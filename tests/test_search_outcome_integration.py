@@ -1256,25 +1256,3 @@ def test_all_governed_scoring_models_are_invariant_to_raw_trade_count(
     assert high_score == pytest.approx(low_score, rel=0.0, abs=1e-12)
 
 
-def test_governed_legacy_confidence_uses_effective_not_raw_count():
-    optimizer = RegimeOptimizer(PipelineConfig(regime_scoring_model="legacy_confidence"))
-    train_power, validation_power = _persisted_power_pair(
-        train_observations=500,
-        val_observations=500,
-        seed=601,
-    )
-    candidate = {
-        "trade_power_contract_enforced": True,
-        "trade_power_train": train_power,
-        "trade_power_validation": validation_power,
-    }
-    base = {"mean_r": 0.2, "std_r": 0.7, "se_r": 0.001}
-    low = optimizer._build_legacy_confidence_evidence(
-        {**base, "total_trades": 2, "r_count": 2},
-        candidate=candidate,
-    )
-    high = optimizer._build_legacy_confidence_evidence(
-        {**base, "total_trades": 2_000, "r_count": 2_000},
-        candidate=candidate,
-    )
-    assert high == low

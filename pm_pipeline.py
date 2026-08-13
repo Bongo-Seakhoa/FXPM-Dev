@@ -2348,16 +2348,13 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
     if temporal_block:
         reasons.append(temporal_block)
 
-    scoring_model = str(getattr(config, "regime_scoring_model", "legacy") or "legacy").lower()
     historical = dict(getattr(regime_config, "historical_audit_metrics", {}) or {})
     historical_severe_reasons: List[str] = []
     if bool(historical.get("severe_failure", False)):
         historical_severe_reasons.extend(str(reason) for reason in historical.get("failure_reasons", []) or [])
-        if scoring_model != "specialist_spokes_v2":
-            reasons.extend(historical_severe_reasons)
+        reasons.extend(historical_severe_reasons)
     regime_profitability_audit = historical.get("regime_profitability_audit")
     if (
-        scoring_model != "specialist_spokes_v2" and
         isinstance(regime_profitability_audit, dict) and
         bool(regime_profitability_audit.get("severe_failure", False))
     ):
@@ -2463,7 +2460,6 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                 )
     holdout_gate_enabled = (
         false_discovery_enabled
-        or scoring_model == "specialist_spokes_v2"
         or split_mode in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}
     )
     if holdout_gate_enabled:
@@ -2489,23 +2485,11 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                 min_holdout_trades = int(getattr(config, "oos_min_trades", min_holdout_trades) or 0)
             if 0 < min_holdout_trades and holdout_trades < min_holdout_trades:
                 reason = f"holdout trades {holdout_trades} < {min_holdout_trades}"
-                if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
-                    return "BLOCKED", [
-                        "historical severe confirmed by weak holdout",
-                        *historical_severe_reasons,
-                        reason,
-                    ]
                 if holdout_policy == "block":
                     return "BLOCKED", [reason]
                 return "PROMOTE_SMALL", [reason]
             if str(holdout.get("policy_status", "") or "").upper() == "FAIL":
                 reason = str(holdout.get("policy_reason", "") or "purged-kfold OOS policy failed")
-                if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
-                    return "BLOCKED", [
-                        "historical severe confirmed by weak holdout",
-                        *historical_severe_reasons,
-                        reason,
-                    ]
                 if holdout_policy == "block":
                     return "BLOCKED", [reason]
                 return "PROMOTE_SMALL", [reason]
@@ -2535,12 +2519,6 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
                         f"holdout max DD {holdout_drawdown:.1f}% > {max_holdout_drawdown:.1f}%"
                     )
                 if holdout_reasons:
-                    if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
-                        return "BLOCKED", [
-                            "historical severe confirmed by weak holdout",
-                            *historical_severe_reasons,
-                            *holdout_reasons,
-                        ]
                     if holdout_policy == "block":
                         return "BLOCKED", holdout_reasons
                     return "PROMOTE_SMALL", holdout_reasons
@@ -2549,12 +2527,6 @@ def classify_promotion_status(regime_config: "RegimeConfig", config: PipelineCon
         return "BLOCKED", false_discovery_reasons
 
     if holdout_trades > 0 and holdout_return <= 0.0:
-        if scoring_model == "specialist_spokes_v2" and historical_severe_reasons:
-            return "BLOCKED", [
-                "historical severe confirmed by weak holdout",
-                *historical_severe_reasons,
-                "freshest holdout non-positive; risk derated",
-            ]
         return "PROMOTE_SMALL", ["freshest holdout non-positive; risk derated"]
     if wf_promote_small_reasons:
         return "PROMOTE_SMALL", wf_promote_small_reasons
@@ -6632,179 +6604,6 @@ class RegimeOptimizer:
         if records_by_id:
             self.oos_candidate_evidence_records.extend(records_by_id.values())
 
-    def _attach_threadspark_selection_evidence_to_candidates(self,
-                                                             symbol: str,
-                                                             timeframe: str,
-                                                             selection_features: Optional[pd.DataFrame],
-                                                             selection_warmup_bars: int,
-                                                             historical_features: Optional[pd.DataFrame],
-                                                             candidates: List[Dict[str, Any]],
-                                                             *,
-                                                             selection_surface: str) -> None:
-        """Attach post-search evidence used only by the ThreadSpark selector.
-
-        This runs after the Optuna candidate pool is fixed. It deliberately writes
-        evidence onto candidate dictionaries instead of mutating train/validation
-        metrics, so the inner TPE objective remains stationary and leak-clean.
-        """
-
-        scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
-        if scoring_model != "specialist_spokes_threadspark":
-            return
-
-        surface_name = str(selection_surface or "validation")
-        has_selection = selection_features is not None and len(selection_features) > max(2, int(selection_warmup_bars or 0))
-        if has_selection and "REGIME_LIVE" not in selection_features.columns:
-            has_selection = False
-        requested_clean_holdout_missing = surface_name == "clean_holdout" and not has_selection
-        has_historical = (
-            bool(getattr(self.config, "threadspark_use_historical_cost_evidence", True))
-            and historical_features is not None
-            and len(historical_features) >= 50
-            and "REGIME_LIVE" in historical_features.columns
-        )
-        if not has_selection and not has_historical and not requested_clean_holdout_missing:
-            return
-
-        historical_chunk_count = max(1, int(getattr(self.config, "threadspark_historical_chunk_count", 5) or 1))
-
-        def _historical_chunk_buckets(
-            trades: List[Dict[str, Any]],
-            features: pd.DataFrame,
-        ) -> List[Dict[str, Dict[str, Any]]]:
-            if historical_chunk_count <= 1 or features is None or len(features) < 100:
-                return []
-            chunks = [chunk for chunk in np.array_split(np.arange(len(features)), historical_chunk_count) if len(chunk)]
-            chunk_buckets: List[Dict[str, Dict[str, Any]]] = []
-            for chunk in chunks:
-                start = int(chunk[0])
-                end = int(chunk[-1]) + 1
-                if end - start < 20:
-                    continue
-                adjusted_trades: List[Dict[str, Any]] = []
-                for trade in trades:
-                    raw_signal = trade.get("signal_bar", trade.get("entry_bar", None))
-                    try:
-                        signal_bar = int(raw_signal)
-                    except (TypeError, ValueError):
-                        continue
-                    if not (start <= signal_bar < end):
-                        continue
-                    adjusted = dict(trade)
-                    for key in ("signal_bar", "entry_bar", "exit_bar"):
-                        if key in adjusted:
-                            try:
-                                adjusted[key] = int(adjusted[key]) - start
-                            except (TypeError, ValueError):
-                                pass
-                    adjusted_trades.append(adjusted)
-                if not adjusted_trades:
-                    continue
-                chunk_features = features.iloc[start:end].copy()
-                chunk_buckets.append(
-                    self._bucket_trades_by_regime(
-                        adjusted_trades,
-                        chunk_features,
-                        timeframe=timeframe,
-                    )
-                )
-            return chunk_buckets
-
-        for cand in candidates:
-            cand["threadspark_selection_requested_surface"] = surface_name
-            cand["threadspark_selection_missing"] = bool(requested_clean_holdout_missing)
-            if requested_clean_holdout_missing:
-                cand["threadspark_selection_surface"] = "clean_holdout_missing"
-                cand["threadspark_selection_missing_reason"] = (
-                    "requested_clean_holdout_unavailable_or_too_thin"
-                )
-            try:
-                evaluation_regime = self._candidate_evaluation_regime(cand)
-                if not evaluation_regime:
-                    raise ValueError("candidate has no exact regime identity")
-                strategy = cand.get("strategy")
-                if strategy is None:
-                    strategy = StrategyRegistry.get(cand.get("strategy_name", ""), **(cand.get("params", {}) or {}))
-            except Exception as exc:
-                logger.debug(
-                    f"[{symbol}] [{timeframe}] ThreadSpark evidence skipped for "
-                    f"{cand.get('strategy_name', 'Unknown')}: {exc}"
-                )
-                continue
-
-            if has_selection:
-                try:
-                    raw_signals = strategy.generate_signals(selection_features, symbol)
-                    signals = self._gate_signals_to_exact_regime(
-                        raw_signals,
-                        selection_features,
-                        evaluation_regime,
-                    )
-                    result = self.backtester.run(
-                        selection_features,
-                        signals,
-                        symbol,
-                        strategy,
-                        timeframe=timeframe,
-                        warmup_bars=selection_warmup_bars,
-                    )
-                    cand["threadspark_selection_regime_metrics"] = {
-                        evaluation_regime: self._compact_exact_regime_result(
-                            result,
-                            evaluation_regime,
-                        )
-                    }
-                    cand["threadspark_selection_surface"] = surface_name
-                    cand["threadspark_selection_missing"] = False
-                    record = self._build_oos_evidence_record(
-                        symbol,
-                        timeframe,
-                        cand,
-                        result,
-                        selection_features,
-                        selection_warmup_bars,
-                    )
-                    if record:
-                        record["oos_surface"] = f"threadspark_{surface_name}"
-                        cand["threadspark_selection_evidence"] = record
-                except Exception as exc:
-                    logger.debug(
-                        f"[{symbol}] [{timeframe}] ThreadSpark selection surface failed for "
-                        f"{cand.get('strategy_name', 'Unknown')}: {exc}"
-                    )
-
-            if has_historical:
-                try:
-                    raw_hist_signals = strategy.generate_signals(historical_features, symbol)
-                    hist_signals = self._gate_signals_to_exact_regime(
-                        raw_hist_signals,
-                        historical_features,
-                        evaluation_regime,
-                    )
-                    hist_result = self.backtester.run(
-                        historical_features,
-                        hist_signals,
-                        symbol,
-                        strategy,
-                        timeframe=timeframe,
-                    )
-                    hist_trades = hist_result.get("trades", [])
-                    cand["threadspark_historical_regime_metrics"] = {
-                        evaluation_regime: self._compact_exact_regime_result(
-                            hist_result,
-                            evaluation_regime,
-                        )
-                    }
-                    historical_chunks = _historical_chunk_buckets(hist_trades, historical_features)
-                    if historical_chunks:
-                        cand["threadspark_historical_chunk_regime_metrics"] = historical_chunks
-                        cand["threadspark_historical_chunk_count"] = int(len(historical_chunks))
-                except Exception as exc:
-                    logger.debug(
-                        f"[{symbol}] [{timeframe}] ThreadSpark historical surface failed for "
-                        f"{cand.get('strategy_name', 'Unknown')}: {exc}"
-                    )
-
     def _apply_training_eligibility_gates(self,
                                           candidates: List[Dict[str, Any]],
                                           symbol: str,
@@ -7977,16 +7776,6 @@ class RegimeOptimizer:
                 val_warmup_bars,
                 eligible_candidates,
             )
-            if self._uses_threadspark_selector():
-                self._attach_threadspark_selection_evidence_to_candidates(
-                    symbol,
-                    timeframe,
-                    selection_features,
-                    selection_warmup_bars,
-                    historical_features,
-                    eligible_candidates,
-                    selection_surface=selection_surface,
-                )
             return eligible_candidates
 
         # Phase 2: Hyperparameter tuning for top-K strategies per regime
@@ -8027,16 +7816,6 @@ class RegimeOptimizer:
                 val_warmup_bars,
                 eligible_candidates,
             )
-            if self._uses_threadspark_selector():
-                self._attach_threadspark_selection_evidence_to_candidates(
-                    symbol,
-                    timeframe,
-                    selection_features,
-                    selection_warmup_bars,
-                    historical_features,
-                    eligible_candidates,
-                    selection_surface=selection_surface,
-                )
             return eligible_candidates
 
         logger.info(
@@ -8154,33 +7933,9 @@ class RegimeOptimizer:
             val_warmup_bars,
             all_candidates,
         )
-        if self._uses_threadspark_selector():
-            self._attach_threadspark_selection_evidence_to_candidates(
-                symbol,
-                timeframe,
-                selection_features,
-                selection_warmup_bars,
-                historical_features,
-                all_candidates,
-                selection_surface=selection_surface,
-            )
 
         return all_candidates
 
-    def _uses_threadspark_selector(self) -> bool:
-        """Return whether candidate ranking consumes ThreadSpark evidence.
-
-        Building ThreadSpark evidence replays every candidate on an additional
-        selection surface and optional historical chunks.  Those computations
-        have no decision effect for the other scoring models, so production
-        must not pay their runtime and memory cost unless ThreadSpark is the
-        configured selector.  The research model remains fully supported.
-        """
-        scoring_model = str(
-            getattr(self.config, "regime_scoring_model", "legacy") or "legacy"
-        ).strip().lower()
-        return scoring_model == "specialist_spokes_threadspark"
-    
     def _identify_top_strategies_per_regime(self,
                                             candidates: List[Dict[str, Any]],
                                             top_k: int = 3) -> Dict[str, List[str]]:
@@ -9465,50 +9220,6 @@ class RegimeOptimizer:
                     raise
         return float(score_fn(train_metrics, val_metrics))
 
-    def _build_legacy_confidence_evidence(
-        self,
-        val_metrics: Dict[str, Any],
-        candidate: Optional[Mapping[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Build positive-edge confidence evidence for post-search legacy reranking."""
-        _, governed_val, _ = self._governed_scoring_inputs(
-            {}, val_metrics, candidate
-        )
-        scoring_metrics = governed_val if governed_val else dict(val_metrics or {})
-        r_count = int(
-            scoring_metrics.get(
-                "r_count", scoring_metrics.get("total_trades", 0)
-            )
-            or 0
-        )
-        mean_r = float(scoring_metrics.get("mean_r", 0.0) or 0.0)
-        std_r = float(scoring_metrics.get("std_r", 0.0) or 0.0)
-        se_r = float(scoring_metrics.get("se_r", 0.0) or 0.0)
-        if (
-            isinstance(candidate, Mapping)
-            and bool(candidate.get("trade_power_contract_enforced", False))
-        ):
-            se_r = std_r / math.sqrt(float(r_count)) if r_count >= 2 and std_r > 1e-12 else 0.0
-        elif se_r <= 1e-12 and r_count >= 2 and std_r > 1e-12:
-            se_r = std_r / math.sqrt(float(r_count))
-        t_stat = mean_r / se_r if mean_r > 0.0 and se_r > 1e-12 else 0.0
-        confidence = max(0.0, min(1.0, 1.0 - (1.0 / t_stat))) if t_stat > 1.0 else 0.0
-        cap = max(0.0, min(0.50, float(getattr(self.config, "legacy_confidence_bonus_cap", 0.08) or 0.0)))
-        multiplier = 1.0 + cap * confidence
-        return {
-            "enabled": True,
-            "surface": "validation",
-            "positive_edge_only": True,
-            "r_count": r_count,
-            "mean_r": round(mean_r, 6),
-            "std_r": round(std_r, 6),
-            "se_r": round(se_r, 6),
-            "edge_t_stat_r": round(t_stat, 6),
-            "confidence": round(confidence, 6),
-            "bonus_cap": round(cap, 6),
-            "multiplier": round(multiplier, 6),
-        }
-
     @staticmethod
     def _selection_surface_failure(
         metrics: Dict[str, Any],
@@ -10054,46 +9765,8 @@ class RegimeOptimizer:
                         )
                         continue
 
-            scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
-            if scoring_model == "specialist_spokes_threadspark":
-                scoring_train, scoring_val, scoring_candidate = (
-                    self._governed_scoring_inputs(
-                        train_metrics,
-                        val_metrics,
-                        cand,
-                    )
-                )
-                if not scoring_train or not scoring_val or scoring_candidate is None:
-                    raise SearchInfrastructureError(TrialOutcome(
-                        kind=SearchOutcomeKind.INFRA_FAILURE,
-                        stage=SearchStage.FAMILY_CELL,
-                        reason_code="TRADE_POWER_SCORING_SURFACE_INVALID",
-                        reason="governed scoring inputs could not be authenticated",
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        regime=regime,
-                        strategy_family=str(cand.get("strategy_name", "")),
-                    ))
-                cand["_threadspark_l1_base_score"] = self._compute_threadspark_l1_score(
-                    scoring_train,
-                    scoring_val,
-                    scoring_candidate,
-                )
-                score = self._compute_threadspark_spoke_score(
-                    scoring_train,
-                    scoring_val,
-                    candidate=scoring_candidate,
-                    regime=regime,
-                )
-            else:
-                score = self._call_regime_score(train_metrics, val_metrics, candidate=cand)
+            score = self._call_regime_score(train_metrics, val_metrics, candidate=cand)
             legacy_confidence = None
-            if scoring_model == "legacy_confidence":
-                legacy_confidence = self._build_legacy_confidence_evidence(
-                    val_metrics,
-                    candidate=cand,
-                )
-                score *= float(legacy_confidence.get("multiplier", 1.0) or 1.0)
             if bool(false_discovery.get("enabled", False)):
                 score *= float(false_discovery.get("confidence_multiplier", 1.0) or 1.0)
             if not math.isfinite(float(score)):
@@ -10117,36 +9790,15 @@ class RegimeOptimizer:
             return None, False, reason
 
         scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
-        if scoring_model == "specialist_spokes_threadspark":
-            scored_candidates.sort(
-                key=lambda item: (
-                    -float(item[1].get("_threadspark_l1_base_score", item[0]) or 0.0),
-                    int(item[1].get('search_trials', 1) or 1),
-                    str(item[1].get('strategy_name', '')),
-                    _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
-                )
+        scored_candidates.sort(
+            key=lambda item: (
+                -float(item[0]),
+                -self._candidate_selection_sample_strength(item[1], regime),
+                int(item[1].get('search_trials', 1) or 1),
+                str(item[1].get('strategy_name', '')),
+                _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
             )
-            l1_top_k = min(self.regime_validation_top_k, len(scored_candidates))
-            scored_candidates = sorted(
-                scored_candidates[:l1_top_k],
-                key=lambda item: (
-                    -float(item[0]),
-                    -float(item[1].get("_threadspark_l1_base_score", item[0]) or 0.0),
-                    int(item[1].get('search_trials', 1) or 1),
-                    str(item[1].get('strategy_name', '')),
-                    _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
-                ),
-            )
-        else:
-            scored_candidates.sort(
-                key=lambda item: (
-                    -float(item[0]),
-                    -self._candidate_selection_sample_strength(item[1], regime),
-                    int(item[1].get('search_trials', 1) or 1),
-                    str(item[1].get('strategy_name', '')),
-                    _stable_hash(self._clean_candidate_params(item[1].get('params', {}))),
-                )
-            )
+        )
 
         # Every candidate in this list already paid the cost of frozen tuning
         # validation and metric scoring.  Truncating descent here saved no
@@ -10218,14 +9870,6 @@ class RegimeOptimizer:
                         legacy_confidence_evidence=legacy_confidence,
                     ),
                 )
-                if scoring_model == "specialist_spokes_threadspark":
-                    config.validation_evidence["threadspark_selector"] = self._compute_threadspark_spoke_evidence(
-                        train_metrics,
-                        val_metrics,
-                        cand,
-                        regime=regime,
-                    )
-
                 return config, True, validation_reason
             else:
                 validation_failures.append(f"#{rank} {strategy_name}: {validation_reason}")
@@ -10286,14 +9930,6 @@ class RegimeOptimizer:
                 legacy_confidence_evidence=legacy_confidence,
             ),
         )
-        if str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower() == "specialist_spokes_threadspark":
-            config.validation_evidence["threadspark_selector"] = self._compute_threadspark_spoke_evidence(
-                train_metrics,
-                val_metrics,
-                best_candidate,
-                regime=regime,
-            )
-
         descent_summary = "; ".join(validation_failures)
         final_reason = (
             f"All {len(validation_failures)} descent candidates failed validation "
@@ -11072,18 +10708,6 @@ class RegimeOptimizer:
             "score": score,
         }
 
-    def _compute_asym_specialist_spoke_score(self,
-                                             train_metrics: Dict[str, Any],
-                                             val_metrics: Dict[str, Any],
-                                             candidate: Optional[Dict[str, Any]] = None) -> float:
-        return float(
-            self._compute_asym_specialist_spoke_evidence(
-                train_metrics,
-                val_metrics,
-                candidate,
-            )["score"]
-        )
-
     def _specialist_spoke_vector(self,
                                  train_metrics: Dict[str, Any],
                                  val_metrics: Dict[str, Any],
@@ -11178,40 +10802,6 @@ class RegimeOptimizer:
             "score": score,
         }
 
-    def _compute_specialist_spoke_score(self,
-                                        train_metrics: Dict[str, Any],
-                                        val_metrics: Dict[str, Any],
-                                        candidate: Optional[Dict[str, Any]] = None) -> float:
-        """Experimental specialist-first scorer for like-for-like discovery runs.
-
-        This is an optimization-time approximation of the evidence geometry:
-        final face quality, path average quality, shape balance, dent health,
-        and saturating evidence confidence. It is not a promotion gate.
-        """
-
-        return float(
-            self._compute_specialist_spoke_evidence(
-                train_metrics,
-                val_metrics,
-                candidate,
-            )["score"]
-        )
-
-    def _compute_threadspark_l1_score(self,
-                                      train_metrics: Dict[str, Any],
-                                      val_metrics: Dict[str, Any],
-                                      candidate: Optional[Dict[str, Any]] = None) -> float:
-        """ThreadSpark shortlist score using the volume-neutral spoke set."""
-
-        return float(
-            self._compute_specialist_spoke_evidence(
-                train_metrics,
-                val_metrics,
-                candidate,
-                spoke_names=self.THREADSPARK_SPOKES,
-            )["score"]
-        )
-
     def _threadspark_face(self,
                           train_metrics: Dict[str, Any],
                           surface_metrics: Dict[str, Any],
@@ -11238,194 +10828,6 @@ class RegimeOptimizer:
             "parameter_stability": stability_status,
         }
         return np.asarray([axes[name] for name in self.THREADSPARK_SPOKES], dtype=np.float64), status
-
-    def _compute_threadspark_spoke_evidence(self,
-                                            train_metrics: Dict[str, Any],
-                                            val_metrics: Dict[str, Any],
-                                            candidate: Optional[Dict[str, Any]] = None,
-                                            regime: Optional[str] = None) -> Dict[str, Any]:
-        """Post-search candidate x evidence_step x spoke selector evidence.
-
-        Inner Optuna calls may not have post-search surfaces yet; in that case
-        this safely falls back to the old two-face spoke approximation. Once
-        `_attach_threadspark_selection_evidence_to_candidates()` has run, the
-        final selector uses train -> validation -> selection -> historical-cost
-        faces as the evidence path.
-        """
-
-        if not isinstance(candidate, dict) or not regime:
-            evidence = self._compute_specialist_spoke_evidence(train_metrics, val_metrics, candidate)
-            evidence["selector_model"] = "specialist_spokes_threadspark_fallback"
-            return evidence
-
-        selection_by_regime = candidate.get("threadspark_selection_regime_metrics") or {}
-        historical_by_regime = candidate.get("threadspark_historical_regime_metrics") or {}
-        historical_chunk_sets = candidate.get("threadspark_historical_chunk_regime_metrics") or []
-        selection_metrics = selection_by_regime.get(regime) if isinstance(selection_by_regime, dict) else None
-        historical_metrics = historical_by_regime.get(regime) if isinstance(historical_by_regime, dict) else None
-
-        train_face = self._surface_spoke_axes(
-            train_metrics,
-            drawdown_limit=float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
-        )
-        train_face["generalization_survival"] = (
-            1.0 if float(train_metrics.get("total_return_pct", 0.0) or 0.0) > 0.0 else 0.0
-        )
-        stability, stability_status = self._parameter_stability_axis(candidate)
-        train_face["parameter_stability"] = stability
-        faces: List[np.ndarray] = [
-            np.asarray([train_face[name] for name in self.THREADSPARK_SPOKES], dtype=np.float64)
-        ]
-        statuses: List[Dict[str, str]] = [{
-            "surface": "train",
-            "evidence": "available" if int(train_metrics.get("total_trades", 0) or 0) >= self.min_train_trades else "thin_or_missing",
-            "execution_cost_survival": self._execution_cost_axis(train_metrics)[1],
-            "parameter_stability": stability_status,
-        }]
-
-        val_face, val_status = self._threadspark_face(
-            train_metrics,
-            val_metrics,
-            candidate,
-            drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0),
-            surface_name="validation",
-        )
-        faces.append(val_face)
-        statuses.append(val_status)
-
-        final_surface_name = "validation"
-        final_metrics = val_metrics
-        final_face_index = len(faces) - 1
-        selection_missing = bool(candidate.get("threadspark_selection_missing", False))
-        if isinstance(selection_metrics, dict) and selection_metrics:
-            final_surface_name = str(candidate.get("threadspark_selection_surface", "selection") or "selection")
-            final_metrics = selection_metrics
-            selection_face, selection_status = self._threadspark_face(
-                train_metrics,
-                selection_metrics,
-                candidate,
-                drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0),
-                surface_name=final_surface_name,
-            )
-            faces.append(selection_face)
-            statuses.append(selection_status)
-            final_face_index = len(faces) - 1
-        elif selection_missing:
-            final_surface_name = str(candidate.get("threadspark_selection_surface", "clean_holdout_missing") or "clean_holdout_missing")
-            faces.append(np.zeros(len(self.THREADSPARK_SPOKES), dtype=np.float64))
-            statuses.append({
-                "surface": final_surface_name,
-                "evidence": "missing_requested_surface",
-                "execution_cost_survival": "unmeasurable",
-                "parameter_stability": stability_status,
-            })
-            final_face_index = len(faces) - 1
-
-        if isinstance(historical_chunk_sets, list):
-            for chunk_idx, chunk_by_regime in enumerate(historical_chunk_sets, start=1):
-                if not isinstance(chunk_by_regime, dict):
-                    continue
-                chunk_metrics = chunk_by_regime.get(regime)
-                if not isinstance(chunk_metrics, dict) or int(chunk_metrics.get("total_trades", 0) or 0) <= 0:
-                    continue
-                chunk_face, chunk_status = self._threadspark_face(
-                    train_metrics,
-                    chunk_metrics,
-                    candidate,
-                    drawdown_limit=float(getattr(self.config, "historical_audit_max_drawdown", 35.0) or 35.0),
-                    surface_name=f"historical_cost_chunk_{chunk_idx}",
-                )
-                faces.append(chunk_face)
-                statuses.append(chunk_status)
-
-        if isinstance(historical_metrics, dict) and int(historical_metrics.get("total_trades", 0) or 0) > 0:
-            historical_face, historical_status = self._threadspark_face(
-                train_metrics,
-                historical_metrics,
-                candidate,
-                drawdown_limit=float(getattr(self.config, "historical_audit_max_drawdown", 35.0) or 35.0),
-                surface_name="historical_cost",
-            )
-            faces.append(historical_face)
-            statuses.append(historical_status)
-
-        tensor = np.vstack(faces)
-        face_qualities = np.asarray([self._geo_mean(face) for face in tensor], dtype=np.float64)
-        final_face = tensor[max(0, min(final_face_index, tensor.shape[0] - 1))]
-        final_quality = self._geo_mean(final_face)
-        path_quality = float(np.mean(face_qualities)) if face_qualities.size else 0.0
-        balance = self._face_balance(final_face)
-        dent_values = [
-            self._dent_health(tensor[idx - 1], tensor[idx])
-            for idx in range(1, tensor.shape[0])
-        ]
-        dent_health = float(min(dent_values)) if dent_values else 0.0
-        selection_trades = max(0, int(final_metrics.get("total_trades", 0) or 0))
-        if selection_trades >= self.min_val_trades:
-            target = max(1, self.min_val_trades * 2)
-            evidence_confidence = min(1.0, math.sqrt(float(selection_trades) / float(target)))
-        else:
-            target = max(1, self.min_train_trades * 2)
-            train_trades = max(0, int(train_metrics.get("total_trades", 0) or 0))
-            evidence_confidence = 0.55 * min(1.0, math.sqrt(float(train_trades) / float(target)))
-        if selection_missing:
-            evidence_confidence *= 0.35
-
-        score = 100.0 * evidence_confidence * final_quality * path_quality * balance * dent_health
-        score = float(score if math.isfinite(score) else 0.0)
-        return {
-            "selector_model": "specialist_spokes_threadspark",
-            "score": score,
-            "spokes": {
-                name: float(final_face[idx])
-                for idx, name in enumerate(self.THREADSPARK_SPOKES)
-            },
-            "train_spokes": {
-                name: float(tensor[0, idx])
-                for idx, name in enumerate(self.THREADSPARK_SPOKES)
-            },
-            "evidence_steps": [
-                {
-                    "surface": statuses[idx].get("surface", f"step_{idx}"),
-                    "quality": float(face_qualities[idx]) if idx < len(face_qualities) else 0.0,
-                    "spokes": {
-                        name: float(tensor[idx, spoke_idx])
-                        for spoke_idx, name in enumerate(self.THREADSPARK_SPOKES)
-                    },
-                    "status": statuses[idx],
-                }
-                for idx in range(tensor.shape[0])
-            ],
-            "derived_shape_features": {
-                "final_face_quality": float(final_quality),
-                "path_average_quality": float(path_quality),
-                "cross_axis_balance": float(balance),
-                "dent_health": float(dent_health),
-                "evidence_confidence": float(evidence_confidence),
-                "evidence_step_count": int(tensor.shape[0]),
-                "final_surface": final_surface_name,
-                "selection_surface_available": bool(
-                    isinstance(selection_metrics, dict) and bool(selection_metrics)
-                ),
-                "selection_missing_reason": str(
-                    candidate.get("threadspark_selection_missing_reason", "")
-                ),
-            },
-        }
-
-    def _compute_threadspark_spoke_score(self,
-                                         train_metrics: Dict[str, Any],
-                                         val_metrics: Dict[str, Any],
-                                         candidate: Optional[Dict[str, Any]] = None,
-                                         regime: Optional[str] = None) -> float:
-        return float(
-            self._compute_threadspark_spoke_evidence(
-                train_metrics,
-                val_metrics,
-                candidate,
-                regime=regime,
-            )["score"]
-        )
 
     @staticmethod
     def _cost_frequency_surface(metrics: Dict[str, Any], *, min_trades: int) -> Dict[str, float]:
@@ -11506,18 +10908,6 @@ class RegimeOptimizer:
         }
         evidence["cost_frequency_evidence"] = cost_frequency
         return evidence
-
-    def _compute_specialist_spoke_v2_score(self,
-                                           train_metrics: Dict[str, Any],
-                                           val_metrics: Dict[str, Any],
-                                           candidate: Optional[Dict[str, Any]] = None) -> float:
-        return float(
-            self._compute_specialist_spoke_v2_evidence(
-                train_metrics,
-                val_metrics,
-                candidate,
-            )["score"]
-        )
 
     def _compute_train_regime_score(
         self,
@@ -11610,24 +11000,6 @@ class RegimeOptimizer:
             not scoring_train or not scoring_val or scoring_candidate is None
         ):
             return float("-inf")
-
-        scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
-        if scoring_model == "specialist_spokes":
-            return self._compute_specialist_spoke_score(
-                scoring_train, scoring_val, scoring_candidate
-            )
-        if scoring_model == "specialist_spokes_threadspark":
-            return self._compute_threadspark_spoke_score(
-                scoring_train, scoring_val, scoring_candidate
-            )
-        if scoring_model == "specialist_spokes_v2":
-            return self._compute_specialist_spoke_v2_score(
-                scoring_train, scoring_val, scoring_candidate
-            )
-        if scoring_model == "specialist_spokes_asym":
-            return self._compute_asym_specialist_spoke_score(
-                scoring_train, scoring_val, scoring_candidate
-            )
 
         # Target trade counts for full stability bonus
         # (2x minimum is considered "healthy")
@@ -13863,75 +13235,6 @@ class OptimizationPipeline:
                 reasons.append(f"validation Sharpe {val_sharpe:.2f} > {max_val_sharpe:.2f} with PBO unavailable")
         return reasons
 
-    def _select_v2_symbol_default(self,
-                                  regime_configs: Dict[str, Dict[str, RegimeConfig]],
-                                  current_default: Optional[RegimeConfig]
-                                  ) -> Tuple[Optional[RegimeConfig], Optional[str], Optional[str], Dict[str, Any]]:
-        candidates: List[Tuple[float, str, str, RegimeConfig]] = []
-        for tf, regimes in regime_configs.items():
-            for regime, cfg in regimes.items():
-                if cfg is not None and not cfg.is_no_trade_marker():
-                    candidates.append((float(cfg.quality_score or 0.0), tf, regime, cfg))
-        candidates.sort(key=lambda item: item[0], reverse=True)
-
-        def _reject_record(tf: str, regime: str, cfg: RegimeConfig, reasons: List[str]) -> Dict[str, Any]:
-            return {
-                "tf": tf,
-                "regime": regime,
-                "strategy": cfg.strategy_name,
-                "promotion_status": str(getattr(cfg, "promotion_status", "BLOCKED") or "BLOCKED"),
-                "quality_score": float(cfg.quality_score or 0.0),
-                "reasons": reasons,
-            }
-
-        strict_rejected: List[Dict[str, Any]] = []
-        for _score, tf, regime, cfg in candidates:
-            reasons = self._v2_default_rejection_reasons(cfg, allow_promote_small=False)
-            if not reasons:
-                return cfg, tf, regime, {
-                    "selected_tf": tf,
-                    "selected_regime": regime,
-                    "selected_strategy": cfg.strategy_name,
-                    "selection_pass": "promoted_only",
-                    "rejected_before_selection": strict_rejected,
-                }
-            strict_rejected.append(_reject_record(tf, regime, cfg, reasons))
-
-        allow_small = bool(getattr(self.config, "specialist_spokes_v2_allow_promote_small_default", True))
-        small_rejected: List[Dict[str, Any]] = []
-        if allow_small:
-            for _score, tf, regime, cfg in candidates:
-                reasons = self._v2_default_rejection_reasons(cfg, allow_promote_small=True)
-                if not reasons:
-                    return cfg, tf, regime, {
-                        "selected_tf": tf,
-                        "selected_regime": regime,
-                        "selected_strategy": cfg.strategy_name,
-                        "selection_pass": "promote_small_allowed",
-                        "rejected_before_selection": strict_rejected,
-                        "fallback_rejected_before_selection": small_rejected,
-                    }
-                small_rejected.append(_reject_record(tf, regime, cfg, reasons))
-
-        current_reasons = self._v2_default_rejection_reasons(
-            current_default,
-            allow_promote_small=allow_small,
-        )
-        if current_default is not None and not current_reasons:
-            return current_default, None, None, {
-                "selected_strategy": current_default.strategy_name,
-                "selected_current_default": True,
-                "selection_pass": "current_default",
-                "rejected_before_selection": strict_rejected,
-                "fallback_rejected_before_selection": small_rejected,
-            }
-        return None, None, None, {
-            "selected_strategy": None,
-            "rejected_before_selection": strict_rejected,
-            "fallback_rejected_before_selection": small_rejected,
-            "no_acceptable_default": True,
-        }
-    
     def run_for_symbol(self, symbol: str) -> PipelineResult:
         """
         Run regime-aware optimization pipeline for a single symbol.
@@ -14536,28 +13839,16 @@ class OptimizationPipeline:
                 threadspark_history_scope = str(
                     getattr(self.config, "threadspark_historical_cost_scope", "workflow") or "workflow"
                 ).lower()
-                threadspark_historical_features = (
-                    full_features
-                    if (
-                        split_mode not in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}
-                        and scoring_model == "specialist_spokes_threadspark"
-                        and threadspark_history_scope == "workflow"
-                    )
-                    else historical_features
-                )
+                threadspark_historical_features = historical_features
                 scored_validation_rows = max(
                     0, len(stage2_features) - validation_warmup_bars
                 )
                 if scored_validation_rows >= 50:
                     val_features_by_tf[tf] = stage2_features
                     val_warmup_by_tf[tf] = validation_warmup_bars
-                    if not (
-                        scoring_model == "specialist_spokes_threadspark"
-                        and threadspark_surface == "clean_holdout"
-                    ):
-                        selection_features_by_tf[tf] = stage2_features
-                        selection_warmup_by_tf[tf] = val_warmup_by_tf[tf]
-                        selection_surface_by_tf[tf] = "validation"
+                    selection_features_by_tf[tf] = stage2_features
+                    selection_warmup_by_tf[tf] = val_warmup_by_tf[tf]
+                    selection_surface_by_tf[tf] = "validation"
 
                 if (
                     threadspark_surface == "clean_holdout"
@@ -14566,11 +13857,6 @@ class OptimizationPipeline:
                 ):
                     selection_features_by_tf[tf] = holdout_features
                     selection_warmup_by_tf[tf] = int((holdout_features.index < holdout_start).sum())
-                    selection_surface_by_tf[tf] = "clean_holdout"
-                elif (
-                    scoring_model == "specialist_spokes_threadspark"
-                    and threadspark_surface == "clean_holdout"
-                ):
                     selection_surface_by_tf[tf] = "clean_holdout"
 
                 with Timer(f"[{symbol}] [{tf}] Regime Optimization"):
@@ -15005,33 +14291,7 @@ class OptimizationPipeline:
             else:
                 self._apply_promotion_statuses(regime_configs, default_config)
 
-            scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
             default_selection_evidence: Dict[str, Any] = {}
-            if (
-                scoring_model == "specialist_spokes_v2"
-                and bool(getattr(self.config, "specialist_spokes_v2_default_fallback_enabled", True))
-            ):
-                selected_default, selected_tf, selected_regime, default_selection_evidence = self._select_v2_symbol_default(
-                    regime_configs,
-                    default_config,
-                )
-                if selected_default is None:
-                    result.error_message = "No acceptable v2 symbol default after catastrophe fallback"
-                    result.regime_winners = total_winners
-                    logger.warning(f"[{symbol}] No acceptable specialist_spokes_v2 default after fallback")
-                    return result
-                if selected_default is not default_config:
-                    logger.info(
-                        f"[{symbol}] specialist_spokes_v2 default fallback: "
-                        f"{getattr(default_config, 'strategy_name', 'None')} -> "
-                        f"{selected_default.strategy_name} @ {selected_tf}/{selected_regime}"
-                    )
-                default_config = selected_default
-                if selected_tf and selected_regime:
-                    best_overall_tf, best_overall_regime = selected_tf, selected_regime
-                else:
-                    best_overall_tf, best_overall_regime = self._locate_default_origin(default_config, regime_configs)
-                best_overall_score = float(default_config.quality_score or 0.0)
 
             for regimes in regime_configs.values():
                 for cfg in regimes.values():
