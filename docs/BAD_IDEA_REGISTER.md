@@ -61,7 +61,12 @@ Every change is classified before it lands:
 | Class | Definition | How it may be justified |
 |---|---|---|
 | **A — output-preserving** | Provably identical outputs. Bit-identical hashes, bit-identical metrics, identical error behaviour. | Speed alone is sufficient. |
-| **B — output-changing** | Changes any produced number, decision, or evidence. | **On accuracy or correctness grounds only.** Its speed effect is not admissible as justification, in either direction. |
+| **B — output-changing** | Changes any produced number, decision, or evidence. | **Never on speed as the sole justification.** Approval requires correctness or out-of-sample evidence. Runtime and resource feasibility may *constrain* a choice among quality-equivalent or better designs; they may not *be* the argument. |
+
+*(Amended from an outright ban on citing speed, after XPM-048: deployability is a
+real constraint and making it unmentionable was overbroad. The protection that
+matters — runtime pressure must not decide a quality question — survives in the
+narrower form.)*
 
 ### Coverage is not a currency
 
@@ -78,26 +83,32 @@ and are opposites in kind:
 | | What it does | Verdict |
 |---|---|---|
 | **Shrink the space** | Fewer candidates are *reachable*. Coverage falls. | Forbidden as an efficiency move. It is a quality decision wearing a speed argument. |
-| **Navigate the space better** | The same or a **larger** space is explored for fewer evaluations, with the optimum still found. | This is the target. |
+| **Navigate the space better** | The same or a wider **economically plausible** domain explored for fewer evaluations. | This is the target — on evidence, not assertion. |
 
-So the direction of travel is not fewer trials — it is **more candidate space at
-lower cost**, by searching it more intelligently. A method that expands the
-reachable field *and* reduces evaluations is a quality improvement and an
-efficiency improvement at once, and is the shape we are aiming at. A method that
-reaches the same optimum from a smaller sample is the same thing viewed from the
-other side, provided the optimum is genuinely still found — which is an evidence
-question, never an assumption.
+**But reach is not free, and this is the correction that makes the rule usable**
+(XPM-049). A larger hypothesis field raises multiplicity and spends validation
+power; redundant or economically impossible regions are not coverage, they are
+noise with a bigger denominator. That is not hypothetical — it is the mechanism
+behind the June book, where both multiple-testing defences were inoperative and
+157 rows survived on thin samples.
 
-The operator offered a Bayesian/Optuna-style illustration of this shape and was
-explicit that it is **illustrative, not prescriptive**: no method is mandated
-here. What is mandated is the property — coverage preserved or increased,
-evaluations reduced, and the claim that the optimum is still found demonstrated
-with evidence rather than asserted.
+The two rules resolve, and both halves are binding:
 
-**Consequence for Class B.** A Class B change that *narrows* what the search can
-reach is inadmissible on speed grounds and must clear a high quality bar even on
-its own terms. A Class B change that *widens* coverage is legitimate even if it
-costs runtime, and is the preferred direction when the two conflict.
+> **Reach must never be traded for runtime** — the operator's direction.
+> **Reach is bought with validation power** — so widen the economically
+> *plausible* domain rather than the raw count, and pay for any widening in
+> multiplicity accounting rather than assuming it is free.
+
+Neither agent may cite runtime when arguing about reach, in either direction.
+
+A navigator earns adoption only on a **precommitted** equivalent-or-wider
+plausible domain, a fixed-compute comparison, untouched OOS/forward outcomes, and
+PBO/DSR plus stability. Claiming the "true optimum is still found" is
+inadmissible — it is unknowable. Widening the field or raising a budget likewise
+needs a marginal-value hypothesis and a stop rule, not a free pass.
+
+The operator's Bayesian/Optuna illustration was explicitly **illustrative, not
+prescriptive**. No method is mandated; the property is.
 
 **Consequence for Class A.** Pure overhead removal — machinery around the search
 rather than the search itself — is unconstrained by any of this, because it
@@ -237,27 +248,9 @@ the same job.
 party, a shared host, or an auditor who must verify the log without trusting us.
 Preserved read-only as decision history.
 
-### Needs re-framing before it can be decided
+### Stale framing
 
-These are register elements whose *evidence* has been withdrawn or superseded.
-They are not bad ideas; they are questions currently posed against stale facts,
-and deciding them as written would be deciding against numbers we no longer hold.
-
-- **E15 — "the binding constraint is RAM, not CPU."** Codex's canonical probe
-  measured 1.07 GiB peak with **99.763%** of wall time in the native semantic
-  resolver. It is neither: the binding constraint is the authority preflight.
-- **E16 — quantified efficiency defects.** The feature-cache copy is recorded at
-  51 ms; re-measured on current HEAD it is **174 ms** (126.6 MB frame, 68 cols,
-  copy-on-write off). The derived "4.4 hours across 100 symbols" multiplies by a
-  run structure inherited from BI-4 and must not be used.
-- **E17 — "the resolver re-verifies 12 GB on every call."** Substantially
-  addressed by the resolver memo and now the subject of E26/E27; the figure
-  predates both.
-- **E7 — Optuna config keys.** Framed around a search path that BI-4 showed is
-  not the canonical executor. Its provenance/live-readiness argument stands and
-  is independent, but the runtime framing does not.
-
----
+Register elements whose evidence has been withdrawn or superseded are flagged **in `RECONCILIATION_REGISTER.md` itself**, not duplicated here. Currently E15, E16, E17 and E7. An entry belongs in this file only when it is a failed implemented experiment, a rejected high-value hypothesis, or withdrawn evidence with a credible risk of being rebuilt.
 
 ## Protocol
 
