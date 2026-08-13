@@ -13,6 +13,10 @@ integration — is the one outcome this register exists to prevent.
 Status: **first pass, 2026-08-08.** Sections marked `NEEDS OPERATOR CONTEXT` are
 gaps I cannot close by reading code.
 
+**Governance update (2026-08-11).** The operator-only decision rule above is
+superseded by `agent_comms/PM_CHARTER.md`: the equal PMs may resolve elements
+inside that charter, and only a three-round deadlock escalates to the operator.
+
 ---
 
 ## 1. Iteration map

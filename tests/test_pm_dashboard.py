@@ -168,8 +168,8 @@ def test_render_removes_withdrawn_runtime_arithmetic() -> None:
     assert "36m 58s" in page
     assert "2,217.712s of 2,222.971s total" in page
     assert "zero strategy, attempt or backtest calls" in page
-    assert "Current implementation (L-0033)" in page
-    assert "Parallel PM gate (XPM-053)" in page
+    assert "Current decision frontier:" in page
+    assert "XPM-060 asks Claude-PM" in page
     assert "Retained · c5c42cc" in page
     assert "Removed · c50758c" in page
     assert "Retained · 2288435" in page
@@ -181,19 +181,21 @@ def test_render_removes_withdrawn_runtime_arithmetic() -> None:
     assert "two new identity reads and no extra structural or evidence replay" in page
     assert "Warm 3.2885s" in page
     assert "19/19 focused and 153 passed / 1 skipped wider" in page
-    assert "Provisional · L-0033" in page
-    assert "no output or line-reduction claim is accepted yet" in page
-    assert "Design only · XPM-053" in page
-    assert "broker schedule-source routing still bypasses" in page
+    assert "Peer verdict pending · XPM-060" in page
+    assert "full suite has not run" in page
+    assert "Peer verdict pending · XPM-058" in page
+    assert "E27b is a Round-3-final design" in page
     assert "local tag + verified/restored bundle" in page
     assert "CX-106 · 611953d · 34,119,074 B" in page
     assert "restore-tested 13-ref bundle + thin overlay + sanitized dirty state" in page
     assert "CX-111 · MANIFEST.md · C800CA08…7603" in page
     assert "annotated tag peels to 611953d" in page
     assert "ignored credential files were excluded" in page
-    assert "37-minute global sweep stays" in page
+    assert "No E27b implementation or Gate-2 rerun is authorised" in page
+    assert "academic source gained only the preservation tag" in page
     assert "Not authorised · XPM-043" not in page
-    assert "Round-3 peer closure pending" not in page
+    assert "Round-1 PM design" not in page
+    assert "Current implementation (L-0033)" not in page
     assert "Current next action (XPM-037)" not in page
     assert "Test suite can go green while blind" not in page
     assert "current end-to-end rebaseline pending" not in page
