@@ -61,6 +61,9 @@ STARTUP_STAGES = [
     ("Artifact registration", 86.154, "CX-076: 1,211 logical freeze artifacts"),
 ]
 
+E24_REOPEN_BEFORE_SECONDS = 81.884079
+E24_REOPEN_AFTER_SECONDS = 5.716661
+
 SINGLE_GRID_MAX_RUNS = 11_520_000
 
 RISKS = [
@@ -495,7 +498,7 @@ def svg_startup_breakdown() -> str:
     )
     p.append(
         f"<text x='{w-x0}' y='91' class='axis' text-anchor='end'>"
-        "E23 is targeting repeated native fits; no saving is claimed until measured.</text>"
+        "Preserved pre-E23 baseline (CX-076); current end-to-end rebaseline pending.</text>"
     )
     p.append("</svg>")
     return "".join(p)
@@ -644,10 +647,10 @@ def render(*, live: bool = True) -> str:
       f"<div class='l'>Authoritative fold package</div>"
       f"<div class='d'>Exact preserved H1 path; down {fold_gain:.1f}% from 2.62 s with "
       f"identical decision hashes and failure.</div></div>")
-    A(f"<div class='kpi'><div class='n'>{sum(value for _, value, _ in STARTUP_STAGES):.0f} s</div>"
-      f"<div class='l'>Pre-evaluation fixed cost</div>"
-      f"<div class='d'>Preserved-spool timing (CX-076). E23 targets "
-      f"15 discarded refits; no saving claimed yet.</div></div>")
+    A("<div class='kpi'><div class='n'>17 → 2</div>"
+      "<div class='l'>Native fits per canary</div>"
+      "<div class='d'>E23 retained at 79303f8. Fifteen discarded full refits were "
+      "replaced by bound held-state checks; final replay remains.</div></div>")
     pending = [e for e in register if "pending" in e["state"].lower()]
     A(f"<div class='kpi'><div class='n'>{len(pending)}</div>"
       f"<div class='l'>Unresolved lineage items</div>"
@@ -668,10 +671,10 @@ def render(*, live: bool = True) -> str:
     for number, name, cls, why in flow:
         A(f"<div class='step {cls}'><div class='num'>{number}</div><div class='name'>{esc(name)}</div>"
           f"<div class='why'>{esc(why)}</div></div>")
-    A("</div><div class='note'><b>Declared current next action (CX-074):</b> validate E23 at exactly two native "
-      "fits and measure the startup reduction. Redundant frozen-plan publications are the "
-      "next measured candidate, not yet an approved implementation. The cost-stress repair "
-      "remains a separate PM-gated correctness decision.</div></div>")
+    A("</div><div class='note'><b>Current next action (XPM-030):</b> rebaseline the "
+      "complete canonical fixed-cost path after E23/E24 before authorising another "
+      "optimization. The cost-stress repair remains a separate PM-gated correctness "
+      "decision; no Gate-2 rerun is authorised.</div></div>")
 
     A("<h2>Deliverables and preserved lineages</h2><div class='split'><div class='panel'>")
     A(f"<div class='kpi' style='border:0;padding:0'><div class='n'>{reports['verified']}/{reports['total'] or 4}</div>"
@@ -684,16 +687,20 @@ def render(*, live: bool = True) -> str:
           f"<td class='mono'>{esc(lineage['evidence'])}</td></tr>")
     A("</table></div></div>")
 
-    A("<h2>Active experiment contract</h2><div class='panel wrap'><table>"
-      "<tr><th>Element</th><th>E23 contract recorded in CX-074 / XPM-022</th></tr>"
-      "<tr><td><b>Hypothesis</b></td><td>Repeated discarded native refits explain the "
-      "dominant fixed startup delay.</td></tr>"
-      "<tr><td><b>Required evidence</b></td><td>Exactly 2 full fits; tamper rejection; "
-      "unchanged output/failure identity; fixed-path timing.</td></tr>"
-      "<tr><td><b>Scope</b></td><td>No gate, search, fold or roster change. No Gate-2 retry.</td></tr>"
-      "<tr><td><b>Stop</b></td><td>Do not retain the change if call count, tamper, or "
-      "output parity fails. Timing acceptance remains a PM ruling, not a dashboard constant."
-      "</td></tr></table></div>")
+    A("<h2>Recent experiments and next gate</h2><div class='panel wrap'><table>"
+      "<tr><th>Experiment</th><th>Measured outcome</th><th>Decision</th></tr>"
+      "<tr><td><b>E23 · native replay</b></td><td>17 → 2 full fits; fifteen held "
+      "checks took 0.559s versus about 239s of discarded refits; substitution and "
+      "pre-evaluation rejection controls passed.</td><td>Retained · 79303f8</td></tr>"
+      f"<tr><td><b>E24 · duplicate publication</b></td><td>Exact 1,211-entry reopen "
+      f"{E24_REOPEN_BEFORE_SECONDS:.3f}s → {E24_REOPEN_AFTER_SECONDS:.3f}s "
+      f"(-{improvement_pct(E24_REOPEN_BEFORE_SECONDS, E24_REOPEN_AFTER_SECONDS):.1f}%); "
+      "identical entries and fail-closed CAS checks.</td><td>Retained · 38e5022</td></tr>"
+      "<tr><td><b>Next gate</b></td><td>Measure the complete canonical fixed-cost "
+      "path on current HEAD; identify one dominant remaining phase before any new "
+      "change.</td><td>No implementation authorised</td></tr>"
+      "</table><div class='note'>No experiment changed the roster, folds, gates, search "
+      "scope or economic thresholds. Isolated gains are not a universe ETA.</div></div>")
 
     A("<h2>Programme timeline</h2><div class='panel'>")
     A(svg_gantt())
@@ -722,6 +729,9 @@ def render(*, live: bool = True) -> str:
       f"gain: {fold_gain:.1f}%. No search, fold, gate or roster change.</div></div>")
     A("<div class='panel'>")
     A(svg_startup_breakdown())
+    A("<div class='note'>This chart is the preserved pre-E23 baseline, not current "
+      "runtime. E23 removed the repeated-refit mechanism; the complete path must now "
+      "be measured again before another optimization is selected.</div>")
     A("<div class='note'>Canonical count ceiling: one 2,400-cell grid has at most "
       f"{SINGLE_GRID_MAX_RUNS/1_000_000:.2f}M Backtester.run calls, 2.88M stress repricings "
       "and 720k strategy surfaces. The complete multi-grid generation total and duration "

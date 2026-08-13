@@ -112,6 +112,10 @@ def test_render_removes_withdrawn_runtime_arithmetic() -> None:
     assert "complete multi-grid generation total and duration are not yet established" in page
     assert "2.62 s" in page
     assert "61.6%" in page
+    assert "17 → 2" in page
+    assert "81.884s → 5.717s" in page
+    assert "Current next action (XPM-030)" in page
+    assert "validate E23 at exactly two native fits" not in page
     assert "http-equiv='refresh'" not in page
     assert "Decisions waiting on you" not in page
     assert "they need your judgement" not in page
