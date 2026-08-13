@@ -495,6 +495,181 @@ def test_trade_bearing_equal_cost_vectors_are_explicitly_non_adverse() -> None:
     assert stress["winner_daily_r_surface"] == base["winner_daily_r_surface"]
 
 
+def test_equal_swap_inputs_preserve_already_settled_base_cents() -> None:
+    frame = _frame().iloc[:3].copy().assign(Spread=[2, 2, 2])
+    signals = pd.Series([1, 0, 0], index=frame.index, dtype=np.int32)
+    config = PipelineConfig(
+        research_mode=True,
+        use_spread=True,
+        use_slippage=False,
+        use_commission=False,
+        swap_model_enabled=True,
+        swap_model_min_holding_hours=0.0,
+        backtest_spread_mode="conservative_max",
+        discovery_risk_per_trade_pct=2.5,
+    )
+    strategy = _AtrHoldStrategy()
+    spec = _spec(swap_long=-4.095, swap_short=-4.095, swap_mode=-1)
+    backtester = Backtester(config)
+    base = backtester.run(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        spec=spec,
+        timeframe="D1",
+    )
+
+    assert base["trades"][0]["position_size"] == pytest.approx(0.25)
+    assert base["trades"][0]["swap_rollover_units"] == 4
+    assert base["trades"][0]["swap_dollars"] == -4.10
+
+    stress = backtester.replay_frozen_path_cost_stress(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        base,
+        stress_mode="stress_p95",
+        spec=spec,
+        timeframe="D1",
+    )
+
+    assert stress["trades"][0]["swap_dollars"] == -4.10
+    assert stress["position_events"] == base["position_events"]
+    assert stress["winner_daily_r_surface"] == base["winner_daily_r_surface"]
+    receipt = stress["cost_stress_frozen_path_receipt"]
+    assert receipt["strictly_worse_trade_count"] == 0
+    assert receipt["strictly_worse_daily_observation_count"] == 0
+
+
+def test_frozen_path_swap_delta_uses_settled_base_and_rejects_nonfinite() -> None:
+    settle = Backtester._settle_frozen_path_stress_swap
+
+    # This is the exact preserved Gate-2 boundary: the base path has already
+    # settled NumPy's representation of -5.46 * .25 * 3 to -4.10.
+    assert settle(
+        base_swap=-4.10,
+        rollover_units=3,
+        position_size=0.25,
+        base_rate=-5.46,
+        stress_rate=-5.46,
+    ) == -4.10
+    assert settle(
+        base_swap=-4.10,
+        rollover_units=3,
+        position_size=0.25,
+        base_rate=-5.46,
+        stress_rate=-5.50,
+    ) == -4.13
+    assert settle(
+        base_swap=-4.10,
+        rollover_units=3,
+        position_size=0.25,
+        base_rate=-5.46,
+        stress_rate=-5.42,
+    ) == -4.07
+
+    for field, value in (
+        ("base_swap", float("nan")),
+        ("base_rate", float("inf")),
+        ("stress_rate", float("-inf")),
+    ):
+        values = {
+            "base_swap": -4.10,
+            "rollover_units": 3,
+            "position_size": 0.25,
+            "base_rate": -5.46,
+            "stress_rate": -5.50,
+        }
+        values[field] = value
+        with pytest.raises(ValueError, match="swap counterfactual is invalid"):
+            settle(**values)
+
+
+@pytest.mark.parametrize(
+    ("direction", "raw_swap", "must_reject_improvement"),
+    (
+        ("LONG", 36000.0, True),
+        ("LONG", -36000.0, False),
+        ("SHORT", 36000.0, False),
+        ("SHORT", -36000.0, True),
+    ),
+)
+def test_mode6_entry_notional_delta_remains_economic_and_fail_closed(
+    direction: str,
+    raw_swap: float,
+    must_reject_improvement: bool,
+) -> None:
+    frame = _frame().iloc[:3].copy().assign(
+        SpreadOpen=[1, 1, 1],
+        SpreadMax=[5, 5, 5],
+        SpreadP95=[4, 4, 4],
+    )
+    signals = pd.Series(
+        [1 if direction == "LONG" else -1, 0, 0],
+        index=frame.index,
+        dtype=np.int32,
+    )
+    config = PipelineConfig(
+        research_mode=True,
+        use_spread=True,
+        use_slippage=False,
+        use_commission=False,
+        swap_model_enabled=True,
+        swap_model_min_holding_hours=0.0,
+        backtest_spread_mode="conservative_max",
+        discovery_risk_per_trade_pct=2.5,
+    )
+    strategy = _AtrHoldStrategy()
+    spec = _spec(
+        swap_long=raw_swap,
+        swap_short=raw_swap,
+        swap_mode=6,
+        contract_size=100000.0,
+    )
+    backtester = Backtester(config)
+    base = backtester.run(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        spec=spec,
+        timeframe="D1",
+    )
+
+    if must_reject_improvement:
+        with pytest.raises(ValueError, match="improves under stress"):
+            backtester.replay_frozen_path_cost_stress(
+                frame,
+                signals,
+                "ZZZUSD",
+                strategy,
+                base,
+                stress_mode="stress_p95",
+                spec=spec,
+                timeframe="D1",
+            )
+        return
+
+    stress = backtester.replay_frozen_path_cost_stress(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        base,
+        stress_mode="stress_p95",
+        spec=spec,
+        timeframe="D1",
+    )
+    assert stress["trades"][0]["swap_dollars"] < base["trades"][0][
+        "swap_dollars"
+    ]
+    assert stress["trades"][0]["pnl_dollars"] < base["trades"][0][
+        "pnl_dollars"
+    ]
+
+
 def test_noncausal_swap_never_claims_full_path_daily_r() -> None:
     frame = _frame().drop(columns=["_BAR_CLOSE_TS"])
     result = _run(

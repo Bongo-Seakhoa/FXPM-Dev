@@ -8522,13 +8522,24 @@ class Backtester:
             direction = str(stressed["direction"]).upper()
             position_size = float(stressed["position_size"])
             units = int(stressed["swap_rollover_units"])
-            rate = (
+            base_rate = (
+                float(base_swap_long[entry_bar])
+                if direction == "LONG"
+                else float(base_swap_short[entry_bar])
+            )
+            stress_rate = (
                 float(stress_swap_long[entry_bar])
                 if direction == "LONG"
                 else float(stress_swap_short[entry_bar])
             )
-            stress_swap = round(units * rate * position_size, 2)
             base_swap = float(stressed.pop("_frozen_path_base_swap_dollars"))
+            stress_swap = self._settle_frozen_path_stress_swap(
+                base_swap=base_swap,
+                rollover_units=units,
+                position_size=position_size,
+                base_rate=base_rate,
+                stress_rate=stress_rate,
+            )
             base_pnl = float(stressed.pop("_frozen_path_base_pnl_dollars"))
             entry_cost = float(stressed.pop("_frozen_path_entry_cost_dollars"))
             stress_pnl = round(base_pnl - entry_cost + stress_swap - base_swap, 2)
@@ -8932,6 +8943,46 @@ class Backtester:
         if swap_value:
             raise ValueError(f"unsupported nonzero MT5 swap mode {mode}")
         return 0.0
+
+    @staticmethod
+    def _settle_frozen_path_stress_swap(
+        *,
+        base_swap: float,
+        rollover_units: int,
+        position_size: float,
+        base_rate: float,
+        stress_rate: float,
+    ) -> float:
+        """Settle stress financing relative to the already-settled base cents.
+
+        The base sub-cent amount is no longer available here. Equal financing
+        inputs therefore preserve the base settlement exactly; changed inputs
+        apply one unrounded rate delta and one HALF_EVEN cent settlement.
+        """
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (base_swap, position_size, base_rate, stress_rate)
+            )
+            or rollover_units < 0
+            or position_size <= 0.0
+        ):
+            raise ValueError("frozen-path swap counterfactual is invalid")
+        if base_rate == stress_rate:
+            return base_swap
+        try:
+            settled = (
+                Decimal(str(base_swap))
+                + Decimal(rollover_units)
+                * Decimal(str(position_size))
+                * (Decimal(str(stress_rate)) - Decimal(str(base_rate)))
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
+            result = float(settled)
+        except (InvalidOperation, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("frozen-path swap counterfactual is invalid") from exc
+        if not math.isfinite(result):
+            raise ValueError("frozen-path swap counterfactual is invalid")
+        return result
 
     @staticmethod
     def _swap_accrual_bar_index(
