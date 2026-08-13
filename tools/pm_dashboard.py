@@ -45,7 +45,9 @@ TIMELINE = [
     ("Authority preflight measured", "2026-08-13", "2026-08-13", "done"),
     ("E25 stress settlement repaired", "2026-08-13", "2026-08-13", "done"),
     ("E26 cache integrity + extents", "2026-08-13", "2026-08-13", "done"),
-    ("E27 prerequisites PM gate", "2026-08-13", None, "active"),
+    ("E27a1 selected identity bracket", "2026-08-13", "2026-08-13", "done"),
+    ("Canonical scoring cleanup", "2026-08-13", None, "active"),
+    ("E27b sweep replacement PM gate", "2026-08-13", None, "active"),
     ("Test B purge / no valid days", "2026-07-14", "2026-08-18", "pending"),
     ("Test B preliminary window",  "2026-08-18", "2026-10-19", "pending"),
     ("Test B credible horizon",    "2026-08-18", "2027-08-17", "pending"),
@@ -79,6 +81,9 @@ E26_WARM_BEFORE_SECONDS = 4.188571
 E26_WARM_AFTER_SECONDS = 3.266726
 E26_FINGERPRINT = "31c4e125aa2a22f3bfe16f82b097dd9366769b7017edb44fde068d4b825d5fc8"
 
+E27_WARM_SECONDS = 3.2885
+E27_COMMIT = "7376a06"
+
 SINGLE_GRID_MAX_RUNS = 11_520_000
 
 RISKS = [
@@ -86,10 +91,10 @@ RISKS = [
      "The exact 100×6 semantic sweep took 36m58s before any strategy, attempt or "
      "backtest. It consumed 99.763% of the bounded rebaseline; E26 improved a warm "
      "one-cell check but did not remove this global sweep."),
-    ("Sweep removal has unresolved authority prerequisites", "high",
-     "The promotion receipt is not yet code-bound, selected-leaf verification needs an "
-     "ACTIVE identity bracket, and broker-term schedule sourcing can bypass that route. "
-     "E27 remains PM-gated."),
+    ("Sweep replacement still has authority blockers", "high",
+     "E27a1 now brackets selected-artifact verification against ACTIVE identity changes, "
+     "but broker-term schedule sourcing can still bypass that route. E27b is only a "
+     "Round-1 PM design; the 100x6 sweep remains."),
     ("Full-run duration is still unmeasured", "high",
      "The former 576M/years estimate is withdrawn. The pre-search bottleneck is now "
      "measured; downstream complete-generation duration is not."),
@@ -273,18 +278,32 @@ def audit_report_status() -> dict:
 
 def lineage_status(bus: list[dict]) -> list[dict]:
     by_id = {message.get("id"): message for message in bus}
-    g0 = by_id.get("CX-025", {})
-    g0_complete = "G0 COMPLETE" in str(g0.get("body") or "")
+    academic = by_id.get("CX-106", {})
+    commercial = by_id.get("CX-111", {})
+    academic_preserved = "Academic lineage preservation completed" in str(
+        academic.get("body") or ""
+    )
+    commercial_preserved = "Commercial lineage preservation also completed" in str(
+        commercial.get("body") or ""
+    )
     return [
         {
             "lineage": "Academic research",
-            "state": "restore-tested" if g0_complete else "unverified",
-            "evidence": "CX-025" if g0_complete else "CX-011",
+            "state": "local tag + verified/restored bundle"
+            if academic_preserved
+            else "unverified",
+            "evidence": "CX-106 · 611953d · 34,119,074 B"
+            if academic_preserved
+            else "CX-011",
         },
         {
             "lineage": "Commercial history",
-            "state": "remote tags confirmed" if g0_complete else "unverified",
-            "evidence": "CX-025" if g0_complete else "CX-011",
+            "state": "restore-tested 13-ref bundle + thin overlay + sanitized dirty state"
+            if commercial_preserved
+            else "unverified",
+            "evidence": "CX-111 · MANIFEST.md · C800CA08…7603"
+            if commercial_preserved
+            else "CX-011",
         },
         {
             "lineage": "Canonical production",
@@ -666,11 +685,11 @@ def render(*, live: bool = True) -> str:
       "<div class='d'>Exact 100×6 semantic sweep; 99.763% of the bounded baseline "
       "and zero strategy, attempt or backtest calls. It remains the dominant "
       "pre-search cost after E26.</div></div>")
-    A(f"<div class='kpi'><div class='n'>{E26_WARM_AFTER_SECONDS:.3f} s</div>"
-      "<div class='l'>E26 warm one-cell check</div>"
-      f"<div class='d'>Down {improvement_pct(E26_WARM_BEFORE_SECONDS, E26_WARM_AFTER_SECONDS):.2f}% "
-      f"from {E26_WARM_BEFORE_SECONDS:.3f} s; exact fingerprint unchanged. "
-      "This is not a full-sweep result.</div></div>")
+    A(f"<div class='kpi'><div class='n'>{E27_WARM_SECONDS:.4f} s</div>"
+      "<div class='l'>E27a1 selected-artifact check</div>"
+      "<div class='d'>Real route 2/1/1 to 4/1/1: two bounded identity reads added, "
+      "with no extra structural resolution or selected-evidence replay. Exact "
+      "fingerprint unchanged; this is not a full-sweep result.</div></div>")
     A(f"<div class='kpi'><div class='n'>{current_fold:.2f} s</div>"
       f"<div class='l'>Authoritative fold package</div>"
       f"<div class='d'>Exact preserved H1 path through E22; down {fold_gain:.1f}% "
@@ -690,20 +709,21 @@ def render(*, live: bool = True) -> str:
     A("<h2>Canonical path and next action</h2><div class='panel'><div class='flow'>")
     flow = [
         ("1", "Correct executor", "done", "E25 retained; false one-cent stress gain removed."),
-        ("2", "Authority boundary", "active", "Gate E27 prerequisites before sweep removal."),
-        ("3", "Full run", "", "Complete the canonical 4-anchor/current-refit path."),
-        ("4", "Replay + Test A", "", "Reject-only retrospective falsification."),
+        ("2", "Authority boundary", "active", "E27a1 retained; broker bypass and E27b open."),
+        ("3", "Canonical scoring", "active", "L-0033 cleanup is provisional and under test."),
+        ("4", "Full run + Test A", "", "Complete the path, then reject-only falsification."),
         ("5", "Demo shadow", "", "Broker-reconciled operational probation."),
         ("6", "Test B", "blocked", "Only prospective evidence can support certification."),
     ]
     for number, name, cls, why in flow:
         A(f"<div class='step {cls}'><div class='num'>{number}</div><div class='name'>{esc(name)}</div>"
           f"<div class='why'>{esc(why)}</div></div>")
-    A("</div><div class='note'><b>Current next action (XPM-043):</b> PM-gate the "
-      "narrow E27 prerequisites: an ACTIVE identity bracket around selected-leaf "
-      "verification and authority-safe broker-term schedule sourcing. E27 is not yet "
-      "authorised, and the 37-minute global sweep must remain until its authority gaps "
-      "are closed. No Gate-2 rerun is authorised.</div></div>")
+    A("</div><div class='note'><b>Current implementation (L-0033):</b> collapse "
+      "unreachable scoring-model branches into one canonical production path, with "
+      "before/after characterisation. This is in progress and no outcome is retained "
+      "yet. <b>Parallel PM gate (XPM-053):</b> E27b is Round-1 design only, not "
+      "authorised; the broker bypass remains open and the 37-minute global sweep stays. "
+      "No Gate-2 rerun is authorised.</div></div>")
 
     A("<h2>Deliverables and preserved lineages</h2><div class='split'><div class='panel'>")
     A(f"<div class='kpi' style='border:0;padding:0'><div class='n'>{reports['verified']}/{reports['total'] or 4}</div>"
@@ -714,7 +734,12 @@ def render(*, live: bool = True) -> str:
     for lineage in lineages:
         A(f"<tr><td><b>{esc(lineage['lineage'])}</b></td><td>{esc(lineage['state'])}</td>"
           f"<td class='mono'>{esc(lineage['evidence'])}</td></tr>")
-    A("</table></div></div>")
+    A("</table><div class='note'>Academic preservation is local: the annotated tag "
+      "peels to 611953d and the complete-history bundle was verified and restore-tested. "
+      "Commercial preservation includes a self-contained 13-ref history, a verified thin "
+      "Evidence Desk overlay, and a sanitized dirty-state package; ignored credential files "
+      "were excluded. Exact hashes and restore notes are in the commercial MANIFEST.md. "
+      "Source repositories were not changed.</div></div></div>")
 
     A("<h2>Recent experiments and next gate</h2><div class='panel wrap'><table>"
       "<tr><th>Experiment</th><th>Measured outcome</th><th>Decision</th></tr>"
@@ -739,12 +764,23 @@ def render(*, live: bool = True) -> str:
       f"(-{improvement_pct(E26_WARM_BEFORE_SECONDS, E26_WARM_AFTER_SECONDS):.2f}%); "
       f"fingerprint <span class='mono'>{E26_FINGERPRINT}</span>; 79 passed / 1 skipped."
       "</td><td>Retained · 2288435</td></tr>"
+      f"<tr><td><b>E27a1 · selected authority bracket</b></td><td>Real selected route "
+      "2 identity / 1 structural / 1 selected-evidence call became 4 / 1 / 1: exactly "
+      f"two new identity reads and no extra structural or evidence replay. Warm {E27_WARM_SECONDS:.4f}s; "
+      f"fingerprint <span class='mono'>{E26_FINGERPRINT}</span> unchanged; 19/19 focused "
+      f"and 153 passed / 1 skipped wider.</td><td>Retained · {E27_COMMIT}</td></tr>"
+      "<tr><td><b>Canonical scoring cleanup</b></td><td>L-0033 is removing "
+      "superseded scoring branches while characterising the exact production fallthrough "
+      "and preserving read-only provenance compatibility. Work and verification are still "
+      "in progress; no output or line-reduction claim is accepted yet.</td>"
+      "<td>Provisional · L-0033</td></tr>"
       "<tr><td><b>Fixed-cost baseline</b></td><td>The 100×6 native semantic sweep "
       "took 2,217.712s of 2,222.971s total (99.763%); no attempt or backtest ran."
       "</td><td>Dominant bottleneck located · CX-088</td></tr>"
-      "<tr><td><b>Next gate</b></td><td>PMs are reviewing bounded E27 prerequisites. "
-      "The global sweep cannot be retired until activation, selected-leaf and "
-      "broker-routing authority gaps close.</td><td>Not authorised · XPM-043</td></tr>"
+      "<tr><td><b>Next authority gate</b></td><td>E27b is a Round-1 design for replacing "
+      "the repeated semantic sweep with one code-bound promotion receipt. It is not "
+      "authorised, and broker schedule-source routing still bypasses the selected-artifact "
+      "route.</td><td>Design only · XPM-053</td></tr>"
       "</table><div class='note'>No experiment changed the roster, folds, gates, search "
       "scope or economic thresholds. Isolated gains are not a universe ETA.</div></div>")
 

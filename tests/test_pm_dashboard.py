@@ -117,15 +117,31 @@ def test_render_removes_withdrawn_runtime_arithmetic() -> None:
     assert "36m 58s" in page
     assert "2,217.712s of 2,222.971s total" in page
     assert "zero strategy, attempt or backtest calls" in page
-    assert "Current next action (XPM-043)" in page
+    assert "Current implementation (L-0033)" in page
+    assert "Parallel PM gate (XPM-053)" in page
     assert "Retained · c5c42cc" in page
     assert "Removed · c50758c" in page
     assert "Retained · 2288435" in page
+    assert "Retained · 7376a06" in page
     assert "4.188571s → 3.266726s (-22.01%)" in page
     assert dashboard.E26_FINGERPRINT in page
     assert "79 passed / 1 skipped" in page
-    assert "37-minute global sweep must remain" in page
-    assert "Not authorised · XPM-043" in page
+    assert "2 identity / 1 structural / 1 selected-evidence call became 4 / 1 / 1" in page
+    assert "two new identity reads and no extra structural or evidence replay" in page
+    assert "Warm 3.2885s" in page
+    assert "19/19 focused and 153 passed / 1 skipped wider" in page
+    assert "Provisional · L-0033" in page
+    assert "no output or line-reduction claim is accepted yet" in page
+    assert "Design only · XPM-053" in page
+    assert "broker schedule-source routing still bypasses" in page
+    assert "local tag + verified/restored bundle" in page
+    assert "CX-106 · 611953d · 34,119,074 B" in page
+    assert "restore-tested 13-ref bundle + thin overlay + sanitized dirty state" in page
+    assert "CX-111 · MANIFEST.md · C800CA08…7603" in page
+    assert "annotated tag peels to 611953d" in page
+    assert "ignored credential files were excluded" in page
+    assert "37-minute global sweep stays" in page
+    assert "Not authorised · XPM-043" not in page
     assert "Round-3 peer closure pending" not in page
     assert "Current next action (XPM-037)" not in page
     assert "Test suite can go green while blind" not in page
