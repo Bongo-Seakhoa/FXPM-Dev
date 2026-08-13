@@ -262,6 +262,204 @@ def test_per_cell_resolver_accepts_canonical_and_authenticated_promoted_manifest
     assert result.sidecar_path == paths["sidecar"].resolve()
 
 
+def test_per_cell_resolver_adds_only_the_outer_identity_bracket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, universe, _paths, _payloads = _artifact_fixture(
+        tmp_path,
+        promoted=True,
+    )
+    real_identity = native._read_active_authority_identity
+    identity_reads = 0
+    evidence_replays = 0
+    universe_resolutions = 0
+
+    def _identity(*args: Any, **kwargs: Any) -> Any:
+        nonlocal identity_reads
+        identity_reads += 1
+        return real_identity(*args, **kwargs)
+
+    def _evidence(*args: Any, **kwargs: Any) -> list[str]:
+        nonlocal evidence_replays
+        evidence_replays += 1
+        return []
+
+    def _universe(*args: Any, **kwargs: Any) -> native.ActiveNativeUniverse:
+        nonlocal universe_resolutions
+        universe_resolutions += 1
+        return deepcopy(universe)
+
+    monkeypatch.setattr(native, "_read_active_authority_identity", _identity)
+    monkeypatch.setattr(native, "_verify_activation_cell_evidence", _evidence)
+    monkeypatch.setattr(native, "_resolve_active_native_universe_uncached", _universe)
+
+    baseline = native._resolve_active_native_artifact_single_pass(
+        data_dir,
+        PRODUCTION_SYMBOL_ORDER[0],
+        PRODUCTION_TIMEFRAME_ORDER[0],
+        production_contract_required=True,
+    )
+    baseline_identity_reads = identity_reads
+    baseline_evidence_replays = evidence_replays
+    baseline_universe_resolutions = universe_resolutions
+    native.clear_unscoped_native_universe_memo()
+
+    result = native.resolve_active_native_artifact(
+        data_dir,
+        PRODUCTION_SYMBOL_ORDER[0],
+        PRODUCTION_TIMEFRAME_ORDER[0],
+        production_contract_required=True,
+    )
+
+    assert baseline.valid, baseline.errors
+    assert result == baseline
+    assert baseline_identity_reads == 2
+    assert baseline_evidence_replays == 1
+    assert baseline_universe_resolutions == 1
+    assert identity_reads - baseline_identity_reads == 4
+    assert evidence_replays - baseline_evidence_replays == 1
+    assert universe_resolutions - baseline_universe_resolutions == 1
+
+
+def test_per_cell_resolver_rejects_active_identity_movement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, universe, _paths, _payloads = _artifact_fixture(
+        tmp_path,
+        promoted=True,
+    )
+    _stub_runtime_cell_evidence(monkeypatch, universe)
+    identity = native._read_active_authority_identity(data_dir)
+    moved = native._ActiveAuthorityIdentity(
+        data_dir=identity.data_dir,
+        active_pointer_bytes=identity.active_pointer_bytes + b" ",
+        active_pointer_sha256="f" * 64,
+        activation_manifest_sha256=identity.activation_manifest_sha256,
+    )
+    identities = iter((identity, moved))
+    monkeypatch.setattr(
+        native,
+        "_read_active_authority_identity",
+        lambda _data_dir: next(identities),
+    )
+
+    result = native.resolve_active_native_artifact(
+        data_dir,
+        PRODUCTION_SYMBOL_ORDER[0],
+        PRODUCTION_TIMEFRAME_ORDER[0],
+        production_contract_required=True,
+    )
+
+    assert not result.valid
+    assert result.errors == ["NATIVE_ACTIVE_AUTHORITY_CHANGED_DURING_RESOLUTION"]
+
+
+@pytest.mark.parametrize(
+    ("failure_read", "expected_error", "expected_body_calls"),
+    [
+        (1, "NATIVE_ACTIVE_AUTHORITY_IDENTITY_INITIAL_READ_FAILED", 0),
+        (2, "NATIVE_ACTIVE_AUTHORITY_IDENTITY_FINAL_READ_FAILED", 1),
+    ],
+)
+def test_per_cell_resolver_types_active_identity_read_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_read: int,
+    expected_error: str,
+    expected_body_calls: int,
+) -> None:
+    identity = native._ActiveAuthorityIdentity(
+        data_dir=Path("data").resolve(),
+        active_pointer_bytes=b"{}",
+        active_pointer_sha256="a" * 64,
+        activation_manifest_sha256="b" * 64,
+    )
+    identity_reads = 0
+    body_calls = 0
+
+    def _identity(_data_dir: Path) -> native._ActiveAuthorityIdentity:
+        nonlocal identity_reads
+        identity_reads += 1
+        if identity_reads == failure_read:
+            raise RuntimeError("injected authority read failure")
+        return identity
+
+    def _single_pass(*args: Any, **kwargs: Any) -> native.ActiveNativeResolution:
+        nonlocal body_calls
+        body_calls += 1
+        return native.ActiveNativeResolution(symbol="EURUSD", timeframe="H1")
+
+    monkeypatch.setattr(native, "_read_active_authority_identity", _identity)
+    monkeypatch.setattr(
+        native,
+        "_resolve_active_native_artifact_single_pass",
+        _single_pass,
+    )
+
+    result = native.resolve_active_native_artifact(Path("data"), " EURUSD ", "h1")
+
+    assert not result.valid
+    assert result.symbol == "EURUSD"
+    assert result.timeframe == "H1"
+    assert result.errors == [expected_error]
+    assert body_calls == expected_body_calls
+
+
+def test_per_cell_resolver_rejects_result_manifest_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = native._ActiveAuthorityIdentity(
+        data_dir=Path("data").resolve(),
+        active_pointer_bytes=b"{}",
+        active_pointer_sha256="a" * 64,
+        activation_manifest_sha256="b" * 64,
+    )
+    monkeypatch.setattr(
+        native,
+        "_read_active_authority_identity",
+        lambda _data_dir: identity,
+    )
+    monkeypatch.setattr(
+        native,
+        "_resolve_active_native_artifact_single_pass",
+        lambda *args, **kwargs: native.ActiveNativeResolution(
+            symbol="EURUSD",
+            timeframe="H1",
+            data_path=Path("bars.csv"),
+            sidecar_path=Path("sidecar.json"),
+            activation_manifest_sha256="c" * 64,
+        ),
+    )
+
+    result = native.resolve_active_native_artifact(Path("data"), "EURUSD", "H1")
+
+    assert not result.valid
+    assert result.errors == ["NATIVE_ACTIVE_RESULT_MANIFEST_IDENTITY_MISMATCH"]
+
+
+def test_per_cell_resolver_types_malformed_active_pointer_path(
+    tmp_path: Path,
+) -> None:
+    native_root = tmp_path / "data" / "native"
+    _write_json(
+        native_root / "ACTIVE.json",
+        {
+            "manifest_relative_path": "malformed\x00path",
+            "manifest_sha256": "a" * 64,
+        },
+    )
+
+    result = native.resolve_active_native_artifact(
+        tmp_path / "data",
+        "EURUSD",
+        "H1",
+    )
+
+    assert not result.valid
+    assert result.errors == ["NATIVE_ACTIVE_AUTHORITY_IDENTITY_INITIAL_READ_FAILED"]
+
+
 def test_per_cell_resolver_rejects_promoted_manifest_with_tampered_receipt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

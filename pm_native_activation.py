@@ -6406,7 +6406,7 @@ def validate_native_cell_exclusion_no_trade(
     return errors
 
 
-def resolve_active_native_artifact(
+def _resolve_active_native_artifact_single_pass(
     data_dir: Path,
     symbol: str,
     timeframe: str,
@@ -6718,4 +6718,48 @@ def resolve_active_native_artifact(
             != str(entry.get("sidecar_sha256") or "").lower()
         ):
             result.errors.append("NATIVE_ACTIVE_SIDECAR_SHA256_MISMATCH")
+    return result
+
+
+def resolve_active_native_artifact(
+    data_dir: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    production_contract_required: bool = False,
+) -> ActiveNativeResolution:
+    """Resolve one active artifact while ACTIVE remains the same authority."""
+
+    raw_symbol = str(symbol or "").strip()
+    tf = str(timeframe or "").strip().upper()
+    try:
+        identity_before = _read_active_authority_identity(data_dir)
+    except (OSError, RuntimeError, ValueError):
+        return ActiveNativeResolution(
+            symbol=raw_symbol,
+            timeframe=tf,
+            errors=["NATIVE_ACTIVE_AUTHORITY_IDENTITY_INITIAL_READ_FAILED"],
+        )
+
+    result = _resolve_active_native_artifact_single_pass(
+        data_dir,
+        symbol,
+        timeframe,
+        production_contract_required=production_contract_required,
+    )
+
+    try:
+        identity_after = _read_active_authority_identity(data_dir)
+    except (OSError, RuntimeError, ValueError):
+        result.errors.append("NATIVE_ACTIVE_AUTHORITY_IDENTITY_FINAL_READ_FAILED")
+        return result
+    if identity_before != identity_after:
+        result.errors.append("NATIVE_ACTIVE_AUTHORITY_CHANGED_DURING_RESOLUTION")
+        return result
+    if (
+        result.valid
+        and str(result.activation_manifest_sha256 or "").lower()
+        != identity_after.activation_manifest_sha256.lower()
+    ):
+        result.errors.append("NATIVE_ACTIVE_RESULT_MANIFEST_IDENTITY_MISMATCH")
     return result
