@@ -389,6 +389,100 @@ def test_path_state_is_computed_once_on_full_prefix_then_sliced(
     assert sliced.tolist() != [-1, 0, 1, -1]
 
 
+def test_planned_attempt_reuses_one_backtester_across_base_partitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: list[object] = []
+    observed: list[object] = []
+    replayed: list[object] = []
+
+    class MarkerBacktester:
+        def __init__(self, _config):
+            created.append(self)
+
+        def replay_frozen_path_cost_stress(self, *_args, **_kwargs):
+            replayed.append(self)
+            return {"cost_stress_frozen_path_receipt": {"receipt_sha256": "r" * 64}}
+
+    def run_partition(*, partition, backtester, **_kwargs):
+        observed.append(backtester)
+        frame = pd.DataFrame(index=pd.date_range("2020-01-01", periods=2, tz="UTC"))
+        signals = pd.Series([0, 0], index=frame.index, dtype="int32")
+        return {"partition": partition.role}, frame, signals, backtester
+
+    monkeypatch.setattr(execution, "Backtester", MarkerBacktester)
+    monkeypatch.setattr(execution, "_runtime_strategy", lambda _attempt: (object(), {}))
+    monkeypatch.setattr(
+        execution,
+        "_build_full_prefix_strategy_surface",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(execution, "_causal_folds", lambda _attempt: ({}, {}))
+
+    def partitions(**_kwargs):
+        return tuple(
+            SimpleNamespace(role=role, warmup_bars=0)
+            for role in ("optimizer_train", "tuning_validation", "final_lockbox")
+        )
+
+    monkeypatch.setattr(execution, "_fold_partitions", partitions)
+    monkeypatch.setattr(execution, "_run_base_partition", run_partition)
+    monkeypatch.setattr(
+        execution,
+        "_expected_cost_stress_adversity_row",
+        lambda **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verify_realized_cost_stress_adversity",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verify_result_cost_attestation",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        execution,
+        "_decision_relevant_result",
+        lambda _result, role: {"role": role},
+    )
+    monkeypatch.setattr(execution, "_fold_provenance", lambda **_kwargs: {})
+
+    attempt = execution._VerifiedAttempt(
+        ordinal=0,
+        plan_attempt={"attempt_id": "attempt-0", "status": "PLANNED"},
+        candidate={},
+        trial={},
+        artifacts=SimpleNamespace(),
+    )
+    fitted = SimpleNamespace(
+        _frame=pd.DataFrame({"Close": [1.0]}),
+        instrument_spec=object(),
+        source_group_decision=SimpleNamespace(
+            to_dict=lambda: {"source_contract_sha256": "s" * 64}
+        ),
+    )
+    result = execution._build_planned_attempt_evidence(
+        attempt=attempt,
+        raw_attempt_id="raw-0",
+        plan_body={
+            "cell": {"symbol": "EURUSD", "timeframe": "H1", "regime": "TREND"},
+            "derived_dependency_geometry": {"warmup_bars": 0},
+        },
+        plan_receipt_sha256="p" * 64,
+        fitted=fitted,
+        config=_config(),
+        cost_stress_adversity_plan={},
+    )
+
+    assert result["attempt_id"] == "raw-0"
+    assert len(created) == 1
+    assert len(observed) == 6
+    assert all(value is created[0] for value in observed)
+    assert replayed == [created[0], created[0]]
+
+
 def test_cost_stress_adversity_plan_is_source_frozen_and_partition_cached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

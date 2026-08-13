@@ -2312,6 +2312,7 @@ def _run_base_partition(
     *,
     partition: _PartitionSlice,
     full_prefix_surface: _FullPrefixStrategySurface,
+    backtester: Backtester,
     strategy: Any,
     symbol: str,
     timeframe: str,
@@ -2329,7 +2330,6 @@ def _run_base_partition(
         if labels.isna().iloc[partition.warmup_bars :].any():
             _fail("REGIME_SIGNAL_SURFACE_MISSING", partition.role)
         signals = raw_signals.where(labels == regime, 0).astype(np.int32)
-        backtester = Backtester(config)
         result = backtester.run(
             features,
             signals,
@@ -2571,6 +2571,11 @@ def _build_planned_attempt_evidence(
         symbol=symbol,
         timeframe=timeframe,
     )
+    # Backtester run state is immutable apart from its bounded broker-terms
+    # cache and activation pin.  Reuse one instance across this attempt so the
+    # same authenticated terms contract is not reopened for every partition;
+    # every call still rechecks the active pointer before using the cache.
+    base_backtester = Backtester(config)
     folds: list[dict[str, Any]] = []
     for fold_ordinal, fold in enumerate(_causal_folds(attempt)):
         train, tuning, final = _fold_partitions(
@@ -2583,6 +2588,7 @@ def _build_planned_attempt_evidence(
             _run_base_partition(
                 partition=train,
                 full_prefix_surface=full_prefix_surface,
+                backtester=base_backtester,
                 strategy=strategy,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -2596,6 +2602,7 @@ def _build_planned_attempt_evidence(
             _run_base_partition(
                 partition=tuning,
                 full_prefix_surface=full_prefix_surface,
+                backtester=base_backtester,
                 strategy=strategy,
                 symbol=symbol,
                 timeframe=timeframe,
@@ -2609,6 +2616,7 @@ def _build_planned_attempt_evidence(
             _run_base_partition(
                 partition=final,
                 full_prefix_surface=full_prefix_surface,
+                backtester=base_backtester,
                 strategy=strategy,
                 symbol=symbol,
                 timeframe=timeframe,
