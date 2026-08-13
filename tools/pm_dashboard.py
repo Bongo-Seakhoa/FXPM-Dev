@@ -42,7 +42,8 @@ TIMELINE = [
     ("Test A scoring window",      "2026-04-01", "2026-07-14", "ready"),
     ("Gate 1 — PBO verdict",       "2026-08-10", "2026-08-11", "done"),
     ("Gate 2 — H1 technical result", "2026-08-11", "2026-08-11", "done"),
-    ("Efficiency baseline work",   "2026-08-11", None, "active"),
+    ("Authority preflight measured", "2026-08-13", "2026-08-13", "done"),
+    ("Authority boundary repair",  "2026-08-13", None, "active"),
     ("Test B purge / no valid days", "2026-07-14", "2026-08-18", "pending"),
     ("Test B preliminary window",  "2026-08-18", "2026-10-19", "pending"),
     ("Test B credible horizon",    "2026-08-18", "2027-08-17", "pending"),
@@ -56,9 +57,17 @@ FOLD_STAGES = [
     ("Reuse verified swap contract", 1.006329, "ad3d9db — retain strict replay"),
 ]
 
-STARTUP_STAGES = [
-    ("Preparation", 245.766, "CX-076: plan receipt to first freeze-object write"),
-    ("Artifact registration", 86.154, "CX-076: 1,211 logical freeze artifacts"),
+PREFLIGHT_STAGES = [
+    (
+        "100×6 native semantic sweep",
+        2217.712,
+        "CX-088: exact full active-universe authority verification",
+    ),
+    (
+        "Everything else to typed stop",
+        5.259,
+        "CX-088: control work after the sweep; no market evaluation",
+    ),
 ]
 
 E24_REOPEN_BEFORE_SECONDS = 81.884079
@@ -67,15 +76,15 @@ E24_REOPEN_AFTER_SECONDS = 5.716661
 SINGLE_GRID_MAX_RUNS = 11_520_000
 
 RISKS = [
-    ("Cost-stress defect blocks Gate 2", "critical",
-     "The sole H1 canary stopped at attempt 2/fold 0 because trade 23 improved under "
-     "stress. It is a real technical result; no profitability verdict was reached."),
-    ("Full-run duration is not yet credibly measured", "high",
-     "The former 576M/years estimate mixed the legacy Optuna path into the canonical "
-     "executor and is withdrawn. One-cell end-to-end timing comes before a forecast."),
-    ("Test suite can go green while blind", "high",
-     "7 anti-forgery tests errored at setup, so they did not run while the file "
-     "reported 18 passed. 4 of 5 contract drifts fixed; the 5th is structural."),
+    ("Native authority preflight dominates runtime", "critical",
+     "The exact 100×6 semantic sweep took 36m58s before any strategy, attempt or "
+     "backtest. It consumed 99.763% of the bounded rebaseline."),
+    ("Cost-stress repair awaits peer closure", "high",
+     "The one-cent false improvement is reproduced and fixed offline with all guards "
+     "retained, but the Round-3 PM decision is not yet closed by both peers."),
+    ("Full-run duration is still unmeasured", "high",
+     "The former 576M/years estimate is withdrawn. The pre-search bottleneck is now "
+     "measured; downstream complete-generation duration is not."),
     ("Certification cannot be rushed", "high",
      "Test B is the only certification and needs 365 days of unseen data. First valid "
      "day 2026-08-18, credible result 2027-08-17. No code change shortens this."),
@@ -475,13 +484,13 @@ def svg_fold_performance() -> str:
     return "".join(p)
 
 
-def svg_startup_breakdown() -> str:
-    total = sum(stage[1] for stage in STARTUP_STAGES)
+def svg_preflight_baseline() -> str:
+    total = sum(stage[1] for stage in PREFLIGHT_STAGES)
     w, h, x0, usable = 1080, 135, 36, 1008
     p = [f"<svg viewBox='0 0 {w} {h}' class='chart' role='img' "
-         f"aria-label='Measured pre-evaluation startup breakdown'>"]
+         f"aria-label='Measured canonical pre-search baseline'>"]
     cursor = x0
-    for index, (label, seconds, note) in enumerate(STARTUP_STAGES):
+    for index, (label, seconds, note) in enumerate(PREFLIGHT_STAGES):
         width = usable * seconds / total
         p.append(
             f"<rect x='{cursor:.1f}' y='28' width='{width:.1f}' height='34' "
@@ -494,11 +503,11 @@ def svg_startup_breakdown() -> str:
             )
         cursor += width
     p.append(
-        f"<text x='{x0}' y='91' class='lbl'>Total before evaluation: {total:.1f}s</text>"
+        f"<text x='{x0}' y='91' class='lbl'>Total to typed pre-source stop: {total:.3f}s</text>"
     )
     p.append(
         f"<text x='{w-x0}' y='91' class='axis' text-anchor='end'>"
-        "Preserved pre-E23 baseline (CX-076); current end-to-end rebaseline pending.</text>"
+        "CX-088 · 0 backtests, 0 attempts, 0 market evaluations</text>"
     )
     p.append("</svg>")
     return "".join(p)
@@ -643,10 +652,14 @@ def render(*, live: bool = True) -> str:
     A(f"<div class='kpi'><div class='n'>{gates_done}/{len(gates) or 8}</div>"
       f"<div class='l'>Gates closed</div><div class='d'>Gate 8 (Test B) is the only "
       f"certification and cannot finish before Aug 2027.</div></div>")
+    A("<div class='kpi'><div class='n'>36m 58s</div>"
+      "<div class='l'>Native authority preflight</div>"
+      "<div class='d'>Exact 100×6 semantic sweep; 99.763% of the bounded baseline "
+      "and zero strategy, attempt or backtest calls.</div></div>")
     A(f"<div class='kpi'><div class='n'>{current_fold:.2f} s</div>"
       f"<div class='l'>Authoritative fold package</div>"
-      f"<div class='d'>Exact preserved H1 path; down {fold_gain:.1f}% from 2.62 s with "
-      f"identical decision hashes and failure.</div></div>")
+      f"<div class='d'>Exact preserved H1 path through E22; down {fold_gain:.1f}% "
+      f"from 2.62 s with no roster, fold or gate change.</div></div>")
     A("<div class='kpi'><div class='n'>17 → 2</div>"
       "<div class='l'>Native fits per canary</div>"
       "<div class='d'>E23 retained at 79303f8. Fifteen discarded full refits were "
@@ -661,8 +674,8 @@ def render(*, live: bool = True) -> str:
 
     A("<h2>Canonical path and next action</h2><div class='panel'><div class='flow'>")
     flow = [
-        ("1", "Correct executor", "active", "Make canonical evaluation accurate and fast."),
-        ("2", "One-cell baseline", "active", "Measure end to end; no universe extrapolation yet."),
+        ("1", "Correct executor", "active", "Close the verified cost-stress correction."),
+        ("2", "Authority boundary", "active", "Remove 37-minute pre-search verification safely."),
         ("3", "Full run", "", "Complete the canonical 4-anchor/current-refit path."),
         ("4", "Replay + Test A", "", "Reject-only retrospective falsification."),
         ("5", "Demo shadow", "", "Broker-reconciled operational probation."),
@@ -671,10 +684,11 @@ def render(*, live: bool = True) -> str:
     for number, name, cls, why in flow:
         A(f"<div class='step {cls}'><div class='num'>{number}</div><div class='name'>{esc(name)}</div>"
           f"<div class='why'>{esc(why)}</div></div>")
-    A("</div><div class='note'><b>Current next action (XPM-030):</b> rebaseline the "
-      "complete canonical fixed-cost path after E23/E24 before authorising another "
-      "optimization. The cost-stress repair remains a separate PM-gated correctness "
-      "decision; no Gate-2 rerun is authorised.</div></div>")
+    A("</div><div class='note'><b>Current next action (XPM-037):</b> close E25's "
+      "Round-3 peer decision, then fix the proven cache-axis alias and cache exact "
+      "frame extents (bounded E26). Removing the full sweep requires a later code-bound "
+      "activation receipt, selected-leaf identity bracket and broker-terms routing. "
+      "No Gate-2 rerun is authorised.</div></div>")
 
     A("<h2>Deliverables and preserved lineages</h2><div class='split'><div class='panel'>")
     A(f"<div class='kpi' style='border:0;padding:0'><div class='n'>{reports['verified']}/{reports['total'] or 4}</div>"
@@ -696,9 +710,16 @@ def render(*, live: bool = True) -> str:
       f"{E24_REOPEN_BEFORE_SECONDS:.3f}s → {E24_REOPEN_AFTER_SECONDS:.3f}s "
       f"(-{improvement_pct(E24_REOPEN_BEFORE_SECONDS, E24_REOPEN_AFTER_SECONDS):.1f}%); "
       "identical entries and fail-closed CAS checks.</td><td>Retained · 38e5022</td></tr>"
-      "<tr><td><b>Next gate</b></td><td>Measure the complete canonical fixed-cost "
-      "path on current HEAD; identify one dominant remaining phase before any new "
-      "change.</td><td>No implementation authorised</td></tr>"
+      "<tr><td><b>E25 · swap settlement</b></td><td>Exact preserved H1 fold now "
+      "completes NO_NUMERICAL_SHOCK: trade 23 stays -$4.10 / $80.80, zero worse "
+      "trades or days, identical positions and daily surface; 188 focused tests "
+      "pass.</td><td>Round-3 peer closure pending</td></tr>"
+      "<tr><td><b>Fixed-cost baseline</b></td><td>The 100×6 native semantic sweep "
+      "took 2,217.712s of 2,222.971s total (99.763%); no attempt or backtest ran."
+      "</td><td>Dominant bottleneck located · CX-088</td></tr>"
+      "<tr><td><b>Next gate</b></td><td>E26 repairs a proven cached-axis alias and "
+      "reuses exact byte-bound extents; E27 may retire the global sweep only after "
+      "activation and selected-leaf authority gaps close.</td><td>PM review · XPM-037</td></tr>"
       "</table><div class='note'>No experiment changed the roster, folds, gates, search "
       "scope or economic thresholds. Isolated gains are not a universe ETA.</div></div>")
 
@@ -728,10 +749,10 @@ def render(*, live: bool = True) -> str:
     A(f"<div class='note'>One exact preserved EURUSD/H1 attempt-2/fold-0 path. Cumulative "
       f"gain: {fold_gain:.1f}%. No search, fold, gate or roster change.</div></div>")
     A("<div class='panel'>")
-    A(svg_startup_breakdown())
-    A("<div class='note'>This chart is the preserved pre-E23 baseline, not current "
-      "runtime. E23 removed the repeated-refit mechanism; the complete path must now "
-      "be measured again before another optimization is selected.</div>")
+    A(svg_preflight_baseline())
+    A("<div class='note'>This is the current-HEAD bounded baseline through a typed "
+      "pre-source issuer stop. It isolates the pre-search bottleneck but is not a full-run "
+      "duration. The next safe change targets that measured phase.</div>")
     A("<div class='note'>Canonical count ceiling: one 2,400-cell grid has at most "
       f"{SINGLE_GRID_MAX_RUNS/1_000_000:.2f}M Backtester.run calls, 2.88M stress repricings "
       "and 720k strategy surfaces. The complete multi-grid generation total and duration "

@@ -114,7 +114,12 @@ def test_render_removes_withdrawn_runtime_arithmetic() -> None:
     assert "61.6%" in page
     assert "17 → 2" in page
     assert "81.884s → 5.717s" in page
-    assert "Current next action (XPM-030)" in page
+    assert "36m 58s" in page
+    assert "2,217.712s of 2,222.971s total" in page
+    assert "zero strategy, attempt or backtest calls" in page
+    assert "Current next action (XPM-037)" in page
+    assert "Test suite can go green while blind" not in page
+    assert "current end-to-end rebaseline pending" not in page
     assert "validate E23 at exactly two native fits" not in page
     assert "http-equiv='refresh'" not in page
     assert "Decisions waiting on you" not in page
