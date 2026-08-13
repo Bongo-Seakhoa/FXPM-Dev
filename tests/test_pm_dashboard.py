@@ -117,7 +117,17 @@ def test_render_removes_withdrawn_runtime_arithmetic() -> None:
     assert "36m 58s" in page
     assert "2,217.712s of 2,222.971s total" in page
     assert "zero strategy, attempt or backtest calls" in page
-    assert "Current next action (XPM-037)" in page
+    assert "Current next action (XPM-043)" in page
+    assert "Retained · c5c42cc" in page
+    assert "Removed · c50758c" in page
+    assert "Retained · 2288435" in page
+    assert "4.188571s → 3.266726s (-22.01%)" in page
+    assert dashboard.E26_FINGERPRINT in page
+    assert "79 passed / 1 skipped" in page
+    assert "37-minute global sweep must remain" in page
+    assert "Not authorised · XPM-043" in page
+    assert "Round-3 peer closure pending" not in page
+    assert "Current next action (XPM-037)" not in page
     assert "Test suite can go green while blind" not in page
     assert "current end-to-end rebaseline pending" not in page
     assert "validate E23 at exactly two native fits" not in page

@@ -43,7 +43,9 @@ TIMELINE = [
     ("Gate 1 — PBO verdict",       "2026-08-10", "2026-08-11", "done"),
     ("Gate 2 — H1 technical result", "2026-08-11", "2026-08-11", "done"),
     ("Authority preflight measured", "2026-08-13", "2026-08-13", "done"),
-    ("Authority boundary repair",  "2026-08-13", None, "active"),
+    ("E25 stress settlement repaired", "2026-08-13", "2026-08-13", "done"),
+    ("E26 cache integrity + extents", "2026-08-13", "2026-08-13", "done"),
+    ("E27 prerequisites PM gate", "2026-08-13", None, "active"),
     ("Test B purge / no valid days", "2026-07-14", "2026-08-18", "pending"),
     ("Test B preliminary window",  "2026-08-18", "2026-10-19", "pending"),
     ("Test B credible horizon",    "2026-08-18", "2027-08-17", "pending"),
@@ -73,15 +75,21 @@ PREFLIGHT_STAGES = [
 E24_REOPEN_BEFORE_SECONDS = 81.884079
 E24_REOPEN_AFTER_SECONDS = 5.716661
 
+E26_WARM_BEFORE_SECONDS = 4.188571
+E26_WARM_AFTER_SECONDS = 3.266726
+E26_FINGERPRINT = "31c4e125aa2a22f3bfe16f82b097dd9366769b7017edb44fde068d4b825d5fc8"
+
 SINGLE_GRID_MAX_RUNS = 11_520_000
 
 RISKS = [
     ("Native authority preflight dominates runtime", "critical",
      "The exact 100×6 semantic sweep took 36m58s before any strategy, attempt or "
-     "backtest. It consumed 99.763% of the bounded rebaseline."),
-    ("Cost-stress repair awaits peer closure", "high",
-     "The one-cent false improvement is reproduced and fixed offline with all guards "
-     "retained, but the Round-3 PM decision is not yet closed by both peers."),
+     "backtest. It consumed 99.763% of the bounded rebaseline; E26 improved a warm "
+     "one-cell check but did not remove this global sweep."),
+    ("Sweep removal has unresolved authority prerequisites", "high",
+     "The promotion receipt is not yet code-bound, selected-leaf verification needs an "
+     "ACTIVE identity bracket, and broker-term schedule sourcing can bypass that route. "
+     "E27 remains PM-gated."),
     ("Full-run duration is still unmeasured", "high",
      "The former 576M/years estimate is withdrawn. The pre-search bottleneck is now "
      "measured; downstream complete-generation duration is not."),
@@ -575,6 +583,7 @@ code,.mono{font-family:var(--mono);font-size:12.5px}
 .step:not(:last-child):after{content:"→";position:absolute;right:-10px;top:40px;color:var(--muted);z-index:2}
 .step .num{font:11px var(--mono);color:var(--muted)}
 .step .name{font-weight:650;margin:5px 0 4px}.step .why{font-size:11.5px;color:var(--muted);line-height:1.4}
+.step.done{border-color:var(--ok);box-shadow:inset 0 3px 0 var(--ok)}
 .step.active{border-color:var(--accent);box-shadow:inset 0 3px 0 var(--accent)}
 .step.blocked{border-color:var(--bad);box-shadow:inset 0 3px 0 var(--bad)}
 .inside{font-size:12px;fill:white;font-weight:650}
@@ -655,7 +664,13 @@ def render(*, live: bool = True) -> str:
     A("<div class='kpi'><div class='n'>36m 58s</div>"
       "<div class='l'>Native authority preflight</div>"
       "<div class='d'>Exact 100×6 semantic sweep; 99.763% of the bounded baseline "
-      "and zero strategy, attempt or backtest calls.</div></div>")
+      "and zero strategy, attempt or backtest calls. It remains the dominant "
+      "pre-search cost after E26.</div></div>")
+    A(f"<div class='kpi'><div class='n'>{E26_WARM_AFTER_SECONDS:.3f} s</div>"
+      "<div class='l'>E26 warm one-cell check</div>"
+      f"<div class='d'>Down {improvement_pct(E26_WARM_BEFORE_SECONDS, E26_WARM_AFTER_SECONDS):.2f}% "
+      f"from {E26_WARM_BEFORE_SECONDS:.3f} s; exact fingerprint unchanged. "
+      "This is not a full-sweep result.</div></div>")
     A(f"<div class='kpi'><div class='n'>{current_fold:.2f} s</div>"
       f"<div class='l'>Authoritative fold package</div>"
       f"<div class='d'>Exact preserved H1 path through E22; down {fold_gain:.1f}% "
@@ -674,8 +689,8 @@ def render(*, live: bool = True) -> str:
 
     A("<h2>Canonical path and next action</h2><div class='panel'><div class='flow'>")
     flow = [
-        ("1", "Correct executor", "active", "Close the verified cost-stress correction."),
-        ("2", "Authority boundary", "active", "Remove 37-minute pre-search verification safely."),
+        ("1", "Correct executor", "done", "E25 retained; false one-cent stress gain removed."),
+        ("2", "Authority boundary", "active", "Gate E27 prerequisites before sweep removal."),
         ("3", "Full run", "", "Complete the canonical 4-anchor/current-refit path."),
         ("4", "Replay + Test A", "", "Reject-only retrospective falsification."),
         ("5", "Demo shadow", "", "Broker-reconciled operational probation."),
@@ -684,11 +699,11 @@ def render(*, live: bool = True) -> str:
     for number, name, cls, why in flow:
         A(f"<div class='step {cls}'><div class='num'>{number}</div><div class='name'>{esc(name)}</div>"
           f"<div class='why'>{esc(why)}</div></div>")
-    A("</div><div class='note'><b>Current next action (XPM-037):</b> close E25's "
-      "Round-3 peer decision, then fix the proven cache-axis alias and cache exact "
-      "frame extents (bounded E26). Removing the full sweep requires a later code-bound "
-      "activation receipt, selected-leaf identity bracket and broker-terms routing. "
-      "No Gate-2 rerun is authorised.</div></div>")
+    A("</div><div class='note'><b>Current next action (XPM-043):</b> PM-gate the "
+      "narrow E27 prerequisites: an ACTIVE identity bracket around selected-leaf "
+      "verification and authority-safe broker-term schedule sourcing. E27 is not yet "
+      "authorised, and the 37-minute global sweep must remain until its authority gaps "
+      "are closed. No Gate-2 rerun is authorised.</div></div>")
 
     A("<h2>Deliverables and preserved lineages</h2><div class='split'><div class='panel'>")
     A(f"<div class='kpi' style='border:0;padding:0'><div class='n'>{reports['verified']}/{reports['total'] or 4}</div>"
@@ -713,13 +728,23 @@ def render(*, live: bool = True) -> str:
       "<tr><td><b>E25 · swap settlement</b></td><td>Exact preserved H1 fold now "
       "completes NO_NUMERICAL_SHOCK: trade 23 stays -$4.10 / $80.80, zero worse "
       "trades or days, identical positions and daily surface; 188 focused tests "
-      "pass.</td><td>Round-3 peer closure pending</td></tr>"
+      "pass.</td><td>Retained · c5c42cc</td></tr>"
+      "<tr><td><b>ATR fallback cache</b></td><td>A same-length OHLC mutation could "
+      "silently reuse stale ATR and change stop distances. The cache was deleted; "
+      "exact legacy fallback semantics and warn-once visibility remain. Canonical "
+      "runs must still be zero-hit.</td><td>Removed · c50758c</td></tr>"
+      f"<tr><td><b>E26 · cache integrity + extents</b></td><td>Detached cached data, "
+      f"index and columns; exact-byte-bound extents are reused. Warm EURUSD|H1 "
+      f"{E26_WARM_BEFORE_SECONDS:.6f}s → {E26_WARM_AFTER_SECONDS:.6f}s "
+      f"(-{improvement_pct(E26_WARM_BEFORE_SECONDS, E26_WARM_AFTER_SECONDS):.2f}%); "
+      f"fingerprint <span class='mono'>{E26_FINGERPRINT}</span>; 79 passed / 1 skipped."
+      "</td><td>Retained · 2288435</td></tr>"
       "<tr><td><b>Fixed-cost baseline</b></td><td>The 100×6 native semantic sweep "
       "took 2,217.712s of 2,222.971s total (99.763%); no attempt or backtest ran."
       "</td><td>Dominant bottleneck located · CX-088</td></tr>"
-      "<tr><td><b>Next gate</b></td><td>E26 repairs a proven cached-axis alias and "
-      "reuses exact byte-bound extents; E27 may retire the global sweep only after "
-      "activation and selected-leaf authority gaps close.</td><td>PM review · XPM-037</td></tr>"
+      "<tr><td><b>Next gate</b></td><td>PMs are reviewing bounded E27 prerequisites. "
+      "The global sweep cannot be retired until activation, selected-leaf and "
+      "broker-routing authority gaps close.</td><td>Not authorised · XPM-043</td></tr>"
       "</table><div class='note'>No experiment changed the roster, folds, gates, search "
       "scope or economic thresholds. Isolated gains are not a universe ETA.</div></div>")
 
