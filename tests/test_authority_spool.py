@@ -196,6 +196,174 @@ def test_duplicate_artifact_id_is_idempotent_only_for_exact_entry(tmp_path: Path
         sink.register_artifact("cell", "different-type", descriptor)
 
 
+def test_exact_opaque_replay_verifies_without_republication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    payload = b"frozen-plan-body"
+    first = sink.put_opaque(
+        "cell/frozen",
+        "winner_attempt_process",
+        (payload,),
+        format="fxpm-ascii-json-v1",
+    )
+    monkeypatch.setattr(
+        spool,
+        "write_opaque_artifact",
+        lambda *_args, **_kwargs: pytest.fail("duplicate body was republished"),
+    )
+
+    second = sink.put_opaque(
+        "cell/frozen",
+        "winner_attempt_process",
+        (payload,),
+        format="fxpm-ascii-json-v1",
+    )
+
+    assert second == first
+    assert sink.artifact_roster() == [first]
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "payload"),
+    [
+        ("winner_attempt_process", b"changed-body"),
+        ("different-type", b"frozen-plan-body"),
+    ],
+)
+def test_opaque_replay_preserves_artifact_id_conflict(
+    tmp_path: Path,
+    artifact_type: str,
+    payload: bytes,
+) -> None:
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    sink.put_opaque(
+        "cell/frozen",
+        "winner_attempt_process",
+        (b"frozen-plan-body",),
+        format="fxpm-ascii-json-v1",
+    )
+
+    with pytest.raises(spool.AuthoritySpoolError, match="ARTIFACT_ID_CONFLICT"):
+        sink.put_opaque(
+            "cell/frozen",
+            artifact_type,
+            (payload,),
+            format="fxpm-ascii-json-v1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("damage", "error"),
+    [
+        ("missing", "ARTIFACT_FILE_MISSING"),
+        ("corrupt", "ARTIFACT_INTEGRITY_MISMATCH"),
+        ("truncated", "ARTIFACT_SIZE_MISMATCH"),
+    ],
+)
+def test_exact_opaque_replay_rejects_damaged_registered_cas(
+    tmp_path: Path,
+    damage: str,
+    error: str,
+) -> None:
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    payload = b"frozen-plan-body"
+    entry = sink.put_opaque(
+        "cell/frozen",
+        "winner_attempt_process",
+        (payload,),
+        format="fxpm-ascii-json-v1",
+    )
+    path = context.root.joinpath(
+        *Path(entry["descriptor"]["relative_path"]).parts
+    )
+    if damage == "missing":
+        path.unlink()
+    elif damage == "corrupt":
+        path.write_bytes(b"X" * len(payload))
+    else:
+        path.write_bytes(payload[:-1])
+
+    with pytest.raises(spool.AuthoritySpoolError, match=error):
+        sink.put_opaque(
+            "cell/frozen",
+            "winner_attempt_process",
+            (payload,),
+            format="fxpm-ascii-json-v1",
+        )
+
+
+def test_exact_opaque_replay_rejects_registered_cas_reparse_point(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    payload = b"frozen-plan-body"
+    entry = sink.put_opaque(
+        "cell/frozen",
+        "winner_attempt_process",
+        (payload,),
+        format="fxpm-ascii-json-v1",
+    )
+    path = context.root.joinpath(
+        *Path(entry["descriptor"]["relative_path"]).parts
+    )
+    backup = tmp_path / "registered-cas-backup"
+    backup.write_bytes(payload)
+    path.unlink()
+    try:
+        os.symlink(backup, path)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation unavailable")
+
+    with pytest.raises(spool.AuthoritySpoolError, match="REPARSE_POINT|SAFE_REGULAR"):
+        sink.put_opaque(
+            "cell/frozen",
+            "winner_attempt_process",
+            (payload,),
+            format="fxpm-ascii-json-v1",
+        )
+
+
+def test_exact_opaque_replay_preserves_stream_validation(tmp_path: Path) -> None:
+    context = _context(
+        tmp_path,
+        limits=spool.SpoolLimits(
+            max_artifact_bytes=1024,
+            max_symbol_bytes=2048,
+            max_artifacts_per_symbol=10,
+            max_manifest_bytes=1024,
+            max_json_bytes=1024,
+            stream_chunk_bytes=128,
+            max_generation_bytes=2048,
+            min_free_bytes=0,
+        ),
+    )
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    sink.put_opaque("cell", "evidence", (b"valid",), format="binary-v1")
+
+    with pytest.raises(spool.AuthoritySpoolError, match="ARTIFACT_EMPTY"):
+        sink.put_opaque("cell", "evidence", (), format="binary-v1")
+    with pytest.raises(spool.AuthoritySpoolError, match="CHUNK_TYPE_INVALID"):
+        sink.put_opaque("cell", "evidence", ("invalid",), format="binary-v1")
+    with pytest.raises(spool.AuthoritySpoolError, match="SIZE_BOUND_EXCEEDED"):
+        sink.put_opaque("cell", "evidence", (b"x" * 1025,), format="binary-v1")
+
+
+def test_fresh_opaque_put_preserves_stream_before_identity_validation(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+
+    with pytest.raises(spool.AuthoritySpoolError, match="CHUNK_TYPE_INVALID"):
+        sink.put_opaque("", "", ("invalid",), format="binary-v1")
+
+
 @pytest.mark.parametrize(
     ("field", "replacement", "error"),
     [

@@ -1097,8 +1097,65 @@ class SymbolAuthoritySink:
         *,
         format: str,
     ) -> dict[str, Any]:
+        format_name = _validate_format(format)
+        if format_name == CANONICAL_JSON_FORMAT:
+            _fail("OPAQUE_FORMAT_COLLIDES_WITH_CANONICAL_JSON")
+        existing = self._artifacts.get(artifact_id) if type(artifact_id) is str else None
+        if existing is not None:
+            return self._reuse_registered_opaque(
+                _identity(artifact_id, "ARTIFACT_ID", maximum_bytes=1024),
+                _identity(artifact_type, "ARTIFACT_TYPE", maximum_bytes=256),
+                chunks,
+                format_name=format_name,
+                existing=existing,
+            )
         descriptor = write_opaque_artifact(self.context, chunks, format=format)
         return self.register_artifact(artifact_id, artifact_type, descriptor)
+
+    def _reuse_registered_opaque(
+        self,
+        artifact_key: str,
+        type_name: str,
+        chunks: Iterable[bytes],
+        *,
+        format_name: str,
+        existing: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Verify an exact same-sink replay without republishing its bytes."""
+
+        _assert_context_current(self.context)
+        if self.context.writable is not True:
+            _fail("GENERATION_CONTEXT_READ_ONLY")
+        digest = hashlib.sha256()
+        total = 0
+        for raw in chunks:
+            if type(raw) not in {bytes, bytearray, memoryview}:
+                _fail("ARTIFACT_CHUNK_TYPE_INVALID")
+            view = memoryview(raw)
+            projected = total + len(view)
+            if projected > self.context.limits.max_artifact_bytes:
+                _fail("ARTIFACT_SIZE_BOUND_EXCEEDED")
+            digest.update(view)
+            total = projected
+        if total <= 0:
+            _fail("ARTIFACT_EMPTY")
+        content_hash = digest.hexdigest()
+        descriptor = {
+            "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
+            "relative_path": _content_relative_path(content_hash, format_name),
+            "sha256": content_hash,
+            "size_bytes": total,
+            "format": format_name,
+        }
+        candidate = {
+            "artifact_id": artifact_key,
+            "artifact_type": type_name,
+            "descriptor": descriptor,
+        }
+        if dict(existing) != candidate:
+            _fail("ARTIFACT_ID_CONFLICT")
+        _verify_artifact_file(self.context, descriptor)
+        return dict(existing)
 
     def artifact_roster(self) -> list[dict[str, Any]]:
         """Return a bounded canonical copy without publishing a manifest."""
