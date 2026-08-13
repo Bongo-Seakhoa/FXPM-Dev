@@ -1,6 +1,6 @@
 # Cleanup Proposal - 2026-06-06
 
-Status: first-pass archive executed after Bongo sign-off. No deletion was executed.
+Status: scorer cleanup completed 2026-08-13; historical helpers archived and the retired selector test removed.
 
 Purpose: reduce workspace confusion after the scoring discovery phase while preserving every durable safety, evaluation, and audit asset. This proposal intentionally avoids removing old scorer engine paths in the same pass as live-safety work, because tests and historical artifacts still reference those names.
 
@@ -51,13 +51,13 @@ Executed archive location: `tools/archive/scoring_discovery_20260606/`. These ar
 
 Reason: these are tied to specific old ThreadSpark/spokes runs and static debug reports. They are useful historical artifacts, but keeping them in the active `tools/` root makes future sessions think scoring discovery is still active.
 
-## Review Before Archiving
+## Archived After Dedicated Review
 
-These are probably spent for the current production path, but they still encode useful research/audit logic or have tests referencing them. Do not remove until a dedicated pass checks references and either preserves their tests or archives them as a bundle.
+The dedicated scorer-collapse pass proved these helpers had no production caller. They are retained only as historical evidence under `tools/archive/scoring_discovery_20260606/`; their retired-selector test is no longer part of the active suite.
 
-- `tools/spoke_selector_validation.py`
-- `tools/specialist_spokes.py`
-- `tests/test_spoke_selector_validation.py`
+- `tools/archive/scoring_discovery_20260606/spoke_selector_validation.py`
+- `tools/archive/scoring_discovery_20260606/specialist_spokes.py`
+- `tests/test_spoke_selector_validation.py` (deleted; tested only retired machinery)
 - `tests/test_selection_geometry.py`
 - `scoring_model_proposed_vs_real.html`
 - `preview.html`

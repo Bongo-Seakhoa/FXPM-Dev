@@ -152,13 +152,15 @@ The asym run is COMPLETE (8/11 winners + US30/US500/DOGUSD NO_TRADE; no OOM reco
 
 **DECISION: default stays `legacy`. `specialist_spokes_asym` is REJECTED.** A future asym v2 must add real cost/frequency-awareness at SELECTION (functional `execution_cost_survival`, a trade-frequency x cost penalty, or a cost-stressed selection window) and re-validate before any re-run. The pre-registered honest-cost gate caught a catastrophic scorer before any default change — the discipline worked.
 
-## Current Discovery Nuance: old-spoke is not dead
+## Historical Discovery Nuance: old-spoke evidence
 
 `legacy` is the current default because it remains the safest proven default under the existing Tenet-5 gate.
 That is not the same as proving legacy is the strongest robust scorer.
 
-The old `specialist_spokes` scorer remains a live research candidate because the robust view is stronger than
-the raw mean:
+At the 2026-06 decision point, the old `specialist_spokes` evidence looked
+stronger on several robust summaries despite its failed mean. It is no longer
+an executable candidate; the following figures are retained to explain why it
+was investigated before the branch was retired:
 
 - old-spoke median return `8.74%` vs legacy `5.03%`
 - old-spoke trimmed mean return `5.78%` vs legacy `2.39%`
@@ -229,13 +231,16 @@ Post-run analysis watcher:
 
 ## Current Scorer State
 
-Available regime scorers:
+Executable regime scorer:
 
-- `legacy` - default until a new scorer proves improvement.
-- `specialist_spokes` - old 8-spoke implementation kept for comparison.
-- `specialist_spokes_asym` - rejected v1 candidate scorer, retained behind a flag for forensic comparison.
+- `legacy` - the single fixed canonical implementation, recorded as literal artifact provenance rather than a setting.
 
-The `specialist_spokes_asym` scorer is implemented behind a flag and has passed scoped tests, but failed the like-for-like benchmark. It is not the default and must not be promoted unchanged.
+Historical-only comparators:
+
+- `specialist_spokes` - rejected 8-spoke implementation, archived for research reconstruction.
+- `specialist_spokes_asym` - rejected v1 implementation, archived for forensic comparison.
+
+The `specialist_spokes_asym` scorer failed the like-for-like benchmark and has been removed from the executable system. Its evidence remains in the research record and archive; it must not be promoted unchanged.
 
 Primary axes:
 
@@ -312,13 +317,6 @@ Default remains `legacy`. The asym scorer did not prove improvement or a justifi
 
 ## Next Actions
 
-1. Keep `legacy` as default until a new scorer proves improvement under the robust gate.
-2. Do not rerun `specialist_spokes_asym` v1 unchanged.
-3. Treat old `specialist_spokes` as a live candidate, not a killed idea.
-4. First investigate `old_spoke_v2` outlier containment using existing artifacts where possible:
-   top-N fallback, full-history conservative replay before symbol default, catastrophe veto, and
-   cost/frequency pressure.
-5. If the artifact-only test works, integrate the smallest clean old-spoke-v2 selection change and rerun
-   like-for-like vs legacy and old-spoke.
-6. Any future asym v2 must address cost/frequency blind spots before a rerun, but asym is no longer the
-   primary next lane unless new evidence makes it more promising than old-spoke hardening.
+1. Keep the fixed `legacy` scorer until a separately precommitted approach proves superior on untouched evidence.
+2. Do not route historical spoke variants through production config; the retired keys fail closed.
+3. Preserve the rejected-run evidence as learning, not as executable production machinery.

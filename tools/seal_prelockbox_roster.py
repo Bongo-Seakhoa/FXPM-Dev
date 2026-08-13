@@ -13,7 +13,6 @@ import argparse
 import hashlib
 import json
 import sys
-from dataclasses import fields
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping
@@ -24,7 +23,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pm_cap_calibration import cap_neutral_config_sha256  # noqa: E402
-from pm_core import PipelineConfig  # noqa: E402
+from pm_core import PipelineConfig, strict_pipeline_config_kwargs  # noqa: E402
 from pm_pipeline import build_artifact_meta  # noqa: E402
 from pm_portfolio_replay import (  # noqa: E402
     active_native_portfolio_contract,
@@ -40,9 +39,8 @@ from pm_two_phase_lockbox import (  # noqa: E402
 
 
 def _pipeline_config(config_path: Path, payload: Dict[str, Any]) -> PipelineConfig:
-    allowed = {field.name for field in fields(PipelineConfig)}
     pipeline = dict(payload.get("pipeline") or {})
-    cfg = PipelineConfig(**{key: value for key, value in pipeline.items() if key in allowed})
+    cfg = PipelineConfig(**strict_pipeline_config_kwargs(pipeline))
     cfg._deployment_config_path = str(config_path.resolve())
     return cfg
 

@@ -133,7 +133,6 @@ If `data/`, `logs/`, or `pm_outputs/` do not exist yet, they will be created as 
     "production_split_mode": "bleeding_edge",
     "walk_forward_validation_bars": 50000,
     "clean_holdout_pct": 0.0,
-    "threadspark_selection_surface": "validation",
     "false_discovery_holdout_policy": "off",
     "max_param_combos": 200,
     "optimization_max_workers": 4,

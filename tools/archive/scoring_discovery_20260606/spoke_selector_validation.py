@@ -20,8 +20,7 @@ The two engine-gated spokes are reported as missing evidence, not faked:
   parameter_stability: needs Optuna neighborhood/plateau evidence
 
 Run:
-  python tools/spoke_selector_validation.py
-  python tools/spoke_selector_validation.py --symbols EURAUD USDJPY
+  Historical archive only; the corresponding scorer is retired.
 """
 
 from __future__ import annotations
@@ -36,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tools"))
 
 from pareto_select import pareto_mask, percentile_normalize, rank_pool

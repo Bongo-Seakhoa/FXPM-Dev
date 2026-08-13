@@ -304,11 +304,14 @@ the fix is sound, but the two-agent check must not be stubbed on safety-critical
   (an M9/M10 hazard). This is the operator's "reachability proof, not name" guard cutting the other way.
   Their removal moves to the **post-run** freeze, where config + `build_artifact_meta` + `pm_optuna`
   are removed coherently (with book regeneration or contract migration).
-- **HARD GUARD:** legacy-named ≠ dead. `regime_scoring_model="legacy"` is the **active** production
-  scorer and stays. Reachability proof decides, never naming.
-- **No behaviour change to the run path**; the SHA stays honest.
-**Ticked when:** the freeze is reviewed, the inventory proves each removed key has zero live consumers,
-and `regime_scoring_model=legacy` is untouched.
+- **2026-08-13 supersession:** reachability review proved every alternative scoring branch dead and
+  removed the mutable `regime_scoring_model` plus its nine variant-only controls. The surviving
+  scorer is still the same `legacy` behavior; artifact metadata records a fixed literal `legacy`
+  so old nonlegacy books fail closed and old legacy books remain auditable.
+- This cleanup intentionally changes the config authority hash. Existing in-flight generation,
+  spool, and activation receipts must be reissued; there is no compatibility fallback.
+**Ticked when:** canonical scorer tests, artifact compatibility tests, and all active config
+boundaries reject the retired keys.
 
 ### M6 — Full production optimization run (streamed) `[ ]`  ← operator's headline deliverable
 **Goal:** the actual production optimization across the promoted universe.

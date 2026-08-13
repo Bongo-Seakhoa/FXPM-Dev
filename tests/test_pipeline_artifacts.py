@@ -258,31 +258,30 @@ class PipelineArtifactTests(unittest.TestCase):
         changed["production_split_mode"] = "research_clean_holdout"
         self.assertFalse(artifact_contract_matches(current, changed))
 
-    def test_artifact_meta_includes_specialist_spokes_v2_contract(self):
-        cfg = PipelineConfig(
-            regime_scoring_model="specialist_spokes_v2",
-            specialist_spokes_v2_cost_frequency_strength=0.42,
-            specialist_spokes_v2_default_fallback_enabled=True,
-            specialist_spokes_v2_allow_promote_small_default=True,
-            specialist_spokes_v2_max_validation_sharpe=0.0,
-        )
-        current = build_artifact_meta(cfg)
+    def test_artifact_meta_fixes_legacy_scoring_and_rejects_old_nonlegacy_books(self):
+        current = build_artifact_meta(PipelineConfig())
 
-        self.assertEqual(current["regime_scoring_model"], "specialist_spokes_v2")
-        self.assertAlmostEqual(current["specialist_spokes_v2_cost_frequency_strength"], 0.42)
-        self.assertTrue(current["specialist_spokes_v2_default_fallback_enabled"])
-        self.assertTrue(current["specialist_spokes_v2_allow_promote_small_default"])
-        self.assertAlmostEqual(current["specialist_spokes_v2_max_validation_sharpe"], 0.0)
+        self.assertEqual(current["regime_scoring_model"], "legacy")
+        retired = {
+            "legacy_confidence_bonus_cap",
+            "threadspark_selection_surface",
+            "threadspark_use_historical_cost_evidence",
+            "threadspark_historical_cost_scope",
+            "threadspark_historical_chunk_count",
+            "specialist_spokes_v2_cost_frequency_strength",
+            "specialist_spokes_v2_default_fallback_enabled",
+            "specialist_spokes_v2_allow_promote_small_default",
+            "specialist_spokes_v2_max_validation_sharpe",
+        }
+        self.assertTrue(retired.isdisjoint(current))
 
-        for key, value in {
-            "specialist_spokes_v2_cost_frequency_strength": 0.10,
-            "specialist_spokes_v2_default_fallback_enabled": False,
-            "specialist_spokes_v2_allow_promote_small_default": False,
-            "specialist_spokes_v2_max_validation_sharpe": 250.0,
-        }.items():
-            changed = dict(current)
-            changed[key] = value
-            self.assertFalse(artifact_contract_matches(current, changed), key)
+        old_nonlegacy = dict(current)
+        old_nonlegacy["regime_scoring_model"] = "specialist_spokes_v2"
+        self.assertFalse(artifact_contract_matches(old_nonlegacy, current))
+
+        old_legacy_with_retired_meta = dict(current)
+        old_legacy_with_retired_meta["threadspark_selection_surface"] = "validation"
+        self.assertTrue(artifact_contract_matches(old_legacy_with_retired_meta, current))
 
     def test_portfolio_manager_sets_false_discovery_symbol_scope(self):
         tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_false_discovery_scope")

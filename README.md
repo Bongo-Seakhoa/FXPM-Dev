@@ -324,7 +324,6 @@ python pm_main.py --trade
     "production_split_mode": "bleeding_edge",
     "walk_forward_validation_bars": 50000,
     "clean_holdout_pct": 0.0,
-    "threadspark_selection_surface": "validation",
     "false_discovery_holdout_policy": "off",
     "max_param_combos": 200,
     "optimization_max_workers": 4,
@@ -378,7 +377,8 @@ python pm_main.py --trade
 - Stage 1/Stage 2 use the active recent M5 workflow: latest 300k M5 bars, oldest 50k as `historical_stress_audit`, newest 250k as the active universe. Stage 1 runs baseline eligibility across the full active universe; Stage 2 optimizes on the newest half through the market edge.
 - The current presets are the recommended baseline for this workflow. They are designed to favor quality, profitability, and live relevance; do not loosen them without comparing regenerated artifacts and live rejection/outcome data.
 - Stage 2 freshness is intentional: production `clean_holdout` is disabled so the optimizer can use the freshest bars. The immediately prior 50k M5 bars are adjacent WFV evidence used by candidate validation and promotion, not pristine forward OOS.
-- `threadspark_selection_surface = "validation"` and `false_discovery_holdout_policy = "off"` keep production validation pointed at the adjacent WFV slice instead of asking missing clean-holdout metrics to gate winners. `walk_forward_promotion_policy = "promotion_gate"` is the active production promotion gate.
+- `false_discovery_holdout_policy = "off"` keeps the empty clean-holdout surface from gating winners. `walk_forward_promotion_policy = "promotion_gate"` is the active production promotion gate.
+- Scoring has one fixed canonical `legacy` implementation. The former `regime_scoring_model`, ThreadSpark, and specialist-spoke controls are retired and rejected if supplied; `legacy` remains only as an artifact-provenance identifier.
 - `risk_management_selection_stage = "stage3"` means governance/risk policies are selected on the newest Stage 2 selection surface. Setting it to `"stage2"` evaluates policies on the active optimization universe instead.
 - `logs/` is not controlled by `pipeline.output_dir`; runtime logs always go to the root `logs/` folder.
 - `position.risk_per_trade_pct` is the authoritative live target risk. `pipeline.discovery_risk_per_trade_pct` is the fixed discovery/backtest sizing value, while `pipeline.risk_per_trade_pct` only remains as a compatibility backfill when the `position` key is absent.

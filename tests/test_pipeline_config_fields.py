@@ -1,7 +1,7 @@
 import os
 import unittest
 
-from pm_core import PipelineConfig
+from pm_core import PipelineConfig, RETIRED_SCORING_CONFIG_KEYS
 
 
 class PipelineConfigFieldTests(unittest.TestCase):
@@ -229,65 +229,16 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=-1.0).regime_trade_stability_floor, 0.0, places=6)
         self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=2.0).regime_trade_stability_floor, 1.0, places=6)
 
-    def test_regime_scoring_model_defaults_and_normalizes(self):
-        self.assertEqual(PipelineConfig().regime_scoring_model, "legacy")
-        self.assertEqual(PipelineConfig(regime_scoring_model="legacy_confidence").regime_scoring_model, "legacy_confidence")
-        self.assertEqual(PipelineConfig(regime_scoring_model="specialist_spokes").regime_scoring_model, "specialist_spokes")
-        self.assertEqual(PipelineConfig(regime_scoring_model="specialist_spokes_v2").regime_scoring_model, "specialist_spokes_v2")
-        self.assertEqual(PipelineConfig(regime_scoring_model="specialist_spokes_asym").regime_scoring_model, "specialist_spokes_asym")
-        self.assertEqual(PipelineConfig(regime_scoring_model="specialist_spokes_threadspark").regime_scoring_model, "specialist_spokes_threadspark")
-        self.assertEqual(PipelineConfig(regime_scoring_model="mystery").regime_scoring_model, "legacy")
-
-    def test_threadspark_controls_default_and_normalize(self):
-        default = PipelineConfig()
-        self.assertEqual(default.production_split_mode, "calendar_lockbox_v2")
-        self.assertEqual(default.threadspark_selection_surface, "validation")
-        self.assertTrue(default.threadspark_use_historical_cost_evidence)
-        self.assertEqual(default.threadspark_historical_cost_scope, "workflow")
-        self.assertEqual(default.threadspark_historical_chunk_count, 5)
-
-        cfg = PipelineConfig(
-            research_mode=True,
-            production_split_mode="CLEAN_HOLDOUT",
-            walk_forward_validation_bars=-5,
-            threadspark_selection_surface="VALIDATION",
-            threadspark_use_historical_cost_evidence=False,
-            threadspark_historical_cost_scope="AUDIT",
-            threadspark_historical_chunk_count=20,
+    def test_retired_scoring_controls_are_not_constructor_fields(self):
+        self.assertEqual(len(RETIRED_SCORING_CONFIG_KEYS), 10)
+        self.assertTrue(
+            RETIRED_SCORING_CONFIG_KEYS.isdisjoint(
+                PipelineConfig.__dataclass_fields__
+            )
         )
-        self.assertEqual(cfg.production_split_mode, "research_clean_holdout")
-        self.assertEqual(cfg.walk_forward_validation_bars, 0)
-        self.assertEqual(cfg.threadspark_selection_surface, "validation")
-        self.assertFalse(cfg.threadspark_use_historical_cost_evidence)
-        self.assertEqual(cfg.threadspark_historical_cost_scope, "audit")
-        self.assertEqual(cfg.threadspark_historical_chunk_count, 12)
-
-        self.assertEqual(PipelineConfig(threadspark_selection_surface="future").threadspark_selection_surface, "validation")
-        self.assertEqual(
-            PipelineConfig(production_split_mode="future").production_split_mode,
-            "calendar_lockbox_v2",
-        )
-        self.assertEqual(PipelineConfig(threadspark_historical_cost_scope="future").threadspark_historical_cost_scope, "workflow")
-        self.assertEqual(PipelineConfig(threadspark_historical_chunk_count=0).threadspark_historical_chunk_count, 1)
-
-    def test_specialist_spokes_v2_controls_default_and_clamp(self):
-        default = PipelineConfig()
-        self.assertAlmostEqual(default.specialist_spokes_v2_cost_frequency_strength, 0.50)
-        self.assertTrue(default.specialist_spokes_v2_default_fallback_enabled)
-        self.assertTrue(default.specialist_spokes_v2_allow_promote_small_default)
-        # 0.0 is correct, and briefly was not. This knob only reaches
-        # _v2_default_rejection_reasons under regime_scoring_model =
-        # specialist_spokes_v2; production is "legacy", so it cannot fire. The
-        # protection it appeared to add already exists unconditionally:
-        # classify_promotion_status BLOCKS any cell whose pbo_status != "PASS".
-        self.assertAlmostEqual(default.specialist_spokes_v2_max_validation_sharpe, 0.0)
-
-        clamped = PipelineConfig(
-            specialist_spokes_v2_cost_frequency_strength=2.0,
-            specialist_spokes_v2_max_validation_sharpe=-10.0,
-        )
-        self.assertAlmostEqual(clamped.specialist_spokes_v2_cost_frequency_strength, 1.0)
-        self.assertAlmostEqual(clamped.specialist_spokes_v2_max_validation_sharpe, 0.0)
+        for key in RETIRED_SCORING_CONFIG_KEYS:
+            with self.subTest(key=key), self.assertRaises(TypeError):
+                PipelineConfig(**{key: "retired"})
 
     def test_false_discovery_controls_default_on_and_clamp(self):
         cfg = PipelineConfig(
@@ -318,6 +269,10 @@ class PipelineConfigFieldTests(unittest.TestCase):
             "calendar_lockbox_v2",
         )
         self.assertEqual(
+            PipelineConfig(production_split_mode="future").production_split_mode,
+            "calendar_lockbox_v2",
+        )
+        self.assertEqual(
             PipelineConfig(research_mode=True, production_split_mode="bleeding_edge").production_split_mode,
             "bleeding_edge",
         )
@@ -327,6 +282,7 @@ class PipelineConfigFieldTests(unittest.TestCase):
         )
 
         clamped = PipelineConfig(
+            walk_forward_validation_bars=-5,
             tuning_validation_bars=0,
             final_lockbox_bars=-1,
             split_embargo_bars=-2,
@@ -335,6 +291,7 @@ class PipelineConfigFieldTests(unittest.TestCase):
                 "promote_small", "invalid", "PROMOTED", "promoted"
             ],
         )
+        self.assertEqual(clamped.walk_forward_validation_bars, 0)
         self.assertEqual(clamped.tuning_validation_bars, 1)
         self.assertEqual(clamped.final_lockbox_bars, 1)
         self.assertEqual(clamped.split_embargo_bars, 0)

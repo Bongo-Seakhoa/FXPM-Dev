@@ -20,14 +20,13 @@ Spokes (all higher=better, computed from a candidate's per-block OOS return seri
   cost_execution_survival STUB -- needs realistic p90 stress re-sim (engine, Codex)
   parameter_stability     STUB -- needs Optuna neighborhood/plateau evidence (engine, Codex)
 
-Run:  python tools/specialist_spokes.py validate     # forward-validate spokes on completed W4 evidence
-      python tools/specialist_spokes.py selftest      # orientation/logic unit test
+Historical archive: rejected specialist-spokes scorer evidence helper.
 """
 import sys
 from pathlib import Path
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / "tools"))
 from pbo import load_oos_manifest_matrix
 

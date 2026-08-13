@@ -19,7 +19,12 @@ from typing import Any, Final, Mapping, Sequence
 
 import pm_authority_spool as authority_spool
 import pm_cap_calibration as cap
-from pm_core import PipelineConfig
+from pm_core import (
+    PipelineConfig,
+    RetiredScoringConfigError,
+    reject_retired_scoring_config_keys,
+    strict_pipeline_config_kwargs,
+)
 from pm_position import PositionConfig
 
 
@@ -164,13 +169,13 @@ def _derive_pipeline_config(payload: Mapping[str, Any], path: Path) -> PipelineC
     storage = payload.get("storage") or {}
     if type(pipeline) is not dict or type(storage) is not dict:
         _fail("PRODUCTION_PIPELINE_CONFIG_SECTION_INVALID")
-    merged = dict(pipeline)
-    merged.update(_normalized_storage(storage))
-    allowed = {item.name for item in fields(PipelineConfig)}
     try:
-        result = PipelineConfig(
-            **{key: value for key, value in merged.items() if key in allowed}
-        )
+        reject_retired_scoring_config_keys(storage)
+        merged = dict(pipeline)
+        merged.update(_normalized_storage(storage))
+        result = PipelineConfig(**strict_pipeline_config_kwargs(merged))
+    except RetiredScoringConfigError as exc:
+        _fail("RETIRED_SCORING_CONFIG_KEY", *exc.keys)
     except Exception as exc:
         raise ProductionConfigBindingError(
             "PRODUCTION_PIPELINE_CONFIG_RECONSTRUCTION_FAILED",
@@ -181,7 +186,6 @@ def _derive_pipeline_config(payload: Mapping[str, Any], path: Path) -> PipelineC
     if type(metadata) is not dict:
         _fail("PRODUCTION_CONFIG_METADATA_INVALID")
     if str(metadata.get("scope") or "").strip().lower() == FUNDED_SCOPE:
-        result.regime_scoring_model = "legacy"
         result.oos_validation_mode = "fixed_holdout"
 
     # ``pm_main`` always projects the independently loaded PositionConfig TP

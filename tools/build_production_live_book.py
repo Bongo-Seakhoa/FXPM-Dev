@@ -12,7 +12,6 @@ import copy
 import json
 import math
 import sys
-from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Set
@@ -21,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pm_core import PipelineConfig
+from pm_core import PipelineConfig, strict_pipeline_config_kwargs
 
 
 def _load_json(path: Path) -> Any:
@@ -120,8 +119,7 @@ def _no_trade_config(reason: str) -> Dict[str, Any]:
 
 def _config_from_live_payload(payload: Dict[str, Any]) -> PipelineConfig:
     pipeline = payload.get("pipeline") if isinstance(payload.get("pipeline"), dict) else {}
-    allowed = {item.name for item in fields(PipelineConfig)}
-    return PipelineConfig(**{key: value for key, value in pipeline.items() if key in allowed})
+    return PipelineConfig(**strict_pipeline_config_kwargs(pipeline))
 
 
 def _deployment_valid_until(payload: Dict[str, Any]) -> str:

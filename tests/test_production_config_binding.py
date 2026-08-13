@@ -8,7 +8,7 @@ import pytest
 import pm_authority_spool as spool
 import pm_cap_calibration as cap
 import pm_production_config_binding as binding
-from pm_core import PipelineConfig
+from pm_core import PipelineConfig, RETIRED_SCORING_CONFIG_KEYS
 
 
 def _payload(tmp_path: Path) -> dict:
@@ -19,7 +19,6 @@ def _payload(tmp_path: Path) -> dict:
             "output_dir": "outputs",
             "log_dir": "logs",
             "backtest_spread_mode": "stress_p95",
-            "regime_scoring_model": "legacy",
             "oos_validation_mode": "fixed_holdout",
             "false_discovery_symbol_count": 1,
         },
@@ -87,6 +86,23 @@ def test_public_loader_reproduces_complete_effective_config(tmp_path: Path) -> N
         supplied_config=effective,
     )
     assert frozen.materialize(context).data_dir == (tmp_path / "data").resolve()
+
+
+@pytest.mark.parametrize("retired_key", sorted(RETIRED_SCORING_CONFIG_KEYS))
+def test_public_loader_rejects_retired_scoring_config_keys(
+    tmp_path: Path,
+    retired_key: str,
+) -> None:
+    payload = _payload(tmp_path)
+    payload["pipeline"][retired_key] = "retired"
+    path = tmp_path / "config.json"
+    _write(path, payload)
+
+    with pytest.raises(binding.ProductionConfigBindingError) as caught:
+        binding.load_effective_pipeline_config(path)
+
+    assert caught.value.code == "RETIRED_SCORING_CONFIG_KEY"
+    assert retired_key in caught.value.details
 
 
 def test_binding_owns_effective_config_and_ignores_caller_mutation(

@@ -1313,6 +1313,25 @@ def _backtest_loop_numba(
 # CONFIGURATION
 # =============================================================================
 
+# These controls belonged to scoring regimes that have been retired from the
+# executable system.  Keep one short deny-list at the configuration boundary so
+# an old experiment file cannot be accepted while its settings are silently
+# ignored by the canonical scorer.
+RETIRED_SCORING_CONFIG_KEYS = frozenset(
+    {
+        "legacy_confidence_bonus_cap",
+        "regime_scoring_model",
+        "specialist_spokes_v2_allow_promote_small_default",
+        "specialist_spokes_v2_cost_frequency_strength",
+        "specialist_spokes_v2_default_fallback_enabled",
+        "specialist_spokes_v2_max_validation_sharpe",
+        "threadspark_historical_chunk_count",
+        "threadspark_historical_cost_scope",
+        "threadspark_selection_surface",
+        "threadspark_use_historical_cost_evidence",
+    }
+)
+
 @dataclass
 class PipelineConfig:
     """
@@ -1470,42 +1489,9 @@ class PipelineConfig:
     scoring_use_tail_risk: bool = True
     scoring_use_consistency: bool = True
     # More trades are not evidence of more edge once costs and dependence are
-    # modeled. Keep the old bonus available to research, but never enable it by
-    # default in the production selector.
+    # modeled, so the canonical scorer never adds the retired frequency bonus.
     scoring_use_trade_frequency_bonus: bool = False
-    legacy_confidence_bonus_cap: float = 0.08
-    regime_scoring_model: str = "legacy"  # legacy|legacy_confidence|specialist_spokes|specialist_spokes_v2|specialist_spokes_asym|specialist_spokes_threadspark
     regime_trade_stability_floor: float = 0.7  # 0.7 legacy; 0.9 is Phase-1 experiment candidate
-    specialist_spokes_v2_cost_frequency_strength: float = 0.50
-    specialist_spokes_v2_default_fallback_enabled: bool = True
-    specialist_spokes_v2_allow_promote_small_default: bool = True
-    # Reject a cell whose validation Sharpe is implausible *when PBO could not be
-    # evaluated* (pm_pipeline.py:13862). 0.0 disabled the check entirely, and the
-    # 2026-08-11 audit measured the consequence in the checked-in book: all 157
-    # promoted rows carry pbo_status="not_available", val_sharpe runs to a median
-    # of 38.23 and a maximum of 208.97, 147 of 157 exceed 10, and the deflated
-    # Sharpe saturates at exactly 1.000 for 144 of 157 - so neither
-    # multiple-testing defence discriminated anything.
-    #
-    # REVERTED to 0.0 on 2026-08-11 (CPM-001), and the reasoning above is why the
-    # revert is safe rather than a retreat. The guard's only consumer is
-    # _v2_default_rejection_reasons (pm_pipeline.py:13850), reached solely via
-    # _select_v2_symbol_default, which pm_pipeline.py:15010-15014 gates on
-    # scoring_model == "specialist_spokes_v2". Production resolves
-    # regime_scoring_model = "legacy", so the guard cannot execute at all - and
-    # the "all 157 rows rejected" measurement that justified setting it to 4.0
-    # was an offline replay against a gate that never fires.
-    #
-    # Nothing is lost. classify_promotion_status already appends a
-    # false-discovery reason for any pbo_status != "PASS" (pm_pipeline.py:2443)
-    # and returns BLOCKED on any such reason (:2548), under
-    # false_discovery_control_enabled and the calendar split that pm_core.py:2615
-    # forces for every non-research run - with no scoring-model gate in that
-    # path. A cell without a PBO verdict is already hard-blocked one gate earlier.
-    #
-    # Leaving it at 4.0 would put a value in artifact_meta (pm_pipeline.py:2199)
-    # that looks like a live control and is not one.
-    specialist_spokes_v2_max_validation_sharpe: float = 0.0
 
     # Global false-discovery controls are part of the default production
     # contract. Research runs may disable them explicitly, but live readiness
@@ -1546,11 +1532,6 @@ class PipelineConfig:
     oos_evidence_include_execution_cost_survival: bool = True
     oos_evidence_execution_stress_mode: str = "stress_p95"
     oos_evidence_execution_cost_max_candidates_per_tf: int = 0  # 0 = no cap when enabled
-    threadspark_selection_surface: str = "validation"  # validation|clean_holdout
-    threadspark_use_historical_cost_evidence: bool = True
-    threadspark_historical_cost_scope: str = "workflow"  # workflow|audit
-    threadspark_historical_chunk_count: int = 5
-
     # Timeframes to evaluate
     timeframes: List[str] = field(default_factory=lambda: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'])
     
@@ -2192,12 +2173,8 @@ class PipelineConfig:
             "cycle_drift_spread_degradation_mult": 2.0,
             "swap_model_min_holding_hours": 20.0,
             "regime_min_live_gap_warn": 0.05,
-            "legacy_confidence_bonus_cap": 0.08,
         }.items():
-            if _name == "legacy_confidence_bonus_cap":
-                _clamp_float_attr(_name, _default, low=0.0, high=0.50)
-            else:
-                _clamp_float_attr(_name, _default)
+            _clamp_float_attr(_name, _default)
         _clamp_int_attr("cycle_drift_min_trades", 6, low=1)
         _clamp_int_attr("cycle_drift_consecutive_losses", 5, low=1)
 
@@ -2235,34 +2212,6 @@ class PipelineConfig:
         self.walk_forward_live_blocking_enabled = bool(
             getattr(self, "walk_forward_live_blocking_enabled", True)
         )
-        regime_scoring_model = str(getattr(self, "regime_scoring_model", "legacy") or "legacy").strip().lower()
-        if regime_scoring_model not in {
-            "legacy",
-            "legacy_confidence",
-            "specialist_spokes",
-            "specialist_spokes_v2",
-            "specialist_spokes_asym",
-            "specialist_spokes_threadspark",
-        }:
-            logger.warning("Invalid regime_scoring_model=%r; falling back to legacy.", regime_scoring_model)
-            regime_scoring_model = "legacy"
-        self.regime_scoring_model = regime_scoring_model
-        try:
-            v2_strength = float(getattr(self, "specialist_spokes_v2_cost_frequency_strength", 0.50))
-        except (TypeError, ValueError, OverflowError):
-            v2_strength = 0.50
-        self.specialist_spokes_v2_cost_frequency_strength = max(0.0, min(1.0, v2_strength))
-        self.specialist_spokes_v2_default_fallback_enabled = bool(
-            getattr(self, "specialist_spokes_v2_default_fallback_enabled", True)
-        )
-        self.specialist_spokes_v2_allow_promote_small_default = bool(
-            getattr(self, "specialist_spokes_v2_allow_promote_small_default", True)
-        )
-        try:
-            v2_max_sharpe = float(getattr(self, "specialist_spokes_v2_max_validation_sharpe", 0.0))
-        except (TypeError, ValueError, OverflowError):
-            v2_max_sharpe = 0.0
-        self.specialist_spokes_v2_max_validation_sharpe = max(0.0, v2_max_sharpe)
         try:
             stability_floor = float(getattr(self, "regime_trade_stability_floor", 0.7))
         except (TypeError, ValueError, OverflowError):
@@ -2445,26 +2394,6 @@ class PipelineConfig:
         self.oos_evidence_include_execution_cost_survival = bool(
             getattr(self, "oos_evidence_include_execution_cost_survival", False)
         )
-        selection_surface = str(
-            getattr(self, "threadspark_selection_surface", "validation") or "validation"
-        ).strip().lower()
-        if selection_surface not in {"clean_holdout", "validation"}:
-            selection_surface = "validation"
-        self.threadspark_selection_surface = selection_surface
-        self.threadspark_use_historical_cost_evidence = bool(
-            getattr(self, "threadspark_use_historical_cost_evidence", True)
-        )
-        historical_scope = str(
-            getattr(self, "threadspark_historical_cost_scope", "workflow") or "workflow"
-        ).strip().lower()
-        if historical_scope not in {"workflow", "audit"}:
-            historical_scope = "workflow"
-        self.threadspark_historical_cost_scope = historical_scope
-        try:
-            historical_chunks = int(getattr(self, "threadspark_historical_chunk_count", 5) or 0)
-        except (TypeError, ValueError, OverflowError):
-            historical_chunks = 5
-        self.threadspark_historical_chunk_count = max(1, min(12, historical_chunks))
         stress_mode = str(
             getattr(self, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95"
         ).strip().lower()
@@ -3105,6 +3034,35 @@ class PipelineConfig:
         weekday = self.production_retrain_weekday.capitalize()
         weeks = int(self.production_retrain_interval_weeks)
         return f"every {weeks} week{'s' if weeks != 1 else ''} on {weekday} {self.production_retrain_time}"
+
+
+class RetiredScoringConfigError(ValueError):
+    """Raised when an executable config still names a retired scorer control."""
+
+    def __init__(self, keys: Sequence[str]):
+        self.keys = tuple(sorted({str(key) for key in keys}))
+        super().__init__(
+            "retired scoring config keys are no longer executable: "
+            f"{list(self.keys)}"
+        )
+
+
+def reject_retired_scoring_config_keys(data: Mapping[str, Any]) -> None:
+    """Fail before a retired scorer setting can be silently filtered away."""
+
+    if not isinstance(data, Mapping):
+        raise TypeError("pipeline config payload must be a mapping")
+    retired = set(data) & RETIRED_SCORING_CONFIG_KEYS
+    if retired:
+        raise RetiredScoringConfigError(tuple(retired))
+
+
+def strict_pipeline_config_kwargs(data: Mapping[str, Any]) -> Dict[str, Any]:
+    """Project supported PipelineConfig keys after rejecting retired controls."""
+
+    reject_retired_scoring_config_keys(data)
+    allowed = PipelineConfig.__dataclass_fields__
+    return {key: value for key, value in data.items() if key in allowed}
 
 
 # =============================================================================

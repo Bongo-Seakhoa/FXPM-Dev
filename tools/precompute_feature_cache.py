@@ -7,7 +7,6 @@ does not write winner ledgers or promote strategies.
 import argparse
 import json
 import sys
-from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict
 
@@ -16,7 +15,7 @@ REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from pm_core import PipelineConfig
+from pm_core import PipelineConfig, strict_pipeline_config_kwargs
 from pm_pipeline import PortfolioManager
 
 
@@ -31,8 +30,7 @@ def _pipeline_config(data: Dict[str, Any]) -> PipelineConfig:
     pipeline = data.get("pipeline", {})
     if not isinstance(pipeline, dict):
         pipeline = {}
-    allowed = {field.name for field in fields(PipelineConfig)}
-    return PipelineConfig(**{key: value for key, value in pipeline.items() if key in allowed})
+    return PipelineConfig(**strict_pipeline_config_kwargs(pipeline))
 
 
 def main() -> None:

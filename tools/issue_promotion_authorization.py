@@ -15,7 +15,7 @@ import copy
 import json
 import math
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
@@ -30,7 +30,11 @@ from pm_cap_calibration import (
     cap_neutral_policy_contract_sha256,
     validate_cap_calibration_artifact,
 )
-from pm_core import PipelineConfig
+from pm_core import (
+    PipelineConfig,
+    RetiredScoringConfigError,
+    strict_pipeline_config_kwargs,
+)
 from pm_pipeline import build_artifact_meta
 from pm_portfolio_replay import (
     active_native_portfolio_contract,
@@ -149,13 +153,15 @@ def _is_sha1(value: Any) -> bool:
 
 
 def _pipeline_config(config_path: Path, payload: Mapping[str, Any]) -> PipelineConfig:
-    allowed = {item.name for item in fields(PipelineConfig)}
     pipeline = payload.get("pipeline")
     if not isinstance(pipeline, Mapping):
         raise AuthoringFailure("CONFIG_PIPELINE_NOT_OBJECT")
-    cfg = PipelineConfig(
-        **{key: value for key, value in pipeline.items() if key in allowed}
-    )
+    try:
+        cfg = PipelineConfig(**strict_pipeline_config_kwargs(pipeline))
+    except RetiredScoringConfigError as exc:
+        raise AuthoringFailure(
+            *(f"CONFIG_RETIRED_SCORING_KEY:{key}" for key in exc.keys)
+        ) from exc
     cfg._deployment_config_path = str(config_path.resolve())
     data_dir = Path(cfg.data_dir)
     if not data_dir.is_absolute():

@@ -5,7 +5,7 @@ Read-only against the engine, config.json, and the winner ledger.
 import hashlib
 import json
 import sys
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -98,11 +98,14 @@ def iter_tournament_cells(ledger: Dict[str, Any]) -> Iterator[CellRef]:
 
 
 def build_config(no_disk_cache: bool = False):
-    from pm_core import FeatureComputer, PipelineConfig
+    from pm_core import (
+        FeatureComputer,
+        PipelineConfig,
+        strict_pipeline_config_kwargs,
+    )
     payload = json.loads((REPO / "config.json").read_text(encoding="utf-8"))
     pipe = payload.get("pipeline", {})
-    allowed = {f.name for f in fields(PipelineConfig)}
-    cfg = PipelineConfig(**{k: v for k, v in pipe.items() if k in allowed})
+    cfg = PipelineConfig(**strict_pipeline_config_kwargs(pipe))
     cfg.data_dir = str(REPO / "data")
     cfg.regime_params_file = str(REPO / str(getattr(cfg, "regime_params_file", "regime_params.json")))
     FeatureComputer.configure_cache(

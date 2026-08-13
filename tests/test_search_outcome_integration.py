@@ -379,8 +379,6 @@ def test_deep_search_supersedes_identical_b0_identity_and_validates_once():
     optimizer._attach_frozen_probe_validation = validate_probe
     optimizer._attach_local_search_multiplicity = lambda *_args, **_kwargs: None
     optimizer._attach_oos_evidence_to_candidates = lambda *_args, **_kwargs: None
-    optimizer._uses_threadspark_selector = lambda: False
-
     result = optimizer._collect_candidates(
         "EURUSD",
         "H1",
@@ -1170,7 +1168,6 @@ def test_legacy_score_uses_effective_trades_for_governed_candidates():
     config = PipelineConfig(
         regime_min_train_trades=10,
         regime_min_val_trades=10,
-        regime_scoring_model="legacy",
         false_discovery_control_enabled=False,
     )
     optimizer = RegimeOptimizer(config)
@@ -1203,21 +1200,8 @@ def test_legacy_score_uses_effective_trades_for_governed_candidates():
     assert strong_ess > weak_ess
 
 
-@pytest.mark.parametrize(
-    "scoring_model",
-    [
-        "legacy",
-        "specialist_spokes",
-        "specialist_spokes_v2",
-        "specialist_spokes_asym",
-        "specialist_spokes_threadspark",
-    ],
-)
-def test_all_governed_scoring_models_are_invariant_to_raw_trade_count(
-    scoring_model,
-):
+def test_governed_scoring_is_invariant_to_raw_trade_count():
     optimizer = RegimeOptimizer(PipelineConfig(
-        regime_scoring_model=scoring_model,
         regime_min_train_trades=10,
         regime_min_val_trades=10,
         false_discovery_control_enabled=False,

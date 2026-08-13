@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pm_core import RETIRED_SCORING_CONFIG_KEYS
 from pm_main import load_config_json
 from pm_position import PositionConfig
 from pm_production_config_binding import load_effective_pipeline_config
@@ -53,11 +54,14 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
     def test_config_loader_accepts_utf8_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            path.write_text('{"pipeline": {"regime_scoring_model": "legacy"}}', encoding="utf-8-sig")
+            path.write_text(
+                '{"pipeline": {"initial_capital": 10000.0}}',
+                encoding="utf-8-sig",
+            )
 
             data = load_config_json(str(path))
 
-        self.assertEqual(data["pipeline"]["regime_scoring_model"], "legacy")
+        self.assertEqual(data["pipeline"]["initial_capital"], 10000.0)
 
     def test_tracked_config_json_does_not_contain_live_mt5_credentials(self) -> None:
         data = json.loads((self.repo_root / "config.json").read_text(encoding="utf-8"))
@@ -67,16 +71,17 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         self.assertEqual(mt5.get("password", ""), "")
         self.assertEqual(mt5.get("server", ""), "")
 
-    def test_tracked_config_pins_validated_legacy_scoring_flags(self) -> None:
+    def test_tracked_config_has_one_code_owned_scoring_path(self) -> None:
         data = json.loads((self.repo_root / "config.json").read_text(encoding="utf-8"))
         pipeline = data["pipeline"]
         _, resolved = load_effective_pipeline_config(self.repo_root / "config.json")
 
-        self.assertEqual(pipeline["regime_scoring_model"], "legacy")
+        self.assertTrue(RETIRED_SCORING_CONFIG_KEYS.isdisjoint(pipeline))
+        self.assertTrue(
+            all(not hasattr(resolved, key) for key in RETIRED_SCORING_CONFIG_KEYS)
+        )
         self.assertNotIn("scoring_use_trade_frequency_bonus", pipeline)
         self.assertFalse(resolved.scoring_use_trade_frequency_bonus)
-        self.assertNotIn("legacy_confidence_bonus_cap", pipeline)
-        self.assertAlmostEqual(resolved.legacy_confidence_bonus_cap, 0.08, places=6)
         self.assertNotIn("walk_forward_audit_enabled", pipeline)
         self.assertNotIn("walk_forward_promotion_policy", pipeline)
         self.assertNotIn("walk_forward_live_blocking_enabled", pipeline)
@@ -102,7 +107,7 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
         _, resolved = load_effective_pipeline_config(self.repo_root / "config.json")
         resolved_position = PositionConfig(**data["position"])
 
-        self.assertEqual(pipeline["regime_scoring_model"], "legacy")
+        self.assertTrue(RETIRED_SCORING_CONFIG_KEYS.isdisjoint(pipeline))
         self.assertNotIn("scoring_use_trade_frequency_bonus", pipeline)
         self.assertFalse(resolved.scoring_use_trade_frequency_bonus)
         self.assertEqual(pipeline["backtest_spread_mode"], "conservative_max")
@@ -132,10 +137,6 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
             "fx_selection_top_k",
             "fx_opt_top_k",
             "oos_min_trades",
-            "threadspark_selection_surface",
-            "threadspark_use_historical_cost_evidence",
-            "threadspark_historical_cost_scope",
-            "threadspark_historical_chunk_count",
             "promote_small_risk_multiplier",
         ):
             self.assertNotIn(research_only_key, pipeline)

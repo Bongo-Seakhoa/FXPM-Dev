@@ -596,7 +596,11 @@ def combine_outputs(out_dir: Path, tasks_by_symbol: dict[str, list[dict[str, Any
 def main() -> int:
     parser = argparse.ArgumentParser(description="Label OOS-manifest candidate pools via full-history replay.")
     parser.add_argument("--experiment", required=True, type=Path)
-    parser.add_argument("--arm", default="specialist_spokes_threadspark")
+    parser.add_argument(
+        "--arm",
+        required=True,
+        help="Explicit experiment arm directory; no retired scorer is selected implicitly.",
+    )
     parser.add_argument("--out-dir", type=Path)
     parser.add_argument("--spread-mode", default="conservative_max")
     parser.add_argument("--workers", type=int, default=4)

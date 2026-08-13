@@ -925,9 +925,28 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(status, "BLOCKED")
         self.assertTrue(any("RANGE: profitability failed" in reason for reason in reasons))
 
+    def test_default_origin_uses_object_identity_before_equal_value_fallback(self):
+        pipeline = OptimizationPipeline(PipelineConfig())
+        first = RegimeConfig(
+            strategy_name="SameStrategy",
+            parameters={"period": 14},
+            quality_score=0.7,
+        )
+        selected = RegimeConfig(
+            strategy_name="SameStrategy",
+            parameters={"period": 14},
+            quality_score=0.8,
+        )
+
+        tf, regime = pipeline._locate_default_origin(
+            selected,
+            {"M15": {"RANGE": first}, "H1": {"TREND": selected}},
+        )
+
+        self.assertEqual((tf, regime), ("H1", "TREND"))
+
     def test_funded_default_blocks_missing_production_holdout_even_when_false_discovery_disabled(self):
         cfg = PipelineConfig(
-            regime_scoring_model="specialist_spokes_v2",
             false_discovery_control_enabled=False,
             false_discovery_holdout_min_trades=5,
         )
@@ -1557,53 +1576,6 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(as_h1["risk_return_frequency"], "daily_realized")
         self.assertEqual(as_h1["sharpe_approx"], as_m5["sharpe_approx"])
         self.assertEqual(as_h1["sortino_approx"], as_m5["sortino_approx"])
-
-    def test_asym_tail_risk_uses_block_downside_metrics(self):
-        cfg = PipelineConfig(regime_scoring_model="specialist_spokes_asym")
-        optimizer = RegimeOptimizer(cfg)
-        base = {
-            "total_trades": 40,
-            "profit_factor": 1.6,
-            "total_return_pct": 10.0,
-            "max_drawdown_pct": 4.0,
-            "calmar_ratio": 2.5,
-            "sortino_approx": 1.5,
-            "mean_r": 0.18,
-            "median_r": 0.15,
-            "pct_positive_r": 55.0,
-            "worst_5pct_r": -1.0,
-            "max_consecutive_losses": 4,
-            "gross_profit": 1800.0,
-            "gross_loss": 900.0,
-            "total_pnl": 900.0,
-            "avg_win": 110.0,
-            "avg_loss": -80.0,
-        }
-        clean_tail = {
-            **base,
-            "r_downside_deviation": 0.25,
-            "r_block_downside_deviation": 0.20,
-            "r_block_cvar": 0.35,
-        }
-        damaged_tail = {
-            **base,
-            "r_downside_deviation": 1.30,
-            "r_block_downside_deviation": 1.80,
-            "r_block_cvar": 2.50,
-        }
-
-        clean_axes, _ = optimizer._asym_surface_spoke_axes(
-            clean_tail,
-            drawdown_limit=12.0,
-            train_metrics=None,
-        )
-        damaged_axes, _ = optimizer._asym_surface_spoke_axes(
-            damaged_tail,
-            drawdown_limit=12.0,
-            train_metrics=None,
-        )
-
-        self.assertGreater(clean_axes["tail_risk_control"], damaged_axes["tail_risk_control"])
 
     def test_regime_bucket_uses_signal_bar_not_entry_bar(self):
         cfg = PipelineConfig(

@@ -2168,37 +2168,15 @@ def build_artifact_meta(config: PipelineConfig,
         "oos_evidence_execution_cost_max_candidates_per_tf": int(
             getattr(config, "oos_evidence_execution_cost_max_candidates_per_tf", 0) or 0
         ),
-        "threadspark_selection_surface": str(
-            getattr(config, "threadspark_selection_surface", "validation") or "validation"
-        ),
-        "threadspark_use_historical_cost_evidence": bool(
-            getattr(config, "threadspark_use_historical_cost_evidence", True)
-        ),
-        "threadspark_historical_cost_scope": str(
-            getattr(config, "threadspark_historical_cost_scope", "workflow") or "workflow"
-        ),
-        "threadspark_historical_chunk_count": int(
-            getattr(config, "threadspark_historical_chunk_count", 5) or 5
-        ),
         "scoring_use_consistency": bool(getattr(config, "scoring_use_consistency", False)),
         "scoring_use_continuous_dd": bool(getattr(config, "scoring_use_continuous_dd", False)),
         "scoring_use_sortino_blend": bool(getattr(config, "scoring_use_sortino_blend", False)),
         "scoring_use_tail_risk": bool(getattr(config, "scoring_use_tail_risk", False)),
         "scoring_use_trade_frequency_bonus": bool(getattr(config, "scoring_use_trade_frequency_bonus", False)),
-        "legacy_confidence_bonus_cap": float(getattr(config, "legacy_confidence_bonus_cap", 0.08) or 0.0),
-        "regime_scoring_model": str(getattr(config, "regime_scoring_model", "legacy") or "legacy"),
-        "specialist_spokes_v2_cost_frequency_strength": float(
-            getattr(config, "specialist_spokes_v2_cost_frequency_strength", 0.50) or 0.0
-        ),
-        "specialist_spokes_v2_default_fallback_enabled": bool(
-            getattr(config, "specialist_spokes_v2_default_fallback_enabled", True)
-        ),
-        "specialist_spokes_v2_allow_promote_small_default": bool(
-            getattr(config, "specialist_spokes_v2_allow_promote_small_default", True)
-        ),
-        "specialist_spokes_v2_max_validation_sharpe": float(
-            getattr(config, "specialist_spokes_v2_max_validation_sharpe", 0.0) or 0.0
-        ),
+        # Historical books retain this field.  It is now a fixed contract
+        # identifier rather than a user-selectable scoring setting, so an old
+        # non-legacy book still fails closed while legacy books remain readable.
+        "regime_scoring_model": "legacy",
         "regime_trade_stability_floor": float(getattr(config, "regime_trade_stability_floor", 0.7) or 0.7),
         "local_governance_tournament_enabled": bool(getattr(config, "local_governance_tournament_enabled", False)),
         "local_governance_candidate_policies": candidate_policy_names(
@@ -4622,10 +4600,6 @@ class RegimeOptimizer:
                         val_warmup_by_tf: Optional[Dict[str, int]] = None,
                         train_warmup_by_tf: Optional[Dict[str, int]] = None,
                         eligibility_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
-                        selection_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
-                        selection_warmup_by_tf: Optional[Dict[str, int]] = None,
-                        selection_surface_by_tf: Optional[Dict[str, str]] = None,
-                        historical_features_by_tf: Optional[Dict[str, pd.DataFrame]] = None,
                         allowed_regimes_by_tf: Optional[Dict[str, Sequence[str]]] = None) -> Tuple[Dict[str, Dict[str, RegimeConfig]], Optional[RegimeConfig], int, int]:
         """
         Optimize for all (timeframe, regime) combinations with validation.
@@ -4676,15 +4650,6 @@ class RegimeOptimizer:
                 else int(train_warmup_by_tf.get(tf, 0) or 0)
             )
             val_warmup_bars = 0 if val_warmup_by_tf is None else int(val_warmup_by_tf.get(tf, 0) or 0)
-            selection_features = None if selection_features_by_tf is None else selection_features_by_tf.get(tf)
-            selection_warmup_bars = (
-                0 if selection_warmup_by_tf is None else int(selection_warmup_by_tf.get(tf, 0) or 0)
-            )
-            selection_surface = (
-                "validation" if selection_surface_by_tf is None else str(selection_surface_by_tf.get(tf, "validation") or "validation")
-            )
-            historical_features = None if historical_features_by_tf is None else historical_features_by_tf.get(tf)
-            
             if (
                 train_features is None
                 or max(0, len(train_features) - train_warmup_bars) < 200
@@ -4709,10 +4674,6 @@ class RegimeOptimizer:
                 train_warmup_bars=train_warmup_bars,
                 val_warmup_bars=val_warmup_bars,
                 eligibility_features=eligibility_features,
-                selection_features=selection_features,
-                selection_warmup_bars=selection_warmup_bars,
-                selection_surface=selection_surface,
-                historical_features=historical_features,
                 allowed_regimes=active_regimes,
             )
 
@@ -7711,10 +7672,6 @@ class RegimeOptimizer:
                             val_warmup_bars: int = 0,
                             train_warmup_bars: int = 0,
                             eligibility_features: Optional[pd.DataFrame] = None,
-                            selection_features: Optional[pd.DataFrame] = None,
-                            selection_warmup_bars: int = 0,
-                            selection_surface: str = "validation",
-                            historical_features: Optional[pd.DataFrame] = None,
                             allowed_regimes: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
         """
         Collect all strategy candidates with per-regime metrics.
@@ -9327,46 +9284,10 @@ class RegimeOptimizer:
         ):
             return {}, {}, None
 
-        sanitized_candidate = dict(candidate)
-
-        def sanitize_aux_surface(value: Any) -> Any:
-            if not isinstance(value, Mapping):
-                return value
-            surface = dict(value)
-            raw_effective = surface.get("effective_trades")
-            try:
-                auxiliary_effective = float(raw_effective)
-            except (TypeError, ValueError, OverflowError):
-                auxiliary_effective = 0.0
-            if not math.isfinite(auxiliary_effective) or auxiliary_effective < 0.0:
-                auxiliary_effective = 0.0
-            return cls._effective_count_surface(surface, auxiliary_effective)
-
-        for key in (
-            "threadspark_selection_regime_metrics",
-            "threadspark_historical_regime_metrics",
-        ):
-            by_regime = sanitized_candidate.get(key)
-            if isinstance(by_regime, Mapping):
-                sanitized_candidate[key] = {
-                    str(regime): sanitize_aux_surface(surface)
-                    for regime, surface in by_regime.items()
-                }
-        chunks = sanitized_candidate.get("threadspark_historical_chunk_regime_metrics")
-        if isinstance(chunks, list):
-            sanitized_candidate["threadspark_historical_chunk_regime_metrics"] = [
-                {
-                    str(regime): sanitize_aux_surface(surface)
-                    for regime, surface in chunk.items()
-                }
-                if isinstance(chunk, Mapping)
-                else chunk
-                for chunk in chunks
-            ]
         return (
             cls._effective_count_surface(train_metrics, train_effective),
             cls._effective_count_surface(val_metrics, val_effective),
-            sanitized_candidate,
+            dict(candidate),
         )
 
     def _select_best_for_regime(self,
@@ -9383,7 +9304,7 @@ class RegimeOptimizer:
         Returns:
             Tuple of (RegimeConfig or None, is_validated, validation_reason)
         """
-        scored_candidates = []  # List of (score, candidate, false_discovery, legacy_confidence) tuples
+        scored_candidates = []  # List of (score, candidate, false_discovery) tuples
         rejection_reasons = []  # Track why candidates were rejected at gate level
         best_score = -float('inf')
         best_candidate = None
@@ -9766,7 +9687,6 @@ class RegimeOptimizer:
                         continue
 
             score = self._call_regime_score(train_metrics, val_metrics, candidate=cand)
-            legacy_confidence = None
             if bool(false_discovery.get("enabled", False)):
                 score *= float(false_discovery.get("confidence_multiplier", 1.0) or 1.0)
             if not math.isfinite(float(score)):
@@ -9774,7 +9694,7 @@ class RegimeOptimizer:
                     f"{cand.get('strategy_name', 'Unknown')}: selection score is non-finite"
                 )
                 continue
-            scored_candidates.append((score, cand, false_discovery, legacy_confidence))
+            scored_candidates.append((score, cand, false_discovery))
 
             if score > best_score:
                 best_score = score
@@ -9789,7 +9709,6 @@ class RegimeOptimizer:
                 )
             return None, False, reason
 
-        scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
         scored_candidates.sort(
             key=lambda item: (
                 -float(item[0]),
@@ -9804,8 +9723,7 @@ class RegimeOptimizer:
         # validation and metric scoring.  Truncating descent here saved no
         # compute and could manufacture NO_TRADE when rank K+1 was the first
         # candidate to pass the final generalization gates.  Descend the full
-        # scored list.  ThreadSpark's research-only L1 shortlist, when used,
-        # has already been applied above and remains a distinct model choice.
+        # scored list.
         descent_count = len(scored_candidates)
 
         logger.debug(
@@ -9815,7 +9733,7 @@ class RegimeOptimizer:
 
         # Return the highest-scored candidate that passes every final gate.
         validation_failures = []
-        for rank, (score, cand, false_discovery, legacy_confidence) in enumerate(
+        for rank, (score, cand, false_discovery) in enumerate(
             scored_candidates,
             start=1,
         ):
@@ -9867,7 +9785,6 @@ class RegimeOptimizer:
                         validation_reason=validation_reason,
                         candidate=cand,
                         false_discovery_evidence=false_discovery,
-                        legacy_confidence_evidence=legacy_confidence,
                     ),
                 )
                 return config, True, validation_reason
@@ -9879,7 +9796,7 @@ class RegimeOptimizer:
                 )
 
         # Every scored candidate failed validation - return the best one as unvalidated
-        best_score, best_candidate, false_discovery, legacy_confidence = scored_candidates[0]
+        best_score, best_candidate, false_discovery = scored_candidates[0]
         train_metrics = best_candidate['train_regime_metrics'].get(regime, {})
         val_metrics = best_candidate['val_regime_metrics'].get(regime, {})
         
@@ -9927,7 +9844,6 @@ class RegimeOptimizer:
                 validation_reason=validation_reason,
                 candidate=best_candidate,
                 false_discovery_evidence=false_discovery,
-                legacy_confidence_evidence=legacy_confidence,
             ),
         )
         descent_summary = "; ".join(validation_failures)
@@ -10124,8 +10040,7 @@ class RegimeOptimizer:
                                     score: Optional[float] = None,
                                     validation_reason: str = "",
                                     candidate: Optional[Dict[str, Any]] = None,
-                                    false_discovery_evidence: Optional[Dict[str, Any]] = None,
-                                    legacy_confidence_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                    false_discovery_evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Build compact, persisted validation evidence for dashboards and review."""
         score_train_metrics = dict(train_metrics or {})
         score_val_metrics = dict(val_metrics or {})
@@ -10157,17 +10072,11 @@ class RegimeOptimizer:
             "val_max_drawdown_pct": val_dd,
             "validation_reason": validation_reason,
             "fresh_edge_policy": {
-                "winner_source": (
-                    "threadspark_post_search_surface"
-                    if str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
-                    == "specialist_spokes_threadspark"
-                    else "active_recent_stage3"
-                ),
+                "winner_source": "active_recent_stage3",
                 "no_fallback_to_best_train": True,
                 "holdout_does_not_displace_latest_surface": bool(
                     getattr(self.config, "walk_forward_do_not_displace_latest_surface", True)
-                ) and str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
-                != "specialist_spokes_threadspark",
+                ),
             },
         }
         if score is not None:
@@ -10213,700 +10122,6 @@ class RegimeOptimizer:
                 }
         if isinstance(false_discovery_evidence, dict):
             evidence["false_discovery"] = dict(false_discovery_evidence)
-        if isinstance(legacy_confidence_evidence, dict):
-            evidence["legacy_confidence"] = dict(legacy_confidence_evidence)
-        return evidence
-
-    @staticmethod
-    def _geo_mean(values: np.ndarray) -> float:
-        arr = np.asarray(values, dtype=np.float64)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return 0.0
-        arr = np.clip(arr, 1e-9, 1.0)
-        return float(np.exp(np.mean(np.log(arr))))
-
-    @staticmethod
-    def _face_balance(values: np.ndarray) -> float:
-        arr = np.asarray(values, dtype=np.float64)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return 0.0
-        arr = np.clip(arr, 1e-9, 1.0)
-        mean = float(np.mean(arr))
-        return float(RegimeOptimizer._geo_mean(arr) / mean) if mean > 1e-12 else 0.0
-
-    SPECIALIST_SPOKES = (
-        "edge_survival",
-        "profit_structure_quality",
-        "capital_preservation",
-        "tail_risk_control",
-        "temporal_consistency",
-        "generalization_survival",
-        "execution_cost_survival",
-        "parameter_stability",
-    )
-    THREADSPARK_SPOKES = (
-        "edge_survival",
-        "profit_structure_quality",
-        "capital_preservation",
-        "tail_risk_control",
-        "path_persistence",
-        "generalization_survival",
-        "execution_cost_survival",
-        "parameter_stability",
-    )
-
-    @staticmethod
-    def _execution_cost_axis(metrics: Dict[str, Any]) -> Tuple[float, str]:
-        """Return a non-leaky execution-cost spoke from the current metric surface."""
-
-        ret = float(metrics.get("total_return_pct", 0.0) or 0.0)
-        gross_profit_present = "gross_profit" in metrics
-        total_pnl_present = "total_pnl" in metrics
-        gross_profit = max(0.0, float(metrics.get("gross_profit", 0.0) or 0.0))
-        total_pnl = float(metrics.get("total_pnl", 0.0) or 0.0)
-        if gross_profit > 1e-9:
-            return max(0.0, min(1.0, total_pnl / gross_profit)), "net_to_gross_available"
-        if not gross_profit_present and not total_pnl_present and ret > 0.0:
-            return 1.0, "not_available_neutral"
-        return 0.0, "not_available_zero"
-
-    @staticmethod
-    def _surface_spoke_axes(metrics: Dict[str, Any], *, drawdown_limit: float) -> Dict[str, float]:
-        """Non-leaky single-metric specialist axes from one evaluation surface."""
-
-        trades = max(0, int(metrics.get("total_trades", 0) or 0))
-        ret = float(metrics.get("total_return_pct", 0.0) or 0.0)
-        dd = max(0.0, float(metrics.get("max_drawdown_pct", 100.0) or 0.0))
-        pf = max(0.0, float(metrics.get("profit_factor", 0.0) or 0.0))
-        worst_5 = float(metrics.get("worst_5pct_r", 0.0) or 0.0)
-        r_downside = max(0.0, float(metrics.get("r_downside_deviation", 0.0) or 0.0))
-        r_block_downside = max(0.0, float(metrics.get("r_block_downside_deviation", 0.0) or 0.0))
-        r_block_cvar = max(0.0, float(metrics.get("r_block_cvar", 0.0) or 0.0))
-        max_consec = max(0, int(metrics.get("max_consecutive_losses", 0) or 0))
-        mean_r = float(metrics.get("mean_r", 0.0) or 0.0)
-        pct_positive_r = float(metrics.get("pct_positive_r", metrics.get("win_rate", 0.0)) or 0.0)
-        positive_fraction = max(0.0, min(1.0, pct_positive_r / 100.0 if pct_positive_r > 1.0 else pct_positive_r))
-        std_weekly = max(0.0, float(metrics.get("std_weekly_return", 0.0) or 0.0))
-
-        edge = ret / (ret + dd + 1.0) if ret > 0.0 else 0.0
-        profit_structure = (1.0 - (1.0 / pf)) if pf > 1.0 else 0.0
-        boundary = max(1e-9, float(drawdown_limit or 1.0))
-        capital_preservation = max(0.0, min(1.0, 1.0 - (dd / boundary)))
-        if r_block_downside > 1e-12 or r_block_cvar > 1e-12 or r_downside > 1e-12:
-            block_downside = r_block_downside if r_block_downside > 1e-12 else r_downside
-            block_cvar = r_block_cvar if r_block_cvar > 1e-12 else max(0.0, -worst_5)
-            tail_risk_control = 0.55 * (1.0 / (1.0 + block_downside)) + 0.45 * (1.0 / (1.0 + block_cvar))
-        else:
-            tail_risk_control = 1.0 / (1.0 + max(0.0, -worst_5))
-        temporal_consistency = (
-            1.0 / (1.0 + (float(max_consec) / math.sqrt(float(trades))))
-            if trades > 0 else 0.0
-        )
-        edge_reappearance = RegimeOptimizer._sigmoid_score(positive_fraction, center=0.50, scale=0.12)
-        expectancy_reappearance = RegimeOptimizer._sigmoid_score(mean_r, center=0.0, scale=0.25)
-        variance_drag = math.exp(-min(10.0, std_weekly * 20.0))
-        path_persistence = 0.55 * edge_reappearance + 0.25 * expectancy_reappearance + 0.20 * variance_drag
-        execution_cost_survival, _cost_status = RegimeOptimizer._execution_cost_axis(metrics)
-        return {
-            "edge_survival": max(0.0, min(1.0, edge)),
-            "profit_structure_quality": max(0.0, min(1.0, profit_structure)),
-            "capital_preservation": max(0.0, min(1.0, capital_preservation)),
-            "tail_risk_control": max(0.0, min(1.0, tail_risk_control)),
-            "temporal_consistency": max(0.0, min(1.0, temporal_consistency)),
-            "path_persistence": max(0.0, min(1.0, path_persistence)),
-            "execution_cost_survival": max(0.0, min(1.0, execution_cost_survival)),
-        }
-
-    @staticmethod
-    def _generalization_axis(train_metrics: Dict[str, Any], val_metrics: Dict[str, Any]) -> float:
-        train_ret = float(train_metrics.get("total_return_pct", 0.0) or 0.0)
-        val_ret = float(val_metrics.get("total_return_pct", 0.0) or 0.0)
-        if train_ret <= 0.0 or val_ret <= 0.0:
-            return 0.0
-        return float(max(0.0, min(1.0, val_ret / train_ret)))
-
-    @staticmethod
-    def _dent_health(train_face: np.ndarray, final_face: np.ndarray) -> float:
-        ratios = []
-        for before, after in zip(np.asarray(train_face, dtype=np.float64), np.asarray(final_face, dtype=np.float64)):
-            if before > 1e-9:
-                ratios.append(max(0.0, min(1.0, float(after / before))))
-            else:
-                ratios.append(1.0 if after <= 1e-9 else 0.0)
-        return float(np.mean(ratios)) if ratios else 0.0
-
-    @staticmethod
-    def _parameter_stability_axis(candidate: Optional[Dict[str, Any]]) -> Tuple[float, str]:
-        if not isinstance(candidate, dict):
-            return 1.0, "not_available_neutral"
-        evidence = candidate.get("parameter_stability_evidence") or {}
-        if isinstance(evidence, dict) and evidence.get("status") == "available":
-            value = evidence.get("nearest_neighbor_median_score_ratio")
-            try:
-                return max(0.0, min(1.0, float(value))), "available"
-            except Exception:
-                return 1.0, "invalid_neutral"
-        return 1.0, str(evidence.get("status", "not_available_neutral")) if isinstance(evidence, dict) else "not_available_neutral"
-
-    ASYM_SPECIALIST_SPOKES = (
-        "risk_adjusted_edge",
-        "trade_quality",
-        "gain_pain_efficiency",
-        "capital_preservation",
-        "tail_risk_control",
-        "generalization_survival",
-        "execution_cost_survival",
-        "parameter_stability",
-    )
-    ASYM_DIAGNOSTIC_SPOKES = (
-        "conditional_upside_capture",
-        "path_persistence",
-    )
-    ASYM_ALPHA_SPOKES = (
-        "risk_adjusted_edge",
-        "trade_quality",
-        "gain_pain_efficiency",
-        "generalization_survival",
-    )
-    ASYM_RISK_SPOKES = (
-        "capital_preservation",
-        "tail_risk_control",
-    )
-
-    @staticmethod
-    def _metric_float(metrics: Dict[str, Any], key: str, default: float = 0.0) -> float:
-        try:
-            raw_value = metrics.get(key, default)
-            if raw_value is None:
-                raw_value = default
-            value = float(raw_value)
-            return value if math.isfinite(value) else default
-        except Exception:
-            return default
-
-    @staticmethod
-    def _bounded_positive_metric(metrics: Dict[str, Any],
-                                 key: str,
-                                 *,
-                                 default: float = 0.0,
-                                 inf_value: float = 10.0,
-                                 cap: float = 10.0) -> float:
-        try:
-            raw_value = metrics.get(key, default)
-            if raw_value is None:
-                raw_value = default
-            value = float(raw_value)
-            if math.isinf(value):
-                value = inf_value if value > 0.0 else default
-            if math.isnan(value):
-                value = default
-            return max(0.0, min(float(cap), value))
-        except Exception:
-            return default
-
-    @staticmethod
-    def _sigmoid_score(value: float, *, center: float, scale: float) -> float:
-        scale = max(1e-9, float(scale or 1.0))
-        x = max(-60.0, min(60.0, (float(value) - float(center)) / scale))
-        return float(1.0 / (1.0 + math.exp(-x)))
-
-    @staticmethod
-    def _smoothstep_score(value: float, *, floor: float, ceiling: float) -> float:
-        if ceiling <= floor:
-            return 1.0 if value >= ceiling else 0.0
-        x = max(0.0, min(1.0, (float(value) - float(floor)) / float(ceiling - floor)))
-        return float(x * x * (3.0 - 2.0 * x))
-
-    @staticmethod
-    def _trimmed_mean(values: np.ndarray, trim: float = 0.15) -> float:
-        arr = np.asarray(values, dtype=np.float64)
-        arr = arr[np.isfinite(arr)]
-        if arr.size == 0:
-            return 0.0
-        arr = np.sort(np.clip(arr, 0.0, 1.0))
-        n_trim = int(math.floor(arr.size * max(0.0, min(0.45, trim))))
-        if n_trim > 0 and arr.size > n_trim * 2:
-            arr = arr[n_trim:-n_trim]
-        return float(np.mean(arr)) if arr.size else 0.0
-
-    @staticmethod
-    def _execution_cost_survival_axis(metrics: Dict[str, Any],
-                                      candidate: Optional[Dict[str, Any]]) -> Tuple[float, str]:
-        evidence: Any = {}
-        if isinstance(candidate, dict):
-            evidence = candidate.get("selection_execution_cost_survival") or {}
-        if isinstance(evidence, dict) and evidence.get("status") == "available":
-            base_ret = RegimeOptimizer._metric_float(evidence, "baseline_return_pct", 0.0)
-            stress_ret = RegimeOptimizer._metric_float(evidence, "stress_return_pct", 0.0)
-            base_pf = RegimeOptimizer._metric_float(evidence, "baseline_profit_factor", 0.0)
-            stress_pf = RegimeOptimizer._metric_float(evidence, "stress_profit_factor", 0.0)
-            ret_retention = max(0.0, min(1.0, stress_ret / base_ret)) if base_ret > 1e-9 else 0.0
-            pf_retention = max(0.0, min(1.0, stress_pf / base_pf)) if base_pf > 1e-9 else 0.0
-            survives = 1.0 if bool(evidence.get("survives_positive_return")) and bool(evidence.get("survives_pf_ge_1")) else 0.0
-            score = 0.45 * ret_retention + 0.35 * pf_retention + 0.20 * survives
-            return max(0.0, min(1.0, score)), "stress_degradation_available"
-        fallback, status = RegimeOptimizer._execution_cost_axis(metrics)
-        return fallback, f"{status}_fallback"
-
-    @staticmethod
-    def _asym_surface_spoke_axes(metrics: Dict[str, Any],
-                                 *,
-                                 drawdown_limit: float,
-                                 train_metrics: Optional[Dict[str, Any]] = None,
-                                 candidate: Optional[Dict[str, Any]] = None,
-                                 parameter_stability: float = 1.0) -> Tuple[Dict[str, float], Dict[str, str]]:
-        trades = max(0, int(metrics.get("total_trades", 0) or 0))
-        ret = RegimeOptimizer._metric_float(metrics, "total_return_pct", 0.0)
-        dd = max(0.0, RegimeOptimizer._metric_float(metrics, "max_drawdown_pct", 100.0))
-        pf = RegimeOptimizer._bounded_positive_metric(metrics, "profit_factor", default=0.0, inf_value=10.0, cap=10.0)
-        calmar = RegimeOptimizer._metric_float(metrics, "calmar_ratio", 0.0)
-        sortino = RegimeOptimizer._metric_float(
-            metrics,
-            "sortino_approx",
-            RegimeOptimizer._metric_float(metrics, "sortino_ratio", 0.0),
-        )
-        mean_r = RegimeOptimizer._metric_float(metrics, "mean_r", 0.0)
-        median_r = RegimeOptimizer._metric_float(metrics, "median_r", 0.0)
-        pct_positive_r = RegimeOptimizer._metric_float(metrics, "pct_positive_r", metrics.get("win_rate", 0.0)) / 100.0
-        worst_5 = RegimeOptimizer._metric_float(metrics, "worst_5pct_r", 0.0)
-        r_downside_dev = max(0.0, RegimeOptimizer._metric_float(metrics, "r_downside_deviation", 0.0))
-        r_block_downside_dev = max(0.0, RegimeOptimizer._metric_float(metrics, "r_block_downside_deviation", 0.0))
-        r_block_cvar = max(0.0, RegimeOptimizer._metric_float(metrics, "r_block_cvar", 0.0))
-        max_consec = max(0, int(metrics.get("max_consecutive_losses", 0) or 0))
-        std_weekly = max(0.0, RegimeOptimizer._metric_float(metrics, "std_weekly_return", 0.0))
-
-        return_dd = ret / (dd + 1.0) if ret > 0.0 else 0.0
-        risk_adjusted_edge = (
-            0.45 * RegimeOptimizer._sigmoid_score(return_dd, center=1.0, scale=1.25) +
-            0.35 * RegimeOptimizer._sigmoid_score(calmar, center=1.0, scale=2.0) +
-            0.20 * RegimeOptimizer._sigmoid_score(sortino, center=0.5, scale=2.0)
-        )
-        if ret <= 0.0:
-            risk_adjusted_edge *= 0.35
-
-        trade_quality = (
-            0.55 * RegimeOptimizer._sigmoid_score(mean_r, center=0.05, scale=0.25) +
-            0.30 * RegimeOptimizer._sigmoid_score(median_r, center=0.05, scale=0.35) +
-            0.15 * RegimeOptimizer._sigmoid_score(pct_positive_r, center=0.50, scale=0.12)
-        )
-        if mean_r <= 0.0 and median_r <= 0.0:
-            trade_quality *= 0.55
-
-        gross_profit = max(0.0, RegimeOptimizer._metric_float(metrics, "gross_profit", 0.0))
-        gross_loss = abs(RegimeOptimizer._metric_float(metrics, "gross_loss", 0.0))
-        total_pnl = RegimeOptimizer._metric_float(metrics, "total_pnl", ret)
-        if gross_loss > 1e-9:
-            gain_pain = gross_profit / gross_loss
-        else:
-            gain_pain = 3.0 if gross_profit > 0.0 else 0.0
-        net_to_gross = max(0.0, min(1.0, total_pnl / gross_profit)) if gross_profit > 1e-9 else 0.0
-        gain_pain_efficiency = (
-            0.70 * RegimeOptimizer._sigmoid_score(gain_pain, center=1.20, scale=0.75) +
-            0.30 * RegimeOptimizer._sigmoid_score(net_to_gross, center=0.25, scale=0.25)
-        )
-        if ret <= 0.0 or total_pnl <= 0.0:
-            gain_pain_efficiency *= 0.50
-
-        boundary = max(1e-9, float(drawdown_limit or 1.0))
-        capital_preservation = max(0.0, min(1.0, 1.0 - (dd / boundary)))
-        if dd <= 1e-12 and 0 < trades < 50:
-            confidence = min(1.0, math.sqrt(float(trades) / 50.0))
-            capital_preservation = min(capital_preservation, 0.90 + 0.10 * confidence)
-
-        block_downside = r_block_downside_dev if r_block_downside_dev > 1e-12 else r_downside_dev
-        block_cvar = r_block_cvar if r_block_cvar > 1e-12 else max(0.0, -worst_5)
-        downside_score = 1.0 / (1.0 + math.exp(max(-60.0, min(60.0, (block_downside - 0.65) / 0.25))))
-        block_cvar_score = 1.0 / (1.0 + math.exp(max(-60.0, min(60.0, (block_cvar - 1.10) / 0.40))))
-        cluster_score = 1.0 / (1.0 + (float(max_consec) / math.sqrt(float(trades)))) if trades > 0 else 0.0
-        tail_risk_control = 0.60 * downside_score + 0.30 * block_cvar_score + 0.10 * cluster_score
-        if block_downside <= 1e-12 and block_cvar <= 1e-12 and 0 < trades < 50:
-            confidence = min(1.0, math.sqrt(float(trades) / 50.0))
-            tail_risk_control = min(tail_risk_control, 0.85 + 0.15 * confidence)
-
-        avg_win = max(0.0, RegimeOptimizer._metric_float(metrics, "avg_win", 0.0))
-        avg_loss = abs(RegimeOptimizer._metric_float(metrics, "avg_loss", 0.0))
-        if avg_loss <= 1e-9:
-            payoff_ratio = 3.0 if avg_win > 0.0 else 0.0
-        else:
-            payoff_ratio = avg_win / avg_loss
-        payoff_score = RegimeOptimizer._sigmoid_score(payoff_ratio, center=1.15, scale=0.75)
-        upside_base = (
-            0.60 * payoff_score +
-            0.25 * RegimeOptimizer._sigmoid_score(mean_r, center=0.05, scale=0.25) +
-            0.15 * RegimeOptimizer._sigmoid_score(ret, center=2.0, scale=5.0)
-        )
-        downside_guard = math.sqrt(max(0.0, min(1.0, capital_preservation)) * max(0.0, min(1.0, tail_risk_control)))
-        conditional_upside_capture = upside_base * downside_guard
-
-        positive_fraction = max(0.0, min(1.0, pct_positive_r))
-        edge_reappearance = RegimeOptimizer._sigmoid_score(positive_fraction, center=0.50, scale=0.12)
-        expectancy_reappearance = RegimeOptimizer._sigmoid_score(mean_r, center=0.0, scale=0.25)
-        variance_drag = math.exp(-min(10.0, std_weekly * 20.0))
-        path_persistence = 0.55 * edge_reappearance + 0.25 * expectancy_reappearance + 0.20 * variance_drag
-
-        if train_metrics is None:
-            generalization_survival = 1.0 if ret > 0.0 else 0.0
-        else:
-            train_ret = RegimeOptimizer._metric_float(train_metrics, "total_return_pct", 0.0)
-            train_pf = RegimeOptimizer._bounded_positive_metric(train_metrics, "profit_factor", default=0.0, inf_value=10.0, cap=10.0)
-            ret_retention = max(0.0, min(1.0, ret / train_ret)) if train_ret > 0.0 and ret > 0.0 else 0.0
-            pf_retention = max(0.0, min(1.0, pf / train_pf)) if train_pf > 1.0 and pf > 1.0 else 0.0
-            generalization_survival = 0.70 * ret_retention + 0.30 * pf_retention
-
-        execution_cost_survival, cost_status = RegimeOptimizer._execution_cost_survival_axis(metrics, candidate)
-        axes = {
-            "risk_adjusted_edge": risk_adjusted_edge,
-            "trade_quality": trade_quality,
-            "gain_pain_efficiency": gain_pain_efficiency,
-            "capital_preservation": capital_preservation,
-            "tail_risk_control": tail_risk_control,
-            "generalization_survival": generalization_survival,
-            "execution_cost_survival": execution_cost_survival,
-            "parameter_stability": parameter_stability,
-            "conditional_upside_capture": conditional_upside_capture,
-            "path_persistence": path_persistence,
-        }
-        return (
-            {name: max(0.0, min(1.0, float(value))) for name, value in axes.items()},
-            {"execution_cost_survival": cost_status},
-        )
-
-    def _asym_specialist_spoke_vector(self,
-                                      train_metrics: Dict[str, Any],
-                                      val_metrics: Dict[str, Any],
-                                      candidate: Optional[Dict[str, Any]] = None
-                                      ) -> Tuple[np.ndarray, np.ndarray, Dict[str, str], Dict[str, float], Dict[str, float]]:
-        stability, stability_status = self._parameter_stability_axis(candidate)
-        train_axes, train_status = self._asym_surface_spoke_axes(
-            train_metrics,
-            drawdown_limit=float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
-            train_metrics=None,
-            candidate=candidate,
-            parameter_stability=stability,
-        )
-        val_has_evidence = max(0, int(val_metrics.get("total_trades", 0) or 0)) >= self.min_val_trades
-        final_surface = val_metrics if val_has_evidence else train_metrics
-        final_axes, final_status = self._asym_surface_spoke_axes(
-            final_surface,
-            drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0)
-            if val_has_evidence else float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
-            train_metrics=train_metrics if val_has_evidence else None,
-            candidate=candidate,
-            parameter_stability=stability,
-        )
-        status = {
-            name: "available"
-            for name in self.ASYM_SPECIALIST_SPOKES
-        }
-        status["generalization_survival"] = "available" if val_has_evidence else "train_only"
-        status["execution_cost_survival"] = final_status.get(
-            "execution_cost_survival",
-            train_status.get("execution_cost_survival", "unknown"),
-        )
-        status["parameter_stability"] = stability_status
-        return (
-            np.asarray([train_axes[name] for name in self.ASYM_SPECIALIST_SPOKES], dtype=np.float64),
-            np.asarray([final_axes[name] for name in self.ASYM_SPECIALIST_SPOKES], dtype=np.float64),
-            status,
-            {name: float(train_axes[name]) for name in self.ASYM_DIAGNOSTIC_SPOKES},
-            {name: float(final_axes[name]) for name in self.ASYM_DIAGNOSTIC_SPOKES},
-        )
-
-    def _asym_shape_aggregation(self, train_face: np.ndarray, final_face: np.ndarray) -> Dict[str, float]:
-        values = {
-            name: float(final_face[idx])
-            for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
-        }
-        train_values = {
-            name: float(train_face[idx])
-            for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
-        }
-        core_names = [name for name in self.ASYM_SPECIALIST_SPOKES if name != "parameter_stability"]
-        core = np.asarray([values[name] for name in core_names], dtype=np.float64)
-        central_contour = float(np.median(core)) if core.size else 0.0
-        corridor = 0.05
-        inward = np.asarray([max(0.0, central_contour - values[name] - corridor) for name in core_names], dtype=np.float64)
-        outward = np.asarray([max(0.0, values[name] - central_contour - corridor) for name in self.ASYM_ALPHA_SPOKES], dtype=np.float64)
-        inward_divot = float(np.mean(inward)) if inward.size else 0.0
-        outward_extension = float(np.mean(outward)) if outward.size else 0.0
-        core_level = self._trimmed_mean(core)
-        base_shape = max(0.0, min(1.0, core_level + 0.30 * min(1.0, outward_extension / 0.20) - 0.60 * min(1.0, inward_divot / 0.30)))
-
-        capital_gate = self._smoothstep_score(values["capital_preservation"], floor=0.20, ceiling=0.65)
-        tail_gate = self._smoothstep_score(values["tail_risk_control"], floor=0.20, ceiling=0.65)
-        risk_gate = capital_gate * tail_gate
-        generalization_gate = 0.65 + 0.35 * self._smoothstep_score(values["generalization_survival"], floor=0.10, ceiling=0.65)
-        cost_gate = 0.75 + 0.25 * self._smoothstep_score(values["execution_cost_survival"], floor=0.10, ceiling=0.65)
-        stability_factor = 0.80 + 0.20 * values["parameter_stability"]
-        outpush_credit = 1.0 + 0.20 * min(1.0, outward_extension / 0.20)
-
-        critical_dents = []
-        for name in ("capital_preservation", "tail_risk_control", "generalization_survival", "execution_cost_survival"):
-            before = train_values[name]
-            after = values[name]
-            critical_dents.append(max(0.0, before - after - corridor))
-        critical_dent = float(np.mean(critical_dents)) if critical_dents else 0.0
-        dent_health = max(0.65, 1.0 - 0.70 * min(1.0, critical_dent / 0.30))
-        score = base_shape * risk_gate * generalization_gate * cost_gate * stability_factor * outpush_credit * dent_health
-        return {
-            "core_level": float(core_level),
-            "central_contour": float(central_contour),
-            "inward_divot": float(inward_divot),
-            "outward_extension": float(outward_extension),
-            "base_shape_quality": float(base_shape),
-            "capital_gate": float(capital_gate),
-            "tail_gate": float(tail_gate),
-            "risk_gate": float(risk_gate),
-            "generalization_gate": float(generalization_gate),
-            "cost_gate": float(cost_gate),
-            "stability_factor": float(stability_factor),
-            "outpush_credit": float(outpush_credit),
-            "critical_dent": float(critical_dent),
-            "dent_health": float(dent_health),
-            "directional_topology_score": float(max(0.0, min(1.5, score))),
-        }
-
-    def _compute_asym_specialist_spoke_evidence(self,
-                                                train_metrics: Dict[str, Any],
-                                                val_metrics: Dict[str, Any],
-                                                candidate: Optional[Dict[str, Any]] = None
-                                                ) -> Dict[str, Any]:
-        train_trades = max(0, int(train_metrics.get("total_trades", 0) or 0))
-        val_trades = max(0, int(val_metrics.get("total_trades", 0) or 0))
-        train_face, final_face, status, train_diagnostics, final_diagnostics = self._asym_specialist_spoke_vector(
-            train_metrics,
-            val_metrics,
-            candidate,
-        )
-        if val_trades >= self.min_val_trades:
-            target = max(1, self.min_val_trades * 2)
-            evidence_confidence = min(1.0, math.sqrt(float(val_trades) / float(target)))
-        else:
-            target = max(1, self.min_train_trades * 2)
-            evidence_confidence = 0.70 * min(1.0, math.sqrt(float(train_trades) / float(target)))
-        shape = self._asym_shape_aggregation(train_face, final_face)
-        score = 100.0 * evidence_confidence * float(shape["directional_topology_score"])
-        score = float(score if math.isfinite(score) else 0.0)
-        return {
-            "spokes": {
-                name: float(final_face[idx])
-                for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
-            },
-            "train_spokes": {
-                name: float(train_face[idx])
-                for idx, name in enumerate(self.ASYM_SPECIALIST_SPOKES)
-            },
-            "diagnostic_spokes": final_diagnostics,
-            "diagnostic_train_spokes": train_diagnostics,
-            "spoke_status": status,
-            "derived_shape_features": {
-                **shape,
-                "evidence_confidence": float(evidence_confidence),
-            },
-            "score": score,
-        }
-
-    def _specialist_spoke_vector(self,
-                                 train_metrics: Dict[str, Any],
-                                 val_metrics: Dict[str, Any],
-                                 candidate: Optional[Dict[str, Any]] = None,
-                                 spoke_names: Optional[Tuple[str, ...]] = None
-                                 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, str]]:
-        names = tuple(spoke_names or self.SPECIALIST_SPOKES)
-        train_axes = self._surface_spoke_axes(
-            train_metrics,
-            drawdown_limit=float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
-        )
-        val_has_evidence = max(0, int(val_metrics.get("total_trades", 0) or 0)) >= self.min_val_trades
-        final_surface = val_metrics if val_has_evidence else train_metrics
-        final_axes = self._surface_spoke_axes(
-            final_surface,
-            drawdown_limit=float(getattr(self.config, "fx_val_max_drawdown", 12.0) or 12.0)
-            if val_has_evidence else float(getattr(self.config, "train_max_drawdown", 20.0) or 20.0),
-        )
-        final_axes["generalization_survival"] = (
-            self._generalization_axis(train_metrics, val_metrics)
-            if val_has_evidence else
-            (1.0 if float(train_metrics.get("total_return_pct", 0.0) or 0.0) > 0.0 else 0.0)
-        )
-        train_axes["generalization_survival"] = 1.0 if float(train_metrics.get("total_return_pct", 0.0) or 0.0) > 0.0 else 0.0
-        stability, stability_status = self._parameter_stability_axis(candidate)
-        train_axes["parameter_stability"] = stability
-        final_axes["parameter_stability"] = stability
-        _cost_value, cost_status = self._execution_cost_axis(final_surface)
-        status = {
-            "edge_survival": "available",
-            "profit_structure_quality": "available",
-            "capital_preservation": "available",
-            "tail_risk_control": "available",
-            "temporal_consistency": "available",
-            "path_persistence": "available",
-            "generalization_survival": "available" if val_has_evidence else "train_only",
-            "execution_cost_survival": cost_status,
-            "parameter_stability": stability_status,
-        }
-        return (
-            np.asarray([train_axes[name] for name in names], dtype=np.float64),
-            np.asarray([final_axes[name] for name in names], dtype=np.float64),
-            status,
-        )
-
-    def _compute_specialist_spoke_evidence(self,
-                                           train_metrics: Dict[str, Any],
-                                           val_metrics: Dict[str, Any],
-                                           candidate: Optional[Dict[str, Any]] = None,
-                                           spoke_names: Optional[Tuple[str, ...]] = None
-                                           ) -> Dict[str, Any]:
-        names = tuple(spoke_names or self.SPECIALIST_SPOKES)
-        train_trades = max(0, int(train_metrics.get("total_trades", 0) or 0))
-        val_trades = max(0, int(val_metrics.get("total_trades", 0) or 0))
-        train_face, final_face, status = self._specialist_spoke_vector(
-            train_metrics,
-            val_metrics,
-            candidate,
-            spoke_names=names,
-        )
-        if val_trades >= self.min_val_trades:
-            target = max(1, self.min_val_trades * 2)
-            evidence_confidence = min(1.0, math.sqrt(float(val_trades) / float(target)))
-        else:
-            target = max(1, self.min_train_trades * 2)
-            evidence_confidence = 0.70 * min(1.0, math.sqrt(float(train_trades) / float(target)))
-
-        final_quality = self._geo_mean(final_face)
-        train_quality = self._geo_mean(train_face)
-        path_quality = 0.5 * (train_quality + final_quality)
-        balance = self._face_balance(final_face)
-        dent_health = self._dent_health(train_face, final_face)
-        score = 100.0 * evidence_confidence * final_quality * path_quality * balance * dent_health
-        score = float(score if math.isfinite(score) else 0.0)
-        return {
-            "spokes": {
-                name: float(final_face[idx])
-                for idx, name in enumerate(names)
-            },
-            "train_spokes": {
-                name: float(train_face[idx])
-                for idx, name in enumerate(names)
-            },
-            "spoke_status": status,
-            "derived_shape_features": {
-                "final_face_quality": float(final_quality),
-                "path_average_quality": float(path_quality),
-                "cross_axis_balance": float(balance),
-                "dent_health": float(dent_health),
-                "evidence_confidence": float(evidence_confidence),
-            },
-            "score": score,
-        }
-
-    def _threadspark_face(self,
-                          train_metrics: Dict[str, Any],
-                          surface_metrics: Dict[str, Any],
-                          candidate: Optional[Dict[str, Any]],
-                          *,
-                          drawdown_limit: float,
-                          surface_name: str) -> Tuple[np.ndarray, Dict[str, str]]:
-        has_evidence = max(0, int(surface_metrics.get("total_trades", 0) or 0)) >= self.min_val_trades
-        axes = self._surface_spoke_axes(
-            surface_metrics,
-            drawdown_limit=float(drawdown_limit or 1.0),
-        )
-        axes["generalization_survival"] = (
-            self._generalization_axis(train_metrics, surface_metrics)
-            if has_evidence else 0.0
-        )
-        stability, stability_status = self._parameter_stability_axis(candidate)
-        axes["parameter_stability"] = stability
-        _cost_value, cost_status = self._execution_cost_axis(surface_metrics)
-        status = {
-            "surface": surface_name,
-            "evidence": "available" if has_evidence else "thin_or_missing",
-            "execution_cost_survival": cost_status,
-            "parameter_stability": stability_status,
-        }
-        return np.asarray([axes[name] for name in self.THREADSPARK_SPOKES], dtype=np.float64), status
-
-    @staticmethod
-    def _cost_frequency_surface(metrics: Dict[str, Any], *, min_trades: int) -> Dict[str, float]:
-        trades = max(0, int(metrics.get("total_trades", 0) or 0))
-        ret = RegimeOptimizer._metric_float(metrics, "total_return_pct", 0.0)
-        pf = RegimeOptimizer._bounded_positive_metric(metrics, "profit_factor", default=0.0, inf_value=10.0, cap=10.0)
-        mean_r = RegimeOptimizer._metric_float(metrics, "mean_r", 0.0)
-        gross_profit = max(0.0, RegimeOptimizer._metric_float(metrics, "gross_profit", 0.0))
-        total_pnl = RegimeOptimizer._metric_float(metrics, "total_pnl", ret)
-        net_to_gross = max(0.0, min(1.0, total_pnl / gross_profit)) if gross_profit > 1e-9 else (1.0 if ret > 0.0 else 0.0)
-        target_trades = max(1, int(min_trades) * 2)
-        excess = max(0.0, (float(trades) - float(target_trades)) / float(target_trades))
-        edge_quality = (
-            0.40 * net_to_gross +
-            0.35 * RegimeOptimizer._smoothstep_score(mean_r, floor=0.0, ceiling=0.25) +
-            0.25 * RegimeOptimizer._smoothstep_score(pf, floor=1.0, ceiling=1.8)
-        )
-        return {
-            "trades": float(trades),
-            "target_trades": float(target_trades),
-            "excess_ratio": float(excess),
-            "net_to_gross": float(net_to_gross),
-            "mean_r": float(mean_r),
-            "profit_factor": float(pf),
-            "edge_quality": float(max(0.0, min(1.0, edge_quality))),
-        }
-
-    def _specialist_spokes_v2_cost_frequency_factor(self,
-                                                    train_metrics: Dict[str, Any],
-                                                    val_metrics: Dict[str, Any]) -> Dict[str, Any]:
-        val_trades = max(0, int(val_metrics.get("total_trades", 0) or 0))
-        val_has_evidence = val_trades >= self.min_val_trades
-        train_surface = self._cost_frequency_surface(train_metrics, min_trades=self.min_train_trades)
-        validation_surface = (
-            self._cost_frequency_surface(val_metrics, min_trades=self.min_val_trades)
-            if val_has_evidence else None
-        )
-        strength = float(getattr(self.config, "specialist_spokes_v2_cost_frequency_strength", 0.50) or 0.0)
-
-        def _surface_factor(surface: Dict[str, float]) -> float:
-            weakness = max(0.0, 0.75 - float(surface["edge_quality"])) / 0.75
-            excess_pressure = min(1.0, float(surface["excess_ratio"]))
-            factor = 1.0 - strength * excess_pressure * weakness
-            return float(max(0.35, min(1.0, factor)))
-
-        train_factor = _surface_factor(train_surface)
-        validation_factor = _surface_factor(validation_surface) if validation_surface is not None else 1.0
-        factor = min(train_factor, validation_factor)
-        limiting_surface = "train" if train_factor <= validation_factor else "validation"
-        active_surface = validation_surface if val_has_evidence else train_surface
-        return {
-            **dict(active_surface),
-            "surface": "validation" if val_has_evidence else "train",
-            "strength": float(strength),
-            "train": {**train_surface, "factor": train_factor},
-            "validation": (
-                {**validation_surface, "factor": validation_factor}
-                if validation_surface is not None else None
-            ),
-            "limiting_surface": limiting_surface,
-            "factor": float(factor),
-        }
-
-    def _compute_specialist_spoke_v2_evidence(self,
-                                              train_metrics: Dict[str, Any],
-                                              val_metrics: Dict[str, Any],
-                                              candidate: Optional[Dict[str, Any]] = None
-                                              ) -> Dict[str, Any]:
-        evidence = self._compute_specialist_spoke_evidence(train_metrics, val_metrics, candidate)
-        cost_frequency = self._specialist_spokes_v2_cost_frequency_factor(train_metrics, val_metrics)
-        base_score = float(evidence.get("score", 0.0) or 0.0)
-        score = base_score * float(cost_frequency["factor"])
-        evidence["score"] = float(score if math.isfinite(score) else 0.0)
-        evidence["derived_shape_features"] = {
-            **dict(evidence.get("derived_shape_features", {}) or {}),
-            "base_old_spoke_score": float(base_score),
-            "cost_frequency_factor": float(cost_frequency["factor"]),
-        }
-        evidence["cost_frequency_evidence"] = cost_frequency
         return evidence
 
     def _compute_train_regime_score(
@@ -10916,8 +10131,8 @@ class RegimeOptimizer:
     ) -> float:
         """One-surface score for B0, shortlist, and train-only studies.
 
-        Final configured scoring models may use tuning/generalization spokes;
-        those are intentionally unavailable before parameters are frozen.
+        The canonical final score uses tuning/generalization evidence; that
+        evidence is intentionally unavailable before parameters are frozen.
         """
         metrics = dict(train_metrics or {})
         trades = float(
@@ -13144,97 +12359,6 @@ class OptimizationPipeline:
             default_config.promotion_status = status
             default_config.promotion_reasons = reasons
 
-    @staticmethod
-    def _historical_severe_reasons(cfg: RegimeConfig) -> List[str]:
-        historical = dict(getattr(cfg, "historical_audit_metrics", {}) or {})
-        reasons: List[str] = []
-        if bool(historical.get("severe_failure", False)):
-            reasons.extend(str(reason) for reason in historical.get("failure_reasons", []) or [])
-        return reasons
-
-    @staticmethod
-    def _regime_profitability_severe_reasons(cfg: RegimeConfig) -> List[str]:
-        historical = dict(getattr(cfg, "historical_audit_metrics", {}) or {})
-        reasons: List[str] = []
-        regime_audit = historical.get("regime_profitability_audit")
-        if isinstance(regime_audit, dict) and bool(regime_audit.get("severe_failure", False)):
-            reasons.extend(str(reason) for reason in regime_audit.get("warnings", []) or [])
-        return reasons
-
-    def _v2_holdout_quality_reasons(self, cfg: RegimeConfig) -> List[str]:
-        holdout = dict(getattr(cfg, "holdout_metrics", {}) or {})
-        policy = str(getattr(self.config, "false_discovery_holdout_policy", "off") or "off").lower()
-        split_mode = str(getattr(self.config, "production_split_mode", "bleeding_edge") or "bleeding_edge").lower()
-        if split_mode == "bleeding_edge" and not holdout:
-            return []
-        if policy == "off":
-            return []
-        min_trades = int(getattr(self.config, "false_discovery_holdout_min_trades", 5) or 0)
-        if str(holdout.get("validation_mode", "") or "").lower() == "purged_kfold":
-            min_trades = int(getattr(self.config, "oos_min_trades", min_trades) or 0)
-        trades = int(holdout.get("total_trades", 0) or 0)
-        reasons: List[str] = []
-        if 0 < min_trades and trades < min_trades:
-            reasons.append(f"holdout trades {trades} < {min_trades}")
-        if str(holdout.get("policy_status", "") or "").upper() == "FAIL":
-            reasons.append(str(holdout.get("policy_reason", "") or "purged-kfold OOS policy failed"))
-        if trades >= min_trades > 0:
-            pf = float(holdout.get("profit_factor", 0.0) or 0.0)
-            ret = float(holdout.get("total_return_pct", 0.0) or 0.0)
-            min_pf = float(getattr(self.config, "false_discovery_holdout_min_profit_factor", 1.0) or 0.0)
-            min_ret = float(getattr(self.config, "false_discovery_holdout_min_return_pct", 0.0) or 0.0)
-            if pf < min_pf:
-                reasons.append(f"holdout PF {pf:.2f} < {min_pf:.2f}")
-            if ret < min_ret:
-                reasons.append(f"holdout return {ret:.1f}% < {min_ret:.1f}%")
-        return reasons
-
-    def _v2_default_rejection_reasons(self,
-                                      cfg: Optional[RegimeConfig],
-                                      *,
-                                      allow_promote_small: Optional[bool] = None) -> List[str]:
-        if cfg is None or cfg.is_no_trade_marker():
-            return ["no trade marker"]
-        reasons: List[str] = []
-        status = str(getattr(cfg, "promotion_status", "BLOCKED") or "BLOCKED").upper()
-        allow_small = (
-            bool(getattr(self.config, "specialist_spokes_v2_allow_promote_small_default", True))
-            if allow_promote_small is None else bool(allow_promote_small)
-        )
-        if status == "BLOCKED":
-            reasons.append("promotion BLOCKED")
-        elif status == "PROMOTE_SMALL" and not allow_small:
-            reasons.append("promotion PROMOTE_SMALL not allowed for v2 default")
-        historical_severe_reasons = self._historical_severe_reasons(cfg)
-        holdout_reasons = self._v2_holdout_quality_reasons(cfg)
-        if historical_severe_reasons and holdout_reasons:
-            reasons.append("historical severe confirmed by weak holdout")
-            reasons.extend(historical_severe_reasons)
-            reasons.extend(holdout_reasons)
-        regime_severe_reasons = self._regime_profitability_severe_reasons(cfg)
-        if regime_severe_reasons and holdout_reasons:
-            reasons.append("regime severe confirmed by weak holdout")
-            reasons.extend(regime_severe_reasons)
-            reasons.extend(holdout_reasons)
-
-        evidence = dict(getattr(cfg, "validation_evidence", {}) or {})
-        false_discovery = dict(evidence.get("false_discovery", {}) or {})
-        max_val_sharpe = float(getattr(self.config, "specialist_spokes_v2_max_validation_sharpe", 0.0) or 0.0)
-        if max_val_sharpe > 0.0:
-            if false_discovery and "val_sharpe" in false_discovery:
-                val_sharpe = float(false_discovery.get("val_sharpe", 0.0) or 0.0)
-            else:
-                val_sharpe = float(
-                    (getattr(cfg, "val_metrics", {}) or {}).get(
-                        "sharpe_approx",
-                        (getattr(cfg, "val_metrics", {}) or {}).get("sharpe_ratio", 0.0),
-                    ) or 0.0
-                )
-            pbo_status = str(false_discovery.get("pbo_status", "") or "").lower()
-            if val_sharpe > max_val_sharpe and pbo_status in {"", "not_available", "unavailable"}:
-                reasons.append(f"validation Sharpe {val_sharpe:.2f} > {max_val_sharpe:.2f} with PBO unavailable")
-        return reasons
-
     def run_for_symbol(self, symbol: str) -> PipelineResult:
         """
         Run regime-aware optimization pipeline for a single symbol.
@@ -13825,39 +12949,12 @@ class OptimizationPipeline:
                 )
                 val_features_by_tf: Dict[str, pd.DataFrame] = {}
                 val_warmup_by_tf: Dict[str, int] = {}
-                selection_features_by_tf: Dict[str, pd.DataFrame] = {}
-                selection_warmup_by_tf: Dict[str, int] = {}
-                selection_surface_by_tf: Dict[str, str] = {}
-                scoring_model = str(getattr(self.config, "regime_scoring_model", "legacy") or "legacy").lower()
-                threadspark_surface = str(
-                    getattr(self.config, "threadspark_selection_surface", "validation") or "validation"
-                ).lower()
-                # A final lockbox is a one-shot verdict surface. It must never be
-                # exposed to a candidate-ranking model such as ThreadSpark.
-                if split_mode in {"chronological_lockbox_v1", CALENDAR_SPLIT_MODE}:
-                    threadspark_surface = "validation"
-                threadspark_history_scope = str(
-                    getattr(self.config, "threadspark_historical_cost_scope", "workflow") or "workflow"
-                ).lower()
-                threadspark_historical_features = historical_features
                 scored_validation_rows = max(
                     0, len(stage2_features) - validation_warmup_bars
                 )
                 if scored_validation_rows >= 50:
                     val_features_by_tf[tf] = stage2_features
                     val_warmup_by_tf[tf] = validation_warmup_bars
-                    selection_features_by_tf[tf] = stage2_features
-                    selection_warmup_by_tf[tf] = val_warmup_by_tf[tf]
-                    selection_surface_by_tf[tf] = "validation"
-
-                if (
-                    threadspark_surface == "clean_holdout"
-                    and holdout_start is not None
-                    and len(holdout_features) >= 50
-                ):
-                    selection_features_by_tf[tf] = holdout_features
-                    selection_warmup_by_tf[tf] = int((holdout_features.index < holdout_start).sum())
-                    selection_surface_by_tf[tf] = "clean_holdout"
 
                 with Timer(f"[{symbol}] [{tf}] Regime Optimization"):
                     tf_regime_configs, tf_default_config, tf_validated, tf_unvalidated = self.regime_optimizer.optimize_symbol(
@@ -13868,10 +12965,6 @@ class OptimizationPipeline:
                         train_warmup_by_tf=train_warmup_by_tf,
                         val_warmup_by_tf=val_warmup_by_tf,
                         eligibility_features_by_tf=eligibility_features_by_tf,
-                        selection_features_by_tf=selection_features_by_tf,
-                        selection_warmup_by_tf=selection_warmup_by_tf,
-                        selection_surface_by_tf=selection_surface_by_tf,
-                        historical_features_by_tf={tf: threadspark_historical_features} if len(threadspark_historical_features) >= 50 else {},
                         allowed_regimes_by_tf=(
                             {tf: fit_observed_by_tf[tf]}
                             if tf in fit_observed_by_tf

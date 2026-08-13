@@ -1,9 +1,9 @@
 ﻿# Scoring Design Spec â€” ThreadSpark Evidence-Tensor Selector
 
-Status: CANONICAL design spec (supersedes the prior "raw-count â†’ confidence term" draft, which
-was pre-spokes and is retired). Operational run state lives in `docs/ACTIVE_DISCOVERY_STATE.md`,
-which links here. Default production model stays `legacy` until ThreadSpark wins an honest
-like-for-like.
+Status: HISTORICAL research design. The ThreadSpark/spoke variants failed their
+like-for-like gates and were removed from the executable system on 2026-08-13.
+This file preserves the research reasoning; current production uses one fixed
+`legacy` scoring contract recorded in artifact provenance.
 
 Production split note: current production uses `production_split_mode="bleeding_edge"` with
 adjacent WFV and no clean holdout. Clean-holdout ThreadSpark surfaces in this document are
@@ -158,7 +158,7 @@ Tail axis now reads `r_block_downside_deviation` / `r_block_cvar` before falling
 
 | Flag | Default (universal `config.json`) | Historical honest research profile |
 |---|---|---|
-| `regime_scoring_model` | `legacy` | per-arm (`legacy` / `specialist_spokes` / `specialist_spokes_threadspark`) |
+| scoring contract | fixed `legacy` artifact provenance | retired experimental arms remain historical only |
 | `production_split_mode` | `bleeding_edge` | `research_clean_holdout` |
 | `walk_forward_validation_bars` | 50000 | 50000 |
 | `oos_embargo_bars` | 300 | 300 |

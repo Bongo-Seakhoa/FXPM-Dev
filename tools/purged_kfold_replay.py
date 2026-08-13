@@ -22,7 +22,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tools"))
 
 from benchmark import _git_head
-from pm_core import FeatureComputer, PipelineConfig
+from pm_core import FeatureComputer, PipelineConfig, strict_pipeline_config_kwargs
 from pm_pipeline import OptimizationPipeline, RegimeConfig
 
 
@@ -35,8 +35,7 @@ PROMOTE_ANCHORS = {
 def _load_pipeline_config(config_path: Path, *, splits: int, embargo_bars: int, min_trades: int) -> PipelineConfig:
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     pipe = payload.get("pipeline", {}) if isinstance(payload, dict) else {}
-    allowed = {field.name for field in fields(PipelineConfig)}
-    kwargs = {key: value for key, value in pipe.items() if key in allowed}
+    kwargs = strict_pipeline_config_kwargs(pipe)
     cfg = PipelineConfig(**kwargs)
     cfg.data_dir = REPO / str(getattr(cfg, "data_dir", "./data"))
     cfg.output_dir = REPO / "pm_outputs" / "experiments"

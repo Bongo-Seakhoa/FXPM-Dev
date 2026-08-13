@@ -65,7 +65,7 @@ The old clean-holdout design is retained only as explicit `production_split_mode
 
 ## Code Map
 
-- `config.json`: production split is now explicit with `production_split_mode="bleeding_edge"`, `walk_forward_validation_bars=50000`, `active_stage2_pct=50.0`, `clean_holdout_pct=0.0`, `threadspark_selection_surface="validation"`, and `false_discovery_holdout_policy="off"`.
+- `config.json`: production split is explicit with `production_split_mode="bleeding_edge"`, `walk_forward_validation_bars=50000`, `active_stage2_pct=50.0`, `clean_holdout_pct=0.0`, and `false_discovery_holdout_policy="off"`. Scoring is now a fixed canonical code path rather than a configurable ThreadSpark surface.
 - `pm_core.py`: `PipelineConfig` normalizes the new split fields. `DataSplitter.SPLIT_CONTRACT_VERSION` was bumped to invalidate stale ledgers/artifacts, and `DataSplitter` now emits `base_selection`, `walk_forward_validation`, `optimization_train`, and empty production `clean_holdout`.
 - `pm_pipeline.py`: artifact metadata includes the split mode and walk-forward validation bar count. Pipeline slicing now passes separate full-active eligibility features, latest-half optimization features, and prior-window validation features.
 - `RegimeOptimizer`: candidate collection now uses the broad eligibility surface for screening/gates and top-K strategy discovery, while stored train metrics and tuning remain on the bleeding-edge optimization surface.

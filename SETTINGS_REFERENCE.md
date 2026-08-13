@@ -7,6 +7,11 @@ Visual split confirmation: `docs/audit/production_split_process_20260609.html`.
 
 Use this as the reference for the live codebase. The `Default` column documents code defaults unless a row says otherwise. The checked-in `config.json` is the active repo profile and may intentionally override those defaults.
 
+The scorer is a fixed code contract, not a configuration choice. Retired
+`regime_scoring_model`, ThreadSpark, and specialist-spoke keys fail closed at
+every active config boundary. Historical books retain a literal `legacy`
+artifact-provenance field for compatibility and drift rejection.
+
 ---
 
 ## 1. Root-Level Settings
@@ -46,7 +51,6 @@ The pipeline uses the active-recent M5 workflow exclusively. The bar counts belo
 | `production_split_mode` | enum | `"bleeding_edge"` | `"bleeding_edge"` | Production split contract. `"bleeding_edge"` disables production clean holdout, optimizes on the newest active half, and uses the prior window for adjacent walk-forward validation. `"research_clean_holdout"` retains the academic clean-holdout split for explicit research profiles. |
 | `walk_forward_validation_bars` | int | `50000` | `50000` | Base M5 bars immediately before the bleeding-edge optimization half used as adjacent walk-forward validation. |
 | `clean_holdout_pct` | float | `0.0` | `0.0` | Research-only newest holdout percentage. Production keeps this at zero so the freshest active bars remain available to optimization. |
-| `threadspark_selection_surface` | enum | `"validation"` | `"validation"` | Final evidence surface for ThreadSpark-style scoring. Production points this at adjacent WFV/validation, not clean holdout. |
 | `false_discovery_holdout_policy` | enum | `"off"` | `"off"` | Clean-holdout gate policy. Production turns this off because production clean holdout is intentionally empty; the WFV promotion gate remains active through `walk_forward_promotion_policy`. |
 | `overlap_pct` | float | `10.0` | `10.0` | Warmup window expressed as a percentage of the active universe size. Bars in the warmup are not scored. |
 

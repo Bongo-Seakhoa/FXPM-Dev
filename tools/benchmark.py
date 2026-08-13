@@ -6,7 +6,6 @@ baseline JSON used as the Tenet-5 improvement gate. Read-only against the engine
 """
 import json, sys, math, argparse, subprocess
 from pathlib import Path
-from dataclasses import fields
 import numpy as np
 
 
@@ -21,7 +20,14 @@ def _git_head():
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from pm_core import PipelineConfig, DataLoader, FeatureComputer, Backtester, get_instrument_spec
+from pm_core import (
+    Backtester,
+    DataLoader,
+    FeatureComputer,
+    PipelineConfig,
+    get_instrument_spec,
+    strict_pipeline_config_kwargs,
+)
 from pm_metrics import return_drawdown_metrics, round_metric
 from pm_strategies import StrategyRegistry
 from pm_symbol import is_fiat_fx_symbol
@@ -46,8 +52,7 @@ def is_fx(symbol):
 def build_config(spread_mode="fixed_spec"):
     cfg_json = json.load(open(REPO / "config.json"))
     pipe = cfg_json.get("pipeline", {})
-    allowed = {f.name for f in fields(PipelineConfig)}
-    kw = {k: v for k, v in pipe.items() if k in allowed}
+    kw = strict_pipeline_config_kwargs(pipe)
     kw["data_dir"] = str(REPO / "data")
     rp = kw.get("regime_params_file", "regime_params.json")
     kw["regime_params_file"] = str(REPO / rp)

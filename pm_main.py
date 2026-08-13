@@ -237,6 +237,8 @@ def _live_file_identity(path: Path) -> tuple[bool, str]:
 
 def _filter_dataclass_kwargs(cls, data: Dict[str, Any]) -> Dict[str, Any]:
     """Filter dict keys to those accepted by a dataclass constructor."""
+    if cls is PipelineConfig:
+        return strict_pipeline_config_kwargs(data or {})
     allowed = {f.name for f in fields(cls)}
     return {k: v for k, v in (data or {}).items() if k in allowed}
 
@@ -252,6 +254,7 @@ def _normalize_storage_section_for_pipeline(data: Dict[str, Any]) -> Dict[str, A
     payload = dict(data or {})
     if not payload:
         return {}
+    reject_retired_scoring_config_keys(payload)
     allowed = {f.name for f in fields(PipelineConfig)}
     normalized: Dict[str, Any] = {}
     for key, value in payload.items():
@@ -424,8 +427,8 @@ def _is_research_discovery_only_config(config_data: Dict[str, Any]) -> bool:
 FUNDED_LIVE_CONFIG_SCOPE = "funded_live_v1"
 
 # Versioned, positive configuration surface for funded production.  The
-# research dataclasses intentionally retain historical knobs for reproducible
-# experiments, but those knobs must not silently become funded-live behavior.
+# research dataclasses retain unrelated historical knobs for reproducible
+# experiments, but retired scoring regimes are no longer executable anywhere.
 # Adding a new production knob therefore requires an explicit contract review
 # here instead of being admitted merely because somebody added a dataclass
 # field.  These are the keys shipped by config.json after fixed invariants and
@@ -501,7 +504,7 @@ FUNDED_PIPELINE_CONFIG_KEYS = frozenset(
     regime_enable_hyperparam_tuning regime_hyperparam_max_combos
     regime_hyperparam_top_k regime_min_train_trades
     regime_min_val_profit_factor regime_min_val_return_pct
-    regime_min_val_trades regime_params_file regime_scoring_model
+    regime_min_val_trades regime_params_file
     regime_timeframe_val_trade_floors
     regime_timeframe_val_trade_floors_enabled regime_trade_stability_floor
     scoring_use_consistency scoring_use_continuous_dd scoring_use_sortino_blend
@@ -539,12 +542,9 @@ FUNDED_POSITION_CONFIG_KEYS = frozenset(
     }
 )
 
-# Evidence-backed funded invariants. Alternate scoring models and purged-kfold
-# workflows remain constructible for research, but all completed honest
-# per-cell comparisons retained frequency-off legacy as the production scorer,
-# and the native two-phase contract requires one fixed final lockbox.
+# Evidence-backed funded invariant. The scorer itself now has one code-owned
+# path, while the native two-phase contract still requires one fixed lockbox.
 FUNDED_FIXED_PIPELINE_VALUES = {
-    "regime_scoring_model": "legacy",
     "oos_validation_mode": "fixed_holdout",
 }
 
@@ -772,6 +772,8 @@ def log_resolved_config_summary(
 
 from pm_core import (
     PipelineConfig,
+    reject_retired_scoring_config_keys,
+    strict_pipeline_config_kwargs,
     DataLoader,
     FeatureComputer,
     Timer,

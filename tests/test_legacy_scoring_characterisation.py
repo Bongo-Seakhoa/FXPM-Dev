@@ -1,15 +1,4 @@
-"""Pin what _compute_regime_score returns under the production scoring model.
-
-Production sets `regime_scoring_model = "legacy"`, and legacy is the FALLTHROUGH:
-every branch in that method tests for a non-legacy value, so under production all
-of them are skipped. Removing the dead branches must therefore leave every score
-byte-identical.
-
-This characterises the current behaviour BEFORE the branches are deleted, so the
-deletion is provably output-preserving rather than argued to be. Written to pass
-against unchanged code first — a test that only agrees with the new code proves
-nothing.
-"""
+"""Pin the exact outputs of FXPM's one canonical production scorer."""
 
 import unittest
 
@@ -48,6 +37,18 @@ CASES = [
     ("flat", {}, {"profit_factor": 1.0, "total_return_pct": 0.0, "sharpe_ratio": 0.0}),
 ]
 
+GOLDEN_HEX = {
+    "healthy": "0x1.c2ffbda9a7721p+3",
+    "thin_val": "0x1.b26df8603c275p+3",
+    "thin_train": "0x1.b9d6c75a0b6d3p+3",
+    "losing_val": "0x1.46ad7255d4cfdp+3",
+    "zero_trades_val": "0x1.f2ce0ca59f151p+2",
+    "deep_dd": "-0x1.a3f8f73eecddfp+1",
+    "high_sharpe": "0x1.72a9a761c8385p+4",
+    "negative_sharpe": "0x1.2dce7f926a159p+3",
+    "flat": "0x1.0fd51103f74d1p+3",
+}
+
 
 class LegacyScoringCharacterisation(unittest.TestCase):
     @classmethod
@@ -55,31 +56,13 @@ class LegacyScoringCharacterisation(unittest.TestCase):
         cls.config = pm_core.PipelineConfig()
         cls.optimizer = pm_pipeline.RegimeOptimizer(cls.config)
 
-    def test_production_resolves_to_legacy(self):
-        """The premise of the deletion: production is the fallthrough path."""
-        self.assertEqual(
-            str(getattr(self.config, "regime_scoring_model", "legacy")).lower(),
-            "legacy",
-        )
-
-    def test_scores_are_finite_and_ordered_sensibly(self):
-        """Characterises real behaviour, not just 'it returns a number'."""
-        scores = {}
+    def test_all_nine_scores_match_exact_legacy_goldens(self):
         for name, train_over, val_over in CASES:
             train, val = _metrics(**train_over), _metrics(**val_over)
             candidate = {"strategy_name": "EMACrossoverStrategy", "params": {}}
             score = self.optimizer._compute_regime_score(train, val, candidate)
-            scores[name] = float(score)
-
-        # A healthy cell must not score below a losing one, and a cell with no
-        # validation trades must not outscore a healthy one. These are the
-        # invariants a scoring change could silently break.
-        self.assertGreaterEqual(scores["healthy"], scores["losing_val"])
-        self.assertGreaterEqual(scores["healthy"], scores["zero_trades_val"])
-        self.assertGreaterEqual(scores["healthy"], scores["deep_dd"])
-        for name, value in scores.items():
             with self.subTest(case=name):
-                self.assertFalse(value != value, "score is NaN")
+                self.assertEqual(float(score).hex(), GOLDEN_HEX[name])
 
     def test_scores_are_deterministic(self):
         train, val = _metrics(), _metrics()
@@ -87,6 +70,44 @@ class LegacyScoringCharacterisation(unittest.TestCase):
         first = self.optimizer._compute_regime_score(train, val, candidate)
         second = self.optimizer._compute_regime_score(train, val, candidate)
         self.assertEqual(first, second)
+
+    def test_governed_validation_evidence_uses_effective_counts_and_fixed_policy(self):
+        captured = {}
+        optimizer = pm_pipeline.RegimeOptimizer(pm_core.PipelineConfig())
+
+        def robustness(train, val, *, purpose):
+            captured["counts"] = (train["total_trades"], val["total_trades"])
+            captured["purpose"] = purpose
+            return 1.0
+
+        optimizer.scorer.calculate_fx_score_robustness_ratio = robustness
+        train, val = _metrics(total_trades=10_000), _metrics(total_trades=8_000)
+        candidate = {
+            "candidate_id": "canonical-cell",
+            "strategy_name": "MissingFixtureStrategy",
+            "params": {},
+            "trade_power_contract_enforced": True,
+            "trade_power_train": {"observed_effective_trades": 17.0},
+            "trade_power_validation": {"observed_effective_trades": 11.0},
+        }
+
+        evidence = optimizer._build_validation_evidence(
+            train,
+            val,
+            candidate=candidate,
+        )
+
+        self.assertEqual(captured, {"counts": (17.0, 11.0), "purpose": "selection"})
+        self.assertEqual(evidence["candidate_id"], "canonical-cell")
+        self.assertEqual(
+            evidence["fresh_edge_policy"],
+            {
+                "winner_source": "active_recent_stage3",
+                "no_fallback_to_best_train": True,
+                "holdout_does_not_displace_latest_surface": True,
+            },
+        )
+        self.assertNotIn("legacy_confidence", evidence)
 
     def test_degenerate_inputs_behave_as_they_do_today(self):
         """Characterisation, not aspiration.

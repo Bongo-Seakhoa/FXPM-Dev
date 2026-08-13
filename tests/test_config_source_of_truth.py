@@ -6,7 +6,7 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 
-from pm_core import PipelineConfig
+from pm_core import PipelineConfig, RETIRED_SCORING_CONFIG_KEYS
 from pm_main import (
     ACTIONABLE_SCHEMA_VERSION,
     FUNDED_FIXED_PIPELINE_VALUES,
@@ -213,7 +213,7 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertTrue(
             FUNDED_PIPELINE_CONFIG_KEYS.issubset(PipelineConfig.__dataclass_fields__)
         )
-        self.assertEqual(len(FUNDED_PIPELINE_CONFIG_KEYS), 158)
+        self.assertEqual(len(FUNDED_PIPELINE_CONFIG_KEYS), 157)
         self.assertLess(len(FUNDED_PIPELINE_CONFIG_KEYS), len(PipelineConfig.__dataclass_fields__))
 
     def test_funded_schema_admits_only_named_raw_capital_policy_surface(self):
@@ -276,11 +276,6 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
             ("fx_selection_top_k", 1),
             ("fx_opt_top_k", 1),
             ("oos_min_trades", 1),
-            ("legacy_confidence_bonus_cap", 0.5),
-            ("threadspark_selection_surface", "clean_holdout"),
-            ("threadspark_use_historical_cost_evidence", False),
-            ("threadspark_historical_cost_scope", "workflow"),
-            ("threadspark_historical_chunk_count", 2),
             ("promote_small_risk_multiplier", 0.5),
         ):
             payload = {
@@ -292,8 +287,8 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
             ):
                 _validate_funded_config_schema(payload)
 
-        # The same fields remain constructor-compatible for historical and
-        # research reproduction outside the funded profile.
+        # The remaining research fields stay constructor-compatible outside
+        # the funded profile. Retired scoring controls are tested separately.
         research = PipelineConfig(
             research_mode=True,
             production_split_mode="bleeding_edge",
@@ -318,45 +313,57 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertEqual(research.oos_embargo_bars, 2)
         self.assertEqual(research.oos_aggregate_policy, "all_folds")
 
-    def test_funded_scoring_and_oos_models_are_fixed_but_research_remains_open(self):
+    def test_scoring_regime_settings_are_retired_and_oos_remains_fixed(self):
         self.assertEqual(
             FUNDED_FIXED_PIPELINE_VALUES,
-            {
-                "regime_scoring_model": "legacy",
-                "oos_validation_mode": "fixed_holdout",
-            },
+            {"oos_validation_mode": "fixed_holdout"},
         )
-        for key, bad_value in (
-            ("regime_scoring_model", "specialist_spokes_threadspark"),
-            ("oos_validation_mode", "purged_kfold"),
-        ):
+        self.assertEqual(len(RETIRED_SCORING_CONFIG_KEYS), 10)
+        self.assertTrue(
+            RETIRED_SCORING_CONFIG_KEYS.isdisjoint(
+                PipelineConfig.__dataclass_fields__
+            )
+        )
+        self.assertTrue(
+            RETIRED_SCORING_CONFIG_KEYS.isdisjoint(FUNDED_PIPELINE_CONFIG_KEYS)
+        )
+        for key in RETIRED_SCORING_CONFIG_KEYS:
             payload = {
                 "_meta": {"scope": "funded_live_v1"},
-                "pipeline": {key: bad_value},
+                "pipeline": {key: "retired"},
             }
             with self.subTest(key=key), self.assertRaisesRegex(
                 ValueError,
-                "is fixed to",
+                "unsupported funded-live pipeline",
             ):
                 _validate_funded_config_schema(payload)
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ValueError,
+                "retired scoring config keys",
+            ):
+                _filter_dataclass_kwargs(PipelineConfig, {key: "retired"})
+
+        with self.assertRaisesRegex(ValueError, "is fixed to"):
+            _validate_funded_config_schema(
+                {
+                    "_meta": {"scope": "funded_live_v1"},
+                    "pipeline": {"oos_validation_mode": "purged_kfold"},
+                }
+            )
 
         funded = PipelineConfig(
             research_mode=True,
-            regime_scoring_model="specialist_spokes_threadspark",
             oos_validation_mode="purged_kfold",
         )
         _apply_funded_pipeline_contract(
             {"_meta": {"scope": "funded_live_v1"}},
             funded,
         )
-        self.assertEqual(funded.regime_scoring_model, "legacy")
         self.assertEqual(funded.oos_validation_mode, "fixed_holdout")
         research = PipelineConfig(
             research_mode=True,
-            regime_scoring_model="specialist_spokes_threadspark",
             oos_validation_mode="purged_kfold",
         )
-        self.assertEqual(research.regime_scoring_model, "specialist_spokes_threadspark")
         self.assertEqual(research.oos_validation_mode, "purged_kfold")
 
     def test_funded_schema_rejects_dormant_position_management_branches(self):

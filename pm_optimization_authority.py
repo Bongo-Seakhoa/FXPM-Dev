@@ -8,7 +8,7 @@ import json
 import math
 import os
 import stat
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional, Sequence
@@ -3002,15 +3002,21 @@ def verify_live_readiness_authority_chain(
 
 
 def _pipeline_config(config_payload: Mapping[str, Any], config_path: Path) -> Any:
-    from pm_core import PipelineConfig
+    from pm_core import (
+        PipelineConfig,
+        RetiredScoringConfigError,
+        strict_pipeline_config_kwargs,
+    )
 
     pipeline = config_payload.get("pipeline")
     if type(pipeline) is not dict:
         raise _Invalid("CONFIG_PIPELINE_NOT_OBJECT")
-    allowed = {item.name for item in fields(PipelineConfig)}
-    config = PipelineConfig(
-        **{key: value for key, value in pipeline.items() if key in allowed}
-    )
+    try:
+        config = PipelineConfig(**strict_pipeline_config_kwargs(pipeline))
+    except RetiredScoringConfigError as exc:
+        raise _Invalid(
+            "CONFIG_RETIRED_SCORING_KEY:" + ",".join(exc.keys)
+        ) from exc
     setattr(config, "_deployment_config_path", str(config_path))
     return config
 

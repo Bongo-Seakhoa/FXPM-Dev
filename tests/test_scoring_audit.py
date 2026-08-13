@@ -239,7 +239,7 @@ class TestDDHardGateInvariants(unittest.TestCase):
         self.assertTrue(cfg.scoring_use_tail_risk)
         self.assertTrue(cfg.scoring_use_consistency)
         self.assertFalse(cfg.scoring_use_trade_frequency_bonus)
-        self.assertAlmostEqual(cfg.legacy_confidence_bonus_cap, 0.08)
+        self.assertFalse(hasattr(cfg, "legacy_confidence_bonus_cap"))
 
 
 class TestOptunaBlendKnobsRemoved(unittest.TestCase):

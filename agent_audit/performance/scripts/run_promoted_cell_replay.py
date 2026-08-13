@@ -12,7 +12,6 @@ import csv
 import json
 import math
 import sys
-from dataclasses import fields
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
@@ -20,7 +19,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Tuple
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
-from pm_core import Backtester, DataLoader, FeatureComputer, PipelineConfig, get_instrument_spec
+from pm_core import (
+    Backtester,
+    DataLoader,
+    FeatureComputer,
+    PipelineConfig,
+    get_instrument_spec,
+    strict_pipeline_config_kwargs,
+)
 from pm_strategies import StrategyRegistry
 
 
@@ -124,8 +130,7 @@ def gate_signals_to_cell_regime(signals: Any,
 def _pipeline_config(config_path: Path, starting_balance: float) -> PipelineConfig:
     payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
     pipe = dict(payload.get("pipeline") or {})
-    allowed = {field.name for field in fields(PipelineConfig)}
-    kwargs = {key: value for key, value in pipe.items() if key in allowed}
+    kwargs = strict_pipeline_config_kwargs(pipe)
     kwargs["data_dir"] = str((config_path.parent / str(kwargs.get("data_dir", "data"))).resolve())
     regime_file = kwargs.get("regime_params_file", "regime_params.json")
     kwargs["regime_params_file"] = str((config_path.parent / str(regime_file)).resolve())

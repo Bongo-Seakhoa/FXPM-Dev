@@ -22,7 +22,6 @@ import math
 import os
 import sys
 from collections import defaultdict
-from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -40,6 +39,7 @@ from pm_core import (  # noqa: E402
     FeatureComputer,
     PipelineConfig,
     _create_spec_from_broker_data,
+    strict_pipeline_config_kwargs,
 )
 from pm_portfolio_replay import (  # noqa: E402
     MTM_MARK_COST_CONTRACT_VERSION,
@@ -155,8 +155,7 @@ def _sha256(path: Path) -> str:
 def _pipeline_config(config_path: Path, starting_balance: float = 10_000.0) -> Tuple[PipelineConfig, Dict[str, Any]]:
     payload = json.loads(config_path.read_text(encoding="utf-8-sig"))
     pipe = dict(payload.get("pipeline") or {})
-    allowed = {item.name for item in fields(PipelineConfig)}
-    kwargs = {key: value for key, value in pipe.items() if key in allowed}
+    kwargs = strict_pipeline_config_kwargs(pipe)
     kwargs["data_dir"] = str((config_path.parent / str(kwargs.get("data_dir", "data"))).resolve())
     regime_path = Path(str(kwargs.get("regime_params_file", "regime_params.json")))
     if not regime_path.is_absolute():

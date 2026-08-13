@@ -14,7 +14,6 @@ import argparse
 import copy
 import json
 import sys
-from dataclasses import fields
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
@@ -25,7 +24,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from pm_core import FeatureComputer, PipelineConfig  # noqa: E402
+from pm_core import (  # noqa: E402
+    FeatureComputer,
+    PipelineConfig,
+    strict_pipeline_config_kwargs,
+)
 from pm_model_lifecycle import (  # noqa: E402
     EDGE_CHALLENGER_ROLE,
     build_empty_edge_challenger_book,
@@ -43,9 +46,8 @@ from pm_two_phase_lockbox import (  # noqa: E402
 
 
 def _pipeline_config(config_path: Path, payload: Mapping[str, Any]) -> PipelineConfig:
-    allowed = {field.name for field in fields(PipelineConfig)}
     pipeline = dict(payload.get("pipeline") or {})
-    cfg = PipelineConfig(**{key: value for key, value in pipeline.items() if key in allowed})
+    cfg = PipelineConfig(**strict_pipeline_config_kwargs(pipeline))
     cfg._deployment_config_path = str(config_path.resolve())
     return cfg
 

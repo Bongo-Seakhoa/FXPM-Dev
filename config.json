@@ -21,7 +21,6 @@
     "discovery_risk_per_trade_pct": 1,
     "slippage_pips": 0.5,
     "backtest_spread_mode": "conservative_max",
-    "regime_scoring_model": "legacy",
     "production_split_mode": "calendar_lockbox_v2",
     "evidence_sufficiency_enabled": true,
     "evidence_require_native_timeframes": true,

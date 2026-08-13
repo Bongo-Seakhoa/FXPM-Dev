@@ -65,10 +65,6 @@ CONDITIONALLY_INACTIVE_KEYS = {
     "local_governance_tournament_enabled": "disabled in the shipped profile",
     "promote_small_risk_multiplier": "PROMOTE_SMALL is not admitted live",
     "risk_management_optimization_enabled": "disabled in the shipped profile",
-    "threadspark_historical_chunk_count": "funded selector is not ThreadSpark",
-    "threadspark_historical_cost_scope": "funded selector is not ThreadSpark",
-    "threadspark_selection_surface": "funded selector is not ThreadSpark",
-    "threadspark_use_historical_cost_evidence": "funded selector is not ThreadSpark",
 }
 
 

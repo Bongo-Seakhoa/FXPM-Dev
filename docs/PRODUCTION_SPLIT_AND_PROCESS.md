@@ -48,7 +48,6 @@ the freshest market-adjacent data instead of withholding the bleeding edge.
 | `walk_forward_promotion_policy` | `"promotion_gate"` |
 | `walk_forward_live_blocking_enabled` | `true` |
 | `false_discovery_holdout_policy` | `"off"` |
-| `threadspark_selection_surface` | `"validation"` |
 | `oos_embargo_bars` | `300` |
 | `optimization_max_workers` | `4` |
 

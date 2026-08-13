@@ -181,7 +181,7 @@ on regime-gated honest history.
   telemetry is a non-OK status with warning/critical exit codes.
 
 ### 5.3 Clean-coding hygiene
-- `[x]` Bare `except:` / silent passes in touched surfaces; configs self-document `regime_scoring_model`.
+- `[x]` Bare `except:` / silent passes in touched surfaces; artifacts record the fixed canonical scoring contract as `legacy`.
 - `[ ]` Remaining 2 benign `except Exception: pass` (pm_core:5219, pm_pipeline:2086) — low priority.
 - `[ ]` Extract `_coerce_int/_coerce_float` helpers for the ~40 config-coercion blocks (maintainability; narrow excepts to `(TypeError, ValueError)`).
 
@@ -195,7 +195,7 @@ on regime-gated honest history.
 - `[x]` Named regression fixture principle: a mixed fixture with one great specialist (+460%) and one bad churner (-50%, 1132 trades) cannot pass by aggregation; the bad cell remains a blocker.
 - `[x]` Encode the pre-registered per-cell carrier gate as an automated comparison check: taxonomy now covers `GAINED_GOOD_CARRIER`, `RETAINED_SAME_GOOD_CARRIER`, `REPLACED_WITH_GOOD_CARRIER`, `NEW_BAD_CARRIER`, `RETAINED_BAD_CARRIER`, `DROPPED_BAD_CARRIER`, `NO_TRADE_BOTH`, and blockers.
 - `[x]` Circular-feature guard: full-history outcome fields (`full_history_return_pct`, `profit_factor`, `sharpe`, `max_dd_pct`, `trades`) are forbidden as meta-label predictors; requesting them must fail.
-- `[x]` Production scorer config pins are test-locked: `regime_scoring_model=legacy`, `scoring_use_trade_frequency_bonus=false`.
+- `[x]` Production scorer is a single test-locked `legacy` path; `scoring_use_trade_frequency_bonus=false` remains fixed.
 - `[x]` Reporting guardrail follow-up: completion/post-run monitors now cross-check promotion `PROMOTE` rows against the specialist-cell audit before emitting a promotable headline. The W5 `*_completion_report.md` "6 cleared" line remains a stale pre-gatefix artifact and is now marked as such; use the gatefix artifacts for W5 readiness.
 - `[x]` Keep the focused suite green; **no test-weakening without explicit sign-off** (watch for assertion edits alongside code).
 - `[x]` Production-readiness guardrail tests added for MT5 identity pinning, production promotion mismatch,

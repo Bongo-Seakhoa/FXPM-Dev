@@ -34,7 +34,6 @@ import math
 import os
 import shutil
 import uuid
-from dataclasses import fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
@@ -42,7 +41,12 @@ from itertools import product
 
 import pandas as pd
 
-from pm_core import DataLoader, DataSplitter, PipelineConfig
+from pm_core import (
+    DataLoader,
+    DataSplitter,
+    PipelineConfig,
+    strict_pipeline_config_kwargs,
+)
 from pm_evidence import (
     CALENDAR_SPLIT_MODE,
     EVIDENCE_CONTRACT_VERSION,
@@ -2107,11 +2111,9 @@ def main():
     try:
         config_payload = json.loads(config_path.read_text(encoding="utf-8"))
         pipeline_payload = config_payload.get("pipeline", config_payload)
-        allowed = {item.name for item in fields(PipelineConfig)}
-        pipeline_config = PipelineConfig(**{
-            key: value for key, value in dict(pipeline_payload or {}).items()
-            if key in allowed
-        })
+        pipeline_config = PipelineConfig(
+            **strict_pipeline_config_kwargs(dict(pipeline_payload or {}))
+        )
     except Exception as exc:
         logger.error(f"Failed to load pipeline split config from {config_path}: {exc}")
         return 2
