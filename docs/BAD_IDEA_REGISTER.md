@@ -63,6 +63,47 @@ Every change is classified before it lands:
 | **A — output-preserving** | Provably identical outputs. Bit-identical hashes, bit-identical metrics, identical error behaviour. | Speed alone is sufficient. |
 | **B — output-changing** | Changes any produced number, decision, or evidence. | **On accuracy or correctness grounds only.** Its speed effect is not admissible as justification, in either direction. |
 
+### Coverage is not a currency
+
+An operator direction, recorded as a standing preference rather than a fixed
+number, because it decides what "efficiency" is even allowed to mean here:
+
+> **Never reductionist.** More coverage is always preferred — more of the
+> hyperparameter field, more of the situations the system may face. Quality and
+> accuracy lead; efficiency follows them.
+
+This splits cheapening a search into two things that look alike on a stopwatch
+and are opposites in kind:
+
+| | What it does | Verdict |
+|---|---|---|
+| **Shrink the space** | Fewer candidates are *reachable*. Coverage falls. | Forbidden as an efficiency move. It is a quality decision wearing a speed argument. |
+| **Navigate the space better** | The same or a **larger** space is explored for fewer evaluations, with the optimum still found. | This is the target. |
+
+So the direction of travel is not fewer trials — it is **more candidate space at
+lower cost**, by searching it more intelligently. A method that expands the
+reachable field *and* reduces evaluations is a quality improvement and an
+efficiency improvement at once, and is the shape we are aiming at. A method that
+reaches the same optimum from a smaller sample is the same thing viewed from the
+other side, provided the optimum is genuinely still found — which is an evidence
+question, never an assumption.
+
+The operator offered a Bayesian/Optuna-style illustration of this shape and was
+explicit that it is **illustrative, not prescriptive**: no method is mandated
+here. What is mandated is the property — coverage preserved or increased,
+evaluations reduced, and the claim that the optimum is still found demonstrated
+with evidence rather than asserted.
+
+**Consequence for Class B.** A Class B change that *narrows* what the search can
+reach is inadmissible on speed grounds and must clear a high quality bar even on
+its own terms. A Class B change that *widens* coverage is legitimate even if it
+costs runtime, and is the preferred direction when the two conflict.
+
+**Consequence for Class A.** Pure overhead removal — machinery around the search
+rather than the search itself — is unconstrained by any of this, because it
+changes no output and touches no coverage. That is where every efficiency win in
+this program has come from so far, and it is the safe place to keep looking.
+
 **Worked example of a forbidden move**, stated by the operator: cutting the
 hyperparameter budget from 200 to 50 and reporting it as an efficiency win. It
 is a Class B change. It makes the search less likely to find the real best
@@ -147,6 +188,10 @@ inadmissible as justification.
 *No revival condition as an efficiency measure.* A change to the trial budget may
 only ever be proposed as a **quality** decision, with evidence about out-of-sample
 outcomes — in which case it is a different entry, argued on different grounds.
+*Note the asymmetry:* **raising** the budget, or widening the parameter field, is
+not this entry and needs no revival — it runs with the operator's stated
+preference and is limited only by whether the run completes. What is interred is
+trading reach for runtime, not revisiting the number.
 
 ### Dormant
 
