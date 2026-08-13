@@ -351,7 +351,8 @@ def test_scope_close_clears_cache_and_exception_exit_resets_context(
     assert native._PRODUCTION_NATIVE_AUTHORITY_SCOPE.get() is None
 
     outside = _resolve(data_dir)
-    assert outside is full_result
+    assert outside == full_result
+    assert outside is not full_result
     assert len(full_calls) == 2
     with pytest.raises(
         RuntimeError,
