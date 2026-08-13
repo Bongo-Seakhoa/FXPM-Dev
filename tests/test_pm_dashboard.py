@@ -47,6 +47,46 @@ def test_open_requests_require_a_directionally_valid_peer_response() -> None:
     assert dashboard.message_resolutions(bus)["CX-900"]["status"] == "answered"
 
 
+def test_same_pm_followup_replaces_only_the_earlier_open_request() -> None:
+    first = _message("XPM-900", "codex-pm", "claude-pm", "review_request")
+    second = _message(
+        "XPM-901",
+        "codex-pm",
+        "claude-pm",
+        "review_request",
+        refs=["XPM-900"],
+        ts="2026-08-13T10:01:00Z",
+    )
+    bus = [first, second]
+
+    resolutions = dashboard.message_resolutions(bus)
+    assert resolutions["XPM-900"]["status"] == "superseded"
+    assert resolutions["XPM-901"]["status"] == "open"
+    assert [row["id"] for row in dashboard.open_peer_requests(bus)] == ["XPM-901"]
+
+    peer_reply = _message(
+        "CPM-900",
+        "claude-pm",
+        "codex-pm",
+        "answer",
+        refs=["XPM-901"],
+        ts="2026-08-13T10:02:00Z",
+    )
+    bus.append(peer_reply)
+
+    assert dashboard.message_resolutions(bus)["XPM-901"]["status"] == "answered"
+    assert dashboard.open_peer_requests(bus) == []
+
+
+def test_same_sender_reference_to_another_target_does_not_supersede() -> None:
+    bus = [
+        _message("XPM-900", "codex-pm", "claude-pm", "review_request"),
+        _message("XPM-901", "codex-pm", "all", "status", refs=["XPM-900"]),
+    ]
+
+    assert dashboard.message_resolutions(bus)["XPM-900"]["status"] == "open"
+
+
 def test_plain_decisions_and_non_pm_requests_are_not_operator_queue_items() -> None:
     bus = [
         _message("CPM-012", "claude-pm", "codex-pm", "decision"),
@@ -99,7 +139,18 @@ def test_source_health_rejects_valid_json_with_wrong_schema(
 def test_current_bus_does_not_resurrect_known_closed_or_plain_decision_items() -> None:
     open_ids = {row["id"] for row in dashboard.open_peer_requests(dashboard.load_bus())}
 
-    assert not {"CPM-012", "CX-022", "CX-032", "CX-033"} & open_ids
+    assert not {
+        "CPM-012",
+        "CX-022",
+        "CX-032",
+        "CX-033",
+        "XPM-019",
+        "XPM-023",
+        "XPM-026",
+        "XPM-032",
+        "XPM-043",
+        "XPM-056",
+    } & open_ids
 
 
 def test_render_removes_withdrawn_runtime_arithmetic() -> None:

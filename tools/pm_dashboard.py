@@ -331,18 +331,28 @@ def message_resolutions(bus: list[dict]) -> dict[str, dict[str, str]]:
 
     A decision is a record, not automatically an unanswered question. A
     reciprocal, chronological ref is the machine-checkable closure signal.
+    A later message from the same sender to the same target supersedes an
+    earlier request that it directly references; it does not count as a peer
+    answer.
     """
 
     by_id = {str(message.get("id") or ""): message for message in bus}
     replies: dict[str, list[str]] = {}
+    superseded_by: dict[str, list[str]] = {}
     for message in bus:
         for reference in message.get("refs") or []:
             original = by_id.get(str(reference))
-            if original is None or message.get("from") == original.get("from"):
+            if original is None:
                 continue
             original_ts = parse_ts(original.get("ts"))
             response_ts = parse_ts(message.get("ts"))
             if original_ts and response_ts and response_ts < original_ts:
+                continue
+            if message.get("from") == original.get("from"):
+                if message.get("to") == original.get("to"):
+                    superseded_by.setdefault(str(reference), []).append(
+                        str(message.get("id") or "")
+                    )
                 continue
             original_target = original.get("to")
             if original_target not in {"all", message.get("from")}:
@@ -355,6 +365,9 @@ def message_resolutions(bus: list[dict]) -> dict[str, dict[str, str]]:
         if replies.get(message_id):
             status = "answered"
             note = "Answered by " + ", ".join(replies[message_id])
+        elif superseded_by.get(message_id):
+            status = "superseded"
+            note = "Superseded by " + ", ".join(superseded_by[message_id])
         else:
             status = "open"
             note = "Peer response required"
@@ -843,7 +856,7 @@ def render(*, live: bool = True) -> str:
           f"<td>{row['message_count']}</td></tr>")
     A("</table><div class='note'>The PM channel remains active even when operator-facing "
       "updates are sparse. “Open” here means a PM question, veto or review request with "
-      "no reciprocal, chronological reference.</div></div>")
+      "no reciprocal, chronological response and no later same-PM replacement.</div></div>")
 
     A("<h2>Risk register</h2><div class='panel wrap'><table>"
       "<tr><th>Risk</th><th>Severity</th><th>Detail</th></tr>")
