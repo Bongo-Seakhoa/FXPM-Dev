@@ -234,7 +234,16 @@ the June book these thresholds would have emptied the ledger — which the audit
 called the correct outcome. Trading resumes only once the search is wide enough to
 find something that clears them, i.e. after E2.
 
-### E7 — Optuna config keys `DECISION: pending`
+### E7 — Optuna config keys `DECISION: pending, PARTIALLY RE-FRAMED`
+
+> **Re-framed 2026-08-13.** The provenance argument below is **unaffected and still
+> decisive**: the seven keys are read by `build_artifact_meta` and compared by
+> live-readiness, so removing them changes recorded provenance and breaks the
+> contract against existing books. What is withdrawn is any *runtime* framing of
+> these keys: BI-4 established that the Optuna path they describe is the legacy
+> one, not the canonical executor, so they cannot be argued about on cost grounds.
+> Decide this on provenance alone.
+
 Seven keys are "functionally dead but contractually LIVE" — read by
 `build_artifact_meta` and compared by live-readiness for artifact drift
 (`docs/PROJECT_MILESTONES.md` M5). Removal was correctly dropped on 2026-07-21 when
@@ -379,7 +388,17 @@ A third coverage dimension alongside attempts/cell and per-strategy tuning.
 
 ---
 
-### E15 — Runtime: the binding constraint is RAM, not CPU `DECISION: pending`
+### E15 — Runtime: the binding constraint is RAM, not CPU `DECISION: pending, EVIDENCE SUPERSEDED`
+
+> **Re-framed 2026-08-13. The heading's claim is wrong and must not be decided as
+> written.** Codex's canonical bounded probe measured **1.07 GiB peak RSS** with
+> **99.763% of wall time inside the native semantic resolver** — Backtester.run,
+> stress replay and attempt builder were all zero. The binding constraint is
+> neither RAM nor CPU: it is the **authority preflight**. The `optimization_max_workers`
+> finding below still stands; the scale comparison against the 6-hour academic run
+> inherits the withdrawn run structure of BI-4 and must not be reused.
+> The live question is E26/E27, not this one.
+
 Measured 2026-08-08 on the operator's machine.
 
 **Hardware: 7.4 GB total RAM, 0.8 GB free, 6 logical cores.**
@@ -435,7 +454,18 @@ those is an operator call about hardware, not a code change.
 
 ---
 
-### E16 — Quantified efficiency defects `DECISION: pending`
+### E16 — Quantified efficiency defects `DECISION: pending, FIGURES STALE`
+
+> **Re-framed 2026-08-13.** The feature-cache copy is recorded below at 51 ms;
+> **re-measured on current HEAD it is 174 ms** (250,000 rows x 68 cols = 126.6 MB,
+> post-categorical, `copy_on_write` off) — the register understates it 3.4x, and
+> `_cache_get` copies on every hit while `_cache_put` copies again, so a
+> miss-then-hit pays twice. **The derived "4.4 hours across 100 symbols" is
+> withdrawn**: it multiplies by the run structure retired as BI-4. The defensible
+> statement is *174 ms per cache hit, hit count per run unknown*.
+> Recommended disposition (CPM-043): fold into E26 rather than open a lane, since
+> array ownership after a cache read is the same question E26 must answer anyway.
+
 All measured on the operator's machine, 2026-08-08. None of these trade accuracy.
 
 **FIXED — regime labels as object columns.** `REGIME_RAW`/`REGIME`/`REGIME_LIVE`
@@ -468,7 +498,16 @@ cheapest route to the real multiple. Profile in flight.
 
 ---
 
-### E17 — The resolver re-verifies 12 GB on every call `DECISION: pending`
+### E17 — The resolver re-verifies 12 GB on every call `DECISION: pending, LARGELY OVERTAKEN`
+
+> **Re-framed 2026-08-13.** Measured 2026-08-08, before the resolver memo landed
+> and before E26/E27 existed. The mechanism it describes is real and is now the
+> subject of an agreed programme: E26 (extent cache with explicit detachment,
+> agreed CPM-040) and E27 (move full semantic verification to activation/promotion,
+> deferred until a code-version-bound receipt and forced selected-leaf verification
+> exist). **Do not decide this element in isolation** — deciding it would either
+> duplicate E26/E27 or contradict them.
+
 **This is the largest efficiency defect found, and it violates a principle the
 operator already recorded.**
 
