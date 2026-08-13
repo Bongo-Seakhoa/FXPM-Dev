@@ -1,8 +1,8 @@
 """Living FxPM program dashboard — a local service, not a static file.
 
-Every request regenerates the page from repo state: the agent bus, the lane
-ledger, STATE.md, the reconciliation register and git history. Nothing is
-hand-maintained, so if a figure looks wrong the underlying artifact is wrong.
+Every request regenerates operational state from the agent bus, lane ledger,
+STATE.md, reconciliation register and git history. A small number of dated
+benchmark and programme constants are declared below and labelled in the page.
 
     python tools/pm_dashboard.py serve            # http://localhost:8787
     python tools/pm_dashboard.py serve --port 9000 --open
@@ -22,14 +22,15 @@ import subprocess
 import sys
 import threading
 import webbrowser
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT = ROOT / "pm_dashboard.html"
 
-DECISION_TYPES = {"question", "decision", "veto", "review_request"}
+RESPONSE_REQUIRED_TYPES = {"question", "veto", "review_request"}
 
 # Program timeline. Dates come from STATE.md, the Test A pre-registration and
 # the book's own valid_until; edit here when a milestone genuinely moves.
@@ -40,35 +41,35 @@ TIMELINE = [
     ("Repo consolidation",         "2026-08-07", "2026-08-09", "done"),
     ("Test A scoring window",      "2026-04-01", "2026-07-14", "ready"),
     ("Gate 1 — PBO verdict",       "2026-08-10", "2026-08-11", "done"),
-    ("Gate 2 — H1 canary",         "2026-08-11", "2026-08-11", "blocked"),
-    ("Efficiency program",         "2026-08-11", "2026-08-13", "active"),
-    ("Gate 3 — a full run",        "2026-08-14", "2026-09-15", "open"),
-    ("Gate 7 — demo shadow",       "2026-09-15", "2026-10-15", "open"),
-    ("Test B acquisition",         "2026-08-18", "2026-10-19", "pending"),
-    ("Test B 63-day checkpoint",   "2026-10-19", "2026-10-26", "pending"),
-    ("Test B 365-day horizon",     "2026-10-26", "2027-08-17", "pending"),
+    ("Gate 2 — H1 technical result", "2026-08-11", "2026-08-11", "done"),
+    ("Efficiency baseline work",   "2026-08-11", None, "active"),
+    ("Test B purge / no valid days", "2026-07-14", "2026-08-18", "pending"),
+    ("Test B preliminary window",  "2026-08-18", "2026-10-19", "pending"),
+    ("Test B credible horizon",    "2026-08-18", "2027-08-17", "pending"),
 ]
 
-# Measured, unprofiled, 106,697-bar H1 frame. See docs/EFFICIENCY_FINDINGS.
-COST_STAGES = [
-    ("Production (inferred)", 1780.0, "Implied by the Gate-2 canary: 2 attempts in 2,851 s"),
-    ("Synthetic, before",      548.4, "Backtester.run before any fix"),
-    ("After axis digest",      279.7, "811669c — per-bar hashing vectorised"),
-    ("After metrics",          201.1, "0c2e848 — drawdown + safe_float vectorised"),
-    ("Loop floor",               6.7, "The jitted loop alone. The actual economic work."),
+# One exact preserved EURUSD/H1 attempt-2/fold-0 path. These stages are
+# comparable end-to-end fold packages, not synthetic per-backtest estimates.
+FOLD_STAGES = [
+    ("Measured baseline", 2.618102, "Preserved H1 fold before E21/E22"),
+    ("Reuse one backtester", 1.780566, "1d6dee6 — reuse immutable instance state"),
+    ("Reuse verified swap contract", 1.006329, "ad3d9db — retain strict replay"),
 ]
 
-TOTAL_BACKTESTS = 576_000_000
-WORKERS = 6
+STARTUP_STAGES = [
+    ("Preparation", 245.766, "CX-076: plan receipt to first freeze-object write"),
+    ("Artifact registration", 86.154, "CX-076: 1,211 logical freeze artifacts"),
+]
+
+SINGLE_GRID_MAX_RUNS = 11_520_000
 
 RISKS = [
-    ("Cost-stress defect blocks every run", "critical",
-     "The frozen-path invariant fires on positive-carry trades 0.67% into a search. "
-     "Landed 2026-07-17, after the last completed book, so no finished run has ever "
-     "exercised it. One-line repair proposed (CPM-022), awaiting Codex-PM."),
-    ("A full run is not yet feasible", "critical",
-     "576M backtests. At today's cost that is years of wall clock; at the 6.7 ms loop "
-     "floor it is 7.4 days. Every 100 ms removed is ~8 months off the run."),
+    ("Cost-stress defect blocks Gate 2", "critical",
+     "The sole H1 canary stopped at attempt 2/fold 0 because trade 23 improved under "
+     "stress. It is a real technical result; no profitability verdict was reached."),
+    ("Full-run duration is not yet credibly measured", "high",
+     "The former 576M/years estimate mixed the legacy Optuna path into the canonical "
+     "executor and is withdrawn. One-cell end-to-end timing comes before a forecast."),
     ("Test suite can go green while blind", "high",
      "7 anti-forgery tests errored at setup, so they did not run while the file "
      "reported 18 passed. 4 of 5 contract drifts fixed; the 5th is structural."),
@@ -91,22 +92,86 @@ def _read(path: Path) -> str:
 
 
 def load_bus() -> list[dict]:
-    rows = []
-    for line in _read(ROOT / "agent_comms" / "BUS.jsonl").splitlines():
-        line = line.strip()
-        if line:
+    rows: dict[str, dict] = {}
+    bus_root = ROOT / "agent_comms"
+    paths = sorted(bus_root.glob("BUS.archive-*.jsonl")) + [bus_root / "BUS.jsonl"]
+    for path in paths:
+        for line in _read(path).splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
-                rows.append(json.loads(line))
+                message = json.loads(line)
             except json.JSONDecodeError:
-                pass
-    return sorted(rows, key=lambda m: str(m.get("ts") or ""))
+                continue
+            if not isinstance(message, dict):
+                continue
+            message_id = str(message.get("id") or "")
+            if message_id:
+                rows[message_id] = message
+    return sorted(rows.values(), key=lambda message: str(message.get("ts") or ""))
+
+
+def source_health() -> list[dict]:
+    specs = [
+        ("agent_comms/STATE.md", "text"),
+        ("agent_comms/LANES.json", "json"),
+        ("docs/RECONCILIATION_REGISTER.md", "text"),
+    ]
+    bus_paths = sorted((ROOT / "agent_comms").glob("BUS.archive-*.jsonl")) + [
+        ROOT / "agent_comms" / "BUS.jsonl"
+    ]
+    specs.extend((path.relative_to(ROOT).as_posix(), "jsonl") for path in bus_paths)
+    rows = []
+    for relative, kind in specs:
+        path = ROOT / relative
+        state, detail = "ok", "readable"
+        if not path.is_file():
+            state, detail = "missing", "required file is absent"
+        else:
+            try:
+                raw = path.read_text(encoding="utf-8")
+                if kind == "json":
+                    payload = json.loads(raw)
+                    if not isinstance(payload, dict) or not isinstance(
+                        payload.get("lanes"), list
+                    ):
+                        raise ValueError("LANES_SCHEMA_INVALID")
+                elif kind == "jsonl":
+                    for line in raw.splitlines():
+                        if line.strip():
+                            message = json.loads(line)
+                            if not isinstance(message, dict) or any(
+                                not isinstance(message.get(key), str)
+                                or not message.get(key)
+                                for key in ("id", "from", "to", "type")
+                            ) or not isinstance(message.get("refs", []), list):
+                                raise ValueError("BUS_MESSAGE_SCHEMA_INVALID")
+                elif not raw.strip():
+                    raise ValueError("TEXT_SOURCE_EMPTY")
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                state, detail = "invalid", type(exc).__name__
+        rows.append(
+            {
+                "name": relative,
+                "state": state,
+                "detail": detail,
+                "updated": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+                if path.is_file()
+                else None,
+            }
+        )
+    return rows
 
 
 def load_lanes() -> list[dict]:
     """Newest first. LANES.json is stored newest-first and BUS.jsonl oldest-first,
     so sort rather than trust either file's order."""
     try:
-        lanes = json.loads(_read(ROOT / "agent_comms" / "LANES.json")).get("lanes", [])
+        payload = json.loads(_read(ROOT / "agent_comms" / "LANES.json"))
+        if not isinstance(payload, dict) or not isinstance(payload.get("lanes"), list):
+            return []
+        lanes = [lane for lane in payload["lanes"] if isinstance(lane, dict)]
     except (json.JSONDecodeError, AttributeError):
         return []
     return sorted(lanes, key=lambda l: str(l.get("claimed_at") or ""), reverse=True)
@@ -161,15 +226,58 @@ def load_register() -> list[dict]:
     return out
 
 
-def load_test_health() -> dict:
-    n = git("ls-files", "tests/")
-    return {"files": len([x for x in n.splitlines() if x.endswith(".py")])}
+def audit_report_status() -> dict:
+    root = ROOT / "audit_reports" / "fxpm_system_audit_2026-08-11"
+    receipt_path = root / "DELIVERY_RECEIPTS.json"
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        reports = receipt.get("reports") or []
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError):
+        reports = []
+    verified = [
+        report
+        for report in reports
+        if report.get("ok") is True
+        and (root / str(report.get("html") or "")).is_file()
+        and report.get("stages", {}).get("verification") == "passed"
+    ]
+    return {
+        "root": root,
+        "total": len(reports),
+        "verified": len(verified),
+        "updated": datetime.fromtimestamp(receipt_path.stat().st_mtime, timezone.utc)
+        if receipt_path.is_file()
+        else None,
+    }
+
+
+def lineage_status(bus: list[dict]) -> list[dict]:
+    by_id = {message.get("id"): message for message in bus}
+    g0 = by_id.get("CX-025", {})
+    g0_complete = "G0 COMPLETE" in str(g0.get("body") or "")
+    return [
+        {
+            "lineage": "Academic research",
+            "state": "restore-tested" if g0_complete else "unverified",
+            "evidence": "CX-025" if g0_complete else "CX-011",
+        },
+        {
+            "lineage": "Commercial history",
+            "state": "remote tags confirmed" if g0_complete else "unverified",
+            "evidence": "CX-025" if g0_complete else "CX-011",
+        },
+        {
+            "lineage": "Canonical production",
+            "state": git("branch", "--show-current") or "unknown",
+            "evidence": git("rev-parse", "--short", "HEAD") or "unknown",
+        },
+    ]
 
 
 # ------------------------------------------------------------------ derivation
 
-def gate_class(state: str) -> str:
-    s = state.upper()
+def gate_class(state: str, owner: str = "") -> str:
+    s = f"{owner} {state}".upper()
     if "DONE" in s:
         return "ok"
     if "BLOCK" in s or "TECHNICAL" in s:
@@ -179,10 +287,68 @@ def gate_class(state: str) -> str:
     return "idle"
 
 
-def unanswered(bus: list[dict]) -> list[dict]:
-    referenced = {r for m in bus for r in (m.get("refs") or [])}
-    return [m for m in bus
-            if m.get("type") in DECISION_TYPES and m.get("id") not in referenced]
+def message_resolutions(bus: list[dict]) -> dict[str, dict[str, str]]:
+    """Classify only messages that actually require a peer response.
+
+    A decision is a record, not automatically an unanswered question. A
+    reciprocal, chronological ref is the machine-checkable closure signal.
+    """
+
+    by_id = {str(message.get("id") or ""): message for message in bus}
+    replies: dict[str, list[str]] = {}
+    for message in bus:
+        for reference in message.get("refs") or []:
+            original = by_id.get(str(reference))
+            if original is None or message.get("from") == original.get("from"):
+                continue
+            original_ts = parse_ts(original.get("ts"))
+            response_ts = parse_ts(message.get("ts"))
+            if original_ts and response_ts and response_ts < original_ts:
+                continue
+            original_target = original.get("to")
+            if original_target not in {"all", message.get("from")}:
+                continue
+            replies.setdefault(str(reference), []).append(str(message.get("id") or ""))
+    result: dict[str, dict[str, str]] = {}
+    for message_id, message in by_id.items():
+        if message.get("type") not in RESPONSE_REQUIRED_TYPES:
+            continue
+        if replies.get(message_id):
+            status = "answered"
+            note = "Answered by " + ", ".join(replies[message_id])
+        else:
+            status = "open"
+            note = "Peer response required"
+        result[message_id] = {"status": status, "note": note}
+    return result
+
+
+def open_peer_requests(bus: list[dict]) -> list[dict]:
+    resolutions = message_resolutions(bus)
+    return [
+        message
+        for message in bus
+        if resolutions.get(str(message.get("id") or ""), {}).get("status") == "open"
+        and message.get("from") in {"claude-pm", "codex-pm"}
+        and message.get("to") in {"claude-pm", "codex-pm"}
+    ]
+
+
+def pm_continuity(bus: list[dict]) -> list[dict]:
+    rows = []
+    for actor in ("claude-pm", "codex-pm"):
+        messages = [message for message in bus if message.get("from") == actor]
+        latest = messages[-1] if messages else {}
+        rows.append(
+            {
+                "actor": actor,
+                "latest_id": latest.get("id") or "—",
+                "latest_ts": latest.get("ts"),
+                "latest_type": latest.get("type") or "—",
+                "message_count": len(messages),
+            }
+        )
+    return rows
 
 
 def parse_ts(ts):
@@ -206,8 +372,31 @@ def age(ts) -> str:
     return f"{secs // 86400}d ago"
 
 
-def wall_days(ms_per_backtest: float) -> float:
-    return TOTAL_BACKTESTS * (ms_per_backtest / 1000.0) / WORKERS / 86400.0
+def improvement_pct(before: float, after: float) -> float:
+    return (before - after) / before * 100.0
+
+
+def service_snapshot() -> dict:
+    bus, lanes, gates = load_bus(), load_lanes(), load_gates()
+    active = [lane for lane in lanes if lane.get("status") == "active"]
+    sources = source_health()
+    service_state = "ok" if all(row["state"] == "ok" for row in sources) else "degraded"
+    return {
+        "schema_version": "fxpm.project-dashboard-status.v1",
+        "status": service_state,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "tradeable": False,
+        "git_head": git("rev-parse", "--short", "HEAD"),
+        "branch": git("branch", "--show-current"),
+        "gates": gates,
+        "active_lanes": active,
+        "open_peer_requests": open_peer_requests(bus),
+        "pm_continuity": pm_continuity(bus),
+        "sources": [
+            {**row, "updated": row["updated"].isoformat() if row["updated"] else None}
+            for row in sources
+        ],
+    }
 
 
 # --------------------------------------------------------------------- charts
@@ -251,128 +440,63 @@ def svg_gantt() -> str:
                  f"text-anchor='middle'>today</text>")
 
     for i, (label, s, e, status) in enumerate(TIMELINE):
-        ds, de = date.fromisoformat(s), date.fromisoformat(e)
+        ds = date.fromisoformat(s)
+        de = date.fromisoformat(e) if e else datetime.now(timezone.utc).date()
         y = pad_t + i * row_h
         x0, x1 = x(ds), max(x(de), x(ds) + 4)
         p.append(f"<text x='{pad_l-10}' y='{y+13}' class='lbl' "
                  f"text-anchor='end'>{esc(label)}</text>")
         p.append(f"<rect x='{x0:.1f}' y='{y+3}' width='{x1-x0:.1f}' height='15' "
-                 f"rx='4' class='bar-{status}'><title>{esc(label)}: {s} to {e} "
+                 f"rx='4' class='bar-{status}'><title>{esc(label)}: {s} to {e or 'present'} "
                  f"({esc(status)})</title></rect>")
     p.append("</svg>")
     return "".join(p)
 
 
-def svg_cost_bars() -> str:
-    w, h, pad_l, pad_t, row_h = 1080, 40 + 34 * len(COST_STAGES), 196, 26, 34
-    top = max(s[1] for s in COST_STAGES)
+def svg_fold_performance() -> str:
+    w, h, pad_l, pad_t, row_h = 1080, 40 + 42 * len(FOLD_STAGES), 210, 26, 42
+    top = max(stage[1] for stage in FOLD_STAGES)
     p = [f"<svg viewBox='0 0 {w} {h}' class='chart' role='img' "
-         f"aria-label='Cost per backtest by stage'>"]
-    for i, (label, ms, note) in enumerate(COST_STAGES):
+         f"aria-label='Measured authoritative fold package time by stage'>"]
+    for i, (label, seconds, note) in enumerate(FOLD_STAGES):
         y = pad_t + i * row_h
-        bw = max(2.0, ms / top * (w - pad_l - 190))
-        cls = "bar-floor" if ms < 10 else ("bar-now" if abs(ms - 201.1) < .01 else "bar-cost")
+        bw = max(2.0, seconds / top * (w - pad_l - 210))
+        cls = "bar-now" if i == len(FOLD_STAGES) - 1 else "bar-cost"
         p.append(f"<text x='{pad_l-10}' y='{y+14}' class='lbl' "
                  f"text-anchor='end'>{esc(label)}</text>")
         p.append(f"<rect x='{pad_l}' y='{y+2}' width='{bw:.1f}' height='17' rx='4' "
                  f"class='{cls}'><title>{esc(note)}</title></rect>")
         p.append(f"<text x='{pad_l+bw+9:.1f}' y='{y+15}' class='val'>"
-                 f"{ms:,.1f} ms · {wall_days(ms):,.0f}d run</text>")
+                 f"{seconds:.3f} s</text>")
     p.append("</svg>")
     return "".join(p)
 
 
-def svg_feasibility() -> str:
-    """Full-run wall time as a function of per-backtest cost. Log-log."""
-    import math
-    w, h, pl, pr, pt, pb = 1080, 300, 62, 24, 20, 42
-    xmin, xmax = math.log10(5), math.log10(2000)      # ms
-    ymin, ymax = math.log10(3), math.log10(3000)      # days
-
-    def X(ms):
-        return pl + (math.log10(ms) - xmin) / (xmax - xmin) * (w - pl - pr)
-
-    def Y(d):
-        return h - pb - (math.log10(max(d, 1e-9)) - ymin) / (ymax - ymin) * (h - pt - pb)
-
+def svg_startup_breakdown() -> str:
+    total = sum(stage[1] for stage in STARTUP_STAGES)
+    w, h, x0, usable = 1080, 135, 36, 1008
     p = [f"<svg viewBox='0 0 {w} {h}' class='chart' role='img' "
-         f"aria-label='Full run duration versus per-backtest cost'>"]
-    for dv in (7, 30, 90, 365, 1095):
-        y = Y(dv)
-        p.append(f"<line x1='{pl}' y1='{y:.1f}' x2='{w-pr}' y2='{y:.1f}' class='grid'/>")
-        lab = f"{dv}d" if dv < 365 else f"{dv//365}y"
-        p.append(f"<text x='{pl-9}' y='{y+4:.1f}' class='axis' text-anchor='end'>{lab}</text>")
-    for mv in (6.7, 25, 100, 400, 1780):
-        xx = X(mv)
-        p.append(f"<line x1='{xx:.1f}' y1='{pt}' x2='{xx:.1f}' y2='{h-pb}' class='grid'/>")
-        p.append(f"<text x='{xx:.1f}' y='{h-pb+17:.1f}' class='axis' "
-                 f"text-anchor='middle'>{mv:g} ms</text>")
-    # tolerance band: anything under 14 days
-    p.append(f"<rect x='{pl}' y='{Y(14):.1f}' width='{w-pl-pr}' "
-             f"height='{h-pb-Y(14):.1f}' class='band'/>")
-    p.append(f"<text x='{w-pr-10}' y='{Y(11):.1f}' class='axis band-t' "
-             f"text-anchor='end'>under two weeks — a runnable job</text>")
-    pts = []
-    ms = 5.0
-    while ms <= 2000:
-        pts.append(f"{X(ms):.1f},{Y(wall_days(ms)):.1f}")
-        ms *= 1.06
-    p.append(f"<polyline points='{' '.join(pts)}' class='curve'/>")
-    for label, ms, _ in COST_STAGES:
-        d = wall_days(ms)
-        if not (5 <= ms <= 2000):
-            continue
-        cx, cy = X(ms), Y(d)
-        cls = "dot-floor" if ms < 10 else ("dot-now" if abs(ms - 201.1) < .01 else "dot")
-        p.append(f"<circle cx='{cx:.1f}' cy='{cy:.1f}' r='5' class='{cls}'>"
-                 f"<title>{esc(label)}: {ms:,.1f} ms → {d:,.0f} days</title></circle>")
-        anchor = "start" if ms < 300 else "end"
-        dx = 10 if ms < 300 else -10
-        p.append(f"<text x='{cx+dx:.1f}' y='{cy-9:.1f}' class='pt' "
-                 f"text-anchor='{anchor}'>{esc(label)}</text>")
-    p.append("</svg>")
-    return "".join(p)
-
-
-def svg_activity(bus: list[dict]) -> str:
-    """Messages per day, stacked by sender."""
-    by_day: dict[str, dict[str, int]] = {}
-    for m in bus:
-        dt = parse_ts(m.get("ts"))
-        if dt is None:
-            continue
-        key = dt.date().isoformat()
-        by_day.setdefault(key, {}).setdefault(m.get("from", "?"), 0)
-        by_day[key][m.get("from", "?")] += 1
-    if not by_day:
-        return "<div class='empty'>No bus activity yet.</div>"
-    days = sorted(by_day)[-21:]
-    senders = sorted({s for d in days for s in by_day[d]})
-    top = max(sum(by_day[d].values()) for d in days) or 1
-    w, h, pb, pl = 1080, 190, 40, 34
-    bw = (w - pl - 16) / max(len(days), 1)
-    palette = {s: f"seg{i%4}" for i, s in enumerate(senders)}
-    p = [f"<svg viewBox='0 0 {w} {h}' class='chart' role='img' "
-         f"aria-label='Bus messages per day by agent'>"]
-    for i, d in enumerate(days):
-        x0 = pl + i * bw
-        acc = 0.0
-        for s in senders:
-            n = by_day[d].get(s, 0)
-            if not n:
-                continue
-            bh = n / top * (h - pb - 16)
-            acc += bh
-            p.append(f"<rect x='{x0+2:.1f}' y='{h-pb-acc:.1f}' width='{bw-4:.1f}' "
-                     f"height='{bh:.1f}' class='{palette[s]}' rx='2'>"
-                     f"<title>{d} · {esc(s)}: {n}</title></rect>")
-        if i % 3 == 0 or i == len(days) - 1:
-            p.append(f"<text x='{x0+bw/2:.1f}' y='{h-pb+16:.1f}' class='axis' "
-                     f"text-anchor='middle'>{d[5:]}</text>")
-    for i, s in enumerate(senders):
-        p.append(f"<rect x='{pl + i*150}' y='{h-16}' width='10' height='10' rx='2' "
-                 f"class='{palette[s]}'/>")
-        p.append(f"<text x='{pl + i*150 + 16}' y='{h-7}' class='axis'>{esc(s)}</text>")
+         f"aria-label='Measured pre-evaluation startup breakdown'>"]
+    cursor = x0
+    for index, (label, seconds, note) in enumerate(STARTUP_STAGES):
+        width = usable * seconds / total
+        p.append(
+            f"<rect x='{cursor:.1f}' y='28' width='{width:.1f}' height='34' "
+            f"rx='5' class='seg{index}'><title>{esc(note)}: {seconds:.3f}s</title></rect>"
+        )
+        if width > 150:
+            p.append(
+                f"<text x='{cursor + width / 2:.1f}' y='49' class='inside' "
+                f"text-anchor='middle'>{esc(label)} · {seconds:.1f}s</text>"
+            )
+        cursor += width
+    p.append(
+        f"<text x='{x0}' y='91' class='lbl'>Total before evaluation: {total:.1f}s</text>"
+    )
+    p.append(
+        f"<text x='{w-x0}' y='91' class='axis' text-anchor='end'>"
+        "E23 is targeting repeated native fits; no saving is claimed until measured.</text>"
+    )
     p.append("</svg>")
     return "".join(p)
 
@@ -406,6 +530,9 @@ body{margin:0;background:var(--bg);color:var(--ink);padding:22px 20px 70px;
 h1{font-size:22px;margin:0 0 2px;letter-spacing:-.015em}
 h2{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted);
  margin:32px 0 10px;font-weight:650}
+.top{display:flex;justify-content:space-between;gap:18px;align-items:flex-start}
+.live{display:inline-flex;gap:7px;align-items:center;color:var(--ok);font-size:12px;font-weight:650}
+.live:before{content:"";width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px var(--okbg)}
 .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:11px;
  padding:15px 17px;margin-bottom:12px}
@@ -430,6 +557,15 @@ code,.mono{font-family:var(--mono);font-size:12.5px}
 .msg .h{font-size:12px;color:var(--muted);margin-bottom:3px}
 .msg .b{font-size:13.5px;line-height:1.5}
 .who{font-weight:650}.arrow{color:var(--muted)}
+.split{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(280px,.85fr);gap:12px}
+.flow{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:8px;overflow-x:auto;padding-bottom:2px}
+.step{position:relative;min-height:108px;border:1px solid var(--line);border-radius:9px;padding:11px;background:var(--panel)}
+.step:not(:last-child):after{content:"→";position:absolute;right:-10px;top:40px;color:var(--muted);z-index:2}
+.step .num{font:11px var(--mono);color:var(--muted)}
+.step .name{font-weight:650;margin:5px 0 4px}.step .why{font-size:11.5px;color:var(--muted);line-height:1.4}
+.step.active{border-color:var(--accent);box-shadow:inset 0 3px 0 var(--accent)}
+.step.blocked{border-color:var(--bad);box-shadow:inset 0 3px 0 var(--bad)}
+.inside{font-size:12px;fill:white;font-weight:650}
 .foot{color:var(--muted);font-size:12px;margin-top:36px;border-top:1px solid var(--line);padding-top:12px}
 .chart{width:100%;height:auto;display:block;overflow:visible}
 .grid line,line.grid{stroke:var(--grid);stroke-width:1}
@@ -452,31 +588,43 @@ code,.mono{font-family:var(--mono);font-size:12.5px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;
  vertical-align:-1px}
 .note{font-size:12.5px;color:var(--muted);margin-top:9px;line-height:1.5}
+@media (max-width:760px){body{padding:16px 12px 50px}.top{display:block}.live{margin:8px 0}.split{grid-template-columns:1fr}.chart{min-width:720px}.panel:has(.chart){overflow-x:auto}.flow{grid-template-columns:repeat(6,170px)}}
 """
 
 
 # ---------------------------------------------------------------------- render
 
-def render() -> str:
+def render(*, live: bool = True) -> str:
     bus, lanes, gates = load_bus(), load_lanes(), load_gates()
     commits, register = load_commits(), load_register()
     now = datetime.now(timezone.utc)
     active = [l for l in lanes if l.get("status") == "active"]
-    open_q = unanswered(bus)[-10:]
+    open_q = open_peer_requests(bus)
+    pm_rows = pm_continuity(bus)
+    reports = audit_report_status()
+    lineages = lineage_status(bus)
     gates_done = sum(1 for g in gates if "DONE" in g["state"].upper())
-    blocked = [g for g in gates if gate_class(g["state"]) == "bad"]
+    blocked = [g for g in gates if gate_class(g["state"], g["owner"]) == "bad"]
+    current_fold = FOLD_STAGES[-1][1]
+    fold_gain = improvement_pct(FOLD_STAGES[0][1], current_fold)
+    sources = source_health()
+    oldest_source = min((row["updated"] for row in sources if row["updated"]), default=None)
 
     p: list[str] = []
     A = p.append
     A("<!doctype html><html><head><meta charset='utf-8'>")
     A("<meta name='viewport' content='width=device-width,initial-scale=1'>")
-    A("<title>FxPM — program dashboard</title>")
-    A("<meta http-equiv='refresh' content='60'>")
+    A("<title>FxPM — program control room</title>")
+    if live:
+        A("<meta http-equiv='refresh' content='60'>")
     A(f"<style>{CSS}</style></head><body>")
 
-    A("<h1>FxPM — program dashboard</h1>")
-    A(f"<div class='sub'>Live · rebuilt from repo state on every request · "
-      f"{now:%Y-%m-%d %H:%M} UTC · refreshes every 60s</div>")
+    A("<div class='top'><div><h1>FxPM — program control room</h1>")
+    A(f"<div class='sub'>{'Rebuilt from repository state on every request' if live else 'Static snapshot'} · "
+      f"{now:%Y-%m-%d %H:%M} UTC{' · refreshes every 60s' if live else ''}</div></div>")
+    if live:
+        A("<div class='live'>local service online</div>")
+    A("</div>")
 
     A("<div class='panel verdict'><div class='big'>Not tradeable. Do not fund an account.</div>"
       "<div>No optimisation run has completed since the June book expired on 2026-07-05. "
@@ -492,19 +640,60 @@ def render() -> str:
     A(f"<div class='kpi'><div class='n'>{gates_done}/{len(gates) or 8}</div>"
       f"<div class='l'>Gates closed</div><div class='d'>Gate 8 (Test B) is the only "
       f"certification and cannot finish before Aug 2027.</div></div>")
-    A(f"<div class='kpi'><div class='n'>201 ms</div><div class='l'>Cost per backtest</div>"
-      f"<div class='d'>Was 548 ms. The loop doing the real work is 6.7 ms — 30x of pure "
-      f"overhead remains.</div></div>")
-    A(f"<div class='kpi'><div class='n'>{wall_days(201.1):,.0f} d</div>"
-      f"<div class='l'>Full run at today's cost</div>"
-      f"<div class='d'>{wall_days(6.7):,.1f} days at the loop floor. That gap is the "
-      f"whole problem.</div></div>")
+    A(f"<div class='kpi'><div class='n'>{current_fold:.2f} s</div>"
+      f"<div class='l'>Authoritative fold package</div>"
+      f"<div class='d'>Exact preserved H1 path; down {fold_gain:.1f}% from 2.62 s with "
+      f"identical decision hashes and failure.</div></div>")
+    A(f"<div class='kpi'><div class='n'>{sum(value for _, value, _ in STARTUP_STAGES):.0f} s</div>"
+      f"<div class='l'>Pre-evaluation fixed cost</div>"
+      f"<div class='d'>Preserved-spool timing (CX-076). E23 targets "
+      f"15 discarded refits; no saving claimed yet.</div></div>")
     pending = [e for e in register if "pending" in e["state"].lower()]
     A(f"<div class='kpi'><div class='n'>{len(pending)}</div>"
-      f"<div class='l'>Decisions waiting on you</div>"
-      f"<div class='d'>Reconciliation elements nobody else can settle. "
-      f"{len(active)} lane(s) active, {len(open_q)} bus item(s) unanswered.</div></div>")
+      f"<div class='l'>Unresolved lineage items</div>"
+      f"<div class='d'>PMs may resolve items inside their charter; only a recorded "
+      f"deadlock becomes an operator decision. "
+      f"{len(active)} lane(s) active, {len(open_q)} peer request(s) unanswered.</div></div>")
     A("</div>")
+
+    A("<h2>Canonical path and next action</h2><div class='panel'><div class='flow'>")
+    flow = [
+        ("1", "Correct executor", "active", "Make canonical evaluation accurate and fast."),
+        ("2", "One-cell baseline", "active", "Measure end to end; no universe extrapolation yet."),
+        ("3", "Full run", "", "Complete the canonical 4-anchor/current-refit path."),
+        ("4", "Replay + Test A", "", "Reject-only retrospective falsification."),
+        ("5", "Demo shadow", "", "Broker-reconciled operational probation."),
+        ("6", "Test B", "blocked", "Only prospective evidence can support certification."),
+    ]
+    for number, name, cls, why in flow:
+        A(f"<div class='step {cls}'><div class='num'>{number}</div><div class='name'>{esc(name)}</div>"
+          f"<div class='why'>{esc(why)}</div></div>")
+    A("</div><div class='note'><b>Declared current next action (CX-074):</b> validate E23 at exactly two native "
+      "fits and measure the startup reduction. Redundant frozen-plan publications are the "
+      "next measured candidate, not yet an approved implementation. The cost-stress repair "
+      "remains a separate PM-gated correctness decision.</div></div>")
+
+    A("<h2>Deliverables and preserved lineages</h2><div class='split'><div class='panel'>")
+    A(f"<div class='kpi' style='border:0;padding:0'><div class='n'>{reports['verified']}/{reports['total'] or 4}</div>"
+      "<div class='l'>Audit reports verified</div>"
+      "<div class='d'>Reconciliation, architecture/capabilities, quant/risk, and "
+      "production-readiness HTML reports. These are dated audit snapshots, not live status.</div></div></div>")
+    A("<div class='panel wrap'><table><tr><th>Lineage</th><th>State</th><th>Evidence</th></tr>")
+    for lineage in lineages:
+        A(f"<tr><td><b>{esc(lineage['lineage'])}</b></td><td>{esc(lineage['state'])}</td>"
+          f"<td class='mono'>{esc(lineage['evidence'])}</td></tr>")
+    A("</table></div></div>")
+
+    A("<h2>Active experiment contract</h2><div class='panel wrap'><table>"
+      "<tr><th>Element</th><th>E23 contract recorded in CX-074 / XPM-022</th></tr>"
+      "<tr><td><b>Hypothesis</b></td><td>Repeated discarded native refits explain the "
+      "dominant fixed startup delay.</td></tr>"
+      "<tr><td><b>Required evidence</b></td><td>Exactly 2 full fits; tamper rejection; "
+      "unchanged output/failure identity; fixed-path timing.</td></tr>"
+      "<tr><td><b>Scope</b></td><td>No gate, search, fold or roster change. No Gate-2 retry.</td></tr>"
+      "<tr><td><b>Stop</b></td><td>Do not retain the change if call count, tamper, or "
+      "output parity fails. Timing acceptance remains a PM ruling, not a dashboard constant."
+      "</td></tr></table></div>")
 
     A("<h2>Programme timeline</h2><div class='panel'>")
     A(svg_gantt())
@@ -523,28 +712,26 @@ def render() -> str:
       "<tr><th>#</th><th>Gate</th><th>Owner</th><th>State</th></tr>")
     for g in gates:
         A(f"<tr><td class='mono'>{esc(g['n'])}</td><td>{esc(g['gate'])}</td>"
-          f"<td>{esc(g['owner'])}</td><td><span class='tag {gate_class(g['state'])}'>"
+          f"<td>{esc(g['owner'])}</td><td><span class='tag {gate_class(g['state'], g['owner'])}'>"
           f"{esc(truncate(g['state'], 95))}</span></td></tr>")
     A("</table></div>")
 
-    A("<h2>Cost per backtest — what has been won</h2><div class='panel'>")
-    A(svg_cost_bars())
-    A("<div class='note'>Measured unprofiled on a 106,697-bar H1 frame. The right-hand "
-      "figure is the implied full-run wall clock across 6 workers. Production is dearer "
-      "than the synthetic because its frames carry ~100 columns; the fixes so far are "
-      "bar-count driven, so they transfer roughly 1:1 rather than scaling.</div></div>")
+    A("<h2>Measured efficiency</h2><div class='split'><div class='panel'>")
+    A(svg_fold_performance())
+    A(f"<div class='note'>One exact preserved EURUSD/H1 attempt-2/fold-0 path. Cumulative "
+      f"gain: {fold_gain:.1f}%. No search, fold, gate or roster change.</div></div>")
+    A("<div class='panel'>")
+    A(svg_startup_breakdown())
+    A("<div class='note'>Canonical count ceiling: one 2,400-cell grid has at most "
+      f"{SINGLE_GRID_MAX_RUNS/1_000_000:.2f}M Backtester.run calls, 2.88M stress repricings "
+      "and 720k strategy surfaces. The complete multi-grid generation total and duration "
+      "are not yet established. This is a workload bound, not a duration forecast."
+      "</div></div></div>")
 
-    A("<h2>Is a full run reachable?</h2><div class='panel'>")
-    A(svg_feasibility())
-    A(f"<div class='note'>{TOTAL_BACKTESTS:,} backtests — 2,400 cells x 300 attempts x 200 "
-      f"Optuna trials x 4 folds — spread across {WORKERS} workers. The curve is the whole "
-      f"argument: the universe is not too big, the per-evaluation cost is too high. Every "
-      f"100 ms removed is about 8 months off the run.</div></div>")
-
-    A("<h2>Raised and not yet answered</h2>")
+    A("<h2>Open PM-to-PM requests</h2>")
     if open_q:
         A("<div class='panel'>")
-        for m in open_q[::-1]:
+        for m in open_q[-10:][::-1]:
             A(f"<div class='msg'><div class='h'><span class='mono'>{esc(m.get('id'))}</span> · "
               f"<span class='who'>{esc(m.get('from'))}</span> <span class='arrow'>&rarr;</span> "
               f"<span class='who'>{esc(m.get('to'))}</span> · {esc(m.get('type'))} · "
@@ -554,6 +741,18 @@ def render() -> str:
     else:
         A("<div class='panel empty'>Nothing outstanding.</div>")
 
+    A("<h2>PM continuity</h2><div class='panel wrap'><table>"
+      "<tr><th>PM</th><th>Latest</th><th>Type</th><th>Age</th><th>Bus messages</th></tr>")
+    for row in pm_rows:
+        A(f"<tr><td><b>{esc(row['actor'])}</b></td>"
+          f"<td class='mono'>{esc(row['latest_id'])}</td>"
+          f"<td>{esc(row['latest_type'])}</td>"
+          f"<td>{esc(age(row['latest_ts']))}</td>"
+          f"<td>{row['message_count']}</td></tr>")
+    A("</table><div class='note'>The PM channel remains active even when operator-facing "
+      "updates are sparse. “Open” here means a PM question, veto or review request with "
+      "no reciprocal, chronological reference.</div></div>")
+
     A("<h2>Risk register</h2><div class='panel wrap'><table>"
       "<tr><th>Risk</th><th>Severity</th><th>Detail</th></tr>")
     for name, sev, detail in RISKS:
@@ -562,10 +761,6 @@ def render() -> str:
           f"<td><span class='tag {cls}'>{esc(sev)}</span></td>"
           f"<td>{esc(detail)}</td></tr>")
     A("</table></div>")
-
-    A("<h2>Agent activity</h2><div class='panel'>")
-    A(svg_activity(bus))
-    A("</div>")
 
     A("<h2>Lane ledger</h2><div class='panel wrap'><table>"
       "<tr><th>Lane</th><th>Owner</th><th>Status</th><th>Purpose</th><th>Claimed</th></tr>")
@@ -577,6 +772,22 @@ def render() -> str:
           f"<td class='mono'>{esc(age(l.get('claimed_at')))}</td></tr>")
     A("</table></div>")
 
+    A("<h2>Source health</h2><div class='panel wrap'><table>"
+      "<tr><th>Source</th><th>State</th><th>Updated UTC</th><th>Age</th></tr>")
+    for source in sources:
+        updated = source["updated"]
+        A(f"<tr><td class='mono'>{esc(source['name'])}</td>"
+          f"<td><span class='tag {'ok' if source['state'] == 'ok' else 'bad'}'>"
+          f"{esc(source['state'])}</span></td>"
+          f"<td class='mono'>{updated.strftime('%Y-%m-%d %H:%M') if updated else '—'}</td>"
+          f"<td>{esc(age(updated.isoformat() if updated else None))}</td></tr>")
+    A("</table>")
+    if oldest_source:
+        A(f"<div class='note'>Oldest controlling source: {esc(age(oldest_source.isoformat()))}. "
+          "A fresh page proves the files were reread; it does not prove every source was "
+          "recently maintained.</div>")
+    A("</div>")
+
     A("<h2>Agent bus — latest</h2><div class='panel'>")
     for m in bus[-12:][::-1]:
         A(f"<div class='msg'><div class='h'><span class='mono'>{esc(m.get('id'))}</span> · "
@@ -587,7 +798,7 @@ def render() -> str:
     A("</div>")
 
     if register:
-        A("<h2>Reconciliation register — your decisions</h2><div class='panel wrap'><table>"
+        A("<h2>Reconciliation register — unresolved lineage</h2><div class='panel wrap'><table>"
           "<tr><th>ID</th><th>Element</th><th>Decision</th></tr>")
         ordered = sorted(register, key=lambda e: "pending" not in e["state"].lower())
         for e in ordered:
@@ -596,8 +807,8 @@ def render() -> str:
               f"<td>{esc(truncate(e['what'], 130))}</td>"
               f"<td><span class='tag {cls}'>{esc(truncate(e['state'], 60))}</span></td></tr>")
         A(f"</table></div><div class='note'>{len(pending)} of {len(register)} elements are "
-          f"still open. These are reconcile-or-discard calls on work from earlier FxPM "
-          f"iterations — they need your judgement, not another measurement. Detail in "
+          f"still open. These are unresolved lineage calls from earlier FxPM iterations. "
+          f"PMs may decide within the charter; only a genuine deadlock is escalated. Detail in "
           f"docs/RECONCILIATION_REGISTER.md.</div>")
 
     A("<h2>Recent commits</h2><div class='panel wrap'><table>"
@@ -607,11 +818,12 @@ def render() -> str:
           f"<td>{esc(c['author'])}</td><td>{esc(c['subject'])}</td></tr>")
     A("</table></div>")
 
-    A("<div class='foot'>Rebuilt on every request from agent_comms/BUS.jsonl, "
+    A("<div class='foot'>Rebuilt on every live request from agent_comms/BUS*.jsonl, "
       "agent_comms/LANES.json, agent_comms/STATE.md, docs/RECONCILIATION_REGISTER.md and "
-      "git log. Nothing is hand-maintained — if a figure looks wrong, the underlying "
-      "artifact is wrong. Timeline dates and the measured cost stages are declared at the "
-      "top of tools/pm_dashboard.py. Full detail: docs/EFFICIENCY_FINDINGS_2026-08-11.md."
+      "git log. Gates, lanes, communication and commits are source-derived; declared "
+      "timeline milestones and measured benchmark constants live in tools/pm_dashboard.py "
+      "and are labelled as such. Efficiency corrections are recorded in CX-067 and "
+      "XPM-019; docs/EFFICIENCY_FINDINGS_2026-08-11.md is a superseded reference report."
       "</div></body></html>")
     return "\n".join(p)
 
@@ -620,15 +832,37 @@ def render() -> str:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
-        if self.path not in ("/", "/index.html"):
+        path = urlparse(self.path).path
+        if path == "/healthz":
+            snapshot = service_snapshot()
+            body = _canonical_json_bytes(snapshot)
+            self.send_response(200 if snapshot["status"] == "ok" else 503)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/api/status":
+            body = _canonical_json_bytes(service_snapshot())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path not in ("/", "/index.html"):
             self.send_error(404)
             return
+        status = 200
         try:
-            body = render().encode("utf-8")
+            body = render(live=True).encode("utf-8")
         except Exception as exc:  # keep the service up; show the failure
+            status = 500
             body = (f"<pre>dashboard build failed:\n{html.escape(repr(exc))}</pre>"
                     ).encode("utf-8")
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -654,6 +888,15 @@ def serve(port: int, open_browser: bool) -> int:
     return 0
 
 
+def _canonical_json_bytes(value: dict) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", nargs="?", default="serve", choices=("serve", "build"))
@@ -661,7 +904,7 @@ def main() -> int:
     ap.add_argument("--open", action="store_true")
     args = ap.parse_args()
     if args.mode == "build":
-        SNAPSHOT.write_text(render(), encoding="utf-8")
+        SNAPSHOT.write_text(render(live=False), encoding="utf-8")
         print(f"wrote {SNAPSHOT}")
         if args.open:
             webbrowser.open(SNAPSHOT.as_uri())
