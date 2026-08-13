@@ -131,14 +131,15 @@ def _anchor_native_prefixes(
     """Create one activated D1 history and genuine cutoff-local products."""
 
     data_dir = root / "native-data"
-    original_symbol = native_prefix_fixture.SYMBOL
-    native_prefix_fixture.SYMBOL = symbol
-    try:
-        facts = native_prefix_fixture._write_activation(
-            data_dir, adapter_fixture.OBSERVED_TIMEFRAME
-        )
-    finally:
-        native_prefix_fixture.SYMBOL = original_symbol
+    # Pass symbol= explicitly. _write_activation declares `symbol: str = SYMBOL`,
+    # and that default is bound at function-definition time, so reassigning the
+    # module global native_prefix_fixture.SYMBOL never reaches it - the fixture
+    # would write EURUSD's tree and then this file reads `symbol`'s
+    # provenance.json, which never existed. Same defect previously fixed in
+    # test_historical_production_adapter.py.
+    facts = native_prefix_fixture._write_activation(
+        data_dir, adapter_fixture.OBSERVED_TIMEFRAME, symbol=symbol
+    )
 
     start = datetime(2016, 1, 1, tzinfo=timezone.utc)
     last_cutoff = max(
@@ -494,6 +495,11 @@ def _adapter_raw_fold_for_attempt(
         final_end,
         namespace,
         cost=adapter_fixture.STRESS_COST,
+        # A distinct cost namespace makes stress_spread_values_sha256 differ from
+        # the base. Without it the receipt claimed strict adversity while
+        # presenting an UNCHANGED spread vector, which is exactly what
+        # STRESS_METHOD_VECTOR_ADVERSITY_INCONSISTENT exists to catch.
+        cost_namespace=f"{namespace}:stress",
         values=[value - 0.02 for value in daily_values],
     )
     lanes["final_lockbox_base"] = final
@@ -534,7 +540,10 @@ def _adapter_raw_fold_for_attempt(
         "confers_final_oos_or_trading_authority": False,
     }
     stress_body = {
-        "schema_version": "fxpm.backtester-frozen-path-cost-stress.v1",
+        # Was pinned to a hardcoded v1 string. Track the module constant so this
+        # fixture cannot silently fall behind the contract again - it did, and
+        # every test in this file stopped running as a result.
+        "schema_version": adapter_fixture.raw_winner.FROZEN_PATH_COST_STRESS_SCHEMA,
         "symbol": frozen.symbol,
         "timeframe": frozen.timeframe,
         "strategy_name": artifacts["winner_process"]["strategy_id"],
@@ -548,6 +557,12 @@ def _adapter_raw_fold_for_attempt(
         "stress_cost_attestation_sha256": stress[
             "numerical_execution_cost_attestation"
         ]["attestation_sha256"],
+        "base_spread_values_sha256": final["numerical_execution_cost_attestation"][
+            "spread_values_sha256"
+        ],
+        "stress_spread_values_sha256": stress[
+            "numerical_execution_cost_attestation"
+        ]["spread_values_sha256"],
         "base_position_roster_sha256": (
             adapter_fixture.Backtester._cost_attestation_json_sha256(
                 {"position_events": final["position_events"]}
@@ -564,6 +579,18 @@ def _adapter_raw_fold_for_attempt(
         ),
         "path_identity_preserved": True,
         "stress_never_improves": True,
+        "strictly_worse_trade_count": len(stress["position_events"]),
+        "strictly_worse_daily_observation_count": sum(
+            right < left
+            for left, right in zip(
+                final["winner_daily_r_surface"]["daily_net_mtm_r"],
+                stress["winner_daily_r_surface"]["daily_net_mtm_r"],
+                strict=True,
+            )
+        ),
+        "realized_adversity_status": (
+            adapter_fixture.raw_winner.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
+        ),
     }
     stress_receipt = {
         **stress_body,
@@ -2212,6 +2239,18 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
                         source_contract_seed=observed["source_seed"],
                         base_cost_contract=adapter_fixture.BASE_COST_POLICY,
                         stress_cost_contract=adapter_fixture.STRESS_COST_POLICY,
+                        # freeze_observed_cell gained this required argument when
+                        # cost-stress v2 landed; this file was not updated, so
+                        # every test below errored at setup and stopped running.
+                        cost_stress_adversity_plan=(
+                            adapter_fixture._cost_stress_adversity_plan(
+                                horizon_plan=symbol_plans[symbol][
+                                    adapter_fixture.OBSERVED_TIMEFRAME
+                                ][0],
+                                fold_plan=observed["fold_plan"],
+                                symbol=symbol,
+                            )
+                        ),
                         risk_unit_contract=adapter_fixture.RISK_CONTRACT,
                     )
                     capture.complete_observed_cell(
