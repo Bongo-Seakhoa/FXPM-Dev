@@ -187,6 +187,61 @@ class BoundedRawWinnerCanarySourceSession:
         return json.loads(self._spool_entry_json.decode("ascii"))
 
 
+def _verify_bounded_canary_held_source_state(
+    *,
+    source_session: BoundedRawWinnerCanarySourceSession,
+    source_body: Mapping[str, Any],
+    current_config: PipelineConfig,
+) -> None:
+    """Cheaply bind the held canary source until the final full replay.
+
+    The canary executor performs one authoritative native reopen/refit directly
+    before evaluation.  Intermediate capability checks only need to prove that
+    the exact in-memory source/config objects issued by this executor still
+    match their sealed source receipt; recomputing the entire regime fit at
+    every hand-off adds no decision evidence.
+    """
+
+    fitted = source_session._fitted
+    product = source_session._product
+    if (
+        type(fitted) is not FittedNativeSearchTimeframe
+        or fitted.product is not product
+        or source_session._pipeline_config != current_config
+    ):
+        _fail("CANARY_SOURCE_PIPELINE_CONFIG_BINDING_INVALID")
+    try:
+        frame_sha256 = _frame_sha256(fitted._frame)
+        native = product.native_prefix
+        observed = (
+            fitted.frame_sha256,
+            frame_sha256,
+            product.index_sha256,
+            native.get("prefix_content_sha256"),
+            fitted.source_group_decision.receipt_sha256,
+            fitted.regime_fit_decision.receipt_sha256,
+            fitted.train_regime_support.get("receipt_sha256"),
+        )
+    except AuthoritativeSearchExecutionError:
+        raise
+    except Exception as exc:
+        raise AuthoritativeSearchExecutionError(
+            "CANARY_SOURCE_SESSION_REVERIFY_FAILED",
+            (type(exc).__name__, str(exc)),
+        ) from exc
+    expected = (
+        source_body.get("fitted_frame_sha256"),
+        source_body.get("fitted_frame_sha256"),
+        source_body.get("native_prefix_index_sha256"),
+        source_body.get("native_prefix_content_sha256"),
+        source_body.get("source_group_decision_sha256"),
+        source_body.get("regime_fit_decision_sha256"),
+        source_body.get("train_regime_support_receipt_sha256"),
+    )
+    if observed != expected:
+        _fail("CANARY_SOURCE_SESSION_REPLAY_MISMATCH")
+
+
 @dataclass(frozen=True, slots=True)
 class _BoundedRawWinnerCanaryPlanPermit:
     _body_json: bytes
@@ -4201,9 +4256,11 @@ def _make_bounded_raw_winner_canary_executor():
                 != source_body.get("effective_pipeline_config_sha256")
             ):
                 _fail("CANARY_SOURCE_PIPELINE_CONFIG_BINDING_INVALID")
-            source_session._frozen_pipeline_config.verify_current(context)
-            refreshed = _reverify_fitted_timeframe(
-                source_session._fitted, source_session._pipeline_config
+            current_config = source_session._frozen_pipeline_config.materialize(context)
+            _verify_bounded_canary_held_source_state(
+                source_session=source_session,
+                source_body=source_body,
+                current_config=current_config,
             )
         except AuthoritativeSearchExecutionError:
             raise
@@ -4212,15 +4269,6 @@ def _make_bounded_raw_winner_canary_executor():
                 "CANARY_SOURCE_SESSION_REVERIFY_FAILED",
                 (type(exc).__name__, str(exc)),
             ) from exc
-        if (
-            refreshed.frame_sha256 != source_session._fitted.frame_sha256
-            or source_body.get("fitted_frame_sha256") != refreshed.frame_sha256
-            or source_body.get("native_prefix_index_sha256")
-            != source_session._product.index_sha256
-            or source_body.get("train_regime_support_receipt_sha256")
-            != refreshed.train_regime_support.get("receipt_sha256")
-        ):
-            _fail("CANARY_SOURCE_SESSION_REPLAY_MISMATCH")
         return request_body, source_body, state
 
     def _verify_plan_permit(

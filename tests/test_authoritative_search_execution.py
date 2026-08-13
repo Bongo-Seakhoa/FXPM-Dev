@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pandas as pd
@@ -1013,6 +1014,223 @@ def _terminal_product(state, *, symbol="EURUSD", timeframe="M5"):
 
 def _config():
     return PipelineConfig()
+
+
+def _held_canary_source_fixture():
+    frame = _d1_frame(12)
+    fitted_frame_sha256 = execution._frame_sha256(frame)
+    product = SimpleNamespace(
+        index_sha256="i" * 64,
+        native_prefix={"prefix_content_sha256": "n" * 64},
+    )
+    fitted = execution.FittedNativeSearchTimeframe(
+        product=product,
+        source_group_decision=SimpleNamespace(receipt_sha256="s" * 64),
+        regime_fit_decision=SimpleNamespace(receipt_sha256="r" * 64),
+        source_contract_seed={},
+        base_cost_policy={},
+        stress_cost_policy={},
+        regime_parameters={},
+        train_regime_support={"receipt_sha256": "t" * 64},
+        instrument_spec=None,
+        execution_spec_receipt={},
+        frame_sha256=fitted_frame_sha256,
+        _frame=frame,
+    )
+    config = _config()
+    session = execution.BoundedRawWinnerCanarySourceSession(
+        _body_json=b"{}",
+        _product=product,
+        _fitted=fitted,
+        _pipeline_config=config,
+        _frozen_pipeline_config=object(),
+        _spool_entry_json=b"{}",
+        _issuance_tag="test",
+    )
+    body = {
+        "fitted_frame_sha256": fitted_frame_sha256,
+        "native_prefix_index_sha256": "i" * 64,
+        "native_prefix_content_sha256": "n" * 64,
+        "source_group_decision_sha256": "s" * 64,
+        "regime_fit_decision_sha256": "r" * 64,
+        "train_regime_support_receipt_sha256": "t" * 64,
+    }
+    return session, body, config
+
+
+def test_canary_intermediate_source_check_uses_held_binding_not_full_refit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session, body, config = _held_canary_source_fixture()
+    monkeypatch.setattr(
+        execution,
+        "_reverify_fitted_timeframe",
+        lambda *_args, **_kwargs: pytest.fail("intermediate check repeated full fit"),
+    )
+
+    execution._verify_bounded_canary_held_source_state(
+        source_session=session,
+        source_body=body,
+        current_config=config,
+    )
+
+
+def test_canary_intermediate_source_check_rejects_frame_mutation() -> None:
+    session, body, config = _held_canary_source_fixture()
+    session._fitted._frame.iloc[0, 0] += 1.0
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="CANARY_SOURCE_SESSION_REPLAY_MISMATCH",
+    ):
+        execution._verify_bounded_canary_held_source_state(
+            source_session=session,
+            source_body=body,
+            current_config=config,
+        )
+
+
+def test_canary_intermediate_source_check_rejects_config_mutation() -> None:
+    session, body, config = _held_canary_source_fixture()
+    current_config = _config()
+    session._pipeline_config.initial_capital += 1.0
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="CANARY_SOURCE_PIPELINE_CONFIG_BINDING_INVALID",
+    ):
+        execution._verify_bounded_canary_held_source_state(
+            source_session=session,
+            source_body=body,
+            current_config=current_config,
+        )
+
+
+def test_final_canary_replay_rejects_nested_fit_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retained full replay catches state the cheap handoff check defers."""
+
+    session, _body, config = _held_canary_source_fixture()
+    source_decision = SimpleNamespace(
+        receipt_sha256="s" * 64,
+        to_dict=lambda: {
+            "acquisition_attempts_exact": 1,
+            "receipt_sha256": "s" * 64,
+        },
+    )
+    regime_decision = SimpleNamespace(
+        receipt_sha256="r" * 64,
+        to_dict=lambda: {"receipt_sha256": "r" * 64},
+    )
+    pristine = replace(
+        session._fitted,
+        source_group_decision=source_decision,
+        regime_fit_decision=regime_decision,
+        base_cost_policy={"spread_multiplier": 1.0},
+    )
+    substituted = replace(
+        pristine,
+        base_cost_policy={"spread_multiplier": 0.5},
+    )
+    monkeypatch.setattr(
+        execution,
+        "fit_native_timeframe_for_search",
+        lambda **_kwargs: pristine,
+    )
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="FITTED_TIMEFRAME_REPLAY_MISMATCH",
+    ):
+        execution._reverify_fitted_timeframe(substituted, config)
+
+
+def test_historical_executor_replays_before_attempt_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Late fitted-state corruption cannot reach roster or market evaluation."""
+
+    session, _body, config = _held_canary_source_fixture()
+    source_decision = SimpleNamespace(
+        receipt_sha256="s" * 64,
+        to_dict=lambda: {
+            "acquisition_attempts_exact": 1,
+            "receipt_sha256": "s" * 64,
+            "symbol": "EURUSD",
+            "timeframe": "D1",
+        },
+    )
+    fitted = replace(session._fitted, source_group_decision=source_decision)
+    capture = object.__new__(execution.historical_adapter.HistoricalSymbolSearchCapture)
+    capture.record_search_infrastructure_failure = lambda *_args, **_kwargs: None
+    calls: list[str] = []
+
+    def reject_replay(*_args, **_kwargs):
+        calls.append("replay")
+        raise execution.AuthoritativeSearchExecutionError(
+            "FITTED_TIMEFRAME_REPLAY_MISMATCH"
+        )
+
+    monkeypatch.setattr(execution, "_reverify_fitted_timeframe", reject_replay)
+    monkeypatch.setattr(
+        execution,
+        "_verify_attempt_roster",
+        lambda *_args, **_kwargs: pytest.fail(
+            "attempt verification ran after replay rejected fitted state"
+        ),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verified_historical_cell_plan_inputs",
+        lambda *_args, **_kwargs: ({}, ()),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verify_capture_horizon_plan_identity",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = execution.execute_historical_observed_cell(
+        capture=capture,
+        fitted=fitted,
+        regime="TREND",
+        search_process=object(),
+        cell_plan=object(),
+        config=config,
+    )
+
+    assert calls == ["replay"]
+    assert result.status == "TECHNICAL_FAILURE"
+    assert result.failure_code == "FITTED_TIMEFRAME_REPLAY_MISMATCH"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("native_prefix_index_sha256", "x" * 64),
+        ("native_prefix_content_sha256", "x" * 64),
+        ("source_group_decision_sha256", "x" * 64),
+        ("regime_fit_decision_sha256", "x" * 64),
+        ("train_regime_support_receipt_sha256", "x" * 64),
+    ],
+)
+def test_canary_intermediate_source_check_rejects_receipt_splice(
+    field: str,
+    value: str,
+) -> None:
+    session, body, config = _held_canary_source_fixture()
+    body[field] = value
+
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="CANARY_SOURCE_SESSION_REPLAY_MISMATCH",
+    ):
+        execution._verify_bounded_canary_held_source_state(
+            source_session=session,
+            source_body=body,
+            current_config=config,
+        )
 
 
 def test_terminal_source_unavailable_derives_bound_book_decisions():
