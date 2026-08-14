@@ -1084,6 +1084,66 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
             self.assertNotEqual(provenance["failure_status"], "no_history")
             self.assertIn("not proof of broker absence", provenance["error"]["message"])
 
+    def test_forming_only_h4_is_retryable_without_leaf_or_manifest(self):
+        as_of = datetime(2026, 1, 10, 12, 0, tzinfo=UTC)
+
+        class FormingOnlyH4Connector(_RangeConnector):
+            def get_bars_range(
+                self, symbol, timeframe, start_date, end_date, sync_retry=False
+            ):
+                self.calls.append((symbol, timeframe, start_date, end_date, sync_retry))
+                if len(self.calls) > 1:
+                    self.diagnostics = _fixture_mt5_v4_empty_diagnostics(
+                        symbol=symbol, timeframe=timeframe, start=start_date, end=end_date
+                    )
+                    return None
+                frame = _bar_frame([as_of])
+                self.diagnostics = _retried_page_diagnostics(
+                    symbol=symbol,
+                    timeframe=timeframe,
+                    start=start_date,
+                    end=end_date,
+                    first_open=as_of,
+                    last_open=as_of,
+                    rows=1,
+                )
+                frame.attrs["mt5_history_range_diagnostics"] = dict(self.diagnostics)
+                return frame
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            with NativeHistoryStore(native_root, "forming-only-h4") as store:
+                request = NativeHistoryRequest(
+                    symbols=("EURUSD",),
+                    timeframes=("H4",),
+                    horizon_years=1,
+                    as_of_utc=as_of,
+                    enforce_evidence_horizon=False,
+                )
+                result = NativeHistoryAcquirer(
+                    FormingOnlyH4Connector(), store, request, now_fn=lambda: as_of
+                ).acquire()
+                attempts = list(
+                    (store.run_root / "_attempts" / "EURUSD" / "H4").glob(
+                        "attempt-*.json"
+                    )
+                )
+                cell = result["results"][0]
+                self.assertEqual(
+                    result["bounded_stop_reason"], "retryable_acquisition_failures"
+                )
+                self.assertIsNone(result["manifest_path"])
+                self.assertEqual(cell["status"], "failed")
+                self.assertEqual(cell["failure_status"], "no_fully_closed_history")
+                self.assertEqual(cell["resume_disposition"], "retryable_attempt")
+                self.assertEqual(result["resume"]["retryable_attempts"], 1)
+                self.assertEqual(len(attempts), 1)
+                self.assertTrue(
+                    json.loads(attempts[0].read_text(encoding="utf-8"))["retryable"]
+                )
+                self.assertFalse((store.run_root / "EURUSD" / "H4").exists())
+                self.assertFalse((store.run_root / "run_manifest.json").exists())
+
     def test_connector_is_the_only_history_retry_owner(self):
         start = datetime(2024, 1, 1, tzinfo=UTC)
         end = datetime(2024, 1, 10, tzinfo=UTC)
@@ -3324,6 +3384,42 @@ class NativeHistoryAcquisitionTests(unittest.TestCase):
                 )
             finally:
                 store.close()
+
+    def test_output_reserve_breach_stops_without_durable_artifacts(self):
+        as_of = datetime(2026, 1, 10, 12, 2, tzinfo=UTC)
+        with tempfile.TemporaryDirectory() as tmp:
+            _, native_root = self._paths(tmp)
+            with NativeHistoryStore(
+                native_root, "acquisition-output-reserve"
+            ) as store:
+                store._output_storage_snapshot = lambda _frame: {
+                    "status": "limit_exceeded",
+                    "violations": ["output_disk_free_reserve_breached"],
+                }
+                request = NativeHistoryRequest(
+                    symbols=("EURUSD",),
+                    timeframes=("M5",),
+                    horizon_years=1,
+                    as_of_utc=as_of,
+                    enforce_evidence_horizon=False,
+                )
+                result = NativeHistoryAcquirer(
+                    _RangeConnector(), store, request, now_fn=lambda: as_of
+                ).acquire()
+                cell = result["results"][0]
+                self.assertEqual(
+                    result["bounded_stop_reason"], "output_storage_resource_limit"
+                )
+                self.assertIsNone(result["manifest_path"])
+                self.assertEqual(result["resume"]["retryable_attempts"], 1)
+                self.assertEqual(cell["status"], "failed")
+                self.assertEqual(
+                    cell["failure_status"], "output_storage_resource_limit"
+                )
+                self.assertEqual(cell["resume_disposition"], "retryable_attempt")
+                self.assertFalse((store.run_root / "_attempts").exists())
+                self.assertFalse((store.run_root / "EURUSD" / "M5").exists())
+                self.assertFalse((store.run_root / "run_manifest.json").exists())
 
     def test_streamed_artifact_cap_plus_one_fails_before_leaf_publish(self):
         with tempfile.TemporaryDirectory() as tmp:

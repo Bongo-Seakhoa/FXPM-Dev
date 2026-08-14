@@ -92,11 +92,10 @@ never retain all DataFrames in RAM; never trade accuracy for the bound
 
 - Before any real optimizer evidence is trusted: a COMPLETE V5 acquisition
   manifest + per-cell provenance + independent continuity/activation
-  audit. `pm_native_run_reseal` is NOT on the V5 critical path — it is a
-  detached verifier used only when deliberately adopting a legacy V1
-  source (which `production_native_v5_20260713` is not); blanket-requiring
-  it would add an unnecessary signed legacy-adoption authority and another
-  non-constructible key path (the seq778 disease).
+  audit. The detached legacy-V1 exact-byte run-reseal authority was retired
+  under XPM-064/CPM-059 after its two unique live-acquisition failure checks
+  were migrated to the active acquisition suite. It was never on the V5
+  critical path; revival is governed by BI-12.
 - `pm_state_runtime` + exact regime/signal parity: MANDATORY before
   readiness/live.
 - These may be omitted ONLY from a clearly labeled mechanical diagnostic
@@ -288,10 +287,10 @@ mapping technical-vs-process-ineligible, never economic).
 ## 13. Dead-authority disposition (seq797 — supersedes §1's implicit wire-everything)
 
 `pm_state_runtime` (6,679 ln), `pm_native_lifecycle` (7,799),
-`pm_native_composite` (3,092), `pm_native_continuity` (1,513) have ZERO
-non-test callers; `pm_native_run_reseal` (1,432) only its detached V1
-materializer. 20,515 lines of passing tests are not production
-safeguards. Policy:
+`pm_native_composite` (3,092), and `pm_native_continuity` (1,513) have ZERO
+non-test callers. The detached `pm_native_run_reseal` island was retired under
+XPM-064/CPM-059; see BI-12. Passing tests do not make unreachable authority code
+a production safeguard. Policy:
 - Do NOT wire these security-heavy dead authorities into the new critical
   path. V5 source boundary = acquisition manifest/provenance + activation
   audit (consistent with §6/seq784).

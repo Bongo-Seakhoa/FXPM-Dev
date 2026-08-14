@@ -134,11 +134,14 @@ reachable from `pm_main`** — this is entangled, not detachable. Fan-in ranks
 **Cost to discard:** unknown; requires per-subsystem reachability proof.
 
 ### E4 — Orphaned modules `DECISION: pending`
-9 modules, 28,373 lines, reachable only from tests: `pm_native_lifecycle` (7,799),
+8 modules, 26,234 lines, reachable only from tests: `pm_native_lifecycle` (7,799),
 `pm_state_runtime` (6,679), `pm_native_storage` (3,331), `pm_native_composite`
-(3,092, zero non-test references), `pm_native_run_reseal`, `pm_raw_winner_canary_conformance`,
+(3,092, zero non-test references), `pm_raw_winner_canary_conformance`,
 `pm_native_continuity`, `pm_native_source_chain`, `pm_history_dependencies`.
 Each has a test file, so the suite proves the correctness of code that never runs.
+The ninth audited island, `pm_native_run_reseal` (2,139 lines plus its 133-line
+CLI and 1,778-line/45-case test; 4,050 lines total), was retired under
+XPM-064/CPM-059 after its two unique acquisition checks were migrated; see BI-12.
 
 ### E5 — Storage retention graph `DECISION: pending`
 `pm_native_storage` holds `protect_tree` and the collectability graph. **Zero

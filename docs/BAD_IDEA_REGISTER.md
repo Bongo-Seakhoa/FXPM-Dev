@@ -248,6 +248,19 @@ the same job.
 party, a shared host, or an auditor who must verify the log without trusting us.
 Preserved read-only as decision history.
 
+**BI-12 — detached legacy-V1 exact-byte run-reseal authority** · codex-pm + claude-pm · `e6e8be4`, XPM-064/CPM-059
+`pm_native_run_reseal.py`, `tools/materialize_native_run_reseal.py`, and their
+45-case test island implemented signed exact-byte adoption of a legacy V1 native
+source.
+*Killed by:* exhaustive scan found zero production, config, packaging, dynamic-
+import, persisted-artifact, or commercial caller. The V5 source boundary is
+manifest/provenance plus activation audit. The detached island occupied 4,050
+physical lines and measured 792.926s in the frozen full suite. Its two unique
+live-acquisition failure invariants were migrated to active acquisition tests;
+the original implementation remains recoverable from `e6e8be4`.
+*Revival trigger:* **a deliberate legacy-V1 exact-byte signing adoption is
+approved with a named caller.**
+
 ### Stale framing
 
 Register elements whose evidence has been withdrawn or superseded are flagged **in `RECONCILIATION_REGISTER.md` itself**, not duplicated here. Currently E15, E16, E17 and E7. An entry belongs in this file only when it is a failed implemented experiment, a rejected high-value hypothesis, or withdrawn evidence with a credible risk of being rebuilt.
