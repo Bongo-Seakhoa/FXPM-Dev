@@ -1,4 +1,3 @@
-import hashlib
 import json
 from copy import deepcopy
 from dataclasses import replace
@@ -10,19 +9,15 @@ import pm_native_activation as native_activation
 import pytest
 from pm_native_activation import (
     ACTIVE_POINTER_SCHEMA,
-    ACTIVATION_MANIFEST_SCHEMA,
     AUDITED_SIDECAR_CONTRACT,
     NATIVE_BARS_SCHEMA,
     NATIVE_EVIDENCE_CANDIDATE,
     NATIVE_TECHNICAL_ERROR,
-    TERMINAL_PROMOTION_RECEIPT_SCHEMA,
-    TERMINAL_PROMOTION_TRANSITION,
     _v5_authenticated_reference_resolution_audit,
     _v5_select_compatible_edge_receipt,
     classify_native_availability_cell,
     resolve_active_native_universe,
     sha256_file,
-    validate_terminal_promotion_view,
 )
 from pm_native_consensus import (
     CONSENSUS_SCHEMA_VERSION,
@@ -569,68 +564,3 @@ def test_terminal_technical_compatibility_does_not_reclassify_as_unavailable():
 
     assert classification == "terminal_technical"
     assert error is None
-
-
-def test_terminal_promotion_view_rejects_unsafe_activation_identity(tmp_path):
-    errors = validate_terminal_promotion_view(
-        tmp_path,
-        activation_id="../escaped",
-        view_path=tmp_path / "activations" / "escaped.json",
-        view_sha256="0" * 64,
-    )
-
-    assert errors == ["NATIVE_TERMINAL_PROMOTION_ACTIVATION_ID_INVALID"]
-
-
-def test_terminal_promotion_receipt_rejects_backslash_path_aliases(tmp_path):
-    activation_id = "activation-receipt-paths"
-    source = {
-        "activation_id": activation_id,
-        "counts": {"terminal": 600},
-        "previous_active_pointer_sha256": "a" * 64,
-        "run_id": "run-receipt-paths",
-        "schema_version": ACTIVATION_MANIFEST_SCHEMA,
-        "status": "failed",
-    }
-    promoted = dict(source)
-    promoted["status"] = "active"
-    source_bytes = _canonical_file_bytes(source)
-    promoted_bytes = _canonical_file_bytes(promoted)
-    source_path = tmp_path / "activations" / f"{activation_id}.json"
-    view_path = tmp_path / "activations" / "promoted" / f"{activation_id}.json"
-    receipt_path = tmp_path / "transition_receipts" / f"{activation_id}.json"
-    source_path.parent.mkdir(parents=True)
-    view_path.parent.mkdir(parents=True)
-    receipt_path.parent.mkdir(parents=True)
-    source_path.write_bytes(source_bytes)
-    view_path.write_bytes(promoted_bytes)
-    promoted_sha256 = hashlib.sha256(promoted_bytes).hexdigest()
-    receipt = {
-        "activation_id": activation_id,
-        "cell_evidence_replayed": False,
-        "counts": source["counts"],
-        "data_reacquired": False,
-        "previous_active_pointer_sha256": source[
-            "previous_active_pointer_sha256"
-        ],
-        "promoted_manifest_relative_path": (
-            f"activations\\promoted\\{activation_id}.json"
-        ),
-        "promoted_manifest_sha256": promoted_sha256,
-        "run_id": source["run_id"],
-        "schema_version": TERMINAL_PROMOTION_RECEIPT_SCHEMA,
-        "source_manifest_relative_path": f"activations\\{activation_id}.json",
-        "source_manifest_sha256": hashlib.sha256(source_bytes).hexdigest(),
-        "transition": TERMINAL_PROMOTION_TRANSITION,
-    }
-    receipt_path.write_bytes(_canonical_file_bytes(receipt))
-
-    errors = validate_terminal_promotion_view(
-        tmp_path,
-        activation_id=activation_id,
-        view_path=view_path,
-        view_sha256=promoted_sha256,
-    )
-
-    assert "NATIVE_TERMINAL_PROMOTION_SOURCE_PATH_MISMATCH" in errors
-    assert "NATIVE_TERMINAL_PROMOTION_VIEW_PATH_MISMATCH" in errors

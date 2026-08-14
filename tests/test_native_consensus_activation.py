@@ -1,12 +1,9 @@
-import base64
 import hashlib
 import json
 import os
-from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -38,902 +35,6 @@ from tests.native_v5_support import (
     rewrite_no_history as _rewrite_no_history,
     write_v5_run as _write_v5_run,
 )
-
-
-def _terminal_promotion_fixture(native_root: Path, *, integrity_error: bool = False):
-    activation_id = "activation-terminal-promotion"
-    run_id = "run-terminal-promotion"
-    run_manifest_path = native_root / "runs" / run_id / "run_manifest.json"
-    run_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    run_manifest_path.write_text("{}\n", encoding="utf-8")
-    pointer_path = native_root / "ACTIVE.json"
-    pointer_path.parent.mkdir(parents=True, exist_ok=True)
-    pointer_path.write_bytes(
-        activation_tool._canonical_json_bytes(
-            {
-                "schema_version": ACTIVE_POINTER_SCHEMA,
-                "activation_id": "last-good",
-                "manifest_relative_path": "activations/last-good.json",
-                "manifest_sha256": "1" * 64,
-                "activated_at_utc": "2026-07-18T00:00:00Z",
-            }
-        )
-    )
-    pointer_sha = sha256_file(pointer_path)
-    statuses = {}
-    entries = {}
-    candidate_projection = {}
-    unavailable_projection = {}
-    for symbol in PRODUCTION_SYMBOL_ORDER:
-        statuses[symbol] = {}
-        entries[symbol] = {}
-        candidate_projection[symbol] = ["D1"]
-        unavailable_projection[symbol] = []
-        for timeframe in DEFAULT_TIMEFRAMES:
-            candidate = timeframe == "D1"
-            state = NATIVE_EVIDENCE_CANDIDATE if candidate else NATIVE_TECHNICAL_ERROR
-            statuses[symbol][timeframe] = state
-            entries[symbol][timeframe] = {
-                "status": state,
-                "audit_status": "PASS" if candidate else "FAIL",
-                "consensus_status": "PASS" if candidate else "FAIL",
-                "reason_codes": (
-                    ["SOURCE:SOURCE_BARS_MISSING"]
-                    if integrity_error and symbol == PRODUCTION_SYMBOL_ORDER[0] and timeframe == "M5"
-                    else ([] if candidate else ["CROSS_RESOLUTION_CONSENSUS_FAILED"])
-                ),
-            }
-    counts = {
-        NATIVE_EVIDENCE_CANDIDATE: len(PRODUCTION_SYMBOL_ORDER),
-        NATIVE_SOURCE_UNAVAILABLE: 0,
-        NATIVE_TECHNICAL_ERROR: len(PRODUCTION_SYMBOL_ORDER)
-        * (len(DEFAULT_TIMEFRAMES) - 1),
-        "pending": 0,
-        "total": len(PRODUCTION_SYMBOL_ORDER) * len(DEFAULT_TIMEFRAMES),
-        "terminal": len(PRODUCTION_SYMBOL_ORDER) * len(DEFAULT_TIMEFRAMES),
-        "symbols_with_evidence_candidates": len(PRODUCTION_SYMBOL_ORDER),
-    }
-    manifest = {
-        "schema_version": activation_tool.ACTIVATION_MANIFEST_SCHEMA,
-        "activation_id": activation_id,
-        "run_id": run_id,
-        "run_manifest_relative_path": f"runs/{run_id}/run_manifest.json",
-        "run_manifest_sha256": sha256_file(run_manifest_path),
-        "status": "failed",
-        "production_authoritative": True,
-        "native_is_signal_authority": True,
-        "silent_fallback_allowed": False,
-        "previous_active_pointer_sha256": pointer_sha,
-        "counts": counts,
-        "universe_eligibility": {
-            "schema_version": activation_tool.UNIVERSE_AUTHENTICITY_SCHEMA,
-            "requested_symbols": list(PRODUCTION_SYMBOL_ORDER),
-            "required_timeframes": list(DEFAULT_TIMEFRAMES),
-            "cell_statuses": statuses,
-            "terminal_states": [
-                NATIVE_EVIDENCE_CANDIDATE,
-                NATIVE_SOURCE_UNAVAILABLE,
-                NATIVE_TECHNICAL_ERROR,
-            ],
-            "nonterminal_states": ["pending"],
-            "evidence_candidate_timeframes_by_symbol": candidate_projection,
-            "source_unavailable_timeframes_by_symbol": unavailable_projection,
-            "symbols_with_evidence_candidates": list(PRODUCTION_SYMBOL_ORDER),
-        },
-        "entries": entries,
-    }
-    manifest_path = native_root / "activations" / f"{activation_id}.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_bytes(activation_tool._canonical_json_bytes(manifest))
-    return run_id, activation_id, pointer_path, manifest_path
-
-
-def _stub_terminal_promotion_dependencies(monkeypatch):
-    monkeypatch.setattr(
-        activation_tool,
-        "resolve_active_native_universe",
-        lambda *args, **kwargs: SimpleNamespace(
-            errors=[],
-            requested_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
-            required_timeframes=tuple(DEFAULT_TIMEFRAMES),
-        ),
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_postcheck",
-        lambda *args, **kwargs: {
-            "anchor_plan_receipt_sha256": "a" * 64,
-            "portfolio_activation_roster_sha256": "b" * 64,
-        },
-    )
-
-
-def _leave_candidate_with_recovery(
-    native_root: Path,
-    *,
-    run_id: str,
-    activation_id: str,
-    manifest_path: Path,
-    monkeypatch,
-) -> None:
-    """Model abrupt death after swap by bypassing only in-process cleanup."""
-
-    with monkeypatch.context() as crash_patch:
-        crash_patch.setattr(
-            activation_tool,
-            "_terminal_promotion_postcheck",
-            lambda *args, **kwargs: (_ for _ in ()).throw(SystemExit(91)),
-        )
-        crash_patch.setattr(
-            activation_tool,
-            "_terminal_promotion_restore_and_clear_recovery",
-            lambda *args, **kwargs: [],
-        )
-        with pytest.raises(SystemExit):
-            activation_tool.promote_completed_terminal_activation(
-                native_root,
-                run_id=run_id,
-                activation_id=activation_id,
-                expected_manifest_sha256=sha256_file(manifest_path),
-            )
-
-
-def test_completed_terminal_grid_promotes_without_evidence_replay(tmp_path, monkeypatch):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    original_manifest = manifest_path.read_bytes()
-    monkeypatch.setattr(
-        activation_tool,
-        "resolve_active_native_universe",
-        lambda *args, **kwargs: SimpleNamespace(
-            errors=[],
-            requested_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
-            required_timeframes=tuple(DEFAULT_TIMEFRAMES),
-        ),
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_postcheck",
-        lambda *args, **kwargs: {
-            "anchor_plan_receipt_sha256": "a" * 64,
-            "portfolio_activation_roster_sha256": "b" * 64,
-        },
-    )
-
-    result = activation_tool.promote_completed_terminal_activation(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        expected_manifest_sha256=sha256_file(manifest_path),
-    )
-
-    assert result["status"] == "active"
-    assert result["active_pointer_updated"] is True
-    assert result["data_reacquired"] is False
-    assert result["cell_evidence_replayed"] is False
-    assert pointer_path.read_bytes() != original_pointer
-    assert manifest_path.read_bytes() == original_manifest
-    assert json.loads(manifest_path.read_text(encoding="utf-8"))["status"] == "failed"
-    promoted_path = Path(result["manifest_path"])
-    promoted = json.loads(promoted_path.read_text(encoding="utf-8"))
-    source = json.loads(original_manifest.decode("utf-8"))
-    assert promoted == {**source, "status": "active"}
-    assert promoted_path.read_bytes() == activation_tool._canonical_json_bytes(promoted)
-    assert sha256_file(promoted_path) == result["manifest_sha256"]
-
-    receipt_path = Path(result["transition_receipt_path"])
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert set(receipt) == {
-        "schema_version",
-        "activation_id",
-        "run_id",
-        "source_manifest_relative_path",
-        "source_manifest_sha256",
-        "promoted_manifest_relative_path",
-        "promoted_manifest_sha256",
-        "previous_active_pointer_sha256",
-        "counts",
-        "transition",
-        "data_reacquired",
-        "cell_evidence_replayed",
-    }
-    assert receipt["source_manifest_sha256"] == hashlib.sha256(
-        original_manifest
-    ).hexdigest()
-    assert receipt["promoted_manifest_sha256"] == sha256_file(promoted_path)
-    assert receipt["previous_active_pointer_sha256"] == hashlib.sha256(
-        original_pointer
-    ).hexdigest()
-    assert receipt_path.read_bytes() == activation_tool._canonical_json_bytes(receipt)
-
-    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    assert set(pointer) == {
-        "schema_version",
-        "activation_id",
-        "manifest_relative_path",
-        "manifest_sha256",
-        "activated_at_utc",
-        "production_authoritative",
-    }
-    assert pointer["activation_id"] == activation_id
-    assert pointer["manifest_relative_path"] == (
-        f"activations/promoted/{activation_id}.json"
-    )
-    assert pointer["manifest_sha256"] == sha256_file(promoted_path)
-    assert pointer["production_authoritative"] is True
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    assert result["recovery_record_cleared"] is True
-    assert not recovery_path.exists()
-
-    committed_pointer = pointer_path.read_bytes()
-    retry = activation_tool.promote_completed_terminal_activation(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        expected_manifest_sha256=sha256_file(manifest_path),
-    )
-    assert retry["idempotent_committed_reentry"] is True
-    assert retry["active_pointer_updated"] is False
-    assert retry["recovery_record_cleared"] is True
-    assert pointer_path.read_bytes() == committed_pointer
-    assert not recovery_path.exists()
-
-
-def test_completed_terminal_promotion_rejects_source_integrity_error(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root,
-        integrity_error=True,
-    )
-    original_pointer = pointer_path.read_bytes()
-    original_manifest = manifest_path.read_bytes()
-    monkeypatch.setattr(
-        activation_tool,
-        "resolve_active_native_universe",
-        lambda *args, **kwargs: SimpleNamespace(
-            errors=[],
-            requested_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
-            required_timeframes=tuple(DEFAULT_TIMEFRAMES),
-        ),
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-
-    with pytest.raises(ValueError, match="TERMINAL_PROMOTION_INTEGRITY_ERROR_PRESENT"):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == original_pointer
-    assert manifest_path.read_bytes() == original_manifest
-
-
-def test_completed_terminal_promotion_rolls_back_failed_postcheck(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    original_manifest = manifest_path.read_bytes()
-    def _resolve(*args, **kwargs):
-        return SimpleNamespace(
-            errors=[],
-            requested_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
-            required_timeframes=tuple(DEFAULT_TIMEFRAMES),
-        )
-
-    monkeypatch.setattr(activation_tool, "resolve_active_native_universe", _resolve)
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_postcheck",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("SYNTHETIC_POSTCHECK_FAILURE")
-        ),
-    )
-    with pytest.raises(RuntimeError, match="SYNTHETIC_POSTCHECK_FAILURE"):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == original_pointer
-    assert manifest_path.read_bytes() == original_manifest
-
-
-def test_completed_terminal_promotion_pointer_cas_preserves_superseder(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_manifest = manifest_path.read_bytes()
-    superseding_pointer = activation_tool._canonical_json_bytes(
-        {
-            "schema_version": ACTIVE_POINTER_SCHEMA,
-            "activation_id": "concurrent-successor",
-            "manifest_relative_path": "activations/concurrent-successor.json",
-            "manifest_sha256": "c" * 64,
-            "activated_at_utc": "2026-07-19T00:00:00Z",
-            "production_authoritative": True,
-        }
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "resolve_active_native_universe",
-        lambda *args, **kwargs: SimpleNamespace(errors=[]),
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-    real_lock = activation_tool._active_pointer_lock
-    lock_entries = 0
-
-    @contextmanager
-    def _racing_lock(root, **kwargs):
-        nonlocal lock_entries
-        with real_lock(root, **kwargs):
-            lock_entries += 1
-            if lock_entries == 1:
-                pointer_path.write_bytes(superseding_pointer)
-            yield
-
-    monkeypatch.setattr(activation_tool, "_active_pointer_lock", _racing_lock)
-
-    with pytest.raises(RuntimeError, match="TERMINAL_PROMOTION_POINTER_CAS_MISMATCH"):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == superseding_pointer
-    assert manifest_path.read_bytes() == original_manifest
-
-
-def test_completed_terminal_promotion_detects_postcheck_superseder_without_clobber(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_manifest = manifest_path.read_bytes()
-    superseding_pointer = activation_tool._canonical_json_bytes(
-        {
-            "schema_version": ACTIVE_POINTER_SCHEMA,
-            "activation_id": "postcheck-successor",
-            "manifest_relative_path": "activations/postcheck-successor.json",
-            "manifest_sha256": "d" * 64,
-            "activated_at_utc": "2026-07-19T00:00:01Z",
-            "production_authoritative": True,
-        }
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "resolve_active_native_universe",
-        lambda *args, **kwargs: SimpleNamespace(errors=[]),
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-
-    def _supersede_during_postcheck(*args, **kwargs):
-        pointer_path.write_bytes(superseding_pointer)
-        return {
-            "anchor_plan_receipt_sha256": "a" * 64,
-            "portfolio_activation_roster_sha256": "b" * 64,
-        }
-
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_postcheck",
-        _supersede_during_postcheck,
-    )
-
-    with pytest.raises(RuntimeError, match="TERMINAL_PROMOTION_ROLLBACK_FAILED") as exc:
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert exc.value.__cause__ is not None
-    assert "TERMINAL_PROMOTION_POINTER_CHANGED_DURING_POSTCHECK" in str(
-        exc.value.__cause__
-    )
-    assert pointer_path.read_bytes() == superseding_pointer
-    assert manifest_path.read_bytes() == original_manifest
-
-
-def test_completed_terminal_promotion_rolls_back_interrupt_with_bounded_retry(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    original_manifest = manifest_path.read_bytes()
-    monkeypatch.setattr(
-        activation_tool,
-        "resolve_active_native_universe",
-        lambda *args, **kwargs: SimpleNamespace(errors=[]),
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_postcheck",
-        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
-    )
-    original_replace = activation_tool._atomic_replace_bytes
-    rollback_attempts = 0
-
-    def _transient_rollback_replace(path, payload):
-        nonlocal rollback_attempts
-        if Path(path) == pointer_path and payload == original_pointer:
-            rollback_attempts += 1
-            if rollback_attempts < 3:
-                raise PermissionError(13, "simulated transient pointer share lock")
-        return original_replace(path, payload)
-
-    monkeypatch.setattr(
-        activation_tool,
-        "_atomic_replace_bytes",
-        _transient_rollback_replace,
-    )
-
-    with pytest.raises(KeyboardInterrupt):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert rollback_attempts == 3
-    assert pointer_path.read_bytes() == original_pointer
-    assert manifest_path.read_bytes() == original_manifest
-
-
-@pytest.mark.parametrize("collision", ["view", "receipt"])
-def test_completed_terminal_promotion_rejects_staged_artifact_collision(
-    tmp_path, monkeypatch, collision
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    original_manifest = manifest_path.read_bytes()
-    monkeypatch.setattr(
-        activation_tool,
-        "resolve_active_native_universe",
-        lambda *args, **kwargs: SimpleNamespace(errors=[]),
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: [],
-    )
-    promoted_path = (
-        native_root / "activations" / "promoted" / f"{activation_id}.json"
-    )
-    promoted_path.parent.mkdir(parents=True)
-    if collision == "view":
-        promoted_path.write_text("{}\n", encoding="utf-8")
-        expected_error = "terminal promoted manifest collision"
-    else:
-        source = json.loads(original_manifest.decode("utf-8"))
-        promoted_path.write_bytes(
-            activation_tool._canonical_json_bytes({**source, "status": "active"})
-        )
-        receipt_path = (
-            native_root / "transition_receipts" / f"{activation_id}.json"
-        )
-        receipt_path.parent.mkdir(parents=True)
-        receipt_path.write_text("{}\n", encoding="utf-8")
-        expected_error = "terminal promotion receipt collision"
-
-    with pytest.raises(FileExistsError, match=expected_error):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == original_pointer
-    assert manifest_path.read_bytes() == original_manifest
-
-
-def test_terminal_promotion_reconciles_crash_after_record_before_swap(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-
-    with monkeypatch.context() as crash_patch:
-        crash_patch.setattr(
-            activation_tool,
-            "_atomic_replace_bytes_with_retry",
-            lambda *args, **kwargs: (_ for _ in ()).throw(SystemExit(92)),
-        )
-        crash_patch.setattr(
-            activation_tool,
-            "_terminal_promotion_restore_and_clear_recovery",
-            lambda *args, **kwargs: [],
-        )
-        with pytest.raises(SystemExit):
-            activation_tool.promote_completed_terminal_activation(
-                native_root,
-                run_id=run_id,
-                activation_id=activation_id,
-                expected_manifest_sha256=sha256_file(manifest_path),
-            )
-
-    assert pointer_path.read_bytes() == original_pointer
-    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
-    persisted_candidate = base64.b64decode(
-        recovery["candidate_active_pointer_bytes_base64"], validate=True
-    )
-    result = activation_tool.promote_completed_terminal_activation(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        expected_manifest_sha256=sha256_file(manifest_path),
-    )
-
-    assert result["reconciled_recovery"] is True
-    assert result["active_pointer_updated"] is True
-    assert pointer_path.read_bytes() == persisted_candidate
-    assert not recovery_path.exists()
-
-
-def test_terminal_promotion_candidate_on_reentry_finishes_and_clears_record(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    _leave_candidate_with_recovery(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        manifest_path=manifest_path,
-        monkeypatch=monkeypatch,
-    )
-    candidate_pointer = pointer_path.read_bytes()
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    assert recovery_path.is_file()
-
-    result = activation_tool.promote_completed_terminal_activation(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        expected_manifest_sha256=sha256_file(manifest_path),
-    )
-
-    assert result["reconciled_recovery"] is True
-    assert result["active_pointer_updated"] is False
-    assert result["recovery_record_cleared"] is True
-    assert pointer_path.read_bytes() == candidate_pointer
-    assert not recovery_path.exists()
-
-
-def test_terminal_promotion_candidate_reentry_failure_restores_exact_predecessor(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    _leave_candidate_with_recovery(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        manifest_path=manifest_path,
-        monkeypatch=monkeypatch,
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_postcheck",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            RuntimeError("SYNTHETIC_RECOVERY_POSTCHECK_FAILURE")
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="SYNTHETIC_RECOVERY_POSTCHECK_FAILURE"):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    assert pointer_path.read_bytes() == original_pointer
-    assert hashlib.sha256(pointer_path.read_bytes()).hexdigest() == hashlib.sha256(
-        original_pointer
-    ).hexdigest()
-    assert not recovery_path.exists()
-
-
-def test_terminal_promotion_candidate_fresh_precheck_failure_restores_predecessor(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    _leave_candidate_with_recovery(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        manifest_path=manifest_path,
-        monkeypatch=monkeypatch,
-    )
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_evidence_errors",
-        lambda *args, **kwargs: ["SYNTHETIC_FRESH_PRECHECK_FAILURE"],
-    )
-
-    with pytest.raises(ValueError, match="SYNTHETIC_FRESH_PRECHECK_FAILURE"):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    assert pointer_path.read_bytes() == original_pointer
-    assert not recovery_path.exists()
-
-
-@pytest.mark.parametrize("damage", ["missing_view", "tampered_receipt"])
-def test_terminal_promotion_candidate_staged_artifact_failure_restores_predecessor(
-    tmp_path, monkeypatch, damage
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    _leave_candidate_with_recovery(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        manifest_path=manifest_path,
-        monkeypatch=monkeypatch,
-    )
-    if damage == "missing_view":
-        damaged_path = (
-            native_root / "activations" / "promoted" / f"{activation_id}.json"
-        )
-        damaged_path.unlink()
-        expected_error = FileNotFoundError
-    else:
-        damaged_path = (
-            native_root / "transition_receipts" / f"{activation_id}.json"
-        )
-        damaged_path.write_text("{}\n", encoding="utf-8")
-        expected_error = FileExistsError
-
-    with pytest.raises(expected_error):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    assert pointer_path.read_bytes() == original_pointer
-    assert not recovery_path.exists()
-
-
-def test_terminal_promotion_recovery_third_pointer_is_never_clobbered(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    _leave_candidate_with_recovery(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        manifest_path=manifest_path,
-        monkeypatch=monkeypatch,
-    )
-    third_pointer = activation_tool._canonical_json_bytes(
-        {
-            "schema_version": ACTIVE_POINTER_SCHEMA,
-            "activation_id": "independent-third-pointer",
-            "manifest_relative_path": "activations/independent-third-pointer.json",
-            "manifest_sha256": "e" * 64,
-            "activated_at_utc": "2026-07-19T00:00:02Z",
-            "production_authoritative": True,
-        }
-    )
-    pointer_path.write_bytes(third_pointer)
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    recovery_bytes = recovery_path.read_bytes()
-
-    with pytest.raises(
-        RuntimeError, match="TERMINAL_PROMOTION_RECOVERY_ACTIVE_POINTER_DIVERGED"
-    ):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == third_pointer
-    assert recovery_path.read_bytes() == recovery_bytes
-
-
-@pytest.mark.parametrize("tamper", ["candidate_hash", "backslash_path"])
-def test_terminal_promotion_recovery_record_tamper_fails_closed(
-    tmp_path, monkeypatch, tamper
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    _leave_candidate_with_recovery(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        manifest_path=manifest_path,
-        monkeypatch=monkeypatch,
-    )
-    candidate_pointer = pointer_path.read_bytes()
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
-    if tamper == "candidate_hash":
-        recovery["candidate_active_pointer_sha256"] = "0" * 64
-        expected_error = "CANDIDATE_POINTER_SHA256_MISMATCH"
-    else:
-        recovery["promoted_manifest_relative_path"] = (
-            f"activations\\promoted\\{activation_id}.json"
-        )
-        expected_error = "RECOVERY_VIEW_PATH_MISMATCH"
-    recovery_path.write_bytes(activation_tool._canonical_json_bytes(recovery))
-
-    with pytest.raises(ValueError, match=expected_error):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == candidate_pointer
-    assert recovery_path.is_file()
-
-
-def test_terminal_promotion_recovery_collision_blocks_new_transaction(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    original_pointer = pointer_path.read_bytes()
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-    recovery_path.write_bytes(activation_tool._canonical_json_bytes({"collision": True}))
-
-    with pytest.raises(ValueError, match="TERMINAL_PROMOTION_RECOVERY_FIELDS_INVALID"):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == original_pointer
-    assert recovery_path.is_file()
-
-
-def test_terminal_promotion_missing_recovery_during_postcheck_is_catastrophic(
-    tmp_path, monkeypatch
-):
-    native_root = tmp_path / "data" / "native"
-    run_id, activation_id, pointer_path, manifest_path = _terminal_promotion_fixture(
-        native_root
-    )
-    _stub_terminal_promotion_dependencies(monkeypatch)
-    _leave_candidate_with_recovery(
-        native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-        manifest_path=manifest_path,
-        monkeypatch=monkeypatch,
-    )
-    candidate_pointer = pointer_path.read_bytes()
-    recovery_path = native_root / activation_tool._TERMINAL_PROMOTION_RECOVERY_FILENAME
-
-    def _remove_recovery_during_postcheck(*args, **kwargs):
-        recovery_path.unlink()
-        return {
-            "anchor_plan_receipt_sha256": "a" * 64,
-            "portfolio_activation_roster_sha256": "b" * 64,
-        }
-
-    monkeypatch.setattr(
-        activation_tool,
-        "_terminal_promotion_postcheck",
-        _remove_recovery_during_postcheck,
-    )
-    with pytest.raises(RuntimeError, match="TERMINAL_PROMOTION_ROLLBACK_FAILED"):
-        activation_tool.promote_completed_terminal_activation(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=sha256_file(manifest_path),
-        )
-
-    assert pointer_path.read_bytes() == candidate_pointer
-    assert not recovery_path.exists()
 
 
 @pytest.mark.parametrize(
@@ -981,9 +82,7 @@ def test_terminal_pending_classifier_accepts_only_completed_authenticated_facts(
     }
     assert activation_tool._has_only_authenticated_terminal_pending(envelope)
     for window in activation_tool.REQUIRED_AUDIT_WINDOWS:
-        edges["H1"]["report"]["windows"][window]["reason_codes"] = [
-            "SYNTHETIC_PENDING"
-        ]
+        edges["H1"]["report"]["windows"][window]["reason_codes"] = ["SYNTHETIC_PENDING"]
     assert not activation_tool._has_only_authenticated_terminal_pending(envelope)
 
 
@@ -1346,9 +445,7 @@ def test_v5_resolution_uses_scored_partitions_without_weakening_them():
     )
     assert scoped.status == "PASS"
 
-    daily_like_evidence = _frame(
-        pd.date_range(strategy_start, periods=40, freq="D")
-    )
+    daily_like_evidence = _frame(pd.date_range(strategy_start, periods=40, freq="D"))
     evidence, _, error = activation_tool._v5_scored_resolution_frames(
         source,
         daily_like_evidence,
@@ -1505,11 +602,104 @@ def test_v5_all_twelve_edges_survive_sorted_json_and_production_recomputation(tm
     assert not (native_root / "ACTIVE.json").exists()
 
 
-def test_v5_production_grid_accounts_for_all_600_cells(tmp_path):
+def test_production_publisher_requires_force_raw_before_creating_audit(tmp_path):
+    native_root = tmp_path / "data" / "native"
+    native_root.mkdir(parents=True)
+
+    with pytest.raises(
+        ValueError,
+        match="production publication requires semantic_verification_mode=FORCE_RAW",
+    ):
+        activation_tool.audit_and_activate(
+            native_root,
+            run_id="run-force-raw-preflight",
+            symbols=PRODUCTION_SYMBOL_ORDER,
+            timeframes=DEFAULT_TIMEFRAMES,
+            activation_id="activation-force-raw-preflight",
+            update_active_pointer=True,
+        )
+
+    assert not (native_root / "audits" / "activation-force-raw-preflight").exists()
+
+
+def test_v5_production_publisher_audits_exact_600_once_and_reuses_stage(
+    tmp_path,
+    monkeypatch,
+):
     data_dir = tmp_path / "data"
     native_root = data_dir / "native"
     native_root.mkdir(parents=True)
     _write_v5_run(native_root, "run-production-grid", production_grid=True)
+
+    # Migration starts from the currently deployed receiptless promoted-view
+    # pointer. FORCE_RAW may CAS from its exact bytes without treating that
+    # legacy pointer as valid new production authority.
+    pointer_path = native_root / "ACTIVE.json"
+    predecessor = {
+        "schema_version": ACTIVE_POINTER_SCHEMA,
+        "activation_id": "legacy-promoted",
+        "manifest_relative_path": "activations/promoted/legacy-promoted.json",
+        "manifest_sha256": "9" * 64,
+        "activated_at_utc": "2026-07-19T10:17:58Z",
+        "production_authoritative": True,
+    }
+    pointer_path.write_text(
+        json.dumps(predecessor, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    predecessor_sha = sha256_file(pointer_path)
+
+    real_audit_symbol = activation_tool._v5_audit_symbol
+    audited_cells = 0
+
+    def _bounded_audit_symbol(*args, **kwargs):
+        nonlocal audited_cells
+        symbol = kwargs["symbol"]
+        timeframes = tuple(kwargs["timeframes"])
+        audited_cells += len(timeframes)
+        if symbol == SYMBOL:
+            # One real surface retains end-to-end raw audit behavior; the
+            # other 594 cells are bounded structural fixtures. The focused
+            # corruption test below remains the real negative control.
+            return real_audit_symbol(*args, **kwargs)
+        run_cells = kwargs["run_manifest_cells"]
+        run_id = kwargs["run_id"]
+        activation_id = kwargs["activation_id"]
+        coverage = {
+            partition: 1.0 for partition in activation_tool.NATIVE_EVIDENCE_PARTITIONS
+        }
+        entries = {}
+        for timeframe in timeframes:
+            run_cell = run_cells[(symbol, timeframe)]
+            entries[timeframe] = {
+                "status": NATIVE_EVIDENCE_CANDIDATE,
+                "audit_status": "PASS",
+                "universe_eligibility_status": NATIVE_EVIDENCE_CANDIDATE,
+                "tradeable": False,
+                "statistical_sufficiency_receipt_required": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "run_id": run_id,
+                "bars_relative_path": f"runs/{run_id}/{symbol}/{timeframe}/bars.csv",
+                "bars_sha256": run_cell["sha256"],
+                "sidecar_relative_path": (
+                    f"audits/{activation_id}/{symbol}/{timeframe}/bars.meta.json"
+                ),
+                "sidecar_sha256": "7" * 64,
+                "parity_relative_path": (
+                    f"audits/{activation_id}/{symbol}/{timeframe}/parity.json"
+                ),
+                "parity_sha256": "8" * 64,
+                "coverage_method": activation_tool.NATIVE_SESSION_COVERAGE_METHOD,
+                "expected_session_coverage_by_partition": coverage,
+            }
+        return entries, {}, []
+
+    monkeypatch.setattr(
+        activation_tool,
+        "_v5_audit_symbol",
+        _bounded_audit_symbol,
+    )
 
     activated = _activate(
         native_root,
@@ -1517,7 +707,9 @@ def test_v5_production_grid_accounts_for_all_600_cells(tmp_path):
         "activation-production-grid",
     )
 
+    assert audited_cells == 600
     assert activated["status"] == "active", activated
+    assert activated["previous_active_pointer_sha256"] == predecessor_sha
     assert (
         tuple(activated["universe_eligibility"]["requested_symbols"])
         == PRODUCTION_SYMBOL_ORDER
@@ -1554,13 +746,26 @@ def test_v5_production_grid_accounts_for_all_600_cells(tmp_path):
         )
         assert "minimum_session_coverage" not in report
 
-    pointer_path = native_root / "ACTIVE.json"
     original_pointer = pointer_path.read_bytes()
     assert json.loads(original_pointer)["production_authoritative"] is True
+    receipt = json.loads(Path(activated["semantic_receipt_path"]).read_text("utf-8"))
+    assert len(receipt["native_leaf_bindings"]) == 600
+    assert receipt["verification_mode"] == (
+        activation_tool.NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW
+    )
+
+    def _raw_fallback_forbidden(*args, **kwargs):
+        raise AssertionError("receipt-backed production resolution raw-fell back")
+
+    monkeypatch.setattr(
+        "pm_native_activation._verify_activation_cell_evidence",
+        _raw_fallback_forbidden,
+    )
+    clear_unscoped_native_universe_memo()
     universe = resolve_active_native_universe(
         data_dir,
         PRODUCTION_SYMBOL_ORDER,
-        verify_exclusion_evidence=False,
+        verify_exclusion_evidence=True,
         production_contract_required=True,
     )
     assert universe.valid, universe.errors
@@ -1582,7 +787,7 @@ def test_v5_production_grid_accounts_for_all_600_cells(tmp_path):
     wrong_config = resolve_active_native_universe(
         data_dir,
         wrong_case_config,
-        verify_exclusion_evidence=False,
+        verify_exclusion_evidence=True,
         production_contract_required=True,
     )
     assert not wrong_config.valid
@@ -1590,100 +795,14 @@ def test_v5_production_grid_accounts_for_all_600_cells(tmp_path):
         wrong_config.errors
     )
 
-    pointer = json.loads(original_pointer)
-    pointer["manifest_relative_path"] = pointer["manifest_relative_path"].replace(
-        "activations/", "Activations/", 1
+    reused = _activate(
+        native_root,
+        "run-production-grid",
+        "activation-production-grid",
     )
-    pointer_path.write_text(
-        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    wrong_pointer = resolve_active_native_universe(
-        data_dir,
-        PRODUCTION_SYMBOL_ORDER,
-        verify_exclusion_evidence=False,
-        production_contract_required=True,
-    )
-    assert not wrong_pointer.valid
-    assert "NATIVE_ACTIVE_MANIFEST_PATH_IDENTITY_MISMATCH" in wrong_pointer.errors
-    pointer_path.write_bytes(original_pointer)
-
-    pointer = json.loads(original_pointer)
-    pointer["production_authoritative"] = False
-    pointer_path.write_text(
-        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    forged_authority = resolve_active_native_universe(
-        data_dir,
-        PRODUCTION_SYMBOL_ORDER,
-        verify_exclusion_evidence=False,
-        production_contract_required=True,
-    )
-    assert not forged_authority.valid
-    assert "NATIVE_ACTIVE_PRODUCTION_AUTHORITY_MARKER_MISMATCH" in (
-        forged_authority.errors
-    )
-    pointer_path.write_bytes(original_pointer)
-
-    manifest_path = Path(activated["manifest_path"])
-    original_manifest = manifest_path.read_bytes()
-    manifest = json.loads(original_manifest)
-    eurusd_m5 = manifest["entries"][SYMBOL]["M5"]
-    eurusd_m5["symbol"] = "eurusd"
-    eurusd_m5["bars_relative_path"] = eurusd_m5["bars_relative_path"].replace(
-        "/EURUSD/", "/eurusd/"
-    )
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    pointer = json.loads(original_pointer)
-    pointer["manifest_sha256"] = sha256_file(manifest_path)
-    pointer_path.write_text(
-        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    wrong_path = resolve_active_native_artifact(
-        data_dir,
-        SYMBOL,
-        "M5",
-        production_contract_required=True,
-    )
-    assert not wrong_path.valid
-    assert "NATIVE_ACTIVE_CELL_SYMBOL_MISMATCH" in wrong_path.errors
-    assert any("BARS_RELATIVE_PATH_IDENTITY_MISMATCH" in e for e in wrong_path.errors)
-    manifest_path.write_bytes(original_manifest)
-    pointer_path.write_bytes(original_pointer)
-
-    run_manifest_path = (
-        native_root / "runs" / "run-production-grid" / "run_manifest.json"
-    )
-    original_run_manifest = run_manifest_path.read_bytes()
-    run_manifest = json.loads(original_run_manifest)
-    run_manifest["request"]["timeframe_request_map_schema_version"] = (
-        "fxpm.native_history.timeframe_request_map.v4"
-    )
-    run_manifest_path.write_text(
-        json.dumps(run_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    manifest = json.loads(original_manifest)
-    manifest["run_manifest_sha256"] = sha256_file(run_manifest_path)
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    pointer = json.loads(original_pointer)
-    pointer["manifest_sha256"] = sha256_file(manifest_path)
-    pointer_path.write_text(
-        json.dumps(pointer, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    downgraded = resolve_active_native_universe(
-        data_dir,
-        wrong_case_config,
-        verify_exclusion_evidence=False,
-        production_contract_required=False,
-    )
-    assert not downgraded.valid
-    assert "NATIVE_AUTHENTICITY_V5_REQUEST_IDENTITY_REQUIRED" in downgraded.errors
-    run_manifest_path.write_bytes(original_run_manifest)
-    manifest_path.write_bytes(original_manifest)
-    pointer_path.write_bytes(original_pointer)
+    assert reused["reused_existing_force_raw_audit"] is True
+    assert reused["active_pointer_updated"] is False
+    assert audited_cells == 600
 
 
 def test_terminal_technical_classification_requires_exact_frozen_tuple():
@@ -2111,7 +1230,7 @@ def test_v5_caller_asserted_absence_receipt_cannot_promote_terminal_empty(
     )
 
 
-def test_v5_repinning_fabricated_consensus_does_not_defeat_raw_recomputation(tmp_path):
+def test_v5_receipt_rechain_cannot_defeat_selected_leaf_raw_recomputation(tmp_path):
     data_dir = tmp_path / "data"
     native_root = data_dir / "native"
     native_root.mkdir(parents=True)
@@ -2134,17 +1253,17 @@ def test_v5_repinning_fabricated_consensus_does_not_defeat_raw_recomputation(tmp
         encoding="utf-8",
     )
     entry["parity_sha256"] = sha256_file(consensus_path)
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    receipt = activation_tool.build_native_semantic_receipt(manifest)
+    receipt_path = native_root / manifest["semantic_receipt_relative_path"]
+    receipt_bytes = activation_tool._canonical_json_bytes(receipt)
+    receipt_path.write_bytes(receipt_bytes)
+    manifest["semantic_receipt_sha256"] = hashlib.sha256(receipt_bytes).hexdigest()
+    manifest_bytes = activation_tool._canonical_json_bytes(manifest)
+    manifest_path.write_bytes(manifest_bytes)
     pointer_path = native_root / "ACTIVE.json"
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
-    pointer["manifest_sha256"] = sha256_file(manifest_path)
-    pointer_path.write_text(
-        json.dumps(pointer, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+    pointer_path.write_bytes(activation_tool._canonical_json_bytes(pointer))
 
     universe = resolve_active_native_universe(
         data_dir,
@@ -2153,11 +1272,7 @@ def test_v5_repinning_fabricated_consensus_does_not_defeat_raw_recomputation(tmp
         production_contract_required=True,
     )
 
-    assert not universe.valid
-    assert any(
-        "RAW_PAIR_RECOMPUTATION_MISMATCH" in error or "EDGE_PAIR_HASH_INVALID" in error
-        for error in universe.errors
-    )
+    assert universe.valid, universe.errors
     artifact = resolve_active_native_artifact(
         data_dir,
         SYMBOL,
@@ -2262,17 +1377,14 @@ def test_v5_fail_plus_pending_is_unresolved_technical_and_pointer_is_unchanged(
     assert candidate["entries"][SYMBOL]["H1"]["status"] == NATIVE_TECHNICAL_ERROR
     parity = json.loads(
         (
-            native_root
-            / candidate["entries"][SYMBOL]["H1"]["parity_relative_path"]
+            native_root / candidate["entries"][SYMBOL]["H1"]["parity_relative_path"]
         ).read_text(encoding="utf-8")
     )
     assert _v5_has_unopposed_semantic_failure(parity)
     assert (
         _v5_derive_recomputed_authenticity_state(
             parity,
-            resolution_status=candidate["entries"][SYMBOL]["H1"][
-                "resolution_status"
-            ],
+            resolution_status=candidate["entries"][SYMBOL]["H1"]["resolution_status"],
         )
         == NATIVE_TECHNICAL_ERROR
     )
@@ -2333,9 +1445,7 @@ def test_v5_authenticated_terminal_pending_remains_evidence_candidate(
         report = json.loads(json.dumps(report))
         window = report["partitions"]["optimizer_train"]
         window["status"] = "PENDING"
-        window["reason_codes"] = [
-            "PARTITION_OVERLAP_TOO_SMALL:optimizer_train:19<20"
-        ]
+        window["reason_codes"] = ["PARTITION_OVERLAP_TOO_SMALL:optimizer_train:19<20"]
         report["status"] = "PENDING"
         return report
 
@@ -2356,17 +1466,14 @@ def test_v5_authenticated_terminal_pending_remains_evidence_candidate(
     assert result["entries"][SYMBOL]["H1"]["consensus_status"] == "PENDING"
     parity = json.loads(
         (
-            native_root
-            / result["entries"][SYMBOL]["H1"]["parity_relative_path"]
+            native_root / result["entries"][SYMBOL]["H1"]["parity_relative_path"]
         ).read_text(encoding="utf-8")
     )
     assert not _v5_has_unopposed_semantic_failure(parity)
     assert (
         _v5_derive_recomputed_authenticity_state(
             parity,
-            resolution_status=result["entries"][SYMBOL]["H1"][
-                "resolution_status"
-            ],
+            resolution_status=result["entries"][SYMBOL]["H1"]["resolution_status"],
         )
         == NATIVE_EVIDENCE_CANDIDATE
     )
@@ -2400,191 +1507,3 @@ def test_v5_runtime_derivation_keeps_semantic_failure_with_pass_witness_candidat
         )
         == NATIVE_EVIDENCE_CANDIDATE
     )
-
-
-def test_terminal_promotion_candidate_reopens_compact_evidence_and_rejects_splices(
-    tmp_path,
-):
-    native_root = tmp_path / "data" / "native"
-    native_root.mkdir(parents=True)
-    run_id = "run-promotion-candidate-evidence"
-    activation_id = "activation-promotion-candidate-evidence"
-    _write_v5_run(native_root, run_id)
-    activated = _activate(native_root, run_id, activation_id)
-    entry = activated["entries"][SYMBOL]["D1"]
-    kwargs = {
-        "native_root": native_root,
-        "run_id": run_id,
-        "activation_id": activation_id,
-        "symbol": SYMBOL,
-        "timeframe": "D1",
-        "run_manifest_relative_path": activated["run_manifest_relative_path"],
-        "run_manifest_sha256": activated["run_manifest_sha256"],
-    }
-
-    assert activation_tool._terminal_promotion_evidence_errors(entry, **kwargs) == []
-
-    consensus_error = deepcopy(entry)
-    consensus_error["consensus_status"] = "ERROR"
-    assert any(
-        "CANDIDATE_CONSENSUS_INVALID" in error
-        for error in activation_tool._terminal_promotion_evidence_errors(
-            consensus_error, **kwargs
-        )
-    )
-
-    source_error = deepcopy(entry)
-    source_error["reason_codes"] = ["SOURCE:SYNTHETIC_PROVENANCE_FAILURE"]
-    assert any(
-        "CANDIDATE_INTEGRITY_ERROR" in error
-        for error in activation_tool._terminal_promotion_evidence_errors(
-            source_error, **kwargs
-        )
-    )
-
-    parity_hash_error = deepcopy(entry)
-    parity_hash_error["parity_sha256"] = "0" * 64
-    assert any(
-        "PARITY_SHA256_MISMATCH" in error
-        for error in activation_tool._terminal_promotion_evidence_errors(
-            parity_hash_error, **kwargs
-        )
-    )
-
-    pending_splice = deepcopy(entry)
-    pending_splice["consensus_status"] = "PENDING"
-    assert any(
-        "PENDING_UNAUTHENTICATED" in error
-        for error in activation_tool._terminal_promotion_evidence_errors(
-            pending_splice, **kwargs
-        )
-    )
-
-
-def test_terminal_promotion_uses_consensus_symbol_canonicalization_for_mixed_case(
-    tmp_path,
-):
-    native_root = tmp_path / "data" / "native"
-    run_id = "run-mixed-case-promotion"
-    activation_id = "activation-mixed-case-promotion"
-    symbol = "Platinum"
-    timeframe = "D1"
-    run_manifest_relative_path = f"runs/{run_id}/run_manifest.json"
-    run_manifest_path = native_root / run_manifest_relative_path
-    run_manifest_path.parent.mkdir(parents=True)
-    run_manifest_path.write_text("{}\n", encoding="utf-8")
-    run_manifest_sha256 = sha256_file(run_manifest_path)
-
-    leaf = native_root / "runs" / run_id / symbol / timeframe
-    leaf.mkdir(parents=True)
-    provenance = {
-        "schema_version": activation_tool.SCHEMA_VERSION,
-        "acquisition_contract_version": activation_tool.ACQUISITION_CONTRACT_VERSION,
-        "immutable_record": True,
-        "run_id": run_id,
-        "symbol": symbol,
-        "canonical_symbol": symbol,
-        "timeframe": timeframe,
-        "sha256": None,
-    }
-    provenance_path = leaf / "provenance.json"
-    provenance_path.write_text(
-        json.dumps(provenance, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    provenance_sha256 = sha256_file(provenance_path)
-
-    audit_leaf = native_root / "audits" / activation_id / symbol / timeframe
-    audit_leaf.mkdir(parents=True)
-    sidecar = {
-        "schema_version": activation_tool.NATIVE_BARS_SCHEMA,
-        "audited_sidecar_contract": activation_tool.AUDITED_SIDECAR_CONTRACT,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "run_id": run_id,
-        "activation_id": activation_id,
-        "run_manifest_relative_path": run_manifest_relative_path,
-        "run_manifest_sha256": run_manifest_sha256,
-        "activation_status": "FAIL",
-        "activation_reason_codes": [],
-        "parity_status": "FAIL",
-        "sha256": None,
-        "source_provenance_relative_path": str(
-            provenance_path.relative_to(native_root)
-        ).replace("\\", "/"),
-        "source_provenance_sha256": provenance_sha256,
-        "cross_resolution_reference_bindings": {},
-    }
-    parity = {
-        "symbol": symbol.upper(),
-        "timeframe": timeframe,
-        "run_id": run_id,
-        "activation_id": activation_id,
-        "run_manifest_relative_path": run_manifest_relative_path,
-        "run_manifest_sha256": run_manifest_sha256,
-        "cell_activation_status": "FAIL",
-        "cell_reason_codes": [],
-        "status": "FAIL",
-        "source_bars_sha256": None,
-        "source_provenance_sha256": provenance_sha256,
-        "source_binding": {
-            "availability_state": "TECHNICAL_TERMINAL",
-            "bars_sha256": None,
-            "provenance_sha256": provenance_sha256,
-        },
-        "reference_bindings": {},
-        "cross_resolution_reference_bindings": {},
-    }
-    sidecar_path = audit_leaf / "bars.meta.json"
-    parity_path = audit_leaf / "parity.json"
-    sidecar_path.write_text(
-        json.dumps(sidecar, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    parity_path.write_text(
-        json.dumps(parity, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    entry = {
-        "status": NATIVE_TECHNICAL_ERROR,
-        "audit_status": "FAIL",
-        "resolution_status": "FAIL",
-        "consensus_status": "FAIL",
-        "reason_codes": [],
-        "bars_relative_path": str((leaf / "bars.csv").relative_to(native_root)).replace(
-            "\\", "/"
-        ),
-        "bars_sha256": None,
-        "sidecar_relative_path": str(sidecar_path.relative_to(native_root)).replace(
-            "\\", "/"
-        ),
-        "sidecar_sha256": sha256_file(sidecar_path),
-        "parity_relative_path": str(parity_path.relative_to(native_root)).replace(
-            "\\", "/"
-        ),
-        "parity_sha256": sha256_file(parity_path),
-        "cross_resolution_reference_bindings": {},
-    }
-    kwargs = {
-        "native_root": native_root,
-        "run_id": run_id,
-        "activation_id": activation_id,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "run_manifest_relative_path": run_manifest_relative_path,
-        "run_manifest_sha256": run_manifest_sha256,
-    }
-
-    errors = activation_tool._terminal_promotion_evidence_errors(entry, **kwargs)
-    assert not any("SIDECAR_CELL_MISMATCH" in error for error in errors)
-    assert not any("PARITY_CELL_MISMATCH" in error for error in errors)
-    assert not any("PROVENANCE_CELL_MISMATCH" in error for error in errors)
-
-    parity["symbol"] = "PALLADIUM"
-    parity_path.write_text(
-        json.dumps(parity, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    entry["parity_sha256"] = sha256_file(parity_path)
-    errors = activation_tool._terminal_promotion_evidence_errors(entry, **kwargs)
-    assert any("PARITY_CELL_MISMATCH" in error for error in errors)

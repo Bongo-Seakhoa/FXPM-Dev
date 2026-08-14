@@ -27,18 +27,32 @@ from pm_native_activation import (
 
 MANIFEST_SHA = "a" * 64
 OTHER_SHA = "b" * 64
+RECEIPT_SHA = "d" * 64
+OTHER_RECEIPT_SHA = "e" * 64
+BUILD_DIGEST = "f" * 64
+OTHER_BUILD_DIGEST = "1" * 64
 
 
-def _identity(manifest_sha: str = MANIFEST_SHA, pointer: bytes = b"{}") -> _ActiveAuthorityIdentity:
+def _identity(
+    manifest_sha: str = MANIFEST_SHA,
+    pointer: bytes = b"{}",
+    *,
+    receipt_sha: str = RECEIPT_SHA,
+    build_digest: str = BUILD_DIGEST,
+) -> _ActiveAuthorityIdentity:
     return _ActiveAuthorityIdentity(
         data_dir=Path("."),
         active_pointer_bytes=pointer,
         active_pointer_sha256="c" * 64,
         activation_manifest_sha256=manifest_sha,
+        semantic_receipt_sha256=receipt_sha,
+        semantic_verifier_build_digest=build_digest,
     )
 
 
-def _universe(manifest_sha: str = MANIFEST_SHA, valid: bool = True) -> ActiveNativeUniverse:
+def _universe(
+    manifest_sha: str = MANIFEST_SHA, valid: bool = True
+) -> ActiveNativeUniverse:
     # `valid` is derived: not errors and bool(activation_id).
     return ActiveNativeUniverse(
         activation_id="act-1",
@@ -97,7 +111,9 @@ class UnscopedUniverseMemoTests(unittest.TestCase):
         first = self._call()
         second = self._call()
         self.assertEqual(self.calls, 1, "the 12 GB verification ran twice")
-        self.assertEqual(first.activation_manifest_sha256, second.activation_manifest_sha256)
+        self.assertEqual(
+            first.activation_manifest_sha256, second.activation_manifest_sha256
+        )
 
     def test_changed_authority_forces_reverification(self) -> None:
         """ACTIVE.json moving must invalidate immediately."""
@@ -109,6 +125,30 @@ class UnscopedUniverseMemoTests(unittest.TestCase):
         )
         self._call()
         self.assertEqual(self.calls, 2, "a changed authority reused a stale universe")
+
+    def test_changed_receipt_identity_forces_reverification(self) -> None:
+        """A coherent receipt replacement is part of the memo identity."""
+        self._install([_identity()], _universe)
+        self._call()
+        activation._read_active_authority_identity = lambda _d: _identity(
+            receipt_sha=OTHER_RECEIPT_SHA
+        )
+        self._call()
+        self.assertEqual(
+            self.calls, 2, "a changed semantic receipt reused a stale universe"
+        )
+
+    def test_changed_verifier_build_forces_reverification(self) -> None:
+        """A verifier semantic change invalidates an otherwise identical authority."""
+        self._install([_identity()], _universe)
+        self._call()
+        activation._read_active_authority_identity = lambda _d: _identity(
+            build_digest=OTHER_BUILD_DIGEST
+        )
+        self._call()
+        self.assertEqual(
+            self.calls, 2, "a changed verifier build reused a stale universe"
+        )
 
     def test_invalid_universe_is_never_pinned(self) -> None:
         self._install([_identity()], lambda: _universe(valid=False))
@@ -179,7 +219,9 @@ class UnscopedUniverseMemoTests(unittest.TestCase):
             return _identity()
 
         def fake_resolve(_data_dir, configured_symbols, **_kw):
-            seen.append(None if configured_symbols is None else list(configured_symbols))
+            seen.append(
+                None if configured_symbols is None else list(configured_symbols)
+            )
             self.calls += 1
             return _universe()
 

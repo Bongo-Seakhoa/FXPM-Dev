@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import re
 import secrets
 import threading
@@ -23,8 +24,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
+import numpy as np
 import pandas as pd
 
 from pm_evidence import TIMEFRAME_EVIDENCE_CONTRACT_VERSION
@@ -65,8 +68,8 @@ from pm_native_request_contract import (
 
 ACTIVE_POINTER_SCHEMA = "fxpm-native-active-pointer-v1"
 ACTIVATION_MANIFEST_SCHEMA = "fxpm-native-activation-v1"
-TERMINAL_PROMOTION_RECEIPT_SCHEMA = "fxpm-native-terminal-promotion-v2"
-TERMINAL_PROMOTION_TRANSITION = "failed_complete_terminal_grid_to_active_view"
+NATIVE_SEMANTIC_RECEIPT_SCHEMA = "fxpm-native-semantic-receipt-v1"
+NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW = "FORCE_RAW"
 _SAFE_ACTIVATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 ACTIVE_POINTER_FIELDS = frozenset(
     {
@@ -78,21 +81,24 @@ ACTIVE_POINTER_FIELDS = frozenset(
         "production_authoritative",
     }
 )
-TERMINAL_PROMOTION_RECEIPT_FIELDS = frozenset(
+NATIVE_SEMANTIC_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",
+        "verification_mode",
         "activation_id",
         "run_id",
-        "source_manifest_relative_path",
-        "source_manifest_sha256",
-        "promoted_manifest_relative_path",
-        "promoted_manifest_sha256",
-        "previous_active_pointer_sha256",
-        "counts",
-        "transition",
-        "data_reacquired",
-        "cell_evidence_replayed",
+        "activation_manifest_relative_path",
+        "activation_manifest_preimage_sha256",
+        "run_manifest_relative_path",
+        "run_manifest_sha256",
+        "semantic_verifier_build_digest",
+        "semantic_verifier_sources",
+        "native_leaf_bindings",
+        "runtime_versions",
     }
+)
+NATIVE_SEMANTIC_MANIFEST_RECEIPT_FIELDS = frozenset(
+    {"semantic_receipt_relative_path", "semantic_receipt_sha256"}
 )
 NATIVE_RUN_MANIFEST_SCHEMA = "fxpm.native_history_run_manifest.v1"
 NATIVE_BARS_SCHEMA = "fxpm-native-bars-v1"
@@ -169,6 +175,18 @@ PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA = (
     "fxpm.production_native_authority_verification_scope.v1"
 )
 _MAX_ACTIVE_POINTER_BYTES = 64 * 1024
+_MAX_ACTIVATION_MANIFEST_BYTES = 64 * 1024 * 1024
+_MAX_RUN_MANIFEST_BYTES = 64 * 1024 * 1024
+_MAX_SEMANTIC_RECEIPT_BYTES = 64 * 1024 * 1024
+NATIVE_SEMANTIC_VERIFIER_SOURCE_ROSTER: Tuple[str, ...] = (
+    "pm_native_activation.py",
+    "pm_native_consensus.py",
+    "pm_native_parity.py",
+    "pm_native_resolution.py",
+    "pm_native_request_contract.py",
+    "pm_native_intervals.py",
+    "pm_evidence.py",
+)
 _MAX_V5_BARS_BYTES = 256 * 1024 * 1024
 _MAX_V5_NORMALIZED_FRAME_CACHE_FRAMES = 6
 _MAX_V5_NORMALIZED_FRAME_CACHE_BYTES = 512 * 1024 * 1024
@@ -469,143 +487,541 @@ def _is_sha256(value: Any) -> bool:
     )
 
 
-def validate_terminal_promotion_view(
-    native_root: Path,
-    *,
-    activation_id: str,
-    view_path: Path,
-    view_sha256: str,
-) -> List[str]:
-    """Authenticate the sole immutable failed-to-active manifest view.
+def native_semantic_manifest_preimage(manifest: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return the acyclic manifest payload committed by a semantic receipt."""
 
-    This helper never grants authority from a receipt alone.  It requires the
-    exact canonical source bytes, a canonical view that differs only by the
-    ``status`` transition, and a canonical receipt binding both byte streams to
-    the source manifest's predecessor-pointer commitment.
-    """
+    preimage = deepcopy(dict(manifest))
+    for field_name in NATIVE_SEMANTIC_MANIFEST_RECEIPT_FIELDS:
+        preimage.pop(field_name, None)
+    return preimage
 
-    errors: List[str] = []
-    root = Path(native_root).resolve()
-    identity = str(activation_id or "").strip()
-    if _SAFE_ACTIVATION_ID.fullmatch(identity) is None:
-        return ["NATIVE_TERMINAL_PROMOTION_ACTIVATION_ID_INVALID"]
-    source_relative = f"activations/{identity}.json"
-    promoted_relative = f"activations/promoted/{identity}.json"
-    source_path = _contained_path(root, source_relative)
-    expected_view_path = _contained_path(root, promoted_relative)
-    receipt_path = _contained_path(
-        root,
-        f"transition_receipts/{identity}.json",
+
+def native_semantic_manifest_preimage_sha256(manifest: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        _canonical_json_file_bytes(native_semantic_manifest_preimage(manifest))
+    ).hexdigest()
+
+
+def native_semantic_verifier_build() -> Dict[str, Any]:
+    """Hash the explicit source roster whose semantics the receipt attests."""
+
+    project_root = Path(__file__).resolve().parent
+    sources: List[Dict[str, str]] = []
+    for relative_path in NATIVE_SEMANTIC_VERIFIER_SOURCE_ROSTER:
+        source_path = (project_root / relative_path).resolve()
+        try:
+            source_path.relative_to(project_root)
+        except ValueError as exc:  # pragma: no cover - constant roster invariant
+            raise RuntimeError("NATIVE_SEMANTIC_BUILD_SOURCE_PATH_UNSAFE") from exc
+        if not source_path.is_file() or source_path.is_symlink():
+            raise RuntimeError(f"NATIVE_SEMANTIC_BUILD_SOURCE_MISSING:{relative_path}")
+        sources.append(
+            {"relative_path": relative_path, "sha256": sha256_file(source_path)}
+        )
+    digest = hashlib.sha256(
+        json.dumps(
+            sources,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return {"digest": digest, "sources": sources}
+
+
+def native_semantic_runtime_versions() -> Dict[str, str]:
+    """Informational diagnostics; versions never participate in acceptance."""
+
+    return {
+        "python": platform.python_version(),
+        "pandas": str(pd.__version__),
+        "numpy": str(np.__version__),
+    }
+
+
+def native_semantic_leaf_bindings(
+    manifest: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Project the exact ordered 100x6 leaf identity from one V5 manifest."""
+
+    contract = (
+        manifest.get("universe_eligibility")
+        if isinstance(manifest.get("universe_eligibility"), Mapping)
+        else {}
     )
-    try:
-        supplied_view_path = Path(view_path).resolve()
-    except (OSError, RuntimeError, ValueError):
-        supplied_view_path = Path(view_path)
-    if expected_view_path is None or supplied_view_path != expected_view_path:
-        return ["NATIVE_TERMINAL_PROMOTION_VIEW_PATH_IDENTITY_MISMATCH"]
-    if source_path is None or receipt_path is None:
-        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_MISSING_OR_UNSAFE"]
-    if (
-        not source_path.is_file()
-        or source_path.is_symlink()
-        or not expected_view_path.is_file()
-        or expected_view_path.is_symlink()
-        or not receipt_path.is_file()
-        or receipt_path.is_symlink()
-    ):
-        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_MISSING_OR_UNSAFE"]
+    requested = tuple(contract.get("requested_symbols") or ())
+    timeframes = tuple(contract.get("required_timeframes") or ())
+    entries = manifest.get("entries")
+    if requested != NATIVE_PRODUCTION_SYMBOLS:
+        raise ValueError("NATIVE_SEMANTIC_RECEIPT_SYMBOL_ROSTER_INVALID")
+    if timeframes != NATIVE_PRODUCTION_TIMEFRAMES:
+        raise ValueError("NATIVE_SEMANTIC_RECEIPT_TIMEFRAME_ROSTER_INVALID")
+    if not isinstance(entries, Mapping) or set(entries) != set(requested):
+        raise ValueError("NATIVE_SEMANTIC_RECEIPT_ENTRY_SYMBOL_GRID_INVALID")
+    bindings: List[Dict[str, Any]] = []
+    binding_fields = (
+        "status",
+        "bars_relative_path",
+        "bars_sha256",
+        "sidecar_relative_path",
+        "sidecar_sha256",
+        "parity_relative_path",
+        "parity_sha256",
+    )
+    for symbol in requested:
+        symbol_entries = entries.get(symbol)
+        if not isinstance(symbol_entries, Mapping) or set(symbol_entries) != set(
+            timeframes
+        ):
+            raise ValueError(
+                f"NATIVE_SEMANTIC_RECEIPT_ENTRY_TIMEFRAME_GRID_INVALID:{symbol}"
+            )
+        for timeframe in timeframes:
+            entry = symbol_entries.get(timeframe)
+            if not isinstance(entry, Mapping):
+                raise ValueError(
+                    f"NATIVE_SEMANTIC_RECEIPT_ENTRY_MISSING:{symbol}|{timeframe}"
+                )
+            binding = {"symbol": symbol, "timeframe": timeframe}
+            binding.update({field: entry.get(field) for field in binding_fields})
+            bindings.append(binding)
+    expected_count = len(NATIVE_PRODUCTION_SYMBOLS) * len(NATIVE_PRODUCTION_TIMEFRAMES)
+    if len(bindings) != expected_count:  # pragma: no cover - loop invariant
+        raise ValueError("NATIVE_SEMANTIC_RECEIPT_600_CELL_GRID_REQUIRED")
+    return bindings
 
-    try:
-        source_bytes = source_path.read_bytes()
-        promoted_bytes = expected_view_path.read_bytes()
-        receipt_bytes = receipt_path.read_bytes()
-        source = json.loads(source_bytes.decode("utf-8"))
-        receipt = json.loads(receipt_bytes.decode("utf-8"))
-    except Exception:
-        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_INVALID_JSON"]
-    if not isinstance(source, Mapping) or not isinstance(receipt, Mapping):
-        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_NOT_OBJECT"]
-    source = dict(source)
-    receipt = dict(receipt)
-    try:
-        canonical_source_bytes = _canonical_json_file_bytes(source)
-        canonical_receipt_bytes = _canonical_json_file_bytes(receipt)
-    except (TypeError, ValueError, OverflowError):
-        return ["NATIVE_TERMINAL_PROMOTION_ARTIFACT_NOT_CANONICAL"]
-    if source_bytes != canonical_source_bytes:
-        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_NOT_CANONICAL")
-    if receipt_bytes != canonical_receipt_bytes:
-        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_NOT_CANONICAL")
-    if set(receipt) != set(TERMINAL_PROMOTION_RECEIPT_FIELDS):
-        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_FIELDS_INVALID")
-    if str(receipt.get("schema_version") or "") != TERMINAL_PROMOTION_RECEIPT_SCHEMA:
-        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_SCHEMA_INVALID")
-    if str(receipt.get("transition") or "") != TERMINAL_PROMOTION_TRANSITION:
-        errors.append("NATIVE_TERMINAL_PROMOTION_TRANSITION_INVALID")
 
-    observed_source_sha = hashlib.sha256(source_bytes).hexdigest()
-    observed_promoted_sha = hashlib.sha256(promoted_bytes).hexdigest()
-    declared_view_sha = str(view_sha256 or "").strip().lower()
-    for value, label in (
-        (receipt.get("source_manifest_sha256"), "SOURCE"),
-        (receipt.get("promoted_manifest_sha256"), "PROMOTED"),
-        (receipt.get("previous_active_pointer_sha256"), "PREDECESSOR_POINTER"),
-        (declared_view_sha, "POINTER_PROMOTED"),
-    ):
-        if not _is_sha256(value):
-            errors.append(f"NATIVE_TERMINAL_PROMOTION_{label}_SHA256_INVALID")
-    if str(receipt.get("source_manifest_relative_path") or "") != source_relative:
-        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_PATH_MISMATCH")
-    if str(receipt.get("promoted_manifest_relative_path") or "") != promoted_relative:
-        errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_PATH_MISMATCH")
-    if str(receipt.get("source_manifest_sha256") or "").lower() != (
-        observed_source_sha
-    ):
-        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_SHA256_MISMATCH")
-    if (
-        str(receipt.get("promoted_manifest_sha256") or "").lower()
-        != observed_promoted_sha
-        or declared_view_sha != observed_promoted_sha
-    ):
-        errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_SHA256_MISMATCH")
+def build_native_semantic_receipt(
+    manifest: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build the sole FORCE_RAW semantic receipt after the existing raw audit."""
 
-    if str(source.get("schema_version") or "") != ACTIVATION_MANIFEST_SCHEMA:
-        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_SCHEMA_INVALID")
-    if str(source.get("status") or "").lower() != "failed":
-        errors.append("NATIVE_TERMINAL_PROMOTION_SOURCE_STATUS_INVALID")
-    if str(source.get("activation_id") or "") != identity:
-        errors.append("NATIVE_TERMINAL_PROMOTION_ACTIVATION_ID_MISMATCH")
-    run_id = str(source.get("run_id") or "")
-    if not run_id or str(receipt.get("run_id") or "") != run_id:
-        errors.append("NATIVE_TERMINAL_PROMOTION_RUN_ID_MISMATCH")
-    if str(receipt.get("activation_id") or "") != identity:
-        errors.append("NATIVE_TERMINAL_PROMOTION_RECEIPT_ACTIVATION_ID_MISMATCH")
-    if not isinstance(source.get("counts"), Mapping) or receipt.get("counts") != (
-        source.get("counts")
-    ):
-        errors.append("NATIVE_TERMINAL_PROMOTION_COUNTS_MISMATCH")
-    predecessor_sha = str(source.get("previous_active_pointer_sha256") or "").lower()
-    if (
-        not _is_sha256(predecessor_sha)
-        or str(receipt.get("previous_active_pointer_sha256") or "").lower()
-        != predecessor_sha
-    ):
-        errors.append("NATIVE_TERMINAL_PROMOTION_PREDECESSOR_POINTER_MISMATCH")
-    if receipt.get("data_reacquired") is not False:
-        errors.append("NATIVE_TERMINAL_PROMOTION_REACQUIRE_FLAG_INVALID")
-    if receipt.get("cell_evidence_replayed") is not False:
-        errors.append("NATIVE_TERMINAL_PROMOTION_REPLAY_FLAG_INVALID")
+    activation_id = str(manifest.get("activation_id") or "")
+    run_id = str(manifest.get("run_id") or "")
+    if not activation_id or not run_id:
+        raise ValueError("NATIVE_SEMANTIC_RECEIPT_AUTHORITY_IDENTITY_MISSING")
+    build = native_semantic_verifier_build()
+    return {
+        "schema_version": NATIVE_SEMANTIC_RECEIPT_SCHEMA,
+        "verification_mode": NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW,
+        "activation_id": activation_id,
+        "run_id": run_id,
+        "activation_manifest_relative_path": f"activations/{activation_id}.json",
+        "activation_manifest_preimage_sha256": (
+            native_semantic_manifest_preimage_sha256(manifest)
+        ),
+        "run_manifest_relative_path": str(
+            manifest.get("run_manifest_relative_path") or ""
+        ).replace("\\", "/"),
+        "run_manifest_sha256": str(manifest.get("run_manifest_sha256") or "").lower(),
+        "semantic_verifier_build_digest": build["digest"],
+        "semantic_verifier_sources": build["sources"],
+        "native_leaf_bindings": native_semantic_leaf_bindings(manifest),
+        "runtime_versions": native_semantic_runtime_versions(),
+    }
 
-    promoted = dict(source)
-    promoted["status"] = "active"
+
+class NativeSemanticReceiptError(RuntimeError):
+    """Typed receipt failure; production callers must never raw-fallback."""
+
+    def __init__(self, *errors: str) -> None:
+        self.errors = tuple(dict.fromkeys(str(error) for error in errors if error))
+        super().__init__(";".join(self.errors or ("NATIVE_SEMANTIC_RECEIPT_INVALID",)))
+
+
+class _FrozenList(list):
+    """JSON-list-compatible immutable projection for verified authority payloads."""
+
+    def _immutable(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("verified native authority is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __iadd__ = _immutable
+    __imul__ = _immutable
+    append = _immutable
+    clear = _immutable
+    extend = _immutable
+    insert = _immutable
+    pop = _immutable
+    remove = _immutable
+    reverse = _immutable
+    sort = _immutable
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return _FrozenList(_freeze_json(item) for item in value)
+    return value
+
+
+def _thaw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class ReceiptBackedNativeAuthority:
+    """Immutable bounded authority returned to production activation callers."""
+
+    data_dir: Path
+    active_pointer_bytes: bytes
+    active_pointer_sha256: str
+    activation_id: str
+    activation_manifest_path: Path
+    activation_manifest_bytes: bytes
+    activation_manifest_sha256: str
+    manifest: Mapping[str, Any]
+    entries: Mapping[str, Any]
+    run_manifest_path: Path
+    run_manifest_bytes: bytes
+    run_manifest_sha256: str
+    run_manifest: Mapping[str, Any]
+    semantic_receipt_path: Path
+    semantic_receipt_bytes: bytes
+    semantic_receipt_sha256: str
+    semantic_receipt: Mapping[str, Any]
+    semantic_verifier_build_digest: str
+
+
+def _bounded_regular_file_bytes(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    missing_error: str,
+    size_error: str,
+    read_error: str,
+) -> bytes:
     try:
-        expected_promoted_bytes = _canonical_json_file_bytes(promoted)
-    except (TypeError, ValueError, OverflowError):
-        errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_NOT_CANONICAL")
+        if not path.is_file() or path.is_symlink():
+            raise NativeSemanticReceiptError(missing_error)
+        size = path.stat().st_size
+        if size <= 0 or size > maximum_bytes:
+            raise NativeSemanticReceiptError(size_error)
+        payload = path.read_bytes()
+    except NativeSemanticReceiptError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise NativeSemanticReceiptError(read_error) from exc
+    if len(payload) != size or len(payload) > maximum_bytes:
+        raise NativeSemanticReceiptError(read_error)
+    return payload
+
+
+def _canonical_object_from_bytes(
+    payload: bytes,
+    *,
+    json_error: str,
+    object_error: str,
+    canonical_error: str,
+) -> Dict[str, Any]:
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NativeSemanticReceiptError(json_error) from exc
+    if not isinstance(value, Mapping):
+        raise NativeSemanticReceiptError(object_error)
+    value = dict(value)
+    try:
+        canonical = _canonical_json_file_bytes(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise NativeSemanticReceiptError(canonical_error) from exc
+    if payload != canonical:
+        raise NativeSemanticReceiptError(canonical_error)
+    return value
+
+
+def _load_receipt_backed_native_authority(
+    data_dir: Path,
+    *,
+    _candidate_pointer: Optional[Mapping[str, Any]] = None,
+) -> ReceiptBackedNativeAuthority:
+    """Open one exact production authority without reading raw native leaves."""
+
+    resolved_data_dir = Path(data_dir).resolve()
+    native_root = (resolved_data_dir / "native").resolve()
+    pointer_path = native_root / "ACTIVE.json"
+    if _candidate_pointer is None:
+        pointer_bytes = _bounded_regular_file_bytes(
+            pointer_path,
+            maximum_bytes=_MAX_ACTIVE_POINTER_BYTES,
+            missing_error="NATIVE_SEMANTIC_ACTIVE_POINTER_MISSING",
+            size_error="NATIVE_SEMANTIC_ACTIVE_POINTER_SIZE_INVALID",
+            read_error="NATIVE_SEMANTIC_ACTIVE_POINTER_READ_FAILED",
+        )
+        pointer = _canonical_object_from_bytes(
+            pointer_bytes,
+            json_error="NATIVE_SEMANTIC_ACTIVE_POINTER_INVALID_JSON",
+            object_error="NATIVE_SEMANTIC_ACTIVE_POINTER_NOT_OBJECT",
+            canonical_error="NATIVE_SEMANTIC_ACTIVE_POINTER_NOT_CANONICAL",
+        )
     else:
-        if promoted_bytes != expected_promoted_bytes:
-            errors.append("NATIVE_TERMINAL_PROMOTION_VIEW_CONTENT_MISMATCH")
-    return list(dict.fromkeys(errors))
+        pointer = dict(_candidate_pointer)
+        try:
+            pointer_bytes = _canonical_json_file_bytes(pointer)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise NativeSemanticReceiptError(
+                "NATIVE_SEMANTIC_CANDIDATE_POINTER_INVALID"
+            ) from exc
+    if set(pointer) != set(ACTIVE_POINTER_FIELDS):
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_ACTIVE_POINTER_FIELDS_INVALID"
+        )
+    if str(pointer.get("schema_version") or "") != ACTIVE_POINTER_SCHEMA:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_ACTIVE_POINTER_SCHEMA_INVALID"
+        )
+    if pointer.get("production_authoritative") is not True:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_PRODUCTION_AUTHORITY_REQUIRED"
+        )
+    activation_id = str(pointer.get("activation_id") or "")
+    if _SAFE_ACTIVATION_ID.fullmatch(activation_id) is None:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_ACTIVATION_ID_INVALID")
+    manifest_relative = str(pointer.get("manifest_relative_path") or "").replace(
+        "\\", "/"
+    )
+    expected_manifest_relative = f"activations/{activation_id}.json"
+    if manifest_relative != expected_manifest_relative:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_ACTIVE_MANIFEST_PATH_IDENTITY_MISMATCH"
+        )
+    manifest_path = _contained_path(native_root, manifest_relative)
+    if manifest_path is None:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_ACTIVE_MANIFEST_PATH_UNSAFE")
+    manifest_bytes = _bounded_regular_file_bytes(
+        manifest_path,
+        maximum_bytes=_MAX_ACTIVATION_MANIFEST_BYTES,
+        missing_error="NATIVE_SEMANTIC_ACTIVE_MANIFEST_MISSING",
+        size_error="NATIVE_SEMANTIC_ACTIVE_MANIFEST_SIZE_INVALID",
+        read_error="NATIVE_SEMANTIC_ACTIVE_MANIFEST_READ_FAILED",
+    )
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    if (
+        not _is_sha256(pointer.get("manifest_sha256"))
+        or manifest_sha != str(pointer.get("manifest_sha256")).lower()
+    ):
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_ACTIVE_MANIFEST_SHA256_MISMATCH"
+        )
+    manifest = _canonical_object_from_bytes(
+        manifest_bytes,
+        json_error="NATIVE_SEMANTIC_ACTIVE_MANIFEST_INVALID_JSON",
+        object_error="NATIVE_SEMANTIC_ACTIVE_MANIFEST_NOT_OBJECT",
+        canonical_error="NATIVE_SEMANTIC_ACTIVE_MANIFEST_NOT_CANONICAL",
+    )
+    if str(manifest.get("schema_version") or "") != ACTIVATION_MANIFEST_SCHEMA:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_ACTIVE_MANIFEST_SCHEMA_INVALID"
+        )
+    if str(manifest.get("activation_id") or "") != activation_id:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_ACTIVATION_ID_MISMATCH")
+    if str(manifest.get("status") or "").lower() != "active":
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_ACTIVE_MANIFEST_NOT_ACTIVE")
+    if (
+        manifest.get("production_authoritative") is not True
+        or manifest.get("native_is_signal_authority") is not True
+        or manifest.get("silent_fallback_allowed") is not False
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_MANIFEST_AUTHORITY_INVALID")
+
+    receipt_relative = str(
+        manifest.get("semantic_receipt_relative_path") or ""
+    ).replace("\\", "/")
+    expected_receipt_relative = f"semantic_receipts/{activation_id}.json"
+    if receipt_relative != expected_receipt_relative:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_PATH_MISMATCH")
+    receipt_path = _contained_path(native_root, receipt_relative)
+    if receipt_path is None:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_PATH_UNSAFE")
+    receipt_bytes = _bounded_regular_file_bytes(
+        receipt_path,
+        maximum_bytes=_MAX_SEMANTIC_RECEIPT_BYTES,
+        missing_error="NATIVE_SEMANTIC_RECEIPT_MISSING",
+        size_error="NATIVE_SEMANTIC_RECEIPT_SIZE_INVALID",
+        read_error="NATIVE_SEMANTIC_RECEIPT_READ_FAILED",
+    )
+    receipt_sha = hashlib.sha256(receipt_bytes).hexdigest()
+    if (
+        not _is_sha256(manifest.get("semantic_receipt_sha256"))
+        or receipt_sha != str(manifest.get("semantic_receipt_sha256")).lower()
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_SHA256_MISMATCH")
+    receipt = _canonical_object_from_bytes(
+        receipt_bytes,
+        json_error="NATIVE_SEMANTIC_RECEIPT_INVALID_JSON",
+        object_error="NATIVE_SEMANTIC_RECEIPT_NOT_OBJECT",
+        canonical_error="NATIVE_SEMANTIC_RECEIPT_NOT_CANONICAL",
+    )
+    if set(receipt) != set(NATIVE_SEMANTIC_RECEIPT_FIELDS):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_FIELDS_INVALID")
+    if str(receipt.get("schema_version") or "") != NATIVE_SEMANTIC_RECEIPT_SCHEMA:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_SCHEMA_INVALID")
+    if str(receipt.get("verification_mode") or "") != (
+        NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_MODE_INVALID")
+    run_id = str(manifest.get("run_id") or "")
+    for observed, expected, error in (
+        (
+            receipt.get("activation_id"),
+            activation_id,
+            "NATIVE_SEMANTIC_RECEIPT_ACTIVATION_MISMATCH",
+        ),
+        (receipt.get("run_id"), run_id, "NATIVE_SEMANTIC_RECEIPT_RUN_MISMATCH"),
+        (
+            str(receipt.get("activation_manifest_relative_path") or "").replace(
+                "\\", "/"
+            ),
+            expected_manifest_relative,
+            "NATIVE_SEMANTIC_RECEIPT_MANIFEST_PATH_MISMATCH",
+        ),
+        (
+            str(receipt.get("run_manifest_relative_path") or "").replace("\\", "/"),
+            str(manifest.get("run_manifest_relative_path") or "").replace("\\", "/"),
+            "NATIVE_SEMANTIC_RECEIPT_RUN_MANIFEST_PATH_MISMATCH",
+        ),
+        (
+            str(receipt.get("run_manifest_sha256") or "").lower(),
+            str(manifest.get("run_manifest_sha256") or "").lower(),
+            "NATIVE_SEMANTIC_RECEIPT_RUN_MANIFEST_SHA256_MISMATCH",
+        ),
+    ):
+        if observed != expected:
+            raise NativeSemanticReceiptError(error)
+    expected_preimage_sha = native_semantic_manifest_preimage_sha256(manifest)
+    if (
+        not _is_sha256(receipt.get("activation_manifest_preimage_sha256"))
+        or str(receipt.get("activation_manifest_preimage_sha256")).lower()
+        != expected_preimage_sha
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_PREIMAGE_MISMATCH")
+
+    run_manifest_relative = str(
+        manifest.get("run_manifest_relative_path") or ""
+    ).replace("\\", "/")
+    if run_manifest_relative != f"runs/{run_id}/run_manifest.json":
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RUN_MANIFEST_PATH_MISMATCH")
+    run_manifest_path = _contained_path(native_root, run_manifest_relative)
+    if run_manifest_path is None:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RUN_MANIFEST_PATH_UNSAFE")
+    expected_run_sha = str(manifest.get("run_manifest_sha256") or "").lower()
+    run_manifest_bytes = _bounded_regular_file_bytes(
+        run_manifest_path,
+        maximum_bytes=_MAX_RUN_MANIFEST_BYTES,
+        missing_error="NATIVE_SEMANTIC_RUN_MANIFEST_MISSING",
+        size_error="NATIVE_SEMANTIC_RUN_MANIFEST_SIZE_INVALID",
+        read_error="NATIVE_SEMANTIC_RUN_MANIFEST_READ_FAILED",
+    )
+    if (
+        not _is_sha256(expected_run_sha)
+        or hashlib.sha256(run_manifest_bytes).hexdigest() != expected_run_sha
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RUN_MANIFEST_SHA256_MISMATCH")
+    try:
+        run_manifest = json.loads(run_manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_RUN_MANIFEST_INVALID_JSON"
+        ) from exc
+    if (
+        not isinstance(run_manifest, Mapping)
+        or str(run_manifest.get("schema_version") or "") != NATIVE_RUN_MANIFEST_SCHEMA
+        or str(run_manifest.get("run_id") or "") != run_id
+        or run_manifest.get("immutable_record") is not True
+        or run_manifest.get("complete") is not True
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RUN_MANIFEST_INVALID")
+
+    try:
+        expected_bindings = native_semantic_leaf_bindings(manifest)
+    except ValueError as exc:
+        raise NativeSemanticReceiptError(str(exc)) from exc
+    if receipt.get("native_leaf_bindings") != expected_bindings:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_RECEIPT_LEAF_BINDINGS_MISMATCH"
+        )
+    if len(expected_bindings) != 600:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_RECEIPT_600_CELL_GRID_REQUIRED"
+        )
+    runtime_versions = receipt.get("runtime_versions")
+    if (
+        not isinstance(runtime_versions, Mapping)
+        or set(runtime_versions) != {"python", "pandas", "numpy"}
+        or any(
+            not isinstance(runtime_versions.get(name), str)
+            or not runtime_versions.get(name)
+            for name in ("python", "pandas", "numpy")
+        )
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_VERSIONS_INVALID")
+    try:
+        current_build = native_semantic_verifier_build()
+    except RuntimeError as exc:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_BUILD_UNAVAILABLE") from exc
+    if receipt.get("semantic_verifier_sources") != current_build["sources"]:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_BUILD_ROSTER_MISMATCH")
+    if (
+        not _is_sha256(receipt.get("semantic_verifier_build_digest"))
+        or str(receipt.get("semantic_verifier_build_digest")).lower()
+        != current_build["digest"]
+    ):
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_BUILD_DIGEST_MISMATCH")
+
+    # Bracket the multi-file read with a final exact byte check. A concurrent
+    # publisher can move ACTIVE, but no caller may receive a mixed authority.
+    if _candidate_pointer is None and pointer_path.read_bytes() != pointer_bytes:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_AUTHORITY_MOVED_DURING_READ")
+    if manifest_path.read_bytes() != manifest_bytes:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_MANIFEST_MOVED_DURING_READ")
+    if receipt_path.read_bytes() != receipt_bytes:
+        raise NativeSemanticReceiptError("NATIVE_SEMANTIC_RECEIPT_MOVED_DURING_READ")
+    if run_manifest_path.read_bytes() != run_manifest_bytes:
+        raise NativeSemanticReceiptError(
+            "NATIVE_SEMANTIC_RUN_MANIFEST_MOVED_DURING_READ"
+        )
+
+    frozen_manifest = _freeze_json(manifest)
+    return ReceiptBackedNativeAuthority(
+        data_dir=resolved_data_dir,
+        active_pointer_bytes=bytes(pointer_bytes),
+        active_pointer_sha256=hashlib.sha256(pointer_bytes).hexdigest(),
+        activation_id=activation_id,
+        activation_manifest_path=manifest_path,
+        activation_manifest_bytes=bytes(manifest_bytes),
+        activation_manifest_sha256=manifest_sha,
+        manifest=frozen_manifest,
+        entries=frozen_manifest["entries"],
+        run_manifest_path=run_manifest_path,
+        run_manifest_bytes=bytes(run_manifest_bytes),
+        run_manifest_sha256=expected_run_sha,
+        run_manifest=_freeze_json(run_manifest),
+        semantic_receipt_path=receipt_path,
+        semantic_receipt_bytes=bytes(receipt_bytes),
+        semantic_receipt_sha256=receipt_sha,
+        semantic_receipt=_freeze_json(receipt),
+        semantic_verifier_build_digest=current_build["digest"],
+    )
+
+
+def validate_staged_receipt_backed_native_authority(
+    data_dir: Path,
+    candidate_pointer: Mapping[str, Any],
+) -> ReceiptBackedNativeAuthority:
+    """Validate one staged candidate for exact CAS reuse without reading ACTIVE."""
+
+    return _load_receipt_backed_native_authority(
+        data_dir,
+        _candidate_pointer=candidate_pointer,
+    )
 
 
 def _contained_path(root: Path, relative: Any) -> Optional[Path]:
@@ -4121,21 +4537,12 @@ def _load_active_manifest(
     canonical_manifest_relative = (
         f"activations/{pointer_activation_id}.json" if pointer_activation_id else ""
     )
-    promoted_manifest_relative = (
-        f"activations/promoted/{pointer_activation_id}.json"
-        if pointer_activation_id
-        else ""
-    )
     observed_manifest_relative = str(
         pointer.get("manifest_relative_path") or ""
     ).replace("\\", "/")
-    promoted_view = observed_manifest_relative == promoted_manifest_relative
-    if observed_manifest_relative not in {
-        canonical_manifest_relative,
-        promoted_manifest_relative,
-    }:
+    if observed_manifest_relative != canonical_manifest_relative:
         errors.append("NATIVE_ACTIVE_MANIFEST_PATH_IDENTITY_MISMATCH")
-    if promoted_view and set(pointer) != set(ACTIVE_POINTER_FIELDS):
+    if set(pointer) != set(ACTIVE_POINTER_FIELDS):
         errors.append("NATIVE_ACTIVE_POINTER_FIELDS_INVALID")
     manifest_path = _contained_path(native_root, pointer.get("manifest_relative_path"))
     if manifest_path is None:
@@ -4149,15 +4556,6 @@ def _load_active_manifest(
             manifest_path,
             observed_sha,
             errors + ["NATIVE_ACTIVE_MANIFEST_SHA256_MISMATCH"],
-        )
-    if promoted_view:
-        errors.extend(
-            validate_terminal_promotion_view(
-                native_root,
-                activation_id=pointer_activation_id,
-                view_path=manifest_path,
-                view_sha256=observed_sha,
-            )
         )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -4196,6 +4594,8 @@ class _ActiveAuthorityIdentity:
     active_pointer_bytes: bytes
     active_pointer_sha256: str
     activation_manifest_sha256: str
+    semantic_receipt_sha256: str
+    semantic_verifier_build_digest: str
 
 
 def _read_active_authority_identity(data_dir: Path) -> _ActiveAuthorityIdentity:
@@ -4231,16 +4631,44 @@ def _read_active_authority_identity(data_dir: Path) -> _ActiveAuthorityIdentity:
     if manifest_path is None or not _is_sha256(declared_manifest_sha):
         raise RuntimeError("NATIVE_AUTHORITY_SCOPE_ACTIVE_POINTER_INVALID")
     try:
-        observed_manifest_sha = sha256_file(manifest_path).lower()
+        manifest_bytes = manifest_path.read_bytes()
+        observed_manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
     except (OSError, ValueError) as exc:
         raise RuntimeError("NATIVE_AUTHORITY_SCOPE_MANIFEST_READ_FAILED") from exc
     if observed_manifest_sha != declared_manifest_sha:
         raise RuntimeError("NATIVE_AUTHORITY_SCOPE_MANIFEST_SHA256_MISMATCH")
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_MANIFEST_INVALID") from exc
+    if not isinstance(manifest, Mapping):
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_MANIFEST_INVALID")
+    receipt_relative = str(
+        manifest.get("semantic_receipt_relative_path") or ""
+    ).replace("\\", "/")
+    declared_receipt_sha = str(manifest.get("semantic_receipt_sha256") or "").lower()
+    observed_receipt_sha = ""
+    if receipt_relative or declared_receipt_sha:
+        receipt_path = _contained_path(native_root, receipt_relative)
+        if receipt_path is None or not _is_sha256(declared_receipt_sha):
+            raise RuntimeError("NATIVE_AUTHORITY_SCOPE_RECEIPT_IDENTITY_INVALID")
+        try:
+            observed_receipt_sha = sha256_file(receipt_path).lower()
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("NATIVE_AUTHORITY_SCOPE_RECEIPT_READ_FAILED") from exc
+        if observed_receipt_sha != declared_receipt_sha:
+            raise RuntimeError("NATIVE_AUTHORITY_SCOPE_RECEIPT_SHA256_MISMATCH")
+    try:
+        build_digest = str(native_semantic_verifier_build()["digest"])
+    except RuntimeError as exc:
+        raise RuntimeError("NATIVE_AUTHORITY_SCOPE_BUILD_READ_FAILED") from exc
     return _ActiveAuthorityIdentity(
         data_dir=resolved_data_dir,
         active_pointer_bytes=pointer_bytes,
         active_pointer_sha256=hashlib.sha256(pointer_bytes).hexdigest(),
         activation_manifest_sha256=observed_manifest_sha,
+        semantic_receipt_sha256=observed_receipt_sha,
+        semantic_verifier_build_digest=build_digest,
     )
 
 
@@ -4271,6 +4699,9 @@ class ProductionNativeAuthorityVerificationScope:
         self._active_pointer_bytes: Optional[bytes] = None
         self._active_pointer_sha256 = ""
         self._activation_manifest_sha256 = ""
+        self._semantic_receipt_sha256 = ""
+        self._semantic_verifier_build_digest = ""
+        self._receipt_authority: Optional[ReceiptBackedNativeAuthority] = None
         self._universe: Optional[ActiveNativeUniverse] = None
 
     def __enter__(self) -> "ProductionNativeAuthorityVerificationScope":
@@ -4329,7 +4760,54 @@ class ProductionNativeAuthorityVerificationScope:
             and identity.active_pointer_bytes == self._active_pointer_bytes
             and identity.active_pointer_sha256 == self._active_pointer_sha256
             and identity.activation_manifest_sha256 == self._activation_manifest_sha256
+            and identity.semantic_receipt_sha256 == self._semantic_receipt_sha256
+            and identity.semantic_verifier_build_digest
+            == self._semantic_verifier_build_digest
         )
+
+    def verify_receipt_backed_authority(
+        self, data_dir: Path
+    ) -> ReceiptBackedNativeAuthority:
+        """Open or reuse the exact receipt-backed 100x6 production authority."""
+
+        self._assert_live_owner()
+        if self._receipt_authority is not None:
+            return self.revalidate_receipt_backed_authority()
+        self._full_verification_count += 1
+        try:
+            authority = _load_receipt_backed_native_authority(data_dir)
+        except NativeSemanticReceiptError as exc:
+            self._poison(exc.errors[0] if exc.errors else "RECEIPT_INVALID")
+            raise
+        self._data_dir = authority.data_dir
+        self._active_pointer_bytes = bytes(authority.active_pointer_bytes)
+        self._active_pointer_sha256 = authority.active_pointer_sha256
+        self._activation_manifest_sha256 = authority.activation_manifest_sha256
+        self._semantic_receipt_sha256 = authority.semantic_receipt_sha256
+        self._semantic_verifier_build_digest = authority.semantic_verifier_build_digest
+        self._receipt_authority = authority
+        return authority
+
+    def revalidate_receipt_backed_authority(self) -> ReceiptBackedNativeAuthority:
+        """Cheaply prove the sealed pointer/manifest/receipt/build did not move."""
+
+        self._assert_live_owner()
+        if self._receipt_authority is None or self._data_dir is None:
+            self._poison("RECEIPT_AUTHORITY_NOT_VERIFIED")
+            raise RuntimeError("NATIVE_RECEIPT_AUTHORITY_NOT_VERIFIED")
+        self._identity_revalidation_attempt_count += 1
+        try:
+            identity = _read_active_authority_identity(self._data_dir)
+            if not self._same_sealed_identity(identity):
+                self._identity_failure("RECEIPT_AUTHORITY_IDENTITY_MISMATCH")
+        except RuntimeError as exc:
+            if str(exc).startswith("NATIVE_AUTHORITY_IDENTITY_REVALIDATION_FAILED:"):
+                raise
+            self._identity_failure("RECEIPT_AUTHORITY_IDENTITY_READ_FAILED", exc)
+        except BaseException as exc:
+            self._identity_failure("RECEIPT_AUTHORITY_IDENTITY_READ_FAILED", exc)
+        self._identity_revalidation_count += 1
+        return self._receipt_authority
 
     def _resolve(
         self,
@@ -4349,20 +4827,14 @@ class ProductionNativeAuthorityVerificationScope:
             raise
         if self._universe is None:
             try:
-                identity_before = _read_active_authority_identity(data_dir)
-            except BaseException as exc:
-                self._poison("INITIAL_IDENTITY_READ_FAILED")
-                raise RuntimeError(
-                    "NATIVE_AUTHORITY_INITIAL_IDENTITY_READ_FAILED"
-                ) from exc
-            self._full_verification_count += 1
-            try:
+                authority = self.verify_receipt_backed_authority(data_dir)
                 universe = _resolve_active_native_universe_uncached(
                     data_dir,
                     configured_symbols,
                     required_timeframes=required_timeframes,
                     verify_exclusion_evidence=verify_exclusion_evidence,
                     production_contract_required=production_contract_required,
+                    _receipt_authority=authority,
                 )
             except BaseException:
                 self._poison("FULL_VERIFICATION_EXCEPTION")
@@ -4374,7 +4846,7 @@ class ProductionNativeAuthorityVerificationScope:
                 raise RuntimeError(
                     "NATIVE_AUTHORITY_INITIAL_IDENTITY_REREAD_FAILED"
                 ) from exc
-            if identity_before != identity_after:
+            if not self._same_sealed_identity(identity_after):
                 self._poison("IDENTITY_CHANGED_DURING_FULL_VERIFICATION")
                 raise RuntimeError(
                     "NATIVE_AUTHORITY_IDENTITY_CHANGED_DURING_FULL_VERIFICATION"
@@ -4392,10 +4864,6 @@ class ProductionNativeAuthorityVerificationScope:
             except BaseException:
                 self._poison("FULL_VERIFICATION_COPY_FAILED")
                 raise
-            self._data_dir = identity_after.data_dir
-            self._active_pointer_bytes = bytes(identity_after.active_pointer_bytes)
-            self._active_pointer_sha256 = identity_after.active_pointer_sha256
-            self._activation_manifest_sha256 = identity_after.activation_manifest_sha256
             self._universe = sealed
             return returned
 
@@ -4431,6 +4899,7 @@ class ProductionNativeAuthorityVerificationScope:
         finally:
             self._token = None
             self._active_pointer_bytes = None
+            self._receipt_authority = None
             self._universe = None
             self._data_dir = None
             self._closed = True
@@ -4475,6 +4944,7 @@ def _resolve_active_native_universe_uncached(
     verify_exclusion_evidence: bool = True,
     production_contract_required: bool = False,
     _v5_frame_cache_enabled: bool = True,
+    _receipt_authority: Optional[ReceiptBackedNativeAuthority] = None,
 ) -> ActiveNativeUniverse:
     """Resolve the availability-only eligible/excluded symbol roster.
 
@@ -4484,7 +4954,25 @@ def _resolve_active_native_universe_uncached(
     """
     result = ActiveNativeUniverse()
     native_root = (Path(data_dir) / "native").resolve()
-    manifest, manifest_path, manifest_sha, errors = _load_active_manifest(data_dir)
+    receipt_verified = False
+    if production_contract_required:
+        try:
+            authority = _receipt_authority or _load_receipt_backed_native_authority(
+                data_dir
+            )
+        except NativeSemanticReceiptError as exc:
+            result.errors.extend(exc.errors)
+            return result
+        if authority.data_dir != Path(data_dir).resolve():
+            result.errors.append("NATIVE_SEMANTIC_AUTHORITY_DATA_DIR_MISMATCH")
+            return result
+        manifest = _thaw_json(authority.manifest)
+        manifest_path = authority.activation_manifest_path
+        manifest_sha = authority.activation_manifest_sha256
+        errors: List[str] = []
+        receipt_verified = True
+    else:
+        manifest, manifest_path, manifest_sha, errors = _load_active_manifest(data_dir)
     result.activation_manifest_path = manifest_path
     result.activation_manifest_sha256 = manifest_sha
     result.errors.extend(errors)
@@ -4513,19 +5001,25 @@ def _resolve_active_native_universe_uncached(
             != expected_run_manifest_relative
         ):
             result.errors.append("NATIVE_ACTIVE_RUN_MANIFEST_PATH_IDENTITY_MISMATCH")
-        run_manifest_path, run_manifest_errors = _verify_pinned_file(
-            native_root,
-            manifest.get("run_manifest_relative_path"),
-            manifest.get("run_manifest_sha256"),
-            error_prefix="NATIVE_ACTIVE_RUN_MANIFEST",
-        )
-        result.errors.extend(run_manifest_errors)
+        if receipt_verified:
+            run_manifest_path = authority.run_manifest_path
+        else:
+            run_manifest_path, run_manifest_errors = _verify_pinned_file(
+                native_root,
+                manifest.get("run_manifest_relative_path"),
+                manifest.get("run_manifest_sha256"),
+                error_prefix="NATIVE_ACTIVE_RUN_MANIFEST",
+            )
+            result.errors.extend(run_manifest_errors)
     if explicit_manifest and run_manifest_path is not None and not run_manifest_errors:
-        try:
-            run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            run_manifest = None
-            result.errors.append("NATIVE_ACTIVE_RUN_MANIFEST_INVALID_JSON")
+        if receipt_verified:
+            run_manifest = _thaw_json(authority.run_manifest)
+        else:
+            try:
+                run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                run_manifest = None
+                result.errors.append("NATIVE_ACTIVE_RUN_MANIFEST_INVALID_JSON")
         if not isinstance(run_manifest, Mapping):
             result.errors.append("NATIVE_ACTIVE_RUN_MANIFEST_NOT_OBJECT")
         else:
@@ -5110,7 +5604,9 @@ def _resolve_active_native_universe_uncached(
                         f"NATIVE_UNIVERSE_CONFIG_ROSTER_MISSING_SYMBOL:{symbol}"
                     )
 
-            if verify_exclusion_evidence or production_contract_required:
+            if (
+                verify_exclusion_evidence or production_contract_required
+            ) and not receipt_verified:
                 for symbol in requested:
                     symbol_entries = entries.get(symbol) or {}
                     symbol_run_cells = {
@@ -5908,7 +6404,8 @@ def _resolve_active_native_universe_uncached(
     # compatibility flag remains available only for non-production forensic
     # inspection of historical manifests.
     verify_cell_evidence = bool(
-        verify_exclusion_evidence or production_contract_required
+        (verify_exclusion_evidence or production_contract_required)
+        and not receipt_verified
     )
     if result.explicit_contract and verify_cell_evidence:
         for symbol in result.requested_symbols:
@@ -6732,6 +7229,21 @@ def resolve_active_native_artifact(
 
     raw_symbol = str(symbol or "").strip()
     tf = str(timeframe or "").strip().upper()
+    receipt_authority: Optional[ReceiptBackedNativeAuthority] = None
+    if production_contract_required:
+        try:
+            scope = _PRODUCTION_NATIVE_AUTHORITY_SCOPE.get()
+            receipt_authority = (
+                scope.verify_receipt_backed_authority(data_dir)
+                if scope is not None
+                else _load_receipt_backed_native_authority(data_dir)
+            )
+        except NativeSemanticReceiptError as exc:
+            return ActiveNativeResolution(
+                symbol=raw_symbol,
+                timeframe=tf,
+                errors=list(exc.errors),
+            )
     try:
         identity_before = _read_active_authority_identity(data_dir)
     except (OSError, RuntimeError, ValueError):
@@ -6739,6 +7251,22 @@ def resolve_active_native_artifact(
             symbol=raw_symbol,
             timeframe=tf,
             errors=["NATIVE_ACTIVE_AUTHORITY_IDENTITY_INITIAL_READ_FAILED"],
+        )
+    if receipt_authority is not None and (
+        identity_before.data_dir != receipt_authority.data_dir
+        or identity_before.active_pointer_bytes
+        != receipt_authority.active_pointer_bytes
+        or identity_before.activation_manifest_sha256
+        != receipt_authority.activation_manifest_sha256
+        or identity_before.semantic_receipt_sha256
+        != receipt_authority.semantic_receipt_sha256
+        or identity_before.semantic_verifier_build_digest
+        != receipt_authority.semantic_verifier_build_digest
+    ):
+        return ActiveNativeResolution(
+            symbol=raw_symbol,
+            timeframe=tf,
+            errors=["NATIVE_ACTIVE_RECEIPT_AUTHORITY_IDENTITY_MISMATCH"],
         )
 
     result = _resolve_active_native_artifact_single_pass(

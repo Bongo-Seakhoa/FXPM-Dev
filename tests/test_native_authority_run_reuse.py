@@ -7,38 +7,47 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import threading
 from typing import Any
 
 import pytest
 
 import pm_native_activation as native
+from tests.native_v5_support import write_receipt_backed_v5_authority
+
+
+_AUTHORITY_TEMPLATE: Path | None = None
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _receipt_authority_template(tmp_path_factory: pytest.TempPathFactory) -> None:
+    global _AUTHORITY_TEMPLATE
+    template = tmp_path_factory.mktemp("receipt-authority") / "native"
+    write_receipt_backed_v5_authority(
+        template,
+        run_id="scope-run",
+        activation_id="scope-activation",
+    )
+    _AUTHORITY_TEMPLATE = template
+    yield
+    _AUTHORITY_TEMPLATE = None
 
 
 def _write_identity(data_dir: Path) -> tuple[Path, Path, str]:
     native_root = data_dir / "native"
+    assert _AUTHORITY_TEMPLATE is not None
+    shutil.copytree(_AUTHORITY_TEMPLATE, native_root)
     manifest_path = native_root / "activations" / "scope-activation.json"
-    manifest_bytes = b'{"activation_id":"scope-activation","generation":1}\n'
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_bytes(manifest_bytes)
+    manifest_bytes = manifest_path.read_bytes()
     manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
     pointer_path = native_root / "ACTIVE.json"
-    pointer = {
-        "schema_version": native.ACTIVE_POINTER_SCHEMA,
-        "activation_id": "scope-activation",
-        "manifest_relative_path": "activations/scope-activation.json",
-        "manifest_sha256": manifest_sha,
-        "activated_at_utc": "2026-07-22T00:00:00Z",
-        "production_authoritative": True,
-    }
-    pointer_path.write_text(
-        json.dumps(pointer, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
     return pointer_path, manifest_path, manifest_sha
 
 
-def _valid_universe(manifest_path: Path, manifest_sha: str) -> native.ActiveNativeUniverse:
+def _valid_universe(
+    manifest_path: Path, manifest_sha: str
+) -> native.ActiveNativeUniverse:
     return native.ActiveNativeUniverse(
         activation_id="scope-activation",
         activation_manifest_path=manifest_path.resolve(),
@@ -131,7 +140,10 @@ def test_scope_runs_one_full_verification_then_exact_identity_revalidation(
         assert scope.stats()["closed"] is True
 
     assert full_thread_ids == [threading.get_ident()]
-    assert len(identity_thread_ids) == 2 + (2 * reuse_calls)
+    # The receipt loader performs the first full verification directly; only
+    # the post-verification bracket and two reads per cached universe hit the
+    # cheap identity reader.
+    assert len(identity_thread_ids) == 1 + (2 * reuse_calls)
     assert set(identity_thread_ids) == {threading.get_ident()}
     assert len({id(value) for value in results}) == total_calls
     assert all(value.valid for value in results)
@@ -256,9 +268,7 @@ def test_scope_rejects_pointer_change_during_first_full_verification(
         assert stats["full_verification_count"] == 1
         assert stats["identity_revalidation_attempt_count"] == 0
         assert stats["poisoned"] is True
-        assert stats["poison_reason"] == (
-            "IDENTITY_CHANGED_DURING_FULL_VERIFICATION"
-        )
+        assert stats["poison_reason"] == ("IDENTITY_CHANGED_DURING_FULL_VERIFICATION")
 
 
 def test_scope_rejects_nested_and_copied_context_thread_drift(
@@ -314,9 +324,7 @@ def test_scope_rejects_process_identity_drift(
         monkeypatch.setattr(native.os, "getpid", lambda: original_pid + 1)
         with pytest.raises(
             RuntimeError,
-            match=(
-                "NATIVE_AUTHORITY_VERIFICATION_SCOPE_EXECUTION_IDENTITY_MISMATCH"
-            ),
+            match=("NATIVE_AUTHORITY_VERIFICATION_SCOPE_EXECUTION_IDENTITY_MISMATCH"),
         ):
             _resolve(data_dir)
         stats = scope.stats()

@@ -10,7 +10,19 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 
-from pm_native_activation import sha256_file
+from pm_native_activation import (
+    ACTIVATION_MANIFEST_SCHEMA,
+    ACTIVE_POINTER_SCHEMA,
+    NATIVE_AUTHENTICITY_DECISION_BASIS,
+    NATIVE_EVIDENCE_CANDIDATE,
+    NATIVE_EVIDENCE_PARTITIONS,
+    NATIVE_PRODUCTION_TIMEFRAMES,
+    NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW,
+    NATIVE_SESSION_COVERAGE_METHOD,
+    UNIVERSE_AUTHENTICITY_SCHEMA,
+    build_native_semantic_receipt,
+    sha256_file,
+)
 from pm_native_parity import ParityThresholds
 from pm_native_request_contract import (
     OUTPUT_MAX_CELL_BYTES,
@@ -788,6 +800,231 @@ def rewrite_no_history(native_root: Path, run_id: str, timeframe: str) -> None:
     )
 
 
+def write_receipt_backed_v5_authority(
+    native_root: Path,
+    *,
+    run_id: str = "receipt-fixture-run",
+    activation_id: str = "receipt-fixture-activation",
+    current_schedule_surface: bool = False,
+) -> dict[str, Any]:
+    """Write a tiny exact 100x6 receipt authority without running raw replay."""
+
+    native_root = Path(native_root).resolve()
+    entries: dict[str, dict[str, Any]] = {}
+    cell_statuses: dict[str, dict[str, str]] = {}
+    evidence_projection: dict[str, list[str]] = {}
+    results: list[dict[str, Any]] = []
+    base = pd.Timestamp("2025-01-06T00:00:00Z")
+    for symbol_index, symbol in enumerate(PRODUCTION_SYMBOL_ORDER):
+        candidate_timeframes = (
+            (("D1",) if symbol_index < 96 else ("M5", "H4"))
+            if current_schedule_surface
+            else NATIVE_PRODUCTION_TIMEFRAMES
+        )
+        entries[symbol] = {}
+        cell_statuses[symbol] = {}
+        evidence_projection[symbol] = list(candidate_timeframes)
+        for timeframe in NATIVE_PRODUCTION_TIMEFRAMES:
+            seconds = TIMEFRAME_SECONDS[timeframe]
+            opens = pd.DatetimeIndex(
+                [base + pd.Timedelta(seconds=seconds * index) for index in range(16)]
+            )
+            leaf = native_root / "runs" / run_id / symbol / timeframe
+            leaf.mkdir(parents=True, exist_ok=True)
+            bars_path = leaf / "bars.csv"
+            frame = pd.DataFrame(
+                {
+                    "time": [value.isoformat() for value in opens],
+                    "_BAR_CLOSE_TS": [
+                        (value + pd.Timedelta(seconds=seconds)).isoformat()
+                        for value in opens
+                    ],
+                    "Open": 1.0 + symbol_index * 1e-6,
+                    "High": 1.1 + symbol_index * 1e-6,
+                    "Low": 0.9 + symbol_index * 1e-6,
+                    "Close": 1.0 + symbol_index * 1e-6,
+                }
+            )
+            frame.to_csv(bars_path, index=False, lineterminator="\n")
+            bars_sha = sha256_file(bars_path)
+            audit_leaf = native_root / "audits" / activation_id / symbol / timeframe
+            audit_leaf.mkdir(parents=True, exist_ok=True)
+            sidecar_path = audit_leaf / "bars.meta.json"
+            parity_path = audit_leaf / "parity.json"
+            sidecar_path.write_text(
+                json.dumps(
+                    {"fixture": True, "symbol": symbol, "timeframe": timeframe},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            parity_path.write_text(
+                json.dumps(
+                    {"fixture": True, "symbol": symbol, "timeframe": timeframe},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            state = (
+                NATIVE_EVIDENCE_CANDIDATE
+                if timeframe in candidate_timeframes
+                else "technical_error"
+            )
+            entries[symbol][timeframe] = {
+                "status": state,
+                "audit_status": "PASS",
+                "universe_eligibility_status": state,
+                "tradeable": False,
+                "statistical_sufficiency_receipt_required": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "run_id": run_id,
+                "bars_relative_path": bars_path.relative_to(native_root).as_posix(),
+                "bars_sha256": bars_sha,
+                "sidecar_relative_path": sidecar_path.relative_to(
+                    native_root
+                ).as_posix(),
+                "sidecar_sha256": sha256_file(sidecar_path),
+                "parity_relative_path": parity_path.relative_to(native_root).as_posix(),
+                "parity_sha256": sha256_file(parity_path),
+            }
+            cell_statuses[symbol][timeframe] = state
+            results.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "relative_leaf": f"{symbol}/{timeframe}",
+                    "status": "success",
+                    "failure_status": None,
+                    "rows": len(frame),
+                    "sha256": bars_sha,
+                    "resume_disposition": "newly_acquired",
+                }
+            )
+    run_manifest = {
+        "schema_version": "fxpm.native_history_run_manifest.v1",
+        "immutable_record": True,
+        "complete": True,
+        "run_id": run_id,
+        "request": {
+            "symbols": list(PRODUCTION_SYMBOL_ORDER),
+            "timeframes": list(NATIVE_PRODUCTION_TIMEFRAMES),
+        },
+        "results": results,
+    }
+    run_manifest_path = native_root / "runs" / run_id / "run_manifest.json"
+    run_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    run_manifest_path.write_text(
+        json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    evidence_candidate_count = sum(
+        state == NATIVE_EVIDENCE_CANDIDATE
+        for grid in cell_statuses.values()
+        for state in grid.values()
+    )
+    technical_error_count = 600 - evidence_candidate_count
+    manifest: dict[str, Any] = {
+        "schema_version": ACTIVATION_MANIFEST_SCHEMA,
+        "activation_id": activation_id,
+        "run_id": run_id,
+        "run_manifest_relative_path": run_manifest_path.relative_to(
+            native_root
+        ).as_posix(),
+        "run_manifest_sha256": sha256_file(run_manifest_path),
+        "status": "active",
+        "created_at_utc": "2026-01-01T00:00:00Z",
+        "native_is_signal_authority": True,
+        "silent_fallback_allowed": False,
+        "production_authoritative": True,
+        "previous_active_pointer_sha256": None,
+        "minimum_session_coverage": None,
+        "coverage_activation_threshold_removed": True,
+        "parity_thresholds": {
+            "min_membership_ratio": 1.0,
+            "max_ohlc_mismatch_ratio": 0.0,
+            "max_unassigned_m5_ratio": 0.0,
+            "min_compared_native_bars": 20,
+        },
+        "universe_eligibility": {
+            "schema_version": UNIVERSE_AUTHENTICITY_SCHEMA,
+            "decision_basis": NATIVE_AUTHENTICITY_DECISION_BASIS,
+            "performance_inputs_used": False,
+            "trading_verdicts_emitted": False,
+            "coverage_is_diagnostic_only": True,
+            "fixed_coverage_activation_threshold": None,
+            "session_coverage_method": NATIVE_SESSION_COVERAGE_METHOD,
+            "session_coverage_partitions": list(NATIVE_EVIDENCE_PARTITIONS),
+            "requested_symbols": list(PRODUCTION_SYMBOL_ORDER),
+            "required_timeframes": list(NATIVE_PRODUCTION_TIMEFRAMES),
+            "cell_statuses": cell_statuses,
+            "terminal_states": [
+                NATIVE_EVIDENCE_CANDIDATE,
+                "source_unavailable",
+                "technical_error",
+            ],
+            "nonterminal_states": ["pending"],
+            "evidence_candidate_timeframes_by_symbol": evidence_projection,
+            "source_unavailable_timeframes_by_symbol": {
+                symbol: [] for symbol in PRODUCTION_SYMBOL_ORDER
+            },
+            "symbols_with_evidence_candidates": list(PRODUCTION_SYMBOL_ORDER),
+            "eligible_symbols": list(PRODUCTION_SYMBOL_ORDER),
+            "excluded_symbols": {},
+        },
+        "entries": entries,
+        "counts": {
+            NATIVE_EVIDENCE_CANDIDATE: evidence_candidate_count,
+            "source_unavailable": 0,
+            "technical_error": technical_error_count,
+            "pending": 0,
+            "total": 600,
+            "terminal": 600,
+            "symbols_with_evidence_candidates": len(PRODUCTION_SYMBOL_ORDER),
+        },
+    }
+    receipt = build_native_semantic_receipt(manifest)
+    receipt_path = native_root / "semantic_receipts" / f"{activation_id}.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_bytes(
+        (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
+    manifest["semantic_receipt_relative_path"] = receipt_path.relative_to(
+        native_root
+    ).as_posix()
+    manifest["semantic_receipt_sha256"] = sha256_file(receipt_path)
+    manifest_path = native_root / "activations" / f"{activation_id}.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_bytes(
+        (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
+    pointer = {
+        "schema_version": ACTIVE_POINTER_SCHEMA,
+        "activation_id": activation_id,
+        "manifest_relative_path": manifest_path.relative_to(native_root).as_posix(),
+        "manifest_sha256": sha256_file(manifest_path),
+        "activated_at_utc": manifest["created_at_utc"],
+        "production_authoritative": True,
+    }
+    pointer_path = native_root / "ACTIVE.json"
+    pointer_path.write_bytes(
+        (json.dumps(pointer, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
+    return {
+        "native_root": native_root,
+        "pointer_path": pointer_path,
+        "manifest_path": manifest_path,
+        "receipt_path": receipt_path,
+        "run_manifest_path": run_manifest_path,
+        "activation_id": activation_id,
+        "run_id": run_id,
+    }
+
+
 def activate_v5_run(
     native_root: Path,
     run_id: str,
@@ -817,6 +1054,9 @@ def activate_v5_run(
         update_active_pointer=(
             production_authoritative if production_only_pointer else True
         ),
+        semantic_verification_mode=(
+            NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW if production_authoritative else None
+        ),
     )
 
 
@@ -824,5 +1064,6 @@ __all__ = [
     "SYMBOL",
     "activate_v5_run",
     "rewrite_no_history",
+    "write_receipt_backed_v5_authority",
     "write_v5_run",
 ]

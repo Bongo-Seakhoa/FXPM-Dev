@@ -33,7 +33,6 @@ from pm_native_activation import (
     UNIVERSE_AUTHENTICITY_SCHEMA,
     ActiveNativeUniverse,
     resolve_active_native_universe,
-    validate_terminal_promotion_view,
 )
 from pm_native_request_contract import (
     COMMON_REQUEST_KEYS,
@@ -392,7 +391,6 @@ def _load_verified_v5_common(
     pointer_path = native_root / "ACTIVE.json"
     pointer, pointer_before = _read_json_bounded(pointer_path, "ACTIVE_POINTER")
     canonical_relative = f"activations/{activation_id}.json"
-    promoted_relative = f"activations/promoted/{activation_id}.json"
     manifest_relative = pointer.get("manifest_relative_path")
     if (
         set(pointer)
@@ -406,7 +404,7 @@ def _load_verified_v5_common(
         }
         or pointer.get("schema_version") != ACTIVE_POINTER_SCHEMA
         or pointer.get("activation_id") != activation_id
-        or manifest_relative not in (canonical_relative, promoted_relative)
+        or manifest_relative != canonical_relative
         or pointer.get("manifest_sha256") != expected_activation_sha
         or pointer.get("production_authoritative") is not True
     ):
@@ -422,18 +420,6 @@ def _load_verified_v5_common(
         or observed_activation.resolve() != expected_activation
     ):
         _fail("ACTIVATION_MANIFEST_PATH_MISMATCH")
-    if manifest_relative == promoted_relative:
-        promotion_errors = validate_terminal_promotion_view(
-            native_root,
-            activation_id=activation_id,
-            view_path=expected_activation,
-            view_sha256=expected_activation_sha,
-        )
-        if promotion_errors:
-            raise ProductionAnchorPlanError(
-                "TERMINAL_PROMOTION_VIEW_INVALID",
-                tuple(str(value) for value in promotion_errors),
-            )
     activation, activation_raw = _read_json_bounded(
         expected_activation, "ACTIVATION_MANIFEST"
     )

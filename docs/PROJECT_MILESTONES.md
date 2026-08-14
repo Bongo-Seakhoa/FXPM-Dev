@@ -193,6 +193,10 @@ else (unknown/unfinished/unauthenticated pending, source/provenance/integrity er
    and the record cleared only after the full postcheck passes.
 **Owner:** Codex implements; Claude reviews. **Blocking dependency for M3.**
 **PROGRESS — 3 of 4 artifacts reviewed and ACCEPTED (2026-07-21):**
+**Historical record (retired 2026-08-14):** the pointer-only terminal-promotion
+publisher, recovery path, and promoted-view consumer described below are no longer
+runnable authority. Their artifacts remain preserved only as provenance and as the
+one migration predecessor for the receipt-backed canonical activation.
 - `[x]` **Receipt-version-compatibility** — Claude ACCEPT seq2332 (pins byte-exact; 18 tests green;
   current-first + byte-exact + real per-window no-more-permissive ordering; frozen profile reverts
   BOTH receipt fields and deferral behaviour). COMPLETE seq2334, RELEASED seq2335.
@@ -273,8 +277,8 @@ the fix is sound, but the two-agent check must not be stubbed on safety-critical
   that is **6.4–9.4 hours to canary a single cell**, for zero added assurance — passes 2–6 verify
   byte-identical inputs and cannot reach a different verdict. Fix = verify once, then cheap exact
   identity revalidation, bound by Claude at seq2348 with five conditions: first full pass never skipped;
-  process/run-local only (no cross-run cache); revalidation compares exact `ACTIVE.json` bytes + promoted
-  manifest sha256; fail closed and loudly, never quiet; and it may never skip a consumer-specific gate
+  process/run-local only (no cross-run cache); revalidation compares exact `ACTIVE.json` bytes + receipt-backed
+  canonical manifest sha256; fail closed and loudly, never quiet; and it may never skip a consumer-specific gate
   (anchor projection, portfolio parity, resolver `production_contract_required`) that asks a different
   question. Claude corrected Codex's cost model at seq2348 (the frozen recompute is **lazy** and
   frame-reusing — ~1,107 not 1,828 pair computations, and CPU not I/O), which Codex accepted at seq2349.
@@ -314,9 +318,9 @@ the fix is sound, but the two-agent check must not be stubbed on safety-critical
 boundaries reject the retired keys.
 
 ### M6 — Full production optimization run (streamed) `[ ]`  ← operator's headline deliverable
-**Goal:** the actual production optimization across the promoted universe.
+**Goal:** the actual production optimization across the receipt-backed canonical universe.
 **Exit criteria:**
-- `--optimize` launched with the promoted V5 universe as signal authority; streamed per-cell so peak
+- `--optimize` launched with the receipt-backed canonical V5 authority; streamed per-cell so peak
   memory stays bounded (loader-level streaming already satisfied — `_BoundedNativeSource`).
 - Search budget = the reviewed **128** attempts/cell (the ≥300 successor is parked — see §4).
 - Full evidence machinery runs and is honoured: DSR, PBO, bootstrap, multiplicity, two-phase lockbox,

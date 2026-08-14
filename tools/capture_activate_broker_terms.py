@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import sys
@@ -27,6 +28,7 @@ from pm_broker_terms import (  # noqa: E402
     EXPORT_COLUMNS,
     TERMS_EXPORT_SCHEMA,
     activate_broker_terms,
+    build_price_receipt_migration_pin,
     build_explicit_stress_snapshot,
     canonical_sha256,
     parse_terms_export,
@@ -51,6 +53,59 @@ def _atomic_state(path: Path, value: Mapping[str, Any]) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _atomic_migration_pin(path: Path, value: Mapping[str, Any]) -> str:
+    """Create one exact ephemeral pin without replacing an existing pin."""
+
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    encoded = json.dumps(
+        value,
+        indent=2,
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    try:
+        with temporary.open("xb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_exact_migration_pin(
+    path: Path,
+    expected_sha256: str,
+    max_bytes: int = 1024 * 1024,
+) -> tuple[Dict[str, Any], bytes]:
+    """Read one bounded regular pin and authenticate its exact bytes."""
+
+    path = Path(path).absolute()
+    if (
+        not path.is_file()
+        or path.is_symlink()
+        or not 0 < path.stat().st_size <= max_bytes
+    ):
+        raise BrokerTermsError("price receipt migration pin is unsafe or oversized")
+    payload = path.read_bytes()
+    if (
+        len(payload) > max_bytes
+        or hashlib.sha256(payload).hexdigest() != expected_sha256
+    ):
+        raise BrokerTermsError("price receipt migration pin SHA-256 mismatch")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BrokerTermsError("price receipt migration pin JSON is invalid") from exc
+    if not isinstance(value, dict):
+        raise BrokerTermsError("price receipt migration pin is not an object")
+    return value, payload
 
 
 def _load_json(path: Path, max_bytes: int = 4 * 1024 * 1024) -> Dict[str, Any]:
@@ -105,9 +160,12 @@ def _response_nonce(path: Path, max_bytes: int = 2 * 1024 * 1024) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-root", type=Path, default=Path("data/native"))
-    parser.add_argument("--exchange-dir", type=Path, required=True,
-                        help="MetaTrader Common/Files directory watched by FXPMTermsExporter")
-    parser.add_argument("--roster-json", type=Path, required=True)
+    parser.add_argument(
+        "--exchange-dir",
+        type=Path,
+        help="MetaTrader Common/Files directory watched by FXPMTermsExporter",
+    )
+    parser.add_argument("--roster-json", type=Path)
     parser.add_argument("--expected-server", default="")
     parser.add_argument("--expected-company", default="")
     parser.add_argument("--expected-currency", default="")
@@ -128,6 +186,30 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-snapshots", type=int, default=16)
     parser.add_argument("--max-terms-bytes", type=int, default=64 * 1024 * 1024)
+    migration = parser.add_mutually_exclusive_group()
+    migration.add_argument(
+        "--prepare-price-receipt-migration-pin",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Before price ACTIVE migration, authenticate and pin the exact "
+            "current TERMS snapshot"
+        ),
+    )
+    migration.add_argument(
+        "--complete-price-receipt-migration-pin",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "After price ACTIVE migration, rebuild TERMS from the exact "
+            "prepared pin and consume it on success"
+        ),
+    )
+    parser.add_argument(
+        "--price-receipt-migration-pin-sha256",
+        default="",
+        help="Required exact SHA-256 for --complete-price-receipt-migration-pin",
+    )
     return parser
 
 
@@ -140,6 +222,123 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_status(
             "INVALID",
             reason="staged activation cannot be combined with post-publication pruning",
+        )
+        return 2
+    migration_prepare = args.prepare_price_receipt_migration_pin
+    migration_complete = args.complete_price_receipt_migration_pin
+    if migration_prepare is not None or migration_complete is not None:
+        if (
+            args.exchange_dir is not None
+            or args.roster_json is not None
+            or args.new_request
+            or args.approve_stress_policy
+            or args.no_pointer_update
+            or args.prune_after_publication
+        ):
+            _print_status(
+                "INVALID",
+                reason=(
+                    "price-receipt migration mode cannot be combined with "
+                    "capture, stress, staging, or retention options"
+                ),
+            )
+            return 2
+        try:
+            if migration_prepare is not None:
+                if args.price_receipt_migration_pin_sha256:
+                    raise BrokerTermsError(
+                        "prepare mode does not accept an expected migration pin hash"
+                    )
+                pin = build_price_receipt_migration_pin(args.native_root)
+                pin_sha = _atomic_migration_pin(migration_prepare, pin)
+                _print_status(
+                    "MIGRATION_PIN_PREPARED",
+                    path=str(Path(migration_prepare).resolve()),
+                    sha256=pin_sha,
+                    action=(
+                        "Publish the receipt-backed native price ACTIVE, then run "
+                        "completion with this exact path and SHA-256."
+                    ),
+                )
+                return 0
+
+            expected_pin_sha = (
+                str(args.price_receipt_migration_pin_sha256 or "").strip().lower()
+            )
+            if len(expected_pin_sha) != 64 or any(
+                value not in "0123456789abcdef" for value in expected_pin_sha
+            ):
+                raise BrokerTermsError(
+                    "completion requires a 64-character lowercase migration pin SHA-256"
+                )
+            pin_path = Path(migration_complete).absolute()
+            pin, pin_bytes = _load_exact_migration_pin(
+                pin_path,
+                expected_pin_sha,
+            )
+            snapshot_relative = str(
+                pin.get("source_terms_snapshot_relative_path") or ""
+            )
+            native_root = Path(args.native_root).resolve()
+            snapshot_path = (native_root / snapshot_relative).resolve()
+            try:
+                snapshot_path.relative_to(native_root)
+            except ValueError as exc:
+                raise BrokerTermsError(
+                    "price receipt migration snapshot path escapes native root"
+                ) from exc
+            snapshot = _load_json(snapshot_path, 64 * 1024 * 1024)
+            activated = activate_broker_terms(
+                native_root,
+                snapshot,
+                activation_id=args.activation_id or None,
+                update_pointer=True,
+                max_snapshot_age_seconds=args.max_age_seconds,
+                price_receipt_migration_pin=pin,
+            )
+            consumption: Dict[str, Any]
+            try:
+                _current_pin, current_pin_bytes = _load_exact_migration_pin(
+                    pin_path,
+                    expected_pin_sha,
+                )
+                if current_pin_bytes != pin_bytes:
+                    raise BrokerTermsError(
+                        "migration pin changed after successful TERMS publication"
+                    )
+                pin_path.unlink()
+                consumption = {"status": "CONSUMED", "path": str(pin_path)}
+            except Exception as exc:
+                consumption = {
+                    "status": "WARNING",
+                    "path": str(pin_path),
+                    "reason": (
+                        "TERMS publication succeeded but the single-use pin could "
+                        "not be removed; exact-source checks prevent reuse"
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            _print_status(
+                "COMPLETE",
+                migration="PRICE_RECEIPT_REBIND",
+                activation_id=activated["activation_id"],
+                manifest_sha256=activated["manifest_sha256"],
+                pointer_updated=activated["pointer_updated"],
+                active_symbols=activated["active_symbols"],
+                pin_consumption=consumption,
+            )
+            return 0
+        except (BrokerTermsError, FileExistsError, OSError) as exc:
+            _print_status("INVALID", reason=str(exc))
+            return 2
+    if args.exchange_dir is None or args.roster_json is None:
+        _print_status(
+            "INVALID",
+            reason=(
+                "--exchange-dir and --roster-json are required outside explicit "
+                "price-receipt migration mode"
+            ),
         )
         return 2
     try:

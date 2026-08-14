@@ -11,7 +11,6 @@ sufficiency and NO_TRADE decisions belong to downstream evidence authorities.
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import math
@@ -34,30 +33,27 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from pm_native_activation import (  # noqa: E402
     ACTIVATION_MANIFEST_SCHEMA,
-    ACTIVE_POINTER_FIELDS,
     ACTIVE_POINTER_SCHEMA,
     LEGACY_NATIVE_SESSION_COVERAGE_METHOD,
     NATIVE_AUTHENTICITY_DECISION_BASIS,
-    NATIVE_BARS_SCHEMA,
     NATIVE_EVIDENCE_CANDIDATE,
     NATIVE_EVIDENCE_PARTITIONS,
     NATIVE_MINIMUM_SESSION_COVERAGE,
     NATIVE_PENDING,
+    NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW,
     NATIVE_SESSION_COVERAGE_METHOD,
     NATIVE_SOURCE_UNAVAILABLE,
     NATIVE_SOURCE_EVIDENCE_DECISION_BASIS,
     NATIVE_TECHNICAL_ERROR,
     SUPPORTED_NATIVE_SESSION_COVERAGE_METHODS,
-    TERMINAL_PROMOTION_RECEIPT_SCHEMA,
-    TERMINAL_PROMOTION_TRANSITION,
     UNIVERSE_AUTHENTICITY_SCHEMA,
     UNIVERSE_ELIGIBILITY_SCHEMA,
+    build_native_semantic_receipt,
     classify_native_availability_cell,
-    resolve_active_native_universe,
     scope_native_pair_window_states,
     sha256_file,
     validate_native_session_coverage_diagnostics,
-    validate_terminal_promotion_view,
+    validate_staged_receipt_backed_native_authority,
 )
 from pm_native_consensus import (  # noqa: E402
     CONSENSUS_SCHEMA_VERSION,
@@ -343,7 +339,9 @@ def _active_pointer_lock(
                     break
                 except OSError as exc:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("timed out waiting for native ACTIVE lock") from exc
+                        raise TimeoutError(
+                            "timed out waiting for native ACTIVE lock"
+                        ) from exc
                     time.sleep(0.025)
             try:
                 yield
@@ -359,7 +357,9 @@ def _active_pointer_lock(
                     break
                 except BlockingIOError as exc:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError("timed out waiting for native ACTIVE lock") from exc
+                        raise TimeoutError(
+                            "timed out waiting for native ACTIVE lock"
+                        ) from exc
                     time.sleep(0.025)
             try:
                 yield
@@ -3094,8 +3094,7 @@ def _v5_audit_symbol(
                     or ""
                 ).upper()
                 reference_resolution_status = str(
-                    (resolution_audits.get(reference) or {}).get("status")
-                    or "PENDING"
+                    (resolution_audits.get(reference) or {}).get("status") or "PENDING"
                 ).upper()
                 if reference_class == "unavailable" and not reference_errors:
                     reference_binding = _v5_unavailable_binding()
@@ -3657,6 +3656,104 @@ def _v5_audit_symbol(
     return symbol_entries, audited_cells, list(dict.fromkeys(blocking))
 
 
+def _reuse_staged_force_raw_activation(
+    native_root: Path,
+    *,
+    run_id: str,
+    activation_id: str,
+    symbols: Sequence[str],
+    timeframes: Sequence[str],
+    thresholds: ParityThresholds,
+) -> Dict[str, Any]:
+    """Finish only the exact staged FORCE_RAW publication after a CAS loss."""
+
+    manifest_path = native_root / "activations" / f"{activation_id}.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_MANIFEST_MISSING")
+    manifest_bytes = manifest_path.read_bytes()
+    try:
+        manifest = json.loads(manifest_bytes.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_MANIFEST_INVALID") from exc
+    if not isinstance(manifest, Mapping) or manifest_bytes != _canonical_json_bytes(
+        manifest
+    ):
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_MANIFEST_NOT_CANONICAL")
+    if (
+        str(manifest.get("activation_id") or "") != activation_id
+        or str(manifest.get("run_id") or "") != run_id
+    ):
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_IDENTITY_MISMATCH")
+    contract = (
+        manifest.get("universe_eligibility")
+        if isinstance(manifest.get("universe_eligibility"), Mapping)
+        else {}
+    )
+    if tuple(contract.get("requested_symbols") or ()) != tuple(symbols) or tuple(
+        contract.get("required_timeframes") or ()
+    ) != tuple(timeframes):
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_ROSTER_MISMATCH")
+    expected_thresholds = {
+        "min_membership_ratio": thresholds.min_membership_ratio,
+        "max_ohlc_mismatch_ratio": thresholds.max_ohlc_mismatch_ratio,
+        "max_unassigned_m5_ratio": thresholds.max_unassigned_m5_ratio,
+        "min_compared_native_bars": thresholds.min_compared_native_bars,
+    }
+    if manifest.get("parity_thresholds") != expected_thresholds:
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_PREIMAGE_INPUT_MISMATCH")
+    manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    pointer = {
+        "schema_version": ACTIVE_POINTER_SCHEMA,
+        "activation_id": activation_id,
+        "manifest_relative_path": f"activations/{activation_id}.json",
+        "manifest_sha256": manifest_sha,
+        "activated_at_utc": str(manifest.get("created_at_utc") or ""),
+        "production_authoritative": True,
+    }
+    candidate = validate_staged_receipt_backed_native_authority(
+        native_root.parent,
+        pointer,
+    )
+    if (
+        candidate.activation_id != activation_id
+        or str(candidate.semantic_receipt.get("run_id") or "") != run_id
+    ):
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_RECEIPT_IDENTITY_MISMATCH")
+    pointer_bytes = _canonical_json_bytes(pointer)
+    pointer_path = native_root / "ACTIVE.json"
+    expected_predecessor_sha = manifest.get("previous_active_pointer_sha256")
+    pointer_updated = False
+    with _active_pointer_lock(native_root):
+        current_bytes = pointer_path.read_bytes() if pointer_path.is_file() else b""
+        if current_bytes != pointer_bytes:
+            current_sha = (
+                hashlib.sha256(current_bytes).hexdigest() if current_bytes else None
+            )
+            if current_sha != expected_predecessor_sha:
+                raise RuntimeError("ACTIVE_POINTER_CHANGED_DURING_AUDIT")
+            # Reopen every staged identity under the CAS lock. This is bounded:
+            # manifest, receipt, run manifest and seven verifier source files.
+            validate_staged_receipt_backed_native_authority(
+                native_root.parent,
+                pointer,
+            )
+            _atomic_replace_bytes(pointer_path, pointer_bytes)
+            pointer_updated = True
+    if pointer_path.read_bytes() != pointer_bytes:
+        raise RuntimeError("NATIVE_FORCE_RAW_REUSE_POINTER_POSTCHECK_FAILED")
+    return {
+        **dict(manifest),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": manifest_sha,
+        "active_pointer_updated": pointer_updated,
+        "audit_only": False,
+        "semantic_verification_mode": NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW,
+        "semantic_receipt_path": str(candidate.semantic_receipt_path),
+        "semantic_receipt_sha256": candidate.semantic_receipt_sha256,
+        "reused_existing_force_raw_audit": True,
+    }
+
+
 def audit_and_activate(
     native_root: Path,
     *,
@@ -3668,6 +3765,7 @@ def audit_and_activate(
     tick_tolerance_overrides: Optional[Mapping[str, float]] = None,
     now: Optional[datetime] = None,
     update_active_pointer: bool = True,
+    semantic_verification_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     native_root = _safe_native_root(native_root)
     run_id = _safe_component(run_id, "run id")
@@ -3691,6 +3789,21 @@ def audit_and_activate(
     if unsupported:
         raise ValueError(f"unsupported native timeframe(s): {', '.join(unsupported)}")
     thresholds = thresholds or ParityThresholds()
+    normalized_verification_mode = str(semantic_verification_mode or "").strip().upper()
+    if normalized_verification_mode not in {
+        "",
+        NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW,
+    }:
+        raise ValueError("unsupported semantic verification mode")
+    if (
+        bool(update_active_pointer)
+        and canonical_symbols == tuple(PRODUCTION_SYMBOL_ORDER)
+        and canonical_timeframes == tuple(DEFAULT_TIMEFRAMES)
+        and normalized_verification_mode != NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW
+    ):
+        raise ValueError(
+            "production publication requires semantic_verification_mode=FORCE_RAW"
+        )
     if not 0.0 <= float(thresholds.min_membership_ratio) <= 1.0:
         raise ValueError("min_membership_ratio must be between 0 and 1")
     if not math.isclose(
@@ -3714,6 +3827,18 @@ def audit_and_activate(
     started = _iso_now(now)
     audit_root = native_root / "audits" / activation_id
     if audit_root.exists():
+        if (
+            bool(update_active_pointer)
+            and normalized_verification_mode == NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW
+        ):
+            return _reuse_staged_force_raw_activation(
+                native_root,
+                run_id=run_id,
+                activation_id=activation_id,
+                symbols=canonical_symbols,
+                timeframes=canonical_timeframes,
+                thresholds=thresholds,
+            )
         raise FileExistsError(
             f"immutable activation audit already exists: {audit_root}"
         )
@@ -4937,6 +5062,24 @@ def audit_and_activate(
         "entries": entries,
         "counts": counts,
     }
+    semantic_receipt_path: Optional[Path] = None
+    semantic_receipt_sha: Optional[str] = None
+    if (
+        manifest_status == "active"
+        and bool(update_active_pointer)
+        and production_authoritative_contract
+    ):
+        semantic_receipt = build_native_semantic_receipt(manifest)
+        semantic_receipt_path = (
+            native_root / "semantic_receipts" / f"{activation_id}.json"
+        )
+        _atomic_create_json(semantic_receipt_path, semantic_receipt)
+        semantic_receipt_sha = sha256_file(semantic_receipt_path)
+        manifest["semantic_receipt_relative_path"] = str(
+            semantic_receipt_path.relative_to(native_root)
+        ).replace("\\", "/")
+        manifest["semantic_receipt_sha256"] = semantic_receipt_sha
+
     manifest_path = native_root / "activations" / f"{activation_id}.json"
     _atomic_create_json(manifest_path, manifest)
     manifest_sha = sha256_file(manifest_path)
@@ -4953,22 +5096,40 @@ def audit_and_activate(
             "production_authoritative": production_authoritative_contract,
         }
         active_pointer_path = native_root / "ACTIVE.json"
+        candidate_pointer_bytes = _canonical_json_bytes(pointer)
         with _active_pointer_lock(native_root):
-            current_pointer_sha = (
-                sha256_file(active_pointer_path)
+            current_pointer_bytes = (
+                active_pointer_path.read_bytes()
                 if active_pointer_path.is_file()
-                else None
+                else b""
             )
-            if current_pointer_sha != previous_pointer_sha:
-                raise RuntimeError("ACTIVE_POINTER_CHANGED_DURING_AUDIT")
-            _atomic_replace_json(active_pointer_path, pointer)
-        pointer_updated = True
+            if current_pointer_bytes != candidate_pointer_bytes:
+                current_pointer_sha = (
+                    hashlib.sha256(current_pointer_bytes).hexdigest()
+                    if current_pointer_bytes
+                    else None
+                )
+                if current_pointer_sha != previous_pointer_sha:
+                    raise RuntimeError("ACTIVE_POINTER_CHANGED_DURING_AUDIT")
+                # Reopen the staged receipt authority under the CAS lock so a
+                # corrupt or concurrently moved stage can never be published.
+                validate_staged_receipt_backed_native_authority(
+                    native_root.parent,
+                    pointer,
+                )
+                _atomic_replace_bytes(active_pointer_path, candidate_pointer_bytes)
+                pointer_updated = True
     return {
         **manifest,
         "manifest_path": str(manifest_path),
         "manifest_sha256": manifest_sha,
         "active_pointer_updated": pointer_updated,
         "audit_only": not bool(update_active_pointer),
+        "semantic_verification_mode": (normalized_verification_mode or None),
+        "semantic_receipt_path": (
+            str(semantic_receipt_path) if semantic_receipt_path is not None else None
+        ),
+        "semantic_receipt_sha256": semantic_receipt_sha,
     }
 
 
@@ -4985,1256 +5146,6 @@ def _parse_tolerances(values: Sequence[str]) -> Dict[str, float]:
     return result
 
 
-_TERMINAL_PROMOTION_RECEIPT_SCHEMA = TERMINAL_PROMOTION_RECEIPT_SCHEMA
-_TERMINAL_PROMOTION_RECOVERY_SCHEMA = "fxpm-native-terminal-promotion-recovery-v1"
-_TERMINAL_PROMOTION_RECOVERY_FILENAME = ".ACTIVE.promotion-recovery.json"
-_TERMINAL_PROMOTION_POINTER_MAX_BYTES = 64 * 1024
-_TERMINAL_PROMOTION_RECOVERY_MAX_BYTES = 256 * 1024
-_TERMINAL_PROMOTION_RECOVERY_FIELDS = frozenset(
-    {
-        "schema_version",
-        "activation_id",
-        "run_id",
-        "source_manifest_relative_path",
-        "source_manifest_sha256",
-        "promoted_manifest_relative_path",
-        "promoted_manifest_sha256",
-        "transition_receipt_relative_path",
-        "transition_receipt_sha256",
-        "previous_active_pointer_bytes_base64",
-        "previous_active_pointer_sha256",
-        "candidate_active_pointer_bytes_base64",
-        "candidate_active_pointer_sha256",
-    }
-)
-
-
-def _terminal_promotion_decode_pointer(
-    recovery: Mapping[str, Any],
-    *,
-    label: str,
-) -> tuple[Optional[bytes], Optional[Mapping[str, Any]], list[str]]:
-    """Decode one bounded, byte-exact ACTIVE pointer from a recovery record."""
-
-    errors: list[str] = []
-    field_prefix = (
-        "previous_active_pointer" if label == "PREVIOUS" else "candidate_active_pointer"
-    )
-    encoded = recovery.get(f"{field_prefix}_bytes_base64")
-    declared_sha = str(recovery.get(f"{field_prefix}_sha256") or "").lower()
-    if not isinstance(encoded, str) or len(encoded) > (
-        4 * ((_TERMINAL_PROMOTION_POINTER_MAX_BYTES + 2) // 3)
-    ):
-        return None, None, [f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_SIZE_INVALID"]
-    try:
-        pointer_bytes = base64.b64decode(encoded.encode("ascii"), validate=True)
-    except Exception:
-        return None, None, [f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_BASE64_INVALID"]
-    if (
-        not pointer_bytes
-        or len(pointer_bytes) > _TERMINAL_PROMOTION_POINTER_MAX_BYTES
-        or base64.b64encode(pointer_bytes).decode("ascii") != encoded
-    ):
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_SIZE_INVALID")
-    if not re.fullmatch(r"[0-9a-f]{64}", declared_sha):
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_SHA256_INVALID")
-    elif hashlib.sha256(pointer_bytes).hexdigest() != declared_sha:
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_SHA256_MISMATCH")
-    try:
-        pointer = json.loads(pointer_bytes.decode("utf-8"))
-    except Exception:
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_JSON_INVALID")
-        return pointer_bytes, None, errors
-    if not isinstance(pointer, Mapping):
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_OBJECT_INVALID")
-        return pointer_bytes, None, errors
-    pointer = dict(pointer)
-    if pointer_bytes != _canonical_json_bytes(pointer):
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_NOT_CANONICAL")
-    return pointer_bytes, pointer, errors
-
-
-def _terminal_promotion_pointer_identity_errors(
-    pointer: Mapping[str, Any],
-    *,
-    label: str,
-    activation_id: str,
-    promoted_relative: str,
-    promoted_sha256: str,
-) -> list[str]:
-    errors: list[str] = []
-    current_fields = set(ACTIVE_POINTER_FIELDS)
-    legacy_fields = current_fields - {"production_authoritative"}
-    observed_fields = set(pointer)
-    if label == "CANDIDATE":
-        if observed_fields != current_fields:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_CANDIDATE_POINTER_FIELDS_INVALID")
-    elif frozenset(observed_fields) not in {
-        frozenset(legacy_fields),
-        frozenset(current_fields),
-    }:
-        errors.append("TERMINAL_PROMOTION_RECOVERY_PREVIOUS_POINTER_FIELDS_INVALID")
-    if str(pointer.get("schema_version") or "") != ACTIVE_POINTER_SCHEMA:
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_POINTER_SCHEMA_INVALID")
-    pointer_activation_id = str(pointer.get("activation_id") or "")
-    pointer_relative = str(pointer.get("manifest_relative_path") or "")
-    pointer_sha = str(pointer.get("manifest_sha256") or "").lower()
-    if label == "CANDIDATE":
-        if pointer_activation_id != activation_id:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_CANDIDATE_ACTIVATION_ID_MISMATCH")
-        if pointer_relative != promoted_relative:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_CANDIDATE_PATH_MISMATCH")
-        if pointer_sha != promoted_sha256:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_CANDIDATE_MANIFEST_SHA_MISMATCH")
-        if pointer.get("production_authoritative") is not True:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_CANDIDATE_AUTHORITY_INVALID")
-    else:
-        canonical_previous = f"activations/{pointer_activation_id}.json"
-        promoted_previous = f"activations/promoted/{pointer_activation_id}.json"
-        if not pointer_activation_id or pointer_relative not in {
-            canonical_previous,
-            promoted_previous,
-        }:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_PREVIOUS_POINTER_IDENTITY_INVALID")
-        if "production_authoritative" in pointer and (
-            pointer.get("production_authoritative") is not True
-        ):
-            errors.append("TERMINAL_PROMOTION_RECOVERY_PREVIOUS_AUTHORITY_INVALID")
-    if not re.fullmatch(r"[0-9a-f]{64}", pointer_sha):
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_MANIFEST_SHA_INVALID")
-    activated_at = str(pointer.get("activated_at_utc") or "")
-    try:
-        parsed_activated_at = datetime.fromisoformat(
-            activated_at[:-1] + "+00:00" if activated_at.endswith("Z") else activated_at
-        )
-    except ValueError:
-        parsed_activated_at = None
-    if parsed_activated_at is None or parsed_activated_at.tzinfo is None:
-        errors.append(f"TERMINAL_PROMOTION_RECOVERY_{label}_ACTIVATED_AT_INVALID")
-    return errors
-
-
-def _terminal_promotion_recovery_record(
-    *,
-    activation_id: str,
-    run_id: str,
-    source_relative: str,
-    source_sha256: str,
-    promoted_relative: str,
-    promoted_sha256: str,
-    receipt_relative: str,
-    receipt_sha256: str,
-    previous_pointer_bytes: bytes,
-    candidate_pointer_bytes: bytes,
-) -> Dict[str, Any]:
-    return {
-        "schema_version": _TERMINAL_PROMOTION_RECOVERY_SCHEMA,
-        "activation_id": activation_id,
-        "run_id": run_id,
-        "source_manifest_relative_path": source_relative,
-        "source_manifest_sha256": source_sha256,
-        "promoted_manifest_relative_path": promoted_relative,
-        "promoted_manifest_sha256": promoted_sha256,
-        "transition_receipt_relative_path": receipt_relative,
-        "transition_receipt_sha256": receipt_sha256,
-        "previous_active_pointer_bytes_base64": base64.b64encode(
-            previous_pointer_bytes
-        ).decode("ascii"),
-        "previous_active_pointer_sha256": hashlib.sha256(
-            previous_pointer_bytes
-        ).hexdigest(),
-        "candidate_active_pointer_bytes_base64": base64.b64encode(
-            candidate_pointer_bytes
-        ).decode("ascii"),
-        "candidate_active_pointer_sha256": hashlib.sha256(
-            candidate_pointer_bytes
-        ).hexdigest(),
-    }
-
-
-def _terminal_promotion_read_recovery(
-    native_root: Path,
-    *,
-    activation_id: str,
-    run_id: str,
-    expected_source_sha256: str,
-) -> tuple[Optional[Dict[str, Any]], list[str]]:
-    """Reopen the one non-authority promotion transaction, if present."""
-
-    recovery_path = native_root / _TERMINAL_PROMOTION_RECOVERY_FILENAME
-    if not recovery_path.exists():
-        return None, []
-    if not recovery_path.is_file() or recovery_path.is_symlink():
-        return None, ["TERMINAL_PROMOTION_RECOVERY_PATH_UNSAFE"]
-    recovery_bytes = recovery_path.read_bytes()
-    if not recovery_bytes or len(recovery_bytes) > _TERMINAL_PROMOTION_RECOVERY_MAX_BYTES:
-        return None, ["TERMINAL_PROMOTION_RECOVERY_SIZE_INVALID"]
-    try:
-        raw_recovery = json.loads(recovery_bytes.decode("utf-8"))
-    except Exception:
-        return None, ["TERMINAL_PROMOTION_RECOVERY_JSON_INVALID"]
-    if not isinstance(raw_recovery, Mapping):
-        return None, ["TERMINAL_PROMOTION_RECOVERY_OBJECT_INVALID"]
-    recovery = dict(raw_recovery)
-    errors: list[str] = []
-    if recovery_bytes != _canonical_json_bytes(recovery):
-        errors.append("TERMINAL_PROMOTION_RECOVERY_NOT_CANONICAL")
-    if set(recovery) != set(_TERMINAL_PROMOTION_RECOVERY_FIELDS):
-        errors.append("TERMINAL_PROMOTION_RECOVERY_FIELDS_INVALID")
-    if str(recovery.get("schema_version") or "") != (
-        _TERMINAL_PROMOTION_RECOVERY_SCHEMA
-    ):
-        errors.append("TERMINAL_PROMOTION_RECOVERY_SCHEMA_INVALID")
-    if str(recovery.get("activation_id") or "") != activation_id or str(
-        recovery.get("run_id") or ""
-    ) != run_id:
-        errors.append("TERMINAL_PROMOTION_RECOVERY_DIFFERENT_PROMOTION_PENDING")
-    source_relative = f"activations/{activation_id}.json"
-    promoted_relative = f"activations/promoted/{activation_id}.json"
-    receipt_relative = f"transition_receipts/{activation_id}.json"
-    if (
-        str(recovery.get("source_manifest_relative_path") or "") != source_relative
-        or str(recovery.get("source_manifest_sha256") or "").lower()
-        != expected_source_sha256
-    ):
-        errors.append("TERMINAL_PROMOTION_RECOVERY_SOURCE_IDENTITY_MISMATCH")
-    if str(recovery.get("promoted_manifest_relative_path") or "") != promoted_relative:
-        errors.append("TERMINAL_PROMOTION_RECOVERY_VIEW_PATH_MISMATCH")
-    if str(recovery.get("transition_receipt_relative_path") or "") != receipt_relative:
-        errors.append("TERMINAL_PROMOTION_RECOVERY_RECEIPT_PATH_MISMATCH")
-    promoted_sha = str(recovery.get("promoted_manifest_sha256") or "").lower()
-    receipt_sha = str(recovery.get("transition_receipt_sha256") or "").lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", promoted_sha):
-        errors.append("TERMINAL_PROMOTION_RECOVERY_VIEW_SHA256_INVALID")
-    if not re.fullmatch(r"[0-9a-f]{64}", receipt_sha):
-        errors.append("TERMINAL_PROMOTION_RECOVERY_RECEIPT_SHA256_INVALID")
-    previous_bytes, previous_pointer, pointer_errors = (
-        _terminal_promotion_decode_pointer(recovery, label="PREVIOUS")
-    )
-    errors.extend(pointer_errors)
-    candidate_bytes, candidate_pointer, pointer_errors = (
-        _terminal_promotion_decode_pointer(recovery, label="CANDIDATE")
-    )
-    errors.extend(pointer_errors)
-    if isinstance(previous_pointer, Mapping):
-        errors.extend(
-            _terminal_promotion_pointer_identity_errors(
-                previous_pointer,
-                label="PREVIOUS",
-                activation_id=activation_id,
-                promoted_relative=promoted_relative,
-                promoted_sha256=promoted_sha,
-            )
-        )
-    if isinstance(candidate_pointer, Mapping):
-        errors.extend(
-            _terminal_promotion_pointer_identity_errors(
-                candidate_pointer,
-                label="CANDIDATE",
-                activation_id=activation_id,
-                promoted_relative=promoted_relative,
-                promoted_sha256=promoted_sha,
-            )
-        )
-    if errors:
-        return None, list(dict.fromkeys(errors))
-    assert previous_bytes is not None and candidate_bytes is not None
-    return {
-        "path": recovery_path,
-        "bytes": recovery_bytes,
-        "record": recovery,
-        "previous_pointer_bytes": previous_bytes,
-        "candidate_pointer_bytes": candidate_bytes,
-    }, []
-
-
-def _terminal_promotion_restore_and_clear_recovery(
-    native_root: Path,
-    recovery: Mapping[str, Any],
-) -> list[str]:
-    """Restore the exact predecessor and clear only this exact transaction."""
-
-    pointer_path = native_root / "ACTIVE.json"
-    recovery_path = Path(recovery["path"])
-    recovery_bytes = bytes(recovery["bytes"])
-    previous_bytes = bytes(recovery["previous_pointer_bytes"])
-    candidate_bytes = bytes(recovery["candidate_pointer_bytes"])
-    previous_sha = str(
-        (recovery.get("record") or {}).get("previous_active_pointer_sha256") or ""
-    ).lower()
-    errors: list[str] = []
-    try:
-        with _active_pointer_lock(native_root):
-            if (
-                not recovery_path.is_file()
-                or recovery_path.read_bytes() != recovery_bytes
-            ):
-                raise RuntimeError("recovery record changed; refusing guessed rollback")
-            if (
-                not re.fullmatch(r"[0-9a-f]{64}", previous_sha)
-                or hashlib.sha256(previous_bytes).hexdigest() != previous_sha
-            ):
-                raise RuntimeError("predecessor pointer recovery hash mismatch")
-            current_bytes = pointer_path.read_bytes() if pointer_path.is_file() else b""
-            if current_bytes == candidate_bytes:
-                _atomic_replace_bytes_with_retry(pointer_path, previous_bytes)
-            elif current_bytes != previous_bytes:
-                raise RuntimeError("ACTIVE pointer was superseded; not clobbering it")
-            restored_bytes = pointer_path.read_bytes() if pointer_path.is_file() else b""
-            if (
-                restored_bytes != previous_bytes
-                or hashlib.sha256(restored_bytes).hexdigest() != previous_sha
-            ):
-                raise RuntimeError("restored pointer bytes/hash do not match")
-            _unlink_with_retry(recovery_path)
-            if recovery_path.exists():
-                raise RuntimeError("recovery record was not cleared")
-    except BaseException as exc:  # pragma: no cover - OS-specific share locks
-        errors.append(f"pointer:{type(exc).__name__}:{exc}")
-    return errors
-
-
-def _terminal_promotion_read_pinned_json(
-    native_root: Path,
-    *,
-    relative_path: Any,
-    expected_sha256: Any,
-    label: str,
-    cell_id: str,
-) -> tuple[Optional[Mapping[str, Any]], list[str]]:
-    errors: list[str] = []
-    try:
-        path = _contained(native_root, str(relative_path or ""))
-    except Exception:
-        return None, [f"TERMINAL_PROMOTION_{label}_PATH_INVALID:{cell_id}"]
-    if not path.is_file():
-        return None, [f"TERMINAL_PROMOTION_{label}_MISSING:{cell_id}"]
-    expected_sha = str(expected_sha256 or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
-        errors.append(f"TERMINAL_PROMOTION_{label}_SHA256_INVALID:{cell_id}")
-    elif sha256_file(path) != expected_sha:
-        errors.append(f"TERMINAL_PROMOTION_{label}_SHA256_MISMATCH:{cell_id}")
-    try:
-        payload = _json(path)
-    except Exception:
-        errors.append(f"TERMINAL_PROMOTION_{label}_JSON_INVALID:{cell_id}")
-        return None, errors
-    if not isinstance(payload, Mapping):
-        errors.append(f"TERMINAL_PROMOTION_{label}_OBJECT_INVALID:{cell_id}")
-        return None, errors
-    return payload, errors
-
-
-def _terminal_promotion_evidence_errors(
-    entry: Mapping[str, Any],
-    *,
-    native_root: Path,
-    run_id: str,
-    activation_id: str,
-    symbol: str,
-    timeframe: str,
-    run_manifest_relative_path: str,
-    run_manifest_sha256: str,
-) -> list[str]:
-    """Reopen compact cell evidence without replaying or hashing bar payloads."""
-
-    cell_id = f"{symbol}|{timeframe}"
-    errors: list[str] = []
-    sidecar, pinned_errors = _terminal_promotion_read_pinned_json(
-        native_root,
-        relative_path=entry.get("sidecar_relative_path"),
-        expected_sha256=entry.get("sidecar_sha256"),
-        label="SIDECAR",
-        cell_id=cell_id,
-    )
-    errors.extend(pinned_errors)
-    parity, pinned_errors = _terminal_promotion_read_pinned_json(
-        native_root,
-        relative_path=entry.get("parity_relative_path"),
-        expected_sha256=entry.get("parity_sha256"),
-        label="PARITY",
-        cell_id=cell_id,
-    )
-    errors.extend(pinned_errors)
-    if not isinstance(sidecar, Mapping) or not isinstance(parity, Mapping):
-        return list(dict.fromkeys(errors))
-
-    if str(sidecar.get("schema_version") or "") != NATIVE_BARS_SCHEMA:
-        errors.append(f"TERMINAL_PROMOTION_SIDECAR_SCHEMA_INVALID:{cell_id}")
-    if str(sidecar.get("audited_sidecar_contract") or "") != (
-        AUDITED_SIDECAR_CONTRACT
-    ):
-        errors.append(f"TERMINAL_PROMOTION_SIDECAR_CONTRACT_INVALID:{cell_id}")
-    for payload, label in ((sidecar, "SIDECAR"), (parity, "PARITY")):
-        observed_symbol = str(payload.get("symbol") or "")
-        symbol_matches = (
-            observed_symbol == symbol
-            if label == "SIDECAR"
-            else observed_symbol.upper() == symbol.upper()
-        )
-        if not symbol_matches or str(payload.get("timeframe") or "").upper() != timeframe:
-            errors.append(f"TERMINAL_PROMOTION_{label}_CELL_MISMATCH:{cell_id}")
-        if str(payload.get("run_id") or "") != run_id:
-            errors.append(f"TERMINAL_PROMOTION_{label}_RUN_ID_MISMATCH:{cell_id}")
-        if str(payload.get("activation_id") or "") != activation_id:
-            errors.append(f"TERMINAL_PROMOTION_{label}_ACTIVATION_MISMATCH:{cell_id}")
-        if str(payload.get("run_manifest_relative_path") or "").replace(
-            "\\", "/"
-        ) != run_manifest_relative_path:
-            errors.append(
-                f"TERMINAL_PROMOTION_{label}_RUN_MANIFEST_PATH_MISMATCH:{cell_id}"
-            )
-        if str(payload.get("run_manifest_sha256") or "").lower() != (
-            run_manifest_sha256
-        ):
-            errors.append(
-                f"TERMINAL_PROMOTION_{label}_RUN_MANIFEST_SHA256_MISMATCH:{cell_id}"
-            )
-
-    audit_status = str(entry.get("audit_status") or "").upper()
-    consensus_status = str(entry.get("consensus_status") or "").upper()
-    entry_reasons = [str(value) for value in (entry.get("reason_codes") or ())]
-    if str(sidecar.get("activation_status") or "").upper() != audit_status:
-        errors.append(f"TERMINAL_PROMOTION_SIDECAR_STATUS_MISMATCH:{cell_id}")
-    if str(parity.get("cell_activation_status") or "").upper() != audit_status:
-        errors.append(f"TERMINAL_PROMOTION_PARITY_STATUS_MISMATCH:{cell_id}")
-    if list(sidecar.get("activation_reason_codes") or ()) != entry_reasons:
-        errors.append(f"TERMINAL_PROMOTION_SIDECAR_REASON_MISMATCH:{cell_id}")
-    if list(parity.get("cell_reason_codes") or ()) != entry_reasons:
-        errors.append(f"TERMINAL_PROMOTION_PARITY_REASON_MISMATCH:{cell_id}")
-    if str(sidecar.get("parity_status") or "").upper() != consensus_status:
-        errors.append(f"TERMINAL_PROMOTION_SIDECAR_CONSENSUS_MISMATCH:{cell_id}")
-    if str(parity.get("status") or "").upper() != consensus_status:
-        errors.append(f"TERMINAL_PROMOTION_PARITY_CONSENSUS_MISMATCH:{cell_id}")
-
-    expected_bars_sha = str(entry.get("bars_sha256") or "").lower()
-    provenance_sha = str(sidecar.get("source_provenance_sha256") or "").lower()
-    if str(sidecar.get("sha256") or "").lower() != expected_bars_sha:
-        errors.append(f"TERMINAL_PROMOTION_SIDECAR_BARS_MISMATCH:{cell_id}")
-    if str(parity.get("source_bars_sha256") or "").lower() != expected_bars_sha:
-        errors.append(f"TERMINAL_PROMOTION_PARITY_BARS_MISMATCH:{cell_id}")
-    if str(parity.get("source_provenance_sha256") or "").lower() != provenance_sha:
-        errors.append(f"TERMINAL_PROMOTION_PARITY_PROVENANCE_MISMATCH:{cell_id}")
-    expected_provenance_relative = str(
-        (Path(str(entry.get("bars_relative_path") or "")).parent / "provenance.json").as_posix()
-    )
-    provenance_relative = str(
-        sidecar.get("source_provenance_relative_path") or ""
-    ).replace("\\", "/")
-    if provenance_relative != expected_provenance_relative:
-        errors.append(f"TERMINAL_PROMOTION_PROVENANCE_PATH_MISMATCH:{cell_id}")
-    provenance: Optional[Mapping[str, Any]] = None
-    try:
-        provenance_path = _contained(native_root, provenance_relative)
-    except Exception:
-        errors.append(f"TERMINAL_PROMOTION_PROVENANCE_PATH_INVALID:{cell_id}")
-    else:
-        if not provenance_path.is_file():
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_MISSING:{cell_id}")
-        elif not re.fullmatch(r"[0-9a-f]{64}", provenance_sha):
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_SHA256_INVALID:{cell_id}")
-        elif sha256_file(provenance_path) != provenance_sha:
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_SHA256_MISMATCH:{cell_id}")
-        else:
-            try:
-                raw_provenance = _json(provenance_path)
-            except Exception:
-                errors.append(f"TERMINAL_PROMOTION_PROVENANCE_JSON_INVALID:{cell_id}")
-            else:
-                if not isinstance(raw_provenance, Mapping):
-                    errors.append(
-                        f"TERMINAL_PROMOTION_PROVENANCE_OBJECT_INVALID:{cell_id}"
-                    )
-                else:
-                    provenance = raw_provenance
-    if isinstance(provenance, Mapping):
-        if str(provenance.get("schema_version") or "") != SCHEMA_VERSION:
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_SCHEMA_INVALID:{cell_id}")
-        if str(provenance.get("acquisition_contract_version") or "") != (
-            ACQUISITION_CONTRACT_VERSION
-        ):
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_CONTRACT_INVALID:{cell_id}")
-        if provenance.get("immutable_record") is not True:
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_NOT_IMMUTABLE:{cell_id}")
-        if str(provenance.get("run_id") or "") != run_id:
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_RUN_ID_MISMATCH:{cell_id}")
-        if (
-            str(provenance.get("symbol") or "") != symbol
-            or str(provenance.get("canonical_symbol") or "") != symbol
-            or str(provenance.get("timeframe") or "").upper() != timeframe
-        ):
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_CELL_MISMATCH:{cell_id}")
-        if str(provenance.get("sha256") or "").lower() != expected_bars_sha:
-            errors.append(f"TERMINAL_PROMOTION_PROVENANCE_BARS_MISMATCH:{cell_id}")
-
-    source_binding = parity.get("source_binding")
-    reference_bindings = parity.get("reference_bindings")
-    if not isinstance(source_binding, Mapping) or str(
-        source_binding.get("bars_sha256") or ""
-    ).lower() != expected_bars_sha or str(
-        source_binding.get("provenance_sha256") or ""
-    ).lower() != provenance_sha:
-        errors.append(f"TERMINAL_PROMOTION_SOURCE_BINDING_MISMATCH:{cell_id}")
-    expected_reference_bindings = entry.get("cross_resolution_reference_bindings")
-    if reference_bindings != expected_reference_bindings:
-        errors.append(f"TERMINAL_PROMOTION_REFERENCE_BINDING_MISMATCH:{cell_id}")
-    for payload, label in ((sidecar, "SIDECAR"), (parity, "PARITY")):
-        if payload.get("cross_resolution_reference_bindings") != (
-            expected_reference_bindings
-        ):
-            errors.append(
-                f"TERMINAL_PROMOTION_{label}_REFERENCE_BINDING_MISMATCH:{cell_id}"
-            )
-    if isinstance(source_binding, Mapping) and isinstance(reference_bindings, Mapping):
-        errors.extend(
-            f"TERMINAL_PROMOTION_CONSENSUS:{cell_id}:{value}"
-            for value in validate_consensus_envelope(
-                parity,
-                symbol=symbol,
-                target_timeframe=timeframe,
-                source_binding=source_binding,
-                reference_bindings=reference_bindings,
-            )
-        )
-
-    if str(entry.get("status") or "").lower() == NATIVE_EVIDENCE_CANDIDATE:
-        if not isinstance(source_binding, Mapping) or str(
-            source_binding.get("availability_state") or ""
-        ).upper() != "AVAILABLE":
-            errors.append(
-                f"TERMINAL_PROMOTION_CANDIDATE_SOURCE_BINDING_INVALID:{cell_id}"
-            )
-        if audit_status != "PASS":
-            errors.append(f"TERMINAL_PROMOTION_CANDIDATE_AUDIT_INVALID:{cell_id}")
-        if str(entry.get("resolution_status") or "").upper() != "PASS":
-            errors.append(f"TERMINAL_PROMOTION_CANDIDATE_RESOLUTION_INVALID:{cell_id}")
-        if consensus_status not in {"PASS", "PENDING", "NOT_APPLICABLE"}:
-            errors.append(f"TERMINAL_PROMOTION_CANDIDATE_CONSENSUS_INVALID:{cell_id}")
-        if consensus_status == "PENDING" and not (
-            _has_only_authenticated_terminal_pending(parity)
-        ):
-            errors.append(
-                f"TERMINAL_PROMOTION_CANDIDATE_PENDING_UNAUTHENTICATED:{cell_id}"
-            )
-        if any(
-            reason.startswith(
-                (
-                    "SOURCE:",
-                    "CONSENSUS:",
-                    "SOURCE_AVAILABILITY_INVALID:",
-                    "CROSS_RESOLUTION_CONSENSUS_INTEGRITY_ERROR",
-                )
-            )
-            for reason in entry_reasons
-        ):
-            errors.append(f"TERMINAL_PROMOTION_CANDIDATE_INTEGRITY_ERROR:{cell_id}")
-    return list(dict.fromkeys(errors))
-
-
-def _completed_terminal_promotion_errors(
-    manifest: Mapping[str, Any],
-    *,
-    native_root: Path,
-    run_id: str,
-    activation_id: str,
-) -> list[str]:
-    """Validate a completed non-active V5 artifact without replaying bar data."""
-
-    errors: list[str] = []
-    if str(manifest.get("schema_version") or "") != ACTIVATION_MANIFEST_SCHEMA:
-        errors.append("TERMINAL_PROMOTION_MANIFEST_SCHEMA_INVALID")
-    if str(manifest.get("activation_id") or "") != activation_id:
-        errors.append("TERMINAL_PROMOTION_ACTIVATION_ID_MISMATCH")
-    if str(manifest.get("run_id") or "") != run_id:
-        errors.append("TERMINAL_PROMOTION_RUN_ID_MISMATCH")
-    if str(manifest.get("status") or "") != "failed":
-        errors.append("TERMINAL_PROMOTION_SOURCE_STATUS_NOT_FAILED")
-    if manifest.get("production_authoritative") is not True:
-        errors.append("TERMINAL_PROMOTION_PRODUCTION_AUTHORITY_MISSING")
-    if manifest.get("native_is_signal_authority") is not True:
-        errors.append("TERMINAL_PROMOTION_SIGNAL_AUTHORITY_INVALID")
-    if manifest.get("silent_fallback_allowed") is not False:
-        errors.append("TERMINAL_PROMOTION_SILENT_FALLBACK_INVALID")
-
-    run_manifest_relative_path = str(
-        manifest.get("run_manifest_relative_path") or ""
-    ).replace("\\", "/")
-    expected_run_manifest_relative_path = f"runs/{run_id}/run_manifest.json"
-    run_manifest_sha256 = str(manifest.get("run_manifest_sha256") or "").lower()
-    if run_manifest_relative_path != expected_run_manifest_relative_path:
-        errors.append("TERMINAL_PROMOTION_RUN_MANIFEST_PATH_INVALID")
-    try:
-        run_manifest_path = _contained(native_root, run_manifest_relative_path)
-    except Exception:
-        errors.append("TERMINAL_PROMOTION_RUN_MANIFEST_PATH_UNSAFE")
-    else:
-        if not run_manifest_path.is_file():
-            errors.append("TERMINAL_PROMOTION_RUN_MANIFEST_MISSING")
-        elif not re.fullmatch(r"[0-9a-f]{64}", run_manifest_sha256):
-            errors.append("TERMINAL_PROMOTION_RUN_MANIFEST_SHA256_INVALID")
-        elif sha256_file(run_manifest_path) != run_manifest_sha256:
-            errors.append("TERMINAL_PROMOTION_RUN_MANIFEST_SHA256_MISMATCH")
-
-    contract = manifest.get("universe_eligibility")
-    if not isinstance(contract, Mapping):
-        return [*errors, "TERMINAL_PROMOTION_UNIVERSE_CONTRACT_MISSING"]
-    if str(contract.get("schema_version") or "") != UNIVERSE_AUTHENTICITY_SCHEMA:
-        errors.append("TERMINAL_PROMOTION_UNIVERSE_SCHEMA_INVALID")
-    if tuple(contract.get("requested_symbols") or ()) != tuple(PRODUCTION_SYMBOL_ORDER):
-        errors.append("TERMINAL_PROMOTION_SYMBOL_ROSTER_INVALID")
-    if tuple(contract.get("required_timeframes") or ()) != tuple(DEFAULT_TIMEFRAMES):
-        errors.append("TERMINAL_PROMOTION_TIMEFRAME_ROSTER_INVALID")
-    expected_terminal_states = (
-        NATIVE_EVIDENCE_CANDIDATE,
-        NATIVE_SOURCE_UNAVAILABLE,
-        NATIVE_TECHNICAL_ERROR,
-    )
-    if tuple(contract.get("terminal_states") or ()) != expected_terminal_states:
-        errors.append("TERMINAL_PROMOTION_TERMINAL_STATES_INVALID")
-    if tuple(contract.get("nonterminal_states") or ()) != (NATIVE_PENDING,):
-        errors.append("TERMINAL_PROMOTION_NONTERMINAL_STATES_INVALID")
-
-    entries = manifest.get("entries")
-    statuses = contract.get("cell_statuses")
-    if not isinstance(entries, Mapping) or set(entries) != set(PRODUCTION_SYMBOL_ORDER):
-        errors.append("TERMINAL_PROMOTION_ENTRY_SYMBOL_GRID_INVALID")
-        entries = {}
-    if not isinstance(statuses, Mapping) or set(statuses) != set(
-        PRODUCTION_SYMBOL_ORDER
-    ):
-        errors.append("TERMINAL_PROMOTION_STATUS_SYMBOL_GRID_INVALID")
-        statuses = {}
-
-    observed_counts = {state: 0 for state in (*expected_terminal_states, NATIVE_PENDING)}
-    candidate_symbols = 0
-    integrity_reason_prefixes = (
-        "SOURCE:",
-        "CONSENSUS:",
-        "SOURCE_AVAILABILITY_INVALID:",
-        "CROSS_RESOLUTION_CONSENSUS_INTEGRITY_ERROR",
-    )
-    for symbol in PRODUCTION_SYMBOL_ORDER:
-        entry_grid = entries.get(symbol)
-        status_grid = statuses.get(symbol)
-        if not isinstance(entry_grid, Mapping) or set(entry_grid) != set(
-            DEFAULT_TIMEFRAMES
-        ):
-            errors.append(f"TERMINAL_PROMOTION_ENTRY_TIMEFRAME_GRID_INVALID:{symbol}")
-            entry_grid = {}
-        if not isinstance(status_grid, Mapping) or set(status_grid) != set(
-            DEFAULT_TIMEFRAMES
-        ):
-            errors.append(f"TERMINAL_PROMOTION_STATUS_TIMEFRAME_GRID_INVALID:{symbol}")
-            status_grid = {}
-        symbol_has_candidate = False
-        for timeframe in DEFAULT_TIMEFRAMES:
-            cell_id = f"{symbol}|{timeframe}"
-            state = str(status_grid.get(timeframe) or "").strip().lower()
-            entry = entry_grid.get(timeframe)
-            if state not in expected_terminal_states:
-                errors.append(
-                    f"TERMINAL_PROMOTION_CELL_NOT_TERMINAL:{cell_id}:{state or 'missing'}"
-                )
-                continue
-            observed_counts[state] += 1
-            symbol_has_candidate = symbol_has_candidate or state == NATIVE_EVIDENCE_CANDIDATE
-            if not isinstance(entry, Mapping):
-                errors.append(f"TERMINAL_PROMOTION_ENTRY_MISSING:{cell_id}")
-                continue
-            if str(entry.get("status") or "").strip().lower() != state:
-                errors.append(f"TERMINAL_PROMOTION_ENTRY_STATUS_MISMATCH:{cell_id}")
-            errors.extend(
-                _terminal_promotion_evidence_errors(
-                    entry,
-                    native_root=native_root,
-                    run_id=run_id,
-                    activation_id=activation_id,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    run_manifest_relative_path=run_manifest_relative_path,
-                    run_manifest_sha256=run_manifest_sha256,
-                )
-            )
-            if state == NATIVE_EVIDENCE_CANDIDATE and str(
-                entry.get("audit_status") or ""
-            ).upper() != "PASS":
-                errors.append(f"TERMINAL_PROMOTION_CANDIDATE_AUDIT_INVALID:{cell_id}")
-            if state == NATIVE_TECHNICAL_ERROR:
-                consensus_status = str(entry.get("consensus_status") or "").upper()
-                resolution_status = str(entry.get("resolution_status") or "").upper()
-                reasons = [str(value) for value in (entry.get("reason_codes") or ())]
-                if consensus_status == "ERROR" or any(
-                    reason.startswith(integrity_reason_prefixes) for reason in reasons
-                ):
-                    errors.append(
-                        f"TERMINAL_PROMOTION_INTEGRITY_ERROR_PRESENT:{cell_id}"
-                    )
-                source_terminal = any(
-                    reason.startswith("SOURCE_TERMINAL_TECHNICAL:")
-                    for reason in reasons
-                )
-                if (
-                    consensus_status == "PENDING"
-                    and resolution_status != "FAIL"
-                    and not source_terminal
-                ):
-                    parity_relative = str(entry.get("parity_relative_path") or "")
-                    try:
-                        parity_path = (
-                            _contained(native_root, parity_relative)
-                            if native_root is not None
-                            else None
-                        )
-                    except Exception:
-                        parity_path = None
-                    if (
-                        parity_path is None
-                        or not parity_path.is_file()
-                        or sha256_file(parity_path)
-                        != str(entry.get("parity_sha256") or "").lower()
-                    ):
-                        errors.append(
-                            f"TERMINAL_PROMOTION_PENDING_PARITY_INVALID:{cell_id}"
-                        )
-                    else:
-                        try:
-                            parity = _json(parity_path)
-                        except Exception:
-                            parity = {}
-                        if not _has_only_authenticated_terminal_pending(parity):
-                            errors.append(
-                                f"TERMINAL_PROMOTION_UNRESOLVED_PENDING_PRESENT:{cell_id}"
-                            )
-        candidate_symbols += int(symbol_has_candidate)
-
-    total = len(PRODUCTION_SYMBOL_ORDER) * len(DEFAULT_TIMEFRAMES)
-    observed_counts[NATIVE_PENDING] = 0
-    expected_counts = {
-        **observed_counts,
-        "total": total,
-        "terminal": sum(observed_counts[state] for state in expected_terminal_states),
-        "symbols_with_evidence_candidates": candidate_symbols,
-    }
-    if dict(manifest.get("counts") or {}) != expected_counts:
-        errors.append("TERMINAL_PROMOTION_COUNTS_MISMATCH")
-    if expected_counts["terminal"] != total or candidate_symbols != len(
-        PRODUCTION_SYMBOL_ORDER
-    ):
-        errors.append("TERMINAL_PROMOTION_COMPLETE_USABLE_GRID_REQUIRED")
-    return list(dict.fromkeys(errors))
-
-
-def _terminal_promotion_postcheck(
-    native_root: Path,
-    *,
-    activation_id: str,
-    promoted_manifest_path: Path,
-    promoted_manifest_sha256: str,
-) -> Dict[str, Any]:
-    """Run every production consumer gate against the exact promoted view."""
-
-    resolved = resolve_active_native_universe(
-        native_root.parent,
-        PRODUCTION_SYMBOL_ORDER,
-        required_timeframes=DEFAULT_TIMEFRAMES,
-        verify_exclusion_evidence=True,
-        production_contract_required=True,
-    )
-    errors = list(resolved.errors)
-    if resolved.activation_id != activation_id:
-        errors.append("TERMINAL_PROMOTION_POST_ACTIVATION_ID_MISMATCH")
-    if (
-        not isinstance(resolved.activation_manifest_path, Path)
-        or resolved.activation_manifest_path.resolve() != promoted_manifest_path.resolve()
-    ):
-        errors.append("TERMINAL_PROMOTION_POST_MANIFEST_PATH_MISMATCH")
-    if resolved.activation_manifest_sha256 != promoted_manifest_sha256:
-        errors.append("TERMINAL_PROMOTION_POST_MANIFEST_SHA256_MISMATCH")
-    if tuple(resolved.requested_symbols) != tuple(PRODUCTION_SYMBOL_ORDER):
-        errors.append("TERMINAL_PROMOTION_POST_SYMBOL_ROSTER_MISMATCH")
-    if tuple(resolved.required_timeframes) != tuple(DEFAULT_TIMEFRAMES):
-        errors.append("TERMINAL_PROMOTION_POST_TIMEFRAME_ROSTER_MISMATCH")
-    if errors:
-        raise RuntimeError(";".join(list(dict.fromkeys(errors))))
-
-    from pm_portfolio_replay import active_native_portfolio_contract
-    from pm_production_anchor_plan import (
-        derive_production_anchor_plan,
-        verify_production_anchor_plan_receipt,
-    )
-
-    anchor_receipt = derive_production_anchor_plan(native_root.parent)
-    anchor_body = verify_production_anchor_plan_receipt(
-        native_root.parent,
-        anchor_receipt,
-    )
-    if (
-        anchor_body.get("activation_id") != activation_id
-        or anchor_body.get("activation_manifest_sha256")
-        != promoted_manifest_sha256
-    ):
-        raise RuntimeError("TERMINAL_PROMOTION_POST_ANCHOR_IDENTITY_MISMATCH")
-    portfolio_contract, portfolio_errors = active_native_portfolio_contract(
-        native_root.parent,
-        PRODUCTION_SYMBOL_ORDER,
-        timeframes=DEFAULT_TIMEFRAMES,
-        # The exact full-grid evidence replay already passed above in this
-        # control flow; avoid only the duplicate raw-bar pass.
-        verify_exclusion_evidence=False,
-    )
-    if portfolio_errors:
-        raise RuntimeError(
-            "TERMINAL_PROMOTION_POST_PORTFOLIO_INVALID:"
-            + ";".join(portfolio_errors)
-        )
-    if (
-        portfolio_contract.get("activation_id") != activation_id
-        or portfolio_contract.get("activation_manifest_sha256")
-        != promoted_manifest_sha256
-        or tuple(portfolio_contract.get("symbols") or ())
-        != tuple(PRODUCTION_SYMBOL_ORDER)
-        or tuple(portfolio_contract.get("timeframes") or ())
-        != tuple(DEFAULT_TIMEFRAMES)
-    ):
-        raise RuntimeError("TERMINAL_PROMOTION_POST_PORTFOLIO_IDENTITY_MISMATCH")
-    return {
-        "anchor_plan_receipt_sha256": anchor_body.get("receipt_sha256"),
-        "portfolio_activation_roster_sha256": portfolio_contract.get(
-            "activation_roster_sha256"
-        ),
-    }
-
-
-def _promote_completed_terminal_activation_transaction(
-    native_root: Path,
-    *,
-    run_id: str,
-    activation_id: str,
-    expected_manifest_sha256: str,
-    recovery: Optional[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """Promote one byte-pinned terminal grid through one atomic pointer swap.
-
-    The failed source manifest remains immutable.  A separately persisted view
-    differs only by ``status=active``; an exact transition receipt binds the
-    source, view, and predecessor pointer.  Orphan views/receipts authorize
-    nothing because every consumer starts from ``ACTIVE.json``.
-    """
-
-    native_root = _safe_native_root(native_root)
-    run_id = _safe_component(run_id, "run id")
-    activation_id = _safe_component(activation_id, "activation id")
-    expected_sha = str(expected_manifest_sha256 or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
-        raise ValueError("expected manifest sha256 must be 64 lowercase hex characters")
-    source_manifest_path = native_root / "activations" / f"{activation_id}.json"
-    if not source_manifest_path.is_file():
-        raise FileNotFoundError(
-            f"activation manifest missing: {source_manifest_path}"
-        )
-    source_manifest_bytes = source_manifest_path.read_bytes()
-    observed_sha = hashlib.sha256(source_manifest_bytes).hexdigest()
-    if observed_sha != expected_sha:
-        raise ValueError("TERMINAL_PROMOTION_MANIFEST_SHA256_MISMATCH")
-    manifest = _json(source_manifest_path)
-    errors = _completed_terminal_promotion_errors(
-        manifest,
-        native_root=native_root,
-        run_id=run_id,
-        activation_id=activation_id,
-    )
-    promoted = dict(manifest)
-    promoted["status"] = "active"
-    promoted_bytes = _canonical_json_bytes(promoted)
-    promoted_sha = hashlib.sha256(promoted_bytes).hexdigest()
-    source_relative = str(source_manifest_path.relative_to(native_root)).replace(
-        "\\", "/"
-    )
-    promoted_manifest_path = (
-        native_root / "activations" / "promoted" / f"{activation_id}.json"
-    )
-    promoted_relative = str(promoted_manifest_path.relative_to(native_root)).replace(
-        "\\", "/"
-    )
-    previous_pointer_sha = str(
-        manifest.get("previous_active_pointer_sha256") or ""
-    ).lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", previous_pointer_sha):
-        errors.append("TERMINAL_PROMOTION_PREVIOUS_POINTER_SHA256_INVALID")
-
-    receipt = {
-        "schema_version": _TERMINAL_PROMOTION_RECEIPT_SCHEMA,
-        "activation_id": activation_id,
-        "run_id": run_id,
-        "source_manifest_relative_path": source_relative,
-        "source_manifest_sha256": observed_sha,
-        "promoted_manifest_relative_path": promoted_relative,
-        "promoted_manifest_sha256": promoted_sha,
-        "previous_active_pointer_sha256": previous_pointer_sha,
-        "counts": dict(promoted["counts"]),
-        "transition": TERMINAL_PROMOTION_TRANSITION,
-        "data_reacquired": False,
-        "cell_evidence_replayed": False,
-    }
-    receipt_path = native_root / "transition_receipts" / f"{activation_id}.json"
-    receipt_relative = str(receipt_path.relative_to(native_root)).replace("\\", "/")
-    receipt_bytes = _canonical_json_bytes(receipt)
-    receipt_sha = hashlib.sha256(receipt_bytes).hexdigest()
-
-    pointer_path = native_root / "ACTIVE.json"
-    current_pointer_bytes = pointer_path.read_bytes() if pointer_path.is_file() else b""
-    original_pointer_bytes = current_pointer_bytes
-    pointer_bytes = b""
-    pointer_was_already_active = False
-    committed_reentry = False
-    current_is_previous = False
-    if recovery is not None:
-        original_pointer_bytes = bytes(recovery["previous_pointer_bytes"])
-        pointer_bytes = bytes(recovery["candidate_pointer_bytes"])
-        recovery_record = recovery.get("record") or {}
-        if hashlib.sha256(original_pointer_bytes).hexdigest() != previous_pointer_sha:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_PREVIOUS_POINTER_MISMATCH")
-        if (
-            str(recovery_record.get("promoted_manifest_sha256") or "").lower()
-            != promoted_sha
-            or str(recovery_record.get("transition_receipt_sha256") or "").lower()
-            != receipt_sha
-        ):
-            errors.append("TERMINAL_PROMOTION_RECOVERY_ARTIFACT_IDENTITY_MISMATCH")
-        if current_pointer_bytes == original_pointer_bytes:
-            current_is_previous = True
-        elif current_pointer_bytes == pointer_bytes:
-            pointer_was_already_active = True
-        else:
-            errors.append("TERMINAL_PROMOTION_RECOVERY_ACTIVE_POINTER_DIVERGED")
-    else:
-        observed_pointer_sha = (
-            hashlib.sha256(current_pointer_bytes).hexdigest()
-            if current_pointer_bytes
-            else None
-        )
-        if observed_pointer_sha == previous_pointer_sha:
-            current_is_previous = True
-        elif current_pointer_bytes:
-            try:
-                current_pointer = json.loads(current_pointer_bytes.decode("utf-8"))
-            except Exception:
-                current_pointer = None
-            candidate_errors = (
-                _terminal_promotion_pointer_identity_errors(
-                    current_pointer,
-                    label="CANDIDATE",
-                    activation_id=activation_id,
-                    promoted_relative=promoted_relative,
-                    promoted_sha256=promoted_sha,
-                )
-                if isinstance(current_pointer, Mapping)
-                else ["invalid"]
-            )
-            if isinstance(current_pointer, Mapping) and current_pointer_bytes != (
-                _canonical_json_bytes(current_pointer)
-            ):
-                candidate_errors.append("not canonical")
-            if candidate_errors:
-                errors.append("TERMINAL_PROMOTION_PREVIOUS_POINTER_SHA256_MISMATCH")
-            else:
-                pointer_bytes = current_pointer_bytes
-                pointer_was_already_active = True
-                committed_reentry = True
-        else:
-            errors.append("TERMINAL_PROMOTION_PREVIOUS_POINTER_MISSING")
-    if current_is_previous:
-        prior = resolve_active_native_universe(
-            native_root.parent,
-            PRODUCTION_SYMBOL_ORDER,
-            required_timeframes=DEFAULT_TIMEFRAMES,
-            verify_exclusion_evidence=False,
-            production_contract_required=False,
-        )
-        if prior.errors:
-            errors.append("TERMINAL_PROMOTION_PREVIOUS_POINTER_INVALID")
-    if errors:
-        raise ValueError(";".join(list(dict.fromkeys(errors))))
-
-    for path, payload, collision in (
-        (
-            promoted_manifest_path,
-            promoted_bytes,
-            "terminal promoted manifest collision",
-        ),
-        (receipt_path, receipt_bytes, "terminal promotion receipt collision"),
-    ):
-        if path.exists():
-            if path.read_bytes() != payload:
-                raise FileExistsError(collision)
-        elif committed_reentry or recovery is not None:
-            raise FileNotFoundError(
-                f"TERMINAL_PROMOTION_RECONCILIATION_ARTIFACT_MISSING:{path}"
-            )
-        elif path == promoted_manifest_path:
-            _atomic_create_json(path, promoted)
-        else:
-            _atomic_create_json(path, receipt)
-
-    staged_view_errors = validate_terminal_promotion_view(
-        native_root,
-        activation_id=activation_id,
-        view_path=promoted_manifest_path,
-        view_sha256=promoted_sha,
-    )
-    if staged_view_errors:
-        raise ValueError(
-            "TERMINAL_PROMOTION_STAGED_VIEW_INVALID:"
-            + ";".join(staged_view_errors)
-        )
-
-    transaction_recovery: Optional[Dict[str, Any]] = (
-        dict(recovery) if recovery is not None else None
-    )
-    recovery_record_established = recovery is not None
-    recovery_path = native_root / _TERMINAL_PROMOTION_RECOVERY_FILENAME
-    if not pointer_bytes:
-        pointer = {
-            "schema_version": ACTIVE_POINTER_SCHEMA,
-            "activation_id": activation_id,
-            "manifest_relative_path": promoted_relative,
-            "manifest_sha256": promoted_sha,
-            "activated_at_utc": _iso_now(),
-            "production_authoritative": True,
-        }
-        pointer_bytes = _canonical_json_bytes(pointer)
-        recovery_record = _terminal_promotion_recovery_record(
-            activation_id=activation_id,
-            run_id=run_id,
-            source_relative=source_relative,
-            source_sha256=observed_sha,
-            promoted_relative=promoted_relative,
-            promoted_sha256=promoted_sha,
-            receipt_relative=receipt_relative,
-            receipt_sha256=receipt_sha,
-            previous_pointer_bytes=original_pointer_bytes,
-            candidate_pointer_bytes=pointer_bytes,
-        )
-        recovery_bytes = _canonical_json_bytes(recovery_record)
-        if len(recovery_bytes) > _TERMINAL_PROMOTION_RECOVERY_MAX_BYTES:
-            raise ValueError("TERMINAL_PROMOTION_RECOVERY_SIZE_INVALID")
-        constructed_recovery_errors: list[str] = []
-        for label in ("PREVIOUS", "CANDIDATE"):
-            _, recovered_pointer, pointer_errors = (
-                _terminal_promotion_decode_pointer(
-                    recovery_record,
-                    label=label,
-                )
-            )
-            constructed_recovery_errors.extend(pointer_errors)
-            if isinstance(recovered_pointer, Mapping):
-                constructed_recovery_errors.extend(
-                    _terminal_promotion_pointer_identity_errors(
-                        recovered_pointer,
-                        label=label,
-                        activation_id=activation_id,
-                        promoted_relative=promoted_relative,
-                        promoted_sha256=promoted_sha,
-                    )
-                )
-        if constructed_recovery_errors:
-            raise ValueError(";".join(list(dict.fromkeys(constructed_recovery_errors))))
-        transaction_recovery = {
-            "path": recovery_path,
-            "bytes": recovery_bytes,
-            "record": recovery_record,
-            "previous_pointer_bytes": original_pointer_bytes,
-            "candidate_pointer_bytes": pointer_bytes,
-        }
-
-    try:
-        with _active_pointer_lock(native_root):
-            if source_manifest_path.read_bytes() != source_manifest_bytes:
-                raise RuntimeError("TERMINAL_PROMOTION_SOURCE_CHANGED_DURING_PRECHECK")
-            expected_current_pointer = (
-                pointer_bytes if pointer_was_already_active else original_pointer_bytes
-            )
-            if (
-                not pointer_path.is_file()
-                or pointer_path.read_bytes() != expected_current_pointer
-            ):
-                raise RuntimeError("TERMINAL_PROMOTION_POINTER_CAS_MISMATCH")
-            if (
-                promoted_manifest_path.read_bytes() != promoted_bytes
-                or receipt_path.read_bytes() != receipt_bytes
-            ):
-                raise RuntimeError("TERMINAL_PROMOTION_STAGED_VIEW_CHANGED")
-            if committed_reentry:
-                if recovery_path.exists():
-                    raise RuntimeError("TERMINAL_PROMOTION_UNEXPECTED_RECOVERY_RECORD")
-            else:
-                assert transaction_recovery is not None
-                expected_recovery_bytes = bytes(transaction_recovery["bytes"])
-                if recovery is None:
-                    if recovery_path.exists():
-                        raise RuntimeError(
-                            "TERMINAL_PROMOTION_DIFFERENT_RECOVERY_RECORD_PENDING"
-                        )
-                    # This immutable, fsynced record is created under the same
-                    # lock immediately before the sole authority mutation.
-                    _atomic_create_json(
-                        recovery_path,
-                        transaction_recovery["record"],
-                    )
-                    recovery_record_established = True
-                if (
-                    not recovery_path.is_file()
-                    or recovery_path.read_bytes() != expected_recovery_bytes
-                ):
-                    raise RuntimeError("TERMINAL_PROMOTION_RECOVERY_RECORD_CHANGED")
-            if not pointer_was_already_active:
-                _atomic_replace_bytes_with_retry(pointer_path, pointer_bytes)
-
-        postcheck = _terminal_promotion_postcheck(
-            native_root,
-            activation_id=activation_id,
-            promoted_manifest_path=promoted_manifest_path,
-            promoted_manifest_sha256=promoted_sha,
-        )
-        # Linearize success after every consumer has validated the candidate.
-        # A cooperating publisher can supersede ACTIVE while the expensive
-        # postcheck runs; never report this promotion as active in that case.
-        with _active_pointer_lock(native_root):
-            if source_manifest_path.read_bytes() != source_manifest_bytes:
-                raise RuntimeError("TERMINAL_PROMOTION_SOURCE_CHANGED_DURING_POSTCHECK")
-            if (
-                promoted_manifest_path.read_bytes() != promoted_bytes
-                or receipt_path.read_bytes() != receipt_bytes
-            ):
-                raise RuntimeError("TERMINAL_PROMOTION_STAGED_VIEW_CHANGED_DURING_POSTCHECK")
-            if not pointer_path.is_file() or pointer_path.read_bytes() != pointer_bytes:
-                raise RuntimeError("TERMINAL_PROMOTION_POINTER_CHANGED_DURING_POSTCHECK")
-            if transaction_recovery is not None:
-                expected_recovery_bytes = bytes(transaction_recovery["bytes"])
-                if (
-                    not recovery_path.is_file()
-                    or recovery_path.read_bytes() != expected_recovery_bytes
-                ):
-                    raise RuntimeError(
-                        "TERMINAL_PROMOTION_RECOVERY_RECORD_CHANGED_DURING_POSTCHECK"
-                    )
-                _unlink_with_retry(recovery_path)
-            if recovery_path.exists():
-                raise RuntimeError("TERMINAL_PROMOTION_RECOVERY_RECORD_NOT_CLEARED")
-    except BaseException as promotion_error:
-        rollback_errors: list[str] = []
-        if transaction_recovery is not None and recovery_record_established:
-            rollback_errors.extend(
-                _terminal_promotion_restore_and_clear_recovery(
-                    native_root,
-                    transaction_recovery,
-                )
-            )
-        if source_manifest_path.read_bytes() != source_manifest_bytes:
-            rollback_errors.append("source_manifest:immutable_bytes_changed")
-        if rollback_errors:
-            raise RuntimeError(
-                "TERMINAL_PROMOTION_ROLLBACK_FAILED:" + "|".join(rollback_errors)
-            ) from promotion_error
-        raise
-    result = {
-        "status": "active",
-        "activation_id": activation_id,
-        "run_id": run_id,
-        "manifest_path": str(promoted_manifest_path),
-        "manifest_sha256": promoted_sha,
-        "source_manifest_path": str(source_manifest_path),
-        "source_manifest_sha256": observed_sha,
-        "active_pointer_updated": not pointer_was_already_active,
-        "reconciled_recovery": recovery is not None,
-        "idempotent_committed_reentry": committed_reentry,
-        "recovery_record_cleared": not recovery_path.exists(),
-        "counts": dict(promoted["counts"]),
-        "transition_receipt_path": str(receipt_path),
-        "data_reacquired": False,
-        "cell_evidence_replayed": False,
-        **postcheck,
-    }
-    if recovery_path.exists():
-        raise RuntimeError("TERMINAL_PROMOTION_RECOVERY_RECORD_NOT_CLEARED")
-    return result
-
-
-def promote_completed_terminal_activation(
-    native_root: Path,
-    *,
-    run_id: str,
-    activation_id: str,
-    expected_manifest_sha256: str,
-) -> Dict[str, Any]:
-    """Promote or reconcile one durable pointer-only activation transaction."""
-
-    native_root = _safe_native_root(native_root)
-    run_id = _safe_component(run_id, "run id")
-    activation_id = _safe_component(activation_id, "activation id")
-    expected_sha = str(expected_manifest_sha256 or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
-        raise ValueError("expected manifest sha256 must be 64 lowercase hex characters")
-    recovery, recovery_errors = _terminal_promotion_read_recovery(
-        native_root,
-        activation_id=activation_id,
-        run_id=run_id,
-        expected_source_sha256=expected_sha,
-    )
-    if recovery_errors:
-        raise ValueError(";".join(recovery_errors))
-    if recovery is not None:
-        pointer_path = native_root / "ACTIVE.json"
-        current_pointer_bytes = (
-            pointer_path.read_bytes() if pointer_path.is_file() else b""
-        )
-        if current_pointer_bytes not in {
-            bytes(recovery["previous_pointer_bytes"]),
-            bytes(recovery["candidate_pointer_bytes"]),
-        }:
-            raise RuntimeError("TERMINAL_PROMOTION_RECOVERY_ACTIVE_POINTER_DIVERGED")
-    try:
-        return _promote_completed_terminal_activation_transaction(
-            native_root,
-            run_id=run_id,
-            activation_id=activation_id,
-            expected_manifest_sha256=expected_sha,
-            recovery=recovery,
-        )
-    except BaseException as promotion_error:
-        if recovery is not None:
-            recovery_path = Path(recovery["path"])
-            pointer_path = native_root / "ACTIVE.json"
-            current_pointer_bytes = (
-                pointer_path.read_bytes() if pointer_path.is_file() else b""
-            )
-            previous_bytes = bytes(recovery["previous_pointer_bytes"])
-            candidate_bytes = bytes(recovery["candidate_pointer_bytes"])
-            # Missing record + exact candidate is the commit point after full
-            # postcheck.  A retry will take the idempotent committed path.
-            if recovery_path.exists():
-                rollback_errors = _terminal_promotion_restore_and_clear_recovery(
-                    native_root,
-                    recovery,
-                )
-                if rollback_errors:
-                    raise RuntimeError(
-                        "TERMINAL_PROMOTION_ROLLBACK_FAILED:"
-                        + "|".join(rollback_errors)
-                    ) from promotion_error
-            elif current_pointer_bytes == candidate_bytes:
-                raise RuntimeError(
-                    "TERMINAL_PROMOTION_ROLLBACK_FAILED:"
-                    "pointer:recovery record missing; refusing guessed rollback"
-                ) from promotion_error
-            elif current_pointer_bytes != previous_bytes:
-                raise RuntimeError(
-                    "TERMINAL_PROMOTION_ROLLBACK_FAILED:"
-                    "pointer:ACTIVE pointer was superseded; not clobbering it"
-                ) from promotion_error
-        raise
-
-
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -6247,15 +5158,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbols", nargs="+")
     parser.add_argument("--timeframes", nargs="+", default=list(DEFAULT_TIMEFRAMES))
     parser.add_argument("--activation-id")
-    parser.add_argument(
-        "--promote-completed-activation",
-        metavar="ACTIVATION_ID",
-        help=(
-            "atomically promote an already-audited complete terminal V5 grid "
-            "without reacquisition or evidence replay"
-        ),
-    )
-    parser.add_argument("--expected-activation-manifest-sha256")
     parser.add_argument("--tick-tolerance", action="append", default=[])
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
@@ -6272,25 +5174,6 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     native_root = _safe_native_root(Path(args.native_root))
-    if args.promote_completed_activation:
-        if args.execute or args.audit_only or args.activation_id or args.symbols:
-            raise ValueError(
-                "--promote-completed-activation cannot be combined with audit execution options"
-            )
-        if args.tick_tolerance:
-            raise ValueError("terminal promotion forbids tick-tolerance overrides")
-        if not args.expected_activation_manifest_sha256:
-            raise ValueError(
-                "--expected-activation-manifest-sha256 is required for terminal promotion"
-            )
-        result = promote_completed_terminal_activation(
-            native_root,
-            run_id=args.run_id,
-            activation_id=args.promote_completed_activation,
-            expected_manifest_sha256=args.expected_activation_manifest_sha256,
-        )
-        print(json.dumps(result, indent=2, sort_keys=True))
-        return 0
     run_root = native_root / "runs" / args.run_id
     run_manifest_path = run_root / "run_manifest.json"
     run_manifest = _json(run_manifest_path) if run_manifest_path.exists() else {}
@@ -6369,6 +5252,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "symbols": symbols,
         "timeframes": args.timeframes,
         "activation_id": args.activation_id,
+        "semantic_verification_mode": (
+            NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW
+            if not args.audit_only and production_contract
+            else None
+        ),
     }
     print(json.dumps(plan, indent=2, sort_keys=True))
     if not args.execute:
@@ -6382,6 +5270,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         thresholds=ParityThresholds(),
         tick_tolerance_overrides=_parse_tolerances(args.tick_tolerance),
         update_active_pointer=not bool(args.audit_only),
+        semantic_verification_mode=(
+            NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW
+            if not args.audit_only and production_contract
+            else None
+        ),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     return (

@@ -1,11 +1,14 @@
+"""Receipt-backed native production authority boundary tests."""
+
 from __future__ import annotations
 
-from copy import deepcopy
-from datetime import datetime, timezone
 import hashlib
 import json
+import shutil
+from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
@@ -17,30 +20,31 @@ from pm_native_request_contract import (
     build_v5_manifest_request,
     build_v5_request_contract,
 )
+from tests.native_v5_support import write_receipt_backed_v5_authority
 
 
 UTC = timezone.utc
 CUTOFF = datetime(2026, 7, 13, 9, 3, 17, tzinfo=UTC)
 
 
+def _canonical(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
 def _write_json(path: Path, value: Any) -> str:
-    raw = (
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-    ).encode("utf-8")
+    raw = _canonical(value)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
     return hashlib.sha256(raw).hexdigest()
 
 
-def _fixture(
+def _canonical_artifact_fixture(
     tmp_path: Path,
-    *,
-    promoted: bool,
-) -> tuple[Path, native.ActiveNativeUniverse, dict[str, Path], dict[str, Any]]:
-    data_dir = tmp_path / "data"
+) -> tuple[Path, native.ActiveNativeUniverse, dict[str, Path]]:
+    data_dir = tmp_path / "canonical-data"
     native_root = data_dir / "native"
-    activation_id = "activation-terminal-view"
-    run_id = "run-terminal-view"
+    activation_id = "activation-canonical-view"
+    run_id = "run-canonical-view"
     common = build_v5_request_contract(
         requested_information_cutoff_utc=CUTOFF,
         warmup_days=500,
@@ -61,113 +65,6 @@ def _fixture(
     }
     run_path = native_root / "runs" / run_id / "run_manifest.json"
     run_sha = _write_json(run_path, run_manifest)
-    counts = {
-        native.NATIVE_EVIDENCE_CANDIDATE: len(PRODUCTION_SYMBOL_ORDER)
-        * len(PRODUCTION_TIMEFRAME_ORDER),
-        native.NATIVE_SOURCE_UNAVAILABLE: 0,
-        native.NATIVE_TECHNICAL_ERROR: 0,
-        native.NATIVE_PENDING: 0,
-        "total": len(PRODUCTION_SYMBOL_ORDER) * len(PRODUCTION_TIMEFRAME_ORDER),
-        "terminal": len(PRODUCTION_SYMBOL_ORDER) * len(PRODUCTION_TIMEFRAME_ORDER),
-        "symbols_with_evidence_candidates": len(PRODUCTION_SYMBOL_ORDER),
-    }
-    source = {
-        "schema_version": native.ACTIVATION_MANIFEST_SCHEMA,
-        "activation_id": activation_id,
-        "run_id": run_id,
-        "status": "failed" if promoted else "active",
-        "production_authoritative": True,
-        "run_manifest_relative_path": f"runs/{run_id}/run_manifest.json",
-        "run_manifest_sha256": run_sha,
-        "previous_active_pointer_sha256": "a" * 64,
-        "counts": counts,
-    }
-    source_path = native_root / "activations" / f"{activation_id}.json"
-    source_sha = _write_json(source_path, source)
-    receipt_path = native_root / "transition_receipts" / f"{activation_id}.json"
-    if promoted:
-        view = {**source, "status": "active"}
-        manifest_path = (
-            native_root / "activations" / "promoted" / f"{activation_id}.json"
-        )
-        manifest_sha = _write_json(manifest_path, view)
-        receipt = {
-            "schema_version": native.TERMINAL_PROMOTION_RECEIPT_SCHEMA,
-            "activation_id": activation_id,
-            "run_id": run_id,
-            "source_manifest_relative_path": f"activations/{activation_id}.json",
-            "source_manifest_sha256": source_sha,
-            "promoted_manifest_relative_path": (
-                f"activations/promoted/{activation_id}.json"
-            ),
-            "promoted_manifest_sha256": manifest_sha,
-            "previous_active_pointer_sha256": "a" * 64,
-            "counts": counts,
-            "transition": "failed_complete_terminal_grid_to_active_view",
-            "data_reacquired": False,
-            "cell_evidence_replayed": False,
-        }
-        _write_json(receipt_path, receipt)
-    else:
-        manifest_path = source_path
-        manifest_sha = source_sha
-        receipt = {}
-    manifest_relative = manifest_path.relative_to(native_root).as_posix()
-    pointer_path = native_root / "ACTIVE.json"
-    _write_json(
-        pointer_path,
-        {
-            "schema_version": native.ACTIVE_POINTER_SCHEMA,
-            "activation_id": activation_id,
-            "manifest_relative_path": manifest_relative,
-            "manifest_sha256": manifest_sha,
-            "activated_at_utc": "2026-07-19T19:00:00Z",
-            "production_authoritative": True,
-        },
-    )
-    cell_statuses = {
-        symbol: {
-            timeframe: native.NATIVE_EVIDENCE_CANDIDATE
-            for timeframe in PRODUCTION_TIMEFRAME_ORDER
-        }
-        for symbol in PRODUCTION_SYMBOL_ORDER
-    }
-    universe = native.ActiveNativeUniverse(
-        activation_id=activation_id,
-        activation_manifest_path=manifest_path.resolve(),
-        activation_manifest_sha256=manifest_sha,
-        requested_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
-        required_timeframes=tuple(PRODUCTION_TIMEFRAME_ORDER),
-        eligible_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
-        excluded_symbols={},
-        cell_statuses=cell_statuses,
-        symbols_with_active_cells=tuple(PRODUCTION_SYMBOL_ORDER),
-        fully_excluded_symbols=(),
-        calendar_contract=resolver_calendar,
-        eligibility_schema=native.UNIVERSE_AUTHENTICITY_SCHEMA,
-        decision_basis=native.NATIVE_AUTHENTICITY_DECISION_BASIS,
-        explicit_contract=True,
-        exact_symbol_identity=True,
-        errors=[],
-    )
-    paths = {
-        "native_root": native_root,
-        "source": source_path,
-        "manifest": manifest_path,
-        "pointer": pointer_path,
-        "receipt": receipt_path,
-    }
-    payloads = {"source": source, "receipt": receipt}
-    return data_dir, universe, paths, payloads
-
-
-def _artifact_fixture(
-    tmp_path: Path,
-    *,
-    promoted: bool,
-) -> tuple[Path, native.ActiveNativeUniverse, dict[str, Path], dict[str, Any]]:
-    data_dir, universe, paths, payloads = _fixture(tmp_path, promoted=promoted)
-    native_root = paths["native_root"]
     symbol = PRODUCTION_SYMBOL_ORDER[0]
     timeframe = PRODUCTION_TIMEFRAME_ORDER[0]
     bars_path = native_root / "cells" / symbol / timeframe / "bars.csv"
@@ -185,39 +82,106 @@ def _artifact_fixture(
         "sidecar_relative_path": sidecar_path.relative_to(native_root).as_posix(),
         "sidecar_sha256": sidecar_sha,
     }
-    source = json.loads(paths["source"].read_text(encoding="utf-8"))
-    source.update(
-        {
-            "native_is_signal_authority": True,
-            "silent_fallback_allowed": False,
-            "universe_eligibility": {
-                "schema_version": native.UNIVERSE_AUTHENTICITY_SCHEMA,
-                "required_timeframes": list(PRODUCTION_TIMEFRAME_ORDER),
-                "session_coverage_method": native.NATIVE_SESSION_COVERAGE_METHOD,
-            },
-            "entries": {symbol: {timeframe: entry}},
+    counts = {
+        native.NATIVE_EVIDENCE_CANDIDATE: len(PRODUCTION_SYMBOL_ORDER)
+        * len(PRODUCTION_TIMEFRAME_ORDER),
+        native.NATIVE_SOURCE_UNAVAILABLE: 0,
+        native.NATIVE_TECHNICAL_ERROR: 0,
+        native.NATIVE_PENDING: 0,
+        "total": len(PRODUCTION_SYMBOL_ORDER) * len(PRODUCTION_TIMEFRAME_ORDER),
+        "terminal": len(PRODUCTION_SYMBOL_ORDER) * len(PRODUCTION_TIMEFRAME_ORDER),
+        "symbols_with_evidence_candidates": len(PRODUCTION_SYMBOL_ORDER),
+    }
+    entries = {
+        candidate_symbol: {
+            candidate_timeframe: {
+                **entry,
+                "symbol": candidate_symbol,
+                "timeframe": candidate_timeframe,
+            }
+            for candidate_timeframe in PRODUCTION_TIMEFRAME_ORDER
         }
+        for candidate_symbol in PRODUCTION_SYMBOL_ORDER
+    }
+    manifest = {
+        "schema_version": native.ACTIVATION_MANIFEST_SCHEMA,
+        "activation_id": activation_id,
+        "run_id": run_id,
+        "status": "active",
+        "production_authoritative": True,
+        "native_is_signal_authority": True,
+        "silent_fallback_allowed": False,
+        "run_manifest_relative_path": f"runs/{run_id}/run_manifest.json",
+        "run_manifest_sha256": run_sha,
+        "previous_active_pointer_sha256": "a" * 64,
+        "counts": counts,
+        "universe_eligibility": {
+            "schema_version": native.UNIVERSE_AUTHENTICITY_SCHEMA,
+            "requested_symbols": list(PRODUCTION_SYMBOL_ORDER),
+            "required_timeframes": list(PRODUCTION_TIMEFRAME_ORDER),
+            "session_coverage_method": native.NATIVE_SESSION_COVERAGE_METHOD,
+        },
+        "entries": entries,
+    }
+    semantic_receipt = native.build_native_semantic_receipt(manifest)
+    receipt_path = native_root / "semantic_receipts" / f"{activation_id}.json"
+    receipt_sha = _write_json(receipt_path, semantic_receipt)
+    manifest["semantic_receipt_relative_path"] = receipt_path.relative_to(
+        native_root
+    ).as_posix()
+    manifest["semantic_receipt_sha256"] = receipt_sha
+    manifest_path = native_root / "activations" / f"{activation_id}.json"
+    manifest_sha = _write_json(manifest_path, manifest)
+    pointer_path = native_root / "ACTIVE.json"
+    _write_json(
+        pointer_path,
+        {
+            "schema_version": native.ACTIVE_POINTER_SCHEMA,
+            "activation_id": activation_id,
+            "manifest_relative_path": f"activations/{activation_id}.json",
+            "manifest_sha256": manifest_sha,
+            "activated_at_utc": "2026-07-19T19:00:00Z",
+            "production_authoritative": True,
+        },
     )
-    source_sha = _write_json(paths["source"], source)
-    if promoted:
-        view = {**source, "status": "active"}
-        manifest_sha = _write_json(paths["manifest"], view)
-        receipt = json.loads(paths["receipt"].read_text(encoding="utf-8"))
-        receipt["source_manifest_sha256"] = source_sha
-        receipt["promoted_manifest_sha256"] = manifest_sha
-        _write_json(paths["receipt"], receipt)
-        payloads["receipt"] = receipt
-    else:
-        manifest_sha = source_sha
-    pointer = json.loads(paths["pointer"].read_text(encoding="utf-8"))
-    pointer["manifest_sha256"] = manifest_sha
-    _write_json(paths["pointer"], pointer)
-    universe.activation_manifest_path = paths["manifest"].resolve()
-    universe.activation_manifest_sha256 = manifest_sha
-    universe.entries = {symbol: {timeframe: entry}}
-    payloads["source"] = source
-    paths.update({"bars": bars_path, "sidecar": sidecar_path})
-    return data_dir, universe, paths, payloads
+    cell_statuses = {
+        candidate_symbol: {
+            candidate_timeframe: native.NATIVE_EVIDENCE_CANDIDATE
+            for candidate_timeframe in PRODUCTION_TIMEFRAME_ORDER
+        }
+        for candidate_symbol in PRODUCTION_SYMBOL_ORDER
+    }
+    universe = native.ActiveNativeUniverse(
+        activation_id=activation_id,
+        activation_manifest_path=manifest_path.resolve(),
+        activation_manifest_sha256=manifest_sha,
+        requested_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
+        required_timeframes=tuple(PRODUCTION_TIMEFRAME_ORDER),
+        eligible_symbols=tuple(PRODUCTION_SYMBOL_ORDER),
+        excluded_symbols={},
+        cell_statuses=cell_statuses,
+        symbols_with_active_cells=tuple(PRODUCTION_SYMBOL_ORDER),
+        fully_excluded_symbols=(),
+        calendar_contract=resolver_calendar,
+        eligibility_schema=native.UNIVERSE_AUTHENTICITY_SCHEMA,
+        decision_basis=native.NATIVE_AUTHENTICITY_DECISION_BASIS,
+        explicit_contract=True,
+        exact_symbol_identity=True,
+        entries={symbol: {timeframe: entry}},
+        errors=[],
+    )
+    return (
+        data_dir,
+        universe,
+        {
+            "native_root": native_root,
+            "manifest": manifest_path,
+            "pointer": pointer_path,
+            "bars": bars_path,
+            "sidecar": sidecar_path,
+            "receipt": receipt_path,
+        },
+    )
 
 
 def _stub_runtime_cell_evidence(
@@ -236,16 +200,11 @@ def _stub_runtime_cell_evidence(
     )
 
 
-@pytest.mark.parametrize("promoted", [False, True])
-def test_per_cell_resolver_accepts_canonical_and_authenticated_promoted_manifest(
+def test_per_cell_resolver_retains_canonical_selected_leaf_verification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    promoted: bool,
 ) -> None:
-    data_dir, universe, paths, _payloads = _artifact_fixture(
-        tmp_path,
-        promoted=promoted,
-    )
+    data_dir, universe, paths = _canonical_artifact_fixture(tmp_path)
     _stub_runtime_cell_evidence(monkeypatch, universe)
 
     result = native.resolve_active_native_artifact(
@@ -262,14 +221,48 @@ def test_per_cell_resolver_accepts_canonical_and_authenticated_promoted_manifest
     assert result.sidecar_path == paths["sidecar"].resolve()
 
 
+def test_per_cell_resolver_reuses_scoped_receipt_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir, universe, _paths = _canonical_artifact_fixture(tmp_path)
+    _stub_runtime_cell_evidence(monkeypatch, universe)
+    real_load = native._load_receipt_backed_native_authority
+    receipt_loads = 0
+
+    def _load(*args: Any, **kwargs: Any) -> native.ReceiptBackedNativeAuthority:
+        nonlocal receipt_loads
+        receipt_loads += 1
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(native, "_load_receipt_backed_native_authority", _load)
+    with native.production_native_authority_verification_scope() as scope:
+        first = native.resolve_active_native_artifact(
+            data_dir,
+            PRODUCTION_SYMBOL_ORDER[0],
+            PRODUCTION_TIMEFRAME_ORDER[0],
+            production_contract_required=True,
+        )
+        second = native.resolve_active_native_artifact(
+            data_dir,
+            PRODUCTION_SYMBOL_ORDER[0],
+            PRODUCTION_TIMEFRAME_ORDER[0],
+            production_contract_required=True,
+        )
+        stats = scope.stats()
+
+    assert first.valid, first.errors
+    assert second == first
+    assert receipt_loads == 1
+    assert stats["full_verification_count"] == 1
+    assert stats["identity_revalidation_count"] == 1
+
+
 def test_per_cell_resolver_adds_only_the_outer_identity_bracket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, universe, _paths, _payloads = _artifact_fixture(
-        tmp_path,
-        promoted=True,
-    )
+    data_dir, universe, _paths = _canonical_artifact_fixture(tmp_path)
     real_identity = native._read_active_authority_identity
     identity_reads = 0
     evidence_replays = 0
@@ -326,10 +319,7 @@ def test_per_cell_resolver_rejects_active_identity_movement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, universe, _paths, _payloads = _artifact_fixture(
-        tmp_path,
-        promoted=True,
-    )
+    data_dir, universe, _paths = _canonical_artifact_fixture(tmp_path)
     _stub_runtime_cell_evidence(monkeypatch, universe)
     identity = native._read_active_authority_identity(data_dir)
     moved = native._ActiveAuthorityIdentity(
@@ -337,6 +327,8 @@ def test_per_cell_resolver_rejects_active_identity_movement(
         active_pointer_bytes=identity.active_pointer_bytes + b" ",
         active_pointer_sha256="f" * 64,
         activation_manifest_sha256=identity.activation_manifest_sha256,
+        semantic_receipt_sha256=identity.semantic_receipt_sha256,
+        semantic_verifier_build_digest=identity.semantic_verifier_build_digest,
     )
     identities = iter((identity, moved))
     monkeypatch.setattr(
@@ -374,6 +366,8 @@ def test_per_cell_resolver_types_active_identity_read_failure(
         active_pointer_bytes=b"{}",
         active_pointer_sha256="a" * 64,
         activation_manifest_sha256="b" * 64,
+        semantic_receipt_sha256="c" * 64,
+        semantic_verifier_build_digest="d" * 64,
     )
     identity_reads = 0
     body_calls = 0
@@ -414,6 +408,8 @@ def test_per_cell_resolver_rejects_result_manifest_identity_mismatch(
         active_pointer_bytes=b"{}",
         active_pointer_sha256="a" * 64,
         activation_manifest_sha256="b" * 64,
+        semantic_receipt_sha256="c" * 64,
+        semantic_verifier_build_digest="d" * 64,
     )
     monkeypatch.setattr(
         native,
@@ -428,7 +424,7 @@ def test_per_cell_resolver_rejects_result_manifest_identity_mismatch(
             timeframe="H1",
             data_path=Path("bars.csv"),
             sidecar_path=Path("sidecar.json"),
-            activation_manifest_sha256="c" * 64,
+            activation_manifest_sha256="e" * 64,
         ),
     )
 
@@ -460,41 +456,10 @@ def test_per_cell_resolver_types_malformed_active_pointer_path(
     assert result.errors == ["NATIVE_ACTIVE_AUTHORITY_IDENTITY_INITIAL_READ_FAILED"]
 
 
-def test_per_cell_resolver_rejects_promoted_manifest_with_tampered_receipt(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    data_dir, universe, paths, payloads = _artifact_fixture(
-        tmp_path,
-        promoted=True,
-    )
-    _stub_runtime_cell_evidence(monkeypatch, universe)
-    receipt = deepcopy(payloads["receipt"])
-    receipt["counts"] = {**receipt["counts"], "total": 599}
-    _write_json(paths["receipt"], receipt)
-
-    result = native.resolve_active_native_artifact(
-        data_dir,
-        PRODUCTION_SYMBOL_ORDER[0],
-        PRODUCTION_TIMEFRAME_ORDER[0],
-        production_contract_required=True,
-    )
-
-    assert not result.valid
-    assert "NATIVE_TERMINAL_PROMOTION_COUNTS_MISMATCH" in result.errors
-
-
 def test_anchor_loader_retains_canonical_active_manifest_support(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    data_dir, universe, _paths, _payloads = _fixture(tmp_path, promoted=False)
-
-    def _unexpected(*args: Any, **kwargs: Any) -> list[str]:
-        raise AssertionError("canonical activation must not invoke promotion verifier")
-
-    monkeypatch.setattr(anchor_plan, "validate_terminal_promotion_view", _unexpected)
-
+    data_dir, universe, _paths = _canonical_artifact_fixture(tmp_path)
     _common, _run_sha, activation_id, activation_sha = (
         anchor_plan._load_verified_v5_common(data_dir, universe)
     )
@@ -503,157 +468,294 @@ def test_anchor_loader_retains_canonical_active_manifest_support(
     assert activation_sha == universe.activation_manifest_sha256
 
 
-def test_anchor_loader_accepts_exact_receipt_validated_promoted_view(
-    tmp_path: Path,
-) -> None:
-    data_dir, universe, paths, _payloads = _fixture(tmp_path, promoted=True)
+@pytest.fixture(scope="module")
+def pristine_authority(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    data_dir = tmp_path_factory.mktemp("receipt-authority")
+    write_receipt_backed_v5_authority(data_dir / "native")
+    return data_dir
 
-    common, _run_sha, activation_id, activation_sha = (
-        anchor_plan._load_verified_v5_common(data_dir, universe)
+
+@pytest.fixture
+def data_dir(tmp_path: Path, pristine_authority: Path) -> Path:
+    copied = tmp_path / "data"
+    shutil.copytree(pristine_authority, copied)
+    return copied
+
+
+def _paths(data_dir: Path) -> tuple[Path, Path, Path]:
+    native_root = data_dir / "native"
+    pointer_path = native_root / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest_path = native_root / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    receipt_path = native_root / manifest["semantic_receipt_relative_path"]
+    return pointer_path, manifest_path, receipt_path
+
+
+def _rewrite_receipt_chain(
+    data_dir: Path,
+    mutate_receipt: Callable[[dict[str, Any]], None],
+) -> None:
+    pointer_path, manifest_path, receipt_path = _paths(data_dir)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    mutate_receipt(receipt)
+    receipt_path.write_bytes(_canonical(receipt))
+    manifest["semantic_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest))
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_bytes(_canonical(pointer))
+
+
+def _rewrite_manifest_and_repin(
+    data_dir: Path,
+    mutate_manifest: Callable[[dict[str, Any]], None],
+) -> None:
+    pointer_path, manifest_path, _receipt_path = _paths(data_dir)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutate_manifest(manifest)
+    manifest_path.write_bytes(_canonical(manifest))
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_bytes(_canonical(pointer))
+
+
+def test_scope_returns_exact_immutable_600_leaf_authority(data_dir: Path) -> None:
+    with native.production_native_authority_verification_scope() as scope:
+        authority = scope.verify_receipt_backed_authority(data_dir)
+        persisted = json.loads(authority.activation_manifest_bytes)
+        assert authority.activation_id == "receipt-fixture-activation"
+        assert authority.manifest == persisted
+        assert authority.entries == persisted["entries"]
+        assert len(authority.semantic_receipt["native_leaf_bindings"]) == 600
+        assert authority.semantic_receipt["verification_mode"] == "FORCE_RAW"
+        assert set(authority.semantic_receipt["runtime_versions"]) == {
+            "python",
+            "pandas",
+            "numpy",
+        }
+        assert (
+            tuple(
+                item["relative_path"]
+                for item in authority.semantic_receipt["semantic_verifier_sources"]
+            )
+            == native.NATIVE_SEMANTIC_VERIFIER_SOURCE_ROSTER
+        )
+        with pytest.raises(TypeError, match="immutable"):
+            authority.semantic_receipt["native_leaf_bindings"].append({})
+        scope.revalidate_receipt_backed_authority()
+        stats = scope.stats()
+        assert stats["full_verification_count"] == 1
+        assert stats["identity_revalidation_count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    [
+        (
+            lambda receipt: receipt.__setitem__(
+                "semantic_verifier_build_digest", "0" * 64
+            ),
+            "NATIVE_SEMANTIC_BUILD_DIGEST_MISMATCH",
+        ),
+        (
+            lambda receipt: receipt.__setitem__(
+                "activation_manifest_preimage_sha256", "1" * 64
+            ),
+            "NATIVE_SEMANTIC_RECEIPT_PREIMAGE_MISMATCH",
+        ),
+        (
+            lambda receipt: receipt["native_leaf_bindings"][0].__setitem__(
+                "bars_sha256", "2" * 64
+            ),
+            "NATIVE_SEMANTIC_RECEIPT_LEAF_BINDINGS_MISMATCH",
+        ),
+        (
+            lambda receipt: receipt["semantic_verifier_sources"].reverse(),
+            "NATIVE_SEMANTIC_BUILD_ROSTER_MISMATCH",
+        ),
+    ],
+)
+def test_rechained_receipt_tamper_fails_typed(
+    data_dir: Path,
+    mutation: Callable[[dict[str, Any]], None],
+    code: str,
+) -> None:
+    _rewrite_receipt_chain(data_dir, mutation)
+    with native.production_native_authority_verification_scope() as scope:
+        with pytest.raises(native.NativeSemanticReceiptError, match=code):
+            scope.verify_receipt_backed_authority(data_dir)
+        assert scope.stats()["poisoned"] is True
+
+
+def test_runtime_versions_are_informational(data_dir: Path) -> None:
+    _rewrite_receipt_chain(
+        data_dir,
+        lambda receipt: receipt.__setitem__(
+            "runtime_versions",
+            {"python": "future", "pandas": "future", "numpy": "future"},
+        ),
     )
-
-    assert common["common_as_of_utc"] == "2026-07-13T09:00:00Z"
-    assert activation_id == universe.activation_id
-    assert activation_sha == universe.activation_manifest_sha256
-    assert paths["manifest"].parent.name == "promoted"
+    with native.production_native_authority_verification_scope() as scope:
+        authority = scope.verify_receipt_backed_authority(data_dir)
+        assert authority.semantic_receipt["runtime_versions"]["python"] == "future"
 
 
-def test_anchor_loader_rejects_alternate_promoted_view_path(tmp_path: Path) -> None:
-    data_dir, universe, paths, _payloads = _fixture(tmp_path, promoted=True)
-    native_root = paths["native_root"]
-    alternate = native_root / "activations" / "promoted-copy" / paths["manifest"].name
-    alternate_sha = _write_json(
-        alternate,
-        json.loads(paths["manifest"].read_text(encoding="utf-8")),
+def test_runtime_version_schema_requires_all_informational_keys(
+    data_dir: Path,
+) -> None:
+    _rewrite_receipt_chain(
+        data_dir,
+        lambda receipt: receipt.__setitem__(
+            "runtime_versions", {"python": "future", "pandas": "future"}
+        ),
     )
-    pointer = json.loads(paths["pointer"].read_text(encoding="utf-8"))
-    pointer["manifest_relative_path"] = alternate.relative_to(native_root).as_posix()
-    pointer["manifest_sha256"] = alternate_sha
-    _write_json(paths["pointer"], pointer)
-    universe.activation_manifest_path = alternate.resolve()
-    universe.activation_manifest_sha256 = alternate_sha
-
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
-        anchor_plan._load_verified_v5_common(data_dir, universe)
-
-    assert caught.value.code == "ACTIVE_POINTER_AUTHORITY_MISMATCH"
+    with native.production_native_authority_verification_scope() as scope:
+        with pytest.raises(
+            native.NativeSemanticReceiptError,
+            match="NATIVE_SEMANTIC_RECEIPT_VERSIONS_INVALID",
+        ):
+            scope.verify_receipt_backed_authority(data_dir)
 
 
-def test_anchor_loader_rejects_noncanonical_promoted_path_separator(
-    tmp_path: Path,
+def test_coherently_rehashed_leaf_poison_cannot_cross_original_receipt(
+    data_dir: Path,
 ) -> None:
-    data_dir, universe, paths, _payloads = _fixture(tmp_path, promoted=True)
-    pointer = json.loads(paths["pointer"].read_text(encoding="utf-8"))
-    pointer["manifest_relative_path"] = pointer["manifest_relative_path"].replace(
-        "/", "\\"
+    pointer_path, manifest_path, _receipt_path = _paths(data_dir)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entry = manifest["entries"][native.NATIVE_PRODUCTION_SYMBOLS[0]]["M5"]
+    bars_path = data_dir / "native" / entry["bars_relative_path"]
+    bars_path.write_bytes(bars_path.read_bytes() + b"\n")
+    entry["bars_sha256"] = hashlib.sha256(bars_path.read_bytes()).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest))
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_bytes(_canonical(pointer))
+    with native.production_native_authority_verification_scope() as scope:
+        with pytest.raises(
+            native.NativeSemanticReceiptError,
+            match="NATIVE_SEMANTIC_RECEIPT_PREIMAGE_MISMATCH",
+        ):
+            scope.verify_receipt_backed_authority(data_dir)
+
+
+def test_rechained_roster_change_is_not_a_valid_production_receipt(
+    data_dir: Path,
+) -> None:
+    def _drop_symbol(manifest: dict[str, Any]) -> None:
+        contract = manifest["universe_eligibility"]
+        contract["requested_symbols"] = contract["requested_symbols"][:-1]
+
+    _rewrite_manifest_and_repin(data_dir, _drop_symbol)
+    pointer_path, manifest_path, receipt_path = _paths(data_dir)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["activation_manifest_preimage_sha256"] = (
+        native.native_semantic_manifest_preimage_sha256(manifest)
     )
-    _write_json(paths["pointer"], pointer)
+    receipt_path.write_bytes(_canonical(receipt))
+    manifest["semantic_receipt_sha256"] = hashlib.sha256(
+        receipt_path.read_bytes()
+    ).hexdigest()
+    manifest_path.write_bytes(_canonical(manifest))
+    pointer["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    pointer_path.write_bytes(_canonical(pointer))
+    with native.production_native_authority_verification_scope() as scope:
+        with pytest.raises(
+            native.NativeSemanticReceiptError,
+            match="NATIVE_SEMANTIC_RECEIPT_SYMBOL_ROSTER_INVALID",
+        ):
+            scope.verify_receipt_backed_authority(data_dir)
 
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
-        anchor_plan._load_verified_v5_common(data_dir, universe)
 
-    assert caught.value.code == "ACTIVE_POINTER_AUTHORITY_MISMATCH"
-
-
-def test_anchor_loader_rejects_non_string_promoted_path_fail_closed(
-    tmp_path: Path,
+def test_missing_receipt_never_falls_back_to_raw_replay(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    data_dir, universe, paths, _payloads = _fixture(tmp_path, promoted=True)
-    pointer = json.loads(paths["pointer"].read_text(encoding="utf-8"))
-    pointer["manifest_relative_path"] = ["activations", "promoted"]
-    _write_json(paths["pointer"], pointer)
+    _pointer, _manifest, receipt_path = _paths(data_dir)
+    receipt_path.unlink()
+    calls = 0
 
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
-        anchor_plan._load_verified_v5_common(data_dir, universe)
+    def _unexpected_raw(*args: Any, **kwargs: Any) -> list[str]:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("raw replay must not be a receipt fallback")
 
-    assert caught.value.code == "ACTIVE_POINTER_AUTHORITY_MISMATCH"
-
-
-def test_anchor_loader_rejects_tampered_promotion_receipt(tmp_path: Path) -> None:
-    data_dir, universe, paths, payloads = _fixture(tmp_path, promoted=True)
-    receipt = deepcopy(payloads["receipt"])
-    receipt["counts"] = {**receipt["counts"], "total": 599}
-    _write_json(paths["receipt"], receipt)
-
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
-        anchor_plan._load_verified_v5_common(data_dir, universe)
-
-    assert caught.value.code == "TERMINAL_PROMOTION_VIEW_INVALID"
-    assert caught.value.details
-
-
-def test_anchor_loader_rejects_receipt_predecessor_mismatch(tmp_path: Path) -> None:
-    data_dir, universe, paths, payloads = _fixture(tmp_path, promoted=True)
-    receipt = deepcopy(payloads["receipt"])
-    receipt["previous_active_pointer_sha256"] = "b" * 64
-    _write_json(paths["receipt"], receipt)
-
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
-        anchor_plan._load_verified_v5_common(data_dir, universe)
-
-    assert caught.value.code == "TERMINAL_PROMOTION_VIEW_INVALID"
-    assert "NATIVE_TERMINAL_PROMOTION_PREDECESSOR_POINTER_MISMATCH" in (
-        caught.value.details
+    monkeypatch.setattr(native, "_verify_activation_cell_evidence", _unexpected_raw)
+    result = native.resolve_active_native_universe(
+        data_dir,
+        production_contract_required=True,
     )
+    assert "NATIVE_SEMANTIC_RECEIPT_MISSING" in result.errors
+    artifact = native.resolve_active_native_artifact(
+        data_dir,
+        native.NATIVE_PRODUCTION_SYMBOLS[0],
+        "M5",
+        production_contract_required=True,
+    )
+    assert "NATIVE_SEMANTIC_RECEIPT_MISSING" in artifact.errors
+    assert calls == 0
 
 
-def test_anchor_loader_rejects_promoted_source_status_not_failed(
+def test_final_identity_revalidation_detects_active_movement(data_dir: Path) -> None:
+    with native.production_native_authority_verification_scope() as scope:
+        scope.verify_receipt_backed_authority(data_dir)
+        pointer_path, _manifest_path, _receipt_path = _paths(data_dir)
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        pointer["activated_at_utc"] = "2026-01-01T00:00:01Z"
+        pointer_path.write_bytes(_canonical(pointer))
+        with pytest.raises(
+            RuntimeError,
+            match="NATIVE_AUTHORITY_IDENTITY_REVALIDATION_FAILED",
+        ):
+            scope.revalidate_receipt_backed_authority()
+        assert scope.stats()["poisoned"] is True
+
+
+def test_final_identity_revalidation_detects_build_movement(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with native.production_native_authority_verification_scope() as scope:
+        scope.verify_receipt_backed_authority(data_dir)
+        observed = native.native_semantic_verifier_build()
+        monkeypatch.setattr(
+            native,
+            "native_semantic_verifier_build",
+            lambda: {**observed, "digest": "f" * 64},
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="NATIVE_AUTHORITY_IDENTITY_REVALIDATION_FAILED",
+        ):
+            scope.revalidate_receipt_backed_authority()
+
+
+def test_canonical_active_path_rejects_retired_promoted_view(data_dir: Path) -> None:
+    pointer_path, _manifest_path, _receipt_path = _paths(data_dir)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    pointer["manifest_relative_path"] = (
+        f"activations/promoted/{pointer['activation_id']}.json"
+    )
+    pointer_path.write_bytes(_canonical(pointer))
+    result = native.resolve_active_native_universe(data_dir)
+    assert "NATIVE_ACTIVE_MANIFEST_PATH_IDENTITY_MISMATCH" in result.errors
+
+
+def test_anchor_loader_rejects_retired_promoted_view(
     tmp_path: Path,
 ) -> None:
-    data_dir, universe, paths, payloads = _fixture(tmp_path, promoted=True)
-    source = deepcopy(payloads["source"])
-    source["status"] = "active"
-    source_sha = _write_json(paths["source"], source)
-    receipt = deepcopy(payloads["receipt"])
-    receipt["source_manifest_sha256"] = source_sha
-    _write_json(paths["receipt"], receipt)
-
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
-        anchor_plan._load_verified_v5_common(data_dir, universe)
-
-    assert caught.value.code == "TERMINAL_PROMOTION_VIEW_INVALID"
-    assert "NATIVE_TERMINAL_PROMOTION_SOURCE_STATUS_INVALID" in caught.value.details
-
-
-def test_anchor_loader_rejects_rehashed_source_authority_mutation(
-    tmp_path: Path,
-) -> None:
-    data_dir, universe, paths, payloads = _fixture(tmp_path, promoted=True)
-    source = deepcopy(payloads["source"])
-    source["production_authoritative"] = False
-    source_sha = _write_json(paths["source"], source)
-    view = {**source, "status": "active"}
-    view_sha = _write_json(paths["manifest"], view)
-    receipt = deepcopy(payloads["receipt"])
-    receipt["source_manifest_sha256"] = source_sha
-    receipt["promoted_manifest_sha256"] = view_sha
-    _write_json(paths["receipt"], receipt)
+    data_dir, universe, paths = _canonical_artifact_fixture(tmp_path)
     pointer = json.loads(paths["pointer"].read_text(encoding="utf-8"))
-    pointer["manifest_sha256"] = view_sha
-    _write_json(paths["pointer"], pointer)
-    universe.activation_manifest_sha256 = view_sha
+    pointer["manifest_relative_path"] = (
+        f"activations/promoted/{pointer['activation_id']}.json"
+    )
+    paths["pointer"].write_bytes(_canonical(pointer))
 
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
+    with pytest.raises(
+        anchor_plan.ProductionAnchorPlanError,
+        match="ACTIVE_POINTER_AUTHORITY_MISMATCH",
+    ):
         anchor_plan._load_verified_v5_common(data_dir, universe)
-
-    assert caught.value.code == "ACTIVATION_MANIFEST_AUTHORITY_INVALID"
-
-
-def test_anchor_loader_rejects_rehashed_non_status_view_mutation(tmp_path: Path) -> None:
-    data_dir, universe, paths, payloads = _fixture(tmp_path, promoted=True)
-    view = json.loads(paths["manifest"].read_text(encoding="utf-8"))
-    view["unexpected_authority_claim"] = True
-    view_sha = _write_json(paths["manifest"], view)
-    receipt = deepcopy(payloads["receipt"])
-    receipt["promoted_manifest_sha256"] = view_sha
-    _write_json(paths["receipt"], receipt)
-    pointer = json.loads(paths["pointer"].read_text(encoding="utf-8"))
-    pointer["manifest_sha256"] = view_sha
-    _write_json(paths["pointer"], pointer)
-    universe.activation_manifest_sha256 = view_sha
-
-    with pytest.raises(anchor_plan.ProductionAnchorPlanError) as caught:
-        anchor_plan._load_verified_v5_common(data_dir, universe)
-
-    assert caught.value.code == "TERMINAL_PROMOTION_VIEW_INVALID"
-    assert caught.value.details

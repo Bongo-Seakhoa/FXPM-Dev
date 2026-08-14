@@ -44,6 +44,22 @@ PRICE_CELL_TERMINAL_NONCANDIDATES = frozenset({"technical_error", "source_unavai
 _SCHEDULE_SOURCE_PREFERENCE = ("D1", "H4", "H1", "M30", "M15", "M5")
 SCHEDULE_SOURCE_POLICY = "d1-preferred-coarsest-intraday-fallback-v1"
 SCHEDULE_SOURCE_SELECTION_SCHEMA = "fxpm-schedule-source-selection-v1"
+TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA = "fxpm-terms-price-receipt-migration-pin-v1"
+_TERMS_PRICE_RECEIPT_MIGRATION_PIN_FIELDS = frozenset(
+    {
+        "schema_version",
+        "prepared_at_utc",
+        "source_terms_active_pointer_sha256",
+        "source_terms_activation_id",
+        "source_terms_manifest_relative_path",
+        "source_terms_manifest_sha256",
+        "source_terms_snapshot_relative_path",
+        "source_terms_snapshot_sha256",
+        "predecessor_price_active_pointer_sha256",
+        "predecessor_price_activation_id",
+        "predecessor_price_manifest_sha256",
+    }
+)
 
 _DIRECT_SNAPSHOT_KEYS = frozenset({
     "schema_version",
@@ -945,6 +961,106 @@ def load_current_price_activation(native_root: Path) -> Dict[str, Any]:
     }
 
 
+def _receipt_backed_price_view(
+    native_root: Path,
+    authority: Any,
+) -> Dict[str, Any]:
+    """Adapt the already-verified native receipt scope result."""
+
+    native_root = Path(native_root).resolve()
+    pointer_bytes = bytes(authority.active_pointer_bytes)
+    manifest_bytes = bytes(authority.activation_manifest_bytes)
+    pointer_sha = str(authority.active_pointer_sha256 or "").lower()
+    manifest_sha = str(authority.activation_manifest_sha256 or "").lower()
+    receipt_sha = str(authority.semantic_receipt_sha256 or "").lower()
+    try:
+        pointer = json.loads(pointer_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BrokerTermsError("receipt-backed native pointer JSON is invalid") from exc
+    manifest = authority.manifest
+    entries = authority.entries
+    receipt = authority.semantic_receipt
+    if (
+        not isinstance(pointer, Mapping)
+        or not isinstance(manifest, Mapping)
+        or not isinstance(entries, Mapping)
+        or not isinstance(receipt, Mapping)
+        or manifest.get("entries") != entries
+    ):
+        raise BrokerTermsError("receipt-backed native authority payload is invalid")
+    activation_id = str(authority.activation_id or "")
+    manifest_path = Path(authority.activation_manifest_path).resolve()
+    receipt_path = Path(authority.semantic_receipt_path).resolve()
+    expected_manifest_path = _safe_relative(
+        native_root,
+        pointer.get("manifest_relative_path"),
+    )
+    expected_receipt_path = _safe_relative(
+        native_root,
+        manifest.get("semantic_receipt_relative_path"),
+    )
+    if (
+        Path(authority.data_dir).resolve() != native_root.parent
+        or str(pointer.get("activation_id") or "") != activation_id
+        or str(pointer.get("manifest_sha256") or "").lower() != manifest_sha
+        or expected_manifest_path != manifest_path
+        or str(manifest.get("activation_id") or "") != activation_id
+        or str(manifest.get("semantic_receipt_sha256") or "").lower() != receipt_sha
+        or expected_receipt_path != receipt_path
+        or str(receipt.get("activation_id") or "") != activation_id
+    ):
+        raise BrokerTermsError("receipt-backed native authority identity mismatch")
+    contract_mode = _price_contract_mode(pointer, manifest)
+    return {
+        "pointer": dict(pointer),
+        "pointer_path": native_root / "ACTIVE.json",
+        "pointer_sha256": pointer_sha,
+        "pointer_bytes": pointer_bytes,
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "manifest_sha256": manifest_sha,
+        "manifest_bytes": manifest_bytes,
+        "activation_id": activation_id,
+        "contract_mode": contract_mode,
+        "semantic_receipt": receipt,
+        "semantic_receipt_path": receipt_path,
+        "semantic_receipt_sha256": receipt_sha,
+    }
+
+
+@contextmanager
+def _receipt_backed_price_authority_scope(
+    native_root: Path,
+) -> Iterator[Tuple[Dict[str, Any], Callable[[], None]]]:
+    """Open the sole receipt-backed price authority scope for one operation."""
+
+    from pm_native_activation import (
+        production_native_authority_verification_scope,
+    )
+
+    native_root = Path(native_root).resolve()
+    try:
+        with production_native_authority_verification_scope() as scope:
+            authority = scope.verify_receipt_backed_authority(native_root.parent)
+            price = _receipt_backed_price_view(native_root, authority)
+
+            def revalidate() -> None:
+                try:
+                    scope.revalidate_receipt_backed_authority()
+                except RuntimeError as exc:
+                    raise BrokerTermsError(
+                        "receipt-backed native price authority changed"
+                    ) from exc
+
+            yield price, revalidate
+    except BrokerTermsError:
+        raise
+    except RuntimeError as exc:
+        raise BrokerTermsError(
+            "receipt-backed native price authority is invalid"
+        ) from exc
+
+
 def _read_interval_axis_hashed(
     csv_path: Path,
     *,
@@ -952,10 +1068,26 @@ def _read_interval_axis_hashed(
     max_rows: int,
     max_bytes: int,
     expected_sha256: Optional[str],
+    axis_cache: Optional[
+        Dict[Path, Tuple[pd.DatetimeIndex, pd.DatetimeIndex, str]]
+    ] = None,
 ) -> Tuple[pd.DatetimeIndex, pd.DatetimeIndex, str]:
     """Hash and validate one exact native interval axis from the same bytes."""
 
-    path = Path(csv_path)
+    path = Path(csv_path).resolve()
+    cached = axis_cache.get(path) if axis_cache is not None else None
+    if cached is not None:
+        opens, closes, observed_sha256 = cached
+        if (
+            expected_sha256 is not None
+            and observed_sha256 != str(expected_sha256).lower()
+        ):
+            raise BrokerTermsError(
+                f"{label} bars hash mismatch before schedule derivation"
+            )
+        if len(opens) <= 0 or len(opens) > int(max_rows):
+            raise BrokerTermsError(f"{label} row count is outside the permitted bound")
+        return opens, closes, observed_sha256
     payload = _read_bounded(path, int(max_bytes))
     observed_sha256 = hashlib.sha256(payload).hexdigest()
     if expected_sha256 is not None and observed_sha256 != str(expected_sha256).lower():
@@ -985,6 +1117,8 @@ def _read_interval_axis_hashed(
         or not bool((closes > opens).all())
     ):
         raise BrokerTermsError(f"{label} interval axis is invalid")
+    if axis_cache is not None:
+        axis_cache[path] = (opens, closes, observed_sha256)
     return opens, closes, observed_sha256
 
 
@@ -1112,6 +1246,9 @@ def _derive_d1_session_events_hashed(
     max_rows: int = 100_000,
     max_bytes: int = 256 * 1024 * 1024,
     expected_sha256: Optional[str] = None,
+    axis_cache: Optional[
+        Dict[Path, Tuple[pd.DatetimeIndex, pd.DatetimeIndex, str]]
+    ] = None,
 ) -> Tuple[list[Dict[str, Any]], str]:
     """Hash and parse one bounded D1 payload from the same exact bytes."""
 
@@ -1121,6 +1258,7 @@ def _derive_d1_session_events_hashed(
         max_rows=max_rows,
         max_bytes=max_bytes,
         expected_sha256=expected_sha256,
+        axis_cache=axis_cache,
     )
     weekday_offset, _matched, _phase = _bind_session_anchors(
         opens,
@@ -1157,6 +1295,9 @@ def _derive_intraday_session_events_hashed(
     max_rows: int = 2_000_000,
     max_bytes: int = 256 * 1024 * 1024,
     expected_sha256: Optional[str] = None,
+    axis_cache: Optional[
+        Dict[Path, Tuple[pd.DatetimeIndex, pd.DatetimeIndex, str]]
+    ] = None,
 ) -> Tuple[list[Dict[str, Any]], str, Dict[str, Any]]:
     """Derive completed broker-day boundaries from one exact intraday axis.
 
@@ -1177,6 +1318,7 @@ def _derive_intraday_session_events_hashed(
         max_rows=max_rows,
         max_bytes=max_bytes,
         expected_sha256=expected_sha256,
+        axis_cache=axis_cache,
     )
     weekday_offset, matched, phase_seconds = _bind_session_anchors(
         opens,
@@ -1326,13 +1468,14 @@ def _write_or_verify_immutable_json(path: Path, value: Mapping[str, Any]) -> str
     return sha256_file(path)
 
 
-def _verified_price_cell_binding(
+def _price_cell_binding_from_verified_manifest(
     native_root: Path,
     cell: Mapping[str, Any],
     *,
     label: str,
-    digest_cache: Dict[Path, str],
 ) -> Dict[str, str]:
+    """Copy one receipt-verified cell binding without reopening its leaves."""
+
     binding: Dict[str, str] = {}
     for artifact in ("bars", "sidecar"):
         relative_field = f"{artifact}_relative_path"
@@ -1341,18 +1484,11 @@ def _verified_price_cell_binding(
         expected = str(cell.get(sha_field) or "").strip().lower()
         if not _is_sha256(expected):
             raise BrokerTermsError(f"{label}: {artifact} pin is invalid")
-        resolved = path.resolve()
-        observed = digest_cache.get(resolved)
-        if observed is None:
-            try:
-                observed = sha256_file(path)
-            except OSError as exc:
-                raise BrokerTermsError(f"{label}: {artifact} cannot be read") from exc
-            digest_cache[resolved] = observed
-        if observed != expected:
-            raise BrokerTermsError(f"{label}: {artifact} hash mismatch")
-        binding[relative_field] = path.relative_to(native_root).as_posix()
-        binding[sha_field] = observed
+        normalized = path.relative_to(Path(native_root).resolve()).as_posix()
+        if str(cell.get(relative_field) or "").replace("\\", "/") != normalized:
+            raise BrokerTermsError(f"{label}: {artifact} path is not canonical")
+        binding[relative_field] = normalized
+        binding[sha_field] = expected
     return binding
 
 
@@ -1361,8 +1497,10 @@ def _verified_price_cell_axis(
     cell: Mapping[str, Any],
     *,
     label: str,
-    digest_cache: Dict[Path, str],
     phase_seconds: int,
+    axis_cache: Optional[
+        Dict[Path, Tuple[pd.DatetimeIndex, pd.DatetimeIndex, str]]
+    ] = None,
 ) -> Dict[str, Any]:
     """Reopen one exact target axis for completed-session coverage proof."""
 
@@ -1376,8 +1514,8 @@ def _verified_price_cell_axis(
         max_rows=2_000_000,
         max_bytes=256 * 1024 * 1024,
         expected_sha256=expected,
+        axis_cache=axis_cache,
     )
-    digest_cache[path.resolve()] = observed
     completed_sessions = _completed_or_represented_session_epochs(
         opens,
         closes=closes,
@@ -1402,6 +1540,102 @@ def _verify_exact_artifact(path: Path, expected_sha256: str, label: str) -> None
         raise BrokerTermsError(f"{label} hash mismatch")
 
 
+def _validated_schedule_axis_bindings(
+    native_root: Path,
+    raw_bindings: Any,
+) -> list[Tuple[Path, str]]:
+    if not isinstance(raw_bindings, list) or not raw_bindings:
+        raise BrokerTermsError("terms schedule-axis binding set is invalid")
+    normalized: list[Tuple[Path, str]] = []
+    rows: list[Dict[str, str]] = []
+    for raw in raw_bindings:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "bars_relative_path",
+            "bars_sha256",
+        }:
+            raise BrokerTermsError("terms schedule-axis binding is invalid")
+        path = _safe_relative(native_root, raw.get("bars_relative_path"))
+        relative = path.relative_to(Path(native_root).resolve()).as_posix()
+        expected = str(raw.get("bars_sha256") or "").strip().lower()
+        row = {
+            "bars_relative_path": relative,
+            "bars_sha256": expected,
+        }
+        if str(raw.get("bars_relative_path") or "").replace(
+            "\\", "/"
+        ) != relative or not _is_sha256(expected):
+            raise BrokerTermsError("terms schedule-axis binding is invalid")
+        rows.append(row)
+        normalized.append((path, expected))
+    if rows != sorted(
+        rows,
+        key=lambda value: (value["bars_relative_path"], value["bars_sha256"]),
+    ) or len({path for path, _sha in normalized}) != len(normalized):
+        raise BrokerTermsError("terms schedule-axis binding set is not canonical")
+    return normalized
+
+
+def _rehash_schedule_axis_bindings(
+    native_root: Path,
+    raw_bindings: Any,
+) -> None:
+    for path, expected in _validated_schedule_axis_bindings(
+        native_root,
+        raw_bindings,
+    ):
+        _verify_exact_artifact(path, expected, "staged price schedule axis")
+
+
+def _load_active_terms_source(native_root: Path) -> Dict[str, Any]:
+    """Load one exact pointer/manifest/snapshot TERMS authority."""
+
+    native_root = Path(native_root).resolve()
+    pointer_path = native_root / "terms" / "ACTIVE.json"
+    pointer, pointer_sha, pointer_bytes = _load_json_bounded_hashed(
+        pointer_path,
+        1024 * 1024,
+    )
+    if str(pointer.get("schema_version") or "") != TERMS_ACTIVE_POINTER_SCHEMA:
+        raise BrokerTermsError("active terms pointer schema is invalid")
+    manifest_path = _safe_relative(native_root, pointer.get("manifest_relative_path"))
+    manifest, manifest_sha, manifest_bytes = _load_json_bounded_hashed(manifest_path)
+    if (
+        manifest_sha != str(pointer.get("manifest_sha256") or "").lower()
+        or str(manifest.get("schema_version") or "") != TERMS_ACTIVATION_SCHEMA
+        or str(manifest.get("status") or "").lower() != "active"
+        or str(manifest.get("activation_id") or "")
+        != str(pointer.get("activation_id") or "")
+    ):
+        raise BrokerTermsError("active terms activation is invalid")
+    snapshot_path = _safe_relative(
+        native_root,
+        manifest.get("terms_snapshot_relative_path"),
+    )
+    snapshot, snapshot_sha, snapshot_bytes = _load_json_bounded_hashed(snapshot_path)
+    if snapshot_sha != str(manifest.get("terms_snapshot_sha256") or "").lower():
+        raise BrokerTermsError("active terms snapshot binding is invalid")
+    if (
+        _read_bounded(pointer_path, 1024 * 1024) != pointer_bytes
+        or _read_bounded(manifest_path, 64 * 1024 * 1024) != manifest_bytes
+        or _read_bounded(snapshot_path, 64 * 1024 * 1024) != snapshot_bytes
+    ):
+        raise BrokerTermsError("active terms authority changed during validation")
+    return {
+        "pointer": pointer,
+        "pointer_path": pointer_path,
+        "pointer_sha256": pointer_sha,
+        "pointer_bytes": pointer_bytes,
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "manifest_sha256": manifest_sha,
+        "manifest_bytes": manifest_bytes,
+        "snapshot": snapshot,
+        "snapshot_path": snapshot_path,
+        "snapshot_sha256": snapshot_sha,
+        "snapshot_bytes": snapshot_bytes,
+    }
+
+
 def _validated_active_terms_repair_source(
     native_root: Path,
     *,
@@ -1414,72 +1648,199 @@ def _validated_active_terms_repair_source(
     expected = str(expected_pointer_sha256 or "").strip().lower()
     if not _is_sha256(expected):
         raise BrokerTermsError("repair source terms pointer pin is invalid")
-    terms_root = Path(native_root).resolve() / "terms"
-    pointer_path = terms_root / "ACTIVE.json"
-    pointer, pointer_sha, pointer_bytes = _load_json_bounded_hashed(
-        pointer_path,
-        1024 * 1024,
-    )
-    if pointer_sha != expected:
+    source = _load_active_terms_source(native_root)
+    if source["pointer_sha256"] != expected:
         raise BrokerTermsError("repair source terms pointer pin mismatch")
-    if str(pointer.get("schema_version") or "") != TERMS_ACTIVE_POINTER_SCHEMA:
-        raise BrokerTermsError("repair source terms pointer schema is invalid")
-    manifest_path = _safe_relative(
-        native_root,
-        pointer.get("manifest_relative_path"),
-    )
-    manifest, manifest_sha, manifest_bytes = _load_json_bounded_hashed(manifest_path)
-    if (
-        manifest_sha != str(pointer.get("manifest_sha256") or "")
-        or str(manifest.get("schema_version") or "") != TERMS_ACTIVATION_SCHEMA
-        or str(manifest.get("status") or "").lower() != "active"
-        or str(manifest.get("activation_id") or "")
-        != str(pointer.get("activation_id") or "")
-    ):
-        raise BrokerTermsError("repair source terms activation is invalid")
+    pointer = source["pointer"]
+    manifest = source["manifest"]
     if (
         str(manifest.get("price_activation_manifest_sha256") or "")
         != price.get("manifest_sha256")
         or str(pointer.get("price_activation_manifest_sha256") or "")
         != price.get("manifest_sha256")
+        or str(manifest.get("price_activation_id") or "") != price.get("activation_id")
+        or str(manifest.get("price_active_pointer_sha256_at_creation") or "").lower()
+        != price.get("pointer_sha256")
     ):
         raise BrokerTermsError("repair source is bound to a different price activation")
-    snapshot_path = _safe_relative(
-        native_root,
-        manifest.get("terms_snapshot_relative_path"),
-    )
-    persisted_snapshot, snapshot_sha, _snapshot_bytes = _load_json_bounded_hashed(
-        snapshot_path
-    )
+    persisted_snapshot = source["snapshot"]
     if (
-        snapshot_sha != str(manifest.get("terms_snapshot_sha256") or "")
-        or _canonical_bytes(persisted_snapshot) != _canonical_bytes(snapshot)
+        _canonical_bytes(persisted_snapshot) != _canonical_bytes(snapshot)
         or persisted_snapshot.get("provenance_status")
         != manifest.get("provenance_status")
     ):
         raise BrokerTermsError("repair source terms snapshot binding is invalid")
-    if (
-        _read_bounded(pointer_path, 1024 * 1024) != pointer_bytes
-        or _read_bounded(manifest_path, 64 * 1024 * 1024) != manifest_bytes
-    ):
-        raise BrokerTermsError("repair source terms activation changed during validation")
     return {
         "activation_id": str(manifest.get("activation_id") or ""),
-        "manifest_sha256": manifest_sha,
-        "pointer_sha256": pointer_sha,
-        "pointer_bytes": pointer_bytes,
+        "manifest_sha256": source["manifest_sha256"],
+        "pointer_sha256": source["pointer_sha256"],
+        "pointer_bytes": source["pointer_bytes"],
     }
 
 
-def activate_broker_terms(
+def build_price_receipt_migration_pin(
+    native_root: Path,
+    *,
+    prepared_at_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Pin the exact active legacy TERMS overlay before the price migration."""
+
+    native_root = Path(native_root).resolve()
+    with _terms_pointer_lock(native_root):
+        with _native_price_pointer_lock(native_root):
+            price = load_current_price_activation(native_root)
+            if (
+                price["manifest"].get("semantic_receipt_relative_path") is not None
+                or price["manifest"].get("semantic_receipt_sha256") is not None
+            ):
+                raise BrokerTermsError(
+                    "price receipt migration predecessor is already receipt-backed"
+                )
+            source = _load_active_terms_source(native_root)
+            pointer = source["pointer"]
+            manifest = source["manifest"]
+            snapshot = source["snapshot"]
+            _validate_terms_snapshot(snapshot)
+            if (
+                str(manifest.get("price_activation_manifest_sha256") or "").lower()
+                != price["manifest_sha256"]
+                or str(pointer.get("price_activation_manifest_sha256") or "").lower()
+                != price["manifest_sha256"]
+                or str(manifest.get("price_activation_id") or "")
+                != price["activation_id"]
+                or str(
+                    manifest.get("price_active_pointer_sha256_at_creation") or ""
+                ).lower()
+                != price["pointer_sha256"]
+            ):
+                raise BrokerTermsError(
+                    "price receipt migration source binding is invalid"
+                )
+            final_price = load_current_price_activation(native_root)
+            if not _same_price_identity(price, final_price):
+                raise BrokerTermsError(
+                    "native price authority changed while preparing migration pin"
+                )
+            if (
+                _read_bounded(source["pointer_path"], 1024 * 1024)
+                != source["pointer_bytes"]
+            ):
+                raise BrokerTermsError(
+                    "broker terms authority changed while preparing migration pin"
+                )
+            prepared = (prepared_at_utc or _utc_now()).astimezone(timezone.utc)
+            return {
+                "schema_version": TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA,
+                "prepared_at_utc": _iso(prepared),
+                "source_terms_active_pointer_sha256": source["pointer_sha256"],
+                "source_terms_activation_id": str(
+                    manifest.get("activation_id") or ""
+                ),
+                "source_terms_manifest_relative_path": source[
+                    "manifest_path"
+                ].relative_to(native_root).as_posix(),
+                "source_terms_manifest_sha256": source["manifest_sha256"],
+                "source_terms_snapshot_relative_path": source[
+                    "snapshot_path"
+                ].relative_to(native_root).as_posix(),
+                "source_terms_snapshot_sha256": source["snapshot_sha256"],
+                "predecessor_price_active_pointer_sha256": price["pointer_sha256"],
+                "predecessor_price_activation_id": price["activation_id"],
+                "predecessor_price_manifest_sha256": price["manifest_sha256"],
+            }
+
+
+def _validated_price_receipt_migration_source(
+    native_root: Path,
+    *,
+    pin: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+    price: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Authenticate one exact prepared TERMS source after price ACTIVE moved."""
+
+    if (
+        not isinstance(pin, Mapping)
+        or set(pin) != _TERMS_PRICE_RECEIPT_MIGRATION_PIN_FIELDS
+        or pin.get("schema_version") != TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA
+    ):
+        raise BrokerTermsError("price receipt migration pin is invalid")
+    _aware_utc(pin.get("prepared_at_utc"), "migration_pin.prepared_at_utc")
+    for field in (
+        "source_terms_active_pointer_sha256",
+        "source_terms_manifest_sha256",
+        "source_terms_snapshot_sha256",
+        "predecessor_price_active_pointer_sha256",
+        "predecessor_price_manifest_sha256",
+    ):
+        if not _is_sha256(pin.get(field)):
+            raise BrokerTermsError("price receipt migration pin digest is invalid")
+    if (
+        not _is_sha256(price.get("semantic_receipt_sha256"))
+        or price.get("pointer_sha256")
+        == pin.get("predecessor_price_active_pointer_sha256")
+        or price.get("manifest_sha256") == pin.get("predecessor_price_manifest_sha256")
+        or not isinstance(price.get("manifest"), Mapping)
+        or str(
+            price["manifest"].get("previous_active_pointer_sha256") or ""
+        ).lower()
+        != pin.get("predecessor_price_active_pointer_sha256")
+    ):
+        raise BrokerTermsError(
+            "price receipt migration requires the direct receipt-backed price successor"
+        )
+    native_root = Path(native_root).resolve()
+    source = _load_active_terms_source(native_root)
+    pointer = source["pointer"]
+    manifest = source["manifest"]
+    persisted_snapshot = source["snapshot"]
+    if (
+        source["pointer_sha256"] != pin.get("source_terms_active_pointer_sha256")
+        or str(pointer.get("activation_id") or "")
+        != pin.get("source_terms_activation_id")
+        or source["manifest_path"].relative_to(native_root).as_posix()
+        != pin.get("source_terms_manifest_relative_path")
+        or source["manifest_sha256"] != pin.get("source_terms_manifest_sha256")
+        or source["snapshot_path"].relative_to(native_root).as_posix()
+        != pin.get("source_terms_snapshot_relative_path")
+        or source["snapshot_sha256"] != pin.get("source_terms_snapshot_sha256")
+        or _canonical_bytes(persisted_snapshot) != _canonical_bytes(snapshot)
+        or str(manifest.get("price_activation_id") or "")
+        != pin.get("predecessor_price_activation_id")
+        or str(manifest.get("price_activation_manifest_sha256") or "").lower()
+        != pin.get("predecessor_price_manifest_sha256")
+        or str(pointer.get("price_activation_manifest_sha256") or "").lower()
+        != pin.get("predecessor_price_manifest_sha256")
+        or str(manifest.get("price_active_pointer_sha256_at_creation") or "").lower()
+        != pin.get("predecessor_price_active_pointer_sha256")
+    ):
+        raise BrokerTermsError("price receipt migration source pin mismatch")
+    _validate_terms_snapshot(persisted_snapshot)
+    return {
+        "activation_id": str(manifest.get("activation_id") or ""),
+        "manifest_sha256": source["manifest_sha256"],
+        "pointer_sha256": source["pointer_sha256"],
+        "pointer_bytes": source["pointer_bytes"],
+        "predecessor_price_activation_id": pin["predecessor_price_activation_id"],
+        "predecessor_price_manifest_sha256": pin["predecessor_price_manifest_sha256"],
+        "predecessor_price_pointer_sha256": pin[
+            "predecessor_price_active_pointer_sha256"
+        ],
+    }
+
+
+def _activate_broker_terms_with_price_authority(
     native_root: Path,
     snapshot: Mapping[str, Any],
     *,
+    price: Mapping[str, Any],
+    revalidate_price_authority: Callable[[], None],
     activation_id: Optional[str] = None,
     now_utc: Optional[datetime] = None,
     update_pointer: bool = True,
     max_snapshot_age_seconds: int = 3600,
     repair_source_terms_pointer_sha256: Optional[str] = None,
+    price_receipt_migration_pin: Optional[Mapping[str, Any]] = None,
     staged_manifest_created_at_utc: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Bind terms schedules to the current immutable price activation."""
@@ -1502,9 +1863,30 @@ def activate_broker_terms(
     )
     roster = list(snapshot.get("roster") or [])
     symbols_payload = dict(snapshot.get("symbols") or {})
-    price = load_current_price_activation(native_root)
+    if (
+        repair_source_terms_pointer_sha256 is not None
+        and price_receipt_migration_pin is not None
+    ):
+        raise BrokerTermsError(
+            "ordinary repair and price receipt migration are mutually exclusive"
+        )
+    if (
+        price_receipt_migration_pin is not None
+        and staged_manifest_created_at_utc is not None
+    ):
+        raise BrokerTermsError(
+            "price receipt migration cannot promote a pre-staged terms activation"
+        )
     repair_source: Optional[Dict[str, Any]] = None
-    if repair_source_terms_pointer_sha256 is None:
+    migration_source: Optional[Dict[str, Any]] = None
+    if price_receipt_migration_pin is not None:
+        migration_source = _validated_price_receipt_migration_source(
+            native_root,
+            pin=price_receipt_migration_pin,
+            snapshot=snapshot,
+            price=price,
+        )
+    elif repair_source_terms_pointer_sha256 is None:
         _require_snapshot_fresh(capture_started, now, max_snapshot_age_seconds)
     else:
         repair_source = _validated_active_terms_repair_source(
@@ -1529,6 +1911,13 @@ def activate_broker_terms(
                 raise BrokerTermsError(
                     "repair source terms pointer changed before staging"
                 )
+            if (
+                migration_source is not None
+                and expected_terms_pointer_bytes != migration_source["pointer_bytes"]
+            ):
+                raise BrokerTermsError(
+                    "price receipt migration source changed before staging"
+                )
     snapshot_id = declared_content_sha[:24]
     snapshot_path = terms_root / "snapshots" / f"{snapshot_id}.json"
     snapshot_sha = _write_or_verify_immutable_json(snapshot_path, dict(snapshot))
@@ -1547,6 +1936,7 @@ def activate_broker_terms(
     active_target_binding_count = 0
     staged_schedule_pins: list[Tuple[Path, str]] = []
     schedule_contracts_used: set[str] = set()
+    schedule_axis_cache: Dict[Path, Tuple[pd.DatetimeIndex, pd.DatetimeIndex, str]] = {}
     for symbol in roster:
         terms = dict(symbols_payload.get(symbol) or {})
         price_symbol = price_symbol_index[symbol.casefold()]
@@ -1598,7 +1988,6 @@ def activate_broker_terms(
             }
             continue
 
-        digest_cache: Dict[Path, str] = {}
         target_axis_cache: Dict[Tuple[int, str], Dict[str, Any]] = {}
         source_rejections: list[Dict[str, Any]] = []
         selected_source_completed_sessions: set[int] = set()
@@ -1624,12 +2013,11 @@ def activate_broker_terms(
                     f"{price_symbol} {candidate_timeframe}: bars pin is invalid"
                 )
             if candidate_timeframe == "D1":
-                candidate_events, candidate_sha = (
-                    _derive_d1_session_events_hashed(
-                        candidate_path,
-                        symbol_terms=terms,
-                        expected_sha256=candidate_expected_sha,
-                    )
+                candidate_events, candidate_sha = _derive_d1_session_events_hashed(
+                    candidate_path,
+                    symbol_terms=terms,
+                    expected_sha256=candidate_expected_sha,
+                    axis_cache=schedule_axis_cache,
                 )
                 candidate_metadata: Dict[str, Any] = {}
                 candidate_contract = D1_SESSION_DERIVATION_CONTRACT
@@ -1644,21 +2032,18 @@ def activate_broker_terms(
                         source_timeframe=candidate_timeframe,
                         symbol_terms=terms,
                         expected_sha256=candidate_expected_sha,
+                        axis_cache=schedule_axis_cache,
                     )
                 except ScheduleSourceUnsuitableError as exc:
                     # This exception is raised only after the exact bars
                     # payload has passed its hash and interval-axis checks.
-                    digest_cache[candidate_path.resolve()] = (
-                        candidate_expected_sha
-                    )
-                    rejected_binding = _verified_price_cell_binding(
+                    rejected_binding = _price_cell_binding_from_verified_manifest(
                         native_root,
                         candidate_entry,
                         label=(
                             f"{price_symbol} {candidate_timeframe} "
                             "rejected schedule source"
                         ),
-                        digest_cache=digest_cache,
                     )
                     source_rejections.append({
                         "timeframe": candidate_timeframe,
@@ -1670,14 +2055,10 @@ def activate_broker_terms(
                     continue
                 candidate_contract = INTRADAY_SESSION_DERIVATION_CONTRACT
 
-            digest_cache[candidate_path.resolve()] = candidate_sha
-            candidate_binding = _verified_price_cell_binding(
+            candidate_binding = _price_cell_binding_from_verified_manifest(
                 native_root,
                 candidate_entry,
-                label=(
-                    f"{price_symbol} {candidate_timeframe} schedule source"
-                ),
-                digest_cache=digest_cache,
+                label=(f"{price_symbol} {candidate_timeframe} schedule source"),
             )
             if candidate_timeframe != "D1":
                 phase_seconds = int(candidate_metadata["phase_seconds"])
@@ -1687,9 +2068,7 @@ def activate_broker_terms(
                 }
                 target_session_union: set[int] = set()
                 missing_by_target: Dict[str, Tuple[int, ...]] = {}
-                for target_timeframe, target_cell in sorted(
-                    admissible_cells.items()
-                ):
+                for target_timeframe, target_cell in sorted(admissible_cells.items()):
                     if target_timeframe == candidate_timeframe:
                         target_completed_sessions = source_completed_sessions
                     else:
@@ -1700,11 +2079,10 @@ def activate_broker_terms(
                                 native_root,
                                 target_cell,
                                 label=(
-                                    f"{price_symbol} {target_timeframe} "
-                                    "target axis"
+                                    f"{price_symbol} {target_timeframe} target axis"
                                 ),
-                                digest_cache=digest_cache,
                                 phase_seconds=phase_seconds,
+                                axis_cache=schedule_axis_cache,
                             )
                             target_axis_cache[cache_key] = target_axis
                         target_completed_sessions = set(
@@ -1850,11 +2228,12 @@ def activate_broker_terms(
         staged_schedule_pins.append((schedule_path, schedule_sha))
         target_bindings: Dict[str, Any] = {}
         for normalized_timeframe, cell in sorted(admissible_cells.items()):
-            target_bindings[normalized_timeframe] = _verified_price_cell_binding(
-                native_root,
-                cell,
-                label=f"{price_symbol} {normalized_timeframe}",
-                digest_cache=digest_cache,
+            target_bindings[normalized_timeframe] = (
+                _price_cell_binding_from_verified_manifest(
+                    native_root,
+                    cell,
+                    label=f"{price_symbol} {normalized_timeframe}",
+                )
             )
         active_target_binding_count += len(target_bindings)
         if schedule_source_timeframe == "D1":
@@ -1897,12 +2276,23 @@ def activate_broker_terms(
                     "schedule_source_selection_receipt"
                 ] = dict(schedule_source_selection_receipt)
 
+    schedule_axis_bindings = sorted(
+        (
+            {
+                "bars_relative_path": path.relative_to(native_root).as_posix(),
+                "bars_sha256": digest,
+            }
+            for path, (_opens, _closes, digest) in schedule_axis_cache.items()
+        ),
+        key=lambda value: (value["bars_relative_path"], value["bars_sha256"]),
+    )
     active_symbols = sorted(
         symbol for symbol, value in symbol_results.items()
         if value.get("status") in {AUTHENTICATED, STRESS_APPROVED}
     )
     if not active_symbols:
         raise BrokerTermsError("no symbol has an active source-bound terms schedule")
+    _validated_schedule_axis_bindings(native_root, schedule_axis_bindings)
     primary_schedule_contract = (
         D1_SESSION_SCHEDULE_SCHEMA
         if D1_SESSION_SCHEDULE_SCHEMA in schedule_contracts_used
@@ -1917,13 +2307,16 @@ def activate_broker_terms(
         "price_activation_id": price["activation_id"],
         "price_activation_manifest_sha256": price["manifest_sha256"],
         "price_active_pointer_sha256_at_creation": price["pointer_sha256"],
-        "terms_snapshot_relative_path": snapshot_path.relative_to(native_root).as_posix(),
+        "terms_snapshot_relative_path": snapshot_path.relative_to(
+            native_root
+        ).as_posix(),
         "terms_snapshot_sha256": snapshot_sha,
         "schedule_contract": primary_schedule_contract,
         "projection_contract": SWAP_PROJECTION_CONTRACT,
         "symbols": symbol_results,
         "active_symbols": active_symbols,
         "active_target_binding_count": active_target_binding_count,
+        "schedule_axis_bindings": schedule_axis_bindings,
         "unscheduled_evidence_candidate_cells": sorted(
             unscheduled_candidate_cells,
             key=lambda value: (value["symbol"], value["timeframe"]),
@@ -1942,6 +2335,21 @@ def activate_broker_terms(
         manifest["repair_source_terms_pointer_sha256"] = repair_source[
             "pointer_sha256"
         ]
+    if migration_source is not None:
+        manifest["price_receipt_migration"] = {
+            "source_terms_activation_id": migration_source["activation_id"],
+            "source_terms_manifest_sha256": migration_source["manifest_sha256"],
+            "source_terms_pointer_sha256": migration_source["pointer_sha256"],
+            "predecessor_price_activation_id": migration_source[
+                "predecessor_price_activation_id"
+            ],
+            "predecessor_price_manifest_sha256": migration_source[
+                "predecessor_price_manifest_sha256"
+            ],
+            "predecessor_price_pointer_sha256": migration_source[
+                "predecessor_price_pointer_sha256"
+            ],
+        }
     manifest_path = terms_root / "activations" / f"{activation_id}.json"
     if staged_manifest_created_at_utc is not None and not manifest_path.is_file():
         raise BrokerTermsError(
@@ -1962,36 +2370,9 @@ def activate_broker_terms(
             if _optional_pointer_bytes(terms_pointer_path) != expected_terms_pointer_bytes:
                 raise BrokerTermsError("broker-terms pointer changed during activation")
             with _native_price_pointer_lock(native_root):
-                current_price = load_current_price_activation(native_root)
-                if not _same_price_identity(price, current_price):
-                    raise BrokerTermsError(
-                        "native price authority changed during terms activation"
-                    )
-                _verify_exact_artifact(
-                    snapshot_path,
-                    snapshot_sha,
-                    "staged terms snapshot",
-                )
-                for staged_schedule_path, staged_schedule_sha in staged_schedule_pins:
-                    _verify_exact_artifact(
-                        staged_schedule_path,
-                        staged_schedule_sha,
-                        "staged D1 session schedule",
-                    )
-                _verify_exact_artifact(
-                    manifest_path,
-                    manifest_sha,
-                    "staged terms activation manifest",
-                )
                 commit_now = now + timedelta(
                     seconds=max(0.0, time.monotonic() - activation_started_monotonic)
                 )
-                if repair_source is None:
-                    _require_snapshot_fresh(
-                        capture_started,
-                        commit_now,
-                        max_snapshot_age_seconds,
-                    )
                 pointer = {
                     "schema_version": TERMS_ACTIVE_POINTER_SCHEMA,
                     "activation_id": activation_id,
@@ -2001,35 +2382,54 @@ def activate_broker_terms(
                     "activated_at_utc": _iso(commit_now),
                 }
 
-                def _check_fresh_immediately_before_replace() -> None:
-                    if repair_source is not None:
-                        return
-                    replace_now = now + timedelta(
-                        seconds=max(
-                            0.0,
-                            time.monotonic() - activation_started_monotonic,
+                def _validate_immediately_before_replace() -> None:
+                    revalidate_price_authority()
+                    _verify_exact_artifact(
+                        snapshot_path,
+                        snapshot_sha,
+                        "staged terms snapshot",
+                    )
+                    for (
+                        staged_schedule_path,
+                        staged_schedule_sha,
+                    ) in staged_schedule_pins:
+                        _verify_exact_artifact(
+                            staged_schedule_path,
+                            staged_schedule_sha,
+                            "staged D1 session schedule",
                         )
+                    _verify_exact_artifact(
+                        manifest_path,
+                        manifest_sha,
+                        "staged terms activation manifest",
                     )
-                    _require_snapshot_fresh(
-                        capture_started,
-                        replace_now,
-                        max_snapshot_age_seconds,
+                    _rehash_schedule_axis_bindings(
+                        native_root,
+                        schedule_axis_bindings,
                     )
+                    if repair_source is None and migration_source is None:
+                        replace_now = now + timedelta(
+                            seconds=max(
+                                0.0,
+                                time.monotonic() - activation_started_monotonic,
+                            )
+                        )
+                        _require_snapshot_fresh(
+                            capture_started,
+                            replace_now,
+                            max_snapshot_age_seconds,
+                        )
 
                 _atomic_replace_json(
                     terms_pointer_path,
                     pointer,
-                    before_replace=_check_fresh_immediately_before_replace,
+                    before_replace=_validate_immediately_before_replace,
                 )
                 pointer_updated = True
     else:
         with _terms_pointer_lock(native_root):
             with _native_price_pointer_lock(native_root):
-                current_price = load_current_price_activation(native_root)
-                if not _same_price_identity(price, current_price):
-                    raise BrokerTermsError(
-                        "native price authority changed during terms activation"
-                    )
+                revalidate_price_authority()
                 _verify_exact_artifact(
                     snapshot_path,
                     snapshot_sha,
@@ -2046,10 +2446,14 @@ def activate_broker_terms(
                     manifest_sha,
                     "staged terms activation manifest",
                 )
+                _rehash_schedule_axis_bindings(
+                    native_root,
+                    schedule_axis_bindings,
+                )
                 staged_now = now + timedelta(
                     seconds=max(0.0, time.monotonic() - activation_started_monotonic)
                 )
-                if repair_source is None:
+                if repair_source is None and migration_source is None:
                     _require_snapshot_fresh(
                         capture_started,
                         staged_now,
@@ -2063,7 +2467,48 @@ def activate_broker_terms(
     }
 
 
-def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str) -> Dict[str, Any]:
+def activate_broker_terms(
+    native_root: Path,
+    snapshot: Mapping[str, Any],
+    *,
+    activation_id: Optional[str] = None,
+    now_utc: Optional[datetime] = None,
+    update_pointer: bool = True,
+    max_snapshot_age_seconds: int = 3600,
+    repair_source_terms_pointer_sha256: Optional[str] = None,
+    price_receipt_migration_pin: Optional[Mapping[str, Any]] = None,
+    staged_manifest_created_at_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Bind terms through exactly one receipt-backed price authority scope."""
+
+    native_root = Path(native_root).resolve()
+    with _receipt_backed_price_authority_scope(native_root) as (
+        price,
+        revalidate_price_authority,
+    ):
+        return _activate_broker_terms_with_price_authority(
+            native_root,
+            snapshot,
+            price=price,
+            revalidate_price_authority=revalidate_price_authority,
+            activation_id=activation_id,
+            now_utc=now_utc,
+            update_pointer=update_pointer,
+            max_snapshot_age_seconds=max_snapshot_age_seconds,
+            repair_source_terms_pointer_sha256=(repair_source_terms_pointer_sha256),
+            price_receipt_migration_pin=price_receipt_migration_pin,
+            staged_manifest_created_at_utc=staged_manifest_created_at_utc,
+        )
+
+
+def _resolve_active_swap_contract_with_price_authority(
+    native_root: Path,
+    symbol: str,
+    timeframe: str,
+    *,
+    price: Mapping[str, Any],
+    revalidate_price_authority: Callable[[], None],
+) -> Dict[str, Any]:
     native_root = Path(native_root).resolve()
     terms_root = native_root / "terms"
     pointer, pointer_sha, pointer_bytes = _load_json_bounded_hashed(
@@ -2082,11 +2527,19 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
         or str(manifest.get("activation_id") or "") != str(pointer.get("activation_id") or "")
     ):
         raise BrokerTermsError("terms activation manifest identity/schema is invalid")
-    price = load_current_price_activation(native_root)
     if str(manifest.get("price_activation_manifest_sha256") or "") != price["manifest_sha256"]:
         raise BrokerTermsError("terms overlay is bound to a different price activation")
     if str(pointer.get("price_activation_manifest_sha256") or "") != price["manifest_sha256"]:
         raise BrokerTermsError("terms pointer price binding mismatch")
+    if (
+        str(manifest.get("price_active_pointer_sha256_at_creation") or "").lower()
+        != price["pointer_sha256"]
+    ):
+        raise BrokerTermsError("terms price ACTIVE pointer binding mismatch")
+    _validated_schedule_axis_bindings(
+        native_root,
+        manifest.get("schedule_axis_bindings"),
+    )
     raw_schedule_contracts = manifest.get("schedule_contracts")
     if raw_schedule_contracts is None:
         declared_schedule_contracts = [str(manifest.get("schedule_contract") or "")]
@@ -2144,12 +2597,10 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
     if not _price_cell_is_admissible(price, price_symbol, tf, price_cell):
         raise BrokerTermsError(f"{price_symbol} {tf}: target price cell is not admissible")
 
-    digest_cache: Dict[Path, str] = {}
-    expected_target_binding = _verified_price_cell_binding(
+    expected_target_binding = _price_cell_binding_from_verified_manifest(
         native_root,
         price_cell,
         label=f"{price_symbol} {tf} target artifact",
-        digest_cache=digest_cache,
     )
     if _canonical_bytes(binding) != _canonical_bytes(expected_target_binding):
         raise BrokerTermsError(f"{price_symbol} {tf}: target price binding mismatch")
@@ -2319,14 +2770,12 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
                         "terms record schedule-source rejection digest is invalid"
                     )
                 rejected_timeframe = str(rejection["timeframe"])
-                expected_rejected_binding = _verified_price_cell_binding(
+                expected_rejected_binding = _price_cell_binding_from_verified_manifest(
                     native_root,
                     admissible_source_cells[rejected_timeframe],
                     label=(
-                        f"{price_symbol} {rejected_timeframe} rejected "
-                        "schedule source"
+                        f"{price_symbol} {rejected_timeframe} rejected schedule source"
                     ),
-                    digest_cache=digest_cache,
                 )
                 if _canonical_bytes(
                     rejection["binding"]
@@ -2428,11 +2877,10 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
             raise BrokerTermsError("terms record lacks its D1 artifact binding")
 
     schedule_source_cell = admissible_source_cells[schedule_source_timeframe]
-    expected_schedule_source_binding = _verified_price_cell_binding(
+    expected_schedule_source_binding = _price_cell_binding_from_verified_manifest(
         native_root,
         schedule_source_cell,
         label=f"{price_symbol} {schedule_source_timeframe} schedule source",
-        digest_cache=digest_cache,
     )
     if _canonical_bytes(schedule_source_binding) != _canonical_bytes(
         expected_schedule_source_binding
@@ -2440,7 +2888,7 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
         raise BrokerTermsError(f"{price_symbol}: schedule-source binding mismatch")
 
     schedule_path = _safe_relative(native_root, record.get("schedule_relative_path"))
-    schedule, schedule_sha, _schedule_bytes = _load_json_bounded_hashed(schedule_path)
+    schedule, schedule_sha, schedule_bytes = _load_json_bounded_hashed(schedule_path)
     if schedule_sha != str(record.get("schedule_sha256") or ""):
         raise BrokerTermsError("session schedule hash mismatch")
     schedule_schema = str(schedule.get("schema_version") or "")
@@ -2489,7 +2937,7 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
     ):
         raise BrokerTermsError("D1 session schedule binding/schema mismatch")
     snapshot_path = _safe_relative(native_root, manifest.get("terms_snapshot_relative_path"))
-    snapshot, snapshot_sha, _snapshot_bytes = _load_json_bounded_hashed(snapshot_path)
+    snapshot, snapshot_sha, snapshot_bytes = _load_json_bounded_hashed(snapshot_path)
     if snapshot_sha != str(manifest.get("terms_snapshot_sha256") or ""):
         raise BrokerTermsError("terms snapshot hash mismatch")
     _validate_terms_snapshot(snapshot)
@@ -2510,17 +2958,18 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
         raise BrokerTermsError("symbol terms record hash mismatch")
     stress_policy = dict(snapshot.get("stress_policy") or {})
     stress_approved = record["status"] == STRESS_APPROVED
-    if (
-        _read_bounded(terms_root / "ACTIVE.json", 1024 * 1024) != pointer_bytes
-        or _read_bounded(manifest_path, 64 * 1024 * 1024) != manifest_bytes
-    ):
-        raise BrokerTermsError("broker terms activation changed during resolution")
-    if (
-        _read_bounded(price["pointer_path"], 1024 * 1024) != price["pointer_bytes"]
-        or _read_bounded(price["manifest_path"], 64 * 1024 * 1024)
-        != price["manifest_bytes"]
-    ):
-        raise BrokerTermsError("native price authority changed during terms resolution")
+    with _terms_pointer_lock(native_root):
+        with _native_price_pointer_lock(native_root):
+            if (
+                _read_bounded(terms_root / "ACTIVE.json", 1024 * 1024) != pointer_bytes
+                or _read_bounded(manifest_path, 64 * 1024 * 1024) != manifest_bytes
+                or _read_bounded(snapshot_path, 64 * 1024 * 1024) != snapshot_bytes
+                or _read_bounded(schedule_path, 64 * 1024 * 1024) != schedule_bytes
+            ):
+                raise BrokerTermsError(
+                    "broker terms activation changed during resolution"
+                )
+            revalidate_price_authority()
     return {
         "status": "AVAILABLE",
         "schedule_provenance_status": record["status"],
@@ -2563,6 +3012,27 @@ def resolve_active_swap_contract(native_root: Path, symbol: str, timeframe: str)
         "terms": terms,
         "events": list(schedule.get("events") or []),
     }
+
+
+def resolve_active_swap_contract(
+    native_root: Path,
+    symbol: str,
+    timeframe: str,
+) -> Dict[str, Any]:
+    """Resolve one terms contract without reopening any raw price leaf."""
+
+    native_root = Path(native_root).resolve()
+    with _receipt_backed_price_authority_scope(native_root) as (
+        price,
+        revalidate_price_authority,
+    ):
+        return _resolve_active_swap_contract_with_price_authority(
+            native_root,
+            symbol,
+            timeframe,
+            price=price,
+            revalidate_price_authority=revalidate_price_authority,
+        )
 
 
 def write_capture_request(

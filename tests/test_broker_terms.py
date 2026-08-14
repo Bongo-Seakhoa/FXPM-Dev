@@ -19,6 +19,7 @@ from tools.capture_activate_broker_terms import main as capture_main
 
 
 UTC = timezone.utc
+_REAL_RECEIPT_BACKED_SCOPE = terms._receipt_backed_price_authority_scope
 
 
 def _sha(path: Path) -> str:
@@ -85,6 +86,58 @@ def _parse_snapshot(tmp_path: Path, symbols=("EURUSD",), now=None):
         requested_at_utc=now - timedelta(minutes=3),
         now_utc=now,
     )
+    return snapshot
+
+
+def _full_receipt_terms_snapshot(now: datetime) -> dict:
+    from pm_native_request_contract import PRODUCTION_SYMBOL_ORDER
+
+    symbols = {
+        native_symbol.upper(): {
+            "canonical_symbol": native_symbol.upper(),
+            "broker_symbol": native_symbol.upper(),
+            "swap_mode": 1,
+            "swap_long": -1.25,
+            "swap_short": 0.5,
+            "swap_rollover3days": 3,
+            "weekday_factors": {
+                "sunday": 0,
+                "monday": 1,
+                "tuesday": 1,
+                "wednesday": 3,
+                "thursday": 1,
+                "friday": 1,
+                "saturday": 0,
+            },
+            "d1_anchors": [
+                {
+                    "open_epoch": int(pd.Timestamp("2025-01-06T00:00:00Z").timestamp()),
+                    "server_weekday": 1,
+                }
+            ],
+            "provenance_status": terms.AUTHENTICATED,
+        }
+        for native_symbol in PRODUCTION_SYMBOL_ORDER
+    }
+    captured = now.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    snapshot = {
+        "schema_version": terms.TERMS_SNAPSHOT_SCHEMA,
+        "provenance_status": terms.AUTHENTICATED,
+        "extractor_contract": "mql5-symbolinfo-direct-v1",
+        "nonce": "r" * 48,
+        "captured_at_utc": captured,
+        "capture_started_at_utc": captured,
+        "broker_identity": {
+            "broker_server": "Broker-Demo",
+            "terminal_company": "Broker Ltd",
+            "account_currency": "USD",
+            "terminal_build": 5001,
+        },
+        "roster": sorted(symbols),
+        "symbols": symbols,
+        "source_export_sha256": "d" * 64,
+    }
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
     return snapshot
 
 
@@ -294,6 +347,26 @@ def _write_price_fixture(tmp_path: Path, *, price_symbol: str = "EURUSD"):
     return native, d1_path, m5_path
 
 
+@pytest.fixture(autouse=True)
+def _compact_receipt_backed_price_scope(monkeypatch):
+    """Adapt compact unit authorities at the one production scope seam."""
+
+    @contextmanager
+    def scope(native_root):
+        price = terms.load_current_price_activation(native_root)
+
+        def revalidate():
+            current = terms.load_current_price_activation(native_root)
+            if not terms._same_price_identity(price, current):
+                raise terms.BrokerTermsError(
+                    "receipt-backed native price authority changed"
+                )
+
+        yield price, revalidate
+
+    monkeypatch.setattr(terms, "_receipt_backed_price_authority_scope", scope)
+
+
 def _promote_price_fixture(
     native: Path,
     *,
@@ -345,6 +418,30 @@ def _promote_price_fixture(
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     pointer["manifest_sha256"] = _sha(manifest_path)
     pointer["production_authoritative"] = True
+    pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
+
+
+def _move_compact_price_to_receipt_identity(native: Path) -> None:
+    """Move the compact test price to a distinct receipt-bearing identity."""
+
+    pointer_path = native / "ACTIVE.json"
+    predecessor_pointer_sha256 = _sha(pointer_path)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    predecessor_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(predecessor_path.read_text(encoding="utf-8"))
+    manifest["activation_id"] = "price-a2"
+    manifest["previous_active_pointer_sha256"] = predecessor_pointer_sha256
+    manifest["semantic_receipt_relative_path"] = "semantic_receipts/price-a2.json"
+    manifest["semantic_receipt_sha256"] = "e" * 64
+    successor_path = native / "activations" / "price-a2.json"
+    successor_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer.update(
+        {
+            "activation_id": "price-a2",
+            "manifest_relative_path": successor_path.relative_to(native).as_posix(),
+            "manifest_sha256": _sha(successor_path),
+        }
+    )
     pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
 
 
@@ -565,10 +662,12 @@ def test_activation_binds_existing_price_hashes_and_projects_close_and_gap(tmp_p
 
     original_m5 = m5_path.read_bytes()
     m5_path.write_bytes(original_m5 + b"\n")
-    with pytest.raises(
-        terms.BrokerTermsError, match="target artifact.*hash mismatch"
-    ):
-        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    # Runtime trusts the receipt-backed price manifest and the immutable terms
+    # schedule; it does not repeat raw price-leaf verification.
+    assert (
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")["target_bars_sha256"]
+        == hashlib.sha256(original_m5).hexdigest()
+    )
     m5_path.write_bytes(original_m5)
 
     # Changing the current price pointer invalidates the overlay immediately.
@@ -577,6 +676,73 @@ def test_activation_binds_existing_price_hashes_and_projects_close_and_gap(tmp_p
     (native / "ACTIVE.json").write_text(json.dumps(pointer), encoding="utf-8")
     with pytest.raises(terms.BrokerTermsError, match="price manifest hash"):
         terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+
+def test_activation_enters_one_price_authority_scope(tmp_path, monkeypatch):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    inherited_scope = terms._receipt_backed_price_authority_scope
+    observed = {"entries": 0, "revalidations": 0}
+
+    @contextmanager
+    def counted_scope(root):
+        observed["entries"] += 1
+        with inherited_scope(root) as (price, revalidate):
+
+            def counted_revalidate():
+                observed["revalidations"] += 1
+                revalidate()
+
+            yield price, counted_revalidate
+
+    monkeypatch.setattr(
+        terms,
+        "_receipt_backed_price_authority_scope",
+        counted_scope,
+    )
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+    assert observed == {"entries": 1, "revalidations": 1}
+
+
+def test_schedule_axis_mutation_immediately_before_cas_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    native, d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    real_atomic_replace = terms._atomic_replace_json
+
+    def mutate_axis_before_validation(path, value, *, before_replace=None):
+        assert before_replace is not None
+        if Path(path) == native / "terms" / "ACTIVE.json":
+            d1_path.write_bytes(d1_path.read_bytes() + b"\n")
+        return real_atomic_replace(
+            path,
+            value,
+            before_replace=before_replace,
+        )
+
+    monkeypatch.setattr(terms, "_atomic_replace_json", mutate_axis_before_validation)
+    with pytest.raises(
+        terms.BrokerTermsError,
+        match="staged price schedule axis hash mismatch",
+    ):
+        terms.activate_broker_terms(native, snapshot, now_utc=now)
+
+    assert not (native / "terms" / "ACTIVE.json").exists()
 
 
 def test_promoted_v4_binds_candidates_and_rejects_terminal_technical_cells(tmp_path):
@@ -664,6 +830,152 @@ def test_promoted_intraday_fallback_builds_one_daily_schedule_from_good_proxy(
         terms.resolve_active_swap_contract(native, "EURUSD", "D1")
 
 
+def test_actual_schedule_axes_are_parsed_once_and_persisted_as_a_sorted_set(
+    tmp_path,
+    monkeypatch,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    source_path, _source_sidecar = _promote_intraday_fallback_fixture(
+        native,
+        source_timeframe="H4",
+    )
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    real_reader = terms._read_interval_axis_hashed
+    reads = []
+
+    def observed_reader(path, **kwargs):
+        reads.append(Path(path).resolve())
+        return real_reader(path, **kwargs)
+
+    monkeypatch.setattr(terms, "_read_interval_axis_hashed", observed_reader)
+    activated = terms.activate_broker_terms(native, snapshot, now_utc=now)
+    bindings = activated["schedule_axis_bindings"]
+
+    assert bindings == sorted(
+        bindings,
+        key=lambda value: (value["bars_relative_path"], value["bars_sha256"]),
+    )
+    assert len(bindings) == 2
+    assert set(reads) == {
+        source_path.resolve(),
+        (native / "runs/r1/EURUSD/M5.csv").resolve(),
+    }
+    assert all(reads.count(path) == 1 for path in set(reads))
+
+
+def test_real_receipt_authority_observes_current_104_axis_surface(
+    tmp_path,
+    monkeypatch,
+):
+    import pm_native_activation as native_activation
+    from pm_native_request_contract import PRODUCTION_SYMBOL_ORDER
+    from tests.native_v5_support import write_receipt_backed_v5_authority
+
+    native = tmp_path / "native"
+    write_receipt_backed_v5_authority(
+        native,
+        current_schedule_surface=True,
+    )
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _full_receipt_terms_snapshot(now)
+    reads = []
+    scopes = []
+    real_reader = terms._read_interval_axis_hashed
+    real_scope_factory = (
+        native_activation.production_native_authority_verification_scope
+    )
+
+    def observed_scope_factory():
+        scope = real_scope_factory()
+        scopes.append(scope)
+        return scope
+
+    def observed_reader(path, **kwargs):
+        reads.append(Path(path).resolve())
+        return real_reader(path, **kwargs)
+
+    monkeypatch.setattr(
+        terms,
+        "_receipt_backed_price_authority_scope",
+        _REAL_RECEIPT_BACKED_SCOPE,
+    )
+    monkeypatch.setattr(
+        native_activation,
+        "production_native_authority_verification_scope",
+        observed_scope_factory,
+    )
+    monkeypatch.setattr(terms, "_read_interval_axis_hashed", observed_reader)
+    activated = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="receipt-backed-terms",
+        now_utc=now,
+    )
+
+    bindings = activated["schedule_axis_bindings"]
+    assert len(bindings) == 104
+    assert len(reads) == len(set(reads)) == 104
+    assert len(activated["active_symbols"]) == 100
+    assert len(scopes) == 1
+    assert scopes[0].stats()["full_verification_count"] == 1
+    assert scopes[0].stats()["identity_revalidation_count"] == 1
+    assert (
+        activated["symbols"][PRODUCTION_SYMBOL_ORDER[-1].upper()][
+            "schedule_source_timeframe"
+        ]
+        == "H4"
+    )
+
+    native_root = native.resolve()
+    real_path_open = Path.open
+
+    def is_raw_price_leaf(path):
+        candidate = Path(path).resolve()
+        return (
+            candidate == native_root or native_root in candidate.parents
+        ) and (
+            candidate.suffix.lower() == ".csv"
+            or candidate.name.endswith(".meta.json")
+        )
+
+    def no_raw_path_open(path, *args, **kwargs):
+        if is_raw_price_leaf(path):
+            pytest.fail(f"runtime opened raw price leaf: {path}")
+        return real_path_open(path, *args, **kwargs)
+
+    def no_selected_resolver(*_args, **_kwargs):
+        pytest.fail("runtime called a selected native resolver")
+
+    monkeypatch.setattr(Path, "open", no_raw_path_open)
+    monkeypatch.setattr(
+        native_activation,
+        "resolve_active_native_universe",
+        no_selected_resolver,
+    )
+    monkeypatch.setattr(
+        native_activation,
+        "_resolve_active_native_universe_uncached",
+        no_selected_resolver,
+    )
+    monkeypatch.setattr(
+        native_activation,
+        "resolve_active_native_artifact",
+        no_selected_resolver,
+    )
+    resolved = terms.resolve_active_swap_contract(
+        native,
+        PRODUCTION_SYMBOL_ORDER[-1],
+        "M5",
+    )
+
+    assert resolved["schedule_source_timeframe"] == "H4"
+    assert len(scopes) == 2
+    assert scopes[1].stats()["full_verification_count"] == 1
+    assert scopes[1].stats()["identity_revalidation_count"] == 1
+
+
 def test_promoted_d1_remains_preferred_and_keeps_the_v2_record_shape(tmp_path):
     native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
     _promote_price_fixture(native)
@@ -710,7 +1022,7 @@ def test_receipt_backed_generic_schedule_cannot_override_admissible_d1(
     _promote_intraday_fallback_fixture(native, source_timeframe="H4")
     now = datetime(2026, 4, 13, 12, tzinfo=UTC)
     snapshot = _parse_snapshot(tmp_path, now=now)
-    activated = terms.activate_broker_terms(native, snapshot, now_utc=now)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
 
     receipt = {
         "schema_version": terms.SCHEDULE_SOURCE_SELECTION_SCHEMA,
@@ -774,7 +1086,7 @@ def test_receipt_backed_generic_schedule_cannot_override_admissible_d1(
 
 
 @pytest.mark.parametrize("artifact", ["bars", "sidecar"])
-def test_intraday_schedule_source_is_reopened_and_tamper_rejected(
+def test_intraday_runtime_does_not_reopen_raw_schedule_source(
     tmp_path,
     artifact,
 ):
@@ -787,7 +1099,85 @@ def test_intraday_schedule_source_is_reopened_and_tamper_rejected(
 
     damaged = source_path if artifact == "bars" else source_sidecar
     damaged.write_bytes(damaged.read_bytes() + b"\n")
-    with pytest.raises(terms.BrokerTermsError, match="schedule source.*hash mismatch"):
+    assert (
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")[
+            "schedule_source_timeframe"
+        ]
+        == "H4"
+    )
+
+
+@pytest.mark.parametrize("intraday", [False, True])
+def test_runtime_performs_zero_raw_price_leaf_reads(
+    tmp_path,
+    monkeypatch,
+    intraday,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    if intraday:
+        _promote_price_fixture(native)
+        _promote_intraday_fallback_fixture(native)
+    else:
+        snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+            {"open_epoch": 1775433600, "server_weekday": 1}
+        ]
+        snapshot.pop("content_sha256")
+        snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+    real_read = terms._read_bounded
+    real_sha = terms.sha256_file
+
+    def no_raw_read(path, max_bytes):
+        if Path(path).suffix.lower() in {".csv", ".meta"} or str(path).endswith(
+            ".meta.json"
+        ):
+            pytest.fail(f"runtime reopened raw price leaf: {path}")
+        return real_read(path, max_bytes)
+
+    def no_raw_sha(path):
+        if Path(path).suffix.lower() == ".csv" or str(path).endswith(".meta.json"):
+            pytest.fail(f"runtime rehashed raw price leaf: {path}")
+        return real_sha(path)
+
+    monkeypatch.setattr(terms, "_read_bounded", no_raw_read)
+    monkeypatch.setattr(terms, "sha256_file", no_raw_sha)
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+
+    assert resolved["schedule_source_timeframe"] == ("H4" if intraday else "D1")
+
+
+def test_runtime_receipt_identity_drift_fails_closed(tmp_path, monkeypatch):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+    inherited_scope = terms._receipt_backed_price_authority_scope
+
+    @contextmanager
+    def receipt_drift_scope(root):
+        with inherited_scope(root) as (price, revalidate):
+
+            def receipt_drift():
+                revalidate()
+                raise terms.BrokerTermsError(
+                    "receipt-backed native price authority changed"
+                )
+
+            yield price, receipt_drift
+
+    monkeypatch.setattr(
+        terms,
+        "_receipt_backed_price_authority_scope",
+        receipt_drift_scope,
+    )
+    with pytest.raises(terms.BrokerTermsError, match="receipt-backed"):
         terms.resolve_active_swap_contract(native, "EURUSD", "M5")
 
 
@@ -1017,7 +1407,7 @@ def test_promoted_v4_rejects_casefold_colliding_native_symbols(tmp_path):
         terms.activate_broker_terms(native, snapshot, now_utc=now)
 
 
-def test_non_d1_resolution_reopens_the_d1_schedule_source_bars(tmp_path):
+def test_non_d1_resolution_does_not_reopen_d1_schedule_source_bars(tmp_path):
     native, d1_path, _m5_path = _write_price_fixture(tmp_path)
     now = datetime(2026, 4, 13, 12, tzinfo=UTC)
     snapshot = _parse_snapshot(tmp_path, now=now)
@@ -1030,11 +1420,15 @@ def test_non_d1_resolution_reopens_the_d1_schedule_source_bars(tmp_path):
     original = d1_path.read_bytes()
     d1_path.write_bytes(original + b"\n")
 
-    with pytest.raises(terms.BrokerTermsError, match="D1|schedule source"):
-        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert (
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")[
+            "schedule_source_timeframe"
+        ]
+        == "D1"
+    )
 
 
-def test_non_d1_resolution_reopens_the_d1_schedule_source_sidecar(tmp_path):
+def test_non_d1_resolution_does_not_reopen_d1_schedule_source_sidecar(tmp_path):
     native, d1_path, _m5_path = _write_price_fixture(tmp_path)
     now = datetime(2026, 4, 13, 12, tzinfo=UTC)
     snapshot = _parse_snapshot(tmp_path, now=now)
@@ -1047,8 +1441,12 @@ def test_non_d1_resolution_reopens_the_d1_schedule_source_sidecar(tmp_path):
     d1_sidecar = d1_path.with_name("D1.meta.json")
     d1_sidecar.write_text('{"tampered": true}', encoding="utf-8")
 
-    with pytest.raises(terms.BrokerTermsError, match="D1|schedule source"):
-        terms.resolve_active_swap_contract(native, "EURUSD", "M5")
+    assert (
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")[
+            "schedule_source_timeframe"
+        ]
+        == "D1"
+    )
 
 
 def test_explicit_stress_is_adverse_and_never_implicit(tmp_path):
@@ -1597,6 +1995,127 @@ def test_exact_active_overlay_pin_allows_stale_schedule_repair_only(tmp_path):
     ] == "exact-pinned-repair"
 
 
+def test_price_receipt_migration_requires_exact_pin_and_rebinds_once(
+    tmp_path,
+    monkeypatch,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    predecessor = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="pre-receipt-terms",
+        now_utc=now,
+    )
+    predecessor_pointer_path = native / "terms" / "ACTIVE.json"
+    predecessor_pointer_sha = _sha(predecessor_pointer_path)
+    pin = terms.build_price_receipt_migration_pin(
+        native,
+        prepared_at_utc=now,
+    )
+    assert pin["source_terms_active_pointer_sha256"] == predecessor_pointer_sha
+    assert pin["source_terms_manifest_sha256"] == predecessor["manifest_sha256"]
+
+    _move_compact_price_to_receipt_identity(native)
+
+    @contextmanager
+    def receipt_scope(root):
+        price = terms.load_current_price_activation(root)
+        price["semantic_receipt_sha256"] = "e" * 64
+
+        def revalidate():
+            current = terms.load_current_price_activation(root)
+            if not terms._same_price_identity(price, current):
+                raise terms.BrokerTermsError(
+                    "receipt-backed native price authority changed"
+                )
+
+        yield price, revalidate
+
+    monkeypatch.setattr(
+        terms,
+        "_receipt_backed_price_authority_scope",
+        receipt_scope,
+    )
+    with pytest.raises(
+        terms.BrokerTermsError,
+        match="different price activation",
+    ):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="ordinary-repair-cannot-cross-price",
+            now_utc=now + timedelta(days=30),
+            repair_source_terms_pointer_sha256=predecessor_pointer_sha,
+        )
+    wrong_pin = dict(pin)
+    wrong_pin["source_terms_active_pointer_sha256"] = "0" * 64
+    with pytest.raises(terms.BrokerTermsError, match="source pin mismatch"):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="wrong-migration-pin",
+            now_utc=now + timedelta(days=30),
+            price_receipt_migration_pin=wrong_pin,
+        )
+    assert _sha(predecessor_pointer_path) == predecessor_pointer_sha
+
+    price_pointer = json.loads((native / "ACTIVE.json").read_text(encoding="utf-8"))
+    price_manifest_path = native / price_pointer["manifest_relative_path"]
+    price_manifest = json.loads(price_manifest_path.read_text(encoding="utf-8"))
+    price_manifest["previous_active_pointer_sha256"] = "f" * 64
+    price_manifest_path.write_text(json.dumps(price_manifest), encoding="utf-8")
+    price_pointer["manifest_sha256"] = _sha(price_manifest_path)
+    (native / "ACTIVE.json").write_text(json.dumps(price_pointer), encoding="utf-8")
+    with pytest.raises(terms.BrokerTermsError, match="direct receipt-backed"):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="unrelated-receipt-successor",
+            now_utc=now + timedelta(days=30),
+            price_receipt_migration_pin=pin,
+        )
+    price_manifest["previous_active_pointer_sha256"] = pin[
+        "predecessor_price_active_pointer_sha256"
+    ]
+    price_manifest_path.write_text(json.dumps(price_manifest), encoding="utf-8")
+    price_pointer["manifest_sha256"] = _sha(price_manifest_path)
+    (native / "ACTIVE.json").write_text(json.dumps(price_pointer), encoding="utf-8")
+
+    rebound = terms.activate_broker_terms(
+        native,
+        snapshot,
+        activation_id="receipt-rebound-terms",
+        now_utc=now + timedelta(days=30),
+        price_receipt_migration_pin=pin,
+    )
+    migration = rebound["price_receipt_migration"]
+    assert rebound["price_activation_id"] == "price-a2"
+    assert migration["source_terms_activation_id"] == "pre-receipt-terms"
+    assert migration["source_terms_pointer_sha256"] == predecessor_pointer_sha
+    assert (
+        terms.resolve_active_swap_contract(native, "EURUSD", "M5")[
+            "terms_activation_id"
+        ]
+        == "receipt-rebound-terms"
+    )
+
+    with pytest.raises(terms.BrokerTermsError, match="source pin mismatch"):
+        terms.activate_broker_terms(
+            native,
+            snapshot,
+            activation_id="migration-pin-reuse",
+            now_utc=now + timedelta(days=30),
+            price_receipt_migration_pin=pin,
+        )
+
+
 def test_exact_promoted_manifest_terms_schedulability_classification():
     repository = Path(__file__).resolve().parents[1]
     manifest_path = (
@@ -1692,6 +2211,85 @@ def test_capture_command_returns_honest_wait_state_and_has_no_history_api(tmp_pa
     assert output["observed_stale_nonce"] == "f" * 48
     source = inspect.getsource(__import__("tools.capture_activate_broker_terms", fromlist=["main"]))
     assert "copy_" + "rates" not in source
+
+
+def test_capture_cli_prepares_exact_pin_and_consumes_only_after_success(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    native, _d1_path, _m5_path = _write_price_fixture(tmp_path)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [
+        {"open_epoch": 1775433600, "server_weekday": 1}
+    ]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    terms.activate_broker_terms(native, snapshot, now_utc=now)
+    pin_path = tmp_path / "terms-receipt-migration.pin.json"
+
+    code = capture_main(
+        [
+            "--native-root",
+            str(native),
+            "--prepare-price-receipt-migration-pin",
+            str(pin_path),
+        ]
+    )
+    prepared = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert prepared["status"] == "MIGRATION_PIN_PREPARED"
+    assert prepared["sha256"] == _sha(pin_path)
+
+    code = capture_main(
+        [
+            "--native-root",
+            str(native),
+            "--complete-price-receipt-migration-pin",
+            str(pin_path),
+            "--price-receipt-migration-pin-sha256",
+            "0" * 64,
+        ]
+    )
+    invalid = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert invalid["status"] == "INVALID"
+    assert pin_path.is_file()
+
+    calls = []
+
+    def complete(root, pinned_snapshot, **kwargs):
+        calls.append((Path(root), pinned_snapshot, dict(kwargs)))
+        return {
+            "activation_id": "receipt-rebound",
+            "manifest_sha256": "f" * 64,
+            "pointer_updated": True,
+            "active_symbols": ["EURUSD"],
+        }
+
+    monkeypatch.setattr(capture_cli, "activate_broker_terms", complete)
+    code = capture_main(
+        [
+            "--native-root",
+            str(native),
+            "--complete-price-receipt-migration-pin",
+            str(pin_path),
+            "--price-receipt-migration-pin-sha256",
+            prepared["sha256"],
+        ]
+    )
+    completed = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert completed["status"] == "COMPLETE"
+    assert completed["pin_consumption"]["status"] == "CONSUMED"
+    assert not pin_path.exists()
+    assert len(calls) == 1
+    assert calls[0][0] == native
+    assert calls[0][2]["price_receipt_migration_pin"]["schema_version"] == (
+        terms.TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA
+    )
 
 
 def _prepare_mock_capture_publication(tmp_path, monkeypatch):
