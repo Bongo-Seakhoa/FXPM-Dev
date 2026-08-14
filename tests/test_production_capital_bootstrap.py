@@ -1562,11 +1562,12 @@ def test_directory_discovery_is_bounded_before_stack_growth(
             st_file_attributes=0,
         )
 
-    monkeypatch.setattr(bootstrap.os, "scandir", lazy_scandir)
-    monkeypatch.setattr(bootstrap.os, "listdir", forbidden_listdir)
-    monkeypatch.setattr(bootstrap.os, "lstat", no_follow_lstat)
-    with pytest.raises(bootstrap.ProductionCapitalBootstrapError, match=error):
-        scanner(root)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(bootstrap.os, "scandir", lazy_scandir)
+        scoped.setattr(bootstrap.os, "listdir", forbidden_listdir)
+        scoped.setattr(bootstrap.os, "lstat", no_follow_lstat)
+        with pytest.raises(bootstrap.ProductionCapitalBootstrapError, match=error):
+            scanner(root)
     assert consumed == limit
     assert scandir_calls == 1
     assert listdir_calls == 0

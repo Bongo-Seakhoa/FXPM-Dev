@@ -59,9 +59,12 @@ def test_demo_partial_expiry_notifies_once_without_authority_calls(
     app.portfolio_manager.retrain_all_needed.assert_not_called()
 
 
-def test_demo_all_expired_transition_is_latched_and_management_only() -> None:
+def test_demo_all_expired_transition_is_latched_and_management_only(
+    monkeypatch,
+) -> None:
     now = datetime(2026, 7, 26, 2, 0, tzinfo=timezone.utc)
     app = _app(now)
+    monkeypatch.setenv("PM_CONFIG_PATH", "config.json")
 
     app._check_demo_refit_expiry_notice(now=now)
     app.trader._current_refit_demo_configs["GBPUSD"].valid_until = (

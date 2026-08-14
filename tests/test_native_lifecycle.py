@@ -2221,6 +2221,7 @@ def test_reservation_only_work_never_mutates_native_or_cold_data(tmp_path: Path)
     native_file.write_bytes(b"time,close\n1,2\n")
     cold_file.write_bytes(b"immutable-cold")
     before_native, before_cold = _snapshot(roots["native"]), _snapshot(roots["cold"])
+    mt5_module_before = sys.modules.get("MetaTrader5")
 
     authority = _authority(roots, _limits(), provision=True)
     with authority.lease("read-only-preflight") as lease:
@@ -2231,7 +2232,7 @@ def test_reservation_only_work_never_mutates_native_or_cold_data(tmp_path: Path)
 
     assert _snapshot(roots["native"]) == before_native
     assert _snapshot(roots["cold"]) == before_cold
-    assert "MetaTrader5" not in sys.modules
+    assert sys.modules.get("MetaTrader5") is mt5_module_before
 
 
 def test_two_processes_serialize_on_the_same_root_key(tmp_path: Path) -> None:

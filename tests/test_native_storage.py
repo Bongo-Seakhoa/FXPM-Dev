@@ -441,9 +441,10 @@ def test_scandir_consumes_only_cap_plus_one_with_poison_iterator(tmp_path, monke
                 raise AssertionError("iterator consumed beyond cap+1")
             return next(self._scanner)
 
-    monkeypatch.setattr(storage.os, "scandir", PoisonScanner)
-    with pytest.raises(NativeStorageBoundError, match="directory entry cap"):
-        storage.tree_bytes(root, max_directory_entries=2)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(storage.os, "scandir", PoisonScanner)
+        with pytest.raises(NativeStorageBoundError, match="directory entry cap"):
+            storage.tree_bytes(root, max_directory_entries=2)
     assert observations == {"next": 3, "closed": True}
 
 

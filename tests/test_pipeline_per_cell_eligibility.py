@@ -217,7 +217,12 @@ def test_calendar_loader_uses_active_h1_when_m5_is_manifest_excluded(
 
     frames, metadata = pipeline._load_symbol_timeframe_data("EURUSD")
 
-    assert load_calls == ["H1"]
+    # The bounded-memory loader may reopen the sole eligible frame for
+    # preflight, calendar-reference, and final workflow use.  Preserve that
+    # ceiling without preventing a future removal of redundant H1 reads.
+    assert load_calls
+    assert set(load_calls) == {"H1"}
+    assert len(load_calls) <= 3
     assert set(frames) == {"H1"}
     assert metadata["base_timeframe"] == "H1"
     assert metadata["as_of_utc"] == "2026-01-01T00:00:00+00:00"
@@ -325,8 +330,9 @@ def test_mixed_symbol_produces_complete_grid_without_searching_excluded_timefram
         base_timeframe="H1",
         calendar_contract=_MixedUniverse.calendar_contract,
     )
-    # Deliberately omit the audited session-count fields so H1 completes as an
-    # evidence NO_TRADE result before feature/search. M5 is activation-excluded.
+    # Missing session-count fields are diagnostic, not a technical or trading
+    # veto.  H1 must therefore complete its search surface while M5 remains
+    # activation-excluded and unreachable by feature/search code.
     metadata["timeframe_sources"] = {
         "H1": {
             "source_kind": "broker_native",
@@ -354,24 +360,52 @@ def test_mixed_symbol_produces_complete_grid_without_searching_excluded_timefram
             "provenance_path": "test",
         },
     )
-    monkeypatch.setattr(
-        "pm_pipeline.FeatureComputer.compute_all",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("evidence-failed active H1 must not reach features")
-        ),
-    )
+    feature_calls: list[str] = []
+
+    def compute_features(data, *, timeframe: str, **_kwargs):
+        feature_calls.append(timeframe)
+        assert timeframe == "H1", "excluded M5 must not reach features"
+        return data
+
+    monkeypatch.setattr("pm_pipeline.FeatureComputer.compute_all", compute_features)
+    search_calls: list[str] = []
+
+    def optimize_symbol(
+        _symbol,
+        train_features_by_tf,
+        _val_features_by_tf,
+        _strategies,
+        **_kwargs,
+    ):
+        assert set(train_features_by_tf) == {"H1"}
+        search_calls.extend(train_features_by_tf)
+        markers = {
+            regime: pipeline.regime_optimizer._make_no_trade_marker(
+                "test complete search found no eligible carrier"
+            )
+            for regime in ("TREND", "RANGE", "BREAKOUT", "CHOP")
+        }
+        return {"H1": markers}, None, 0, 4
+
     monkeypatch.setattr(
         pipeline.regime_optimizer,
         "optimize_symbol",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("excluded/evidence-failed cells must not reach search")
-        ),
+        optimize_symbol,
     )
+    for method_name in (
+        "_attach_historical_stress_audit",
+        "_attach_walk_forward_audit",
+        "_attach_governance_policies",
+        "_log_regime_coverage",
+    ):
+        monkeypatch.setattr(pipeline, method_name, lambda *_args, **_kwargs: None)
 
     result = pipeline.run_for_symbol("EURUSD")
 
     assert result.success
     assert result.config is not None
+    assert feature_calls == ["H1"]
+    assert search_calls == ["H1"]
     assert set(result.config.regime_configs) == {"M5", "H1"}
     assert all(
         set(regimes) == {"TREND", "RANGE", "BREAKOUT", "CHOP"}

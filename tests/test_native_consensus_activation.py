@@ -19,6 +19,7 @@ from pm_native_activation import (
     _v5_derive_recomputed_authenticity_state,
     _v5_has_unopposed_semantic_failure,
     classify_native_availability_cell,
+    clear_unscoped_native_universe_memo,
     resolve_active_native_artifact,
     resolve_active_native_universe,
     sha256_file,
@@ -1846,6 +1847,7 @@ def test_authenticated_terminal_technical_cell_preserves_valid_siblings(
         json.dumps(tampered, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    clear_unscoped_native_universe_memo()
     rejected = resolve_active_native_universe(
         data_dir,
         [SYMBOL],

@@ -354,6 +354,7 @@ def test_reference_resolution_exclusion_is_rederived_for_candidate_and_technical
         "audit_native_resolution",
         _selected_references_are_not_resolution_failures,
     )
+    native_activation.clear_unscoped_native_universe_memo()
     rejected = resolve_active_native_universe(
         data_dir,
         [SYMBOL],
