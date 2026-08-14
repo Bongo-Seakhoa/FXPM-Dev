@@ -146,6 +146,102 @@ class AgentBusTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._run("post", "--from", "gpt", "--type", "status", "--body", "x")
 
+    def test_blocking_posts_require_one_named_recipient(self):
+        for kind in sorted(bus.BLOCKING_MESSAGE_TYPES):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    self._run(
+                        "post",
+                        "--from",
+                        "codex-pm",
+                        "--to",
+                        "all",
+                        "--type",
+                        kind,
+                        "--body",
+                        "unowned",
+                    ),
+                    2,
+                )
+        self.assertEqual(self._bus_records(), [])
+        self.assertEqual(
+            self._run(
+                "post",
+                "--from",
+                "codex-pm",
+                "--to",
+                "claude-pm",
+                "--type",
+                "review_request",
+                "--body",
+                "owned",
+            ),
+            0,
+        )
+        self.assertEqual(
+            self._run(
+                "post",
+                "--from",
+                "codex-pm",
+                "--to",
+                "all",
+                "--type",
+                "review",
+                "--body",
+                "nonblocking verdict",
+            ),
+            0,
+        )
+
+    def test_pm_identities_cannot_claim_or_release_implementation_lanes(self):
+        self.assertEqual(
+            self._run(
+                "claim",
+                "--from",
+                "codex-pm",
+                "--paths",
+                "pm_pipeline.py",
+                "--purpose",
+                "wrong identity",
+            ),
+            2,
+        )
+        self.assertEqual(
+            self._run(
+                "post",
+                "--from",
+                "claude-pm",
+                "--type",
+                "claim",
+                "--body",
+                "manual wrong identity",
+            ),
+            2,
+        )
+        self.assertEqual(self._bus_records(), [])
+
+        self.assertEqual(
+            self._run(
+                "claim",
+                "--from",
+                "codex",
+                "--paths",
+                "pm_pipeline.py",
+                "--purpose",
+                "implementation",
+            ),
+            0,
+        )
+        lane_id = bus._load_lanes()["lanes"][0]["id"]
+        self.assertEqual(
+            self._run("release", "--from", "codex-pm", "--lane", lane_id),
+            2,
+        )
+        self.assertEqual(
+            self._run("release", "--from", "codex", "--lane", lane_id),
+            0,
+        )
+
     def test_lane_history_stays_bounded(self):
         payload = bus._load_lanes()
         for index in range(150):

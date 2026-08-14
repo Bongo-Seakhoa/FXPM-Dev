@@ -34,17 +34,71 @@ def _message(
     }
 
 
-def test_open_requests_require_a_directionally_valid_peer_response() -> None:
+def test_frozen_pm_edge_contract_is_symmetric_and_legacy_bounded() -> None:
     bus = [
-        _message("CX-900", "codex", "claude", "review_request"),
-        _message("CX-901", "codex", "claude", "status", refs=["CX-900"]),
-        _message("CC-900", "claude", "codex", "review", refs=["CX-900"]),
-        _message("CPM-900", "claude-pm", "codex-pm", "decision"),
-        _message("XPM-900", "codex-pm", "claude-pm", "question"),
+        _message("XPM-900", "codex-pm", "claude-pm", "review_request"),
+        _message("CPM-900", "claude-pm", "codex-pm", "question"),
+        _message("XPM-901", "codex-pm", "claude-pm", "veto"),
+        _message("CPM-901", "claude-pm", "codex-pm", "review"),
     ]
 
-    assert [row["id"] for row in dashboard.open_peer_requests(bus)] == ["XPM-900"]
-    assert dashboard.message_resolutions(bus)["CX-900"]["status"] == "answered"
+    assert [row["id"] for row in dashboard.open_peer_requests(bus)] == [
+        "XPM-900",
+        "CPM-900",
+        "XPM-901",
+    ]
+    assert "CPM-901" not in dashboard.message_resolutions(bus)
+
+    bus.extend(
+        [
+            _message(
+                "CPM-902",
+                "claude-pm",
+                "codex-pm",
+                "answer",
+                refs=["XPM-900", "XPM-901"],
+                ts="2026-08-13T10:01:00Z",
+            ),
+            _message(
+                "XPM-902",
+                "codex-pm",
+                "claude-pm",
+                "decision",
+                refs=["CPM-900"],
+                ts="2026-08-13T10:01:00Z",
+            ),
+        ]
+    )
+    assert dashboard.open_peer_requests(bus) == []
+
+    legacy = [
+        _message(message_id, "codex-pm", "claude-pm", "review")
+        for message_id in sorted(dashboard.LEGACY_BLOCKING_REVIEW_IDS)
+    ]
+    legacy_resolutions = dashboard.message_resolutions(legacy)
+    assert set(legacy_resolutions) == set(dashboard.LEGACY_BLOCKING_REVIEW_IDS)
+    assert {row["status"] for row in legacy_resolutions.values()} == {"open"}
+
+    legacy.extend(
+        _message(
+            f"CPM-{900 + index}",
+            "claude-pm",
+            "codex-pm",
+            "answer",
+            refs=[message_id],
+            ts="2026-08-13T10:01:00Z",
+        )
+        for index, message_id in enumerate(
+            sorted(dashboard.LEGACY_BLOCKING_REVIEW_IDS)
+        )
+    )
+    assert {
+        message_id: row["status"]
+        for message_id, row in dashboard.message_resolutions(legacy).items()
+    } == {
+        message_id: "answered"
+        for message_id in dashboard.LEGACY_BLOCKING_REVIEW_IDS
+    }
 
 
 def test_same_pm_followup_replaces_only_the_earlier_open_request() -> None:

@@ -31,6 +31,9 @@ ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT = ROOT / "pm_dashboard.html"
 
 RESPONSE_REQUIRED_TYPES = {"question", "veto", "review_request"}
+LEGACY_BLOCKING_REVIEW_IDS = frozenset(
+    {"XPM-010", "XPM-061", "XPM-062", "XPM-063", "XPM-064"}
+)
 
 # Program timeline. Dates come from STATE.md, the Test A pre-registration and
 # the book's own valid_until; edit here when a milestone genuinely moves.
@@ -361,7 +364,11 @@ def message_resolutions(bus: list[dict]) -> dict[str, dict[str, str]]:
             replies.setdefault(str(reference), []).append(str(message.get("id") or ""))
     result: dict[str, dict[str, str]] = {}
     for message_id, message in by_id.items():
-        if message.get("type") not in RESPONSE_REQUIRED_TYPES:
+        requires_response = message.get("type") in RESPONSE_REQUIRED_TYPES or (
+            message.get("type") == "review"
+            and message_id in LEGACY_BLOCKING_REVIEW_IDS
+        )
+        if not requires_response:
             continue
         if replies.get(message_id):
             status = "answered"

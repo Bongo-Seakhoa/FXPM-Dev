@@ -31,12 +31,27 @@ Direct file edits are allowed when the tool is unavailable, same schema.
  "type": "status", "paths": [], "refs": [], "body": "..."}
 ```
 
-- `id`: `CC-` (Claude) / `CX-` (Codex) + zero-padded increment per agent.
+- `id`: `CC-` (Claude) / `CX-` (Codex) / `CPM-` (Claude PM) /
+  `XPM-` (Codex PM) + zero-padded increment per identity.
 - `type`: one of
   `claim` | `release` | `status` | `finding` | `question` | `answer` |
   `decision` | `veto` | `review_request` | `review`.
 - `refs`: ids this message responds to (threading).
 - `paths`: repo-relative files/dirs the message concerns.
+
+### PM communication boundary
+
+- The only response-blocking types are `review_request`, `question`, and
+  `veto`. A blocking message names one recipient; it is never addressed to
+  `all`.
+- `review` is a non-blocking reply or verdict on work already performed. It
+  never creates a new response obligation. Historical blocking `review`
+  messages are handled only by the frozen compatibility set in the shared
+  detector; new messages must use the canonical types above.
+- A response, closure, or same-sender supersession records the edge it closes
+  in `refs`. Silence is never agreement.
+- PM scope and evidence rulings use `claude-pm` / `codex-pm`. Implementation
+  coordination, lane claims, and lane releases use `claude` / `codex`.
 
 ## Rules
 

@@ -50,6 +50,8 @@ MESSAGE_TYPES = (
     "claim", "release", "status", "finding", "question", "answer",
     "decision", "veto", "review_request", "review",
 )
+BLOCKING_MESSAGE_TYPES = frozenset({"review_request", "question", "veto"})
+IMPLEMENTATION_AGENTS = frozenset({"claude", "codex"})
 BUS_MAX_BYTES = 4 * 1024 * 1024
 LANE_HISTORY_MAX = 100
 LANE_HISTORY_KEEP_DAYS = 14
@@ -211,6 +213,18 @@ def _conflicting_lane(paths: List[str], agent: str, payload: Dict[str, Any]) -> 
 
 
 def cmd_post(args: argparse.Namespace) -> int:
+    if args.type in BLOCKING_MESSAGE_TYPES and args.to == "all":
+        print(
+            f"ERROR: {args.type} requires one named recipient",
+            file=sys.stderr,
+        )
+        return 2
+    if args.type in {"claim", "release"} and args.agent not in IMPLEMENTATION_AGENTS:
+        print(
+            "ERROR: lane coordination must use the claude or codex identity",
+            file=sys.stderr,
+        )
+        return 2
     with _writer_lock():
         records = _read_bus_lines()
         record = {
@@ -229,6 +243,12 @@ def cmd_post(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim_unlocked(args: argparse.Namespace) -> int:
+    if args.agent not in IMPLEMENTATION_AGENTS:
+        print(
+            "ERROR: lane claims must use the claude or codex identity",
+            file=sys.stderr,
+        )
+        return 2
     payload = _load_lanes()
     paths = _normalize_paths(args.paths)
     if not paths:
@@ -275,6 +295,12 @@ def cmd_claim(args: argparse.Namespace) -> int:
 
 
 def _cmd_release_unlocked(args: argparse.Namespace) -> int:
+    if args.agent not in IMPLEMENTATION_AGENTS:
+        print(
+            "ERROR: lane releases must use the claude or codex identity",
+            file=sys.stderr,
+        )
+        return 2
     payload = _load_lanes()
     for lane in payload["lanes"]:
         if lane.get("id") == args.lane and lane.get("status") == "active":
