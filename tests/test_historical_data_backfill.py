@@ -212,6 +212,7 @@ def test_main_returns_failure_when_optimization_generation_does_not_promote(
         def __init__(self, **kwargs):
             observed["init"] = kwargs
             self.mt5 = None
+            self.config_file = kwargs["config_file"]
 
         def initialize(self):
             return True
@@ -239,6 +240,11 @@ def test_main_returns_failure_when_optimization_generation_does_not_promote(
     )
     monkeypatch.setattr(pm_main, "setup_logging", lambda **_kwargs: None)
     monkeypatch.setattr(pm_main, "log_resolved_config_summary", lambda *_args: None)
+    monkeypatch.setattr(
+        pm_main,
+        "_production_hard_supervision_required",
+        lambda *_args, **_kwargs: False,
+    )
     monkeypatch.setattr(pm_main.signal, "signal", lambda *_args: None)
     monkeypatch.setattr(pm_main, "set_instrument_specs", lambda **_kwargs: None)
     monkeypatch.setattr(pm_main, "FXPortfolioManagerApp", _App)

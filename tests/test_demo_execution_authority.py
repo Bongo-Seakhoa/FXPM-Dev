@@ -717,8 +717,12 @@ def test_scheduled_timeframes_come_from_isolated_projection():
 
 def test_demo_loop_cannot_auto_retrain_or_use_legacy_selector():
     source = inspect.getsource(pm_main.FXPortfolioManagerApp.run_trading)
+    normalized_source = " ".join(source.split())
     constructor_source = inspect.getsource(pm_main.LiveTrader.__init__)
-    assert "not is_current_refit_demo and now >= next_retrain_check_at" in source
+    assert (
+        "not is_current_refit_demo and now >= next_retrain_check_at"
+        in normalized_source
+    )
     assert "get_edge_challenger_configs" not in source
     assert "authorize_demo_probation_execution" not in source
     assert "authorize_demo_probation_execution" in constructor_source
