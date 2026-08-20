@@ -49,8 +49,9 @@ TIMELINE = [
     ("E25 stress settlement repaired", "2026-08-13", "2026-08-13", "done"),
     ("E26 cache integrity + extents", "2026-08-13", "2026-08-13", "done"),
     ("E27a1 selected identity bracket", "2026-08-13", "2026-08-13", "done"),
-    ("Canonical scoring cleanup", "2026-08-13", None, "active"),
-    ("E27b sweep replacement PM gate", "2026-08-13", None, "active"),
+    ("Canonical scoring collapse", "2026-08-13", "2026-08-13", "done"),
+    ("E27b exact-600 authority", "2026-08-13", "2026-08-20", "done"),
+    ("Scoring-method quick review", "2026-08-20", None, "active"),
     ("Test B purge / no valid days", "2026-07-14", "2026-08-18", "pending"),
     ("Test B preliminary window",  "2026-08-18", "2026-10-19", "pending"),
     ("Test B credible horizon",    "2026-08-18", "2027-08-17", "pending"),
@@ -66,9 +67,9 @@ FOLD_STAGES = [
 
 PREFLIGHT_STAGES = [
     (
-        "100×6 native semantic sweep",
+        "Historical 100×6 semantic sweep",
         2217.712,
-        "CX-088: exact full active-universe authority verification",
+        "CX-088: pre-E27b exact full active-universe authority verification",
     ),
     (
         "Everything else to typed stop",
@@ -87,21 +88,30 @@ E26_FINGERPRINT = "31c4e125aa2a22f3bfe16f82b097dd9366769b7017edb44fde068d4b825d5
 E27_WARM_SECONDS = 3.2885
 E27_COMMIT = "7376a06"
 
+E27B_COLD_SECONDS = 1.0991
+E27B_HISTORICAL_SECONDS = 2217.712
+E27B_SPEEDUP = E27B_HISTORICAL_SECONDS / E27B_COLD_SECONDS
+E27B_SURFACE_PATHS = 105
+E27B_COMMIT = "2285646"
+
+WINNER_V13_ATTEMPTS = 300
+FULL_SUITE_COMMIT = "c0710aa"
+FULL_SUITE_PASSED = 4_245
+FULL_SUITE_SKIPPED = 11
+SCORING_STUDY_LANE = "L-0060"
+
 SINGLE_GRID_MAX_RUNS = 11_520_000
 
 RISKS = [
-    ("Native authority preflight dominates runtime", "critical",
-     "The exact 100×6 semantic sweep took 36m58s before any strategy, attempt or "
-     "backtest. It consumed 99.763% of the bounded rebaseline; E26 improved a warm "
-     "one-cell check but did not remove this global sweep."),
-    ("Sweep replacement still has authority blockers", "high",
-     "E27a1 now brackets selected-artifact verification against ACTIVE identity changes, "
-     "but broker-term schedule sourcing can still bypass that route. E27b reached Round 3 "
-     "final at XPM-058 and awaits the peer verdict; until explicit agreement, the 100x6 "
-     "sweep remains."),
+    ("Gate 2 remains unanswered", "critical",
+     "E25 repaired the exposed stress-settlement defect, but no candidate has been "
+     "authenticated since. Resolving the blocker did not clear the gate."),
+    ("Scoring review has deliberately narrow inference", "high",
+     "The isolated L-0060 study compares Winner v13 with one predeclared geometry. "
+     "Failure of that challenger would not establish that Winner v13 is optimal."),
     ("Full-run duration is still unmeasured", "high",
      "The former 576M/years estimate is withdrawn. The pre-search bottleneck is now "
-     "measured; downstream complete-generation duration is not."),
+     "removed; downstream complete-generation duration is still not measured."),
     ("Certification cannot be rushed", "high",
      "Test B is the only certification and needs 365 days of unseen data. First valid "
      "day 2026-08-18, credible result 2027-08-17. No code change shortens this."),
@@ -470,7 +480,11 @@ def truncate(text, n: int = 400) -> str:
     return text if len(text) <= n else text[:n].rstrip() + "…"
 
 
-def svg_gantt() -> str:
+def svg_gantt(
+    *,
+    scoring_study_status: str = "active",
+    scoring_study_end: str | None = None,
+) -> str:
     lo, hi = date(2026, 4, 1), date(2027, 9, 30)
     span = (hi - lo).days
     row_h, pad_l, pad_t = 26, 196, 34
@@ -500,6 +514,9 @@ def svg_gantt() -> str:
                  f"text-anchor='middle'>today</text>")
 
     for i, (label, s, e, status) in enumerate(TIMELINE):
+        if label == "Scoring-method quick review" and scoring_study_status != "active":
+            e = scoring_study_end or datetime.now(timezone.utc).date().isoformat()
+            status = "done" if scoring_study_status == "released" else "pending"
         ds = date.fromisoformat(s)
         de = date.fromisoformat(e) if e else datetime.now(timezone.utc).date()
         y = pad_t + i * row_h
@@ -536,7 +553,7 @@ def svg_preflight_baseline() -> str:
     total = sum(stage[1] for stage in PREFLIGHT_STAGES)
     w, h, x0, usable = 1080, 135, 36, 1008
     p = [f"<svg viewBox='0 0 {w} {h}' class='chart' role='img' "
-         f"aria-label='Measured canonical pre-search baseline'>"]
+         f"aria-label='Historical pre-E27b pre-search baseline'>"]
     cursor = x0
     for index, (label, seconds, note) in enumerate(PREFLIGHT_STAGES):
         width = usable * seconds / total
@@ -660,6 +677,12 @@ def render(*, live: bool = True) -> str:
     commits, register = load_commits(), load_register()
     now = datetime.now(timezone.utc)
     active = [l for l in lanes if l.get("status") == "active"]
+    scoring_study = next(
+        (lane for lane in lanes if lane.get("id") == SCORING_STUDY_LANE),
+        {},
+    )
+    scoring_study_status = str(scoring_study.get("status") or "not recorded")
+    scoring_study_end = str(scoring_study.get("released_at") or "")[:10] or None
     open_q = open_peer_requests(bus)
     pm_rows = pm_continuity(bus)
     reports = audit_report_status()
@@ -687,6 +710,11 @@ def render(*, live: bool = True) -> str:
         A("<div class='live'>local service online</div>")
     A("</div>")
 
+    # Tests for withdrawn claims intentionally scope to this declared current-state
+    # surface. The communication and lane panels below remain a verbatim historical
+    # record and may legitimately quote a false claim while correcting it.
+    A("<!-- current-analysis:start -->")
+
     A("<div class='panel verdict'><div class='big'>Not tradeable. Do not fund an account.</div>"
       "<div>No optimisation run has completed since the June book expired on 2026-07-05. "
       "That book was statistically indistinguishable from noise and both multiple-testing "
@@ -701,16 +729,26 @@ def render(*, live: bool = True) -> str:
     A(f"<div class='kpi'><div class='n'>{gates_done}/{len(gates) or 8}</div>"
       f"<div class='l'>Gates closed</div><div class='d'>Gate 8 (Test B) is the only "
       f"certification and cannot finish before Aug 2027.</div></div>")
-    A("<div class='kpi'><div class='n'>36m 58s</div>"
-      "<div class='l'>Native authority preflight</div>"
-      "<div class='d'>Exact 100×6 semantic sweep; 99.763% of the bounded baseline "
-      "and zero strategy, attempt or backtest calls. It remains the dominant "
-      "pre-search cost after E26.</div></div>")
-    A(f"<div class='kpi'><div class='n'>{E27_WARM_SECONDS:.4f} s</div>"
-      "<div class='l'>E27a1 selected-artifact check</div>"
-      "<div class='d'>Real route 2/1/1 to 4/1/1: two bounded identity reads added, "
-      "with no extra structural resolution or selected-evidence replay. Exact "
-      "fingerprint unchanged; this is not a full-sweep result.</div></div>")
+    A(f"<div class='kpi'><div class='n'>{E27B_COLD_SECONDS:.4f} s</div>"
+      "<div class='l'>Cold exact-600 authority</div>"
+      "<div class='d'>E27b completed and peer-closed at 2285646. The receipt-bound "
+      "point-of-use path replaced the repeated global sweep without weakening raw "
+      "selected-leaf recomputation.</div></div>")
+    A(f"<div class='kpi'><div class='n'>{E27B_SURFACE_PATHS} axes</div>"
+      "<div class='l'>Derived broker surface accepted</div>"
+      f"<div class='d'>CPM-070 accepted the final-code output. Historical cold work was "
+      f"2,218 s (36m 58s); current is {E27B_COLD_SECONDS:.4f} s, about "
+      f"{E27B_SPEEDUP:,.0f}× faster.</div></div>")
+    A(f"<div class='kpi'><div class='n'>{WINNER_V13_ATTEMPTS}</div>"
+      "<div class='l'>Planner-frozen attempts per cell</div>"
+      "<div class='d'>Current production selection is Winner v13: 100 registry "
+      "defaults plus two deterministic non-defaults per strategy. The retired "
+      "weighted scalar is not on the executable selection path.</div></div>")
+    A("<div class='kpi'><div class='n'>PASS</div>"
+      f"<div class='l'>Full suite pinned to {FULL_SUITE_COMMIT}</div>"
+      f"<div class='d'>{FULL_SUITE_PASSED:,} passed, {FULL_SUITE_SKIPPED} skipped, "
+      f"zero failures or errors. This receipt is pinned to {FULL_SUITE_COMMIT}, "
+      "not current HEAD.</div></div>")
     A(f"<div class='kpi'><div class='n'>{current_fold:.2f} s</div>"
       f"<div class='l'>Authoritative fold package</div>"
       f"<div class='d'>Exact preserved H1 path through E22; down {fold_gain:.1f}% "
@@ -730,22 +768,23 @@ def render(*, live: bool = True) -> str:
     A("<h2>Canonical path and next action</h2><div class='panel'><div class='flow'>")
     flow = [
         ("1", "Correct executor", "done", "E25 retained; false one-cent stress gain removed."),
-        ("2", "Authority boundary", "active", "E27a1 retained; broker bypass and E27b open."),
-        ("3", "Canonical scoring", "active", "Corrected one-path tree awaits the XPM-060 peer verdict."),
-        ("4", "Full run + Test A", "", "Complete the path, then reject-only falsification."),
-        ("5", "Demo shadow", "", "Broker-reconciled operational probation."),
+        ("2", "Authority boundary", "done", "E27b accepted: exact-600 cold path is 1.0991s."),
+        ("3", "Winner v13", "done", "Canonical production selection; exactly 300 attempts."),
+        ("4", "Scoring review", "active" if scoring_study_status == "active" else "done",
+         f"{SCORING_STUDY_LANE} is {scoring_study_status}; one predeclared challenger."),
+        ("5", "Full run + shadow", "", "Authenticate a candidate, complete a run, then demo shadow."),
         ("6", "Test B", "blocked", "Only prospective evidence can support certification."),
     ]
     for number, name, cls, why in flow:
         A(f"<div class='step {cls}'><div class='num'>{number}</div><div class='name'>{esc(name)}</div>"
           f"<div class='why'>{esc(why)}</div></div>")
-    A("</div><div class='note'><b>Current decision frontier:</b> XPM-060 asks "
-      "Claude-PM to retain the corrected one-path scoring collapse in L-0035–L-0041. "
-      "It remains uncommitted; focused suites pass, but the full suite has not run. "
-      "Retention intentionally changes the config hash and requires all hash-bound "
-      "authority receipts to be reissued. <b>Parallel authority decision:</b> XPM-058 "
-      "is E27b Round 3 final. No E27b implementation or Gate-2 rerun is authorised "
-      "before explicit peer closure.</div></div>")
+    A(f"</div><div class='note'><b>Parallel scoring review:</b> {SCORING_STUDY_LANE} "
+      f"is {esc(scoring_study_status)}. It is the PM-approved, "
+      "self-contained scoring-method quick review. It compares production Winner v13 "
+      "with one preregistered geometry on EURUSD and XAUUSD, using a latest-six-month "
+      "out-of-sample reserve. It does not change production logic, gates or the main "
+      "critical path. <b>Main programme state:</b> Gate 2 remains unanswered and no "
+      "candidate is authenticated.</div></div>")
 
     A("<h2>Deliverables and preserved lineages</h2><div class='split'><div class='panel'>")
     A(f"<div class='kpi' style='border:0;padding:0'><div class='n'>{reports['verified']}/{reports['total'] or 4}</div>"
@@ -794,21 +833,30 @@ def render(*, live: bool = True) -> str:
       f"and 153 passed / 1 skipped wider.</td><td>Retained · {E27_COMMIT}</td></tr>"
       "<tr><td><b>Canonical scoring cleanup</b></td><td>The partial 2e2b9c9 change "
       "was vetoed as incomplete. The corrected one-path tree removes retired scorer knobs, "
-      "fails closed on their old config keys, and retains fixed read-side provenance. It "
-      "remains uncommitted; focused suites pass, but the full suite has not run.</td>"
-      "<td>Peer verdict pending · XPM-060</td></tr>"
-      "<tr><td><b>Fixed-cost baseline</b></td><td>The 100×6 native semantic sweep "
+      "fails closed on their old config keys, and retains fixed read-side provenance. "
+      "Production now selects exclusively through Winner v13.</td>"
+      "<td>Retained · 08239c3</td></tr>"
+      "<tr><td><b>Historical fixed-cost baseline</b></td><td>The pre-E27b 100×6 native semantic sweep "
       "took 2,217.712s of 2,222.971s total (99.763%); no attempt or backtest ran."
-      "</td><td>Dominant bottleneck located · CX-088</td></tr>"
-      "<tr><td><b>Next authority gate</b></td><td>E27b is a Round-3-final design for "
-      "replacing the repeated semantic sweep with a receipt-backed terms boundary. It is "
-      "not authorised pending explicit peer agreement, and broker schedule-source routing "
-      "remains open until then.</td><td>Peer verdict pending · XPM-058</td></tr>"
+      "</td><td>Superseded baseline · CX-088</td></tr>"
+      f"<tr><td><b>E27b · exact-600 authority</b></td><td>Cold path "
+      f"{E27B_COLD_SECONDS:.4f}s versus historical 2,218s (about "
+      f"{E27B_SPEEDUP:,.0f}×); {E27B_SURFACE_PATHS} derived schedule axes accepted, "
+      "economic controls byte-identical, no rollback or rerun.</td>"
+      f"<td>Accepted · {E27B_COMMIT} / CPM-070</td></tr>"
+      "<tr><td><b>Scoring-method quick review</b></td><td>Winner v13 versus one "
+      "predeclared geometry, two symbols and three bounded rounds. Latest six months "
+      "are reserved out of sample; RETAIN would mean this challenger failed, not that "
+      f"Winner v13 is optimal.</td><td>{esc(scoring_study_status.title())} · "
+      f"{SCORING_STUDY_LANE} / CPM-071</td></tr>"
       "</table><div class='note'>No experiment changed the roster, folds, gates, search "
       "scope or economic thresholds. Isolated gains are not a universe ETA.</div></div>")
 
     A("<h2>Programme timeline</h2><div class='panel'>")
-    A(svg_gantt())
+    A(svg_gantt(
+        scoring_study_status=scoring_study_status,
+        scoring_study_end=scoring_study_end,
+    ))
     A("<div class='legend'>"
       "<span><i style='background:var(--ok)'></i>done</span>"
       "<span><i style='background:var(--accent)'></i>active</span>"
@@ -834,9 +882,9 @@ def render(*, live: bool = True) -> str:
       f"gain: {fold_gain:.1f}%. No search, fold, gate or roster change.</div></div>")
     A("<div class='panel'>")
     A(svg_preflight_baseline())
-    A("<div class='note'>This is the current-HEAD bounded baseline through a typed "
-      "pre-source issuer stop. It isolates the pre-search bottleneck but is not a full-run "
-      "duration. The next safe change targets that measured phase.</div>")
+    A("<div class='note'>This chart is the historical pre-E27b bounded baseline through "
+      "a typed pre-source issuer stop. E27b replaced that repeated sweep: the current "
+      "cold exact-600 authority path is 1.0991s. Neither number is a full-run duration.</div>")
     A("<div class='note'>Canonical count ceiling: one 2,400-cell grid has at most "
       f"{SINGLE_GRID_MAX_RUNS/1_000_000:.2f}M Backtester.run calls, 2.88M stress repricings "
       "and 720k strategy surfaces. The complete multi-grid generation total and duration "
@@ -876,6 +924,7 @@ def render(*, live: bool = True) -> str:
           f"<td><span class='tag {cls}'>{esc(sev)}</span></td>"
           f"<td>{esc(detail)}</td></tr>")
     A("</table></div>")
+    A("<!-- current-analysis:end -->")
 
     A("<h2>Lane ledger</h2><div class='panel wrap'><table>"
       "<tr><th>Lane</th><th>Owner</th><th>Status</th><th>Purpose</th><th>Claimed</th></tr>")

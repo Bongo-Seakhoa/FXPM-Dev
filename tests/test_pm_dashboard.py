@@ -207,23 +207,57 @@ def test_current_bus_does_not_resurrect_known_closed_or_plain_decision_items() -
     } & open_ids
 
 
-def test_render_removes_withdrawn_runtime_arithmetic() -> None:
-    page = dashboard.render(live=False)
+def _current_analysis(page: str) -> str:
+    start = "<!-- current-analysis:start -->"
+    end = "<!-- current-analysis:end -->"
+    assert page.count(start) == 1
+    assert page.count(end) == 1
+    return page.split(start, 1)[1].split(end, 1)[0]
 
-    assert "576,000,000" not in page
-    assert "200 Optuna trials" not in page
-    assert "Every 100 ms" not in page
+
+def test_render_scopes_withdrawn_claim_guards_away_from_verbatim_bus(
+    monkeypatch,
+) -> None:
+    correction = _message("CPM-972", "claude-pm", "codex-pm", "finding")
+    correction["body"] = (
+        "Stage 4 was '200 Optuna trials'; it is exactly 300 planner-frozen attempts."
+    )
+    monkeypatch.setattr(dashboard, "load_bus", lambda: [correction])
+
+    page = dashboard.render(live=False)
+    analysis = _current_analysis(page)
+
+    # The append-only communication record is rendered verbatim and may quote an
+    # error to correct it. Only the current analytical surface rejects stale claims.
+    assert "200 Optuna trials" in page
+    assert "200 Optuna trials" not in analysis
+    assert "576,000,000" not in analysis
+    assert "Every 100 ms" not in analysis
+
+
+def test_render_matches_current_committed_program_truth() -> None:
+    page = dashboard.render(live=False)
+    analysis = _current_analysis(page)
+
     assert "11.52M Backtester.run calls" in page
     assert "complete multi-grid generation total and duration are not yet established" in page
     assert "2.62 s" in page
     assert "61.6%" in page
     assert "17 → 2" in page
     assert "81.884s → 5.717s" in page
-    assert "36m 58s" in page
+    assert "1.0991 s" in analysis
+    assert "105 axes" in analysis
+    assert "2,018× faster" in analysis
+    assert "2,218 s (36m 58s)" in analysis
     assert "2,217.712s of 2,222.971s total" in page
-    assert "zero strategy, attempt or backtest calls" in page
-    assert "Current decision frontier:" in page
-    assert "XPM-060 asks Claude-PM" in page
+    assert "no attempt or backtest ran" in page
+    assert "Current production selection is Winner v13" in analysis
+    assert "exactly 300 attempts" in analysis
+    assert "Full suite pinned to c0710aa" in analysis
+    assert "4,245 passed, 11 skipped" in analysis
+    assert "Parallel scoring review:" in analysis
+    assert "self-contained scoring-method quick review" in analysis
+    assert "L-0060 / CPM-071" in analysis
     assert "Retained · c5c42cc" in page
     assert "Removed · c50758c" in page
     assert "Retained · 2288435" in page
@@ -235,28 +269,51 @@ def test_render_removes_withdrawn_runtime_arithmetic() -> None:
     assert "two new identity reads and no extra structural or evidence replay" in page
     assert "Warm 3.2885s" in page
     assert "19/19 focused and 153 passed / 1 skipped wider" in page
-    assert "Peer verdict pending · XPM-060" in page
-    assert "full suite has not run" in page
-    assert "Peer verdict pending · XPM-058" in page
-    assert "E27b is a Round-3-final design" in page
+    assert "Retained · 08239c3" in analysis
+    assert "Accepted · 2285646 / CPM-070" in analysis
+    assert "Peer verdict pending · XPM-060" not in analysis
+    assert "full suite has not run" not in analysis
+    assert "Peer verdict pending · XPM-058" not in analysis
+    assert "E27b is a Round-3-final design" not in analysis
     assert "local tag + verified/restored bundle" in page
     assert "CX-106 · 611953d · 34,119,074 B" in page
     assert "restore-tested 13-ref bundle + thin overlay + sanitized dirty state" in page
     assert "CX-111 · MANIFEST.md · C800CA08…7603" in page
     assert "annotated tag peels to 611953d" in page
     assert "ignored credential files were excluded" in page
-    assert "No E27b implementation or Gate-2 rerun is authorised" in page
+    assert "No E27b implementation or Gate-2 rerun is authorised" not in analysis
     assert "academic source gained only the preservation tag" in page
     assert "Not authorised · XPM-043" not in page
     assert "Round-1 PM design" not in page
     assert "Current implementation (L-0033)" not in page
     assert "Current next action (XPM-037)" not in page
     assert "Test suite can go green while blind" not in page
-    assert "current end-to-end rebaseline pending" not in page
-    assert "validate E23 at exactly two native fits" not in page
+    assert "current end-to-end rebaseline pending" not in analysis
+    assert "validate E23 at exactly two native fits" not in analysis
     assert "http-equiv='refresh'" not in page
     assert "Decisions waiting on you" not in page
     assert "they need your judgement" not in page
+
+
+def test_render_reflects_active_scoring_study_lane(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dashboard,
+        "load_lanes",
+        lambda: [
+            {
+                "id": "L-0060",
+                "owner": "codex",
+                "status": "active",
+                "purpose": "Bounded scoring-method quick review",
+                "claimed_at": "2026-08-20T17:57:23Z",
+            }
+        ],
+    )
+
+    analysis = _current_analysis(dashboard.render(live=False))
+
+    assert "L-0060 is active" in analysis
+    assert "Active · L-0060 / CPM-071" in analysis
 
 
 def test_service_snapshot_is_json_safe_and_has_pm_continuity() -> None:
