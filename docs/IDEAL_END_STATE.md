@@ -30,14 +30,31 @@ that outcome impossible rather than unlikely.
 
 Each numbered step is a real stage in the current code, not an aspiration.
 
+> **Corrected 2026-08-20.** Stages 4 and 6 originally described the *legacy*
+> route — `RegimeOptimizer._call_regime_score → _compute_regime_score`, a
+> weighted scalar with 200 Optuna trials — as current production. That was
+> wrong. Codex-PM's source audit (XPM-074, XPM-086 Round 0) established, and I
+> verified, that `_compute_regime_score` and `_call_regime_score` appear **only
+> in `pm_pipeline.py`** and are never reached from
+> `pm_authoritative_search_execution.py`, `pm_winner_selection.py`,
+> `pm_historical_production_adapter.py` or `pm_winner_raw_evidence.py`.
+> Production selects through **Winner v13**. The error is left visible rather
+> than silently rewritten, because it matters *why* it happened: I read which
+> settings exist instead of which code runs — the third time (see CPM-051,
+> CPM-058).
+>
+> **Consequence worth stating plainly:** the concern that the scoring
+> parameters were educated guesses applies to the legacy scalar, which **does
+> not decide production winners**.
+
 | # | Stage | What it does | Where it lives |
 |---|---|---|---|
 | 1 | **Native data authority** | Per symbol/timeframe leaves under a run manifest, each sha256-verified. Nothing enters the engine unattested. | `data/native/runs/…`, `pm_native_activation.py` |
 | 2 | **Feature computation** | ~70 columns per symbol/timeframe frame; ATR, MACD, regime inputs. | `pm_core.FeatureComputer` |
 | 3 | **Regime labelling** | Every bar assigned TREND / RANGE / BREAKOUT / CHOP. Cells are `symbol\|timeframe\|regime`. | `pm_regime.py` |
-| 4 | **Search** | Per cell: strategy configurations × **200 Optuna trials** over the parameter field. | `pm_pipeline.py`, `pm_optuna.py` |
+| 4 | **Search** | Per cell the planner freezes **exactly 300 attempts** — 100 registry defaults plus two deterministic non-defaults per strategy. Not an Optuna trial budget. | `pm_production_search_planner.py:113-133` |
 | 5 | **Validation geometry** | Purged and embargoed walk-forward; **four non-overlapping 63-day rolling-origin folds**; a final lockbox consumed once per lineage. | `calendar_lockbox_v2` |
-| 6 | **Scoring** | **One canonical scorer.** Worst-fold floor plus newest-fold positivity, so a cell must survive every regime in the sample *and* be alive most recently. | `_compute_regime_score` |
+| 6 | **Selection — Winner v13** | Statistical admissibility and paired dominance on a **dependence-robust lower confidence bound of daily log growth**. Worst-fold *and* newest-fold log growth must be positive, and again under cost stress. No weighted scalar, no tuned constants. | `pm_winner_selection.py:209-258` |
 | 7 | **Multiple-testing defence** | PBO via CSCV, and Deflated Sharpe using the two-term Bailey–López de Prado expected-max with effective independent trials. | `pm_statistics.py` |
 | 8 | **Promotion gates** | Profit factor ≥ 1.10, ≥ 20 trades, ≤ 25% drawdown, DSR ≥ 0.95, PBO ≤ 0.5, ≥ 252 daily observations. | `config.json` pipeline block |
 | 9 | **Evidence receipt** | Each promoted cell carries a receipt binding data identity, frozen process, and outcome. Replayable; tamper fails closed. | `pm_winner_raw_evidence.py` |
