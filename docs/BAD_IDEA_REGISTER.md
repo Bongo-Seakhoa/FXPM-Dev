@@ -217,9 +217,13 @@ basetemp is safe and the sprawl problem returns to being worth solving.
 **BI-8 — `specialist_spokes_v2_max_validation_sharpe` 0.0 → 4.0** · claude · `d517d2c`, reverted `b2d0ba0`
 An implausible-Sharpe-without-PBO guard.
 *Killed by:* unreachable under `regime_scoring_model=legacy`, which production
-uses. The claim that it rejected 157 rows was a replay against a dead gate.
-*Revival trigger:* **the production scoring model stops being `legacy`.** The
-guard is sound; only its reachability is broken.
+used at the time.
+*Status 2026-08-20 — the trigger can no longer fire.* The scoring collapse
+deleted `regime_scoring_model` entirely, and production selects through
+Winner v13, which never calls the legacy scalar this guard sat on. The
+condition named below refers to a setting that no longer exists, so this entry
+moves from DORMANT to **INTERRED**: not because the guard was unsound, but
+because the surface it guarded is gone.
 
 **BI-9 — caching the ATR_14 fallback series** · claude
 *Killed by:* BI-3's identity bug, and more fundamentally because
@@ -234,9 +238,18 @@ Wanted manifest-trust to make cold verification cheap.
 *Killed by:* a stale promotion receipt or a direct bars-path consumer would let
 leaf mutation bypass runtime verification, so the sweep cannot be removed on the
 current memo alone.
-*Revival trigger:* **a code-version-bound semantic receipt at activation/promotion
-exists, and every production bars consumer is forced through selected-leaf
-verification.** This is E27's precondition, already agreed.
+*Revival trigger — **FIRED 2026-08-20**.* The trigger required a
+code-version-bound semantic receipt at activation/promotion plus every
+production bars consumer forced through selected-leaf verification. **E27b
+delivered exactly that** and shipped it: the eager sweep is gone and the cold
+exact-600 path is 1.0991 s against a historical 2,218 s. Peer-reviewed in
+CPM-070 after independently verifying that a coherently rechained receipt is
+still rejected by selected-leaf raw recomputation.
+
+This is the first entry whose trigger has fired, and it is the mechanism
+working as designed: an idea correctly refused in July, revived in August
+because the named condition became true — not because anyone felt like
+retrying it.
 
 **BI-11 — `tools/agent_coordination.py`** (1,543 lines) · retired 2026-08-11
 An OS-locked, hash-chained event ledger so two agents could prove neither had

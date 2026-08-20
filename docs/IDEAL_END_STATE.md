@@ -55,8 +55,8 @@ Each numbered step is a real stage in the current code, not an aspiration.
 | 4 | **Search** | Per cell the planner freezes **exactly 300 attempts** — 100 registry defaults plus two deterministic non-defaults per strategy. Not an Optuna trial budget. | `pm_production_search_planner.py:113-133` |
 | 5 | **Validation geometry** | Purged and embargoed walk-forward; **four non-overlapping 63-day rolling-origin folds**; a final lockbox consumed once per lineage. | `calendar_lockbox_v2` |
 | 6 | **Selection — Winner v13** | Statistical admissibility and paired dominance on a **dependence-robust lower confidence bound of daily log growth**. Worst-fold *and* newest-fold log growth must be positive, and again under cost stress. No weighted scalar, no tuned constants. | `pm_winner_selection.py:209-258` |
-| 7 | **Multiple-testing defence** | PBO via CSCV, and Deflated Sharpe using the two-term Bailey–López de Prado expected-max with effective independent trials. | `pm_statistics.py` |
-| 8 | **Promotion gates** | Profit factor ≥ 1.10, ≥ 20 trades, ≤ 25% drawdown, DSR ≥ 0.95, PBO ≤ 0.5, ≥ 252 daily observations. | `config.json` pipeline block |
+| 7 | **Multiple-testing defence** | PBO via CSCV, and Deflated Sharpe using the two-term Bailey–López de Prado expected-max with effective independent trials. Applied by v13 as **attempt-aware within-cell DSR** and a **precommitted per-cell PBO limit**, not as the flat config thresholds. | `pm_statistics.py`, `pm_winner_selection.py:257-261` |
+| 8 | **Admissibility gates — Winner v13** | **15 candidate codes**: insufficient daily observations, HAC effective days, dependence blocks, completed trades or trade HAC power; unsupported dependence geometry; no stochastic sampling support; non-positive mean, worst fold or newest fold — **each repeated under cost stress**; and moving-block-bootstrap insufficient evidence or lower-bound failure. Plus `WITHIN_CELL_ATTEMPT_AWARE_DSR_FAILED` and per-cell PBO limits. | `pm_winner_selection.py:240-261` |
 | 9 | **Evidence receipt** | Each promoted cell carries a receipt binding data identity, frozen process, and outcome. Replayable; tamper fails closed. | `pm_winner_raw_evidence.py` |
 | 10 | **Live execution** | MT5, magic-number cell attribution (2,400 unique, collision-guarded), lot geometry floored to volume step, per-cell risk caps. | `pm_main.py` |
 
@@ -89,7 +89,7 @@ threshold is a blunt instrument.
 | # | Gate | Proves | State |
 |---|---|---|---|
 | 1 | PBO returns a per-cell verdict | The multiple-testing machinery *runs*, rather than reporting `not_available` as it did for the June book | **DONE** — pbo=0.0, N=224, T=253 |
-| 2 | A timeframe with enough activity to authenticate | The geometry can produce a candidate at all | **DONE** — real technical result, E25 resolved the blocker |
+| 2 | A timeframe with enough activity to authenticate | The geometry can produce a candidate at all | **NOT DONE** — E25 removed the frozen-path cost-stress blocker, but no candidate has yet been authenticated. Resolving a blocker is not clearing the gate. |
 | 3 | A full run that completes | The pipeline survives its own scale | open |
 | 4 | Replay the book, corrected enumerator | Results reproduce from receipts | open |
 | 5 | Forward Test A — reject-only | The frozen lineage does not collapse out of sample | pre-registered |
@@ -104,7 +104,7 @@ efficiency win, no additional gate substitutes for a year of unseen data.
 
 ## 5. What was tried and rejected
 
-The full record is `docs/BAD_IDEA_REGISTER.md` (11 entries, each with a revival
+The full record is `docs/BAD_IDEA_REGISTER.md` (12 entries, each with a revival
 trigger) and `docs/RECONCILIATION_REGISTER.md` (20 elements). The ones that
 shaped the current design:
 
@@ -120,7 +120,7 @@ shaped the current design:
 | Fixed `--basetemp` in pytest | Concurrent agents wipe each other's temp files | Yes — if only one agent runs tests |
 | `specialist_spokes_v2_max_validation_sharpe` guard | Unreachable under `regime_scoring_model=legacy` | Yes — if the scoring model changes |
 | `tools/agent_coordination.py` (1,543 lines) | Anti-tamper ledger for two agents on one laptop with no attacker | Yes — if a real multi-party trust boundary appears |
-| Removing the eager native verification sweep | A stale receipt or direct bars consumer would bypass runtime | Yes — E27b's preconditions are exactly this trigger |
+| Removing the eager native verification sweep | A stale receipt or direct bars consumer would bypass runtime | **Trigger FIRED 2026-08-20.** E27b delivered the code-version-bound receipt and forced selected-leaf verification. Revived and shipped. |
 
 ---
 
@@ -149,7 +149,7 @@ Measured, current:
 | | |
 |---|---|
 | Full verification suite | **4,245 tests, 2h 36m** |
-| Native authority preflight | **36m 58s** per run (E27b targets this) |
+| Native authority preflight | **1.0991 s** — was 36m 58s (2,218 s). E27b **completed**: a ~2,018x reduction, inside its own 2 s failure threshold with 45% margin. |
 | One authoritative fold package | 1.01 s |
 | E27a1 selected-artifact check | 3.2885 s |
 | Backtest loop floor | **6.7 ms** on 106,697 H1 bars |

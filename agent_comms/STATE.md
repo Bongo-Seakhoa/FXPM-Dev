@@ -1,6 +1,6 @@
 # FXPM Program State
 
-Updated: 2026-08-11 (Claude). One page. Rewritten in place, never appended.
+Updated: 2026-08-14 (Codex/Claude PM agreement). One page. Rewritten in place, never appended.
 
 ## The only objective
 
@@ -22,13 +22,14 @@ it is not in scope — however rigorous, provable or elegant it is.
    single pipeline with no reasonable prospect of corruption, carry it to the
    end. Validate hard truths; drop ceremony. The RUN-FIRST-THEN-PRUNE charter of
    2026-07-22 is superseded: prune as we go.
-3. **No unilateral integration.** The failed experiment was AI deciding its own
-   integration. Reconcile-or-discard decisions go to the operator.
+3. **PM-governed integration.** Both PMs may approve, reject, rescope, replace
+   or discard work inside `PM_CHARTER.md`. They are equals; explicit peer
+   evidence is required. Only a three-round deadlock goes to the operator.
 
 ## Where the system actually is
 
 - **Nothing is tradeable.** Book optimised 2026-06-09/11, `valid_until`
-  2026-07-05, expired 37 days. No run has completed since.
+  2026-07-05, expired on 2026-07-05. No run has completed since.
 - **The last book was noise.** All 157 promoted rows: `pbo_status` =
   `not_available`, median `val_sharpe` 38.23 (max 208.97), deflated Sharpe
   saturated at 1.000 for 144/157, median 21 validation trades with 75 rows under
@@ -39,13 +40,13 @@ it is not in scope — however rigorous, provable or elegant it is.
   the correct outcome.
 - **The search can now find something.** 128 → 300 attempts; every strategy
   tuned twice instead of 28 of 100 tuned once.
-- **Runtime: one real win, one overstated.** Regime labels categorical is real —
-  22% off every feature frame, in every worker, on the constraint that actually
-  binds (7.4 GB RAM). The resolver memo's 3798× is real but **does not speed the
-  production run**: `pm_main.py:12341` already wraps `run_optimization` in the
-  authority scope, so the optimize path was cached before the memo existed. It
-  buys test-suite time (3:29:33 → 0:53:42) and one-shot `--preflight`/`--trade`
-  startup. Corrected by CPM-001 after this file claimed otherwise.
+- **Runtime is now measured at the actual bottleneck.** The exact 100×6 native
+  authority sweep took 2,217.712s before any strategy, attempt or backtest and
+  remains the dominant pre-search cost. E21/E22 reduced one exact authoritative
+  fold package from 2.618s to 1.006s; E23 reduced full canary fits from 17 to 2;
+  E24 reduced an exact duplicate reopen from 81.884s to 5.717s; E26 reduced one
+  warm native-cell check by 22.01%. These are bounded wins, not a universe ETA.
+  Complete-generation and full-run duration remain unmeasured.
 - **The leak search is exhausted.** Backtest loop, stop construction, feature
   computation and the calendar_lockbox_v2 split are all clean. `pm_core.py:1227`
   force-closes at each window boundary, so no trade spans a seam and no training
@@ -67,10 +68,39 @@ authenticated: 782 of 896 final lanes had zero trades, 114 had 1-2, pooled max
 against an observed 4.50-11, so all 17 surviving decisions fail anyway.
 **No gate may be moved toward the observed result.**
 
+**Gate 2 remains UNANSWERED after a repaired technical defect.** The sole
+EURUSD|H1 canary was consumed at attempt 2, fold 0 after exposing
+`FROZEN_PATH_COST_STRESS_FAILED`. E25 corrected the heterogeneous swap-cent
+settlement defect and the exact preserved fold now passes with unchanged
+economics (`c5c42cc`). No Gate-2 authentication rerun has been authorised or
+attempted. The terminal receipt remains preserved at
+`audit_reports/fxpm_system_audit_2026-08-11/GATE2_H1_TERMINAL_RECEIPT.json`.
+
+**E27b is COMPLETE and peer-closed (2026-08-20).** The native authority
+preflight — 99.763% of a bounded probe's wall time — is removed. Cold exact-600
+universe is **1.0991 s** against a historical **2,218 s (36m 58s)**: a ~2,018x
+reduction, inside the 2 s failure threshold with 45% margin. Migration moved 47
+M5 cells from `technical_error` to `evidence_candidate`, all 47 resolution
+checks PASS; the derived broker surface is 105 paths, accepted in CPM-070 as
+legitimate final-code output rather than a moved criterion. Economic controls
+byte-identical, TERMS snapshot unchanged.
+
+The defence that survives is point-of-use raw recomputation, and it is proven
+rather than asserted: `test_v5_receipt_rechain_cannot_defeat_selected_leaf_raw_recomputation`
+poisons a leaf, coherently rechains report, consensus, parity, receipt, manifest
+and the ACTIVE pointer so every hash validates, then asserts the structural layer
+ACCEPTS it (`universe.valid`) while the artifact is REJECTED
+(`RAW_PAIR_RECOMPUTATION_MISMATCH`). **If that test ever weakens, the
+justification for E27b weakens with it.**
+
+**Full suite: terminal PASS at `c0710aa`** — 4,245 passed, 11 skipped, 0
+failures, JUnit-confirmed across 5,506 outcomes, 9,347 s. Pinned to that commit,
+not to current HEAD.
+
 | # | Gate | Owner | State |
 |---|---|---|---|
 | 1 | PBO produces a per-cell verdict | Codex | **DONE** — pbo=0.0, N=224, T=253 |
-| 2 | A timeframe with enough activity to authenticate a candidate | Codex | EURUSD H1 canary, 23.6x D1's rows; abort at first fold if <5 trades/lane |
+| 2 | A timeframe with enough activity to authenticate a candidate | Codex | **UNANSWERED** — consumed H1 canary exposed a real defect; E25 retained at `c5c42cc`; candidate authentication has not been rerun |
 | 3 | A full run that completes | open | |
 | 4 | Replay the book, corrected enumerator | open | |
 | 5 | Forward Test A — reject-only falsification | pre-registered | `docs/FORWARD_TEST_A_PREREGISTRATION.md` v2 |
