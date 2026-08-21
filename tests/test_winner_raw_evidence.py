@@ -464,6 +464,14 @@ def _production_provenance(*, frozen, attempt_ordinal, fold_ordinal, planned, la
                 strict=True,
             )
         ),
+        "stress_daily_improvement_observation_count": sum(
+            stress_value > base_value
+            for base_value, stress_value in zip(
+                base["winner_daily_r_surface"]["daily_net_mtm_r"],
+                stress_surface["daily_net_mtm_r"],
+                strict=True,
+            )
+        ),
         "realized_adversity_status": (
             BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
         ),
@@ -1837,7 +1845,7 @@ def test_label_only_cost_stress_is_rejected_even_when_receipts_are_resealed(
     fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
     with pytest.raises(
         WinnerRawEvidenceIncomplete,
-        match="STRESS_METHOD_VECTOR_ADVERSITY_INCONSISTENT",
+        match="STRESS_METHOD_ADVERSITY_STATUS_MISMATCH",
     ):
         _produce(sink, frozen, [raw])
 
@@ -1866,7 +1874,11 @@ def test_resealed_adversity_status_cannot_relabel_genuine_shock(
         _produce(sink, frozen, [raw])
 
 
-def _reseal_first_fold_as_no_numerical_shock(raw):
+def _reseal_first_fold_as_no_numerical_shock(
+    raw,
+    *,
+    preserve_changed_spread_vector: bool = False,
+):
     fold = raw["folds"][0]
     base = fold["lanes"]["final_lockbox_base"]
     stress = fold["lanes"]["final_lockbox_stress"]
@@ -1874,12 +1886,13 @@ def _reseal_first_fold_as_no_numerical_shock(raw):
     stress["winner_daily_r_surface"] = json.loads(
         _canonical(base["winner_daily_r_surface"])
     )
-    stress["numerical_execution_cost_attestation"] = _rebuilt_cost(
-        stress["numerical_execution_cost_attestation"],
-        spread_values_sha256=base["numerical_execution_cost_attestation"][
-            "spread_values_sha256"
-        ],
-    )
+    if not preserve_changed_spread_vector:
+        stress["numerical_execution_cost_attestation"] = _rebuilt_cost(
+            stress["numerical_execution_cost_attestation"],
+            spread_values_sha256=base["numerical_execution_cost_attestation"][
+                "spread_values_sha256"
+            ],
+        )
     replay = fold["provenance"]["attempt_replay_receipt"]
     stress_receipt = replay["stress_method_receipt"]
     stress_receipt["stress_cost_attestation_sha256"] = stress[
@@ -1899,6 +1912,7 @@ def _reseal_first_fold_as_no_numerical_shock(raw):
     )
     stress_receipt["strictly_worse_trade_count"] = 0
     stress_receipt["strictly_worse_daily_observation_count"] = 0
+    stress_receipt["stress_daily_improvement_observation_count"] = 0
     stress_receipt["realized_adversity_status"] = (
         BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
     )
@@ -1950,6 +1964,7 @@ def _reseal_first_fold_as_zero_trade(raw):
     )
     stress_receipt["strictly_worse_trade_count"] = 0
     stress_receipt["strictly_worse_daily_observation_count"] = 0
+    stress_receipt["stress_daily_improvement_observation_count"] = 0
     stress_receipt["realized_adversity_status"] = (
         BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
     )
@@ -1963,19 +1978,33 @@ def _reseal_first_fold_as_zero_trade(raw):
     return raw
 
 
-def test_coherent_no_shock_reseal_conflicts_with_frozen_strict_plan(
+def test_changed_spread_without_realized_degradation_is_process_rejected(
     tmp_path: Path,
 ) -> None:
     _, sink, frozen = _freeze(tmp_path)
     raw = _reseal_first_fold_as_no_numerical_shock(
-        _copied_attempt_evidence(frozen)
+        _copied_attempt_evidence(frozen),
+        preserve_changed_spread_vector=True,
     )
 
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="STRESS_ADVERSITY_PRECOMMITMENT_MISMATCH",
-    ):
-        _produce(sink, frozen, [raw])
+    receipt = raw["folds"][0]["provenance"]["attempt_replay_receipt"][
+        "stress_method_receipt"
+    ]
+    assert receipt["base_spread_values_sha256"] != receipt[
+        "stress_spread_values_sha256"
+    ]
+    assert receipt["realized_adversity_status"] == (
+        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+    )
+
+    produced = _produce(sink, frozen, [raw])
+
+    entry = produced.evidence_ledger["entries"][0]
+    assert entry["evidence_status"] == "PROCESS_REJECTED"
+    assert entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
+    assert produced.decision.to_dict()["validated"] is True
+    assert entry["folds"] == []
+    assert entry["pbo_fold_count"] == len(frozen.precommitment["causal_fold_plan"])
 
 
 def test_authenticated_no_numerical_shock_keeps_pbo_and_rejects_attempt(

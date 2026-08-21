@@ -5111,12 +5111,13 @@ def audit_and_activate(
                 )
                 if current_pointer_sha != previous_pointer_sha:
                     raise RuntimeError("ACTIVE_POINTER_CHANGED_DURING_AUDIT")
-                # Reopen the staged receipt authority under the CAS lock so a
-                # corrupt or concurrently moved stage can never be published.
-                validate_staged_receipt_backed_native_authority(
-                    native_root.parent,
-                    pointer,
-                )
+                if production_authoritative_contract:
+                    # Reopen the staged receipt authority under the CAS lock so a
+                    # corrupt or concurrently moved stage can never be published.
+                    validate_staged_receipt_backed_native_authority(
+                        native_root.parent,
+                        pointer,
+                    )
                 _atomic_replace_bytes(active_pointer_path, candidate_pointer_bytes)
                 pointer_updated = True
     return {

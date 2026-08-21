@@ -62,6 +62,7 @@ from tools.audit_activate_native_history import (  # noqa: E402
     _source_leaf,
     audit_and_activate,
 )
+from tests.native_v5_support import write_v5_run as _write_v5_run  # noqa: E402
 
 
 UTC = timezone.utc
@@ -818,6 +819,145 @@ def _write_timeframe_v4_run(native_root, run_id):
         json.dumps(run_manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def test_semantic_receipt_creation_and_validation_share_structural_gate(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    events = []
+    real_build = native_activation_audit.build_native_semantic_receipt
+    real_validate = (
+        native_activation_audit.validate_staged_receipt_backed_native_authority
+    )
+
+    def _tracked_build(manifest):
+        events.append(
+            (
+                "create",
+                manifest["activation_id"],
+                manifest["production_authoritative"],
+            )
+        )
+        return real_build(manifest)
+
+    def _tracked_validate(data_dir, pointer):
+        events.append(
+            (
+                "validate",
+                pointer["activation_id"],
+                pointer["production_authoritative"],
+            )
+        )
+        return real_validate(data_dir, pointer)
+
+    def _bounded_v5_symbol(*_args, **kwargs):
+        symbol = kwargs["symbol"]
+        run_id = kwargs["run_id"]
+        activation_id = kwargs["activation_id"]
+        coverage = {
+            partition: 1.0
+            for partition in native_activation_audit.NATIVE_EVIDENCE_PARTITIONS
+        }
+        entries = {}
+        for timeframe in kwargs["timeframes"]:
+            cell = kwargs["run_manifest_cells"][(symbol, timeframe)]
+            entries[timeframe] = {
+                "status": NATIVE_EVIDENCE_CANDIDATE,
+                "audit_status": "PASS",
+                "universe_eligibility_status": NATIVE_EVIDENCE_CANDIDATE,
+                "tradeable": False,
+                "statistical_sufficiency_receipt_required": True,
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "run_id": run_id,
+                "bars_relative_path": (
+                    f"runs/{run_id}/{symbol}/{timeframe}/bars.csv"
+                ),
+                "bars_sha256": cell["sha256"],
+                "sidecar_relative_path": (
+                    f"audits/{activation_id}/{symbol}/{timeframe}/bars.meta.json"
+                ),
+                "sidecar_sha256": "7" * 64,
+                "parity_relative_path": (
+                    f"audits/{activation_id}/{symbol}/{timeframe}/parity.json"
+                ),
+                "parity_sha256": "8" * 64,
+                "coverage_method": (
+                    native_activation_audit.NATIVE_SESSION_COVERAGE_METHOD
+                ),
+                "expected_session_coverage_by_partition": coverage,
+            }
+        return entries, {}, []
+
+    monkeypatch.setattr(
+        native_activation_audit,
+        "build_native_semantic_receipt",
+        _tracked_build,
+    )
+    monkeypatch.setattr(
+        native_activation_audit,
+        "validate_staged_receipt_backed_native_authority",
+        _tracked_validate,
+    )
+    monkeypatch.setattr(
+        native_activation_audit,
+        "_v5_audit_symbol",
+        _bounded_v5_symbol,
+    )
+
+    forensic_root = tmp_path / "forensic" / "data" / "native"
+    forensic_root.mkdir(parents=True)
+    _write_run(forensic_root, "run-forensic-symmetry")
+    forensic = audit_and_activate(
+        forensic_root,
+        run_id="run-forensic-symmetry",
+        symbols=["EURUSD"],
+        timeframes=["M5", "H1"],
+        activation_id="activation-forensic-symmetry",
+        thresholds=ParityThresholds(min_compared_native_bars=20),
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert forensic["status"] == "active", forensic
+    assert forensic["production_authoritative"] is False
+    assert forensic["active_pointer_updated"] is True
+    assert forensic["semantic_receipt_path"] is None
+    assert forensic["semantic_receipt_sha256"] is None
+    forensic_pointer = json.loads(
+        (forensic_root / "ACTIVE.json").read_text(encoding="utf-8")
+    )
+    assert forensic_pointer["production_authoritative"] is False
+    assert events == []
+
+    production_root = tmp_path / "production" / "data" / "native"
+    production_root.mkdir(parents=True)
+    _write_v5_run(
+        production_root,
+        "run-production-symmetry",
+        production_grid=True,
+    )
+    production = audit_and_activate(
+        production_root,
+        run_id="run-production-symmetry",
+        symbols=native_activation_audit.PRODUCTION_SYMBOL_ORDER,
+        timeframes=native_activation_audit.DEFAULT_TIMEFRAMES,
+        activation_id="activation-production-symmetry",
+        thresholds=ParityThresholds(min_compared_native_bars=20),
+        now=datetime(2026, 1, 1, tzinfo=UTC),
+        semantic_verification_mode=(
+            native_activation_audit.NATIVE_SEMANTIC_VERIFICATION_FORCE_RAW
+        ),
+    )
+    assert production["status"] == "active", production
+    assert production["production_authoritative"] is True
+    assert production["active_pointer_updated"] is True
+    receipt_path = Path(production["semantic_receipt_path"])
+    assert receipt_path.is_file()
+    assert production["semantic_receipt_sha256"] == sha256_file(receipt_path)
+    assert events == [
+        ("create", "activation-production-symmetry", True),
+        ("validate", "activation-production-symmetry", True),
+    ]
 
 
 def _rewrite_m5_as_no_history(native_root, run_id):
@@ -1677,9 +1817,9 @@ def test_segmented_v2_coverage_is_recomputed_and_authenticated():
             production_contract_required=True,
         )
         assert not production.valid
-        assert "NATIVE_UNIVERSE_PRODUCTION_CROSS_RESOLUTION_REQUIRED" in (
-            production.errors
-        )
+        assert production.errors == [
+            "NATIVE_SEMANTIC_PRODUCTION_AUTHORITY_REQUIRED"
+        ]
 
 
 def test_timeframe_v4_cell_windows_activate_and_resolve_independently():
@@ -1713,10 +1853,9 @@ def test_timeframe_v4_cell_windows_activate_and_resolve_independently():
             production_contract_required=True,
         )
         assert not production.valid
-        assert "NATIVE_UNIVERSE_PRODUCTION_TIMEFRAME_V5_REQUIRED" in (production.errors)
-        assert "NATIVE_UNIVERSE_PRODUCTION_SIX_TIMEFRAME_ROSTER_REQUIRED" in (
-            production.errors
-        )
+        assert production.errors == [
+            "NATIVE_SEMANTIC_PRODUCTION_AUTHORITY_REQUIRED"
+        ]
         calendar = universe.calendar_contract
         assert calendar["window_contract_version"] == (
             TIMEFRAME_EVIDENCE_CONTRACT_VERSION

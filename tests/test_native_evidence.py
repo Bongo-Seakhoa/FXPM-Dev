@@ -11,6 +11,7 @@ from pm_core import DataLoader, PipelineConfig
 from pm_native_activation import (
     ACTIVATION_MANIFEST_SCHEMA,
     ACTIVE_POINTER_SCHEMA,
+    resolve_active_native_artifact,
     sha256_file,
 )
 from pm_evidence import (
@@ -383,7 +384,7 @@ def test_calendar_trim_prefers_audited_broker_close_over_nominal_d1_utc_close():
     assert latest == pd.Timestamp("2025-03-30T21:00:00Z")
 
 
-def test_native_loader_rejects_legacy_active_manifest_without_production_contract():
+def test_native_loader_rejects_canonical_nonauthoritative_activation_without_fallback():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         native = root / "native"
@@ -423,6 +424,7 @@ def test_native_loader_rejects_legacy_active_manifest_without_production_contrac
             "activation_id": "activation-1",
             "run_id": "run-1",
             "status": "active",
+            "production_authoritative": False,
             "entries": {
                 "EURUSD": {
                     "H4": {
@@ -441,25 +443,54 @@ def test_native_loader_rejects_legacy_active_manifest_without_production_contrac
         }
         manifest_path = native / "activations" / "activation-1.json"
         manifest_path.parent.mkdir()
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_path.write_bytes(
+            (
+                json.dumps(
+                    manifest,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
         pointer = {
             "schema_version": ACTIVE_POINTER_SCHEMA,
             "activation_id": "activation-1",
             "manifest_relative_path": manifest_path.relative_to(native).as_posix(),
             "manifest_sha256": sha256_file(manifest_path),
+            "activated_at_utc": "2025-01-01T00:00:00Z",
+            "production_authoritative": False,
         }
-        (native / "ACTIVE.json").write_text(json.dumps(pointer), encoding="utf-8")
+        (native / "ACTIVE.json").write_bytes(
+            (
+                json.dumps(
+                    pointer,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+        )
+
+        forensic = resolve_active_native_artifact(
+            root,
+            "EURUSD",
+            "H4",
+            production_contract_required=False,
+        )
+        assert forensic.valid, forensic.errors
 
         loader = DataLoader(root, cache_resampled=False)
         loaded, meta = loader.load_native_timeframe("EURUSD", "H4")
         assert loaded is None
         assert not meta["provenance_valid"]
-        assert (
-            "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED"
-            in meta["provenance_errors"]
-        )
+        assert meta["provenance_errors"] == [
+            "NATIVE_SEMANTIC_PRODUCTION_AUTHORITY_REQUIRED"
+        ]
 
-        # A flat file is never a fallback when the production contract is absent.
+        # A flat file never bypasses the semantic production-authority gate.
         (native / "EURUSD_H4.csv").write_text(
             "time,Open,High,Low,Close\n", encoding="utf-8"
         )
@@ -467,10 +498,9 @@ def test_native_loader_rejects_legacy_active_manifest_without_production_contrac
             root, cache_resampled=False
         ).load_native_timeframe("EURUSD", "H4")
         assert still_missing is None
-        assert (
-            "NATIVE_UNIVERSE_PRODUCTION_EXPLICIT_CONTRACT_REQUIRED"
-            in strict_meta["provenance_errors"]
-        )
+        assert strict_meta["provenance_errors"] == [
+            "NATIVE_SEMANTIC_PRODUCTION_AUTHORITY_REQUIRED"
+        ]
 
 
 def test_pipeline_evidence_failure_is_technical_and_never_emits_trade_verdict():

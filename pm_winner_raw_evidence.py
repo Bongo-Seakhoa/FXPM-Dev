@@ -2261,7 +2261,9 @@ def _validated_stress_method_receipt(
         "realized_adversity_status",
         "receipt_sha256",
     }
-    if not isinstance(value, Mapping) or set(value) != expected_keys:
+    diagnostic_key = "stress_daily_improvement_observation_count"
+    valid_keysets = (expected_keys, expected_keys | {diagnostic_key})
+    if not isinstance(value, Mapping) or set(value) not in valid_keysets:
         _fail("STRESS_METHOD_RECEIPT_SCHEMA_INVALID")
     receipt = dict(value)
     receipt_sha = receipt.pop("receipt_sha256", None)
@@ -2333,6 +2335,13 @@ def _validated_stress_method_receipt(
         or receipt.get("strictly_worse_trade_count") < 0
         or type(receipt.get("strictly_worse_daily_observation_count")) is not int
         or receipt.get("strictly_worse_daily_observation_count") < 0
+        or (
+            diagnostic_key in receipt
+            and (
+                type(receipt.get(diagnostic_key)) is not int
+                or receipt.get(diagnostic_key) < 0
+            )
+        )
         or receipt.get("realized_adversity_status")
         not in {
             BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
@@ -2367,6 +2376,10 @@ def _validated_stress_method_receipt(
         Decimal(str(right)) < Decimal(str(left))
         for left, right in zip(base_daily, stress_daily, strict=True)
     )
+    stress_daily_improvement_observation_count = sum(
+        Decimal(str(right)) > Decimal(str(left))
+        for left, right in zip(base_daily, stress_daily, strict=True)
+    )
     vector_changed = (
         receipt["base_spread_values_sha256"]
         != receipt["stress_spread_values_sha256"]
@@ -2375,7 +2388,7 @@ def _validated_stress_method_receipt(
         strictly_worse_trade_count
         or strictly_worse_daily_observation_count
     )
-    if vector_changed != strictly_adverse:
+    if strictly_adverse and not vector_changed:
         _fail("STRESS_METHOD_VECTOR_ADVERSITY_INCONSISTENT")
     expected_adversity_status = (
         BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
@@ -2387,6 +2400,11 @@ def _validated_stress_method_receipt(
         != strictly_worse_trade_count
         or receipt.get("strictly_worse_daily_observation_count")
         != strictly_worse_daily_observation_count
+        or (
+            diagnostic_key in receipt
+            and receipt.get(diagnostic_key)
+            != stress_daily_improvement_observation_count
+        )
         or receipt.get("realized_adversity_status") != expected_adversity_status
     ):
         _fail("STRESS_METHOD_ADVERSITY_STATUS_MISMATCH")
@@ -3764,10 +3782,16 @@ def _build_authenticated_fold(
     )
     if dates != stress_dates:
         _fail(f"FOLD_{ordinal:03d}_BASE_STRESS_DAILY_AXIS_MISMATCH")
-    if any(
-        stress_value > base_value + 1e-12
-        for base_value, stress_value in zip(base_daily, stress_daily, strict=True)
-    ):
+    base_cumulative = Decimal(0)
+    stress_cumulative = Decimal(0)
+    cumulative_mtm_improves = False
+    for base_value, stress_value in zip(base_daily, stress_daily, strict=True):
+        base_cumulative += Decimal(str(base_value))
+        stress_cumulative += Decimal(str(stress_value))
+        if stress_cumulative > base_cumulative + Decimal("1e-12"):
+            cumulative_mtm_improves = True
+            break
+    if cumulative_mtm_improves:
         _fail(f"FOLD_{ordinal:03d}_COST_STRESS_IMPROVES_DAILY_R")
     (
         trade_opens,
@@ -3856,6 +3880,21 @@ def _build_authenticated_fold(
             BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
         ),
     }.get(expected_declared_status)
+    realized_status = (
+        stress_method_receipt.get("realized_adversity_status")
+        if isinstance(stress_method_receipt, Mapping)
+        else None
+    )
+    valid_realized_status = (
+        realized_status == expected_realized_status
+        if expected_realized_status
+        == BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+        else realized_status
+        in {
+            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
+            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
+        }
+    )
     if (
         not isinstance(expected_adversity_row, Mapping)
         or not isinstance(stress_method_receipt, Mapping)
@@ -3887,8 +3926,7 @@ def _build_authenticated_fold(
         or expected_adversity_row.get("stress_spread_values_sha256")
         != stress_cost_attestation.get("spread_values_sha256")
         or expected_realized_status is None
-        or stress_method_receipt.get("realized_adversity_status")
-        != expected_realized_status
+        or not valid_realized_status
     ):
         _fail("STRESS_ADVERSITY_PRECOMMITMENT_MISMATCH")
     shared_partition = _shared_oos_partition_receipt(

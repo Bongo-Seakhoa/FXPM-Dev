@@ -670,6 +670,129 @@ def test_mode6_entry_notional_delta_remains_economic_and_fail_closed(
     ]
 
 
+def test_mode6_rollover_rebound_passes_cumulative_stress_rule() -> None:
+    frame = _frame().iloc[:3].copy().assign(
+        SpreadOpen=[1, 1, 1],
+        SpreadMax=[5, 5, 5],
+        SpreadP95=[4, 4, 4],
+    )
+    signals = pd.Series([-1, 0, 0], index=frame.index, dtype=np.int32)
+    config = PipelineConfig(
+        research_mode=True,
+        use_spread=True,
+        use_slippage=False,
+        use_commission=False,
+        swap_model_enabled=True,
+        swap_model_min_holding_hours=0.0,
+        backtest_spread_mode="conservative_max",
+        discovery_risk_per_trade_pct=2.5,
+    )
+    strategy = _AtrHoldStrategy()
+    spec = _spec(
+        swap_long=-36.0,
+        swap_short=-36.0,
+        swap_mode=6,
+        contract_size=100000.0,
+    )
+    backtester = Backtester(config)
+    base = backtester.run(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        spec=spec,
+        timeframe="D1",
+    )
+
+    stress = backtester.replay_frozen_path_cost_stress(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        base,
+        stress_mode="stress_p95",
+        spec=spec,
+        timeframe="D1",
+    )
+
+    base_trade = base["trades"][0]
+    stress_trade = stress["trades"][0]
+    assert stress_trade["entry_price"] < base_trade["entry_price"]
+    assert stress_trade["swap_dollars"] > base_trade["swap_dollars"]
+    assert stress_trade["pnl_dollars"] < base_trade["pnl_dollars"]
+
+    base_daily = base["winner_daily_r_surface"]["daily_net_mtm_r"]
+    stress_daily = stress["winner_daily_r_surface"]["daily_net_mtm_r"]
+    improvement_count = sum(
+        Decimal(str(stress_value)) > Decimal(str(base_value))
+        for base_value, stress_value in zip(base_daily, stress_daily, strict=True)
+    )
+    assert improvement_count > 0  # The retired componentwise rule rejected this path.
+
+    base_cumulative = Decimal(0)
+    stress_cumulative = Decimal(0)
+    for base_value, stress_value in zip(base_daily, stress_daily, strict=True):
+        base_cumulative += Decimal(str(base_value))
+        stress_cumulative += Decimal(str(stress_value))
+        assert stress_cumulative <= base_cumulative + Decimal("1e-12")
+
+    receipt = stress["cost_stress_frozen_path_receipt"]
+    assert receipt["stress_daily_improvement_observation_count"] == improvement_count
+    assert receipt["realized_adversity_status"] == (
+        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
+    )
+
+
+def test_changed_spread_without_realized_degradation_is_insufficient() -> None:
+    frame = _frame().assign(
+        SpreadOpen=[1, 1, 1, 1, 1],
+        SpreadMax=[5, 5, 5, 5, 5],
+        SpreadP95=[4, 4, 4, 4, 4],
+    )
+    signals = pd.Series(np.zeros(len(frame), dtype=np.int32), index=frame.index)
+    config = PipelineConfig(
+        research_mode=True,
+        use_spread=True,
+        use_slippage=False,
+        use_commission=False,
+        swap_model_enabled=False,
+        backtest_spread_mode="conservative_max",
+    )
+    strategy = _AtrHoldStrategy()
+    spec = _spec()
+    backtester = Backtester(config)
+    base = backtester.run(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        spec=spec,
+        timeframe="D1",
+    )
+
+    stress = backtester.replay_frozen_path_cost_stress(
+        frame,
+        signals,
+        "ZZZUSD",
+        strategy,
+        base,
+        stress_mode="stress_p95",
+        spec=spec,
+        timeframe="D1",
+    )
+
+    receipt = stress["cost_stress_frozen_path_receipt"]
+    assert receipt["base_spread_values_sha256"] != receipt[
+        "stress_spread_values_sha256"
+    ]
+    assert receipt["strictly_worse_trade_count"] == 0
+    assert receipt["strictly_worse_daily_observation_count"] == 0
+    assert receipt["stress_daily_improvement_observation_count"] == 0
+    assert receipt["realized_adversity_status"] == (
+        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+    )
+
+
 def test_noncausal_swap_never_claims_full_path_daily_r() -> None:
     frame = _frame().drop(columns=["_BAR_CLOSE_TS"])
     result = _run(

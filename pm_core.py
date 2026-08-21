@@ -8586,6 +8586,21 @@ class Backtester:
         stress_dates = stress_surface.get("daily_dates_utc")
         base_daily = rebuilt_base_surface.get("daily_net_mtm_r")
         stress_daily = stress_surface.get("daily_net_mtm_r")
+        cumulative_mtm_improves = False
+        if (
+            type(base_daily) is list
+            and type(stress_daily) is list
+            and len(base_daily) == len(stress_daily)
+        ):
+            base_cumulative = Decimal(0)
+            stress_cumulative = Decimal(0)
+            tolerance = Decimal("1e-12")
+            for base_value, stress_value in zip(base_daily, stress_daily, strict=True):
+                base_cumulative += Decimal(str(base_value))
+                stress_cumulative += Decimal(str(stress_value))
+                if stress_cumulative > base_cumulative + tolerance:
+                    cumulative_mtm_improves = True
+                    break
         if (
             rebuilt_base_surface.get("status") != "AVAILABLE"
             or stress_surface.get("status") != "AVAILABLE"
@@ -8593,16 +8608,16 @@ class Backtester:
             or type(base_daily) is not list
             or type(stress_daily) is not list
             or len(base_daily) != len(stress_daily)
-            or any(
-                float(stress_value) > float(base_value) + 1e-12
-                for base_value, stress_value in zip(
-                    base_daily,
-                    stress_daily,
-                    strict=True,
-                )
-            )
+            # Daily values are first differences of cumulative MTM.  In MT5
+            # swap mode 6 the rate depends on opening notional: a wider SHORT
+            # entry is lower, so negative carry becomes less negative on each
+            # rollover day even while the entry shock leaves the trade adverse.
+            # The unchanged per-trade P&L check above protects closed positions;
+            # this cumulative-prefix check also protects positions still open at
+            # the partition boundary.
+            or cumulative_mtm_improves
         ):
-            raise ValueError("frozen-path stress daily MTM improves or is unavailable")
+            raise ValueError("frozen-path stress cumulative MTM improves or is unavailable")
 
         # A different policy label or spread-column preference is not proof of
         # realized cost-stress survival.  Record whether at least one exact net
@@ -8628,6 +8643,14 @@ class Backtester:
                 strict=True,
             )
         )
+        stress_daily_improvement_observation_count = sum(
+            Decimal(str(stress_value)) > Decimal(str(base_value))
+            for base_value, stress_value in zip(
+                base_daily,
+                stress_daily,
+                strict=True,
+            )
+        )
         base_spread_values_sha256 = str(
             rebuilt_base_attestation.get("spread_values_sha256") or ""
         )
@@ -8641,15 +8664,6 @@ class Backtester:
             strictly_worse_trade_count
             or strictly_worse_daily_observation_count
         )
-        if vector_changed and not strict_realized_degradation:
-            raise FrozenPathCostStressError(
-                "STRESS_VECTOR_CHANGED_WITHOUT_REALIZED_DEGRADATION",
-                (
-                    normalized_stress_mode,
-                    base_spread_values_sha256,
-                    stress_spread_values_sha256,
-                ),
-            )
         if strict_realized_degradation and not vector_changed:
             raise FrozenPathCostStressError(
                 "STRESS_REALIZED_DEGRADATION_WITHOUT_VECTOR_CHANGE",
@@ -8698,6 +8712,9 @@ class Backtester:
             "strictly_worse_trade_count": strictly_worse_trade_count,
             "strictly_worse_daily_observation_count": (
                 strictly_worse_daily_observation_count
+            ),
+            "stress_daily_improvement_observation_count": (
+                stress_daily_improvement_observation_count
             ),
             "realized_adversity_status": realized_adversity_status,
         }

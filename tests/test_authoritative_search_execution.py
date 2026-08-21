@@ -584,6 +584,107 @@ def test_cost_stress_adversity_plan_is_source_frozen_and_partition_cached(
     )
 
 
+@pytest.mark.parametrize(
+    ("expected_status", "realized_status", "accepted"),
+    (
+        (
+            execution.raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK,
+            execution.pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
+            True,
+        ),
+        (
+            execution.raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK,
+            execution.pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
+            False,
+        ),
+        (
+            execution.raw_winner.COST_STRESS_ADVERSITY_EXPECTED_STRICT,
+            execution.pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
+            True,
+        ),
+        (
+            execution.raw_winner.COST_STRESS_ADVERSITY_EXPECTED_STRICT,
+            execution.pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
+            True,
+        ),
+    ),
+    ids=(
+        "no-shock-to-insufficient",
+        "no-shock-cannot-become-strict",
+        "strict-remains-strict",
+        "strict-may-realize-insufficient",
+    ),
+)
+def test_realized_cost_stress_adversity_status_matrix(
+    expected_status: str,
+    realized_status: str,
+    accepted: bool,
+) -> None:
+    attempt = execution._VerifiedAttempt(
+        ordinal=7,
+        plan_attempt={"attempt_id": "horizon-attempt-7"},
+        candidate={},
+        trial={},
+        artifacts=SimpleNamespace(),
+    )
+    final = execution._PartitionSlice(
+        role="final_lockbox",
+        frame=pd.DataFrame(),
+        warmup_bars=0,
+        scored_start_utc="2025-01-01T00:00:00+00:00",
+        end_exclusive_utc="2025-01-02T00:00:00+00:00",
+        geometry_receipt={
+            "receipt_sha256": "g" * 64,
+            "frame_sha256": "f" * 64,
+        },
+    )
+    receipt = {
+        "base_cost_attestation_sha256": "b" * 64,
+        "stress_cost_attestation_sha256": "s" * 64,
+        "base_spread_values_sha256": "v" * 64,
+        "stress_spread_values_sha256": "w" * 64,
+        "realized_adversity_status": realized_status,
+    }
+    expected = {
+        "attempt_ordinal": attempt.ordinal,
+        "horizon_attempt_id": attempt.plan_attempt["attempt_id"],
+        "fold_ordinal": 2,
+        "final_partition_geometry_receipt_sha256": "g" * 64,
+        "final_partition_frame_sha256": "f" * 64,
+        **{
+            name: receipt[name]
+            for name in (
+                "base_cost_attestation_sha256",
+                "stress_cost_attestation_sha256",
+                "base_spread_values_sha256",
+                "stress_spread_values_sha256",
+            )
+        },
+        "expected_adversity_status": expected_status,
+    }
+
+    if accepted:
+        execution._verify_realized_cost_stress_adversity(
+            expected=expected,
+            attempt=attempt,
+            fold_ordinal=2,
+            final=final,
+            receipt=receipt,
+        )
+    else:
+        with pytest.raises(
+            execution.AuthoritativeSearchExecutionError,
+            match="FROZEN_COST_STRESS_ADVERSITY_PLAN_MISMATCH",
+        ):
+            execution._verify_realized_cost_stress_adversity(
+                expected=expected,
+                attempt=attempt,
+                fold_ordinal=2,
+                final=final,
+                receipt=receipt,
+            )
+
+
 def test_process_rejection_is_typed_nontechnical_abstention() -> None:
     attempt = execution._VerifiedAttempt(
         ordinal=4,

@@ -244,6 +244,7 @@ def _write_activation(
         "activation_id": ACTIVATION_ID,
         "manifest_relative_path": manifest_relative,
         "manifest_sha256": activation_sha,
+        "activated_at_utc": SOURCE_ACCESSED,
         "production_authoritative": False,
     }
     _write_json(native / "ACTIVE.json", pointer)
@@ -685,6 +686,7 @@ def _write_authenticated_suffix_activation(
         "activation_id": ACTIVATION_ID,
         "manifest_relative_path": manifest_relative,
         "manifest_sha256": activation_sha,
+        "activated_at_utc": SOURCE_ACCESSED,
         "production_authoritative": False,
     }
     pointer_path = native / "ACTIVE.json"

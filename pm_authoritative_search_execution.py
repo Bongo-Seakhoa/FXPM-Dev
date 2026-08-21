@@ -2211,9 +2211,20 @@ def _verify_realized_cost_stress_adversity(
         "base_spread_values_sha256": receipt.get("base_spread_values_sha256"),
         "stress_spread_values_sha256": receipt.get("stress_spread_values_sha256"),
     }
+    realized_status = receipt.get("realized_adversity_status")
+    valid_realized_status = (
+        realized_status == expected_realized_status
+        if expected_realized_status
+        == pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+        else realized_status
+        in {
+            pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
+            pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
+        }
+    )
     if (
         any(expected.get(name) != value for name, value in comparisons.items())
-        or receipt.get("realized_adversity_status") != expected_realized_status
+        or not valid_realized_status
     ):
         _fail(
             "FROZEN_COST_STRESS_ADVERSITY_PLAN_MISMATCH",
