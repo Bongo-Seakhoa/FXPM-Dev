@@ -43,6 +43,7 @@ import pm_current_refit_execution as current_refit_execution
 import pm_historical_anchor_orchestration as historical
 import pm_historical_production_adapter as historical_adapter
 import pm_native_prefix_production as native_prefix
+import pm_regime
 import pm_state_contract as state_contract
 import pm_training_horizon as training_horizon
 from pm_current_refit_parameters import (
@@ -63,7 +64,7 @@ PROCESS_SPOOL_SYMBOL: Final = "__PRODUCTION_SEARCH_PROCESS__"
 CURRENT_AUTH_SPOOL_SYMBOL: Final = "__CURRENT_SEARCH_AUTHORIZATION__"
 PROCESS_ARTIFACT_ID: Final = "production-search-process-precommit"
 PROCESS_ARTIFACT_TYPE: Final = "production_search_process_precommit"
-CELL_PLAN_SCHEMA: Final = "fxpm.production-search-cell-plan-receipt.v1"
+CELL_PLAN_SCHEMA: Final = "fxpm.production-search-cell-plan-receipt.v2"
 CELL_PLAN_ARTIFACT_TYPE: Final = "production_search_cell_plan_receipt"
 STATE_CONTEXT_DISPOSITION_SCHEMA: Final = (
     "fxpm.production-trial-state-context-disposition.v1"
@@ -72,6 +73,9 @@ STATE_CONTEXT_SELECTION_SCHEMA: Final = (
     "fxpm.production-cell-state-context-selection.v1"
 )
 STATE_CONTEXT_BOUNDARY_REASON: Final = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+STATE_ERROR_ENVELOPE_SCHEMA: Final = (
+    "fxpm.production-preprotected-state-error-envelope.v1"
+)
 CURRENT_SOURCE_CAPTURE_SCHEMA: Final = "fxpm.production-current-source-capture.v1"
 CURRENT_SOURCE_SNAPSHOT_SCHEMA: Final = "fxpm.current-refit-source-snapshot.v1"
 CURRENT_BAR_FILE_SCHEMA: Final = "fxpm.current-refit-bars.csv.v1"
@@ -1208,6 +1212,7 @@ def _seal_cell_plan(
     attempt_artifacts: Sequence[Mapping[str, Any]],
     state_requirements: Sequence[Mapping[str, Any]],
     state_context_selection: Mapping[str, Any],
+    state_error_envelope: Mapping[str, Any],
     boundary_limited: bool,
     current_refit_source_capture_sha256: str | None = None,
     bounded_canary_request: Any = None,
@@ -1259,6 +1264,11 @@ def _seal_cell_plan(
         _hex64(value.get("requirement_sha256"), "STATE_REQUIREMENT_HASH_INVALID")
         for value in state_requirements
     ]
+    _verify_state_error_envelope_fitted_binding(
+        state_error_envelope,
+        fitted=fitted,
+        native=native,
+    )
     if (
         len(attempt_hashes) != ATTEMPT_COUNT
         or len(state_hashes) != ATTEMPT_COUNT
@@ -1306,6 +1316,7 @@ def _seal_cell_plan(
         "state_requirement_sha256": state_hashes,
         "state_requirement_roster_sha256": _sha(state_hashes),
         "state_context_selection": dict(state_context_selection),
+        "state_error_envelope": dict(state_error_envelope),
         "current_refit_source_capture_sha256": source_capture_sha256,
         "attempts_frozen_before_search": True,
         "state_replay_required_before_scored_partition": True,
@@ -1530,6 +1541,11 @@ def _verify_state_context_plan_binding(
         ) from exc
     payload = receipt.get("dependency_payload")
     geometry = receipt.get("dependency_geometry")
+    native_prefix = receipt.get("native_prefix")
+    envelope = receipt.get("state_error_envelope")
+    initial_error, tolerance, regime_warmup_bars = (
+        _validated_state_error_envelope(envelope, native_prefix=native_prefix)
+    )
     candidates = plan_body.get("candidates")
     trials = plan_body.get("trials")
     plan_attempts = plan_body.get("attempts")
@@ -1537,6 +1553,7 @@ def _verify_state_context_plan_binding(
     if (
         type(payload) is not dict
         or type(geometry) is not dict
+        or type(native_prefix) is not dict
         or type(candidates) is not list
         or len(candidates) != 1
         or type(trials) is not list
@@ -1550,13 +1567,38 @@ def _verify_state_context_plan_binding(
         _fail("STATE_CONTEXT_PLAN_ROSTER_INVALID")
     candidate = candidates[0]
     selected = payload.get("feature_lookback_bars")
+    folds = candidate.get("folds") if type(candidate) is dict else None
+    folds_are_objects = type(folds) is list and all(
+        type(value) is dict for value in folds
+    )
+    envelope_cutoff = _utc(
+        envelope.get("preprotected_cutoff_utc"),
+        "STATE_ERROR_ENVELOPE_CUTOFF_INVALID",
+    )
+    earliest_fit_start = (
+        min(
+            _utc(value.get("fit_start_utc"), "FIT_START_INVALID")
+            for value in folds
+        )
+        if folds_are_objects and folds
+        else None
+    )
     if (
         type(candidate) is not dict
         or candidate != receipt.get("candidate")
+        or not folds_are_objects
+        or (
+            earliest_fit_start is not None
+            and (
+                envelope.get("four_fold_protected_axis_available") is not True
+                or envelope_cutoff > earliest_fit_start
+            )
+        )
         or type(selected) is not int
         or selected < 1
         or geometry != _derived_dependency_geometry(timeframe, payload)
         or geometry.get("warmup_bars", -1) < selected
+        or payload.get("regime_warmup_bars") != regime_warmup_bars
         or plan_body.get("derived_dependency_geometry") != geometry
         or dependency_policy.get("payload") != payload
         or (not candidate.get("folds")) is not boundary_limited
@@ -1578,6 +1620,8 @@ def _verify_state_context_plan_binding(
             requirement_sha256 != _sha(requirement_body)
             or state.get("execution_rule")
             != "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
+            or state.get("initial_error_bound_hex") != initial_error.hex()
+            or state.get("tolerance_hex") != tolerance.hex()
             or type(state_evidence) is not list
             or any(
                 type(value) is not dict
@@ -2211,39 +2255,354 @@ def _validate_available_prefix_anchor_binding(
         _fail("NATIVE_PREFIX_NOT_EXACT_ANCHOR_CUTOFF")
 
 
-def _state_error_and_tolerance(
-    frame: pd.DataFrame,
-    fitted: search_execution.FittedNativeSearchTimeframe,
-) -> tuple[float, float]:
+def _state_price_error_bound(frame: pd.DataFrame) -> float:
+    """Return the conservative price-state envelope for one admitted prefix."""
+
     try:
-        values = pd.to_numeric(
-            frame.loc[:, ["Open", "High", "Low", "Close"]].stack(),
-            errors="coerce",
-        )
-        if values.empty or values.isna().any():
+        if frame.empty:
             _fail("STATE_PRICE_SURFACE_INVALID")
-        maximum = float(values.abs().max())
-        spread = float(values.max() - values.min())
-        initial_error = max(STATE_INITIAL_ERROR_FLOOR, 2.0 * maximum, spread)
-        instrument = dict(fitted.product.instrument_snapshot or {})
-        parity = float(instrument.get("parity_tick_tolerance"))
-        tick_size = float(fitted.instrument_spec.tick_size)
-        tolerance = min(parity, tick_size)
+        minimum = math.inf
+        maximum = -math.inf
+        for name in ("Open", "High", "Low", "Close"):
+            values = pd.to_numeric(frame[name], errors="coerce")
+            if values.empty or values.isna().any():
+                _fail("STATE_PRICE_SURFACE_INVALID")
+            minimum = min(minimum, float(values.min()))
+            maximum = max(maximum, float(values.max()))
     except ProductionSearchPlannerError:
         raise
     except Exception as exc:
         raise ProductionSearchPlannerError(
-            "STATE_ERROR_TOLERANCE_DERIVATION_FAILED", (type(exc).__name__,)
+            "STATE_PRICE_SURFACE_INVALID", (type(exc).__name__,)
+        ) from exc
+    maximum_absolute = max(abs(minimum), abs(maximum))
+    spread = maximum - minimum
+    bound = max(STATE_INITIAL_ERROR_FLOOR, 2.0 * maximum_absolute, spread)
+    if not math.isfinite(bound) or bound <= 0.0:
+        _fail("STATE_ERROR_ENVELOPE_INVALID")
+    return bound
+
+
+def _state_tolerance(
+    fitted: search_execution.FittedNativeSearchTimeframe,
+) -> float:
+    try:
+        instrument = dict(fitted.product.instrument_snapshot or {})
+        parity = float(instrument.get("parity_tick_tolerance"))
+        tick_size = float(fitted.instrument_spec.tick_size)
+        tolerance = min(parity, tick_size)
+    except Exception as exc:
+        raise ProductionSearchPlannerError(
+            "STATE_TOLERANCE_DERIVATION_FAILED", (type(exc).__name__,)
         ) from exc
     if (
-        not math.isfinite(initial_error)
-        or not math.isfinite(tolerance)
-        or initial_error <= 0.0
+        not math.isfinite(tolerance)
         or tolerance <= 0.0
+        or not math.isfinite(tick_size)
+        or tick_size <= 0.0
         or tolerance > tick_size
     ):
-        _fail("STATE_ERROR_TOLERANCE_INVALID")
-    return initial_error, tolerance
+        _fail("STATE_TOLERANCE_INVALID")
+    return tolerance
+
+
+def _preprotected_state_envelope_cutoff(
+    *,
+    native: Mapping[str, Any],
+    opens: pd.DatetimeIndex,
+    closes: pd.DatetimeIndex,
+    timeframe: str,
+) -> tuple[pd.Timestamp, bool]:
+    """Choose an index-only cutoff earlier than every possible tuning split.
+
+    Use the first fit start of the largest depth that is feasible under the
+    minimum state context.  Any realized state context can only remove that
+    depth or select a later fit start.  The envelope therefore ends before
+    every possible optimizer, tuning, or final-lockbox observation without
+    defeating the existing shorter-depth source-boundary recovery.
+    """
+
+    prefix_end = pd.Timestamp(
+        _utc(native.get("prefix_end_exclusive_utc"), "PREFIX_END_INVALID")
+    )
+    minimal_payload = _dependency_payload(
+        timeframe,
+        feature_lookback_bars=1,
+        regime_warmup_bars=1,
+    )
+    minimal_geometry = _derived_dependency_geometry(timeframe, minimal_payload)
+    for depth_days in reversed(FIT_CALENDAR_DAY_LADDERS[timeframe]):
+        result = _try_causal_folds(
+            native=native,
+            opens=opens,
+            closes=closes,
+            timeframe=timeframe,
+            depth_days=depth_days,
+            geometry=minimal_geometry,
+            state_context_bars=1,
+        )
+        if result is not None:
+            candidate_start, _folds = result
+            return candidate_start, True
+    return prefix_end, False
+
+
+def _regime_warmup_contract(
+    fitted: search_execution.FittedNativeSearchTimeframe,
+) -> tuple[int, str]:
+    """Derive regime warmup from the frozen detector parameters, not a surface."""
+
+    try:
+        parameters = pm_regime.RegimeParams.from_dict(
+            dict(fitted.regime_parameters)
+        )
+        parameters_sha256 = pm_regime.regime_params_sha256(parameters.to_dict())
+        decision = fitted.regime_fit_decision.to_dict()
+        expected_sha256 = decision.get("regime_params_sha256")
+        warmup_bars = int(pm_regime.MarketRegimeDetector(parameters).warmup_bars)
+    except Exception as exc:
+        raise ProductionSearchPlannerError(
+            "REGIME_WARMUP_CONTRACT_DERIVATION_FAILED", (type(exc).__name__,)
+        ) from exc
+    if (
+        expected_sha256 != parameters_sha256
+        or warmup_bars < 1
+        or warmup_bars > 1_000_000
+    ):
+        _fail("REGIME_WARMUP_CONTRACT_INVALID")
+    return warmup_bars, parameters_sha256
+
+
+def _freeze_state_error_envelope(
+    *,
+    frame: pd.DataFrame,
+    fitted: search_execution.FittedNativeSearchTimeframe,
+    native: Mapping[str, Any],
+    opens: pd.DatetimeIndex,
+    closes: pd.DatetimeIndex,
+) -> dict[str, Any]:
+    """Seal a pre-protected envelope; later values may only fail it closed."""
+
+    timeframe = str(native.get("timeframe") or "").upper()
+    if (
+        timeframe not in TIMEFRAMES
+        or len(frame) != len(opens)
+        or len(frame) != len(closes)
+    ):
+        _fail("STATE_ERROR_ENVELOPE_INPUT_INVALID")
+    cutoff, four_fold_axis_available = _preprotected_state_envelope_cutoff(
+        native=native,
+        opens=opens,
+        closes=closes,
+        timeframe=timeframe,
+    )
+    # When no four-fold axis exists, ``cutoff`` is the prefix end and the whole
+    # frame is non-protected planning input.  Otherwise this same mask ends at
+    # the largest feasible first-fold fit start, before every tuning observation.
+    source_mask = (opens < cutoff) & (closes <= cutoff)
+    source = frame.loc[source_mask, ["Open", "High", "Low", "Close"]]
+    if source.empty:
+        _fail("STATE_ERROR_ENVELOPE_SOURCE_EMPTY")
+    initial_error = _state_price_error_bound(source)
+    # This reads later values only as a one-bit verifier.  The observed bound is
+    # deliberately neither returned nor sealed, so it cannot tune a ceiling.
+    if _state_price_error_bound(frame) > initial_error:
+        _fail("STATE_ERROR_ENVELOPE_BREACHED")
+    tolerance = _state_tolerance(fitted)
+    regime_warmup_bars, regime_parameters_sha256 = _regime_warmup_contract(fitted)
+    source_closes = closes[source_mask]
+    body = {
+        "schema_version": STATE_ERROR_ENVELOPE_SCHEMA,
+        "derivation": "MAX_100_DOUBLE_MAX_ABS_AND_RANGE_ON_PREPROTECTED_PREFIX",
+        "preprotected_cutoff_rule": (
+            "LARGEST_FEASIBLE_FIRST_FOLD_FIT_START_BEFORE_ANY_TUNING_OR_FINAL_OBSERVATION"
+            if four_fold_axis_available
+            else "FULL_PREFIX_ONLY_WHEN_FOUR_FOLD_PROTECTED_AXIS_UNAVAILABLE"
+        ),
+        "preprotected_cutoff_utc": _utc_text(cutoff),
+        "four_fold_protected_axis_available": four_fold_axis_available,
+        "source_rows": int(source_mask.sum()),
+        "post_cutoff_rows": int(len(frame) - int(source_mask.sum())),
+        "source_last_close_utc": _utc_text(source_closes[-1]),
+        "source_price_surface_sha256": _frame_sha256(source),
+        "initial_error_bound_hex": initial_error.hex(),
+        "tolerance_hex": tolerance.hex(),
+        "full_prefix_verification": "WITHIN_FROZEN_PREPROTECTED_ENVELOPE",
+        "protected_market_values_can_only_fail_closed": True,
+        "regime_parameters_sha256": regime_parameters_sha256,
+        "regime_warmup_bars": regime_warmup_bars,
+    }
+    receipt = {**body, "receipt_sha256": _sha(body)}
+    _validated_state_error_envelope(receipt, native_prefix=native)
+    return receipt
+
+
+def _validated_state_error_envelope(
+    value: Mapping[str, Any],
+    *,
+    native_prefix: Mapping[str, Any] | None = None,
+) -> tuple[float, float, int]:
+    if type(value) is not dict:
+        _fail("STATE_ERROR_ENVELOPE_INVALID")
+    expected_fields = {
+        "schema_version",
+        "derivation",
+        "preprotected_cutoff_rule",
+        "preprotected_cutoff_utc",
+        "four_fold_protected_axis_available",
+        "source_rows",
+        "post_cutoff_rows",
+        "source_last_close_utc",
+        "source_price_surface_sha256",
+        "initial_error_bound_hex",
+        "tolerance_hex",
+        "full_prefix_verification",
+        "protected_market_values_can_only_fail_closed",
+        "regime_parameters_sha256",
+        "regime_warmup_bars",
+        "receipt_sha256",
+    }
+    try:
+        initial_error = float.fromhex(str(value.get("initial_error_bound_hex")))
+        tolerance = float.fromhex(str(value.get("tolerance_hex")))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ProductionSearchPlannerError("STATE_ERROR_ENVELOPE_INVALID") from exc
+    body = {key: item for key, item in value.items() if key != "receipt_sha256"}
+    cutoff = _utc(
+        value.get("preprotected_cutoff_utc"),
+        "STATE_ERROR_ENVELOPE_CUTOFF_INVALID",
+    )
+    source_end = _utc(
+        value.get("source_last_close_utc"),
+        "STATE_ERROR_ENVELOPE_SOURCE_END_INVALID",
+    )
+    four_fold_axis_available = value.get("four_fold_protected_axis_available")
+    expected_rule = (
+        "LARGEST_FEASIBLE_FIRST_FOLD_FIT_START_BEFORE_ANY_TUNING_OR_FINAL_OBSERVATION"
+        if four_fold_axis_available is True
+        else "FULL_PREFIX_ONLY_WHEN_FOUR_FOLD_PROTECTED_AXIS_UNAVAILABLE"
+    )
+    native_rows: Any = None
+    native_end: datetime | None = None
+    native_last_close: datetime | None = None
+    if native_prefix is not None:
+        if type(native_prefix) is not dict:
+            _fail("STATE_ERROR_ENVELOPE_NATIVE_BINDING_INVALID")
+        native_rows = native_prefix.get("prefix_rows", native_prefix.get("rows"))
+        native_end = _utc(
+            native_prefix.get(
+                "prefix_end_exclusive_utc",
+                native_prefix.get("end_exclusive_utc"),
+            ),
+            "STATE_ERROR_ENVELOPE_NATIVE_END_INVALID",
+        )
+        native_last_close = _utc(
+            native_prefix.get(
+                "prefix_last_close_utc",
+                native_prefix.get("last_close_utc"),
+            ),
+            "STATE_ERROR_ENVELOPE_NATIVE_LAST_CLOSE_INVALID",
+        )
+    if (
+        set(value) != expected_fields
+        or value.get("schema_version") != STATE_ERROR_ENVELOPE_SCHEMA
+        or value.get("derivation")
+        != "MAX_100_DOUBLE_MAX_ABS_AND_RANGE_ON_PREPROTECTED_PREFIX"
+        or value.get("preprotected_cutoff_rule") != expected_rule
+        or value.get("receipt_sha256") != _sha(body)
+        or type(four_fold_axis_available) is not bool
+        or type(value.get("source_rows")) is not int
+        or value["source_rows"] < 1
+        or type(value.get("post_cutoff_rows")) is not int
+        or value["post_cutoff_rows"] < 0
+        or value.get("full_prefix_verification")
+        != "WITHIN_FROZEN_PREPROTECTED_ENVELOPE"
+        or value.get("protected_market_values_can_only_fail_closed") is not True
+        or type(value.get("regime_warmup_bars")) is not int
+        or not 1 <= value["regime_warmup_bars"] <= 1_000_000
+        or not math.isfinite(initial_error)
+        or initial_error < STATE_INITIAL_ERROR_FLOOR
+        or not math.isfinite(tolerance)
+        or tolerance <= 0.0
+        or source_end > cutoff
+        or (four_fold_axis_available and value["post_cutoff_rows"] < 1)
+        or (
+            native_prefix is not None
+            and (
+                type(native_rows) is not int
+                or native_rows
+                != value["source_rows"] + value["post_cutoff_rows"]
+                or cutoff > native_end
+                or source_end > native_last_close
+                or (
+                    four_fold_axis_available
+                    and cutoff >= native_end
+                )
+                or (
+                    not four_fold_axis_available
+                    and (
+                        value["post_cutoff_rows"] != 0
+                        or value["source_rows"] != native_rows
+                        or cutoff != native_end
+                        or source_end != native_last_close
+                    )
+                )
+            )
+        )
+    ):
+        _fail("STATE_ERROR_ENVELOPE_INVALID")
+    _hex64(
+        value.get("source_price_surface_sha256"),
+        "STATE_ERROR_ENVELOPE_SOURCE_HASH_INVALID",
+    )
+    _hex64(
+        value.get("regime_parameters_sha256"),
+        "STATE_ERROR_ENVELOPE_REGIME_HASH_INVALID",
+    )
+    return initial_error, tolerance, int(value["regime_warmup_bars"])
+
+
+def _verify_state_error_envelope_fitted_binding(
+    value: Mapping[str, Any],
+    *,
+    fitted: search_execution.FittedNativeSearchTimeframe,
+    native: Mapping[str, Any],
+) -> tuple[float, float, int]:
+    """Bind the envelope's non-price terms to the authenticated fit."""
+
+    initial_error, tolerance, regime_warmup_bars = (
+        _validated_state_error_envelope(value, native_prefix=native)
+    )
+    expected_tolerance = _state_tolerance(fitted)
+    expected_warmup_bars, expected_parameters_sha256 = _regime_warmup_contract(
+        fitted
+    )
+    if (
+        tolerance != expected_tolerance
+        or regime_warmup_bars != expected_warmup_bars
+        or value.get("regime_parameters_sha256") != expected_parameters_sha256
+    ):
+        _fail("STATE_ERROR_ENVELOPE_FITTED_BINDING_INVALID")
+    return initial_error, tolerance, regime_warmup_bars
+
+
+def verify_preprotected_state_error_envelope(
+    fitted: search_execution.FittedNativeSearchTimeframe,
+    value: Mapping[str, Any],
+) -> bool:
+    """Independently rederive one envelope from its authenticated full frame."""
+
+    frame, native, opens, closes = _validated_frame(fitted)
+    expected = _freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
+    if type(value) is not dict or dict(value) != expected:
+        _fail("STATE_ERROR_ENVELOPE_SOURCE_REPLAY_INVALID")
+    return True
 
 
 def _state_replay_requirement(
@@ -2363,11 +2722,17 @@ def _state_replay_requirement(
 def _state_requirements(
     *,
     fitted: search_execution.FittedNativeSearchTimeframe,
-    frame: pd.DataFrame,
     native: Mapping[str, Any],
     designs: Sequence[Mapping[str, Any]],
+    state_error_envelope: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], int]:
-    initial_error, tolerance = _state_error_and_tolerance(frame, fitted)
+    initial_error, tolerance, regime_warmup_bars = (
+        _verify_state_error_envelope_fitted_binding(
+            state_error_envelope,
+            fitted=fitted,
+            native=native,
+        )
+    )
     requirements = [
         _state_replay_requirement(
             fitted=fitted,
@@ -2379,19 +2744,7 @@ def _state_requirements(
         )
         for design in designs
     ]
-    warmup_surface = frame.get("REGIME_WARMUP")
-    if not isinstance(warmup_surface, pd.Series) or warmup_surface.empty:
-        _fail("REGIME_WARMUP_SURFACE_MISSING")
-    if warmup_surface.isna().any() or not warmup_surface.isin([True, False]).all():
-        _fail("REGIME_WARMUP_SURFACE_INVALID")
-    flags = warmup_surface.astype(bool).to_numpy()
-    false_positions = [ordinal for ordinal, value in enumerate(flags) if not value]
-    if not false_positions:
-        _fail("REGIME_WARMUP_NEVER_COMPLETES")
-    leading = false_positions[0]
-    if any(flags[leading:]):
-        _fail("REGIME_WARMUP_SURFACE_NONPREFIX")
-    return requirements, max(1, leading)
+    return requirements, regime_warmup_bars
 
 
 def _midnight(value: pd.Timestamp) -> bool:
@@ -2680,7 +3033,6 @@ def _write_current_refit_source_capture(
 
 def _try_causal_folds(
     *,
-    frame: pd.DataFrame,
     native: Mapping[str, Any],
     opens: pd.DatetimeIndex,
     closes: pd.DatetimeIndex,
@@ -2803,7 +3155,6 @@ def _try_causal_folds(
 
 def _build_causal_folds(
     *,
-    frame: pd.DataFrame,
     native: Mapping[str, Any],
     opens: pd.DatetimeIndex,
     closes: pd.DatetimeIndex,
@@ -2814,7 +3165,6 @@ def _build_causal_folds(
     ladder = FIT_CALENDAR_DAY_LADDERS[timeframe]
     for depth_days in reversed(ladder):
         result = _try_causal_folds(
-            frame=frame,
             native=native,
             opens=opens,
             closes=closes,
@@ -2841,7 +3191,6 @@ def _build_causal_folds(
 
 def _select_feasible_common_state_context(
     *,
-    frame: pd.DataFrame,
     native: Mapping[str, Any],
     opens: pd.DatetimeIndex,
     closes: pd.DatetimeIndex,
@@ -2880,7 +3229,6 @@ def _select_feasible_common_state_context(
         )
         geometry = _derived_dependency_geometry(timeframe, payload)
         depth_days, candidate_start, folds, boundary_limited = _build_causal_folds(
-            frame=frame,
             native=native,
             opens=opens,
             closes=closes,
@@ -3913,14 +4261,20 @@ def _build_observed_cell_plan(
         timeframe=timeframe,
         regime=normalized_regime,
     )
+    state_error_envelope = _freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
     state_requirements, regime_warmup_bars = _state_requirements(
         fitted=fitted,
-        frame=frame,
         native=native,
         designs=designs,
+        state_error_envelope=state_error_envelope,
     )
     state_selection = _select_feasible_common_state_context(
-        frame=frame,
         native=native,
         opens=opens,
         closes=closes,
@@ -4127,6 +4481,7 @@ def _build_observed_cell_plan(
         attempt_artifacts=artifacts,
         state_requirements=state_requirements,
         state_context_selection=state_context_selection,
+        state_error_envelope=state_error_envelope,
         boundary_limited=boundary_limited,
         current_refit_source_capture_sha256=(
             _sha(current_source_capture) if current_source_capture is not None else None
@@ -4177,6 +4532,7 @@ def production_search_planner_contract() -> dict[str, Any]:
         "pm_current_refit_artifacts": _source_sha256(current_refit),
         "pm_causal_process": _source_sha256(causal),
         "pm_historical_production_adapter": _source_sha256(historical_adapter),
+        "pm_regime": _source_sha256(pm_regime),
         "pm_state_contract": _source_sha256(state_contract),
         "pm_strategies": _source_sha256(StrategyRegistry),
         "pm_training_horizon": _source_sha256(training_horizon),
@@ -4192,6 +4548,9 @@ def production_search_planner_contract() -> dict[str, Any]:
         "multiple_horizon_depths_claimed": False,
         "source_geometry_only_depth_ladder": True,
         "authenticated_full_prefix_state_replay_required": True,
+        "state_error_envelope_frozen_before_tuning_and_protected_values": True,
+        "protected_state_envelope_breach_fails_closed": True,
+        "regime_warmup_derived_from_frozen_parameters": True,
         "current_refit_reuses_historical_horizon_oracle": True,
         "full_grid_exhaustive_search_claimed": False,
         "technical_failure_is_market_verdict": False,
@@ -4226,5 +4585,6 @@ __all__ = [
     "production_search_planner_contract",
     "verify_frozen_production_search_process",
     "verify_current_search_authorization",
+    "verify_preprotected_state_error_envelope",
     "verify_production_cell_search_plan",
 ]

@@ -461,7 +461,7 @@ def _build_canary_state_context_admission_summary(
         _fail("CANARY_STATE_CONTEXT_PROCESS_SEMANTICS_INVALID")
     if (
         cell_receipt_sha256 != _sha256(cell_body)
-        or cell.get("schema_version") != "fxpm.production-search-cell-plan-receipt.v1"
+        or cell.get("schema_version") != "fxpm.production-search-cell-plan-receipt.v2"
         or cell.get("mode") != "BOUNDED_RAW_WINNER_CANARY"
         or cell.get("search_process_receipt_sha256") != process_receipt_sha256
         or cell.get("attempt_count")
@@ -5528,7 +5528,7 @@ def verify_bounded_raw_winner_canary_receipt(
     cell_plan_horizon_binding = cell_plan_receipt.get("horizon_plan_binding")
     if (
         cell_plan_receipt.get("schema_version")
-        != "fxpm.production-search-cell-plan-receipt.v1"
+        != "fxpm.production-search-cell-plan-receipt.v2"
         or cell_plan_receipt.get("mode") != "BOUNDED_RAW_WINNER_CANARY"
         or cell_plan_receipt.get("artifact_namespace") != body["raw_artifact_namespace"]
         or cell_plan_receipt.get("generation_id") != context.generation_id

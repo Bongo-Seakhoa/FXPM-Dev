@@ -814,6 +814,44 @@ def test_release_contract_binds_all_execution_dependencies() -> None:
     )
 
 
+def test_executor_rederives_cell_state_envelope_before_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = {"receipt_sha256": "e" * 64}
+    cell_plan = SimpleNamespace(
+        cell_receipt={"state_error_envelope": envelope},
+    )
+    fitted = SimpleNamespace()
+    calls = []
+    monkeypatch.setattr(
+        search_planner,
+        "verify_preprotected_state_error_envelope",
+        lambda observed_fitted, observed_envelope: (
+            calls.append((observed_fitted, observed_envelope)) or True
+        ),
+    )
+
+    execution._reverify_cell_state_error_envelope(
+        cell_plan=cell_plan,
+        fitted=fitted,
+    )
+    assert calls == [(fitted, envelope)]
+
+    monkeypatch.setattr(
+        search_planner,
+        "verify_preprotected_state_error_envelope",
+        lambda *_args, **_kwargs: False,
+    )
+    with pytest.raises(
+        execution.AuthoritativeSearchExecutionError,
+        match="STATE_ERROR_ENVELOPE_REVERIFY_FAILED",
+    ):
+        execution._reverify_cell_state_error_envelope(
+            cell_plan=cell_plan,
+            fitted=fitted,
+        )
+
+
 def test_source_identity_uses_the_raw_winner_trade_power_policy_owner() -> None:
     from tests.test_trade_power import _source_contract
 
@@ -1562,6 +1600,87 @@ def test_historical_execution_rejects_capture_horizon_plan_substitution(
     assert verified == [(capture.context, process, capture.sink, cell_plan)]
 
 
+def test_historical_executor_replays_envelope_before_attempt_roster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture = object.__new__(
+        execution.historical_adapter.HistoricalSymbolSearchCapture
+    )
+    failures = []
+    capture.record_search_infrastructure_failure = (
+        lambda timeframe, regime, *, failure, attempted_trials_exact: failures.append(
+            (
+                timeframe,
+                regime,
+                failure.outcome.reason_code,
+                attempted_trials_exact,
+            )
+        )
+    )
+    fitted = SimpleNamespace(
+        source_group_decision=_decision(
+            "s" * 64,
+            {"symbol": "EURUSD", "timeframe": "H1"},
+        )
+    )
+    horizon_plan = object()
+    attempt_artifacts = ({"attempt": 0},)
+    order = []
+    monkeypatch.setattr(
+        execution,
+        "_verified_historical_cell_plan_inputs",
+        lambda *_args, **_kwargs: (horizon_plan, attempt_artifacts),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verify_capture_horizon_plan_identity",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        execution,
+        "_reverify_fitted_timeframe",
+        lambda _fitted, _config: (order.append("fitted") or fitted),
+    )
+
+    def reject_envelope(**_kwargs):
+        order.append("envelope")
+        raise execution.AuthoritativeSearchExecutionError(
+            "STATE_ERROR_ENVELOPE_REVERIFY_FAILED"
+        )
+
+    monkeypatch.setattr(
+        execution,
+        "_reverify_cell_state_error_envelope",
+        reject_envelope,
+    )
+    monkeypatch.setattr(
+        execution,
+        "_verify_attempt_roster",
+        lambda **_kwargs: pytest.fail("attempt roster reached before envelope replay"),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_close_reserved_stage",
+        lambda **_kwargs: None,
+    )
+
+    result = execution.execute_historical_observed_cell(
+        capture=capture,
+        fitted=fitted,
+        regime="TREND",
+        search_process=SimpleNamespace(),
+        cell_plan=SimpleNamespace(),
+        config=_config(),
+    )
+
+    assert order == ["fitted", "envelope"]
+    assert result.status == "TECHNICAL_FAILURE"
+    assert result.failure_code == "STATE_ERROR_ENVELOPE_REVERIFY_FAILED"
+    assert failures == [
+        ("H1", "TREND", "STATE_ERROR_ENVELOPE_REVERIFY_FAILED", 1)
+    ]
+
+
 def _attempt_roster_fixture(*, boundary: bool, attempt_count: int):
     symbol = "EURUSD"
     timeframe = "D1"
@@ -1988,6 +2107,38 @@ def test_current_executor_rejects_fitted_support_receipt_splice_before_search(
             config=_config(),
         )
     assert caught.value.code == "CURRENT_FITTED_PLAN_BINDING_MISMATCH"
+
+    order = []
+    monkeypatch.setattr(
+        execution.historical,
+        "historical_horizon_plan_binding",
+        lambda _plan: {
+            "plan_receipt_sha256": execution._sha256(plan_body),
+            "train_regime_support_receipt_sha256": "t" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        execution,
+        "_reverify_fitted_timeframe",
+        lambda _fitted, _config: (order.append("fitted") or refreshed),
+    )
+    monkeypatch.setattr(
+        execution,
+        "_reverify_cell_state_error_envelope",
+        lambda **_kwargs: order.append("envelope"),
+    )
+    observed, observed_receipt, _observed_binding = (
+        execution._verified_current_observed_inputs(
+            process=SimpleNamespace(),
+            sink=sink,
+            cell_plan=cell_plan,
+            fitted=SimpleNamespace(),
+            config=_config(),
+        )
+    )
+    assert observed is refreshed
+    assert observed_receipt == receipt
+    assert order == ["fitted", "envelope"]
 
 
 def test_current_cross_binding_v2_contains_only_current_outer_receipts(

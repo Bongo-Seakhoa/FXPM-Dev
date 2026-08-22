@@ -211,7 +211,7 @@ def _state_context_admission_inputs(
     }
     horizon_receipt_sha256 = _sha(horizon)
     cell_body = {
-        "schema_version": "fxpm.production-search-cell-plan-receipt.v1",
+        "schema_version": "fxpm.production-search-cell-plan-receipt.v2",
         "mode": "BOUNDED_RAW_WINNER_CANARY",
         "search_process_receipt_sha256": process_sha256,
         "attempt_count": len(attempts),

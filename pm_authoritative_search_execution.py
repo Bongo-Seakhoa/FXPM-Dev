@@ -2808,6 +2808,30 @@ def _reverify_fitted_timeframe(
     return refreshed
 
 
+def _reverify_cell_state_error_envelope(
+    *,
+    cell_plan: Any,
+    fitted: FittedNativeSearchTimeframe,
+) -> None:
+    """Recompute the planner's preprotected envelope before any evaluation."""
+
+    try:
+        import pm_production_search_planner as planner
+
+        receipt = cell_plan.cell_receipt
+        verified = planner.verify_preprotected_state_error_envelope(
+            fitted,
+            receipt.get("state_error_envelope") if type(receipt) is dict else None,
+        )
+    except Exception as exc:
+        detail = getattr(exc, "code", type(exc).__name__)
+        raise AuthoritativeSearchExecutionError(
+            "STATE_ERROR_ENVELOPE_REVERIFY_FAILED", (str(detail),)
+        ) from exc
+    if verified is not True:
+        _fail("STATE_ERROR_ENVELOPE_REVERIFY_FAILED")
+
+
 def reverify_fitted_native_timeframe_for_search(
     *,
     fitted: FittedNativeSearchTimeframe,
@@ -3418,6 +3442,7 @@ def _verified_current_observed_inputs(
         or binding.get("plan_receipt_sha256") != _sha256(plan_body)
     ):
         _fail("CURRENT_FITTED_PLAN_BINDING_MISMATCH")
+    _reverify_cell_state_error_envelope(cell_plan=cell_plan, fitted=refreshed)
     return refreshed, dict(receipt), dict(binding)
 
 
@@ -3918,6 +3943,7 @@ def execute_historical_observed_cell(
     primary_error: BaseException | None = None
     try:
         refreshed = _reverify_fitted_timeframe(fitted, config)
+        _reverify_cell_state_error_envelope(cell_plan=cell_plan, fitted=refreshed)
         plan_body, attempts = _verify_attempt_roster(
             plan=horizon_plan,
             attempt_artifacts=attempt_artifacts,

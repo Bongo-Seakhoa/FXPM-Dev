@@ -26,6 +26,85 @@ def _process_body() -> dict:
     return {"semantics": planner._process_semantics(domains)}
 
 
+def _state_error_envelope_receipt(
+    *,
+    source_rows: int = 1,
+    post_cutoff_rows: int = 1,
+    initial_error: float = planner.STATE_INITIAL_ERROR_FLOOR,
+    tolerance: float = 0.01,
+    regime_warmup_bars: int = 100,
+    regime_parameters_sha256: str = "b" * 64,
+) -> dict:
+    body = {
+        "schema_version": planner.STATE_ERROR_ENVELOPE_SCHEMA,
+        "derivation": "MAX_100_DOUBLE_MAX_ABS_AND_RANGE_ON_PREPROTECTED_PREFIX",
+        "preprotected_cutoff_rule": (
+            "LARGEST_FEASIBLE_FIRST_FOLD_FIT_START_BEFORE_ANY_TUNING_OR_FINAL_OBSERVATION"
+        ),
+        "preprotected_cutoff_utc": "2020-01-02T00:00:00+00:00",
+        "four_fold_protected_axis_available": True,
+        "source_rows": source_rows,
+        "post_cutoff_rows": post_cutoff_rows,
+        "source_last_close_utc": "2020-01-02T00:00:00+00:00",
+        "source_price_surface_sha256": "a" * 64,
+        "initial_error_bound_hex": initial_error.hex(),
+        "tolerance_hex": tolerance.hex(),
+        "full_prefix_verification": "WITHIN_FROZEN_PREPROTECTED_ENVELOPE",
+        "protected_market_values_can_only_fail_closed": True,
+        "regime_parameters_sha256": regime_parameters_sha256,
+        "regime_warmup_bars": regime_warmup_bars,
+    }
+    return {**body, "receipt_sha256": planner._sha(body)}
+
+
+def _state_error_envelope_inputs(*, days: int = 1_600) -> tuple[
+    pd.DataFrame,
+    SimpleNamespace,
+    dict,
+    pd.DatetimeIndex,
+    pd.DatetimeIndex,
+]:
+    opens = pd.date_range(
+        "2020-01-01T00:00:00Z",
+        periods=days * 24,
+        freq="h",
+    )
+    closes = opens + pd.Timedelta(hours=1)
+    frame = pd.DataFrame(
+        {
+            "Open": 10.0,
+            "High": 10.5,
+            "Low": 9.5,
+            "Close": 10.0,
+        },
+        index=opens,
+    )
+    parameters = planner.pm_regime.DEFAULT_PARAMS_BY_TIMEFRAME["H1"].to_dict()
+    parameters_sha256 = planner.pm_regime.regime_params_sha256(parameters)
+    fitted = SimpleNamespace(
+        product=SimpleNamespace(
+            index_sha256="1" * 64,
+            instrument_snapshot={"parity_tick_tolerance": 0.0001},
+        ),
+        instrument_spec=SimpleNamespace(tick_size=0.001),
+        regime_parameters=parameters,
+        regime_fit_decision=SimpleNamespace(
+            receipt_sha256="2" * 64,
+            to_dict=lambda: {"regime_params_sha256": parameters_sha256},
+        ),
+    )
+    native = {
+        "symbol": "USDNOK",
+        "timeframe": "H1",
+        "prefix_start_utc": planner._utc_text(opens[0]),
+        "prefix_end_exclusive_utc": planner._utc_text(closes[-1]),
+        "prefix_last_close_utc": planner._utc_text(closes[-1]),
+        "prefix_rows": len(frame),
+        "prefix_content_sha256": "3" * 64,
+    }
+    return frame, fitted, native, opens, closes
+
+
 def test_process_freeze_reopens_exact_100_strategy_domain(tmp_path) -> None:
     context = authority_spool.freeze_generation_context(
         (tmp_path / "spool").resolve(),
@@ -376,7 +455,6 @@ def test_largest_feasible_calendar_depth_is_selected_from_frozen_ladder() -> Non
     geometry = planner._derived_dependency_geometry("D1", payload)
 
     depth, candidate_start, folds, boundary_limited = planner._build_causal_folds(
-        frame=pd.DataFrame(index=opens),
         native=native,
         opens=opens,
         closes=closes,
@@ -410,7 +488,6 @@ def test_source_boundary_shortfall_never_fabricates_folds_or_market_verdict() ->
     )
 
     depth, candidate_start, folds, boundary_limited = planner._build_causal_folds(
-        frame=pd.DataFrame(index=opens),
         native=native,
         opens=opens,
         closes=closes,
@@ -423,6 +500,278 @@ def test_source_boundary_shortfall_never_fabricates_folds_or_market_verdict() ->
     assert boundary_limited is True
     assert folds == []
     assert candidate_start == opens[0] - timedelta(days=1)
+
+
+def test_preprotected_state_envelope_keeps_planning_decision_invariant() -> None:
+    frame, fitted, native, opens, closes = _state_error_envelope_inputs()
+    first_envelope = planner._freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
+    cutoff = pd.Timestamp(first_envelope["preprotected_cutoff_utc"])
+    protected = opens >= cutoff
+    changed = frame.copy()
+    changed.loc[protected, ["Open", "High", "Low", "Close"]] = 20.0
+    second_native = {**native, "prefix_content_sha256": "4" * 64}
+    second_envelope = planner._freeze_state_error_envelope(
+        frame=changed,
+        fitted=fitted,
+        native=second_native,
+        opens=opens,
+        closes=closes,
+    )
+
+    assert first_envelope == second_envelope
+    assert first_envelope["four_fold_protected_axis_available"] is True
+    assert first_envelope["post_cutoff_rows"] == int(protected.sum())
+    assert first_envelope["regime_warmup_bars"] == (
+        planner.pm_regime.MarketRegimeDetector(
+            planner.pm_regime.DEFAULT_PARAMS_BY_TIMEFRAME["H1"]
+        ).warmup_bars
+    )
+    assert "REGIME_WARMUP" not in frame
+
+    strategy_id = "KaufmanAMATrendStrategy"
+    parameters = planner.canonicalize_parameter_mapping(
+        StrategyRegistry.get(strategy_id).get_default_params()
+    )
+    first_requirements, first_warmup = planner._state_requirements(
+        fitted=fitted,
+        native=native,
+        designs=[{"strategy_id": strategy_id, "parameters": parameters}],
+        state_error_envelope=first_envelope,
+    )
+    second_requirements, second_warmup = planner._state_requirements(
+        fitted=fitted,
+        native=second_native,
+        designs=[{"strategy_id": strategy_id, "parameters": parameters}],
+        state_error_envelope=second_envelope,
+    )
+    assert first_warmup == second_warmup
+    assert first_requirements[0]["bounded_context_bars"] == (
+        second_requirements[0]["bounded_context_bars"]
+    )
+    first_selection = planner._select_feasible_common_state_context(
+        native=native,
+        opens=opens,
+        closes=closes,
+        timeframe="H1",
+        state_requirements=first_requirements,
+        regime_warmup_bars=first_warmup,
+    )
+    second_selection = planner._select_feasible_common_state_context(
+        native=second_native,
+        opens=opens,
+        closes=closes,
+        timeframe="H1",
+        state_requirements=second_requirements,
+        regime_warmup_bars=second_warmup,
+    )
+    for key in (
+        "selected_common_context_bars",
+        "dependency_payload",
+        "dependency_geometry",
+        "depth_days",
+        "candidate_start",
+        "boundary_limited",
+    ):
+        assert first_selection[key] == second_selection[key]
+    for first_fold, second_fold in zip(
+        first_selection["folds"], second_selection["folds"], strict=True
+    ):
+        assert {
+            key: value
+            for key, value in first_fold.items()
+            if key not in {"source_slice_sha256", "fold_definition_sha256"}
+        } == {
+            key: value
+            for key, value in second_fold.items()
+            if key not in {"source_slice_sha256", "fold_definition_sha256"}
+        }
+    assert pd.Timestamp(first_envelope["preprotected_cutoff_utc"]) <= min(
+        pd.Timestamp(value["fit_start_utc"])
+        for value in first_selection["folds"]
+    )
+    first_candidate = planner._candidate(
+        symbol="USDNOK",
+        timeframe="H1",
+        regime="TREND",
+        depth_days=first_selection["depth_days"],
+        candidate_start=first_selection["candidate_start"],
+        folds=first_selection["folds"],
+    )
+    second_candidate = planner._candidate(
+        symbol="USDNOK",
+        timeframe="H1",
+        regime="TREND",
+        depth_days=second_selection["depth_days"],
+        candidate_start=second_selection["candidate_start"],
+        folds=second_selection["folds"],
+    )
+    first_disposition = planner._state_context_dispositions(
+        first_requirements,
+        candidate=first_candidate,
+        selected_common_context_bars=first_selection[
+            "selected_common_context_bars"
+        ],
+    )[0]
+    second_disposition = planner._state_context_dispositions(
+        second_requirements,
+        candidate=second_candidate,
+        selected_common_context_bars=second_selection[
+            "selected_common_context_bars"
+        ],
+    )[0]
+    for key in (
+        "required_context_bars",
+        "selected_context_bars",
+        "status",
+        "reason_code",
+    ):
+        assert first_disposition[key] == second_disposition[key]
+
+
+def test_preprotected_envelope_preserves_shorter_feasible_depth() -> None:
+    frame, fitted, native, opens, closes = _state_error_envelope_inputs(days=800)
+    envelope = planner._freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
+
+    assert envelope["four_fold_protected_axis_available"] is True
+    assert envelope["source_rows"] > 0
+    assert pd.Timestamp(envelope["preprotected_cutoff_utc"]) > opens[0]
+    requirement = {
+        "bounded_context_bars": 20,
+        "requirement_sha256": "a" * 64,
+    }
+    selected = planner._select_feasible_common_state_context(
+        native=native,
+        opens=opens,
+        closes=closes,
+        timeframe="H1",
+        state_requirements=[requirement],
+        regime_warmup_bars=envelope["regime_warmup_bars"],
+    )
+    assert selected["boundary_limited"] is False
+    assert selected["depth_days"] == 270
+    assert pd.Timestamp(envelope["preprotected_cutoff_utc"]) <= min(
+        pd.Timestamp(value["fit_start_utc"])
+        for value in selected["folds"]
+    )
+
+
+def test_preprotected_state_envelope_fails_closed_on_later_price_breach() -> None:
+    frame, fitted, native, opens, closes = _state_error_envelope_inputs()
+    envelope = planner._freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
+    cutoff = pd.Timestamp(envelope["preprotected_cutoff_utc"])
+    breached = frame.copy()
+    breached.loc[
+        opens >= cutoff,
+        ["Open", "High", "Low", "Close"],
+    ] = 60.0
+
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_ERROR_ENVELOPE_BREACHED",
+    ):
+        planner._freeze_state_error_envelope(
+            frame=breached,
+            fitted=fitted,
+            native={**native, "prefix_content_sha256": "4" * 64},
+            opens=opens,
+            closes=closes,
+        )
+
+
+def test_preprotected_state_envelope_replay_recomputes_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame, fitted, native, opens, closes = _state_error_envelope_inputs()
+    envelope = planner._freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
+    monkeypatch.setattr(
+        planner,
+        "_validated_frame",
+        lambda _fitted: (frame, native, opens, closes),
+    )
+
+    assert planner.verify_preprotected_state_error_envelope(fitted, envelope)
+
+    tampered_body = {
+        **{
+            key: value
+            for key, value in envelope.items()
+            if key != "receipt_sha256"
+        },
+        "source_price_surface_sha256": "f" * 64,
+    }
+    tampered = {
+        **tampered_body,
+        "receipt_sha256": planner._sha(tampered_body),
+    }
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_ERROR_ENVELOPE_SOURCE_REPLAY_INVALID",
+    ):
+        planner.verify_preprotected_state_error_envelope(fitted, tampered)
+
+
+def test_boundary_limited_envelope_must_cover_the_full_prefix() -> None:
+    frame, fitted, native, opens, closes = _state_error_envelope_inputs(days=100)
+    envelope = planner._freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
+
+    assert envelope["four_fold_protected_axis_available"] is False
+    assert envelope["source_rows"] == len(frame)
+    assert envelope["post_cutoff_rows"] == 0
+    assert envelope["preprotected_cutoff_utc"] == native[
+        "prefix_end_exclusive_utc"
+    ]
+
+    tampered_body = {
+        **{
+            key: value
+            for key, value in envelope.items()
+            if key != "receipt_sha256"
+        },
+        "source_rows": len(frame) - 1,
+        "post_cutoff_rows": 1,
+    }
+    tampered = {
+        **tampered_body,
+        "receipt_sha256": planner._sha(tampered_body),
+    }
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_ERROR_ENVELOPE_INVALID",
+    ):
+        planner._validated_state_error_envelope(
+            tampered,
+            native_prefix=native,
+        )
 
 
 def test_current_refit_window_replays_depth_at_cutoff_not_discovery_span() -> None:
@@ -469,7 +818,6 @@ def test_boundary_limited_current_window_does_not_require_evaluation_state() -> 
         regime_warmup_bars=10,
     )
     depth_days, candidate_start, folds, boundary_limited = planner._build_causal_folds(
-        frame=pd.DataFrame(index=opens),
         native=native,
         opens=opens,
         closes=closes,
@@ -567,7 +915,6 @@ def test_d1_selects_largest_feasible_common_context_and_rejects_only_excess(
         audited_fit_rows,
     )
     selected = planner._select_feasible_common_state_context(
-        frame=frame,
         native=native,
         opens=opens,
         closes=closes,
@@ -660,7 +1007,6 @@ def test_short_d1_prefix_keeps_low_context_trials_searchable() -> None:
         requirements.append({**body, "requirement_sha256": planner._sha(body)})
 
     selected = planner._select_feasible_common_state_context(
-        frame=pd.DataFrame(index=opens),
         native=native,
         opens=opens,
         closes=closes,
@@ -715,6 +1061,8 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         "schema_version": "fxpm.production-attempt-state-requirement.v1",
         "strategy_id": "ExampleStrategy",
         "parameters_sha256": planner._sha({"period": 10}),
+        "initial_error_bound_hex": planner.STATE_INITIAL_ERROR_FLOOR.hex(),
+        "tolerance_hex": float(0.01).hex(),
         "bounded_context_bars": 4,
         "state_evidence": [],
         "execution_rule": (
@@ -800,8 +1148,18 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
     assert plan_body["attempts"][0]["reason_code"] == "SOURCE_BOUNDARY_SHORTFALL"
     receipt = {
         "candidate": candidate,
+        "native_prefix": {
+            "rows": 366,
+            "end_exclusive_utc": "2025-01-01T00:00:00Z",
+            "last_close_utc": "2025-01-01T00:00:00Z",
+        },
         "dependency_payload": payload,
         "dependency_geometry": geometry,
+        "state_error_envelope": _state_error_envelope_receipt(
+            source_rows=365,
+            post_cutoff_rows=1,
+            regime_warmup_bars=4,
+        ),
         "state_context_selection": planner._state_context_selection_receipt(
             [state],
             [disposition],
@@ -822,6 +1180,28 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         boundary_limited=True,
         timeframe="D1",
     )
+
+    changed_envelope = {
+        **receipt,
+        "state_error_envelope": _state_error_envelope_receipt(
+            source_rows=365,
+            post_cutoff_rows=1,
+            initial_error=200.0,
+            regime_warmup_bars=4,
+        ),
+    }
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_REQUIREMENT_REPLAY_INVALID",
+    ):
+        planner._verify_state_context_plan_binding(
+            receipt=changed_envelope,
+            attempts=[artifact],
+            states=[state],
+            horizon_plan=plan,
+            boundary_limited=True,
+            timeframe="D1",
+        )
 
     changed_geometry = {
         **receipt,
@@ -1564,15 +1944,26 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         "timeframe": "H1",
         "prefix_content_sha256": "c" * 64,
         "prefix_start_utc": "2020-01-01T00:00:00Z",
-        "prefix_end_exclusive_utc": "2021-01-01T00:00:00Z",
-        "prefix_last_close_utc": "2020-12-31T23:00:00Z",
-        "prefix_rows": 8_784,
+        "prefix_end_exclusive_utc": "2020-01-03T00:00:00Z",
+        "prefix_last_close_utc": "2020-01-03T00:00:00Z",
+        "prefix_rows": 2,
     }
+    parameters = planner.pm_regime.DEFAULT_PARAMS_BY_TIMEFRAME["H1"].to_dict()
+    parameters_sha256 = planner.pm_regime.regime_params_sha256(parameters)
     fitted = SimpleNamespace(
-        product=SimpleNamespace(native_prefix=native, index_sha256="i" * 64),
+        product=SimpleNamespace(
+            native_prefix=native,
+            index_sha256="i" * 64,
+            instrument_snapshot={"parity_tick_tolerance": 0.01},
+        ),
         source_group_decision=SimpleNamespace(receipt_sha256="s" * 64),
-        regime_fit_decision=SimpleNamespace(receipt_sha256="r" * 64),
+        regime_fit_decision=SimpleNamespace(
+            receipt_sha256="r" * 64,
+            to_dict=lambda: {"regime_params_sha256": parameters_sha256},
+        ),
         train_regime_support={"receipt_sha256": "t" * 64},
+        regime_parameters=parameters,
+        instrument_spec=SimpleNamespace(tick_size=0.01),
     )
     attempts = [{"ordinal": value} for value in range(planner.ATTEMPT_COUNT)]
     states = []
@@ -1596,6 +1987,9 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         attempt_artifacts=attempts,
         state_requirements=states,
         state_context_selection={},
+        state_error_envelope=_state_error_envelope_receipt(
+            regime_parameters_sha256=parameters_sha256,
+        ),
         boundary_limited=False,
     )
     plan = planner.ProductionCellSearchPlan(
