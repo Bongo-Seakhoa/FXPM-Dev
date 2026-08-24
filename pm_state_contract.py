@@ -23,6 +23,7 @@ The four state classes are intentionally exhaustive:
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -33,6 +34,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 STATE_CONTRACT_SCHEMA_VERSION = "fxpm.state-contract.v2"
 STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION = "fxpm.state-candidate-domain.v1"
+STATE_DOMAIN_CEILING_SCHEMA_VERSION = "fxpm.state-domain-ceiling.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -92,6 +94,46 @@ def _finite_positive(value: Any) -> Optional[float]:
     if not math.isfinite(number) or number <= 0.0:
         return None
     return number
+
+
+def _inferred_window_value(key: Any, value: Any) -> Optional[int]:
+    """Return the exact generic finite-window contribution, if any.
+
+    Keeping the name/value predicate in one place is important: domain-ceiling
+    projection may omit an axis only when ``FiniteWindowRule.bound`` cannot
+    read it.  A second, approximately similar predicate would turn that
+    efficiency optimization into an under-bounding risk.
+    """
+
+    name = str(key).lower()
+    if isinstance(value, bool):
+        return None
+    if name.endswith("_hour") or name in {
+        "weekday",
+        "tom_start_day",
+        "tom_end_day",
+        "adx_threshold",
+        "oversold",
+        "overbought",
+        "signal_mode",
+        "period_type",
+    }:
+        return None
+    if not any(
+        token in name
+        for token in ("period", "lookback", "window", "bars", "order", "age")
+    ):
+        return None
+    number = _finite_positive(value)
+    if number is None:
+        return None
+    multiplier = 1.0
+    offset = 2
+    if "swing_order" in name:
+        multiplier = 5.0
+    elif "wing_bars" in name:
+        multiplier = 2.0
+    return int(math.ceil(number * multiplier)) + offset
 
 
 @dataclass(frozen=True)
@@ -228,26 +270,11 @@ class FiniteWindowRule:
 
         if self.infer_window_parameters:
             for key, raw in sorted(parameters.items(), key=lambda item: str(item[0])):
-                name = str(key).lower()
-                if key in explicit or isinstance(raw, bool):
+                if key in explicit:
                     continue
-                if name.endswith("_hour") or name in {
-                    "weekday", "tom_start_day", "tom_end_day", "adx_threshold",
-                    "oversold", "overbought", "signal_mode", "period_type",
-                }:
-                    continue
-                if not any(token in name for token in ("period", "lookback", "window", "bars", "order", "age")):
-                    continue
-                value = _finite_positive(raw)
-                if value is None:
-                    continue
-                multiplier = 1.0
-                offset = 2
-                if "swing_order" in name:
-                    multiplier = 5.0
-                elif "wing_bars" in name:
-                    multiplier = 2.0
-                bars = max(bars, int(math.ceil(value * multiplier)) + offset)
+                candidate = _inferred_window_value(key, raw)
+                if candidate is not None:
+                    bars = max(bars, candidate)
         return (None, tuple(reasons)) if reasons else (max(1, bars), ())
 
 
@@ -425,6 +452,70 @@ class StateResolution:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class StateDomainCeiling:
+    """DataFrame-free upper bound over one explicit Cartesian strategy domain."""
+
+    status: str
+    strategy_name: str
+    timeframe: str
+    effective_domain_sha256: str
+    authority_candidate_domain_sha256: str
+    registry_hash: str
+    include_regime_controller: bool
+    initial_error_bound_hex: str
+    tolerance_hex: str
+    parameter_domain_sha256: str
+    full_domain_point_count: int
+    state_parameter_keys: tuple[str, ...]
+    state_projection_point_count: int
+    requested_features: tuple[str, ...]
+    bounded_context_bars: Optional[int]
+    witness_state_parameters_sha256: Optional[str]
+    witness_resolution_decision_sha256: Optional[str]
+    projection_roster_sha256: str
+    reason_codes: tuple[str, ...]
+    decision_hash: str
+    schema_version: str = STATE_DOMAIN_CEILING_SCHEMA_VERSION
+
+    @property
+    def proved(self) -> bool:
+        return self.status == "PROVED"
+
+    def to_dict(self) -> dict[str, Any]:
+        # Lists are deliberate here.  A ceiling is carried through canonical
+        # JSON receipts and must compare byte-for-byte after a JSON reopen.
+        return {
+            "schema_version": self.schema_version,
+            "status": self.status,
+            "strategy_name": self.strategy_name,
+            "timeframe": self.timeframe,
+            "effective_domain_sha256": self.effective_domain_sha256,
+            "authority_candidate_domain_sha256": (
+                self.authority_candidate_domain_sha256
+            ),
+            "registry_hash": self.registry_hash,
+            "include_regime_controller": self.include_regime_controller,
+            "initial_error_bound_hex": self.initial_error_bound_hex,
+            "tolerance_hex": self.tolerance_hex,
+            "parameter_domain_sha256": self.parameter_domain_sha256,
+            "full_domain_point_count": self.full_domain_point_count,
+            "state_parameter_keys": list(self.state_parameter_keys),
+            "state_projection_point_count": self.state_projection_point_count,
+            "requested_features": list(self.requested_features),
+            "bounded_context_bars": self.bounded_context_bars,
+            "witness_state_parameters_sha256": (
+                self.witness_state_parameters_sha256
+            ),
+            "witness_resolution_decision_sha256": (
+                self.witness_resolution_decision_sha256
+            ),
+            "projection_roster_sha256": self.projection_roster_sha256,
+            "reason_codes": list(self.reason_codes),
+            "decision_hash": self.decision_hash,
+        }
+
+
 class StateContractAuthority:
     """Immutable registry plus deterministic fail-closed DAG resolver."""
 
@@ -475,6 +566,84 @@ class StateContractAuthority:
             for name in self.contract_names
             if name.startswith("strategy:")
         )
+
+    @staticmethod
+    def _cell_roots(
+        strategy_name: str,
+        requested_features: Sequence[str],
+        *,
+        include_regime_controller: bool,
+    ) -> tuple[str, ...]:
+        roots = [f"strategy:{strategy_name}"]
+        for feature in requested_features:
+            feature_name = str(feature)
+            bare_name = (
+                feature_name.split(":", 1)[1]
+                if feature_name.startswith("feature:")
+                else feature_name
+            )
+            alias = STATE_FEATURE_ALIASES.get(bare_name)
+            roots.append(
+                alias
+                or (
+                    feature_name
+                    if feature_name.startswith("feature:")
+                    else f"feature:{feature_name}"
+                )
+            )
+        if include_regime_controller:
+            roots.append("controller:REGIME_HYSTERESIS")
+        return tuple(sorted(dict.fromkeys(roots)))
+
+    def _state_parameter_keys(
+        self,
+        roots: Sequence[str],
+        parameter_domains: Mapping[str, Sequence[Any]],
+    ) -> tuple[str, ...]:
+        """Return exactly the domain axes the reachable resolver DAG may read."""
+
+        keys: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in visited:
+                return
+            visited.add(name)
+            contract = self._contracts.get(name)
+            if contract is None:
+                return
+            for dependency in contract.dependencies:
+                visit(dependency)
+            finite = contract.finite_rule
+            if finite is not None:
+                explicit_terms = finite.terms + tuple(
+                    term
+                    for expression in finite.expressions
+                    for term in expression.terms
+                )
+                explicit = {term.key for term in explicit_terms}
+                keys.update(explicit.intersection(parameter_domains))
+                if finite.infer_window_parameters:
+                    for key, choices in parameter_domains.items():
+                        if key in explicit:
+                            continue
+                        if any(
+                            _inferred_window_value(key, choice) is not None
+                            for choice in choices
+                        ):
+                            keys.add(key)
+            recursive = contract.recursive_rule
+            if recursive is not None:
+                for term in recursive.terms:
+                    keys.update(
+                        key
+                        for key in term.parameter_keys
+                        if key in parameter_domains
+                    )
+
+        for root in roots:
+            visit(root)
+        return tuple(sorted(keys))
 
     def _evidence_valid(self, contract: StateContract, evidence: Optional[StateEvidence]) -> tuple[bool, Optional[str], tuple[str, ...]]:
         if evidence is None:
@@ -633,25 +802,11 @@ class StateContractAuthority:
         tolerance: Optional[float] = None,
         state_evidence: Optional[Mapping[str, StateEvidence]] = None,
     ) -> StateResolution:
-        roots = [f"strategy:{strategy_name}"]
-        for feature in requested_features:
-            feature_name = str(feature)
-            bare_name = (
-                feature_name.split(":", 1)[1]
-                if feature_name.startswith("feature:")
-                else feature_name
-            )
-            alias = STATE_FEATURE_ALIASES.get(bare_name)
-            roots.append(
-                alias
-                or (
-                    feature_name
-                    if feature_name.startswith("feature:")
-                    else f"feature:{feature_name}"
-                )
-            )
-        if include_regime_controller:
-            roots.append("controller:REGIME_HYSTERESIS")
+        roots = self._cell_roots(
+            strategy_name,
+            requested_features,
+            include_regime_controller=include_regime_controller,
+        )
         return self.resolve(
             roots,
             parameters=parameters,
@@ -659,6 +814,204 @@ class StateContractAuthority:
             initial_error_bound=initial_error_bound,
             tolerance=tolerance,
             state_evidence=state_evidence,
+        )
+
+    def resolve_cell_domain_ceiling(
+        self,
+        strategy_name: str,
+        *,
+        parameter_domains: Mapping[str, Sequence[Any]],
+        requested_features: Sequence[str],
+        timeframe: str,
+        effective_domain_hash: str,
+        include_regime_controller: bool = False,
+        initial_error_bound: Optional[float] = None,
+        tolerance: Optional[float] = None,
+        state_evidence: Optional[Mapping[str, StateEvidence]] = None,
+    ) -> StateDomainCeiling:
+        """Prove one safe state-context ceiling without reading market data.
+
+        The full parameter Cartesian product remains hashed and counted.  The
+        resolver itself is evaluated only over axes the reachable declarative
+        state DAG can read; omitted axes therefore cannot alter its result.
+        This is an exact projection of the resolver, not sampled search.
+        """
+
+        normalized_name = str(strategy_name or "")
+        normalized_timeframe = str(timeframe or "").upper()
+        if not normalized_name:
+            raise ValueError("strategy_name must be non-empty")
+        if normalized_timeframe not in _BARS_PER_UTC_DAY:
+            raise ValueError("timeframe is unsupported")
+        if not _SHA256_RE.fullmatch(str(effective_domain_hash or "")):
+            raise ValueError("effective_domain_hash must be a lowercase SHA-256 digest")
+        if not _SHA256_RE.fullmatch(str(self.candidate_domain_hash or "")):
+            raise ValueError("authority candidate domain must be a lowercase SHA-256 digest")
+        if type(include_regime_controller) is not bool:
+            raise ValueError("include_regime_controller must be bool")
+        initial = _finite_positive(initial_error_bound)
+        target = _finite_positive(tolerance)
+        if initial is None or target is None:
+            raise ValueError("positive initial_error_bound and tolerance are required")
+        if not isinstance(parameter_domains, Mapping) or not parameter_domains:
+            raise ValueError("parameter_domains must be a non-empty mapping")
+
+        normalized_domains: dict[str, tuple[Any, ...]] = {}
+        for raw_key in sorted(parameter_domains, key=lambda item: str(item)):
+            if type(raw_key) is not str or not raw_key:
+                raise ValueError("parameter domain keys must be non-empty strings")
+            raw_choices = parameter_domains[raw_key]
+            if type(raw_choices) not in {list, tuple} or not raw_choices:
+                raise ValueError(f"parameter domain {raw_key} must be non-empty")
+            choices = tuple(raw_choices)
+            try:
+                encoded = [
+                    json.dumps(
+                        choice,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                        allow_nan=False,
+                    )
+                    for choice in choices
+                ]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"parameter domain {raw_key} is not canonical JSON"
+                ) from exc
+            if len(encoded) != len(set(encoded)):
+                raise ValueError(f"parameter domain {raw_key} has duplicate choices")
+            normalized_domains[raw_key] = choices
+
+        if type(requested_features) not in {list, tuple}:
+            raise ValueError("requested_features must be a list or tuple")
+        normalized_features = tuple(
+            sorted(dict.fromkeys(str(value) for value in requested_features))
+        )
+        if any(not value for value in normalized_features):
+            raise ValueError("requested_features must be non-empty strings")
+        roots = self._cell_roots(
+            normalized_name,
+            normalized_features,
+            include_regime_controller=include_regime_controller,
+        )
+        state_keys = self._state_parameter_keys(roots, normalized_domains)
+        full_count = math.prod(len(choices) for choices in normalized_domains.values())
+        projection_count = math.prod(
+            len(normalized_domains[key]) for key in state_keys
+        )
+        parameter_domain_sha256 = _canonical_sha256(
+            {
+                "parameter_domains": {
+                    key: list(choices)
+                    for key, choices in normalized_domains.items()
+                }
+            }
+        )
+        evidence = dict(state_evidence or {})
+        if any(not isinstance(item, StateEvidence) for item in evidence.values()):
+            raise ValueError("state_evidence values must be StateEvidence")
+        base_parameters = {
+            key: choices[0] for key, choices in normalized_domains.items()
+        }
+        axes = [normalized_domains[key] for key in state_keys]
+        projection_roster: list[dict[str, Any]] = []
+        reasons: list[str] = []
+        maximum: Optional[int] = None
+        witness_parameters_sha256: Optional[str] = None
+        witness_decision_sha256: Optional[str] = None
+        for values in itertools.product(*axes):
+            state_parameters = dict(zip(state_keys, values))
+            parameters = {**base_parameters, **state_parameters}
+            resolution = self.resolve_cell(
+                normalized_name,
+                parameters=parameters,
+                requested_features=normalized_features,
+                timeframe=normalized_timeframe,
+                include_regime_controller=include_regime_controller,
+                initial_error_bound=initial,
+                tolerance=target,
+                state_evidence=evidence,
+            )
+            state_parameters_sha256 = _canonical_sha256(state_parameters)
+            projection_roster.append(
+                {
+                    "state_parameters_sha256": state_parameters_sha256,
+                    "resolution_decision_sha256": resolution.decision_hash,
+                    "status": resolution.status,
+                    "bounded_context_bars": resolution.bounded_context_bars,
+                    "reason_codes": list(resolution.reason_codes),
+                }
+            )
+            if not resolution.admissible:
+                reasons.extend(resolution.reason_codes)
+                continue
+            bound = resolution.bounded_context_bars
+            if type(bound) is not int or bound < 0:
+                reasons.append("DOMAIN_RESOLUTION_BOUND_INVALID")
+                continue
+            if maximum is None or bound > maximum:
+                maximum = bound
+                witness_parameters_sha256 = state_parameters_sha256
+                witness_decision_sha256 = resolution.decision_hash
+
+        unique_reasons = tuple(dict.fromkeys(reasons))
+        proved = not unique_reasons and maximum is not None
+        body = {
+            "schema_version": STATE_DOMAIN_CEILING_SCHEMA_VERSION,
+            "status": "PROVED" if proved else "QUARANTINED",
+            "strategy_name": normalized_name,
+            "timeframe": normalized_timeframe,
+            "effective_domain_sha256": str(effective_domain_hash),
+            "authority_candidate_domain_sha256": str(self.candidate_domain_hash),
+            "registry_hash": self.registry_hash,
+            "include_regime_controller": include_regime_controller,
+            "initial_error_bound_hex": initial.hex(),
+            "tolerance_hex": target.hex(),
+            "parameter_domain_sha256": parameter_domain_sha256,
+            "full_domain_point_count": full_count,
+            "state_parameter_keys": list(state_keys),
+            "state_projection_point_count": projection_count,
+            "requested_features": list(normalized_features),
+            "bounded_context_bars": maximum if proved else None,
+            "witness_state_parameters_sha256": (
+                witness_parameters_sha256 if proved else None
+            ),
+            "witness_resolution_decision_sha256": (
+                witness_decision_sha256 if proved else None
+            ),
+            "projection_roster_sha256": _canonical_sha256(projection_roster),
+            "reason_codes": list(unique_reasons),
+        }
+        # Evidence identity is receipt provenance, not a planning decision.
+        # The enclosing production record binds its exact replay bytes; the
+        # ceiling follows StateResolution and binds the admissible mode only.
+        decision_hash = _canonical_sha256(body)
+        return StateDomainCeiling(
+            status=body["status"],
+            strategy_name=normalized_name,
+            timeframe=normalized_timeframe,
+            effective_domain_sha256=str(effective_domain_hash),
+            authority_candidate_domain_sha256=str(self.candidate_domain_hash),
+            registry_hash=self.registry_hash,
+            include_regime_controller=include_regime_controller,
+            initial_error_bound_hex=initial.hex(),
+            tolerance_hex=target.hex(),
+            parameter_domain_sha256=parameter_domain_sha256,
+            full_domain_point_count=full_count,
+            state_parameter_keys=state_keys,
+            state_projection_point_count=projection_count,
+            requested_features=normalized_features,
+            bounded_context_bars=maximum if proved else None,
+            witness_state_parameters_sha256=(
+                witness_parameters_sha256 if proved else None
+            ),
+            witness_resolution_decision_sha256=(
+                witness_decision_sha256 if proved else None
+            ),
+            projection_roster_sha256=body["projection_roster_sha256"],
+            reason_codes=unique_reasons,
+            decision_hash=decision_hash,
         )
 
 
@@ -1007,10 +1360,12 @@ __all__ = [
     "ResolvedNode",
     "STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION",
     "STATE_CONTRACT_SCHEMA_VERSION",
+    "STATE_DOMAIN_CEILING_SCHEMA_VERSION",
     "STATE_FEATURE_ALIASES",
     "STRATEGY_CANDIDATE_DOMAIN_SHA256",
     "StateContract",
     "StateContractAuthority",
+    "StateDomainCeiling",
     "StateEvidence",
     "StateKind",
     "StateResolution",

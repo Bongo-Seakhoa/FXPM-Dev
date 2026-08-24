@@ -1,5 +1,8 @@
 from collections import Counter
 import hashlib
+from itertools import product
+
+import pytest
 
 from pm_core import FeatureComputer
 from pm_state_contract import (
@@ -10,6 +13,7 @@ from pm_state_contract import (
     EvidenceMode,
     FiniteWindowRule,
     RecursiveRule,
+    STATE_DOMAIN_CEILING_SCHEMA_VERSION,
     StateContract,
     StateContractAuthority,
     StateEvidence,
@@ -35,6 +39,16 @@ def _evidence(authority: StateContractAuthority, node: str) -> StateEvidence:
         state_schema=str(contract.checkpoint_schema),
         transition_schema=str(contract.transition_schema),
     )
+
+
+def _parameter_domains(strategy_name: str) -> dict[str, tuple[object, ...]]:
+    strategy = StrategyRegistry.get(strategy_name)
+    domains = {
+        key: (value,) for key, value in strategy.get_params().items()
+    }
+    for key, choices in strategy.get_param_grid().items():
+        domains[key] = tuple(choices)
+    return domains
 
 
 def test_default_authority_covers_actual_strategy_and_feature_registries() -> None:
@@ -79,8 +93,8 @@ def test_every_registered_default_cell_resolves_with_all_required_state_evidence
         assert result.admissible, (name, result.reason_codes)
 
 
-def test_every_registered_grid_axis_feature_request_resolves() -> None:
-    """Every value admitted by a strategy grid has state-history authority."""
+def test_every_registered_cartesian_point_is_within_its_domain_ceiling() -> None:
+    """Prove the complete 2.64m-point registry, including axis interactions."""
 
     evidence = {
         name: _evidence(DEFAULT_AUTHORITY, name)
@@ -91,19 +105,30 @@ def test_every_registered_grid_axis_feature_request_resolves() -> None:
     for name in StrategyRegistry.list_all():
         registered = StrategyRegistry.get(name)
         defaults = registered.get_default_params()
-        parameter_points = [defaults]
-        for axis, choices in registered.get_param_grid().items():
+        grid = registered.get_param_grid()
+        axes = tuple(grid)
+        declared_union = set(
+            StrategyRegistry.get(name, **defaults).get_feature_request()
+        )
+        for axis, choices in grid.items():
             for choice in choices:
-                parameters = dict(defaults)
-                parameters[axis] = choice
-                parameter_points.append(parameters)
-
-        for parameters in parameter_points:
+                declared_union.update(
+                    StrategyRegistry.get(
+                        name, **{**defaults, axis: choice}
+                    ).get_feature_request()
+                )
+        requested_union: set[str] = set()
+        exact_maximum = 0
+        strategy_count = 0
+        for values in product(*(grid[axis] for axis in axes)):
+            parameters = {**defaults, **dict(zip(axes, values))}
             strategy = StrategyRegistry.get(name, **parameters)
+            normalized = strategy.get_params()
             requested = sorted(strategy.get_feature_request())
+            requested_union.update(requested)
             result = DEFAULT_AUTHORITY.resolve_cell(
                 name,
-                parameters=strategy.get_params(),
+                parameters=normalized,
                 requested_features=requested,
                 timeframe="M5",
                 include_regime_controller=False,
@@ -117,9 +142,168 @@ def test_every_registered_grid_axis_feature_request_resolves() -> None:
                 requested,
                 result.reason_codes,
             )
-            evaluated += 1
+            exact_maximum = max(exact_maximum, int(result.bounded_context_bars))
+            strategy_count += 1
 
-    assert evaluated == 2974
+        ceiling = DEFAULT_AUTHORITY.resolve_cell_domain_ceiling(
+            name,
+            parameter_domains=_parameter_domains(name),
+            requested_features=sorted(declared_union),
+            timeframe="M5",
+            effective_domain_hash=_digest(f"effective-domain:{name}:M5"),
+            include_regime_controller=False,
+            initial_error_bound=100.0,
+            tolerance=0.000005,
+            state_evidence=evidence,
+        )
+        assert ceiling.proved, (name, ceiling.reason_codes)
+        assert strategy_count == ceiling.full_domain_point_count
+        assert exact_maximum <= ceiling.bounded_context_bars
+        assert requested_union == declared_union, (
+            name,
+            sorted(requested_union - declared_union),
+        )
+        assert set(ceiling.requested_features) == declared_union
+        evaluated += strategy_count
+
+    assert evaluated == 2_644_015
+
+
+def test_domain_ceiling_projects_exact_state_axes_and_keeps_full_count() -> None:
+    authority = StateContractAuthority(
+        (
+            StateContract(
+                "strategy:Projected",
+                StateKind.FINITE_WINDOW,
+                finite_rule=FiniteWindowRule(
+                    expressions=(
+                        WindowExpression(
+                            (
+                                WindowTerm("left", required=True),
+                                WindowTerm("right", required=True),
+                            )
+                        ),
+                    )
+                ),
+            ),
+        ),
+        candidate_domain_hash=_digest("projected-candidate-domain"),
+    )
+    ceiling = authority.resolve_cell_domain_ceiling(
+        "Projected",
+        parameter_domains={
+            "left": (2, 5),
+            "right": (3, 7),
+            "risk_only": (1.0, 2.0, 3.0),
+        },
+        requested_features=(),
+        timeframe="H1",
+        effective_domain_hash=_digest("projected-effective-domain"),
+        initial_error_bound=100.0,
+        tolerance=0.00001,
+    )
+
+    assert ceiling.schema_version == STATE_DOMAIN_CEILING_SCHEMA_VERSION
+    assert ceiling.proved
+    assert ceiling.full_domain_point_count == 12
+    assert ceiling.state_parameter_keys == ("left", "right")
+    assert ceiling.state_projection_point_count == 4
+    assert ceiling.bounded_context_bars == 12
+    assert len(ceiling.projection_roster_sha256) == 64
+    assert ceiling.to_dict()["decision_hash"] == ceiling.decision_hash
+
+
+@pytest.mark.parametrize(
+    ("strategy_name", "feature_union", "full_count", "projection_count", "expected"),
+    (
+        ("KaufmanAMATrendStrategy", ("ATR_14",), 3_960, 18, 10_490),
+        (
+            "DoubleEMATrendStrategy",
+            ("ADX", "ATR_14"),
+            11_880,
+            36,
+            2_439,
+        ),
+    ),
+)
+def test_recursive_strategy_domain_ceiling_matches_exact_h1_bound(
+    strategy_name: str,
+    feature_union: tuple[str, ...],
+    full_count: int,
+    projection_count: int,
+    expected: int,
+) -> None:
+    ceiling = DEFAULT_AUTHORITY.resolve_cell_domain_ceiling(
+        strategy_name,
+        parameter_domains=_parameter_domains(strategy_name),
+        requested_features=feature_union,
+        timeframe="H1",
+        effective_domain_hash=_digest(f"{strategy_name}:USDNOK:H1"),
+        initial_error_bound=100.0,
+        tolerance=0.00001,
+    )
+
+    assert ceiling.proved
+    assert ceiling.full_domain_point_count == full_count
+    assert ceiling.state_projection_point_count == projection_count
+    assert ceiling.bounded_context_bars == expected
+
+
+def test_domain_ceiling_hash_and_structural_inputs_fail_closed() -> None:
+    authority = StateContractAuthority(
+        (
+            StateContract(
+                "strategy:Finite",
+                StateKind.FINITE_WINDOW,
+                finite_rule=FiniteWindowRule(
+                    terms=(WindowTerm("period", required=True),)
+                ),
+            ),
+        ),
+        candidate_domain_hash=_digest("finite-candidate-domain"),
+    )
+    kwargs = {
+        "parameter_domains": {"period": (10, 20)},
+        "requested_features": (),
+        "timeframe": "H1",
+        "include_regime_controller": False,
+        "initial_error_bound": 100.0,
+        "tolerance": 0.00001,
+    }
+    first = authority.resolve_cell_domain_ceiling(
+        "Finite", effective_domain_hash=_digest("effective-a"), **kwargs
+    )
+    second = authority.resolve_cell_domain_ceiling(
+        "Finite", effective_domain_hash=_digest("effective-b"), **kwargs
+    )
+    assert first.bounded_context_bars == second.bounded_context_bars == 20
+    assert first.decision_hash != second.decision_hash
+
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        authority.resolve_cell_domain_ceiling(
+            "Finite", effective_domain_hash="bad", **kwargs
+        )
+    with pytest.raises(ValueError, match="duplicate choices"):
+        authority.resolve_cell_domain_ceiling(
+            "Finite",
+            effective_domain_hash=_digest("duplicate"),
+            **{**kwargs, "parameter_domains": {"period": (10, 10)}},
+        )
+    with pytest.raises(ValueError, match="non-empty"):
+        authority.resolve_cell_domain_ceiling(
+            "Finite",
+            effective_domain_hash=_digest("empty"),
+            **{**kwargs, "parameter_domains": {"period": ()}},
+        )
+
+    unknown = authority.resolve_cell_domain_ceiling(
+        "Finite",
+        effective_domain_hash=_digest("unknown-feature"),
+        **{**kwargs, "requested_features": ("NOT_REAL",)},
+    )
+    assert not unknown.proved
+    assert unknown.status == "QUARANTINED"
+    assert "CONTRACT_MISSING:feature:NOT_REAL" in unknown.reason_codes
 
 
 def test_newly_admitted_dynamic_contracts_match_existing_formula_templates() -> None:

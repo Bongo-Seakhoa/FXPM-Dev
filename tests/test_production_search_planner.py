@@ -23,7 +23,12 @@ from pm_strategies import StrategyRegistry
 
 def _process_body() -> dict:
     domains = planner._strategy_domains()
-    return {"semantics": planner._process_semantics(domains)}
+    return {
+        "candidate_domain_sha256": (
+            planner.state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
+        ),
+        "semantics": planner._process_semantics(domains),
+    }
 
 
 def _state_error_envelope_receipt(
@@ -84,7 +89,7 @@ def _state_error_envelope_inputs(*, days: int = 1_600) -> tuple[
     fitted = SimpleNamespace(
         product=SimpleNamespace(
             index_sha256="1" * 64,
-            instrument_snapshot={"parity_tick_tolerance": 0.0001},
+            instrument_snapshot={"parity_tick_tolerance": 0.00001},
         ),
         instrument_spec=SimpleNamespace(tick_size=0.001),
         regime_parameters=parameters,
@@ -103,6 +108,59 @@ def _state_error_envelope_inputs(*, days: int = 1_600) -> tuple[
         "prefix_content_sha256": "3" * 64,
     }
     return frame, fitted, native, opens, closes
+
+
+def _state_domain_records_for_envelope(
+    *,
+    fitted: SimpleNamespace,
+    native: dict,
+    envelope: dict,
+    regime: str = "TREND",
+) -> list[dict]:
+    records, warmup = planner._state_domain_ceiling_records(
+        _process_body(),
+        native_prefix={
+            "index_sha256": fitted.product.index_sha256,
+            "content_sha256": native["prefix_content_sha256"],
+            "start_utc": native["prefix_start_utc"],
+            "end_exclusive_utc": native["prefix_end_exclusive_utc"],
+            "last_close_utc": native["prefix_last_close_utc"],
+            "rows": native["prefix_rows"],
+        },
+        cell={
+            "symbol": native["symbol"],
+            "timeframe": native["timeframe"],
+            "regime": regime,
+        },
+        state_error_envelope=envelope,
+    )
+    assert warmup == envelope["regime_warmup_bars"]
+    return records
+
+
+def _fake_state_domain_records(contexts: tuple[int, ...]) -> list[dict]:
+    records = []
+    for ordinal in range(planner.BASELINE_ATTEMPTS):
+        context = contexts[ordinal % len(contexts)]
+        strategy_id = f"strategy-{ordinal:03d}"
+        ceiling = {
+            "status": "PROVED",
+            "strategy_name": strategy_id,
+            "bounded_context_bars": context,
+            "decision_hash": hashlib.sha256(
+                f"ceiling:{ordinal}:{context}".encode("ascii")
+            ).hexdigest(),
+        }
+        body = {
+            "schema_version": planner.STATE_DOMAIN_CEILING_RECORD_SCHEMA,
+            "strategy_ordinal": ordinal,
+            "strategy_id": strategy_id,
+            "effective_domain": {},
+            "state_replay_evidence": [],
+            "ceiling": ceiling,
+        }
+        records.append({**body, "record_sha256": planner._sha(body)})
+    return records
 
 
 def test_process_freeze_reopens_exact_100_strategy_domain(tmp_path) -> None:
@@ -538,17 +596,40 @@ def test_preprotected_state_envelope_keeps_planning_decision_invariant() -> None
     parameters = planner.canonicalize_parameter_mapping(
         StrategyRegistry.get(strategy_id).get_default_params()
     )
+    first_domain_records = _state_domain_records_for_envelope(
+        fitted=fitted,
+        native=native,
+        envelope=first_envelope,
+    )
+    second_domain_records = _state_domain_records_for_envelope(
+        fitted=fitted,
+        native=second_native,
+        envelope=second_envelope,
+    )
+    for first_record, second_record in zip(
+        first_domain_records, second_domain_records, strict=True
+    ):
+        assert first_record["effective_domain"] == second_record["effective_domain"]
+        for key in (
+            "bounded_context_bars",
+            "decision_hash",
+            "state_parameter_keys",
+            "state_projection_point_count",
+        ):
+            assert first_record["ceiling"][key] == second_record["ceiling"][key]
     first_requirements, first_warmup = planner._state_requirements(
         fitted=fitted,
         native=native,
         designs=[{"strategy_id": strategy_id, "parameters": parameters}],
         state_error_envelope=first_envelope,
+        state_domain_records=first_domain_records,
     )
     second_requirements, second_warmup = planner._state_requirements(
         fitted=fitted,
         native=second_native,
         designs=[{"strategy_id": strategy_id, "parameters": parameters}],
         state_error_envelope=second_envelope,
+        state_domain_records=second_domain_records,
     )
     assert first_warmup == second_warmup
     assert first_requirements[0]["bounded_context_bars"] == (
@@ -559,7 +640,7 @@ def test_preprotected_state_envelope_keeps_planning_decision_invariant() -> None
         opens=opens,
         closes=closes,
         timeframe="H1",
-        state_requirements=first_requirements,
+        state_domain_records=first_domain_records,
         regime_warmup_bars=first_warmup,
     )
     second_selection = planner._select_feasible_common_state_context(
@@ -567,7 +648,7 @@ def test_preprotected_state_envelope_keeps_planning_decision_invariant() -> None
         opens=opens,
         closes=closes,
         timeframe="H1",
-        state_requirements=second_requirements,
+        state_domain_records=second_domain_records,
         regime_warmup_bars=second_warmup,
     )
     for key in (
@@ -634,6 +715,110 @@ def test_preprotected_state_envelope_keeps_planning_decision_invariant() -> None
         assert first_disposition[key] == second_disposition[key]
 
 
+def test_state_domain_ceiling_roster_drives_h1_geometry_before_attempts() -> None:
+    frame, fitted, native, opens, closes = _state_error_envelope_inputs()
+    envelope = planner._freeze_state_error_envelope(
+        frame=frame,
+        fitted=fitted,
+        native=native,
+        opens=opens,
+        closes=closes,
+    )
+    records = _state_domain_records_for_envelope(
+        fitted=fitted,
+        native=native,
+        envelope=envelope,
+    )
+
+    assert len(records) == planner.BASELINE_ATTEMPTS == 100
+    assert [value["strategy_id"] for value in records] == list(
+        planner.state_contract.ACTUAL_STRATEGY_NAMES
+    )
+    assert len({
+        value["effective_domain"]["effective_domain_sha256"]
+        for value in records
+    }) == 100
+    by_strategy = {value["strategy_id"]: value for value in records}
+    kaufman = by_strategy["KaufmanAMATrendStrategy"]["ceiling"]
+    double_ema = by_strategy["DoubleEMATrendStrategy"]["ceiling"]
+    assert (
+        kaufman["bounded_context_bars"],
+        kaufman["full_domain_point_count"],
+        kaufman["state_projection_point_count"],
+    ) == (10_490, 3_960, 18)
+    assert (
+        double_ema["bounded_context_bars"],
+        double_ema["full_domain_point_count"],
+        double_ema["state_projection_point_count"],
+    ) == (2_439, 11_880, 36)
+    assert double_ema["requested_features"] == ["ADX", "ATR_14"]
+
+    selected = planner._select_feasible_common_state_context(
+        native=native,
+        opens=opens,
+        closes=closes,
+        timeframe="H1",
+        state_domain_records=records,
+        regime_warmup_bars=envelope["regime_warmup_bars"],
+    )
+    assert selected["selected_common_context_bars"] == 2_439
+    assert selected["boundary_limited"] is False
+
+    # Exact attempt disposition stays separate from the domain geometry:
+    # a point may be valid under its strategy ceiling yet exceed the common C.
+    requirement_body = {
+        "strategy_id": "KaufmanAMATrendStrategy",
+        "bounded_context_bars": 3_882,
+    }
+    requirement = {
+        **requirement_body,
+        "requirement_sha256": planner._sha(requirement_body),
+    }
+    candidate = planner._candidate(
+        symbol="USDNOK",
+        timeframe="H1",
+        regime="TREND",
+        depth_days=selected["depth_days"],
+        candidate_start=selected["candidate_start"],
+        folds=selected["folds"],
+    )
+    disposition = planner._state_context_dispositions(
+        [requirement],
+        candidate=candidate,
+        selected_common_context_bars=selected["selected_common_context_bars"],
+    )[0]
+    assert disposition["status"] == "PROCESS_REJECTED"
+    assert disposition["reason_code"] == planner.STATE_CONTEXT_BOUNDARY_REASON
+
+    understated = json.loads(
+        json.dumps(by_strategy["KaufmanAMATrendStrategy"])
+    )
+    understated["ceiling"]["bounded_context_bars"] = 100
+    understated_body = {
+        key: value
+        for key, value in understated.items()
+        if key != "record_sha256"
+    }
+    understated["record_sha256"] = planner._sha(understated_body)
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_DOMAIN_CEILING_BREACH",
+    ):
+        planner._state_replay_requirement(
+            fitted=fitted,
+            native=native,
+            strategy_name="KaufmanAMATrendStrategy",
+            wire_parameters=planner.canonicalize_parameter_mapping(
+                StrategyRegistry.get(
+                    "KaufmanAMATrendStrategy"
+                ).get_default_params()
+            ),
+            initial_error_bound=100.0,
+            tolerance=0.00001,
+            state_domain_record=understated,
+        )
+
+
 def test_preprotected_envelope_preserves_shorter_feasible_depth() -> None:
     frame, fitted, native, opens, closes = _state_error_envelope_inputs(days=800)
     envelope = planner._freeze_state_error_envelope(
@@ -647,16 +832,17 @@ def test_preprotected_envelope_preserves_shorter_feasible_depth() -> None:
     assert envelope["four_fold_protected_axis_available"] is True
     assert envelope["source_rows"] > 0
     assert pd.Timestamp(envelope["preprotected_cutoff_utc"]) > opens[0]
-    requirement = {
-        "bounded_context_bars": 20,
-        "requirement_sha256": "a" * 64,
-    }
+    domain_records = _state_domain_records_for_envelope(
+        fitted=fitted,
+        native=native,
+        envelope=envelope,
+    )
     selected = planner._select_feasible_common_state_context(
         native=native,
         opens=opens,
         closes=closes,
         timeframe="H1",
-        state_requirements=[requirement],
+        state_domain_records=domain_records,
         regime_warmup_bars=envelope["regime_warmup_bars"],
     )
     assert selected["boundary_limited"] is False
@@ -919,7 +1105,9 @@ def test_d1_selects_largest_feasible_common_context_and_rejects_only_excess(
         opens=opens,
         closes=closes,
         timeframe="D1",
-        state_requirements=requirements,
+        state_domain_records=_fake_state_domain_records(
+            (3_882, 1_629, 1_515, 943, 545, 20)
+        ),
         regime_warmup_bars=100,
     )
     assert selected["selected_common_context_bars"] == 545
@@ -1011,7 +1199,7 @@ def test_short_d1_prefix_keeps_low_context_trials_searchable() -> None:
         opens=opens,
         closes=closes,
         timeframe="D1",
-        state_requirements=requirements,
+        state_domain_records=_fake_state_domain_records((943, 100, 20)),
         regime_warmup_bars=100,
     )
     assert selected["selected_common_context_bars"] == 100
@@ -1038,7 +1226,9 @@ def test_short_d1_prefix_keeps_low_context_trials_searchable() -> None:
     ]
 
 
-def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> None:
+def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = planner._dependency_payload(
         "D1",
         feature_lookback_bars=4,
@@ -1057,10 +1247,43 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         "candidate_definition_sha256": planner._sha(candidate_body),
         "folds": [],
     }
+    domain_records = _fake_state_domain_records((4,))
+    example_effective_domain_sha256 = hashlib.sha256(
+        b"example-effective-domain"
+    ).hexdigest()
+    example_ceiling_decision_sha256 = hashlib.sha256(
+        b"example-domain-ceiling"
+    ).hexdigest()
+    first_record_body = {
+        **{
+            key: value
+            for key, value in domain_records[0].items()
+            if key != "record_sha256"
+        },
+        "strategy_id": "ExampleStrategy",
+        "effective_domain": {
+            "effective_domain_sha256": example_effective_domain_sha256
+        },
+        "ceiling": {
+            "status": "PROVED",
+            "strategy_name": "ExampleStrategy",
+            "bounded_context_bars": 4,
+            "decision_hash": example_ceiling_decision_sha256,
+        },
+    }
+    domain_records[0] = {
+        **first_record_body,
+        "record_sha256": planner._sha(first_record_body),
+    }
     state_body = {
-        "schema_version": "fxpm.production-attempt-state-requirement.v1",
+        "schema_version": planner.STATE_REQUIREMENT_SCHEMA,
         "strategy_id": "ExampleStrategy",
         "parameters_sha256": planner._sha({"period": 10}),
+        "effective_domain_sha256": example_effective_domain_sha256,
+        "state_domain_ceiling_decision_sha256": (
+            example_ceiling_decision_sha256
+        ),
+        "state_domain_ceiling_bars": 4,
         "initial_error_bound_hex": planner.STATE_INITIAL_ERROR_FLOOR.hex(),
         "tolerance_hex": float(0.01).hex(),
         "bounded_context_bars": 4,
@@ -1149,6 +1372,9 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
     receipt = {
         "candidate": candidate,
         "native_prefix": {
+            "index_sha256": "1" * 64,
+            "content_sha256": "2" * 64,
+            "start_utc": "2024-01-01T00:00:00Z",
             "rows": 366,
             "end_exclusive_utc": "2025-01-01T00:00:00Z",
             "last_close_utc": "2025-01-01T00:00:00Z",
@@ -1161,10 +1387,17 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
             regime_warmup_bars=4,
         ),
         "state_context_selection": planner._state_context_selection_receipt(
-            [state],
+            domain_records,
             [disposition],
             selected_common_context_bars=4,
             boundary_limited=True,
+        ),
+        "state_domain_ceiling_records": domain_records,
+        "state_domain_ceiling_record_sha256": [
+            value["record_sha256"] for value in domain_records
+        ],
+        "state_domain_ceiling_record_roster_sha256": planner._sha(
+            [value["record_sha256"] for value in domain_records]
         ),
     }
     artifact = {
@@ -1172,7 +1405,13 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         "trial_definition": {"parameters": {"period": 10}},
     }
 
+    monkeypatch.setattr(
+        planner,
+        "_state_domain_ceiling_records",
+        lambda *_args, **_kwargs: (domain_records, 4),
+    )
     planner._verify_state_context_plan_binding(
+        process_body={},
         receipt=receipt,
         attempts=[artifact],
         states=[state],
@@ -1180,6 +1419,37 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         boundary_limited=True,
         timeframe="D1",
     )
+
+    spliced_records = json.loads(json.dumps(domain_records))
+    spliced_records[0]["ceiling"]["bounded_context_bars"] = 5
+    spliced_body = {
+        key: value
+        for key, value in spliced_records[0].items()
+        if key != "record_sha256"
+    }
+    spliced_records[0]["record_sha256"] = planner._sha(spliced_body)
+    spliced_hashes = [value["record_sha256"] for value in spliced_records]
+    spliced_receipt = {
+        **receipt,
+        "state_domain_ceiling_records": spliced_records,
+        "state_domain_ceiling_record_sha256": spliced_hashes,
+        "state_domain_ceiling_record_roster_sha256": planner._sha(
+            spliced_hashes
+        ),
+    }
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="STATE_DOMAIN_CEILING_REPLAY_INVALID",
+    ):
+        planner._verify_state_context_plan_binding(
+            process_body={},
+            receipt=spliced_receipt,
+            attempts=[artifact],
+            states=[state],
+            horizon_plan=plan,
+            boundary_limited=True,
+            timeframe="D1",
+        )
 
     changed_envelope = {
         **receipt,
@@ -1195,6 +1465,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         match="STATE_REQUIREMENT_REPLAY_INVALID",
     ):
         planner._verify_state_context_plan_binding(
+            process_body={},
             receipt=changed_envelope,
             attempts=[artifact],
             states=[state],
@@ -1212,6 +1483,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         match="STATE_CONTEXT_GEOMETRY_BINDING_INVALID",
     ):
         planner._verify_state_context_plan_binding(
+            process_body={},
             receipt=changed_geometry,
             attempts=[artifact],
             states=[state],
@@ -1227,6 +1499,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement() -> 
         match="STATE_REQUIREMENT_REPLAY_INVALID",
     ):
         planner._verify_state_context_plan_binding(
+            process_body={},
             receipt=receipt,
             attempts=[artifact],
             states=[tampered],
@@ -1970,6 +2243,7 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
     for value in range(planner.ATTEMPT_COUNT):
         body = {"ordinal": value}
         states.append({**body, "requirement_sha256": planner._sha(body)})
+    state_domain_records = _fake_state_domain_records((20,))
     sink = authority_spool.open_symbol_sink(context, "EURUSD")
     receipt_json, entry_json = planner._seal_cell_plan(
         context,
@@ -1986,6 +2260,7 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         dependency_geometry={"geometry": True},
         attempt_artifacts=attempts,
         state_requirements=states,
+        state_domain_records=state_domain_records,
         state_context_selection={},
         state_error_envelope=_state_error_envelope_receipt(
             regime_parameters_sha256=parameters_sha256,

@@ -58,7 +58,7 @@ from pm_strategies import StrategyRegistry
 UTC: Final = timezone.utc
 PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v1"
 PROCESS_SEMANTICS_SCHEMA: Final = "fxpm.production-search-process-semantics.v1"
-DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v1"
+DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v2"
 ATTEMPT_POLICY_SCHEMA: Final = "fxpm.production-attempt-design-policy.v1"
 PROCESS_SPOOL_SYMBOL: Final = "__PRODUCTION_SEARCH_PROCESS__"
 CURRENT_AUTH_SPOOL_SYMBOL: Final = "__CURRENT_SEARCH_AUTHORIZATION__"
@@ -70,11 +70,18 @@ STATE_CONTEXT_DISPOSITION_SCHEMA: Final = (
     "fxpm.production-trial-state-context-disposition.v1"
 )
 STATE_CONTEXT_SELECTION_SCHEMA: Final = (
-    "fxpm.production-cell-state-context-selection.v1"
+    "fxpm.production-cell-state-context-selection.v2"
 )
+STATE_REQUIREMENT_SCHEMA: Final = "fxpm.production-attempt-state-requirement.v2"
 STATE_CONTEXT_BOUNDARY_REASON: Final = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
 STATE_ERROR_ENVELOPE_SCHEMA: Final = (
     "fxpm.production-preprotected-state-error-envelope.v1"
+)
+EFFECTIVE_STATE_DOMAIN_SCHEMA: Final = (
+    "fxpm.production-effective-state-domain.v1"
+)
+STATE_DOMAIN_CEILING_RECORD_SCHEMA: Final = (
+    "fxpm.production-state-domain-ceiling-record.v1"
 )
 CURRENT_SOURCE_CAPTURE_SCHEMA: Final = "fxpm.production-current-source-capture.v1"
 CURRENT_SOURCE_SNAPSHOT_SCHEMA: Final = "fxpm.current-refit-source-snapshot.v1"
@@ -293,6 +300,41 @@ def _parameter_value_key(value: Any) -> bytes:
     return _canonical_bytes(canonicalize_parameter_value(value), maximum=256 * 1024)
 
 
+def _required_feature_union(
+    name: str,
+    *,
+    defaults: Mapping[str, Any],
+    grid: Mapping[str, Sequence[Any]],
+) -> list[str]:
+    """Derive the compact union whose exhaustive coverage is release-tested.
+
+    The runtime derivation is default plus every value of every single axis,
+    which is only thousands of materializations rather than millions.  The
+    state-contract suite independently visits the complete Cartesian registry
+    and proves that every member's request is contained in this union.  A
+    future interaction-dependent request therefore fails the release test
+    before this compact producer can understate a cell domain.
+    """
+
+    parameter_points = [dict(defaults)]
+    for axis, choices in grid.items():
+        for choice in choices:
+            parameter_points.append({**defaults, axis: choice})
+    requested: set[str] = set()
+    try:
+        for parameters in parameter_points:
+            strategy = StrategyRegistry.get(name, **parameters)
+            requested.update(str(value) for value in strategy.get_feature_request())
+    except Exception as exc:
+        raise ProductionSearchPlannerError(
+            "STRATEGY_FEATURE_UNION_MATERIALIZATION_FAILED",
+            (name, type(exc).__name__, str(exc)),
+        ) from exc
+    if not requested or any(not value for value in requested):
+        _fail("STRATEGY_FEATURE_UNION_INVALID", name)
+    return sorted(requested)
+
+
 def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
     strategy = StrategyRegistry.get(name)
     defaults = canonicalize_parameter_mapping(strategy.get_default_params())
@@ -324,6 +366,11 @@ def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
             _fail("STRATEGY_DEFAULT_OUTSIDE_GRID", name, axis_name)
         grid_size *= len(choices)
         axes.append({"name": axis_name, "choices": choices})
+    required_feature_union = _required_feature_union(
+        name,
+        defaults=strategy.get_default_params(),
+        grid=raw_grid,
+    )
     body = {
         "schema_version": DOMAIN_SCHEMA,
         "ordinal": ordinal,
@@ -336,6 +383,11 @@ def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
         "exit_rule_identity_sha256": _callable_sha256(type(strategy).calculate_stops),
         "minimum_bars": int(strategy.MIN_BARS),
         "required_features": sorted(strategy.get_feature_request()),
+        "required_feature_union": required_feature_union,
+        "required_feature_union_derivation": (
+            "DEFAULT_PLUS_EVERY_SINGLE_AXIS_VALUE_WITH_EXHAUSTIVE_CARTESIAN_"
+            "RELEASE_PROOF"
+        ),
         "defaults": defaults,
         "grid_axes": axes,
         "grid_size": grid_size,
@@ -481,8 +533,8 @@ def _process_semantics(domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "LARGEST_FEASIBLE_BY_AUTHENTICATED_SOURCE_GEOMETRY_ONLY"
             ),
             "dependency_payload_rule": (
-                "PM_STATE_CONTRACT_MAX_ATTEMPT_BOUND_PLUS_EXACT_REGIME_WARMUP_"
-                "AND_CAUSAL_HOLDING_POLICY"
+                "PM_STATE_CONTRACT_EXHAUSTIVE_EFFECTIVE_DOMAIN_CEILING_PLUS_"
+                "EXACT_REGIME_WARMUP_AND_CAUSAL_HOLDING_POLICY"
             ),
         }
         for timeframe in TIMEFRAMES
@@ -1211,6 +1263,7 @@ def _seal_cell_plan(
     dependency_geometry: Mapping[str, Any],
     attempt_artifacts: Sequence[Mapping[str, Any]],
     state_requirements: Sequence[Mapping[str, Any]],
+    state_domain_records: Sequence[Mapping[str, Any]],
     state_context_selection: Mapping[str, Any],
     state_error_envelope: Mapping[str, Any],
     boundary_limited: bool,
@@ -1264,6 +1317,13 @@ def _seal_cell_plan(
         _hex64(value.get("requirement_sha256"), "STATE_REQUIREMENT_HASH_INVALID")
         for value in state_requirements
     ]
+    state_domain_record_hashes = [
+        _hex64(
+            value.get("record_sha256"),
+            "STATE_DOMAIN_CEILING_RECORD_SHA256_INVALID",
+        )
+        for value in state_domain_records
+    ]
     _verify_state_error_envelope_fitted_binding(
         state_error_envelope,
         fitted=fitted,
@@ -1272,8 +1332,11 @@ def _seal_cell_plan(
     if (
         len(attempt_hashes) != ATTEMPT_COUNT
         or len(state_hashes) != ATTEMPT_COUNT
+        or len(state_domain_record_hashes) != BASELINE_ATTEMPTS
         or len(set(attempt_hashes)) != len(attempt_hashes)
         or len(state_hashes) != len(set(state_hashes))
+        or len(state_domain_record_hashes)
+        != len(set(state_domain_record_hashes))
     ):
         _fail("CELL_PLAN_ROSTER_INVALID")
     body = {
@@ -1315,6 +1378,13 @@ def _seal_cell_plan(
         "attempt_roster_sha256": _sha(attempt_hashes),
         "state_requirement_sha256": state_hashes,
         "state_requirement_roster_sha256": _sha(state_hashes),
+        "state_domain_ceiling_records": [
+            dict(value) for value in state_domain_records
+        ],
+        "state_domain_ceiling_record_sha256": state_domain_record_hashes,
+        "state_domain_ceiling_record_roster_sha256": _sha(
+            state_domain_record_hashes
+        ),
         "state_context_selection": dict(state_context_selection),
         "state_error_envelope": dict(state_error_envelope),
         "current_refit_source_capture_sha256": source_capture_sha256,
@@ -1523,6 +1593,7 @@ def _verify_current_refit_source_capture(
 
 def _verify_state_context_plan_binding(
     *,
+    process_body: Mapping[str, Any],
     receipt: Mapping[str, Any],
     attempts: Sequence[Mapping[str, Any]],
     states: Sequence[Mapping[str, Any]],
@@ -1546,6 +1617,29 @@ def _verify_state_context_plan_binding(
     initial_error, tolerance, regime_warmup_bars = (
         _validated_state_error_envelope(envelope, native_prefix=native_prefix)
     )
+    carried_domain_records = receipt.get("state_domain_ceiling_records")
+    if type(carried_domain_records) is not list:
+        _fail("STATE_DOMAIN_CEILING_ROSTER_INVALID")
+    expected_domain_records, domain_regime_warmup_bars = (
+        _state_domain_ceiling_records(
+            process_body,
+            native_prefix=native_prefix,
+            cell=receipt.get("cell", {}),
+            state_error_envelope=envelope,
+        )
+    )
+    record_hashes = [value["record_sha256"] for value in expected_domain_records]
+    if (
+        carried_domain_records != expected_domain_records
+        or receipt.get("state_domain_ceiling_record_sha256") != record_hashes
+        or receipt.get("state_domain_ceiling_record_roster_sha256")
+        != _sha(record_hashes)
+        or domain_regime_warmup_bars != regime_warmup_bars
+    ):
+        _fail("STATE_DOMAIN_CEILING_REPLAY_INVALID")
+    domains_by_strategy = {
+        value["strategy_id"]: value for value in expected_domain_records
+    }
     candidates = plan_body.get("candidates")
     trials = plan_body.get("trials")
     plan_attempts = plan_body.get("attempts")
@@ -1616,12 +1710,36 @@ def _verify_state_context_plan_binding(
             key: value for key, value in state.items() if key != "requirement_sha256"
         }
         state_evidence = state.get("state_evidence")
+        domain_record = domains_by_strategy.get(state.get("strategy_id"))
+        effective_domain = (
+            domain_record.get("effective_domain")
+            if type(domain_record) is dict
+            else None
+        )
+        ceiling = (
+            domain_record.get("ceiling")
+            if type(domain_record) is dict
+            else None
+        )
         if (
             requirement_sha256 != _sha(requirement_body)
+            or state.get("schema_version") != STATE_REQUIREMENT_SCHEMA
             or state.get("execution_rule")
             != "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
             or state.get("initial_error_bound_hex") != initial_error.hex()
             or state.get("tolerance_hex") != tolerance.hex()
+            or type(effective_domain) is not dict
+            or type(ceiling) is not dict
+            or state.get("effective_domain_sha256")
+            != effective_domain.get("effective_domain_sha256")
+            or state.get("state_domain_ceiling_decision_sha256")
+            != ceiling.get("decision_hash")
+            or state.get("state_domain_ceiling_bars")
+            != ceiling.get("bounded_context_bars")
+            or type(state.get("bounded_context_bars")) is not int
+            or state["bounded_context_bars"] > ceiling.get(
+                "bounded_context_bars", -1
+            )
             or type(state_evidence) is not list
             or any(
                 type(value) is not dict
@@ -1642,7 +1760,7 @@ def _verify_state_context_plan_binding(
         selected_common_context_bars=selected,
     )
     expected_selection = _state_context_selection_receipt(
-        states,
+        expected_domain_records,
         expected_dispositions,
         selected_common_context_bars=selected,
         boundary_limited=boundary_limited,
@@ -1840,6 +1958,7 @@ def verify_production_cell_search_plan(
         _fail("CELL_PLAN_ROSTER_REPLAY_INVALID")
     if not terminal and not unobserved:
         _verify_state_context_plan_binding(
+            process_body=process.to_dict(),
             receipt=receipt,
             attempts=attempts,
             states=states,
@@ -2605,6 +2724,281 @@ def verify_preprotected_state_error_envelope(
     return True
 
 
+def _effective_state_domains(
+    process_body: Mapping[str, Any],
+    *,
+    symbol: str,
+    timeframe: str,
+    regime: str,
+) -> list[dict[str, Any]]:
+    """Bind the frozen registry domain to one explicit production cell."""
+
+    domains = list(_domain_by_name(process_body).values())
+    domains.sort(key=lambda value: int(value.get("ordinal", -1)))
+    candidate_domain_sha256 = _hex64(
+        process_body.get("candidate_domain_sha256"),
+        "PROCESS_CANDIDATE_DOMAIN_SHA256_INVALID",
+    )
+    effective: list[dict[str, Any]] = []
+    for ordinal, domain in enumerate(domains):
+        defaults = domain.get("defaults")
+        axes = domain.get("grid_axes")
+        features = domain.get("required_feature_union")
+        if (
+            domain.get("schema_version") != DOMAIN_SCHEMA
+            or domain.get("ordinal") != ordinal
+            or type(defaults) is not dict
+            or not defaults
+            or type(axes) is not list
+            or not axes
+            or type(features) is not list
+            or any(type(value) is not str or not value for value in features)
+            or features != sorted(set(features))
+            or domain.get("required_feature_union_derivation")
+            != (
+                "DEFAULT_PLUS_EVERY_SINGLE_AXIS_VALUE_WITH_EXHAUSTIVE_"
+                "CARTESIAN_RELEASE_PROOF"
+            )
+            or domain.get("domain_sha256")
+            != _sha(
+                {
+                    key: value
+                    for key, value in domain.items()
+                    if key != "domain_sha256"
+                }
+            )
+        ):
+            _fail("EFFECTIVE_STATE_SOURCE_DOMAIN_INVALID", ordinal)
+        parameter_domains = {
+            key: [value] for key, value in sorted(defaults.items())
+        }
+        for axis in axes:
+            if (
+                type(axis) is not dict
+                or set(axis) != {"name", "choices"}
+                or type(axis.get("name")) is not str
+                or axis["name"] not in parameter_domains
+                or type(axis.get("choices")) is not list
+                or not axis["choices"]
+            ):
+                _fail("EFFECTIVE_STATE_DOMAIN_AXIS_INVALID", ordinal)
+            parameter_domains[axis["name"]] = list(axis["choices"])
+        full_count = math.prod(len(values) for values in parameter_domains.values())
+        if full_count != domain.get("grid_size"):
+            _fail("EFFECTIVE_STATE_DOMAIN_COUNT_INVALID", ordinal)
+        body = {
+            "schema_version": EFFECTIVE_STATE_DOMAIN_SCHEMA,
+            "cell": {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "regime": regime,
+            },
+            "strategy_ordinal": ordinal,
+            "strategy_id": domain["strategy_id"],
+            "candidate_domain_sha256": candidate_domain_sha256,
+            "source_strategy_domain_sha256": domain["domain_sha256"],
+            "parameter_domains": parameter_domains,
+            "full_domain_point_count": full_count,
+            "requested_feature_union": list(features),
+            "feature_union_derivation": domain[
+                "required_feature_union_derivation"
+            ],
+            "outcome_or_protected_value_dependent": False,
+        }
+        effective.append({**body, "effective_domain_sha256": _sha(body)})
+    if (
+        len(effective) != BASELINE_ATTEMPTS
+        or [value["strategy_id"] for value in effective]
+        != list(state_contract.ACTUAL_STRATEGY_NAMES)
+    ):
+        _fail("EFFECTIVE_STATE_DOMAIN_ROSTER_INVALID")
+    return effective
+
+
+def _sealed_state_replay_evidence(
+    *,
+    node: str,
+    identity_body: Mapping[str, Any],
+    schema_unavailable_code: str,
+    error_context: Sequence[Any] = (),
+) -> tuple[state_contract.StateEvidence, dict[str, Any]]:
+    """Bind one authenticated replay identity to the authority's path schema."""
+
+    contract = state_contract.DEFAULT_AUTHORITY._contracts.get(node)  # noqa: SLF001
+    if (
+        contract is None
+        or contract.kind != state_contract.StateKind.PATH_STATE
+        or not contract.checkpoint_schema
+        or not contract.transition_schema
+    ):
+        _fail(schema_unavailable_code, *error_context, node)
+    body = {
+        **dict(identity_body),
+        "state_schema": contract.checkpoint_schema,
+        "transition_schema": contract.transition_schema,
+    }
+    identity = _sha(body)
+    return (
+        state_contract.StateEvidence(
+            node=node,
+            mode=state_contract.EvidenceMode.AUTHENTICATED_REPLAY,
+            identity_sha256=identity,
+            registry_hash=state_contract.DEFAULT_AUTHORITY.registry_hash,
+            state_schema=str(contract.checkpoint_schema),
+            transition_schema=str(contract.transition_schema),
+        ),
+        {**body, "identity_sha256": identity},
+    )
+
+
+def _domain_state_replay_evidence(
+    *,
+    native_prefix: Mapping[str, Any],
+    effective_domain: Mapping[str, Any],
+    initial_error_bound: float,
+    tolerance: float,
+) -> tuple[dict[str, state_contract.StateEvidence], list[dict[str, Any]]]:
+    parameter_domains = effective_domain.get("parameter_domains")
+    requested = effective_domain.get("requested_feature_union")
+    if type(parameter_domains) is not dict or type(requested) is not list:
+        _fail("STATE_DOMAIN_EVIDENCE_INPUT_INVALID")
+    parameters = {
+        key: values[0]
+        for key, values in parameter_domains.items()
+        if type(values) is list and values
+    }
+    if len(parameters) != len(parameter_domains):
+        _fail("STATE_DOMAIN_EVIDENCE_PARAMETER_INVALID")
+    unresolved = state_contract.DEFAULT_AUTHORITY.resolve_cell(
+        str(effective_domain.get("strategy_id") or ""),
+        parameters=parameters,
+        requested_features=requested,
+        timeframe=str(effective_domain.get("cell", {}).get("timeframe") or ""),
+        include_regime_controller=False,
+        initial_error_bound=initial_error_bound,
+        tolerance=tolerance,
+    )
+    evidence: dict[str, state_contract.StateEvidence] = {}
+    bodies: list[dict[str, Any]] = []
+    for node in unresolved.required_path_state_nodes:
+        identity_body = {
+            "schema_version": "fxpm.production-domain-state-replay.v1",
+            "node": node,
+            "mode": state_contract.EvidenceMode.AUTHENTICATED_REPLAY.value,
+            "state_contract_registry_sha256": (
+                state_contract.DEFAULT_AUTHORITY.registry_hash
+            ),
+            "native_prefix_index_sha256": _hex64(
+                native_prefix.get("index_sha256"),
+                "STATE_DOMAIN_NATIVE_INDEX_SHA256_INVALID",
+            ),
+            "native_prefix_content_sha256": _hex64(
+                native_prefix.get("content_sha256"),
+                "STATE_DOMAIN_NATIVE_CONTENT_SHA256_INVALID",
+            ),
+            "prefix_start_utc": native_prefix.get("start_utc"),
+            "prefix_end_exclusive_utc": native_prefix.get("end_exclusive_utc"),
+            "prefix_rows": native_prefix.get("rows"),
+            "strategy_id": effective_domain["strategy_id"],
+            "effective_domain_sha256": effective_domain[
+                "effective_domain_sha256"
+            ],
+            "requested_feature_union": list(requested),
+            "feature_computer_release_sha256": _source_sha256(
+                search_execution.FeatureComputer
+            ),
+            "requires_executor_full_prefix_replay_before_any_scored_slice": True,
+        }
+        item, receipt = _sealed_state_replay_evidence(
+            node=node,
+            identity_body=identity_body,
+            schema_unavailable_code="STATE_DOMAIN_REPLAY_SCHEMA_UNAVAILABLE",
+        )
+        evidence[node] = item
+        bodies.append(receipt)
+    return evidence, bodies
+
+
+def _state_domain_ceiling_records(
+    process_body: Mapping[str, Any],
+    *,
+    native_prefix: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    state_error_envelope: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Rebuild all 100 cell ceilings from sealed non-market inputs."""
+
+    initial_error, tolerance, regime_warmup_bars = _validated_state_error_envelope(
+        state_error_envelope,
+        native_prefix=native_prefix,
+    )
+    symbol = _identity(cell.get("symbol"), "STATE_DOMAIN_SYMBOL_INVALID")
+    timeframe = _identity(
+        cell.get("timeframe"), "STATE_DOMAIN_TIMEFRAME_INVALID"
+    ).upper()
+    regime = _identity(cell.get("regime"), "STATE_DOMAIN_REGIME_INVALID").upper()
+    effective_domains = _effective_state_domains(
+        process_body,
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=regime,
+    )
+    records: list[dict[str, Any]] = []
+    for ordinal, effective_domain in enumerate(effective_domains):
+        evidence, evidence_bodies = _domain_state_replay_evidence(
+            native_prefix=native_prefix,
+            effective_domain=effective_domain,
+            initial_error_bound=initial_error,
+            tolerance=tolerance,
+        )
+        try:
+            ceiling = state_contract.DEFAULT_AUTHORITY.resolve_cell_domain_ceiling(
+                effective_domain["strategy_id"],
+                parameter_domains=effective_domain["parameter_domains"],
+                requested_features=effective_domain["requested_feature_union"],
+                timeframe=timeframe,
+                effective_domain_hash=effective_domain[
+                    "effective_domain_sha256"
+                ],
+                include_regime_controller=False,
+                initial_error_bound=initial_error,
+                tolerance=tolerance,
+                state_evidence=evidence,
+            )
+        except Exception as exc:
+            raise ProductionSearchPlannerError(
+                "STATE_DOMAIN_CEILING_RESOLUTION_FAILED",
+                (effective_domain["strategy_id"], type(exc).__name__, str(exc)),
+            ) from exc
+        if (
+            not ceiling.proved
+            or type(ceiling.bounded_context_bars) is not int
+            or ceiling.bounded_context_bars < 0
+            or ceiling.full_domain_point_count
+            != effective_domain["full_domain_point_count"]
+        ):
+            _fail(
+                "STATE_DOMAIN_CEILING_PROCESS_REJECTED",
+                effective_domain["strategy_id"],
+                *ceiling.reason_codes,
+            )
+        body = {
+            "schema_version": STATE_DOMAIN_CEILING_RECORD_SCHEMA,
+            "strategy_ordinal": ordinal,
+            "strategy_id": effective_domain["strategy_id"],
+            "effective_domain": effective_domain,
+            "state_replay_evidence": evidence_bodies,
+            "ceiling": ceiling.to_dict(),
+        }
+        records.append({**body, "record_sha256": _sha(body)})
+    if (
+        len(records) != BASELINE_ATTEMPTS
+        or len({value["record_sha256"] for value in records}) != len(records)
+    ):
+        _fail("STATE_DOMAIN_CEILING_ROSTER_INVALID")
+    return records, regime_warmup_bars
+
+
 def _state_replay_requirement(
     *,
     fitted: search_execution.FittedNativeSearchTimeframe,
@@ -2613,7 +3007,42 @@ def _state_replay_requirement(
     wire_parameters: Mapping[str, Any],
     initial_error_bound: float,
     tolerance: float,
+    state_domain_record: Mapping[str, Any],
 ) -> dict[str, Any]:
+    record_body = {
+        key: value
+        for key, value in state_domain_record.items()
+        if key != "record_sha256"
+    }
+    effective_domain = state_domain_record.get("effective_domain")
+    ceiling = state_domain_record.get("ceiling")
+    if (
+        state_domain_record.get("schema_version")
+        != STATE_DOMAIN_CEILING_RECORD_SCHEMA
+        or state_domain_record.get("record_sha256") != _sha(record_body)
+        or state_domain_record.get("strategy_id") != strategy_name
+        or type(effective_domain) is not dict
+        or type(ceiling) is not dict
+        or effective_domain.get("strategy_id") != strategy_name
+        or ceiling.get("strategy_name") != strategy_name
+        or ceiling.get("status") != "PROVED"
+        or ceiling.get("effective_domain_sha256")
+        != effective_domain.get("effective_domain_sha256")
+    ):
+        _fail("STATE_DOMAIN_ATTEMPT_RECORD_INVALID", strategy_name)
+    parameter_domains = effective_domain.get("parameter_domains")
+    if (
+        type(parameter_domains) is not dict
+        or set(wire_parameters) != set(parameter_domains)
+        or any(
+            type(choices) is not list
+            or not choices
+            or _parameter_value_key(wire_parameters[key])
+            not in {_parameter_value_key(value) for value in choices}
+            for key, choices in parameter_domains.items()
+        )
+    ):
+        _fail("STATE_ATTEMPT_OUTSIDE_EFFECTIVE_DOMAIN", strategy_name)
     base = StrategyRegistry.get(strategy_name)
     try:
         parameters = decode_parameter_mapping(
@@ -2626,6 +3055,13 @@ def _state_replay_requirement(
             (strategy_name, type(exc).__name__, str(exc)),
         ) from exc
     requested = sorted(strategy.get_feature_request())
+    feature_union = effective_domain.get("requested_feature_union")
+    if (
+        type(feature_union) is not list
+        or feature_union != sorted(set(feature_union))
+        or not set(requested).issubset(feature_union)
+    ):
+        _fail("STATE_ATTEMPT_FEATURE_OUTSIDE_EFFECTIVE_DOMAIN", strategy_name)
     unresolved = state_contract.DEFAULT_AUTHORITY.resolve_cell(
         strategy_name,
         parameters=parameters,
@@ -2638,13 +3074,6 @@ def _state_replay_requirement(
     evidence: dict[str, state_contract.StateEvidence] = {}
     evidence_bodies: list[dict[str, Any]] = []
     for node in unresolved.required_path_state_nodes:
-        contract = state_contract.DEFAULT_AUTHORITY._contracts.get(node)  # noqa: SLF001
-        if (
-            contract is None
-            or not contract.checkpoint_schema
-            or not contract.transition_schema
-        ):
-            _fail("STATE_REPLAY_SCHEMA_UNAVAILABLE", strategy_name, node)
         identity_body = {
             "schema_version": "fxpm.production-full-prefix-state-replay.v1",
             "node": node,
@@ -2663,21 +3092,16 @@ def _state_replay_requirement(
             "feature_computer_release_sha256": _source_sha256(
                 search_execution.FeatureComputer
             ),
-            "state_schema": contract.checkpoint_schema,
-            "transition_schema": contract.transition_schema,
             "requires_executor_full_prefix_replay_before_any_scored_slice": True,
         }
-        identity = _sha(identity_body)
-        item = state_contract.StateEvidence(
+        item, receipt = _sealed_state_replay_evidence(
             node=node,
-            mode=state_contract.EvidenceMode.AUTHENTICATED_REPLAY,
-            identity_sha256=identity,
-            registry_hash=state_contract.DEFAULT_AUTHORITY.registry_hash,
-            state_schema=str(contract.checkpoint_schema),
-            transition_schema=str(contract.transition_schema),
+            identity_body=identity_body,
+            schema_unavailable_code="STATE_REPLAY_SCHEMA_UNAVAILABLE",
+            error_context=(strategy_name,),
         )
         evidence[node] = item
-        evidence_bodies.append({**identity_body, "identity_sha256": identity})
+        evidence_bodies.append(receipt)
     resolved = state_contract.DEFAULT_AUTHORITY.resolve_cell(
         strategy_name,
         parameters=parameters,
@@ -2698,10 +3122,18 @@ def _state_replay_requirement(
             strategy_name,
             *resolved.reason_codes,
         )
+    ceiling_bars = ceiling.get("bounded_context_bars")
+    if type(ceiling_bars) is not int or resolved.bounded_context_bars > ceiling_bars:
+        _fail("STATE_DOMAIN_CEILING_BREACH", strategy_name)
     body = {
-        "schema_version": "fxpm.production-attempt-state-requirement.v1",
+        "schema_version": STATE_REQUIREMENT_SCHEMA,
         "strategy_id": strategy_name,
         "parameters_sha256": _sha(dict(wire_parameters)),
+        "effective_domain_sha256": effective_domain[
+            "effective_domain_sha256"
+        ],
+        "state_domain_ceiling_decision_sha256": ceiling["decision_hash"],
+        "state_domain_ceiling_bars": ceiling_bars,
         "requested_features": requested,
         "include_regime_controller": False,
         "regime_surface_source": "FITTED_FULL_NATIVE_PREFIX_REGIME_LIVE",
@@ -2725,6 +3157,7 @@ def _state_requirements(
     native: Mapping[str, Any],
     designs: Sequence[Mapping[str, Any]],
     state_error_envelope: Mapping[str, Any],
+    state_domain_records: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
     initial_error, tolerance, regime_warmup_bars = (
         _verify_state_error_envelope_fitted_binding(
@@ -2733,17 +3166,33 @@ def _state_requirements(
             native=native,
         )
     )
-    requirements = [
-        _state_replay_requirement(
-            fitted=fitted,
-            native=native,
-            strategy_name=str(design["strategy_id"]),
-            wire_parameters=dict(design["parameters"]),
-            initial_error_bound=initial_error,
-            tolerance=tolerance,
+    by_strategy = {
+        str(record.get("strategy_id") or ""): record
+        for record in state_domain_records
+        if type(record) is dict
+    }
+    if (
+        len(state_domain_records) != BASELINE_ATTEMPTS
+        or len(by_strategy) != BASELINE_ATTEMPTS
+    ):
+        _fail("STATE_DOMAIN_CEILING_ROSTER_INVALID")
+    requirements = []
+    for design in designs:
+        strategy_name = str(design["strategy_id"])
+        record = by_strategy.get(strategy_name)
+        if record is None:
+            _fail("STATE_DOMAIN_CEILING_MISSING", strategy_name)
+        requirements.append(
+            _state_replay_requirement(
+                fitted=fitted,
+                native=native,
+                strategy_name=strategy_name,
+                wire_parameters=dict(design["parameters"]),
+                initial_error_bound=initial_error,
+                tolerance=tolerance,
+                state_domain_record=record,
+            )
         )
-        for design in designs
-    ]
     return requirements, regime_warmup_bars
 
 
@@ -3195,29 +3644,30 @@ def _select_feasible_common_state_context(
     opens: pd.DatetimeIndex,
     closes: pd.DatetimeIndex,
     timeframe: str,
-    state_requirements: Sequence[Mapping[str, Any]],
+    state_domain_records: Sequence[Mapping[str, Any]],
     regime_warmup_bars: int,
 ) -> dict[str, Any]:
-    """Select the largest common state context backed by genuine fold geometry.
+    """Select geometry from exhaustive domain ceilings, never sampled attempts.
 
     Winner comparisons require one paired fold axis.  A single extreme strategy
     must not veto lower-context siblings, so source geometry is tested at each
-    exact frozen requirement from largest to smallest.  Requirements above the
-    selected value remain in the multiplicity roster and are typed separately
-    before evaluation.
+    exhaustive per-strategy ceiling from largest to smallest.  Exact attempts
+    are admitted against their strategy ceiling and typed against the selected
+    value later; changing a sampler therefore cannot change fold geometry.
     """
 
     if (
-        not state_requirements
+        len(state_domain_records) != BASELINE_ATTEMPTS
         or type(regime_warmup_bars) is not int
         or regime_warmup_bars < 1
     ):
         _fail("STATE_CONTEXT_SELECTION_INPUT_INVALID")
     contexts: list[int] = []
-    for requirement in state_requirements:
-        bounded = requirement.get("bounded_context_bars")
+    for record in state_domain_records:
+        ceiling = record.get("ceiling") if type(record) is dict else None
+        bounded = ceiling.get("bounded_context_bars") if type(ceiling) is dict else None
         if type(bounded) is not int or bounded < 0:
-            _fail("STATE_CONTEXT_REQUIREMENT_INVALID")
+            _fail("STATE_DOMAIN_CEILING_INVALID")
         contexts.append(max(1, bounded))
     unique_descending = sorted(set(contexts), reverse=True)
     selected: dict[str, Any] | None = None
@@ -3297,17 +3747,38 @@ def _state_context_dispositions(
 
 
 def _state_context_selection_receipt(
-    state_requirements: Sequence[Mapping[str, Any]],
+    state_domain_records: Sequence[Mapping[str, Any]],
     dispositions: Sequence[Mapping[str, Any]],
     *,
     selected_common_context_bars: int,
     boundary_limited: bool,
 ) -> dict[str, Any]:
     if (
-        len(state_requirements) != len(dispositions)
+        len(state_domain_records) != BASELINE_ATTEMPTS
+        or not dispositions
         or type(boundary_limited) is not bool
     ):
         _fail("STATE_CONTEXT_SELECTION_ROSTER_INVALID")
+    record_hashes = [
+        _hex64(
+            value.get("record_sha256"),
+            "STATE_DOMAIN_CEILING_RECORD_SHA256_INVALID",
+        )
+        for value in state_domain_records
+    ]
+    ceiling_hashes = [
+        _hex64(
+            value.get("ceiling", {}).get("decision_hash"),
+            "STATE_DOMAIN_CEILING_DECISION_SHA256_INVALID",
+        )
+        for value in state_domain_records
+    ]
+    ceiling_contexts = [
+        value.get("ceiling", {}).get("bounded_context_bars")
+        for value in state_domain_records
+    ]
+    if any(type(value) is not int or value < 0 for value in ceiling_contexts):
+        _fail("STATE_DOMAIN_CEILING_CONTEXT_INVALID")
     disposition_hashes = [
         _hex64(
             value.get("disposition_sha256"),
@@ -3324,13 +3795,15 @@ def _state_context_selection_receipt(
     body = {
         "schema_version": STATE_CONTEXT_SELECTION_SCHEMA,
         "selection_rule": (
-            "LARGEST_SOURCE_GEOMETRY_FEASIBLE_COMMON_CONTEXT_DESCENDING"
+            "LARGEST_SOURCE_GEOMETRY_FEASIBLE_EXHAUSTIVE_DOMAIN_CEILING_"
+            "DESCENDING"
         ),
         "selected_common_context_bars": selected_common_context_bars,
         "candidate_boundary_limited": boundary_limited,
-        "required_context_roster_sha256": _sha(
-            [value.get("bounded_context_bars") for value in state_requirements]
-        ),
+        "state_domain_ceiling_record_sha256": record_hashes,
+        "state_domain_ceiling_record_roster_sha256": _sha(record_hashes),
+        "state_domain_ceiling_decision_sha256": ceiling_hashes,
+        "state_domain_ceiling_context_roster_sha256": _sha(ceiling_contexts),
         "disposition_sha256": disposition_hashes,
         "disposition_roster_sha256": _sha(disposition_hashes),
         "within_selected_context_count": within_count,
@@ -4255,12 +4728,6 @@ def _build_observed_cell_plan(
         _fail("REGIME_NOT_EMPIRICALLY_OBSERVED_USE_TERMINAL_PATH")
 
     process_body = process.to_dict()
-    designs = _attempt_designs(
-        process_body,
-        symbol=symbol,
-        timeframe=timeframe,
-        regime=normalized_regime,
-    )
     state_error_envelope = _freeze_state_error_envelope(
         frame=frame,
         fitted=fitted,
@@ -4268,10 +4735,23 @@ def _build_observed_cell_plan(
         opens=opens,
         closes=closes,
     )
-    state_requirements, regime_warmup_bars = _state_requirements(
-        fitted=fitted,
-        native=native,
-        designs=designs,
+    cell_identity = {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "regime": normalized_regime,
+    }
+    native_binding = {
+        "index_sha256": fitted.product.index_sha256,
+        "content_sha256": native["prefix_content_sha256"],
+        "start_utc": native["prefix_start_utc"],
+        "end_exclusive_utc": native["prefix_end_exclusive_utc"],
+        "last_close_utc": native["prefix_last_close_utc"],
+        "rows": native["prefix_rows"],
+    }
+    state_domain_records, regime_warmup_bars = _state_domain_ceiling_records(
+        process_body,
+        native_prefix=native_binding,
+        cell=cell_identity,
         state_error_envelope=state_error_envelope,
     )
     state_selection = _select_feasible_common_state_context(
@@ -4279,7 +4759,7 @@ def _build_observed_cell_plan(
         opens=opens,
         closes=closes,
         timeframe=timeframe,
-        state_requirements=state_requirements,
+        state_domain_records=state_domain_records,
         regime_warmup_bars=regime_warmup_bars,
     )
     state_context_bars = state_selection["selected_common_context_bars"]
@@ -4297,13 +4777,28 @@ def _build_observed_cell_plan(
         candidate_start=candidate_start,
         folds=folds,
     )
+    designs = _attempt_designs(
+        process_body,
+        symbol=symbol,
+        timeframe=timeframe,
+        regime=normalized_regime,
+    )
+    state_requirements, exact_regime_warmup_bars = _state_requirements(
+        fitted=fitted,
+        native=native,
+        designs=designs,
+        state_error_envelope=state_error_envelope,
+        state_domain_records=state_domain_records,
+    )
+    if exact_regime_warmup_bars != regime_warmup_bars:
+        _fail("STATE_DOMAIN_REGIME_WARMUP_MISMATCH")
     state_dispositions = _state_context_dispositions(
         state_requirements,
         candidate=candidate,
         selected_common_context_bars=state_context_bars,
     )
     state_context_selection = _state_context_selection_receipt(
-        state_requirements,
+        state_domain_records,
         state_dispositions,
         selected_common_context_bars=state_context_bars,
         boundary_limited=boundary_limited,
@@ -4480,6 +4975,7 @@ def _build_observed_cell_plan(
         dependency_geometry=dependency_geometry,
         attempt_artifacts=artifacts,
         state_requirements=state_requirements,
+        state_domain_records=state_domain_records,
         state_context_selection=state_context_selection,
         state_error_envelope=state_error_envelope,
         boundary_limited=boundary_limited,
@@ -4551,6 +5047,10 @@ def production_search_planner_contract() -> dict[str, Any]:
         "state_error_envelope_frozen_before_tuning_and_protected_values": True,
         "protected_state_envelope_breach_fails_closed": True,
         "regime_warmup_derived_from_frozen_parameters": True,
+        "dataframe_free_exhaustive_state_domain_ceiling_required": True,
+        "state_geometry_independent_of_sampled_attempts": True,
+        "effective_per_cell_state_domain_hash_required": True,
+        "complete_cartesian_feature_union_release_proof_required": True,
         "current_refit_reuses_historical_horizon_oracle": True,
         "full_grid_exhaustive_search_claimed": False,
         "technical_failure_is_market_verdict": False,
