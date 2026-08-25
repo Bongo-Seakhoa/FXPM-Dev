@@ -460,7 +460,7 @@ def build_scoring_system(story):
         ["scoring_use_sortino_blend", "ON", "Uses pure Sharpe ratio (no downside weighting)"],
         ["scoring_use_tail_risk", "ON", "No penalty for extreme negative R-multiples"],
         ["scoring_use_consistency", "ON", "No penalty for consecutive losing streaks"],
-        ["scoring_use_trade_frequency_bonus", "ON", "No bonus for higher trade counts"],
+        ["scoring_use_trade_frequency_bonus", "OFF", "Canonical scoring applies no trade-frequency bonus"],
     ]
     story.append(make_table(flags_data, col_widths=[160, 55, 225]))
     story.append(spacer(8))
