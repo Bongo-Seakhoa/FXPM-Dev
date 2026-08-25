@@ -134,11 +134,16 @@ reachable from `pm_main`** — this is entangled, not detachable. Fan-in ranks
 **Cost to discard:** unknown; requires per-subsystem reachability proof.
 
 ### E4 — Orphaned modules `DECISION: pending`
-8 modules, 26,234 lines, reachable only from tests: `pm_native_lifecycle` (7,799),
+7 modules remain reachable only from tests: `pm_native_lifecycle` (7,799),
 `pm_state_runtime` (6,679), `pm_native_storage` (3,331), `pm_native_composite`
-(3,092, zero non-test references), `pm_raw_winner_canary_conformance`,
-`pm_native_continuity`, `pm_native_source_chain`, `pm_history_dependencies`.
+(3,092, zero non-test references), `pm_native_continuity`, `pm_native_source_chain`,
+`pm_history_dependencies`.
 Each has a test file, so the suite proves the correctness of code that never runs.
+The unrecoverable `pm_raw_winner_canary_conformance` module, CLI, and tests were retired rather than
+left as a permanently skipped verifier. Its historical expected root comprised 14 files totalling
+949,589 bytes with inventory SHA-256
+`a0ec21a7eaa8f492cfc73bd064aecde07953f8cd8fb2b7ef589ab57d1f5e979e`; the artifact was not
+recoverable at `963feae`, and semantic closure was never achieved.
 The ninth audited island, `pm_native_run_reseal` (2,139 lines plus its 133-line
 CLI and 1,778-line/45-case test; 4,050 lines total), was retired under
 XPM-064/CPM-059 after its two unique acquisition checks were migrated; see BI-12.

@@ -50,7 +50,7 @@ under M10's evidence gate.
 | M1 | Native history authority (V5) built + 600-cell audit | `[x]` | prerequisite (done) |
 | M2 | Producer-wiring + terminal-cell promotion correctness (successor freezes) | `[x]` | done — all 6 artifacts accepted |
 | M3 | Atomic promotion of the e3ce manifest to ACTIVE | `[x]` | **done + independently verified (2026-07-22)** |
-| M4 | Raw-winner canary (bounded, non-authorizing) at 128 attempts | `[x]` | **gate closed 2026-07-26 (offline fix-verification, operator no-rerun)** |
+| M4 | Raw-winner canary (bounded, non-authorizing) at 128 attempts | `[ ]` | **historical artifact unrecoverable; semantic gate not closed** |
 | M5 | Pre-optimize hygiene config freeze | `[ ]` | YES |
 | M6 | Full production optimization run (parallel, streamed) | `[~]` | **infrastructure BUILT + fully reviewed; ready for operator launch** |
 | M7 | Synchronized replay + capital-envelope calibration | `[ ]` | YES |
@@ -111,8 +111,12 @@ fixed across executor+planner (seq2512-era) and the adapter/Winner/Book successo
 **cost-stress `NO_NUMERICAL_SHOCK`** correctness fix (seq2611) — a tight-spread cell (real spread below
 the broker floor) genuinely produces no cost shock, now a typed honest abstention rather than a hard
 failure, admitted only on hash-identical base/stress vectors with improvement/drift still fail-closed.
-The gate was closed on offline preserved-root replay of the fix per the operator's no-second-long-canary
-instruction.
+The historical preserved-root replay was never reproducible from the retained workspace, so it did not
+close the semantic gate. The expected root had 14 files totalling 949,589 bytes and inventory SHA-256
+`a0ec21a7eaa8f492cfc73bd064aecde07953f8cd8fb2b7ef589ab57d1f5e979e`; it was not recoverable at
+`963feae`, and semantic closure was never achieved. If that exact authoritative root is later supplied,
+it must be checked outside production against these pinned inventory facts before any preservation
+decision.
 
 **Parallel M6 build (11 lanes, all ACCEPTED + RELEASED 2026-07-26):** the whole optimize now runs both
 the historical-anchor and current-refit halves **in parallel** (≤5 workers, 1 GiB reserve) under one
