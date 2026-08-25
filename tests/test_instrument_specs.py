@@ -8,7 +8,6 @@ from pm_core import (
     InstrumentSpec,
     _create_spec_from_broker_data,
     get_instrument_spec,
-    InstrumentSpec,
     load_broker_specs,
     set_broker_specs_path,
     set_instrument_specs,
@@ -38,7 +37,7 @@ class InstrumentSpecTests(unittest.TestCase):
             os.environ["PM_CONFIG_PATH"] = self._old_pm_config_path
 
     def test_config_override_and_defaults(self):
-        defaults = {"commission_per_lot": 12.0}
+        defaults = {"swap_long": -12.0}
         specs = {
             "AAA": {"pip_position": 4, "pip_value": 10.0, "spread_avg": 1.5, "min_lot": 0.01, "max_lot": 100.0},
             "BBB": {"inherit": "AAA", "spread_avg": 2.0},
@@ -51,13 +50,27 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(a.pip_position, 4)
         self.assertEqual(a.pip_value, 10.0)
         self.assertEqual(a.spread_avg, 1.5)
-        self.assertEqual(a.commission_per_lot, 12.0)
+        self.assertEqual(a.swap_long, -12.0)
 
         # Inherit should copy AAA and override spread_avg
         self.assertEqual(b.pip_position, 4)
         self.assertEqual(b.pip_value, 10.0)
         self.assertEqual(b.spread_avg, 2.0)
-        self.assertEqual(b.commission_per_lot, 12.0)
+        self.assertEqual(b.swap_long, -12.0)
+
+    def test_retired_commission_key_is_rejected_in_instrument_override(self):
+        with self.assertRaisesRegex(ValueError, "retired key.*commission_per_lot"):
+            set_instrument_specs(
+                specs={"EURUSD": {"commission_per_lot": 7.0}},
+                defaults={},
+            )
+
+    def test_retired_commission_key_is_rejected_in_instrument_defaults(self):
+        with self.assertRaisesRegex(ValueError, "retired key.*commission_per_lot"):
+            set_instrument_specs(
+                specs={},
+                defaults={"commission_per_lot": 7.0},
+            )
 
     def test_symbol_suffix_normalization(self):
         specs = {
@@ -70,18 +83,7 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(spec.spread_avg, 1.2)
         self.assertEqual(spec.symbol, "EURUSD.a")
 
-    def test_mt5_symbol_info_to_spec_uses_configured_commission(self):
-        specs = {
-            "EURUSD": {
-                "pip_position": 4,
-                "pip_value": 10.0,
-                "spread_avg": 1.2,
-                "min_lot": 0.01,
-                "max_lot": 100.0,
-                "commission_per_lot": 0.0,
-            },
-        }
-        set_instrument_specs(specs=specs, defaults={})
+    def test_mt5_symbol_info_to_spec_has_no_synthetic_commission_field(self):
         symbol_info = MT5SymbolInfo(
             symbol="EURUSD.a",
             digits=5,
@@ -101,7 +103,7 @@ class InstrumentSpecTests(unittest.TestCase):
 
         spec = symbol_info.to_instrument_spec()
 
-        self.assertEqual(spec.commission_per_lot, 0.0)
+        self.assertFalse(hasattr(spec, "commission_per_lot"))
 
     def test_python_mt5_weekday_fields_never_claim_authenticated_terms(self):
         symbol_info = MT5SymbolInfo(
@@ -135,7 +137,7 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertEqual(spec.swap_terms_provenance_status, "INCOMPLETE")
         self.assertEqual(spec.swap_terms_snapshot_sha256, "")
 
-    def test_broker_spec_preserves_explicit_zero_commission(self):
+    def test_broker_spec_has_no_synthetic_commission_field(self):
         spec = _create_spec_from_broker_data(
             "US100",
             {
@@ -149,11 +151,10 @@ class InstrumentSpecTests(unittest.TestCase):
                 "volume_min": 0.1,
                 "volume_max": 100.0,
                 "volume_step": 0.1,
-                "commission_per_lot": 0.0,
             },
         )
 
-        self.assertEqual(spec.commission_per_lot, 0.0)
+        self.assertFalse(hasattr(spec, "commission_per_lot"))
         self.assertEqual(spec.asset_class, "index")
 
     def test_asset_class_inference_avoids_crypto_fx_collision(self):
@@ -217,7 +218,7 @@ class InstrumentSpecTests(unittest.TestCase):
         set_broker_specs_path(str(self._tmpdir / "missing_broker_specs.json"))
         self.assertEqual(load_broker_specs(), {})
 
-    def test_broker_specs_override_config_execution_fields_and_preserve_commission(self):
+    def test_broker_specs_override_execution_fields_without_retired_commission(self):
         broker_path = self._tmpdir / "broker_specs.json"
         broker_path.write_text(
             """{
@@ -247,7 +248,6 @@ class InstrumentSpecTests(unittest.TestCase):
                     "spread_avg": 1.2,
                     "min_lot": 0.01,
                     "max_lot": 100.0,
-                    "commission_per_lot": 0.0,
                 }
             },
             defaults={},
@@ -261,7 +261,7 @@ class InstrumentSpecTests(unittest.TestCase):
         self.assertAlmostEqual(spec.spread_avg, 2.5, places=8)
         self.assertEqual(spec.max_lot, 50)
         self.assertEqual(spec.stops_level, 12)
-        self.assertEqual(spec.commission_per_lot, 0.0)
+        self.assertFalse(hasattr(spec, "commission_per_lot"))
 
     def test_broker_spec_lookup_accepts_case_variant_aliases(self):
         broker_path = self._tmpdir / "broker_specs.json"

@@ -159,6 +159,45 @@ def test_retired_validator_does_not_force_physical_four_regime_grids():
     assert "independent_cell_ledger_incomplete" not in source
 
 
+@pytest.mark.parametrize(
+    "validator",
+    (readiness.validate_live_readiness, readiness._validate_legacy_live_readiness),
+)
+def test_live_cost_prerequisites_are_spread_and_swap_only(validator):
+    source = inspect.getsource(validator)
+    assert "use_commission" not in source
+    assert "use_slippage" not in source
+    assert "slippage_pips" not in source
+    assert "_position_slippage_buffer_issues" in source
+    assert '"use_spread"' in source
+    assert '"swap_model_enabled"' in source
+
+
+@pytest.mark.parametrize("slippage_pips", (0.0, 0.5, 1))
+def test_live_position_slippage_buffer_accepts_independent_c2_policy(slippage_pips):
+    position = SimpleNamespace(use_slippage=True, slippage_pips=slippage_pips)
+    assert readiness._position_slippage_buffer_issues(position) == []
+
+
+def test_live_position_slippage_buffer_fails_closed_when_disabled():
+    issues = readiness._position_slippage_buffer_issues(
+        SimpleNamespace(use_slippage=False, slippage_pips=0.5)
+    )
+    assert [code for code, _message in issues] == [
+        "position_slippage_buffer_disabled"
+    ]
+
+
+@pytest.mark.parametrize("slippage_pips", (-0.01, float("nan"), float("inf"), True, "x"))
+def test_live_position_slippage_buffer_fails_closed_when_invalid(slippage_pips):
+    issues = readiness._position_slippage_buffer_issues(
+        SimpleNamespace(use_slippage=True, slippage_pips=slippage_pips)
+    )
+    assert [code for code, _message in issues] == [
+        "position_slippage_buffer_invalid"
+    ]
+
+
 def test_physical_ledger_rejects_no_trade_accounting_placeholders():
     ledger = _winner_ledger()
     ledger["EURUSD"]["regime_configs"]["H1"]["CHOP"] = {

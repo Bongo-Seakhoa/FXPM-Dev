@@ -773,7 +773,7 @@ def _run_production_optimization_once(
             context,
             run_id=run_id,
         )
-        causal_precommit = causal_evidence.freeze_causal_process_precommit_v8(
+        causal_precommit = causal_evidence.freeze_causal_process_precommit_v9(
             context=context,
             search_process=search_process,
             process_id=process_id,

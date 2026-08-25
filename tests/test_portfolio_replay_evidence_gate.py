@@ -10,8 +10,8 @@ import pytest
 
 import pm_portfolio_replay as replay
 from agent_audit.performance.scripts.run_synchronized_portfolio_replay import (
-    _final_lockbox_pair,
     _native_replay_frame,
+    _partition_pair,
 )
 from pm_core import PipelineConfig
 from pm_live_readiness import validate_live_readiness
@@ -171,9 +171,6 @@ def _valid_evidence() -> tuple[dict, dict, dict, dict]:
     costs = {
         "use_spread": True,
         "backtest_spread_mode": "conservative_max",
-        "use_commission": True,
-        "use_slippage": True,
-        "slippage_pips": 0.5,
         "swap_model_enabled": True,
         "swap_model_min_holding_hours": 20.0,
         "swap_model_triple_rollover_day": "wednesday",
@@ -1027,7 +1024,7 @@ def test_synchronized_generator_accepts_only_exact_activated_native_source() -> 
     loaded, report, error = _native_replay_frame(Loader(), "EURUSD", "H1")
     assert error == ""
     assert loaded is not None and len(loaded) == 1
-    assert _final_lockbox_pair(report) == (
+    assert _partition_pair(report, "final_lockbox") == (
         pd.Timestamp("2024-01-01"),
         pd.Timestamp("2026-01-01"),
     )

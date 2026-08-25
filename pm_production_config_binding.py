@@ -28,7 +28,7 @@ from pm_core import (
 from pm_position import PositionConfig
 
 
-BINDING_SCHEMA: Final = "fxpm.production-effective-pipeline-config.v1"
+BINDING_SCHEMA: Final = "fxpm.production-effective-pipeline-config.v2"
 FUNDED_SCOPE: Final = "funded_live_v1"
 MAX_CONFIG_BYTES: Final = 16 * 1024 * 1024
 MAX_SNAPSHOT_BYTES: Final = 4 * 1024 * 1024
@@ -188,11 +188,10 @@ def _derive_pipeline_config(payload: Mapping[str, Any], path: Path) -> PipelineC
     if str(metadata.get("scope") or "").strip().lower() == FUNDED_SCOPE:
         result.oos_validation_mode = "fixed_holdout"
 
-    # ``pm_main`` always projects the independently loaded PositionConfig TP
-    # surface onto PipelineConfig after applying the funded cost contract.  TP
-    # multipliers are the only PositionConfig values retained by the optimizer
-    # object, so reproduce that projection exactly instead of silently relying
-    # on today's coincidentally neutral defaults.
+    # ``pm_main`` binds PipelineConfig.use_spread into the independently loaded
+    # PositionConfig, while PositionConfig TP multipliers project back onto
+    # PipelineConfig.  The live-only slippage buffer remains owned by
+    # PositionConfig and is deliberately not mirrored into optimizer economics.
     position_payload = payload.get("position") or {}
     if type(position_payload) is not dict:
         _fail("PRODUCTION_POSITION_CONFIG_SECTION_INVALID")
@@ -212,8 +211,6 @@ def _derive_pipeline_config(payload: Mapping[str, Any], path: Path) -> PipelineC
         ) from exc
     if str(metadata.get("scope") or "").strip().lower() == FUNDED_SCOPE:
         position.use_spread = bool(result.use_spread)
-        position.use_slippage = bool(result.use_slippage)
-        position.slippage_pips = float(result.slippage_pips or 0.0)
     result.regime_tp_multipliers = dict(position.regime_tp_multipliers or {})
 
     result._deployment_config_path = str(path)

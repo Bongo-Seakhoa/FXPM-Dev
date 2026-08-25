@@ -23,7 +23,7 @@ import os
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -52,13 +52,13 @@ from pm_portfolio_replay import (  # noqa: E402
     active_native_portfolio_contract,
     build_ledger_cell_roster,
     canonical_json_sha256,
-    infer_risk_groups,
     portfolio_cost_contract,
     portfolio_mark_cost_contract,
     seal_portfolio_replay_evidence,
     validate_funded_portfolio_replay_evidence,
     write_immutable_portfolio_replay_evidence,
 )
+from pm_risk_admission import infer_factor_groups  # noqa: E402
 from pm_cap_calibration import (  # noqa: E402
     CapCalibrationConstraints,
     calibrate_total_stop_risk_cap,
@@ -114,27 +114,6 @@ def _required_trade_number(value: Any, field: str) -> float:
     return number
 
 
-def stop_risk_per_lot_including_commission(
-    spec: Any,
-    *,
-    entry_price: float,
-    stop_price: float,
-    direction: int,
-    use_commission: bool,
-) -> float:
-    """Return the same round-trip-cost loss-at-stop budget used live."""
-    price_loss = _finite(
-        spec.calculate_loss_at_stop(entry_price, stop_price, 1.0, direction),
-        float("nan"),
-    )
-    commission = (
-        max(0.0, _finite(getattr(spec, "commission_per_lot", 0.0)))
-        if use_commission
-        else 0.0
-    )
-    return price_loss + commission
-
-
 def _stamp(value: Any) -> pd.Timestamp:
     stamp = pd.Timestamp(value)
     if pd.isna(stamp):
@@ -167,55 +146,6 @@ def _pipeline_config(config_path: Path, starting_balance: float = 10_000.0) -> T
     return config, payload
 
 
-def _tradeable(payload: Mapping[str, Any]) -> bool:
-    strategy = str(payload.get("strategy_name", "") or "").upper()
-    status = str(payload.get("promotion_status", "BLOCKED") or "BLOCKED").upper()
-    artifact = payload.get("artifact_meta") if isinstance(payload.get("artifact_meta"), Mapping) else {}
-    return bool(
-        strategy
-        and strategy != "NO_TRADE"
-        and not artifact.get("no_trade")
-        and status not in {"NO_TRADE", "BLOCKED", "PAPER_ONLY"}
-    )
-
-
-def iter_promoted_cells(ledger: Mapping[str, Any]) -> Iterable[Dict[str, Any]]:
-    """Yield full leaf payloads; replay helpers previously dropped governance and quality."""
-    for raw_symbol, symbol_payload in sorted(ledger.items()):
-        if not isinstance(symbol_payload, Mapping):
-            continue
-        symbol = str(symbol_payload.get("symbol") or raw_symbol).upper()
-        symbol_tradeable = _tradeable(symbol_payload)
-        leaves: List[Dict[str, Any]] = []
-        regimes = symbol_payload.get("regime_configs")
-        if isinstance(regimes, Mapping):
-            for timeframe, regime_payload in sorted(regimes.items()):
-                if not isinstance(regime_payload, Mapping):
-                    continue
-                for regime, cell in sorted(regime_payload.items()):
-                    if not isinstance(cell, Mapping) or not _tradeable(cell):
-                        continue
-                    row = dict(cell)
-                    row.update({
-                        "symbol": symbol,
-                        "timeframe": str(timeframe).upper(),
-                        "regime": str(regime).upper(),
-                        "promotion_source": "symbol_and_regime" if symbol_tradeable else "regime_leaf",
-                    })
-                    leaves.append(row)
-        if leaves:
-            yield from leaves
-        elif symbol_tradeable:
-            row = dict(symbol_payload)
-            row.update({
-                "symbol": symbol,
-                "timeframe": str(symbol_payload.get("timeframe") or "H1").upper(),
-                "regime": str(symbol_payload.get("regime") or "SYMBOL_LEVEL").upper(),
-                "promotion_source": "symbol_level",
-            })
-            yield row
-
-
 def resolve_instrument_spec(symbol: str, broker_specs: Mapping[str, Any]) -> Tuple[Any, str]:
     """Resolve broker specs case-insensitively and reject silent generic fallbacks."""
     target = str(symbol).upper()
@@ -236,20 +166,6 @@ def resolve_instrument_spec(symbol: str, broker_specs: Mapping[str, Any]) -> Tup
     if invalid:
         raise ValueError(f"broker_spec_incomplete:{symbol}:{','.join(invalid)}")
     return spec, key
-
-
-def estimate_offline_margin_per_lot(symbol: str, spec: Any) -> Tuple[float, Dict[str, Any]]:
-    """Conservative account-USD notional approximation; never presented as broker exact."""
-    asset_class = str(getattr(spec, "asset_class", "unknown") or "unknown").lower()
-    contract_size = _finite(getattr(spec, "contract_size", 0.0))
-    if contract_size <= 0.0:
-        return float("nan"), {"status": "unavailable", "reason": "contract_size"}
-    # Entry price is supplied later by returning a notional callable's metadata.
-    return contract_size, {
-        "status": "requires_entry_price",
-        "asset_class": asset_class,
-        "margin_rate": DEFAULT_MARGIN_RATES.get(asset_class, DEFAULT_MARGIN_RATES["unknown"]),
-    }
 
 
 def margin_at_entry_per_lot(symbol: str, entry_price: float, spec: Any) -> Tuple[float, Dict[str, Any]]:
@@ -315,7 +231,6 @@ def _marks_for_position(
     final_exit_time: pd.Timestamp,
     entry_price: float,
     direction: int,
-    commission_per_lot: float,
     backtester: Backtester,
     timeframe: str,
     *,
@@ -341,7 +256,7 @@ def _marks_for_position(
             if direction > 0
             else observed_price[index] + spread
         )
-        pnl = spec.calculate_tick_profit(entry_price, mark_exit, 1.0, direction) - commission_per_lot
+        pnl = spec.calculate_tick_profit(entry_price, mark_exit, 1.0, direction)
         if bool(getattr(backtester.config, "swap_model_enabled", True)):
             mark_time = features.index[index]
             rollover_units = backtester._swap_rollover_units(
@@ -520,20 +435,14 @@ def replay_cell_candidates(
             continue
         stop_distance = entry_to_stop_pips * _finite(getattr(spec, "pip_size", 0.0))
         synthetic_stop = entry_price - stop_distance if direction > 0 else entry_price + stop_distance
-        commission_per_lot = (
-            max(0.0, _finite(getattr(spec, "commission_per_lot", 0.0)))
-            if cfg.use_commission
-            else 0.0
-        )
-        # Match funded pre-send sizing exactly: loss-at-stop includes the
-        # configured round-trip commission.  Exit P&L already contains this
-        # cost; adding it here changes risk sizing only, not replay cashflows.
-        stop_risk_per_lot = stop_risk_per_lot_including_commission(
-            spec,
-            entry_price=entry_price,
-            stop_price=synthetic_stop,
-            direction=direction,
-            use_commission=bool(cfg.use_commission),
+        stop_risk_per_lot = _finite(
+            spec.calculate_loss_at_stop(
+                entry_price,
+                synthetic_stop,
+                1.0,
+                direction,
+            ),
+            float("nan"),
         )
         if not math.isfinite(_finite(stop_risk_per_lot, float("nan"))) or stop_risk_per_lot <= 0.0:
             group_errors.append(f"group_{group_index}:invalid_stop_risk")
@@ -565,7 +474,6 @@ def replay_cell_candidates(
                 fraction=fraction,
                 net_pnl_per_entry_lot=_finite(trade.get("pnl_dollars")) / total_source_volume,
                 price_pnl_per_entry_lot=price_pnl / total_source_volume,
-                commission_per_entry_lot=(commission_per_lot * leg_volume) / total_source_volume,
                 swap_per_entry_lot=swap / total_source_volume,
                 exit_reason=str(trade.get("exit_reason") or ""),
             ))
@@ -580,7 +488,6 @@ def replay_cell_candidates(
                 final_exit,
                 entry_price,
                 direction,
-                commission_per_lot,
                 backtester,
                 "M5",
                 valuation_price_field="Open",
@@ -596,7 +503,9 @@ def replay_cell_candidates(
             strategy_name=strategy_name,
             promotion_status=str(cell.get("promotion_status") or "BLOCKED").upper(),
             asset_class=str(getattr(spec, "asset_class", "unknown") or "unknown").lower(),
-            risk_groups=infer_risk_groups(symbol, getattr(spec, "asset_class", "unknown")),
+            risk_groups=infer_factor_groups(
+                symbol, getattr(spec, "asset_class", "unknown")
+            ),
             entry_time=entry_time,
             direction=direction,
             stop_risk_per_lot=stop_risk_per_lot,
@@ -631,12 +540,6 @@ def replay_cell_candidates(
         "spread_model": spread_meta,
         "margin_model_example": margin_meta if candidates else {},
     }
-
-
-def _daily_returns(base: pd.DataFrame) -> pd.Series:
-    close = pd.to_numeric(base["Close"], errors="coerce")
-    close.index = pd.DatetimeIndex([_stamp(value) for value in close.index])
-    return close.resample("1D").last().pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
@@ -753,11 +656,6 @@ def _partition_pair(
     except Exception:
         return None
     return (start, end) if end > start else None
-
-
-def _final_lockbox_pair(source_report: Mapping[str, Any]) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
-    """Compatibility wrapper retained for tests and external audit tooling."""
-    return _partition_pair(source_report, "final_lockbox")
 
 
 def build_policy(config_payload: Mapping[str, Any], starting_balance: float) -> Any:
@@ -1003,7 +901,7 @@ def main() -> int:
             ),
         )
         pre_lockbox_errors = list(roster_errors) + list(native_contract_errors) + cap_errors
-        for key in ("use_spread", "use_commission", "use_slippage", "swap_model_enabled"):
+        for key in ("use_spread", "swap_model_enabled"):
             if not bool(cost_contract.get(key)):
                 pre_lockbox_errors.append(f"COST_COMPONENT_DISABLED:{key}")
         if pre_lockbox_errors:
@@ -1204,7 +1102,7 @@ def main() -> int:
             calibration_failures.append("PARTIAL_CALIBRATION_RUN")
         if sorted(replayed_cell_ids) != sorted(required_replay_ids):
             calibration_failures.append("CALIBRATION_REPLAYED_CELL_ROSTER_MISMATCH")
-        for key in ("use_spread", "use_commission", "use_slippage", "swap_model_enabled"):
+        for key in ("use_spread", "swap_model_enabled"):
             if not bool(cost_contract.get(key)):
                 calibration_failures.append(f"COST_COMPONENT_DISABLED:{key}")
         for cell_id, source in native_sources.items():
@@ -1444,7 +1342,7 @@ def main() -> int:
         manual_failures.append("REPLAY_WINDOW_NOT_EXACT_FINAL_LOCKBOX")
     if partial_run:
         manual_failures.append("PARTIAL_REPLAY_RUN")
-    for key in ("use_spread", "use_commission", "use_slippage", "swap_model_enabled"):
+    for key in ("use_spread", "swap_model_enabled"):
         if not bool(cost_contract.get(key)):
             manual_failures.append(f"COST_COMPONENT_DISABLED:{key}")
     for cell_id, source in native_sources.items():

@@ -235,9 +235,14 @@ def build_baseline() -> dict[str, Any]:
         },
         "cost_settings": {
             "use_spread": pipeline.get("use_spread"),
-            "use_slippage": pipeline.get("use_slippage"),
-            "use_commission": pipeline.get("use_commission"),
             "backtest_spread_mode": pipeline.get("backtest_spread_mode"),
+            "swap_model_enabled": pipeline.get("swap_model_enabled"),
+            "swap_model_min_holding_hours": pipeline.get(
+                "swap_model_min_holding_hours"
+            ),
+            "swap_model_triple_rollover_day": pipeline.get(
+                "swap_model_triple_rollover_day"
+            ),
         },
         "mt5_identity": {
             "account_id": mt5.get("account_id"),
@@ -333,7 +338,7 @@ def intended_edge(strategy: str) -> str:
 def fix_points_for_strategy(strategy: str) -> list[str]:
     points = [
         "Run a USD 10,000 promoted-cell replay and bucket by `mae_r`, `mfe_r`, final R, and exit reason.",
-        "Stress entry slippage by symbol/timeframe/session before changing trade eligibility.",
+        "Stress executable entry-price degradation by symbol/timeframe/session before changing trade eligibility.",
         "Do not add a gate until the new measurement fields prove it removes unpaid drawdown rather than profitable pain.",
     ]
     name = strategy.lower()
@@ -467,7 +472,7 @@ def build_strategy_anatomy() -> dict[str, Any]:
             "- Immediate adverse entries: now measurable through `mae_pips`, `mae_r`, and `time_to_mae_bars`; existing historical summaries cannot classify it.",
             "- Repeated stop-out structures: requires replay with `exit_reason`, `mae_r`, and symbol/regime grouping.",
             "- Poor payoff structures: compare `mfe_r` versus final realized R after replay.",
-            "- High-cost low-edge trades: requires spread/commission/swap/slippage fields joined to trades.",
+            "- High-cost low-edge trades: requires executable spread, financing, and requested-versus-filled live entry evidence joined to trades.",
             "- Entries during unsuitable regimes: compare MAE/final R by promoted regime versus live/computed regime.",
             "- Entries with late confirmation: use time-to-MAE/time-to-MFE and first-bar MAE from the new records.",
             "- MFE given back: requires replay; the new fields make this testable but do not backfill old summaries.",
@@ -485,14 +490,14 @@ def build_strategy_anatomy() -> dict[str, Any]:
             "- SL/TP exits are modeled in the trade-path implementation; Numba and Python paths now emit equivalent MAE/MFE fields.",
             "- MFE retained/given back is now measurable after replay but not derivable from old ledger summaries.",
             "- Stop-outs that later recover require post-exit feature/path analysis; current records do not include post-exit recovery.",
-            "- Slippage is currently strongest for entry attribution; exit/TP fill slippage remains a queued measurement extension.",
+            "- Requested-versus-filled live evidence is currently strongest for entry attribution; exit/TP fill evidence remains a queued measurement extension.",
             "",
             "## Strategy interaction analysis",
             "- Risk and position sizing: handled by `pm_core.Backtester` in research and `pm_position.PositionCalculator`/`pm_main.LiveTrader` in live.",
             "- Regime filters: regime-specific winners come from `pm_configs.json`; validation is a selection surface, not pristine post-selection OOS.",
             "- Portfolio filters: live position/risk gates can block otherwise promoted cells; replay needs portfolio context to measure missed positive expectancy.",
             "- Execution handling: live actionable logs now include entry slippage schema/version fields.",
-            "- Cost model: backtest spread/commission/swap/slippage assumptions must be matched in USD 10,000 A/B replay before claiming profit improvement.",
+            "- Cost model: historical replay uses executable spread and causal swap; requested-versus-filled live evidence and actual broker deal costs must be compared before claiming profit improvement.",
             "- Symbol specifications: broker tick/pip/volume specs are part of `InstrumentSpec`/MT5 spec sync and must stay unchanged across baseline/candidate.",
             "- Parameter-selection process: current winner metrics can be sparse; use trade count and post-selection decay when comparing candidates.",
             "",

@@ -5,7 +5,7 @@ authorize a current refit, promote a model, allocate capital, assert profitabili
 or enable funded/live trading.  It consumes three exact bounded canonical payloads:
 the precommitment, executed historical evidence, and ledger reconciliation.
 
-Decision-v8 retains its historical ``*_receipt_sha256`` output field names for
+Decision-v9 retains its historical ``*_receipt_sha256`` output field names for
 downstream compatibility.  Each value is the deterministic canonical payload
 receipt (the SHA-256 identity of the exact payload), not a signature receipt.
 
@@ -33,19 +33,19 @@ from decimal import (
 )
 from typing import Any, Final, Mapping, Sequence
 
-PROCESS_AUTHORITY_VERSION: Final = "fxpm-offline-process-validation-v8"
-PRECOMMIT_SCHEMA: Final = "fxpm-historical-process-precommit-v8"
-EVIDENCE_SCHEMA: Final = "fxpm-historical-process-evidence-v8"
-RECONCILIATION_SCHEMA: Final = "fxpm-historical-process-reconciliation-v8"
-DECISION_SCHEMA: Final = "fxpm-offline-process-validation-decision-v8"
+PROCESS_AUTHORITY_VERSION: Final = "fxpm-offline-process-validation-v9"
+PRECOMMIT_SCHEMA: Final = "fxpm-historical-process-precommit-v9"
+EVIDENCE_SCHEMA: Final = "fxpm-historical-process-evidence-v9"
+RECONCILIATION_SCHEMA: Final = "fxpm-historical-process-reconciliation-v9"
+DECISION_SCHEMA: Final = "fxpm-offline-process-validation-decision-v9"
 FORWARD_OOS_REPLAY_LINEAGE_SCHEMA: Final = "fxpm.causal-forward-oos-replay-lineage.v1"
 FORWARD_OOS_ANCHOR_LINEAGE_SCHEMA: Final = "fxpm.causal-forward-oos-anchor-lineage.v1"
 PINNED_FORWARD_OOS_PRODUCTION_CONTRACT_VERSION: Final = (
-    "fxpm.forward-oos-replay-producer.v3"
+    "fxpm.forward-oos-replay-producer.v4"
 )
-PINNED_FORWARD_OOS_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v3"
+PINNED_FORWARD_OOS_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v4"
 PINNED_FORWARD_OOS_PRODUCER_RECEIPT_SCHEMA: Final = (
-    "fxpm.forward-oos-replay-producer-receipt.v3"
+    "fxpm.forward-oos-replay-producer-receipt.v4"
 )
 PINNED_AUTHORITY_ARTIFACT_DESCRIPTOR_SCHEMA: Final = (
     "fxpm.authority-spool-artifact-descriptor.v1"
@@ -348,9 +348,12 @@ _FROZEN_RISK_POLICY: Final = {
     "minimum_purge_calendar_days": _DERIVED_MINIMUM_PURGE_DAYS,
 }
 _FROZEN_COST_POLICY: Final = {
-    "schema": "fxpm-historical-process-cost-policy-v2",
+    "schema": "fxpm-historical-process-cost-policy-v3",
     "base_lane": "GROSS_MTM_PLUS_OBSERVED_EXECUTION_COST_DEBITS",
-    "stress_lane": "SAME_EVENTS_WITH_COST_DEBITS_NOT_LESS_SEVERE_THAN_BASE",
+    "stress_lane": (
+        "SAME_EVENTS_WITH_PER_POSITION_AND_AGGREGATE_CUMULATIVE_COST_PREFIX_"
+        "NON_IMPROVEMENT_AND_COMPONENT_DAY_REBOUND_ALLOWED"
+    ),
     "require_same_gross_event_stream": True,
     "require_daily_gross_cost_decomposition": True,
 }
@@ -427,7 +430,7 @@ _ECONOMIC_VALUE_BOUND: Final = Decimal("1000000000000000")
 _RETURN_QUANTUM: Final = Decimal("0.000000000001")
 
 _PINNED_POLICY: Final = {
-    "schema": "fxpm-historical-process-policy-v8",
+    "schema": "fxpm-historical-process-policy-v9",
     "authority_scope": "OFFLINE_PROCESS_VALIDATION_ONLY",
     "book_multiplicity_contract_version": (PINNED_BOOK_MULTIPLICITY_CONTRACT_VERSION),
     "winner_selection_contract_version": PINNED_WINNER_SELECTION_CONTRACT_VERSION,
@@ -880,7 +883,7 @@ def _validate_forward_oos_replay_lineage(
     plans: Sequence[Mapping[str, Any]],
     precommit_payload_sha256: str,
 ) -> dict[str, Any]:
-    """Validate the sealed forward producer/precommit identity carried by v8.
+    """Validate the sealed forward producer/precommit identity carried by v9.
 
     The raw six-ledger objects are reopened by the production adapter before
     this standalone evaluator is called.  The evaluator nevertheless owns the
@@ -1252,7 +1255,7 @@ def _validate_process_definition(
         ),
         "process_definition",
     )
-    if value["schema"] != "fxpm-frozen-historical-institution-process-v8":
+    if value["schema"] != "fxpm-frozen-historical-institution-process-v9":
         raise ProcessVerificationError("process definition schema mismatch")
     if type(value["symbols"]) is not list or tuple(value["symbols"]) != SYMBOLS:
         raise ProcessVerificationError(
@@ -2714,7 +2717,7 @@ def _validate_activity_ledger_in_context(
         ("schema", "initial_positions", "days"),
         "activity ledger",
     )
-    if ledger["schema"] != "fxpm-anchor-economic-position-activity-ledger-v2":
+    if ledger["schema"] != "fxpm-anchor-economic-position-activity-ledger-v3":
         raise ProcessVerificationError("activity ledger schema mismatch")
     initial_positions = ledger["initial_positions"]
     day_records = ledger["days"]
@@ -2745,10 +2748,6 @@ def _validate_activity_ledger_in_context(
         "reference_ask_price",
         "base_fill_price",
         "stress_fill_price",
-        "base_commission_cash",
-        "stress_commission_cash",
-        "base_fee_cash",
-        "stress_fee_cash",
     )
     opening_identity_keys = (
         "opening_fill_payload_sha256",
@@ -2768,10 +2767,6 @@ def _validate_activity_ledger_in_context(
         "reference_ask_price",
         "base_fill_price",
         "stress_fill_price",
-        "base_commission_cash",
-        "stress_commission_cash",
-        "base_fee_cash",
-        "stress_fee_cash",
     )
     closing_identity_keys = (
         "closing_fill_payload_sha256",
@@ -2783,6 +2778,15 @@ def _validate_activity_ledger_in_context(
         return identity_registry.register(
             value, f"{anchor['anchor_id']} activity {label}"
         )
+
+    def require_position_cost_prefix(state: Mapping[str, Any], label: str) -> None:
+        if (
+            state["stress_cost_prefix_cash"] + _RETURN_QUANTUM
+            < state["base_cost_prefix_cash"]
+        ):
+            raise ProcessVerificationError(
+                f"{label} stress cumulative cost prefix improves on base"
+            )
 
     def validate_opening_fill(
         value: Any, label: str, *, carried: bool
@@ -2860,26 +2864,6 @@ def _validate_activity_ledger_in_context(
             f"{label} stress fill price",
             strictly_positive=True,
         )
-        base_commission = _economic_decimal(
-            value["base_commission_cash"],
-            f"{label} base commission",
-            strictly_positive=False,
-        )
-        stress_commission = _economic_decimal(
-            value["stress_commission_cash"],
-            f"{label} stress commission",
-            strictly_positive=False,
-        )
-        base_fee = _economic_decimal(
-            value["base_fee_cash"],
-            f"{label} base fee",
-            strictly_positive=False,
-        )
-        stress_fee = _economic_decimal(
-            value["stress_fee_cash"],
-            f"{label} stress fee",
-            strictly_positive=False,
-        )
         if (side == "LONG" and stop_price >= reference_mid) or (
             side == "SHORT" and stop_price <= reference_mid
         ):
@@ -2905,7 +2889,7 @@ def _validate_activity_ledger_in_context(
             used_broker_fill_ids.add(broker_fill_id)
         payload_sha = _sha256(
             {
-                "schema": "fxpm-position-opening-fill-payload-v2",
+                "schema": "fxpm-position-opening-fill-payload-v3",
                 "anchor_id": anchor["anchor_id"],
                 "fill": {key: value[key] for key in opening_primitive_keys},
             }
@@ -2925,14 +2909,14 @@ def _validate_activity_ledger_in_context(
             executable_quote - reference_mid,
             unit_scale,
         )
-        base_slippage_cash = _bounded_economic_product(
-            f"{label} base slippage cash",
+        base_fill_degradation_cash = _bounded_economic_product(
+            f"{label} base fill-degradation cash",
             side_sign,
             base_fill - executable_quote,
             unit_scale,
         )
-        stress_slippage_cash = _bounded_economic_product(
-            f"{label} stress slippage cash",
+        stress_fill_degradation_cash = _bounded_economic_product(
+            f"{label} stress fill-degradation cash",
             side_sign,
             stress_fill - executable_quote,
             unit_scale,
@@ -2940,31 +2924,21 @@ def _validate_activity_ledger_in_context(
         base_execution_cost = max(
             Decimal(0),
             _bounded_economic_sum(
-                f"{label} base spread and slippage cash",
+                f"{label} base spread and fill-degradation cash",
                 base_spread_cash,
-                base_slippage_cash,
+                base_fill_degradation_cash,
             ),
         )
         stress_execution_cost = max(
             Decimal(0),
             _bounded_economic_sum(
-                f"{label} stress spread and slippage cash",
+                f"{label} stress spread and fill-degradation cash",
                 base_spread_cash,
-                stress_slippage_cash,
+                stress_fill_degradation_cash,
             ),
         )
-        base_cost_cash = _bounded_economic_sum(
-            f"{label} base opening cost cash",
-            base_execution_cost,
-            base_commission,
-            base_fee,
-        )
-        stress_cost_cash = _bounded_economic_sum(
-            f"{label} stress opening cost cash",
-            stress_execution_cost,
-            stress_commission,
-            stress_fee,
-        )
+        base_cost_cash = base_execution_cost
+        stress_cost_cash = stress_execution_cost
         if stress_cost_cash < base_cost_cash:
             raise ProcessVerificationError(
                 f"{label} stress execution cost is less severe than base"
@@ -3005,7 +2979,7 @@ def _validate_activity_ledger_in_context(
                 raise ProcessVerificationError(
                     f"{label} carried stop is not adverse at the forward boundary"
                 )
-        return {
+        state = {
             "position_id": position_id,
             "cell_decision_sha256": value["cell_decision_sha256"],
             "timeframe": timeframe,
@@ -3020,8 +2994,12 @@ def _validate_activity_ledger_in_context(
             "last_mark": last_mark,
             "pending_base_cost_cash": Decimal(0) if carried else base_cost_cash,
             "pending_stress_cost_cash": (Decimal(0) if carried else stress_cost_cash),
+            "base_cost_prefix_cash": base_cost_cash,
+            "stress_cost_prefix_cash": stress_cost_cash,
             "base_contribution": Decimal(0),
         }
+        require_position_cost_prefix(state, label)
+        return state
 
     open_positions: dict[str, dict[str, Any]] = {}
     seen_positions: set[str] = set()
@@ -3052,6 +3030,8 @@ def _validate_activity_ledger_in_context(
     maximum_open_risk = Decimal(0)
     maximum_gross_exposure = Decimal(0)
     maximum_concurrent_positions = 0
+    cumulative_base_cost_return = Decimal(0)
+    cumulative_stress_cost_return = Decimal(0)
     for index, (record, date_text) in enumerate(zip(day_records, dates, strict=True)):
         if type(record) is not dict:
             raise ProcessVerificationError("activity day must be an exact mapping")
@@ -3193,10 +3173,6 @@ def _validate_activity_ledger_in_context(
                 "position stress financing",
                 strictly_positive=False,
             )
-            if stress_financing < base_financing:
-                raise ProcessVerificationError(
-                    "stress financing is less severe than base financing"
-                )
             if (state["side"] == "LONG" and state["stop_price"] >= mark_price) or (
                 state["side"] == "SHORT" and state["stop_price"] <= mark_price
             ):
@@ -3219,6 +3195,17 @@ def _validate_activity_ledger_in_context(
                 state["pending_stress_cost_cash"],
                 stress_financing,
             )
+            state["base_cost_prefix_cash"] = _bounded_economic_sum(
+                "position cumulative base cost cash",
+                state["base_cost_prefix_cash"],
+                base_financing,
+            )
+            state["stress_cost_prefix_cash"] = _bounded_economic_sum(
+                "position cumulative stress cost cash",
+                state["stress_cost_prefix_cash"],
+                stress_financing,
+            )
+            require_position_cost_prefix(state, "position mark")
             gross_cash_sum = _bounded_economic_sum(
                 "aggregate daily gross cash", gross_cash_sum, gross_cash
             )
@@ -3383,26 +3370,6 @@ def _validate_activity_ledger_in_context(
                 "closing stress fill price",
                 strictly_positive=True,
             )
-            base_commission = _economic_decimal(
-                exit_fill["base_commission_cash"],
-                "closing base commission",
-                strictly_positive=False,
-            )
-            stress_commission = _economic_decimal(
-                exit_fill["stress_commission_cash"],
-                "closing stress commission",
-                strictly_positive=False,
-            )
-            base_fee = _economic_decimal(
-                exit_fill["base_fee_cash"],
-                "closing base fee",
-                strictly_positive=False,
-            )
-            stress_fee = _economic_decimal(
-                exit_fill["stress_fee_cash"],
-                "closing stress fee",
-                strictly_positive=False,
-            )
             executable_quote = (
                 reference_bid if state["side"] == "LONG" else reference_ask
             )
@@ -3412,14 +3379,14 @@ def _validate_activity_ledger_in_context(
                 reference_mid - executable_quote,
                 state["unit_scale"],
             )
-            base_slippage_cash = _bounded_economic_product(
-                "closing base slippage cash",
+            base_fill_degradation_cash = _bounded_economic_product(
+                "closing base fill-degradation cash",
                 state["side_sign"],
                 executable_quote - base_fill,
                 state["unit_scale"],
             )
-            stress_slippage_cash = _bounded_economic_product(
-                "closing stress slippage cash",
+            stress_fill_degradation_cash = _bounded_economic_product(
+                "closing stress fill-degradation cash",
                 state["side_sign"],
                 executable_quote - stress_fill,
                 state["unit_scale"],
@@ -3427,38 +3394,39 @@ def _validate_activity_ledger_in_context(
             base_execution_cost = max(
                 Decimal(0),
                 _bounded_economic_sum(
-                    "closing base spread and slippage cash",
+                    "closing base spread and fill-degradation cash",
                     exit_spread_cash,
-                    base_slippage_cash,
+                    base_fill_degradation_cash,
                 ),
             )
             stress_execution_cost = max(
                 Decimal(0),
                 _bounded_economic_sum(
-                    "closing stress spread and slippage cash",
+                    "closing stress spread and fill-degradation cash",
                     exit_spread_cash,
-                    stress_slippage_cash,
+                    stress_fill_degradation_cash,
                 ),
             )
-            base_exit_cost = _bounded_economic_sum(
-                "closing base cost cash",
-                base_execution_cost,
-                base_commission,
-                base_fee,
-            )
-            stress_exit_cost = _bounded_economic_sum(
-                "closing stress cost cash",
-                stress_execution_cost,
-                stress_commission,
-                stress_fee,
-            )
+            base_exit_cost = base_execution_cost
+            stress_exit_cost = stress_execution_cost
             if stress_exit_cost < base_exit_cost:
                 raise ProcessVerificationError(
                     "closing stress execution cost is less severe than base"
                 )
+            state["base_cost_prefix_cash"] = _bounded_economic_sum(
+                "position cumulative base cost cash",
+                state["base_cost_prefix_cash"],
+                base_exit_cost,
+            )
+            state["stress_cost_prefix_cash"] = _bounded_economic_sum(
+                "position cumulative stress cost cash",
+                state["stress_cost_prefix_cash"],
+                stress_exit_cost,
+            )
+            require_position_cost_prefix(state, "position close")
             expected_close_payload = _sha256(
                 {
-                    "schema": "fxpm-position-closing-fill-payload-v2",
+                    "schema": "fxpm-position-closing-fill-payload-v3",
                     "anchor_id": anchor["anchor_id"],
                     "fill": {key: exit_fill[key] for key in closing_primitive_keys},
                 }
@@ -3513,6 +3481,17 @@ def _validate_activity_ledger_in_context(
             raise ProcessVerificationError(
                 "economic fill and mark replay does not reconcile daily gross and cost vectors"
             )
+        cumulative_base_cost_return += derived_base_cost
+        cumulative_stress_cost_return += derived_stress_cost
+        if (
+            cumulative_stress_cost_return
+            > cumulative_base_cost_return + _RETURN_QUANTUM
+        ):
+            raise ProcessVerificationError(
+                "stress cumulative cost-return prefix improves on base"
+            )
+        for position_id, state in open_positions.items():
+            require_position_cost_prefix(state, f"position {position_id} day boundary")
         event_days.append(
             {
                 "date": date_text,
@@ -3553,6 +3532,9 @@ def _validate_activity_ledger_in_context(
         closing_days.append(
             {"date": date_text, "closing_position_ids": sorted(open_positions)}
         )
+
+    for position_id, state in open_positions.items():
+        require_position_cost_prefix(state, f"position {position_id} anchor end")
 
     final_positions = [
         {
@@ -3779,6 +3761,8 @@ def _validate_anchor_evidence(
         _decimal(value, "stress daily return", absolute_bound=bound)
         for value in stress_values
     ]
+    cumulative_base_cost_return = Decimal(0)
+    cumulative_stress_cost_return = Decimal(0)
     for index, (
         gross_return,
         base_debit,
@@ -3786,9 +3770,9 @@ def _validate_anchor_evidence(
         base_net,
         stress_net,
     ) in enumerate(zip(gross, base_cost, stress_cost, base, stress, strict=True)):
-        if base_debit > 0 or stress_debit > base_debit:
+        if base_debit > 0 or stress_debit > 0:
             raise ProcessVerificationError(
-                f"cost stress is not at least as severe as base on day {index}"
+                f"cost evidence is not a debit on day {index}"
             )
         if gross_return + base_debit != base_net:
             raise ProcessVerificationError(
@@ -3797,6 +3781,15 @@ def _validate_anchor_evidence(
         if gross_return + stress_debit != stress_net:
             raise ProcessVerificationError(
                 f"stress return does not reconcile the same gross MTM stream on day {index}"
+            )
+        cumulative_base_cost_return += base_debit
+        cumulative_stress_cost_return += stress_debit
+        if (
+            cumulative_stress_cost_return
+            > cumulative_base_cost_return + _RETURN_QUANTUM
+        ):
+            raise ProcessVerificationError(
+                f"stress cumulative cost prefix improves on base on day {index}"
             )
     if anchor["gross_vector_sha256"] != _vector_hash(dates, gross_values, "GROSS_MTM"):
         raise ProcessVerificationError("gross daily vector identity mismatch")

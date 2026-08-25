@@ -18,6 +18,7 @@ import pm_current_refit_artifacts as refit_artifacts
 import pm_winner_selection as winner
 from pm_authority_spool import SymbolAuthoritySink
 from pm_core import (
+    BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
     BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
     BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
     BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
@@ -46,7 +47,7 @@ from pm_trade_power import (
 
 
 FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v1"
-FROZEN_COST_POLICY_SCHEMA = "fxpm.winner-numerical-execution-cost-policy.v1"
+FROZEN_COST_POLICY_SCHEMA = "fxpm.winner-numerical-execution-cost-policy.v2"
 RAW_LANE_SCHEMA = "fxpm.winner-raw-backtester-lane.v1"
 DAILY_R_SURFACE_SCHEMA = BACKTEST_WINNER_DAILY_R_SCHEMA_VERSION
 RISK_UNIT_SCHEMA = BACKTEST_WINNER_RISK_UNIT_SCHEMA_VERSION
@@ -62,7 +63,7 @@ CURRENT_CROSS_BINDING_MODE = "CURRENT"
 PARTITION_GEOMETRY_SCHEMA = "fxpm.winner-partition-geometry.v1"
 SIGNAL_VECTOR_SCHEMA = "fxpm.authoritative-search-signal-vector.v1"
 SOURCE_COUNT_RECEIPT_SCHEMA = "fxpm.historical-attempt-source-count.v1"
-EXECUTION_SPEC_RECEIPT_SCHEMA = "fxpm.execution-instrument-spec-receipt.v1"
+EXECUTION_SPEC_RECEIPT_SCHEMA = "fxpm.execution-instrument-spec-receipt.v2"
 COST_STRESS_ADVERSITY_PLAN_SCHEMA = (
     "fxpm.winner-cost-stress-adversity-plan.v1"
 )
@@ -123,13 +124,8 @@ _FROZEN_COST_POLICY_BODY_FIELDS = frozenset(
         "lane",
         "attestation_schema_version",
         "use_spread",
-        "use_slippage",
-        "use_commission",
         "spread_mode",
-        "commission_inputs_sha256",
         "instrument_spec_sha256",
-        "slippage_pips_hex",
-        "slippage_price_hex",
         "numerical_execution_cost_policy_sha256",
     }
 )
@@ -471,12 +467,10 @@ def _validated_execution_spec_receipt(
         "broker_specs_size_bytes",
         "broker_record_key",
         "broker_record_sha256",
-        "configured_instrument_record_sha256",
         "native_prefix_index_sha256",
         "native_provenance_sha256",
         "native_instrument_snapshot_sha256",
         "tick_value_source",
-        "commission_source",
         "volume_source",
         "instrument_spec",
         "instrument_spec_sha256",
@@ -510,7 +504,6 @@ def _validated_execution_spec_receipt(
         "spread_avg",
         "min_lot",
         "max_lot",
-        "commission_per_lot",
         "swap_long",
         "swap_short",
         "tick_size",
@@ -564,7 +557,6 @@ def _validated_execution_spec_receipt(
             )
         )
         or float(spec["spread_avg"]) < 0.0
-        or float(spec["commission_per_lot"]) < 0.0
         or float(spec["min_lot"]) > float(spec["max_lot"])
         or float(spec["volume_step"]) > float(spec["max_lot"])
         or type(spec.get("asset_class")) is not str
@@ -619,13 +611,11 @@ def _validated_execution_spec_receipt(
             "ACTIVATED_ACQUISITION_INSTRUMENT_SNAPSHOT",
             "FROZEN_BROKER_SPECS_RECORD_NATIVE_ZERO_UNAVAILABLE",
         }
-        or receipt.get("commission_source")
-        != "FROZEN_DEPLOYMENT_CONFIG_INSTRUMENT_SURFACE"
         or receipt.get("volume_source") != "FROZEN_BROKER_SPECS_RECORD"
         or receipt.get("instrument_spec_sha256")
         != _backtester_receipt_sha256(
             {
-                "schema_version": "fxpm-backtester-instrument-spec-v1",
+                "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
                 "instrument_spec": dict(spec),
             }
         )
@@ -648,7 +638,6 @@ def _validated_execution_spec_receipt(
         "deployment_config_sha256",
         "broker_specs_sha256",
         "broker_record_sha256",
-        "configured_instrument_record_sha256",
         "native_prefix_index_sha256",
         "native_provenance_sha256",
         "native_instrument_snapshot_sha256",
@@ -728,13 +717,8 @@ def build_frozen_numerical_execution_cost_policy(
     *,
     lane: str,
     use_spread: bool,
-    use_slippage: bool,
-    use_commission: bool,
     spread_mode: str,
-    commission_inputs_sha256: str,
     instrument_spec_sha256: str,
-    slippage_pips: Any,
-    slippage_price: Any,
 ) -> dict[str, Any]:
     """Freeze only invariant numerical-cost facts, never partition arrays.
 
@@ -748,48 +732,25 @@ def build_frozen_numerical_execution_cost_policy(
     if normalized_lane not in {"BASE", "STRESS"}:
         _fail("COST_POLICY_LANE_INVALID")
     try:
-        normalized_slippage_pips = (
-            float.fromhex(slippage_pips)
-            if type(slippage_pips) is str and slippage_pips.lower().startswith("0x")
-            else slippage_pips
-        )
-        normalized_slippage_price = (
-            float.fromhex(slippage_price)
-            if type(slippage_price) is str and slippage_price.lower().startswith("0x")
-            else slippage_price
-        )
         # The TradePower builder is the canonical owner of policy
         # canonicalization.  The dummy vector hash cannot enter policy_sha256.
         reference = build_numerical_execution_cost_attestation(
             use_spread=use_spread,
-            use_slippage=use_slippage,
-            use_commission=use_commission,
             spread_mode=spread_mode,
             spread_values_sha256="0" * 64,
-            commission_inputs_sha256=commission_inputs_sha256,
             instrument_spec_sha256=instrument_spec_sha256,
-            slippage_pips=normalized_slippage_pips,
-            slippage_price=normalized_slippage_price,
         )
     except (TypeError, ValueError, OverflowError) as exc:
         raise WinnerRawEvidenceError("COST_POLICY_FACTS_INVALID") from exc
-    if any(
-        reference[name] is not True
-        for name in ("use_spread", "use_slippage", "use_commission")
-    ):
+    if reference["use_spread"] is not True:
         _fail("COST_POLICY_COMPONENT_DISABLED")
     body = {
         "schema_version": FROZEN_COST_POLICY_SCHEMA,
         "lane": normalized_lane,
         "attestation_schema_version": (NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION),
         "use_spread": reference["use_spread"],
-        "use_slippage": reference["use_slippage"],
-        "use_commission": reference["use_commission"],
         "spread_mode": reference["spread_mode"],
-        "commission_inputs_sha256": reference["commission_inputs_sha256"],
         "instrument_spec_sha256": reference["instrument_spec_sha256"],
-        "slippage_pips_hex": reference["slippage_pips_hex"],
-        "slippage_price_hex": reference["slippage_price_hex"],
         "numerical_execution_cost_policy_sha256": reference["policy_sha256"],
     }
     return {**body, "policy_identity_sha256": _sha_json(body)}
@@ -815,13 +776,8 @@ def _validated_frozen_cost_policy(
         rebuilt = build_frozen_numerical_execution_cost_policy(
             lane=lane,
             use_spread=policy.get("use_spread"),
-            use_slippage=policy.get("use_slippage"),
-            use_commission=policy.get("use_commission"),
             spread_mode=policy.get("spread_mode"),
-            commission_inputs_sha256=policy.get("commission_inputs_sha256"),
             instrument_spec_sha256=policy.get("instrument_spec_sha256"),
-            slippage_pips=policy.get("slippage_pips_hex"),
-            slippage_price=policy.get("slippage_price_hex"),
         )
     except WinnerRawEvidenceError as exc:
         raise WinnerRawEvidenceError(code) from exc
@@ -843,28 +799,11 @@ def _validated_partition_cost_attestation(
         _fail(code)
     attestation = dict(value)
     try:
-        slippage_pips_hex = attestation.get("slippage_pips_hex")
-        slippage_price_hex = attestation.get("slippage_price_hex")
-        slippage_pips = (
-            float.fromhex(slippage_pips_hex)
-            if type(slippage_pips_hex) is str
-            else slippage_pips_hex
-        )
-        slippage_price = (
-            float.fromhex(slippage_price_hex)
-            if type(slippage_price_hex) is str
-            else slippage_price_hex
-        )
         rebuilt = build_numerical_execution_cost_attestation(
             use_spread=attestation.get("use_spread"),
-            use_slippage=attestation.get("use_slippage"),
-            use_commission=attestation.get("use_commission"),
             spread_mode=attestation.get("spread_mode"),
             spread_values_sha256=attestation.get("spread_values_sha256"),
-            commission_inputs_sha256=attestation.get("commission_inputs_sha256"),
             instrument_spec_sha256=attestation.get("instrument_spec_sha256"),
-            slippage_pips=slippage_pips,
-            slippage_price=slippage_price,
         )
     except (TypeError, ValueError, OverflowError) as exc:
         raise WinnerRawEvidenceError(code) from exc
@@ -873,57 +812,12 @@ def _validated_partition_cost_attestation(
     derived_policy = build_frozen_numerical_execution_cost_policy(
         lane=lane,
         use_spread=rebuilt["use_spread"],
-        use_slippage=rebuilt["use_slippage"],
-        use_commission=rebuilt["use_commission"],
         spread_mode=rebuilt["spread_mode"],
-        commission_inputs_sha256=rebuilt["commission_inputs_sha256"],
         instrument_spec_sha256=rebuilt["instrument_spec_sha256"],
-        slippage_pips=rebuilt["slippage_pips_hex"],
-        slippage_price=rebuilt["slippage_price_hex"],
     )
     if derived_policy != dict(policy):
         _fail(f"{code}_POLICY_DRIFT")
     return rebuilt
-
-
-def _normalize_cost_policy_input(
-    value: Any,
-    *,
-    lane: str,
-    code: str,
-) -> dict[str, Any]:
-    """Accept a policy, or safely migrate a genuine full attestation to one."""
-
-    if isinstance(value, Mapping) and value.get("schema_version") == (
-        FROZEN_COST_POLICY_SCHEMA
-    ):
-        return _validated_frozen_cost_policy(value, lane=lane, code=code)
-    # Backward-compatible call shape: the old argument name was "contract".
-    # Authenticate the whole attestation before discarding its local vector hash.
-    if not isinstance(value, Mapping):
-        _fail(code)
-    attestation = dict(value)
-    try:
-        provisional = build_frozen_numerical_execution_cost_policy(
-            lane=lane,
-            use_spread=attestation.get("use_spread"),
-            use_slippage=attestation.get("use_slippage"),
-            use_commission=attestation.get("use_commission"),
-            spread_mode=attestation.get("spread_mode"),
-            commission_inputs_sha256=attestation.get("commission_inputs_sha256"),
-            instrument_spec_sha256=attestation.get("instrument_spec_sha256"),
-            slippage_pips=attestation.get("slippage_pips_hex"),
-            slippage_price=attestation.get("slippage_price_hex"),
-        )
-        _validated_partition_cost_attestation(
-            attestation,
-            policy=provisional,
-            lane=lane,
-            code=code,
-        )
-    except WinnerRawEvidenceError as exc:
-        raise WinnerRawEvidenceError(code) from exc
-    return provisional
 
 
 def build_precommitted_risk_unit_contract() -> dict[str, Any]:
@@ -1489,12 +1383,12 @@ def freeze_winner_search_plan_v3(
         _fail("ATTEMPTS_NOT_FROZEN_AFTER_PRECOMMITMENT")
 
     source_seed = dict(source_contract_seed)
-    base_cost = _normalize_cost_policy_input(
+    base_cost = _validated_frozen_cost_policy(
         base_cost_contract,
         lane="BASE",
         code="BASE_COST_POLICY_INVALID",
     )
-    stress_cost = _normalize_cost_policy_input(
+    stress_cost = _validated_frozen_cost_policy(
         stress_cost_contract,
         lane="STRESS",
         code="STRESS_COST_POLICY_INVALID",

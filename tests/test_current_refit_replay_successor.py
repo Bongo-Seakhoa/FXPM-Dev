@@ -59,9 +59,6 @@ def _case() -> tuple[dict, dict, dict, dict, dict]:
     costs = {
         "use_spread": True,
         "backtest_spread_mode": "conservative_max",
-        "use_commission": True,
-        "use_slippage": True,
-        "slippage_pips": 0.5,
         "swap_model_enabled": True,
         "swap_model_min_holding_hours": 20.0,
         "swap_model_triple_rollover_day": "wednesday",

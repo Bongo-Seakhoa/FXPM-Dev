@@ -36,7 +36,7 @@ except ImportError:
     MT5_AVAILABLE = False
     mt5 = None
 
-from pm_core import get_instrument_spec, InstrumentSpec
+from pm_core import InstrumentSpec
 from pm_symbol import infer_asset_class
 
 # Configure module logger
@@ -178,28 +178,9 @@ class MT5SymbolInfo:
             default="unknown",
         )
 
-    def to_instrument_spec(
-        self,
-        base_spec: Optional[InstrumentSpec] = None,
-        commission_per_lot: Optional[float] = None,
-    ) -> InstrumentSpec:
+    def to_instrument_spec(self) -> InstrumentSpec:
         """Convert to InstrumentSpec for backtesting compatibility."""
         pip_position = self.digits - 1 if self.digits in [3, 5] else self.digits
-
-        resolved_commission = commission_per_lot
-        if resolved_commission is None and base_spec is not None:
-            resolved_commission = getattr(base_spec, "commission_per_lot", None)
-        if resolved_commission is None:
-            try:
-                resolved_commission = get_instrument_spec(
-                    self.symbol
-                ).commission_per_lot
-            except Exception:
-                resolved_commission = None
-        try:
-            resolved_commission = float(resolved_commission)
-        except (TypeError, ValueError):
-            resolved_commission = 7.0
 
         return InstrumentSpec(
             symbol=self.symbol,
@@ -210,7 +191,6 @@ class MT5SymbolInfo:
             else float(self.spread),
             min_lot=self.volume_min,
             max_lot=self.volume_max,
-            commission_per_lot=resolved_commission,
             swap_long=self.swap_long,
             swap_short=self.swap_short,
             swap_mode=self.swap_mode,

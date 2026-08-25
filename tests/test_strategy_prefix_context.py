@@ -255,8 +255,6 @@ def test_real_backtester_excludes_warmup_trade_from_metrics() -> None:
     backtester = Backtester(
         PipelineConfig(
             use_spread=False,
-            use_commission=False,
-            use_slippage=False,
             swap_model_enabled=False,
         )
     )

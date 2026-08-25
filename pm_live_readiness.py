@@ -670,6 +670,38 @@ def _to_float(value: Any, default: float = 0.0) -> float:
     )
 
 
+def _position_slippage_buffer_issues(
+    position_config: Any,
+) -> List[Tuple[str, str]]:
+    """Validate the independent funded-position C2 slippage buffer."""
+    issues: List[Tuple[str, str]] = []
+    if getattr(position_config, "use_slippage", None) is not True:
+        issues.append(
+            (
+                "position_slippage_buffer_disabled",
+                "the funded position slippage buffer must be enabled",
+            )
+        )
+
+    raw_pips = getattr(position_config, "slippage_pips", None)
+    try:
+        slippage_pips = float(raw_pips)
+    except (TypeError, ValueError, OverflowError):
+        slippage_pips = float("nan")
+    if (
+        isinstance(raw_pips, bool)
+        or not math.isfinite(slippage_pips)
+        or slippage_pips < 0.0
+    ):
+        issues.append(
+            (
+                "position_slippage_buffer_invalid",
+                "the funded position slippage buffer must be finite and nonnegative",
+            )
+        )
+    return issues
+
+
 def _pip_size_from_broker_spec(payload: Dict[str, Any]) -> float:
     point = _to_float(payload.get("point"), 0.0)
     digits_raw = payload.get("digits")
@@ -1267,16 +1299,11 @@ def _validate_legacy_live_readiness(
         "execution_cost_survival_required",
         "execution-cost survival evidence must be enabled",
     )
-    for field_name in (
-        "use_spread",
-        "use_commission",
-        "use_slippage",
-        "swap_model_enabled",
-    ):
+    for field_name in ("use_spread", "swap_model_enabled"):
         require(
             bool(getattr(config, field_name, False)),
             f"{field_name}_required",
-            f"{field_name} cannot be disabled in the funded-production cost contract",
+            f"{field_name} cannot be disabled in funded-production evidence",
         )
     require(
         bool(getattr(config, "production_require_promotion_gate", False)),
@@ -1434,6 +1461,8 @@ def _validate_legacy_live_readiness(
         "margin thresholds must satisfy reopen >= entry_block > recovery_start > panic > 0",
     )
     if position_config is not None:
+        for code, message in _position_slippage_buffer_issues(position_config):
+            add("error", code, message)
         require(
             not bool(getattr(position_config, "auto_widen_sl", False)),
             "auto_widen_sl_not_live",
@@ -3195,12 +3224,11 @@ def validate_live_readiness(
             f"{name}_disabled",
             f"{name} must be enabled",
         )
-    for name in ("use_spread", "use_commission", "use_slippage"):
-        require(
-            bool(getattr(config, name, True)),
-            f"{name}_disabled",
-            f"{name} cannot be disabled for funded trading",
-        )
+    require(
+        bool(getattr(config, "use_spread", True)),
+        "use_spread_disabled",
+        "use_spread cannot be disabled for funded trading",
+    )
     require(
         bool(getattr(config, "swap_model_enabled", False)),
         "swap_model_disabled",
@@ -3411,6 +3439,8 @@ def validate_live_readiness(
     )
 
     if position_config is not None:
+        for code, message in _position_slippage_buffer_issues(position_config):
+            add("error", code, message)
         require(
             not bool(getattr(position_config, "auto_widen_sl", False)),
             "auto_widen_sl_not_live",

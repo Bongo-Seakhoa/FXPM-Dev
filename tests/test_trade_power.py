@@ -257,23 +257,17 @@ def _source_contract(
     source_binding.update(dict(binding_overrides or {}))
     numerical_cost_inputs = {
         "use_spread": True,
-        "use_slippage": True,
-        "use_commission": True,
         "spread_mode": "conservative_max",
         "spread_values_sha256": "a" * 64,
-        "commission_inputs_sha256": "b" * 64,
         "instrument_spec_sha256": "c" * 64,
-        "slippage_pips": 0.5,
-        "slippage_price": 0.00005,
     }
     numerical_cost_inputs.update(dict(cost_overrides or {}))
     numerical_cost = build_numerical_execution_cost_attestation(**numerical_cost_inputs)
     return {
-        "schema_version": "fxpm-trade-evidence-source-v3",
+        "schema_version": "fxpm-trade-evidence-source-v4",
         "source_binding": source_binding,
         "trade_record_schema_version": "2026-07-14-position-events-v2",
         "execution_cost_timing_contract": {
-            "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
         },
         "numerical_execution_cost_attestation": numerical_cost,
@@ -398,7 +392,9 @@ def test_source_contract_is_mandatory_and_exact_execution_tokens_are_binding():
     missing = build_trade_sample_evidence(records)
     missing_even_when_empty = build_trade_sample_evidence([])
     legacy = _source_contract()
-    legacy["execution_cost_timing_contract"]["entry_slippage"] = "legacy_v0"
+    legacy["execution_cost_timing_contract"]["entry_slippage"] = (
+        "entry_slippage_parity_v1"
+    )
     stale_execution = build_trade_sample_evidence(records, source_contract=legacy)
     stale_schema = _source_contract()
     stale_schema["trade_record_schema_version"] = "legacy_trade_schema"
@@ -514,7 +510,7 @@ def test_source_bindings_and_every_nonempty_trade_schema_are_verified():
         "target_sidecar_sha256",
     ],
 )
-def test_v2_requires_the_complete_authenticated_artifact_graph(binding_name):
+def test_v4_requires_the_complete_authenticated_artifact_graph(binding_name):
     records = _trade_records(np.linspace(-1.0, 1.0, 20))
     evidence = build_trade_sample_evidence(
         records,
@@ -525,23 +521,23 @@ def test_v2_requires_the_complete_authenticated_artifact_graph(binding_name):
     assert evidence.reason_codes == ("SOURCE_CONTRACT_BINDING_INVALID",)
 
 
-def test_v2_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
+def test_v4_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
     records = _trade_records(np.linspace(-1.0, 1.0, 20))
     missing_contract = _source_contract()
     missing_contract.pop("numerical_execution_cost_attestation")
     missing = build_trade_sample_evidence(records, source_contract=missing_contract)
 
     tampered_contract = _source_contract()
-    tampered_contract["numerical_execution_cost_attestation"]["slippage_pips_hex"] = (
-        float(99.0).hex()
-    )
+    tampered_contract["numerical_execution_cost_attestation"][
+        "spread_values_sha256"
+    ] = "d" * 64
     tampered = build_trade_sample_evidence(
         records,
         source_contract=tampered_contract,
     )
 
     disabled_contract = _source_contract()
-    disabled_contract["numerical_execution_cost_attestation"]["use_commission"] = False
+    disabled_contract["numerical_execution_cost_attestation"]["use_spread"] = False
     disabled = build_trade_sample_evidence(
         records,
         source_contract=disabled_contract,
@@ -559,7 +555,7 @@ def test_v2_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
         ("projection_sha256", "not-a-hash"),
     ],
 )
-def test_v2_requires_an_exact_slice_projection_attestation(field, value):
+def test_v4_requires_an_exact_slice_projection_attestation(field, value):
     records = _trade_records(np.linspace(-1.0, 1.0, 20))
     source = _source_contract()
     source["swap_accrual_contract"][field] = value
@@ -653,8 +649,7 @@ def test_train_calibration_freezes_sigma_multiplicity_and_all_partition_threshol
     assert requirement.multiplicity_method == "raw_attempt_ledger_count_v1"
     assert requirement.multiple_testing_adjustment == "sidak_effective_trials"
     assert requirement.pilot_dispersion_method == "max_mad_sample_std_r"
-    assert requirement.policy_schema_version == "fxpm-cell-power-v2"
-    assert requirement.entry_slippage_contract_version == "entry_slippage_parity_v1"
+    assert requirement.policy_schema_version == "fxpm-cell-power-v3"
     assert requirement.swap_accrual_contract_version == "causal_swap_accrual_v1"
     assert requirement.trade_record_schema_version == "2026-07-14-position-events-v2"
     assert requirement.attempted_trials_exact == 25
@@ -673,7 +668,7 @@ def test_train_calibration_freezes_sigma_multiplicity_and_all_partition_threshol
     assert len(requirement.calibration_source_contract_sha256) == 64
     assert len(requirement.calibration_partition_source_contract_sha256) == 64
     assert requirement.source_contract_schema_version == (
-        "fxpm-trade-evidence-source-v3"
+        "fxpm-trade-evidence-source-v4"
     )
     assert requirement.target_bars_sha256 == "8" * 64
     assert requirement.target_sidecar_sha256 == "9" * 64
@@ -998,7 +993,7 @@ def test_partition_projection_digests_may_differ_on_one_frozen_artifact():
         {"binding_overrides": {"target_bars_sha256": "d" * 64}},
         {"binding_overrides": {"target_sidecar_sha256": "d" * 64}},
         {"binding_overrides": {"schedule_sha256": "d" * 64}},
-        {"cost_overrides": {"slippage_pips": 0.75}},
+        {"cost_overrides": {"instrument_spec_sha256": "d" * 64}},
     ],
 )
 def test_artifact_schedule_or_numerical_cost_drift_is_infrastructure_failure(
@@ -1133,9 +1128,7 @@ def test_same_samples_are_timeframe_invariant_and_artifacts_are_compact():
     assert len(payload["sample_evidence"]["net_r_values_sha256"]) == 64
     assert len(payload["sample_evidence"]["holding_intervals_sha256"]) == 64
     compact_source = payload["sample_evidence"]["source_contract"]
-    assert compact_source["entry_slippage_contract_version"] == (
-        "entry_slippage_parity_v1"
-    )
+    assert "entry_slippage_contract_version" not in compact_source
     assert compact_source["swap_accrual_contract_version"] == ("causal_swap_accrual_v1")
     assert len(compact_source["source_contract_sha256"]) == 64
     assert "source_binding" not in compact_source

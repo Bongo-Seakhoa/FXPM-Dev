@@ -33,9 +33,9 @@ from pm_model_lifecycle import (
 )
 
 
-CAPTURE_CONTRACT_VERSION = "fxpm.current-refit-production-capture.v1"
-CANDIDATE_LEDGER_VERSION = "fxpm.current-refit-candidate-source-ledger.v1"
-PORTFOLIO_SOURCE_LEDGER_VERSION = "fxpm.current-refit-portfolio-source-ledger.v1"
+CAPTURE_CONTRACT_VERSION = "fxpm.current-refit-production-capture.v2"
+CANDIDATE_LEDGER_VERSION = "fxpm.current-refit-candidate-source-ledger.v2"
+PORTFOLIO_SOURCE_LEDGER_VERSION = "fxpm.current-refit-portfolio-source-ledger.v2"
 SCHEDULE_DEFAULT_VALIDITY_BASIS = "CONFIG_RETRAIN_SCHEDULE_DEFAULT"
 
 ART_CURRENT_BOOK = "current_refit_book_v9_decision"
@@ -115,7 +115,6 @@ _LEG_FIELDS = frozenset(
         "fraction",
         "net_pnl_per_entry_lot",
         "price_pnl_per_entry_lot",
-        "commission_per_entry_lot",
         "swap_per_entry_lot",
         "exit_reason",
     }

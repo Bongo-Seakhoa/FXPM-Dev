@@ -567,8 +567,8 @@ class TestPortfolioRiskCap:
         )
 
         assert can_trade is False
-        # Live geometry is commission-inclusive: $150 loss + $2.10 commission.
-        assert "existing 1.52%" in reason
+        # Live geometry is the broker-calculated gross stop loss.
+        assert "existing 1.50%" in reason
         assert "new 1.60%" in reason
 
     def test_check_portfolio_risk_cap_estimates_truncated_comment_from_live_geometry(self):
@@ -614,9 +614,9 @@ class TestPortfolioRiskCap:
         )
 
         assert can_trade is False
-        # Live geometry is commission-inclusive: $100 loss + $1.40 commission.
-        assert "existing 1.01%" in reason
-        assert "3.21% > max 3.00%" in reason
+        # Live geometry is the broker-calculated gross stop loss.
+        assert "existing 1.00%" in reason
+        assert "3.20% > max 3.00%" in reason
 
     def test_daily_loss_advisory_logs_info_without_blocking_entries(self, caplog):
         mock_mt5 = Mock()

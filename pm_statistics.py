@@ -25,14 +25,12 @@ from pm_sample_dependence import effective_sample_evidence
 
 
 STATISTICS_CONTRACT_VERSION = (
-    "2026-07-14-institutional-promotion-statistics-v4-diagnostic-dsr"
+    "2026-08-24-institutional-promotion-statistics-v5-spread-swap"
 )
-DAILY_NET_MTM_CONTRACT_VERSION = "daily_net_mtm_v1"
-DSR_POPULATION_CONTRACT_VERSION = "aligned_validation_dsr_population_v1"
-ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION = "entry_slippage_parity_v1"
+DAILY_NET_MTM_CONTRACT_VERSION = "daily_net_mtm_v2"
+DSR_POPULATION_CONTRACT_VERSION = "aligned_validation_dsr_population_v2"
 SWAP_ACCRUAL_TIMING_CONTRACT_VERSION = "causal_swap_accrual_v1"
 EXECUTION_COST_TIMING_CONTRACT = {
-    "entry_slippage": ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION,
     "swap_accrual": SWAP_ACCRUAL_TIMING_CONTRACT_VERSION,
 }
 LOCKBOX_REGISTRY_VERSION = "2026-07-11-nonoverlapping-lockbox-v2"

@@ -12,7 +12,6 @@ def bare_trader() -> LiveTrader:
     trader = LiveTrader.__new__(LiveTrader)
     trader.mt5 = MagicMock()
     trader.logger = MagicMock()
-    trader.pipeline_config = SimpleNamespace(use_commission=False)
     trader._get_management_configs = MagicMock(return_value={})
     trader._resolve_symbol_from_broker = MagicMock(return_value=None)
     trader.mt5.order_calc_profit.return_value = -25.0
@@ -141,14 +140,13 @@ def test_signed_stop_pnl_unavailable_after_all_paths_fails_closed():
     assert "signed stop P&L cannot be measured" in error
 
 
-def test_signed_stop_pnl_fallback_preserves_profit_direction_and_costs():
+def test_signed_stop_pnl_fallback_preserves_profit_direction_and_swap():
     trader = bare_trader()
-    trader.pipeline_config = SimpleNamespace(use_commission=True)
     trader.mt5.order_calc_profit.return_value = None
     spec = SimpleNamespace(
         pip_size=0.0001,
         pip_value=10.0,
-        commission_per_lot=8.0,
+        commission_per_lot=7.0,
     )
     info = SimpleNamespace(trade_tick_size=0.0001, trade_tick_value=10.0)
     pnl, path = trader._estimate_stop_pnl_amount(
@@ -162,7 +160,7 @@ def test_signed_stop_pnl_fallback_preserves_profit_direction_and_costs():
         symbol_info=info,
     )
     assert path == "tick_value"
-    assert pnl == pytest.approx(101.0)  # +100 price +5 swap -4 exit commission
+    assert pnl == pytest.approx(105.0)  # +100 price +5 accrued broker swap
 
 
 def test_live_open_position_without_stop_fails_closed():

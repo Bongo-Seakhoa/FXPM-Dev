@@ -45,8 +45,7 @@ def _candidate() -> replay.CandidateTrade:
                 exit_time="2025-01-02T00:00:00Z",
                 fraction=1.0,
                 net_pnl_per_entry_lot=200.0,
-                price_pnl_per_entry_lot=205.0,
-                commission_per_entry_lot=-5.0,
+                price_pnl_per_entry_lot=200.0,
                 swap_per_entry_lot=0.0,
                 exit_reason="target",
             ),
@@ -460,6 +459,15 @@ def test_candidate_and_portfolio_source_ledgers_are_real_and_request_bound(
 
     candidate_ledger = artifact_json("candidate_ledger")
     source_ledger = artifact_json("portfolio_source_ledger")
+    assert production.CAPTURE_CONTRACT_VERSION == (
+        "fxpm.current-refit-production-capture.v2"
+    )
+    assert candidate_ledger["schema_version"] == (
+        "fxpm.current-refit-candidate-source-ledger.v2"
+    )
+    assert source_ledger["schema_version"] == (
+        "fxpm.current-refit-portfolio-source-ledger.v2"
+    )
     frozen = production._FrozenFile(staged, len(staged_raw), staged_sha)
     producer = production.SealedPortfolioSourceLedgerProducer(
         source_ledger,
@@ -490,8 +498,6 @@ def test_candidate_and_portfolio_source_ledgers_are_real_and_request_bound(
         "expected_lineage": {"physical_ledger_sha256": physical_sha},
         "expected_cost_contract": {
             "use_spread": True,
-            "use_commission": True,
-            "use_slippage": True,
             "swap_model_enabled": True,
         },
         "expected_policies": {},

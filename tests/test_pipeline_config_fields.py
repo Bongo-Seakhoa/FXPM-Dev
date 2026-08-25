@@ -229,8 +229,12 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=-1.0).regime_trade_stability_floor, 0.0, places=6)
         self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=2.0).regime_trade_stability_floor, 1.0, places=6)
 
-    def test_retired_scoring_controls_are_not_constructor_fields(self):
-        self.assertEqual(len(RETIRED_SCORING_CONFIG_KEYS), 10)
+    def test_retired_pipeline_controls_are_not_constructor_fields(self):
+        self.assertTrue(
+            {"use_commission", "use_slippage", "slippage_pips"}.issubset(
+                RETIRED_SCORING_CONFIG_KEYS
+            )
+        )
         self.assertTrue(
             RETIRED_SCORING_CONFIG_KEYS.isdisjoint(
                 PipelineConfig.__dataclass_fields__

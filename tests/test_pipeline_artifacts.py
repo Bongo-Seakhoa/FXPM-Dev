@@ -110,10 +110,16 @@ class PipelineArtifactTests(unittest.TestCase):
         stored["operator_note"] = "does not participate in invalidation"
 
         self.assertTrue(artifact_contract_matches(stored, current))
+        self.assertEqual(
+            current["artifact_version"],
+            "2026-08-24-spread-swap-execution-v8",
+        )
 
-        changed = dict(current)
-        changed["artifact_version"] = "changed"
-        self.assertFalse(artifact_contract_matches(stored, changed))
+        legacy = dict(current)
+        legacy["artifact_version"] = (
+            "2026-07-13-trade-power-derived-binding-deployment-v7"
+        )
+        self.assertFalse(artifact_contract_matches(legacy, current))
 
     def test_artifact_meta_keeps_live_tp_overlay_out_of_discovery_contract(self):
         cfg = PipelineConfig(regime_tp_multipliers={"TREND": 1.25})
@@ -172,9 +178,6 @@ class PipelineArtifactTests(unittest.TestCase):
         cfg = PipelineConfig(
             backtest_spread_mode="conservative_max",
             use_spread=True,
-            use_commission=True,
-            use_slippage=True,
-            slippage_pips=0.75,
             swap_model_enabled=True,
             swap_model_min_holding_hours=12.0,
             swap_model_triple_rollover_day="Friday",
@@ -183,9 +186,9 @@ class PipelineArtifactTests(unittest.TestCase):
 
         self.assertEqual(current["backtest_spread_mode"], "conservative_max")
         self.assertTrue(current["use_spread"])
-        self.assertTrue(current["use_commission"])
-        self.assertTrue(current["use_slippage"])
-        self.assertAlmostEqual(current["slippage_pips"], 0.75)
+        self.assertNotIn("use_commission", current)
+        self.assertNotIn("use_slippage", current)
+        self.assertNotIn("slippage_pips", current)
         self.assertTrue(current["swap_model_enabled"])
         self.assertAlmostEqual(current["swap_model_min_holding_hours"], 12.0)
         self.assertEqual(current["swap_model_triple_rollover_day"], "friday")
@@ -195,9 +198,6 @@ class PipelineArtifactTests(unittest.TestCase):
             if k not in {
                 "use_spread",
                 "backtest_spread_mode",
-                "use_commission",
-                "use_slippage",
-                "slippage_pips",
                 "swap_model_enabled",
                 "swap_model_min_holding_hours",
                 "swap_model_triple_rollover_day",

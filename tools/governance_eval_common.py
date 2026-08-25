@@ -16,8 +16,8 @@ PF_CAP = 10.0
 DEFAULT_OUT_DIR = REPO / "pm_outputs" / "governance_oos_eval"
 
 COST_PARITY_KEYS = (
-    "use_spread", "backtest_spread_mode", "use_commission", "use_slippage",
-    "slippage_pips", "swap_model_enabled", "swap_model_min_holding_hours",
+    "use_spread", "backtest_spread_mode",
+    "swap_model_enabled", "swap_model_min_holding_hours",
     "swap_model_triple_rollover_day", "discovery_risk_per_trade_pct",
 )
 

@@ -80,7 +80,7 @@ class Section13SurfaceTests(unittest.TestCase):
         features = make_features()
         strategy = FixedStopStrategy()
         signals = strategy.generate_signals(features, "EURUSD")
-        config = PipelineConfig(use_spread=False, use_commission=False, use_slippage=False)
+        config = PipelineConfig(use_spread=False)
         backtester = Backtester(config)
 
         baseline = backtester.run(features, signals, "EURUSD", strategy)

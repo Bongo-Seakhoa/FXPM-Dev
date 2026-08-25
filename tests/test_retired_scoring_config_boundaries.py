@@ -23,10 +23,17 @@ from tools import (
 
 
 REPO = Path(__file__).resolve().parents[1]
+RETIRED_EXECUTION_CONFIG_KEYS = frozenset(
+    {"use_commission", "use_slippage", "slippage_pips"}
+)
+
+
+def test_retired_execution_keys_share_the_fail_closed_projection_boundary() -> None:
+    assert RETIRED_EXECUTION_CONFIG_KEYS.issubset(RETIRED_SCORING_CONFIG_KEYS)
 
 
 @pytest.mark.parametrize("retired_key", sorted(RETIRED_SCORING_CONFIG_KEYS))
-def test_shared_projection_rejects_every_retired_scoring_key(retired_key: str) -> None:
+def test_shared_projection_rejects_every_retired_pipeline_key(retired_key: str) -> None:
     with pytest.raises(RetiredScoringConfigError) as caught:
         strict_pipeline_config_kwargs({retired_key: "retired"})
 

@@ -376,7 +376,7 @@ def _mock_cli_dependencies(
     causal = SimpleNamespace(to_dict=lambda: {})
     monkeypatch.setattr(
         causal_producer,
-        "freeze_causal_process_precommit_v8",
+        "freeze_causal_process_precommit_v9",
         lambda **_kwargs: causal,
     )
     request = object()

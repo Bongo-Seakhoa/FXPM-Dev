@@ -39,8 +39,6 @@ def _full_config(tmp_path, ledger_path):
         evidence_require_native_provenance=True,
         evidence_require_session_coverage=True,
         use_spread=True,
-        use_commission=True,
-        use_slippage=True,
         swap_model_enabled=True,
         backtest_spread_mode="conservative_max",
         winner_ledger_path=str(ledger_path),
@@ -56,7 +54,6 @@ def _position_config():
         risk_per_trade_pct=0.5,
         max_risk_pct=1.0,
         risk_tolerance_pct=10.0,
-        slippage_pips=0.0,
     )
 
 
@@ -69,6 +66,56 @@ def _write_config(path: Path):
             }
         ),
         encoding="utf-8",
+    )
+
+
+def test_demo_cost_prerequisites_are_spread_and_swap_only():
+    source = inspect.getsource(demo.validate_demo_probation_readiness)
+    assert "use_commission" not in source
+    assert "use_slippage" not in source
+    assert "slippage_pips" not in source
+    assert '"use_spread"' in source
+    assert '"swap_model_enabled"' in source
+
+
+def test_demo_position_slippage_buffer_is_independent_of_pipeline_fields():
+    position = PositionConfig(
+        risk_per_trade_pct=0.5,
+        max_risk_pct=1.0,
+        risk_tolerance_pct=10.0,
+        use_slippage=True,
+        slippage_pips=0.75,
+    )
+    config_payload = {
+        "_meta": {"scope": "funded_live_v1"},
+        "position": vars(position),
+    }
+    config = SimpleNamespace(
+        max_combined_risk_pct=1.0,
+        use_spread=True,
+        use_slippage=False,
+        slippage_pips=99.0,
+    )
+
+    expected = demo._expected_position_policy(config_payload, config)
+
+    assert expected["use_slippage"] is True
+    assert expected["slippage_pips"] == 0.75
+    assert demo._position_policy_errors(expected, config) == []
+
+
+def test_demo_position_slippage_buffer_fails_closed_when_disabled_or_negative():
+    payload = demo._position_policy_payload(_position_config())
+    config = SimpleNamespace(max_combined_risk_pct=1.0, use_spread=True)
+
+    disabled = dict(payload, use_slippage=False)
+    assert "DEMO_POSITION_SLIPPAGE_BUFFER_DISABLED" in (
+        demo._position_policy_errors(disabled, config)
+    )
+
+    negative = dict(payload, slippage_pips=-0.01)
+    assert "DEMO_POSITION_SLIPPAGE_BUFFER_INVALID" in (
+        demo._position_policy_errors(negative, config)
     )
 
 

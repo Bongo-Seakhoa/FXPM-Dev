@@ -21,7 +21,12 @@ import pm_historical_anchor_orchestration as orchestration
 import pm_historical_production_adapter as adapter
 import pm_native_prefix_production as native_prefix
 import pm_training_horizon as training_horizon
-from pm_core import Backtester, InstrumentSpec, PipelineConfig
+from pm_core import (
+    BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
+    Backtester,
+    InstrumentSpec,
+    PipelineConfig,
+)
 from pm_native_activation import ActiveNativeResolution
 from pm_native_request_contract import PRODUCTION_ARTIFACT_COLUMNS, TIMEFRAME_SECONDS
 from pm_strategies import StrategyRegistry
@@ -1124,11 +1129,10 @@ TEST_INSTRUMENT_SPEC = InstrumentSpec(
     pip_position=4,
     pip_value=10.0,
     spread_avg=1.0,
-    commission_per_lot=7.0,
 )
 TEST_INSTRUMENT_SPEC_SHA256 = Backtester._cost_attestation_json_sha256(
     {
-        "schema_version": "fxpm-backtester-instrument-spec-v1",
+        "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
         "instrument_spec": asdict(TEST_INSTRUMENT_SPEC),
     }
 )
@@ -1166,25 +1170,15 @@ STRESS_SPREAD_POLICY = json.dumps(
 
 BASE_COST = build_numerical_execution_cost_attestation(
     use_spread=True,
-    use_slippage=True,
-    use_commission=True,
     spread_mode=BASE_SPREAD_POLICY,
     spread_values_sha256="7" * 64,
-    commission_inputs_sha256="8" * 64,
     instrument_spec_sha256=TEST_INSTRUMENT_SPEC_SHA256,
-    slippage_pips=0.5,
-    slippage_price=0.00005,
 )
 STRESS_COST = build_numerical_execution_cost_attestation(
     use_spread=True,
-    use_slippage=True,
-    use_commission=True,
     spread_mode=STRESS_SPREAD_POLICY,
     spread_values_sha256="6" * 64,
-    commission_inputs_sha256="8" * 64,
     instrument_spec_sha256=TEST_INSTRUMENT_SPEC_SHA256,
-    slippage_pips=0.5,
-    slippage_price=0.00005,
 )
 
 
@@ -1192,13 +1186,8 @@ def _frozen_cost_policy(lane, attestation):
     return raw_winner.build_frozen_numerical_execution_cost_policy(
         lane=lane,
         use_spread=attestation["use_spread"],
-        use_slippage=attestation["use_slippage"],
-        use_commission=attestation["use_commission"],
         spread_mode=attestation["spread_mode"],
-        commission_inputs_sha256=attestation["commission_inputs_sha256"],
         instrument_spec_sha256=attestation["instrument_spec_sha256"],
-        slippage_pips=attestation["slippage_pips_hex"],
-        slippage_price=attestation["slippage_price_hex"],
     )
 
 
@@ -1256,14 +1245,9 @@ def _partition_cost_attestation(policy_seed, namespace):
 
     return build_numerical_execution_cost_attestation(
         use_spread=policy_seed["use_spread"],
-        use_slippage=policy_seed["use_slippage"],
-        use_commission=policy_seed["use_commission"],
         spread_mode=policy_seed["spread_mode"],
         spread_values_sha256=_sha(f"{namespace}:spread-values"),
-        commission_inputs_sha256=policy_seed["commission_inputs_sha256"],
         instrument_spec_sha256=policy_seed["instrument_spec_sha256"],
-        slippage_pips=float.fromhex(policy_seed["slippage_pips_hex"]),
-        slippage_price=float.fromhex(policy_seed["slippage_price_hex"]),
     )
 
 
@@ -1302,7 +1286,6 @@ def _result(
         "winner_daily_r_surface": surface,
         "trade_power_partition_axis": axis,
         "execution_cost_timing_contract": {
-            "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
         },
         "numerical_execution_cost_attestation": _partition_cost_attestation(
@@ -1651,7 +1634,7 @@ def _partition_geometry(fold_ordinal, lanes):
 
 def _execution_spec_receipt(frozen, cross):
     body = {
-        "schema_version": "fxpm.execution-instrument-spec-receipt.v1",
+        "schema_version": raw_winner.EXECUTION_SPEC_RECEIPT_SCHEMA,
         "symbol": frozen.symbol,
         "authority_timing": "FROZEN_BEFORE_FIRST_SEARCH_EVALUATION",
         "deployment_scope": "TEST_PRODUCTION_SCOPE",
@@ -1662,12 +1645,10 @@ def _execution_spec_receipt(frozen, cross):
         "broker_specs_size_bytes": 2048,
         "broker_record_key": frozen.symbol,
         "broker_record_sha256": _sha("broker-record"),
-        "configured_instrument_record_sha256": _sha("configured-instrument"),
         "native_prefix_index_sha256": cross["native_prefix_index_sha256"],
         "native_provenance_sha256": _sha("native-provenance"),
         "native_instrument_snapshot_sha256": _sha("native-instrument"),
         "tick_value_source": "ACTIVATED_ACQUISITION_INSTRUMENT_SNAPSHOT",
-        "commission_source": "FROZEN_DEPLOYMENT_CONFIG_INSTRUMENT_SURFACE",
         "volume_source": "FROZEN_BROKER_SPECS_RECORD",
         "instrument_spec": asdict(TEST_INSTRUMENT_SPEC),
         "instrument_spec_sha256": TEST_INSTRUMENT_SPEC_SHA256,

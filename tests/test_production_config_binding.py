@@ -85,6 +85,10 @@ def test_public_loader_reproduces_complete_effective_config(tmp_path: Path) -> N
         config_payload=owned,
         supplied_config=effective,
     )
+    assert binding.BINDING_SCHEMA == "fxpm.production-effective-pipeline-config.v2"
+    assert json.loads(frozen._snapshot_json.decode("ascii"))["schema_version"] == (
+        binding.BINDING_SCHEMA
+    )
     assert frozen.materialize(context).data_dir == (tmp_path / "data").resolve()
 
 

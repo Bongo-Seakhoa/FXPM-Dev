@@ -786,8 +786,6 @@ def _expected_position_policy(
     scope = str(((config_payload.get("_meta") or {}).get("scope") or "")).lower()
     if scope == "funded_live_v1":
         expected.use_spread = bool(getattr(config, "use_spread", True))
-        expected.use_slippage = bool(getattr(config, "use_slippage", True))
-        expected.slippage_pips = float(getattr(config, "slippage_pips", 0.0) or 0.0)
     return _position_policy_payload(expected)
 
 
@@ -817,15 +815,10 @@ def _position_policy_errors(payload: Mapping[str, Any], config: Any) -> List[str
         errors.append("DEMO_POSITION_UNVALIDATED_OVERRIDE_FORBIDDEN")
     if payload["use_spread"] != bool(getattr(config, "use_spread", True)):
         errors.append("DEMO_POSITION_SPREAD_CONTRACT_MISMATCH")
-    if payload["use_slippage"] != bool(getattr(config, "use_slippage", True)):
-        errors.append("DEMO_POSITION_SLIPPAGE_CONTRACT_MISMATCH")
-    if not math.isclose(
-        float(payload["slippage_pips"]),
-        float(getattr(config, "slippage_pips", 0.0) or 0.0),
-        rel_tol=0.0,
-        abs_tol=1e-12,
-    ):
-        errors.append("DEMO_POSITION_SLIPPAGE_VALUE_MISMATCH")
+    if not payload["use_slippage"]:
+        errors.append("DEMO_POSITION_SLIPPAGE_BUFFER_DISABLED")
+    if float(payload["slippage_pips"]) < 0.0:
+        errors.append("DEMO_POSITION_SLIPPAGE_BUFFER_INVALID")
     return errors
 
 
@@ -1227,18 +1220,17 @@ def validate_demo_probation_readiness(
             f"demo_{field}_disabled",
             f"{field} must be enabled for DEMO evidence",
         )
-    for field in ("use_spread", "use_commission", "use_slippage"):
-        require(
-            bool(getattr(config, field, True)),
-            f"demo_{field}_disabled",
-            f"{field} cannot be disabled for DEMO evidence",
-        )
+    require(
+        bool(getattr(config, "use_spread", True)),
+        "demo_use_spread_disabled",
+        "use_spread cannot be disabled for DEMO evidence",
+    )
     require(
         bool(getattr(config, "swap_model_enabled", False))
         and str(getattr(config, "backtest_spread_mode", "") or "").lower()
         == "conservative_max",
         "demo_cost_contract_invalid",
-        "DEMO probation requires the production cost model",
+        "DEMO probation requires spread and swap modeling",
     )
 
     config_file = Path(config_path).resolve()

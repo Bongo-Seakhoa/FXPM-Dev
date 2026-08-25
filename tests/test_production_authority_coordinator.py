@@ -292,8 +292,7 @@ def _capital_candidate(
                 exit_time=f"2020-03-01T01:{minute:02d}:00Z",
                 fraction=1.0,
                 net_pnl_per_entry_lot=10.0,
-                price_pnl_per_entry_lot=12.0,
-                commission_per_entry_lot=-2.0,
+                price_pnl_per_entry_lot=10.0,
                 swap_per_entry_lot=0.0,
                 exit_reason="test",
             ),
@@ -724,6 +723,9 @@ def test_environment_authority_derives_exact_native_broker_and_margin_terms(
     )
     assert environment["margin_contract"]["candidate_margin_model"] == (
         coordinator.PRODUCTION_MARGIN_MODEL
+    )
+    assert environment["margin_contract"]["forward_replay_contract_version"] == (
+        "fxpm.forward-oos-replay-producer.v4"
     )
 
 

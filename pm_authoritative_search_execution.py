@@ -54,6 +54,7 @@ import pm_winner_raw_evidence as raw_winner
 import pm_winner_selection as winner_v11
 from pm_core import (
     BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
+    BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
     Backtester,
     FeatureComputer,
     InstrumentSpec,
@@ -70,7 +71,7 @@ from pm_strategies import StrategyRegistry
 
 
 UTC: Final = timezone.utc
-EXECUTION_CONTRACT_VERSION: Final = "fxpm.authoritative-search-execution.v2"
+EXECUTION_CONTRACT_VERSION: Final = "fxpm.authoritative-search-execution.v3"
 REGIME_FIT_POLICY_VERSION: Final = "fxpm.historical-regime-fit-policy.v1"
 REGIME_FIT_EVIDENCE_VERSION: Final = "fxpm.historical-regime-fit-evidence.v1"
 PARTITION_GEOMETRY_VERSION: Final = "fxpm.winner-partition-geometry.v1"
@@ -91,7 +92,7 @@ MAX_ATTEMPT_EVIDENCE_BYTES: Final = 512 * 1024**2
 MAX_CELL_EVIDENCE_BYTES: Final = 8 * 1024**3
 MAX_DEPLOYMENT_CONFIG_BYTES: Final = 32 * 1024**2
 MAX_BROKER_SPECS_BYTES: Final = 64 * 1024**2
-EXECUTION_SPEC_RECEIPT_SCHEMA: Final = "fxpm.execution-instrument-spec-receipt.v1"
+EXECUTION_SPEC_RECEIPT_SCHEMA: Final = "fxpm.execution-instrument-spec-receipt.v2"
 TERMINAL_SOURCE_CONTRACT_SCHEMA: Final = (
     "fxpm.terminal-source-non-evaluation-contract.v2"
 )
@@ -500,13 +501,8 @@ def _cost_policy_from_seed(
         return raw_winner.build_frozen_numerical_execution_cost_policy(
             lane=lane,
             use_spread=attestation.get("use_spread"),
-            use_slippage=attestation.get("use_slippage"),
-            use_commission=attestation.get("use_commission"),
             spread_mode=attestation.get("spread_mode"),
-            commission_inputs_sha256=attestation.get("commission_inputs_sha256"),
             instrument_spec_sha256=attestation.get("instrument_spec_sha256"),
-            slippage_pips=attestation.get("slippage_pips_hex"),
-            slippage_price=attestation.get("slippage_price_hex"),
         )
     except raw_winner.WinnerRawEvidenceError as exc:
         raise AuthoritativeSearchExecutionError(
@@ -690,49 +686,6 @@ def _matched_symbol_record(
     return matches[0]
 
 
-def _merged_config_instrument_record(
-    config_body: Mapping[str, Any],
-    symbol: str,
-) -> tuple[dict[str, Any], str]:
-    specs = config_body.get("instrument_specs")
-    defaults = config_body.get("instrument_spec_defaults")
-    if type(specs) is not dict or type(defaults) is not dict:
-        _fail("EXECUTION_SPEC_CONFIG_INSTRUMENT_SURFACE_INVALID")
-
-    def resolve(name: str, seen: frozenset[str]) -> dict[str, Any]:
-        normalized = _normalized_symbol(name)
-        if normalized in seen:
-            _fail("EXECUTION_SPEC_CONFIG_INHERITANCE_CYCLE", normalized)
-        matches = [
-            dict(raw)
-            for key, raw in specs.items()
-            if type(raw) is dict
-            and (
-                _normalized_symbol(key) == normalized
-                or _normalized_symbol(raw.get("symbol")) == normalized
-            )
-        ]
-        if len(matches) > 1 or (
-            not matches and normalized != _normalized_symbol(symbol)
-        ):
-            _fail(
-                "EXECUTION_SPEC_CONFIG_SYMBOL_CARDINALITY_INVALID",
-                normalized,
-                len(matches),
-            )
-        row = matches[0] if matches else {}
-        inherited: dict[str, Any] = {}
-        parent = row.get("inherit")
-        if parent:
-            inherited = resolve(str(parent), seen | {normalized})
-        merged = {**inherited, **dict(defaults)}
-        merged.update({key: value for key, value in row.items() if key != "inherit"})
-        return merged
-
-    merged = resolve(symbol, frozenset())
-    return merged, _sha256(merged)
-
-
 def _finite_number(value: Any, code: str, *, allow_zero: bool = False) -> float:
     if type(value) not in {int, float}:
         _fail(code)
@@ -785,8 +738,6 @@ def _freeze_bound_execution_spec(
         symbol,
         code="EXECUTION_SPEC_BROKER_SYMBOL_CARDINALITY_INVALID",
     )
-    configured, configured_sha = _merged_config_instrument_record(config_body, symbol)
-
     if _normalized_symbol(instrument.get("symbol")) != _normalized_symbol(
         symbol
     ) or _normalized_symbol(broker.get("symbol") or broker_key) != _normalized_symbol(
@@ -842,11 +793,6 @@ def _freeze_bound_execution_spec(
         point * 10.0 if digits in {3, 5} else point,
         "EXECUTION_SPEC_PIP_SIZE_INVALID",
     )
-    commission = _finite_number(
-        configured.get("commission_per_lot"),
-        "EXECUTION_SPEC_COMMISSION_INVALID",
-        allow_zero=True,
-    )
     volume_min = _finite_number(
         broker.get("volume_min"), "EXECUTION_SPEC_VOLUME_MIN_INVALID"
     )
@@ -868,7 +814,6 @@ def _freeze_bound_execution_spec(
         spread_avg=(spread_points * point / pip_size),
         min_lot=volume_min,
         max_lot=volume_max,
-        commission_per_lot=commission,
         swap_long=float(broker.get("swap_long") or 0.0),
         swap_short=float(broker.get("swap_short") or 0.0),
         swap_mode=int(broker.get("swap_mode", -1)),
@@ -896,17 +841,15 @@ def _freeze_bound_execution_spec(
             "broker_specs_size_bytes": broker_size,
             "broker_record_key": broker_key,
             "broker_record_sha256": _sha256(broker),
-            "configured_instrument_record_sha256": configured_sha,
             "native_prefix_index_sha256": product.index_sha256,
             "native_provenance_sha256": native["provenance_sha256"],
             "native_instrument_snapshot_sha256": _sha256(instrument),
             "tick_value_source": tick_value_source,
-            "commission_source": "FROZEN_DEPLOYMENT_CONFIG_INSTRUMENT_SURFACE",
             "volume_source": "FROZEN_BROKER_SPECS_RECORD",
             "instrument_spec": spec_body,
             "instrument_spec_sha256": Backtester._cost_attestation_json_sha256(
                 {
-                    "schema_version": "fxpm-backtester-instrument-spec-v1",
+                    "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
                     "instrument_spec": spec_body,
                 }
             ),
@@ -1961,16 +1904,10 @@ def _partition_cost_attestation(
 
     try:
         entry, intrabar, meta = backtester._build_half_spread_arrays(frame, spec)
-        slippage_price = (
-            spec.pips_to_price(backtester.config.slippage_pips)
-            if backtester.config.use_slippage
-            else 0.0
-        )
         attestation = backtester._numerical_execution_cost_attestation(
             entry_half_spread=entry,
             intrabar_half_spread=intrabar,
             spread_meta=meta,
-            slippage_price=slippage_price,
             spec=spec,
         )
     except Exception as exc:
@@ -2261,16 +2198,10 @@ def _verify_result_cost_attestation(
 ) -> None:
     try:
         entry, intrabar, meta = backtester._build_half_spread_arrays(features, spec)
-        slippage_price = (
-            spec.pips_to_price(backtester.config.slippage_pips)
-            if backtester.config.use_slippage
-            else 0.0
-        )
         rebuilt = backtester._numerical_execution_cost_attestation(
             entry_half_spread=entry,
             intrabar_half_spread=intrabar,
             spread_meta=meta,
-            slippage_price=slippage_price,
             spec=spec,
         )
     except Exception as exc:

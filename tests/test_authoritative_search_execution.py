@@ -560,8 +560,6 @@ def test_cost_stress_adversity_plan_is_source_frozen_and_partition_cached(
         fitted=fitted,
         config=execution.PipelineConfig(
             use_spread=True,
-            use_slippage=False,
-            use_commission=False,
             swap_model_enabled=False,
             backtest_spread_mode="conservative_max",
             oos_evidence_execution_stress_mode="stress_p95",
@@ -582,6 +580,32 @@ def test_cost_stress_adversity_plan_is_source_frozen_and_partition_cached(
     assert first["expected_adversity_status"] == (
         execution.raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
     )
+
+
+def test_cost_policy_from_seed_freezes_only_spread_economics() -> None:
+    attestation = execution.trade_power.build_numerical_execution_cost_attestation(
+        use_spread=True,
+        spread_mode="fixed_spec",
+        spread_values_sha256="1" * 64,
+        instrument_spec_sha256="2" * 64,
+    )
+
+    policy = execution._cost_policy_from_seed(
+        {"numerical_execution_cost_attestation": attestation},
+        lane="BASE",
+    )
+
+    assert policy["lane"] == "BASE"
+    assert policy["use_spread"] is True
+    assert policy["spread_mode"] == "fixed_spec"
+    assert policy["instrument_spec_sha256"] == "2" * 64
+    assert not {
+        "use_commission",
+        "use_slippage",
+        "commission_inputs_sha256",
+        "slippage_pips_hex",
+        "slippage_price_hex",
+    }.intersection(policy)
 
 
 @pytest.mark.parametrize(
@@ -798,6 +822,7 @@ def test_winner_evidence_roles_are_derived_from_sealed_horizon_status() -> None:
 
 def test_release_contract_binds_all_execution_dependencies() -> None:
     contract = execution.authoritative_search_execution_contract()
+    assert contract["schema_version"] == "fxpm.authoritative-search-execution.v3"
     assert contract["position_event_source"].endswith("position-events-v2")
     assert set(contract["dependency_source_sha256"]) == {
         "pm_authoritative_search_execution",
@@ -857,7 +882,7 @@ def test_source_identity_uses_the_raw_winner_trade_power_policy_owner() -> None:
 
     assert execution.raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS == 8
     assert execution._source_identity(_source_contract()) == (
-        "3170012d89a064587cd5abbc3ab40677c7a5e6533124fa5ad921cd48337e1454"
+        "51e09d17bf77c779d3e6278bb65e062525aad9d9ccc0044bbaff90f402d3cf59"
     )
     with pytest.raises(
         execution.AuthoritativeSearchExecutionError,

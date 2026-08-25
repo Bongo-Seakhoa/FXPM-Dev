@@ -67,8 +67,6 @@ class BacktesterTests(unittest.TestCase):
         cfg = PipelineConfig(
             initial_capital=10000.0,
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
         )
         bt = Backtester(cfg)
         n = 12
@@ -97,7 +95,6 @@ class BacktesterTests(unittest.TestCase):
             tp_prices,
             entry_prices,
             np.zeros(n, dtype=np.float64),
-            0.0,
             spec,
         )
 
@@ -133,11 +130,7 @@ class BacktesterTests(unittest.TestCase):
             10000.0,
             1.0,
             np.zeros(n, dtype=np.float64),
-            0.0,
             False,
-            False,
-            False,
-            0.0,
             0.00001,
             0.0,
             0.0001,
@@ -160,8 +153,6 @@ class BacktesterTests(unittest.TestCase):
         cfg = PipelineConfig(
             initial_capital=10000.0,
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
         )
         bt = Backtester(cfg)
         index = pd.date_range("2024-01-01", periods=5, freq="h")
@@ -197,7 +188,6 @@ class BacktesterTests(unittest.TestCase):
             tp_prices,
             entry_prices,
             np.zeros(5, dtype=np.float64),
-            0.0,
             spec,
         )
 
@@ -228,11 +218,7 @@ class BacktesterTests(unittest.TestCase):
             10000.0,
             1.0,
             np.zeros(5, dtype=np.float64),
-            0.0,
             False,
-            False,
-            False,
-            0.0,
             0.00001,
             1.0,
             0.0001,
@@ -323,8 +309,6 @@ class BacktesterTests(unittest.TestCase):
     def test_default_atr_stop_fast_path_matches_slow_trade_intent_path(self):
         cfg = PipelineConfig(
             use_spread=True,
-            use_slippage=False,
-            use_commission=False,
             risk_per_trade_pct=1.0,
             backtest_spread_mode="fixed_spec",
         )
@@ -359,8 +343,6 @@ class BacktesterTests(unittest.TestCase):
     def test_entry_timing_and_exit(self):
         cfg = PipelineConfig(
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
             risk_per_trade_pct=1.0,
         )
         bt = Backtester(cfg)
@@ -392,8 +374,6 @@ class BacktesterTests(unittest.TestCase):
     def test_same_bar_exit_is_possible_after_entry(self):
         cfg = PipelineConfig(
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
             risk_per_trade_pct=1.0,
         )
         bt = Backtester(cfg)
@@ -415,8 +395,6 @@ class BacktesterTests(unittest.TestCase):
     def test_discovery_risk_is_independent_from_pipeline_risk(self):
         cfg = PipelineConfig(
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
             risk_per_trade_pct=5.0,
             discovery_risk_per_trade_pct=1.0,
         )
@@ -437,7 +415,7 @@ class BacktesterTests(unittest.TestCase):
         self.assertAlmostEqual(res["trades"][0]["risk_amount"], 100.0)
 
     def test_signal_index_mismatch_raises(self):
-        cfg = PipelineConfig(use_spread=False, use_slippage=False, use_commission=False)
+        cfg = PipelineConfig(use_spread=False)
         bt = Backtester(cfg)
         df = pd.DataFrame({
             "Open": [100.0, 100.1, 100.2],
@@ -477,14 +455,10 @@ class BacktesterTests(unittest.TestCase):
 
         fixed = Backtester(PipelineConfig(
             use_spread=True,
-            use_slippage=False,
-            use_commission=False,
             backtest_spread_mode="fixed_spec",
         )).run(df, signals, "TEST", strat, spec=spec)
         historical = Backtester(PipelineConfig(
             use_spread=True,
-            use_slippage=False,
-            use_commission=False,
             backtest_spread_mode="historical_bar",
         )).run(df, signals, "TEST", strat, spec=spec)
 

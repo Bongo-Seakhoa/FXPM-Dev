@@ -14,6 +14,7 @@ import pm_authority_spool as spool
 import pm_production_search_planner as planner
 import pm_winner_selection as winner
 from pm_core import (
+    BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
     BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
     BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
     BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
@@ -29,6 +30,8 @@ from pm_winner_raw_evidence import (
     COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK,
     COST_STRESS_ADVERSITY_EXPECTED_STRICT,
     COST_STRESS_ADVERSITY_PLAN_SCHEMA,
+    EXECUTION_SPEC_RECEIPT_SCHEMA,
+    FROZEN_COST_POLICY_SCHEMA,
     WinnerRawEvidenceError,
     WinnerRawEvidenceIncomplete,
     _event_vectors,
@@ -68,14 +71,10 @@ COST_SPEC = InstrumentSpec(
     pip_position=4,
     pip_value=10.0,
     spread_avg=1.0,
-    commission_per_lot=7.0,
 )
 BASE_COST_BACKTESTER = Backtester(
     PipelineConfig(
         use_spread=True,
-        use_slippage=True,
-        use_commission=True,
-        slippage_pips=0.5,
         backtest_spread_mode="conservative_max",
         swap_model_enabled=False,
     )
@@ -83,9 +82,6 @@ BASE_COST_BACKTESTER = Backtester(
 STRESS_COST_BACKTESTER = Backtester(
     PipelineConfig(
         use_spread=True,
-        use_slippage=True,
-        use_commission=True,
-        slippage_pips=0.5,
         backtest_spread_mode="stress_p95",
         swap_model_enabled=False,
     )
@@ -119,7 +115,6 @@ def _genuine_partition_cost(*, label: str, bars: int, stress: bool):
         entry_half_spread=entry,
         intrabar_half_spread=intrabar,
         spread_meta=meta,
-        slippage_price=COST_SPEC.pips_to_price(0.5),
         spec=COST_SPEC,
     )
 
@@ -128,13 +123,8 @@ def _frozen_policy(attestation, lane):
     return build_frozen_numerical_execution_cost_policy(
         lane=lane,
         use_spread=attestation["use_spread"],
-        use_slippage=attestation["use_slippage"],
-        use_commission=attestation["use_commission"],
         spread_mode=attestation["spread_mode"],
-        commission_inputs_sha256=attestation["commission_inputs_sha256"],
         instrument_spec_sha256=attestation["instrument_spec_sha256"],
-        slippage_pips=float.fromhex(attestation["slippage_pips_hex"]),
-        slippage_price=float.fromhex(attestation["slippage_price_hex"]),
     )
 
 
@@ -150,14 +140,9 @@ def _rebuilt_cost(attestation, **changes):
     values.update(changes)
     return build_numerical_execution_cost_attestation(
         use_spread=values["use_spread"],
-        use_slippage=values["use_slippage"],
-        use_commission=values["use_commission"],
         spread_mode=values["spread_mode"],
         spread_values_sha256=values["spread_values_sha256"],
-        commission_inputs_sha256=values["commission_inputs_sha256"],
         instrument_spec_sha256=values["instrument_spec_sha256"],
-        slippage_pips=float.fromhex(values["slippage_pips_hex"]),
-        slippage_price=float.fromhex(values["slippage_price_hex"]),
     )
 
 
@@ -254,7 +239,6 @@ def _result(
         "winner_daily_r_surface": surface,
         "trade_power_partition_axis": axis,
         "execution_cost_timing_contract": {
-            "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
         },
         "numerical_execution_cost_attestation": partition_cost,
@@ -350,12 +334,12 @@ def _execution_spec_receipt(frozen):
     instrument_spec = asdict(COST_SPEC)
     instrument_spec_sha256 = Backtester._cost_attestation_json_sha256(
         {
-            "schema_version": "fxpm-backtester-instrument-spec-v1",
+            "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
             "instrument_spec": instrument_spec,
         }
     )
     body = {
-        "schema_version": "fxpm.execution-instrument-spec-receipt.v1",
+        "schema_version": EXECUTION_SPEC_RECEIPT_SCHEMA,
         "symbol": frozen.symbol,
         "authority_timing": "FROZEN_BEFORE_FIRST_SEARCH_EVALUATION",
         "deployment_scope": "TEST_PRODUCTION_SCOPE",
@@ -366,12 +350,10 @@ def _execution_spec_receipt(frozen):
         "broker_specs_size_bytes": 2048,
         "broker_record_key": frozen.symbol,
         "broker_record_sha256": _sha("broker-record"),
-        "configured_instrument_record_sha256": _sha("configured-instrument"),
         "native_prefix_index_sha256": _sha("native-prefix-index"),
         "native_provenance_sha256": _sha("native-provenance"),
         "native_instrument_snapshot_sha256": _sha("native-instrument"),
         "tick_value_source": "ACTIVATED_ACQUISITION_INSTRUMENT_SNAPSHOT",
-        "commission_source": "FROZEN_DEPLOYMENT_CONFIG_INSTRUMENT_SURFACE",
         "volume_source": "FROZEN_BROKER_SPECS_RECORD",
         "instrument_spec": instrument_spec,
         "instrument_spec_sha256": instrument_spec_sha256,
@@ -803,6 +785,24 @@ def _freeze(
         artifact_namespace=artifact_namespace,
     )
     return context, sink, frozen
+
+
+def test_frozen_cost_policy_v2_is_exact_and_rejects_full_attestation(
+    tmp_path: Path,
+) -> None:
+    assert BASE_COST_POLICY["schema_version"] == FROZEN_COST_POLICY_SCHEMA
+    assert set(BASE_COST_POLICY) == {
+        "schema_version",
+        "lane",
+        "attestation_schema_version",
+        "use_spread",
+        "spread_mode",
+        "instrument_spec_sha256",
+        "numerical_execution_cost_policy_sha256",
+        "policy_identity_sha256",
+    }
+    with pytest.raises(WinnerRawEvidenceError, match="BASE_COST_POLICY_INVALID"):
+        _freeze(tmp_path, base_cost_policy=BASE_COST)
 
 
 @pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
@@ -2136,7 +2136,7 @@ def test_internally_valid_partition_policy_mutation_fails_closed(
     lane = raw["folds"][0]["lanes"]["optimizer_train_base"]
     lane["numerical_execution_cost_attestation"] = _rebuilt_cost(
         lane["numerical_execution_cost_attestation"],
-        commission_inputs_sha256="f" * 64,
+        instrument_spec_sha256="f" * 64,
     )
 
     with pytest.raises(
@@ -2280,8 +2280,6 @@ class _OneTradeStrategy:
 def test_core_returns_authenticated_no_numerical_shock_after_full_replay() -> None:
     config = PipelineConfig(
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         backtest_spread_mode="conservative_max",
     )
@@ -2346,8 +2344,6 @@ def test_core_returns_authenticated_no_numerical_shock_after_full_replay() -> No
 def test_real_backtester_position_events_feed_daily_surface() -> None:
     config = PipelineConfig(
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
     )
     backtester = Backtester(config)

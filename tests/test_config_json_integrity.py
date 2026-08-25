@@ -51,6 +51,39 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
             "./pm_outputs/production_live/feature_cache",
         )
 
+    def test_retired_execution_economics_are_absent_from_tracked_configs(self) -> None:
+        retired_pipeline_keys = {
+            "use_commission",
+            "use_slippage",
+            "slippage_pips",
+        }
+        config = json.loads(
+            (self.repo_root / "config.json").read_text(encoding="utf-8")
+        )
+        ledger = json.loads(
+            (self.repo_root / "pm_configs.json").read_text(encoding="utf-8")
+        )
+
+        def nested_keys(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    yield key
+                    yield from nested_keys(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from nested_keys(item)
+
+        self.assertTrue(retired_pipeline_keys.issubset(RETIRED_SCORING_CONFIG_KEYS))
+        self.assertTrue(retired_pipeline_keys.isdisjoint(config["pipeline"]))
+        self.assertTrue(retired_pipeline_keys.isdisjoint(set(nested_keys(ledger))))
+        self.assertNotIn("instrument_spec_defaults", config)
+        self.assertTrue(
+            all(
+                "commission_per_lot" not in spec
+                for spec in config["instrument_specs"].values()
+            )
+        )
+
     def test_config_loader_accepts_utf8_bom(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
@@ -152,9 +185,16 @@ class ConfigJsonIntegrityTests(unittest.TestCase):
             "aggregate_with_worst_fold_floor",
         )
         self.assertEqual(resolved.clean_holdout_pct, 0.0)
-        for fixed_true_key in ("use_spread", "use_commission", "use_slippage"):
+        for fixed_true_key in ("use_spread",):
             self.assertNotIn(fixed_true_key, pipeline)
             self.assertTrue(getattr(resolved, fixed_true_key))
+        for retired_execution_key in (
+            "use_commission",
+            "use_slippage",
+            "slippage_pips",
+        ):
+            self.assertNotIn(retired_execution_key, pipeline)
+            self.assertFalse(hasattr(resolved, retired_execution_key))
         for fixed_false_key in (
             "local_governance_tournament_enabled",
             "risk_management_optimization_enabled",

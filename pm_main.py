@@ -510,7 +510,7 @@ FUNDED_PIPELINE_CONFIG_KEYS = frozenset(
     scoring_use_consistency scoring_use_continuous_dd scoring_use_sortino_blend
     scoring_use_tail_risk screening_atr_anchor_enabled
     screening_atr_anchor_multipliers secondary_trade_max_risk_pct
-    session_loss_hard_block_pct slippage_pips
+    session_loss_hard_block_pct
     storage_pause_entries_below_free_gb swap_model_enabled
     swap_model_min_holding_hours swap_model_triple_rollover_day
     timeframes train_max_drawdown train_min_profit_factor train_min_return_pct
@@ -568,20 +568,10 @@ def _apply_funded_position_cost_contract(
     pipeline_config: "PipelineConfig",
     position_config: "PositionConfig",
 ) -> None:
-    """Bind live position math to the funded backtest cost contract.
-
-    PositionConfig retains its historic cost fields for research compatibility,
-    but funded JSON cannot override them independently.  Copying the resolved
-    production values prevents the backtest and live risk projection from
-    drifting if either dataclass default changes in the future.
-    """
+    """Bind the funded spread switch without overriding live execution buffers."""
     if _config_scope(config_data) != FUNDED_LIVE_CONFIG_SCOPE:
         return
     position_config.use_spread = bool(getattr(pipeline_config, "use_spread", True))
-    position_config.use_slippage = bool(getattr(pipeline_config, "use_slippage", True))
-    position_config.slippage_pips = float(
-        getattr(pipeline_config, "slippage_pips", 0.0) or 0.0
-    )
 
 
 def _apply_funded_pipeline_contract(
@@ -3543,19 +3533,12 @@ class LiveTrader:
         self._order_governance_state[ticket_id] = dict(state)
 
     def _symbol_info_to_instrument_spec(self, symbol: str, symbol_info: Any) -> Any:
-        """Convert MT5 symbol info while preserving configured instrument specs."""
+        """Prefer current MT5 contract metadata, with configured fallback."""
         base_spec = get_instrument_spec(symbol)
         if symbol_info is None or not hasattr(symbol_info, "to_instrument_spec"):
             return base_spec
         try:
-            return symbol_info.to_instrument_spec(base_spec=base_spec)
-        except TypeError:
-            # Compatibility for older test doubles/adapters that predate the
-            # configured-commission argument.
-            try:
-                return symbol_info.to_instrument_spec()
-            except Exception:
-                return base_spec
+            return symbol_info.to_instrument_spec()
         except Exception:
             return base_spec
 
@@ -4860,41 +4843,6 @@ class LiveTrader:
 
         return fresh, None
 
-    def _commission_amount_for_volume(
-        self, symbol: str, volume: float, *, spec: Optional[Any] = None
-    ) -> float:
-        """Estimate configured round-trip commission for the proposed volume."""
-        pipeline_config = getattr(self, "pipeline_config", None)
-        if not bool(getattr(pipeline_config, "use_commission", False)):
-            return 0.0
-        try:
-            volume_value = max(0.0, float(volume))
-        except (TypeError, ValueError):
-            return 0.0
-        if volume_value <= 0.0:
-            return 0.0
-        resolved_spec = spec
-        if resolved_spec is None:
-            try:
-                resolved_spec = get_instrument_spec(symbol)
-            except Exception:
-                resolved_spec = None
-        try:
-            commission_per_lot = float(
-                getattr(resolved_spec, "commission_per_lot", 0.0) or 0.0
-            )
-        except (TypeError, ValueError):
-            commission_per_lot = 0.0
-        if commission_per_lot <= 0.0:
-            return 0.0
-        return commission_per_lot * volume_value
-
-    def _remaining_exit_commission_amount(
-        self, symbol: str, volume: float, *, spec: Optional[Any] = None
-    ) -> float:
-        """Return the uncharged exit side of the configured round-trip commission."""
-        return self._commission_amount_for_volume(symbol, volume, spec=spec) * 0.5
-
     def _estimate_stop_pnl_amount(
         self,
         order_type: int,
@@ -4911,8 +4859,8 @@ class LiveTrader:
 
         MT5 contract math is authoritative.  Deterministic tick- and pip-value
         fallbacks preserve direction instead of applying ``abs``.  The returned
-        amount includes accrued swap and the remaining one-way exit commission;
-        positive values therefore represent capital already locked by the stop.
+        amount includes accrued swap; positive values therefore represent
+        capital already locked by the stop.
         """
         try:
             volume_value = float(volume)
@@ -5005,12 +4953,7 @@ class LiveTrader:
 
         if price_pnl is None or not math.isfinite(price_pnl):
             return None, path
-        exit_commission = self._remaining_exit_commission_amount(
-            symbol,
-            volume_value,
-            spec=resolved_spec,
-        )
-        stop_pnl = price_pnl + swap_value - exit_commission
+        stop_pnl = price_pnl + swap_value
         return (float(stop_pnl), path) if math.isfinite(stop_pnl) else (None, path)
 
     def _estimate_stop_loss_amount(
@@ -5023,7 +4966,6 @@ class LiveTrader:
         *,
         spec: Optional[Any] = None,
         symbol_info: Optional[Any] = None,
-        include_commission: bool = True,
     ) -> Tuple[Optional[float], Optional[str]]:
         """Estimate stop-loss amount using MT5 first, then deterministic fallbacks."""
         try:
@@ -5097,10 +5039,6 @@ class LiveTrader:
         if risk_amount is None or risk_amount <= 0.0:
             return None, path
 
-        if include_commission:
-            risk_amount += self._commission_amount_for_volume(
-                symbol, volume_value, spec=spec
-            )
         return float(risk_amount), path
 
     def _estimate_position_risk_pct(
@@ -5185,7 +5123,6 @@ class LiveTrader:
                     if self.mt5 and pos_symbol
                     else None
                 ),
-                include_commission=True,
             )
             mt5_path_failed = path != "mt5"
             fallback_path: Optional[str] = path if path not in {None, "mt5"} else None
@@ -8596,7 +8533,6 @@ class LiveTrader:
             sl_price,
             spec=spec,
             symbol_info=symbol_info,
-            include_commission=True,
         )
         if loss_per_lot_path == "tick_value" and loss_per_lot:
             self.logger.info(
@@ -8651,7 +8587,6 @@ class LiveTrader:
                     sl_price,
                     spec=spec,
                     symbol_info=symbol_info,
-                    include_commission=True,
                 )
                 if loss_try is None or loss_try <= 0:
                     break
@@ -8718,7 +8653,6 @@ class LiveTrader:
             sl_price,
             spec=spec,
             symbol_info=symbol_info,
-            include_commission=True,
         )
         if actual_risk_amount is None or actual_risk_amount <= 0:
             self.logger.warning(
@@ -9022,7 +8956,6 @@ class LiveTrader:
             sl_price,
             spec=spec,
             symbol_info=symbol_info,
-            include_commission=True,
         )
         if actual_risk_amount is None or actual_risk_amount <= 0:
             self.logger.warning(
@@ -9579,7 +9512,6 @@ class LiveTrader:
                     sl_price,
                     spec=spec,
                     symbol_info=symbol_info,
-                    include_commission=True,
                 )
                 if (
                     actual_risk_amount is None
@@ -10033,7 +9965,6 @@ class LiveTrader:
                     sl_price,
                     spec=spec,
                     symbol_info=symbol_info,
-                    include_commission=True,
                 )
                 if risk_exec is not None and risk_exec > 0 and basis_value > 0:
                     actual_risk_pct_exec = (risk_exec / basis_value) * 100.0
@@ -10100,7 +10031,6 @@ class LiveTrader:
                             sl_price,
                             spec=spec,
                             symbol_info=symbol_info,
-                            include_commission=True,
                         )
                     except Exception:
                         pass

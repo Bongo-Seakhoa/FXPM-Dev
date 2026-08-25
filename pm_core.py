@@ -112,19 +112,19 @@ EXIT_EOD = 3
 # interpreted as zero-excursion records.
 BACKTEST_TRADE_RECORD_SCHEMA_VERSION = "2026-06-18-mae-mfe-v1"
 BACKTEST_POSITION_EVENT_SCHEMA_VERSION = REQUIRED_TRADE_RECORD_SCHEMA
-BACKTEST_EXECUTION_COST_CONTRACT_VERSION = "entry_slippage_parity_v1"
 BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION = "causal_swap_accrual_v1"
 NATIVE_SOURCE_BINDING_ATTR = "_fxpm_native_source_binding_v1"
 BACKTEST_PARTITION_AXIS_SCHEMA_VERSION = "fxpm.backtest-partition-axis.v1"
-BACKTEST_WINNER_DAILY_R_SCHEMA_VERSION = "fxpm.backtester-winner-daily-r.v1"
-BACKTEST_WINNER_RISK_UNIT_SCHEMA_VERSION = "fxpm.precommitted-cell-risk-unit.v1"
+BACKTEST_WINNER_DAILY_R_SCHEMA_VERSION = "fxpm.backtester-winner-daily-r.v2"
+BACKTEST_WINNER_RISK_UNIT_SCHEMA_VERSION = "fxpm.precommitted-cell-risk-unit.v2"
+BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION = "fxpm-backtester-instrument-spec-v2"
 BACKTEST_WINNER_DAILY_R_MAX_DAYS = 20_000
 BACKTEST_WINNER_DAILY_R_MAX_LEGS = 500_000
 BACKTEST_WINNER_DAILY_R_MAX_MARKS = 5_000_000
 BACKTEST_WINNER_R_DECIMAL_PLACES = 12
 _BACKTEST_WINNER_R_QUANTUM = Decimal("0.000000000001")
 BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION = (
-    "fxpm.backtester-frozen-path-cost-stress.v2"
+    "fxpm.backtester-frozen-path-cost-stress.v3"
 )
 BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT = (
     "ADVERSE"
@@ -202,7 +202,7 @@ def build_backtest_winner_risk_unit_contract() -> Dict[str, Any]:
     return {
         "schema_version": BACKTEST_WINNER_RISK_UNIT_SCHEMA_VERSION,
         "unit": "PRECOMMITTED_CELL_RISK_UNIT",
-        "position_denominator": "ENTRY_RISK_AMOUNT_DOLLARS",
+        "position_denominator": "ENTRY_BROKER_STOP_PRICE_LOSS_DOLLARS",
         "daily_surface": "SEARCH_TIME_FULL_PATH_POSITION_NORMALIZED_NET_MTM",
         "inventory_boundary": "FLAT_TO_FLAT_LIQUIDATED_POST_COST",
         "accounting_identity": (
@@ -383,7 +383,6 @@ def build_backtest_winner_daily_r_surface(
     spec: "InstrumentSpec",
     half_spread_arr: Sequence[float],
     use_spread: bool,
-    use_commission: bool,
     swap_model_enabled: bool,
     causal_swap_enabled: bool,
     pre_open_rollover_units_arr: Sequence[int],
@@ -585,8 +584,6 @@ def build_backtest_winner_daily_r_surface(
                     leg["size"],
                     leg["direction"],
                 )
-                if use_commission:
-                    marked_pnl -= spec.commission_per_lot * leg["size"]
                 pre_units = int(
                     pre_open_prefix[mark_index + 1]
                     - pre_open_prefix[entry_bar + 1]
@@ -741,9 +738,7 @@ def _calc_trade_pnl_numba(entry_px: float,
                           tick_size: float,
                           tick_value: float,
                           pip_size: float,
-                          pip_value: float,
-                          use_commission: bool,
-                          commission_per_lot: float) -> Tuple[float, float]:
+                          pip_value: float) -> Tuple[float, float]:
     """Numba-safe trade PnL helper used by the backtest kernel."""
     if tick_size > 0.0 and tick_value > 0.0:
         price_diff = (exit_px - entry_px) * direction
@@ -766,9 +761,6 @@ def _calc_trade_pnl_numba(entry_px: float,
     else:
         pnl_pips_local = 0.0
 
-    if use_commission:
-        pnl_dollars_local -= commission_per_lot * size
-
     return pnl_dollars_local, pnl_pips_local
 
 
@@ -789,11 +781,7 @@ def _backtest_loop_numba(
     initial_capital: float,
     position_size_pct: float,
     half_spread_arr: np.ndarray,
-    slippage_price: float,
     use_spread: bool,
-    use_slippage: bool,
-    use_commission: bool,
-    commission_per_lot: float,
     # Tick calculation params
     tick_size: float,
     tick_value: float,
@@ -979,7 +967,7 @@ def _backtest_loop_numba(
                     exit_price = bid_open
                     exit_reason = EXIT_SL
                 elif bid_low <= stop_loss:
-                    exit_price = stop_loss - slippage_price if use_slippage else stop_loss
+                    exit_price = stop_loss
                     exit_reason = EXIT_SL
                 elif bid_high >= take_profit:
                     exit_price = take_profit
@@ -989,7 +977,7 @@ def _backtest_loop_numba(
                     exit_price = ask_open
                     exit_reason = EXIT_SL
                 elif ask_high >= stop_loss:
-                    exit_price = stop_loss + slippage_price if use_slippage else stop_loss
+                    exit_price = stop_loss
                     exit_reason = EXIT_SL
                 elif ask_low <= take_profit:
                     exit_price = take_profit
@@ -998,8 +986,7 @@ def _backtest_loop_numba(
             if exit_reason != EXIT_NONE:
                 gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
                     entry_price, exit_price, position_direction, position_size,
-                    tick_size, tick_value, pip_size, pip_value,
-                    use_commission, commission_per_lot
+                    tick_size, tick_value, pip_size, pip_value
                 )
                 equity += gross_pnl_dollars
                 net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
@@ -1062,8 +1049,6 @@ def _backtest_loop_numba(
                 elif pip_size > 0.0 and pip_value > 0.0:
                     pips = dist / pip_size
                     loss_per_lot = pips * pip_value
-                if use_commission:
-                    loss_per_lot += commission_per_lot
                 if loss_per_lot <= 0.0:
                     equity_curve[i] = equity
                     if equity > peak_equity:
@@ -1141,7 +1126,7 @@ def _backtest_loop_numba(
                         exit_price = bid_open
                         exit_reason = EXIT_SL
                     elif bid_low <= stop_loss:
-                        exit_price = stop_loss - slippage_price if use_slippage else stop_loss
+                        exit_price = stop_loss
                         exit_reason = EXIT_SL
                     elif bid_high >= take_profit:
                         exit_price = take_profit
@@ -1151,7 +1136,7 @@ def _backtest_loop_numba(
                         exit_price = ask_open
                         exit_reason = EXIT_SL
                     elif ask_high >= stop_loss:
-                        exit_price = stop_loss + slippage_price if use_slippage else stop_loss
+                        exit_price = stop_loss
                         exit_reason = EXIT_SL
                     elif ask_low <= take_profit:
                         exit_price = take_profit
@@ -1160,8 +1145,7 @@ def _backtest_loop_numba(
                 if exit_reason != EXIT_NONE:
                     gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
                         entry_price, exit_price, position_direction, position_size,
-                        tick_size, tick_value, pip_size, pip_value,
-                        use_commission, commission_per_lot
+                        tick_size, tick_value, pip_size, pip_value
                     )
                     equity += gross_pnl_dollars
                     net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
@@ -1214,8 +1198,7 @@ def _backtest_loop_numba(
             mark_exit_price = bid_close if position_direction == 1 else ask_close
             unrealized_pnl, _ = _calc_trade_pnl_numba(
                 entry_price, mark_exit_price, position_direction, position_size,
-                tick_size, tick_value, pip_size, pip_value,
-                use_commission, commission_per_lot
+                tick_size, tick_value, pip_size, pip_value
             )
             current_equity = equity + unrealized_pnl
 
@@ -1235,8 +1218,7 @@ def _backtest_loop_numba(
             exit_price = close_arr[n_bars - 1]
         gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
             entry_price, exit_price, position_direction, position_size,
-            tick_size, tick_value, pip_size, pip_value,
-            use_commission, commission_per_lot
+            tick_size, tick_value, pip_size, pip_value
         )
         equity += gross_pnl_dollars
         net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
@@ -1329,8 +1311,28 @@ RETIRED_SCORING_CONFIG_KEYS = frozenset(
         "threadspark_historical_cost_scope",
         "threadspark_selection_surface",
         "threadspark_use_historical_cost_evidence",
+        "use_commission",
+        "use_slippage",
+        "slippage_pips",
     }
 )
+RETIRED_INSTRUMENT_SPEC_CONFIG_KEYS = frozenset({"commission_per_lot"})
+
+
+def _reject_retired_instrument_spec_config_keys(
+    source: Optional[Mapping[str, Any]],
+    *,
+    source_name: str,
+) -> None:
+    if source is None:
+        return
+    if not isinstance(source, Mapping):
+        raise ValueError(f"{source_name} must be a mapping")
+    retired = sorted(RETIRED_INSTRUMENT_SPEC_CONFIG_KEYS.intersection(source))
+    if retired:
+        raise ValueError(
+            f"{source_name} contains retired key(s): {', '.join(retired)}"
+        )
 
 @dataclass
 class PipelineConfig:
@@ -1421,17 +1423,10 @@ class PipelineConfig:
     # - Spread: fixed/average per-symbol from config.json by default. Evidence
     #   modes can use historical bar-level Spread columns once broker point/pip
     #   units are trusted.
-    # - Commission: per-lot fee (use_commission=True). Set to False for
-    #   spread-only accounts where commission is embedded in the spread.
-    # - Slippage: applied adversely to market entry and SL exits. TP exits are
-    #   limit fills and do not incur slippage.
     # - Swap: modeled from InstrumentSpec.swap_long/swap_short when
     #   swap_model_enabled=True. Triple rollover is applied on the configured
     #   broker rollover weekday.
     use_spread: bool = True
-    use_commission: bool = True
-    use_slippage: bool = True
-    slippage_pips: float = 0.5
     backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max|stress_p90|stress_p95|stress_max
     swap_model_enabled: bool = True
     swap_model_triple_rollover_day: str = "wednesday"
@@ -3267,7 +3262,7 @@ class InstrumentSpec:
     
     Contains all instrument-specific parameters needed for:
     - Pip calculations
-    - Spread/commission modeling
+    - Spread and swap modeling
     - Position sizing
     - P&L calculation (tick-based for broker parity)
     
@@ -3288,7 +3283,6 @@ class InstrumentSpec:
     spread_avg: float = 1.0  # Average spread in pips
     min_lot: float = 0.01
     max_lot: float = 100.0
-    commission_per_lot: float = 7.0  # Commission in USD per round trip per lot
     swap_long: float = 0.0  # Daily swap for long positions
     swap_short: float = 0.0  # Daily swap for short positions
     swap_mode: int = -1  # -1=config/account-currency-per-lot; MT5 mode otherwise
@@ -3542,108 +3536,108 @@ def sync_instrument_spec_from_mt5(spec: InstrumentSpec, mt5_symbol_info) -> Inst
 # Live trading will override these with actual broker values
 INSTRUMENT_SPECS = {
     # Major FX Pairs
-    'EURUSD': InstrumentSpec('EURUSD', 4, 10.0, 1.0, 0.01, 100.0, 7.0, -6.5, 1.2),
-    'GBPUSD': InstrumentSpec('GBPUSD', 4, 10.0, 1.2, 0.01, 100.0, 7.0, -5.0, 0.8),
-    'AUDUSD': InstrumentSpec('AUDUSD', 4, 10.0, 1.2, 0.01, 100.0, 7.0, -4.0, 0.5),
-    'NZDUSD': InstrumentSpec('NZDUSD', 4, 10.0, 1.5, 0.01, 100.0, 7.0, -3.5, 0.3),
-    'USDJPY': InstrumentSpec('USDJPY', 2, 9.0, 1.0, 0.01, 100.0, 7.0, 8.5, -15.0),
-    'USDCAD': InstrumentSpec('USDCAD', 4, 7.5, 1.5, 0.01, 100.0, 7.0, 2.5, -8.0),
-    'USDCHF': InstrumentSpec('USDCHF', 4, 11.0, 1.5, 0.01, 100.0, 7.0, 5.0, -10.0),
+    'EURUSD': InstrumentSpec('EURUSD', 4, 10.0, 1.0, 0.01, 100.0, swap_long=-6.5, swap_short=1.2),
+    'GBPUSD': InstrumentSpec('GBPUSD', 4, 10.0, 1.2, 0.01, 100.0, swap_long=-5.0, swap_short=0.8),
+    'AUDUSD': InstrumentSpec('AUDUSD', 4, 10.0, 1.2, 0.01, 100.0, swap_long=-4.0, swap_short=0.5),
+    'NZDUSD': InstrumentSpec('NZDUSD', 4, 10.0, 1.5, 0.01, 100.0, swap_long=-3.5, swap_short=0.3),
+    'USDJPY': InstrumentSpec('USDJPY', 2, 9.0, 1.0, 0.01, 100.0, swap_long=8.5, swap_short=-15.0),
+    'USDCAD': InstrumentSpec('USDCAD', 4, 7.5, 1.5, 0.01, 100.0, swap_long=2.5, swap_short=-8.0),
+    'USDCHF': InstrumentSpec('USDCHF', 4, 11.0, 1.5, 0.01, 100.0, swap_long=5.0, swap_short=-10.0),
     
     # Cross pairs
-    'AUDNZD': InstrumentSpec('AUDNZD', 4, 6.0, 2.5, 0.01, 100.0, 8.0, -2.0, -1.5),
-    'EURGBP': InstrumentSpec('EURGBP', 4, 12.5, 1.5, 0.01, 100.0, 7.0, -4.0, 0.5),
-    'EURJPY': InstrumentSpec('EURJPY', 2, 9.0, 1.5, 0.01, 100.0, 7.0, 3.0, -10.0),
-    'GBPJPY': InstrumentSpec('GBPJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, 5.0, -12.0),
+    'AUDNZD': InstrumentSpec('AUDNZD', 4, 6.0, 2.5, 0.01, 100.0, swap_long=-2.0, swap_short=-1.5),
+    'EURGBP': InstrumentSpec('EURGBP', 4, 12.5, 1.5, 0.01, 100.0, swap_long=-4.0, swap_short=0.5),
+    'EURJPY': InstrumentSpec('EURJPY', 2, 9.0, 1.5, 0.01, 100.0, swap_long=3.0, swap_short=-10.0),
+    'GBPJPY': InstrumentSpec('GBPJPY', 2, 9.0, 2.0, 0.01, 100.0, swap_long=5.0, swap_short=-12.0),
     
     # Exotic FX Pairs
-    'USDBRL': InstrumentSpec('USDBRL', 4, 2.0, 50.0, 0.01, 100.0, 15.0, 15.0, -40.0),
-    'USDMXN': InstrumentSpec('USDMXN', 4, 0.55, 30.0, 0.01, 100.0, 12.0, 20.0, -45.0),
-    'USDPLN': InstrumentSpec('USDPLN', 4, 2.5, 25.0, 0.01, 100.0, 10.0, 3.0, -12.0),
-    'USDNOK': InstrumentSpec('USDNOK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
-    'USDSEK': InstrumentSpec('USDSEK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
-    'USDSGD': InstrumentSpec('USDSGD', 4, 7.5, 2.0, 0.01, 100.0, 8.0, 1.5, -6.0),
-    'USDTRY': InstrumentSpec('USDTRY', 4, 0.035, 100.0, 0.01, 100.0, 20.0, 50.0, -150.0),
-    'USDZAR': InstrumentSpec('USDZAR', 4, 0.55, 50.0, 0.01, 100.0, 15.0, 12.0, -35.0),
-    'USDCNH': InstrumentSpec('USDCNH', 4, 1.4, 20.0, 0.01, 100.0, 10.0, 2.0, -10.0),
-    'EURCNH': InstrumentSpec('EURCNH', 4, 1.4, 10.0, 0.01, 100.0, 10.0, 2.0, -10.0),
-    'EURPLN': InstrumentSpec('EURPLN', 4, 2.5, 25.0, 0.01, 100.0, 10.0, 3.0, -12.0),
-    'EURNOK': InstrumentSpec('EURNOK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
-    'EURSEK': InstrumentSpec('EURSEK', 4, 0.95, 30.0, 0.01, 100.0, 10.0, 2.0, -10.0),
-    'GBPNOK': InstrumentSpec('GBPNOK', 4, 0.95, 35.0, 0.01, 100.0, 10.0, 2.0, -12.0),
-    'GBPSEK': InstrumentSpec('GBPSEK', 4, 0.95, 35.0, 0.01, 100.0, 10.0, 2.0, -12.0),
-    'EURTRY': InstrumentSpec('EURTRY', 4, 0.035, 120.0, 0.01, 100.0, 20.0, 45.0, -130.0),
-    'Platinum': InstrumentSpec('Platinum', 2, 1.0, 8.0, 0.01, 100.0, 5.0, -5.0, -3.0),
-    'Palladium': InstrumentSpec('Palladium', 2, 1.0, 8.0, 0.01, 100.0, 5.0, -6.0, -4.0),
-    'EURMXN': InstrumentSpec('EURMXN', 4, 0.55, 140.0, 0.01, 100.0, 12.0, 20.0, -45.0),
-    'NOKJPY': InstrumentSpec('NOKJPY', 2, 9.0, 2.0, 0.01, 100.0, 8.0, -1.0, -2.0),
+    'USDBRL': InstrumentSpec('USDBRL', 4, 2.0, 50.0, 0.01, 100.0, swap_long=15.0, swap_short=-40.0),
+    'USDMXN': InstrumentSpec('USDMXN', 4, 0.55, 30.0, 0.01, 100.0, swap_long=20.0, swap_short=-45.0),
+    'USDPLN': InstrumentSpec('USDPLN', 4, 2.5, 25.0, 0.01, 100.0, swap_long=3.0, swap_short=-12.0),
+    'USDNOK': InstrumentSpec('USDNOK', 4, 0.95, 30.0, 0.01, 100.0, swap_long=2.0, swap_short=-10.0),
+    'USDSEK': InstrumentSpec('USDSEK', 4, 0.95, 30.0, 0.01, 100.0, swap_long=2.0, swap_short=-10.0),
+    'USDSGD': InstrumentSpec('USDSGD', 4, 7.5, 2.0, 0.01, 100.0, swap_long=1.5, swap_short=-6.0),
+    'USDTRY': InstrumentSpec('USDTRY', 4, 0.035, 100.0, 0.01, 100.0, swap_long=50.0, swap_short=-150.0),
+    'USDZAR': InstrumentSpec('USDZAR', 4, 0.55, 50.0, 0.01, 100.0, swap_long=12.0, swap_short=-35.0),
+    'USDCNH': InstrumentSpec('USDCNH', 4, 1.4, 20.0, 0.01, 100.0, swap_long=2.0, swap_short=-10.0),
+    'EURCNH': InstrumentSpec('EURCNH', 4, 1.4, 10.0, 0.01, 100.0, swap_long=2.0, swap_short=-10.0),
+    'EURPLN': InstrumentSpec('EURPLN', 4, 2.5, 25.0, 0.01, 100.0, swap_long=3.0, swap_short=-12.0),
+    'EURNOK': InstrumentSpec('EURNOK', 4, 0.95, 30.0, 0.01, 100.0, swap_long=2.0, swap_short=-10.0),
+    'EURSEK': InstrumentSpec('EURSEK', 4, 0.95, 30.0, 0.01, 100.0, swap_long=2.0, swap_short=-10.0),
+    'GBPNOK': InstrumentSpec('GBPNOK', 4, 0.95, 35.0, 0.01, 100.0, swap_long=2.0, swap_short=-12.0),
+    'GBPSEK': InstrumentSpec('GBPSEK', 4, 0.95, 35.0, 0.01, 100.0, swap_long=2.0, swap_short=-12.0),
+    'EURTRY': InstrumentSpec('EURTRY', 4, 0.035, 120.0, 0.01, 100.0, swap_long=45.0, swap_short=-130.0),
+    'Platinum': InstrumentSpec('Platinum', 2, 1.0, 8.0, 0.01, 100.0, swap_long=-5.0, swap_short=-3.0),
+    'Palladium': InstrumentSpec('Palladium', 2, 1.0, 8.0, 0.01, 100.0, swap_long=-6.0, swap_short=-4.0),
+    'EURMXN': InstrumentSpec('EURMXN', 4, 0.55, 140.0, 0.01, 100.0, swap_long=20.0, swap_short=-45.0),
+    'NOKJPY': InstrumentSpec('NOKJPY', 2, 9.0, 2.0, 0.01, 100.0, swap_long=-1.0, swap_short=-2.0),
     
     # Commodities
     # XAUUSD: 1 lot = 100 troy oz, pip_size = 0.01, pip_value = $1.00
-    'XAUUSD': InstrumentSpec('XAUUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
+    'XAUUSD': InstrumentSpec('XAUUSD', 2, 1.0, 3.0, 0.01, 100.0, swap_long=-8.0, swap_short=-5.0),
     # XAGUSD: 1 lot = 5,000 oz, pip_size = 0.001, pip_value = $5.00
-    'XAGUSD': InstrumentSpec('XAGUSD', 3, 5.0, 2.0, 0.01, 100.0, 5.0, -3.0, -2.0),
+    'XAGUSD': InstrumentSpec('XAGUSD', 3, 5.0, 2.0, 0.01, 100.0, swap_long=-3.0, swap_short=-2.0),
     # Metal crosses
-    'XAUEUR': InstrumentSpec('XAUEUR', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
-    'XAUGBP': InstrumentSpec('XAUGBP', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
-    'XAUAUD': InstrumentSpec('XAUAUD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -8.0, -5.0),
-    'XAGEUR': InstrumentSpec('XAGEUR', 3, 5.0, 2.0, 0.01, 100.0, 5.0, -3.0, -2.0),
-    'XRX': InstrumentSpec('XRX', 3, 1.0, 5.0, 0.01, 100.0, 5.0, 0.0, 0.0),
+    'XAUEUR': InstrumentSpec('XAUEUR', 2, 1.0, 3.0, 0.01, 100.0, swap_long=-8.0, swap_short=-5.0),
+    'XAUGBP': InstrumentSpec('XAUGBP', 2, 1.0, 3.0, 0.01, 100.0, swap_long=-8.0, swap_short=-5.0),
+    'XAUAUD': InstrumentSpec('XAUAUD', 2, 1.0, 3.0, 0.01, 100.0, swap_long=-8.0, swap_short=-5.0),
+    'XAGEUR': InstrumentSpec('XAGEUR', 3, 5.0, 2.0, 0.01, 100.0, swap_long=-3.0, swap_short=-2.0),
+    'XRX': InstrumentSpec('XRX', 3, 1.0, 5.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
     # Additional FX Pairs (aligned with config)
-    'AUDJPY': InstrumentSpec('AUDJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -4.0, 1.0),
-    'EURAUD': InstrumentSpec('EURAUD', 4, 7.0, 2.0, 0.01, 100.0, 7.0, -4.0, 0.5),
-    'EURCHF': InstrumentSpec('EURCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
-    'EURCAD': InstrumentSpec('EURCAD', 4, 7.5, 2.0, 0.01, 100.0, 7.0, -4.0, 0.5),
-    'EURNZD': InstrumentSpec('EURNZD', 4, 6.0, 3.0, 0.01, 100.0, 7.0, -4.0, 0.5),
-    'GBPAUD': InstrumentSpec('GBPAUD', 4, 7.0, 2.5, 0.01, 100.0, 7.0, -5.0, 0.8),
-    'GBPCAD': InstrumentSpec('GBPCAD', 4, 7.5, 2.5, 0.01, 100.0, 7.0, -5.0, 0.8),
-    'GBPCHF': InstrumentSpec('GBPCHF', 4, 11.0, 2.5, 0.01, 100.0, 7.0, -5.0, 0.8),
-    'CADJPY': InstrumentSpec('CADJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -2.0, 0.5),
-    'NZDJPY': InstrumentSpec('NZDJPY', 2, 9.0, 2.0, 0.01, 100.0, 7.0, -2.0, 0.5),
-    'AUDCAD': InstrumentSpec('AUDCAD', 4, 7.5, 1.5, 0.01, 100.0, 7.0, 2.5, -8.0),
-    'AUDCHF': InstrumentSpec('AUDCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
-    'CADCHF': InstrumentSpec('CADCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
-    'CHFJPY': InstrumentSpec('CHFJPY', 2, 9.0, 1.0, 0.01, 100.0, 7.0, 8.5, -15.0),
-    'NZDCAD': InstrumentSpec('NZDCAD', 4, 7.5, 1.5, 0.01, 100.0, 7.0, 2.5, -8.0),
-    'NZDCHF': InstrumentSpec('NZDCHF', 4, 11.0, 2.0, 0.01, 100.0, 7.0, -3.0, 0.5),
-    'GBPNZD': InstrumentSpec('GBPNZD', 4, 6.0, 3.0, 0.01, 100.0, 7.0, -4.0, 0.5),
+    'AUDJPY': InstrumentSpec('AUDJPY', 2, 9.0, 2.0, 0.01, 100.0, swap_long=-4.0, swap_short=1.0),
+    'EURAUD': InstrumentSpec('EURAUD', 4, 7.0, 2.0, 0.01, 100.0, swap_long=-4.0, swap_short=0.5),
+    'EURCHF': InstrumentSpec('EURCHF', 4, 11.0, 2.0, 0.01, 100.0, swap_long=-3.0, swap_short=0.5),
+    'EURCAD': InstrumentSpec('EURCAD', 4, 7.5, 2.0, 0.01, 100.0, swap_long=-4.0, swap_short=0.5),
+    'EURNZD': InstrumentSpec('EURNZD', 4, 6.0, 3.0, 0.01, 100.0, swap_long=-4.0, swap_short=0.5),
+    'GBPAUD': InstrumentSpec('GBPAUD', 4, 7.0, 2.5, 0.01, 100.0, swap_long=-5.0, swap_short=0.8),
+    'GBPCAD': InstrumentSpec('GBPCAD', 4, 7.5, 2.5, 0.01, 100.0, swap_long=-5.0, swap_short=0.8),
+    'GBPCHF': InstrumentSpec('GBPCHF', 4, 11.0, 2.5, 0.01, 100.0, swap_long=-5.0, swap_short=0.8),
+    'CADJPY': InstrumentSpec('CADJPY', 2, 9.0, 2.0, 0.01, 100.0, swap_long=-2.0, swap_short=0.5),
+    'NZDJPY': InstrumentSpec('NZDJPY', 2, 9.0, 2.0, 0.01, 100.0, swap_long=-2.0, swap_short=0.5),
+    'AUDCAD': InstrumentSpec('AUDCAD', 4, 7.5, 1.5, 0.01, 100.0, swap_long=2.5, swap_short=-8.0),
+    'AUDCHF': InstrumentSpec('AUDCHF', 4, 11.0, 2.0, 0.01, 100.0, swap_long=-3.0, swap_short=0.5),
+    'CADCHF': InstrumentSpec('CADCHF', 4, 11.0, 2.0, 0.01, 100.0, swap_long=-3.0, swap_short=0.5),
+    'CHFJPY': InstrumentSpec('CHFJPY', 2, 9.0, 1.0, 0.01, 100.0, swap_long=8.5, swap_short=-15.0),
+    'NZDCAD': InstrumentSpec('NZDCAD', 4, 7.5, 1.5, 0.01, 100.0, swap_long=2.5, swap_short=-8.0),
+    'NZDCHF': InstrumentSpec('NZDCHF', 4, 11.0, 2.0, 0.01, 100.0, swap_long=-3.0, swap_short=0.5),
+    'GBPNZD': InstrumentSpec('GBPNZD', 4, 6.0, 3.0, 0.01, 100.0, swap_long=-4.0, swap_short=0.5),
 
     # Crypto (CFDs) - defaults used mainly for offline backtests; live trading overrides via broker specs
-    'BTCETH': InstrumentSpec('BTCETH', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'BTCXAU': InstrumentSpec('BTCXAU', 2, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'BTCETH': InstrumentSpec('BTCETH', 2, 1.0, 8.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'BTCXAU': InstrumentSpec('BTCXAU', 2, 1.0, 10.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
 
     # Exotic FX Crosses (ZAR)
-    'EURZAR': InstrumentSpec('EURZAR', 4, 0.55, 60.0, 0.01, 100.0, 15.0, 10.0, -30.0),
-    'GBPZAR': InstrumentSpec('GBPZAR', 4, 0.55, 70.0, 0.01, 100.0, 15.0, 8.0, -28.0),
+    'EURZAR': InstrumentSpec('EURZAR', 4, 0.55, 60.0, 0.01, 100.0, swap_long=10.0, swap_short=-30.0),
+    'GBPZAR': InstrumentSpec('GBPZAR', 4, 0.55, 70.0, 0.01, 100.0, swap_long=8.0, swap_short=-28.0),
 
     # Indices - point-based instruments; defaults used mainly for offline backtests; live trading overrides via broker specs
-    'US100': InstrumentSpec('US100', 0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'US30':  InstrumentSpec('US30',  0, 1.0, 3.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'US500': InstrumentSpec('US500', 0, 1.0, 1.5, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'DE30':  InstrumentSpec('DE30',  0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'EU50':  InstrumentSpec('EU50',  0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'UK100': InstrumentSpec('UK100', 0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'JP225': InstrumentSpec('JP225', 0, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'FR40':  InstrumentSpec('FR40',  0, 1.0, 2.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'ES35':  InstrumentSpec('ES35',  0, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'HK50':  InstrumentSpec('HK50',  0, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'AU200': InstrumentSpec('AU200', 0, 1.0, 3.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'US100': InstrumentSpec('US100', 0, 1.0, 2.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'US30':  InstrumentSpec('US30',  0, 1.0, 3.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'US500': InstrumentSpec('US500', 0, 1.0, 1.5, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'DE30':  InstrumentSpec('DE30',  0, 1.0, 2.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'EU50':  InstrumentSpec('EU50',  0, 1.0, 2.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'UK100': InstrumentSpec('UK100', 0, 1.0, 2.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'JP225': InstrumentSpec('JP225', 0, 1.0, 8.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'FR40':  InstrumentSpec('FR40',  0, 1.0, 2.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'ES35':  InstrumentSpec('ES35',  0, 1.0, 5.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'HK50':  InstrumentSpec('HK50',  0, 1.0, 8.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'AU200': InstrumentSpec('AU200', 0, 1.0, 3.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
 
     # Crypto (CFDs) - defaults used mainly for offline backtests; live trading overrides via broker specs
-    'BTCUSD': InstrumentSpec('BTCUSD', 2, 1.0, 15.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'ETHUSD': InstrumentSpec('ETHUSD', 2, 1.0, 8.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'XRPUSD': InstrumentSpec('XRPUSD', 4, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'TONUSD': InstrumentSpec('TONUSD', 3, 1.0, 12.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'LTCUSD': InstrumentSpec('LTCUSD', 2, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'SOLUSD': InstrumentSpec('SOLUSD', 2, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'BCHUSD': InstrumentSpec('BCHUSD', 2, 1.0, 5.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'DOGUSD': InstrumentSpec('DOGUSD', 4, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
-    'TRXUSD': InstrumentSpec('TRXUSD', 4, 1.0, 10.0, 0.01, 100.0, 0.0, 0.0, 0.0),
+    'BTCUSD': InstrumentSpec('BTCUSD', 2, 1.0, 15.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'ETHUSD': InstrumentSpec('ETHUSD', 2, 1.0, 8.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'XRPUSD': InstrumentSpec('XRPUSD', 4, 1.0, 12.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'TONUSD': InstrumentSpec('TONUSD', 3, 1.0, 12.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'LTCUSD': InstrumentSpec('LTCUSD', 2, 1.0, 5.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'SOLUSD': InstrumentSpec('SOLUSD', 2, 1.0, 5.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'BCHUSD': InstrumentSpec('BCHUSD', 2, 1.0, 5.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'DOGUSD': InstrumentSpec('DOGUSD', 4, 1.0, 10.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
+    'TRXUSD': InstrumentSpec('TRXUSD', 4, 1.0, 10.0, 0.01, 100.0, swap_long=0.0, swap_short=0.0),
 
     # Energy Commodities
-    'XTIUSD': InstrumentSpec('XTIUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -5.0, -3.0),
-    'XBRUSD': InstrumentSpec('XBRUSD', 2, 1.0, 3.0, 0.01, 100.0, 5.0, -5.0, -3.0),
-    'XNGUSD': InstrumentSpec('XNGUSD', 3, 1.0, 5.0, 0.01, 100.0, 5.0, -3.0, -2.0),
+    'XTIUSD': InstrumentSpec('XTIUSD', 2, 1.0, 3.0, 0.01, 100.0, swap_long=-5.0, swap_short=-3.0),
+    'XBRUSD': InstrumentSpec('XBRUSD', 2, 1.0, 3.0, 0.01, 100.0, swap_long=-5.0, swap_short=-3.0),
+    'XNGUSD': InstrumentSpec('XNGUSD', 3, 1.0, 5.0, 0.01, 100.0, swap_long=-3.0, swap_short=-2.0),
 }
 
 
@@ -3804,6 +3798,11 @@ def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
     Build an InstrumentSpec from config dict with optional defaults and inheritance.
     """
     data = data or {}
+    _reject_retired_instrument_spec_config_keys(data, source_name="instrument spec")
+    _reject_retired_instrument_spec_config_keys(
+        defaults,
+        source_name="instrument defaults",
+    )
     merged: Dict[str, Any] = {}
 
     # Inherit from another symbol if requested
@@ -3847,7 +3846,7 @@ def _spec_from_config_dict(symbol: str, data: Optional[Dict[str, Any]],
 
     # Coerce numeric types lightly (avoid strings in config)
     float_fields = {
-        "pip_value", "spread_avg", "min_lot", "max_lot", "commission_per_lot",
+        "pip_value", "spread_avg", "min_lot", "max_lot",
         "swap_long", "swap_short", "tick_size", "tick_value", "contract_size",
         "volume_step", "point", "swap_sunday", "swap_monday", "swap_tuesday",
         "swap_wednesday", "swap_thursday", "swap_friday", "swap_saturday"
@@ -3882,6 +3881,10 @@ def set_instrument_specs(specs: Optional[Dict[str, Any]] = None,
         Number of specs loaded
     """
     global _CONFIG_INSTRUMENT_SPECS, _CONFIG_SPEC_DEFAULTS
+    _reject_retired_instrument_spec_config_keys(
+        defaults,
+        source_name="instrument defaults",
+    )
     _CONFIG_SPEC_DEFAULTS = defaults or {}
     _CONFIG_INSTRUMENT_SPECS = {}
     if not specs:
@@ -3938,7 +3941,6 @@ def save_broker_specs(specs: Dict[str, Dict[str, Any]], filepath: str = "broker_
 def _create_spec_from_broker_data(
     symbol: str,
     broker_data: Dict[str, Any],
-    base_spec: Optional[InstrumentSpec] = None,
 ) -> InstrumentSpec:
     """Create an InstrumentSpec from broker spec data.
 
@@ -3950,9 +3952,6 @@ def _create_spec_from_broker_data(
     Args:
         symbol: Symbol name
         broker_data: Dict with MT5 symbol info fields
-        base_spec: Optional config/default spec used only for fields the broker
-            snapshot does not carry, such as explicit commission.
-
     Returns:
         InstrumentSpec populated with broker-real values (sanitized)
     """
@@ -4012,16 +4011,6 @@ def _create_spec_from_broker_data(
     else:
         spread_avg = 2.0
 
-    commission_raw = broker_data.get('commission_per_lot', None)
-    if commission_raw is None and base_spec is not None:
-        commission_raw = getattr(base_spec, "commission_per_lot", None)
-    if commission_raw is None:
-        commission_raw = 7.0
-    try:
-        commission_per_lot = float(commission_raw if commission_raw is not None else 7.0)
-    except (TypeError, ValueError):
-        commission_per_lot = 7.0
-
     try:
         return InstrumentSpec(
             symbol=symbol,
@@ -4031,7 +4020,6 @@ def _create_spec_from_broker_data(
             min_lot=float(broker_data.get('volume_min', 0.01) or 0.01),
             max_lot=float(broker_data.get('volume_max', 100.0) or 100.0),
             volume_step=float(broker_data.get('volume_step', 0.01) or 0.01),
-            commission_per_lot=commission_per_lot,
             swap_long=float(broker_data.get('swap_long', 0.0) or 0.0),
             swap_short=float(broker_data.get('swap_short', 0.0) or 0.0),
             swap_mode=int(broker_data.get('swap_mode', -1) if broker_data.get('swap_mode') is not None else -1),
@@ -4079,8 +4067,7 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
     Get instrument specification for a symbol.
     
     Priority:
-    1. Broker specs from broker_specs.json (if available) for execution fields,
-       with config specs used as commercial fallbacks such as commission.
+    1. Broker specs from broker_specs.json (if available) for execution fields.
     2. Config-provided instrument_specs overrides
     3. Default hardcoded specs
     4. Generic fallback spec
@@ -4101,7 +4088,7 @@ def get_instrument_spec(symbol: str) -> InstrumentSpec:
     broker_specs = load_broker_specs()
     broker_match = _lookup_broker_spec(symbol, broker_specs)
     if broker_match is not None:
-        return _create_spec_from_broker_data(symbol, broker_match[1], base_spec=config_spec)
+        return _create_spec_from_broker_data(symbol, broker_match[1])
 
     # 2) Config-provided overrides
     if config_spec is not None:
@@ -6774,10 +6761,10 @@ class Backtester:
     Simulates trading with:
     - Tick-based P&L calculation (MT5 parity)
     - Proper entry/exit price calculation (spread)
-    - Slippage applied only on STOP exits (not entries or TP)
+    - Exact broker-price STOP fills with gap exits at the observed bar open
     - Position sizing based on risk using tick math
     - Volume rounding using broker volume_step
-    - Commission deduction
+    - Causal swap accrual from authenticated instrument terms
     - Complete performance metrics calculation
     
     Optimizations:
@@ -6989,10 +6976,9 @@ class Backtester:
         entry_half_spread: np.ndarray,
         intrabar_half_spread: np.ndarray,
         spread_meta: Dict[str, Any],
-        slippage_price: float,
         spec: InstrumentSpec,
     ) -> Dict[str, Any]:
-        """Seal exact cost arrays, scalars, flags and broker instrument inputs."""
+        """Seal the exact spread arrays, policy, and instrument inputs."""
 
         spread_policy = {
             "mode": str(spread_meta.get("mode") or ""),
@@ -7023,28 +7009,18 @@ class Backtester:
             separators=(",", ":"),
             ensure_ascii=True,
         )
-        commission_inputs_sha256 = self._cost_attestation_json_sha256({
-            "schema_version": "fxpm-round-trip-commission-inputs-v1",
-            "commission_per_lot": float(spec.commission_per_lot),
-            "deduction_timing": "round_trip_at_trade_close",
-        })
         instrument_spec_sha256 = self._cost_attestation_json_sha256({
-            "schema_version": "fxpm-backtester-instrument-spec-v1",
+            "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
             "instrument_spec": asdict(spec),
         })
         return build_numerical_execution_cost_attestation(
             use_spread=bool(getattr(self.config, "use_spread", True)),
-            use_slippage=bool(getattr(self.config, "use_slippage", True)),
-            use_commission=bool(getattr(self.config, "use_commission", True)),
             spread_mode=spread_mode,
             spread_values_sha256=self._spread_arrays_sha256(
                 entry_half_spread,
                 intrabar_half_spread,
             ),
-            commission_inputs_sha256=commission_inputs_sha256,
             instrument_spec_sha256=instrument_spec_sha256,
-            slippage_pips=float(getattr(self.config, "slippage_pips", 0.0)),
-            slippage_price=float(slippage_price),
         )
 
     @staticmethod
@@ -7687,22 +7663,13 @@ class Backtester:
             entry_half_spread_arr, half_spread_arr, spread_meta = (
                 self._build_half_spread_arrays(features, spec)
             )
-            slippage_price = (
-                spec.pips_to_price(self.config.slippage_pips)
-                if self.config.use_slippage
-                else 0.0
-            )
             metrics = self._empty_result()
             metrics["winner_daily_r_surface"] = _backtest_winner_daily_surface(
                 "UNAVAILABLE"
             )
             metrics["spread_model"] = spread_meta
-            metrics["execution_cost_contract"] = (
-                BACKTEST_EXECUTION_COST_CONTRACT_VERSION
-            )
             metrics["swap_accrual_contract"] = swap_accrual_contract
             metrics["execution_cost_timing_contract"] = {
-                "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
                 "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
             }
             metrics["numerical_execution_cost_attestation"] = (
@@ -7710,7 +7677,6 @@ class Backtester:
                     entry_half_spread=entry_half_spread_arr,
                     intrabar_half_spread=half_spread_arr,
                     spread_meta=spread_meta,
-                    slippage_price=slippage_price,
                     spec=spec,
                 )
             )
@@ -7729,7 +7695,6 @@ class Backtester:
         # spread to preserve benchmark behavior; evidence modes can consume
         # historical bar-level spread columns.
         entry_half_spread_arr, half_spread_arr, spread_meta = self._build_half_spread_arrays(features, spec)
-        slippage_price = spec.pips_to_price(self.config.slippage_pips) if self.config.use_slippage else 0.0
         
         if 'ATR_14' in features.columns:
             atr_arr = pd.to_numeric(features['ATR_14'], errors='coerce').to_numpy().astype(np.float64)
@@ -7794,13 +7759,6 @@ class Backtester:
                     )
                 else:
                     entry_px = open_arr[entry_idx]
-                if self.config.use_slippage:
-                    entry_px = np.where(
-                        directions == 1,
-                        entry_px + slippage_price,
-                        entry_px - slippage_price,
-                    )
-
                 sl_delta = sl_pips_arr * float(spec.pip_size)
                 tp_delta = tp_pips_arr * float(spec.pip_size)
                 entry_prices[entry_idx] = entry_px
@@ -7869,21 +7827,14 @@ class Backtester:
                             f"sl={sl_pips}, tp={tp_pips}"
                         )
 
-                    # Entry price: Open of ENTRY bar (i), plus spread and an
-                    # adverse market-entry slippage allowance.
+                    # Entry price: Open of ENTRY bar (i), plus the configured
+                    # spread model.
                     open_price = open_arr[i]
                     entry_half_spread = entry_half_spread_arr[i] if i < len(entry_half_spread_arr) else 0.0
                     if self.config.use_spread:
                         entry_price = open_price + entry_half_spread if is_long else open_price - entry_half_spread
                     else:
                         entry_price = open_price
-                    if self.config.use_slippage:
-                        entry_price = (
-                            entry_price + slippage_price
-                            if is_long
-                            else entry_price - slippage_price
-                        )
-
                     # Set SL/TP prices
                     if direction == 1:
                         stop_loss = entry_price - spec.pips_to_price(sl_pips)
@@ -7934,9 +7885,8 @@ class Backtester:
                 sl_prices, tp_prices, entry_prices,
                 self.config.initial_capital,
                 discovery_risk_per_trade_pct,
-                half_spread_arr, slippage_price,
-                self.config.use_spread, self.config.use_slippage,
-                self.config.use_commission, spec.commission_per_lot,
+                half_spread_arr,
+                self.config.use_spread,
                 spec.tick_size, spec.tick_value, spec.pip_size, spec.pip_value,
                 spec.min_lot, spec.max_lot, spec.volume_step,
                 warmup_bars,
@@ -8000,7 +7950,7 @@ class Backtester:
             trades, final_equity, max_drawdown, equity_curve = self._run_python_loop(
                 features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                 sl_prices, tp_prices, entry_prices,
-                half_spread_arr, slippage_price, spec, warmup_bars,
+                half_spread_arr, spec, warmup_bars,
                 atr_arr=atr_arr,
                 governance_policy=normalized_governance,
                 discovery_risk_per_trade_pct=discovery_risk_per_trade_pct,
@@ -8051,7 +8001,6 @@ class Backtester:
             spec=spec,
             half_spread_arr=half_spread_arr,
             use_spread=bool(self.config.use_spread),
-            use_commission=bool(self.config.use_commission),
             swap_model_enabled=bool(
                 getattr(self.config, "swap_model_enabled", True)
             ),
@@ -8072,10 +8021,8 @@ class Backtester:
                 warmup_bars=warmup_bars,
             )
         metrics["spread_model"] = spread_meta
-        metrics["execution_cost_contract"] = BACKTEST_EXECUTION_COST_CONTRACT_VERSION
         metrics["swap_accrual_contract"] = swap_accrual_contract
         metrics["execution_cost_timing_contract"] = {
-            "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
             "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
         }
         metrics["numerical_execution_cost_attestation"] = (
@@ -8083,7 +8030,6 @@ class Backtester:
                 entry_half_spread=entry_half_spread_arr,
                 intrabar_half_spread=half_spread_arr,
                 spread_meta=spread_meta,
-                slippage_price=slippage_price,
                 spec=spec,
             )
         )
@@ -8114,11 +8060,6 @@ class Backtester:
         entry_half_spread, intrabar_half_spread, spread_meta = (
             self._build_half_spread_arrays(features, spec)
         )
-        slippage_price = (
-            spec.pips_to_price(self.config.slippage_pips)
-            if self.config.use_slippage
-            else 0.0
-        )
         (
             _pre_open_units,
             _close_units,
@@ -8135,9 +8076,7 @@ class Backtester:
         return {
             "position_events": [],
             "spread_model": spread_meta,
-            "execution_cost_contract": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
             "execution_cost_timing_contract": {
-                "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
                 "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
             },
             "numerical_execution_cost_attestation": (
@@ -8145,7 +8084,6 @@ class Backtester:
                     entry_half_spread=entry_half_spread,
                     intrabar_half_spread=intrabar_half_spread,
                     spread_meta=spread_meta,
-                    slippage_price=slippage_price,
                     spec=spec,
                 )
             ),
@@ -8180,7 +8118,8 @@ class Backtester:
         The returned object is a normal decision-relevant Backtester lane plus
         a method receipt.  It fails closed if the stress arrays are not
         pointwise adverse, the base lane cannot be reproduced, position
-        identities change, or any stressed daily/trade R improves.  A fully
+        identities change, any stressed trade R improves, or any stressed
+        cumulative daily-MTM prefix improves.  A fully
         evaluated lane with no strict realized degradation is returned with an
         authenticated insufficiency status so the evidence consumer can keep
         its genuine PBO fold while excluding the attempt from Winner.
@@ -8235,16 +8174,10 @@ class Backtester:
         base_entry_spread, base_intrabar_spread, base_spread_meta = (
             self._build_half_spread_arrays(features, spec)
         )
-        base_slippage_price = (
-            spec.pips_to_price(self.config.slippage_pips)
-            if self.config.use_slippage
-            else 0.0
-        )
         rebuilt_base_attestation = self._numerical_execution_cost_attestation(
             entry_half_spread=base_entry_spread,
             intrabar_half_spread=base_intrabar_spread,
             spread_meta=base_spread_meta,
-            slippage_price=base_slippage_price,
             spec=spec,
         )
         if (
@@ -8334,16 +8267,10 @@ class Backtester:
             or bool((stress_intrabar_spread + 1e-15 < base_intrabar_spread).any())
         ):
             raise ValueError("frozen-path stress spread arrays are not adverse")
-        stress_slippage_price = (
-            spec.pips_to_price(stress_config.slippage_pips)
-            if stress_config.use_slippage
-            else 0.0
-        )
         stress_attestation = stress_backtester._numerical_execution_cost_attestation(
             entry_half_spread=stress_entry_spread,
             intrabar_half_spread=stress_intrabar_spread,
             spread_meta=stress_spread_meta,
-            slippage_price=stress_slippage_price,
             spec=spec,
         )
         if (
@@ -8552,7 +8479,6 @@ class Backtester:
             spec=spec,
             half_spread_arr=base_intrabar_spread,
             use_spread=bool(self.config.use_spread),
-            use_commission=bool(self.config.use_commission),
             swap_model_enabled=bool(getattr(self.config, "swap_model_enabled", True)),
             causal_swap_enabled=base_causal_swap,
             pre_open_rollover_units_arr=base_pre_open_units,
@@ -8571,7 +8497,6 @@ class Backtester:
             spec=spec,
             half_spread_arr=stress_intrabar_spread,
             use_spread=bool(stress_config.use_spread),
-            use_commission=bool(stress_config.use_commission),
             swap_model_enabled=bool(
                 getattr(stress_config, "swap_model_enabled", True)
             ),
@@ -8729,9 +8654,7 @@ class Backtester:
             "winner_daily_r_surface": stress_surface,
             "trade_power_partition_axis": rebuilt_axis,
             "spread_model": stress_spread_meta,
-            "execution_cost_contract": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
             "execution_cost_timing_contract": {
-                "entry_slippage": BACKTEST_EXECUTION_COST_CONTRACT_VERSION,
                 "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
             },
             "numerical_execution_cost_attestation": stress_attestation,
@@ -9123,7 +9046,7 @@ class Backtester:
     
     def _run_python_loop(self, features, open_arr, high_arr, low_arr, close_arr, sig_arr,
                          sl_prices, tp_prices, entry_prices,
-                         half_spread_arr, slippage_price, spec,
+                         half_spread_arr, spec,
                          warmup_bars: int = 0,
                          atr_arr: Optional[np.ndarray] = None,
                          governance_policy: Optional[Dict[str, Any]] = None,
@@ -9422,8 +9345,6 @@ class Backtester:
                                     partial_size,
                                     position_direction,
                                 )
-                                if self.config.use_commission:
-                                    partial_gross_pnl -= spec.commission_per_lot * partial_size
                                 partial_risk = risk_amount_at_entry * partial_fraction
                                 partial_swap = accrued_swap_dollars_current * partial_fraction
                                 partial_net_pnl = partial_gross_pnl + partial_swap
@@ -9515,7 +9436,7 @@ class Backtester:
                         exit_price = bid_open
                         exit_reason = TradeStatus.CLOSED_SL.value
                     elif bid_low <= stop_loss:
-                        exit_price = stop_loss - slippage_price
+                        exit_price = stop_loss
                         exit_reason = TradeStatus.CLOSED_SL.value
                     elif bid_high >= take_profit:
                         exit_price = take_profit
@@ -9526,7 +9447,7 @@ class Backtester:
                         exit_price = ask_open
                         exit_reason = TradeStatus.CLOSED_SL.value
                     elif ask_high >= stop_loss:
-                        exit_price = stop_loss + slippage_price
+                        exit_price = stop_loss
                         exit_reason = TradeStatus.CLOSED_SL.value
                     elif ask_low <= take_profit:
                         exit_price = take_profit
@@ -9544,9 +9465,6 @@ class Backtester:
                     else:
                         pnl_pips = spec.price_to_pips(entry_price - exit_price)
                     
-                    # Deduct commission
-                    if self.config.use_commission:
-                        gross_pnl_dollars -= spec.commission_per_lot * position_size
                     net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
                     
                     # Calculate R-multiple
@@ -9605,9 +9523,6 @@ class Backtester:
                         loss_per_lot = spec.calculate_loss_at_stop(
                             entry_price_candidate, stop_loss_candidate, 1.0, direction
                         )
-                        if self.config.use_commission:
-                            loss_per_lot += spec.commission_per_lot
-                        
                         if loss_per_lot > 0:
                             raw_size = risk_amount_at_entry / loss_per_lot
                             position_size = spec.round_volume(raw_size)
@@ -9694,7 +9609,7 @@ class Backtester:
                                     exit_price = bid_open
                                     exit_reason = TradeStatus.CLOSED_SL.value
                                 elif bid_low <= stop_loss:
-                                    exit_price = stop_loss - slippage_price
+                                    exit_price = stop_loss
                                     exit_reason = TradeStatus.CLOSED_SL.value
                                 elif bid_high >= take_profit:
                                     exit_price = take_profit
@@ -9704,7 +9619,7 @@ class Backtester:
                                     exit_price = ask_open
                                     exit_reason = TradeStatus.CLOSED_SL.value
                                 elif ask_high >= stop_loss:
-                                    exit_price = stop_loss + slippage_price
+                                    exit_price = stop_loss
                                     exit_reason = TradeStatus.CLOSED_SL.value
                                 elif ask_low <= take_profit:
                                     exit_price = take_profit
@@ -9718,8 +9633,6 @@ class Backtester:
                                     pnl_pips = spec.price_to_pips(exit_price - entry_price)
                                 else:
                                     pnl_pips = spec.price_to_pips(entry_price - exit_price)
-                                if self.config.use_commission:
-                                    gross_pnl_dollars -= spec.commission_per_lot * position_size
                                 net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
                                 r_multiple = net_pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
                                 equity += gross_pnl_dollars
@@ -9772,8 +9685,6 @@ class Backtester:
                 unrealized = spec.calculate_tick_profit(
                     entry_price, mark_exit_price, position_size, position_direction
                 )
-                if self.config.use_commission:
-                    unrealized -= spec.commission_per_lot * position_size
                 current_equity = equity + unrealized
 
             equity_curve.append(current_equity)
@@ -9799,8 +9710,6 @@ class Backtester:
             else:
                 pnl_pips = spec.price_to_pips(entry_price - exit_price)
             
-            if self.config.use_commission:
-                gross_pnl_dollars -= spec.commission_per_lot * position_size
             net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
             
             r_multiple = net_pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0

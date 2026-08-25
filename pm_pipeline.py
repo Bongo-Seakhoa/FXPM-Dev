@@ -79,7 +79,6 @@ from pm_fairness_audit import build_fairness_evidence, build_fairness_report
 from pm_regime_audit import audit_regime_profitability
 from pm_statistics import (
     DAILY_NET_MTM_CONTRACT_VERSION,
-    ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION,
     EXECUTION_COST_TIMING_CONTRACT,
     LockboxAccessRegistry,
     STATISTICS_CONTRACT_VERSION,
@@ -141,7 +140,6 @@ from pm_search_outcomes import (
     classify_search_exception,
 )
 from pm_trade_power import (
-    REQUIRED_ENTRY_SLIPPAGE_CONTRACT,
     REQUIRED_SWAP_ACCRUAL_CONTRACT,
     REQUIRED_SWAP_PROJECTION_CONTRACT,
     REQUIRED_TRADE_RECORD_SCHEMA,
@@ -203,7 +201,7 @@ def _optimization_ledger_lock_path(filepath: Any) -> Path:
         ledger_path = Path.cwd() / ledger_path
     ledger_path = ledger_path.resolve()
     return ledger_path.with_name(f".{ledger_path.name}.generation.lock")
-PIPELINE_ARTIFACT_VERSION = "2026-07-13-trade-power-derived-binding-deployment-v7"
+PIPELINE_ARTIFACT_VERSION = "2026-08-24-spread-swap-execution-v8"
 
 # Runtime-only optimizer resource contract.  These values control scheduling
 # and failure isolation only; they never alter bars, features, trials, scoring,
@@ -2073,9 +2071,6 @@ def build_artifact_meta(config: PipelineConfig,
         "discovery_risk_per_trade_pct": float(getattr(config, "discovery_risk_per_trade_pct", 1.0)),
         "use_spread": bool(getattr(config, "use_spread", True)),
         "backtest_spread_mode": str(getattr(config, "backtest_spread_mode", "fixed_spec") or "fixed_spec"),
-        "use_commission": bool(getattr(config, "use_commission", True)),
-        "use_slippage": bool(getattr(config, "use_slippage", True)),
-        "slippage_pips": float(getattr(config, "slippage_pips", 0.0) or 0.0),
         "swap_model_enabled": bool(getattr(config, "swap_model_enabled", True)),
         "swap_model_min_holding_hours": float(getattr(config, "swap_model_min_holding_hours", 20.0) or 0.0),
         "swap_model_triple_rollover_day": str(
@@ -2095,9 +2090,6 @@ def build_artifact_meta(config: PipelineConfig,
         ),
         "false_discovery_symbol_count": int(getattr(config, "false_discovery_symbol_count", 0) or 0),
         "statistics_contract_version": STATISTICS_CONTRACT_VERSION,
-        "entry_slippage_timing_contract_version": (
-            ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION
-        ),
         "swap_accrual_timing_contract_version": (
             SWAP_ACCRUAL_TIMING_CONTRACT_VERSION
         ),
@@ -5545,8 +5537,6 @@ class RegimeOptimizer:
             != TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
             or requirement.projection_contract_version
             != REQUIRED_SWAP_PROJECTION_CONTRACT
-            or requirement.entry_slippage_contract_version
-            != REQUIRED_ENTRY_SLIPPAGE_CONTRACT
             or requirement.swap_accrual_contract_version
             != REQUIRED_SWAP_ACCRUAL_CONTRACT
             or requirement.trade_record_schema_version
@@ -5796,8 +5786,6 @@ class RegimeOptimizer:
             != requirement.projection_contract_version
             or source.get("numerical_execution_cost_policy_sha256")
             != requirement.numerical_execution_cost_policy_sha256
-            or source.get("entry_slippage_contract_version")
-            != requirement.entry_slippage_contract_version
             or source.get("swap_accrual_contract_version")
             != requirement.swap_accrual_contract_version
             or source.get("trade_record_schema_version")
@@ -6769,8 +6757,7 @@ class RegimeOptimizer:
             "return_type": "simple_net_equity_return",
             "includes_zero_return_active_days": True,
             "cost_contract": {
-                "spread_slippage_commission": "already_in_equity_curve",
-                "entry_slippage": ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION,
+                "spread": "already_in_equity_curve",
                 "swap_accrual": SWAP_ACCRUAL_TIMING_CONTRACT_VERSION,
                 "swap": "already_in_equity_curve_causal_rollover_accrual",
             },

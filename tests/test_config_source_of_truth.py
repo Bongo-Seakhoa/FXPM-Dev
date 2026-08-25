@@ -117,8 +117,6 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         )
         fixed_switches = {
             "use_spread",
-            "use_commission",
-            "use_slippage",
             "scoring_use_trade_frequency_bonus",
             "local_governance_tournament_enabled",
             "local_governance_live_mode",
@@ -135,12 +133,10 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         )
 
         self.assertTrue(resolved.use_spread)
-        self.assertTrue(resolved.use_commission)
-        self.assertTrue(resolved.use_slippage)
         live_position_defaults = PositionConfig()
         self.assertTrue(live_position_defaults.use_spread)
         self.assertTrue(live_position_defaults.use_slippage)
-        self.assertEqual(live_position_defaults.slippage_pips, resolved.slippage_pips)
+        self.assertEqual(live_position_defaults.slippage_pips, 0.5)
         self.assertFalse(live_position_defaults.auto_widen_sl)
         self.assertFalse(live_position_defaults.allow_min_lot_risk_clamp)
         self.assertTrue(
@@ -157,9 +153,13 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertEqual(resolved.walk_forward_promotion_policy, "promotion_gate")
         self.assertTrue(resolved.walk_forward_live_blocking_enabled)
 
-    def test_funded_position_cost_math_is_bound_to_backtest_contract(self):
-        pipeline = PipelineConfig(slippage_pips=0.75)
-        position = PositionConfig(use_spread=False, use_slippage=False, slippage_pips=9.0)
+    def test_funded_live_slippage_buffer_is_independent_of_pipeline_cost_model(self):
+        pipeline = SimpleNamespace(
+            use_spread=True,
+            use_slippage=False,
+            slippage_pips=9.0,
+        )
+        position = PositionConfig()
 
         _apply_funded_position_cost_contract(
             {"_meta": {"scope": "funded_live_v1"}},
@@ -169,7 +169,7 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
 
         self.assertTrue(position.use_spread)
         self.assertTrue(position.use_slippage)
-        self.assertEqual(position.slippage_pips, 0.75)
+        self.assertEqual(position.slippage_pips, 0.5)
 
         research_position = PositionConfig(
             use_spread=False,
@@ -213,7 +213,6 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertTrue(
             FUNDED_PIPELINE_CONFIG_KEYS.issubset(PipelineConfig.__dataclass_fields__)
         )
-        self.assertEqual(len(FUNDED_PIPELINE_CONFIG_KEYS), 157)
         self.assertLess(len(FUNDED_PIPELINE_CONFIG_KEYS), len(PipelineConfig.__dataclass_fields__))
 
     def test_funded_schema_admits_only_named_raw_capital_policy_surface(self):
@@ -313,12 +312,29 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertEqual(research.oos_embargo_bars, 2)
         self.assertEqual(research.oos_aggregate_policy, "all_folds")
 
-    def test_scoring_regime_settings_are_retired_and_oos_remains_fixed(self):
+    def test_retired_pipeline_settings_are_rejected_and_oos_remains_fixed(self):
         self.assertEqual(
             FUNDED_FIXED_PIPELINE_VALUES,
             {"oos_validation_mode": "fixed_holdout"},
         )
-        self.assertEqual(len(RETIRED_SCORING_CONFIG_KEYS), 10)
+        self.assertEqual(
+            RETIRED_SCORING_CONFIG_KEYS,
+            {
+                "legacy_confidence_bonus_cap",
+                "regime_scoring_model",
+                "slippage_pips",
+                "specialist_spokes_v2_allow_promote_small_default",
+                "specialist_spokes_v2_cost_frequency_strength",
+                "specialist_spokes_v2_default_fallback_enabled",
+                "specialist_spokes_v2_max_validation_sharpe",
+                "threadspark_historical_chunk_count",
+                "threadspark_historical_cost_scope",
+                "threadspark_selection_surface",
+                "threadspark_use_historical_cost_evidence",
+                "use_commission",
+                "use_slippage",
+            },
+        )
         self.assertTrue(
             RETIRED_SCORING_CONFIG_KEYS.isdisjoint(
                 PipelineConfig.__dataclass_fields__
@@ -436,7 +452,6 @@ class LiveRiskIntentTests(unittest.TestCase):
             max_combined_risk_pct=2.0,
             margin_entry_block_level=100.0,
             target_annual_vol=0.10,
-            use_commission=False,
             live_min_account_equity=0.0,
             live_min_account_equity_currency="",
         )
@@ -924,49 +939,6 @@ class LiveRiskIntentTests(unittest.TestCase):
         self.assertIsNone(actionable_payload["actual_risk_pct"])
         trader.mt5.send_market_order.assert_not_called()
 
-    def test_execute_entry_blocks_when_commission_pushes_min_lot_over_hard_cap(self):
-        trader = self._make_trader(
-            SimpleNamespace(
-                risk_per_trade_pct=0.05,
-                max_risk_pct=0.10,
-                min_position_size=0.01,
-                max_position_size=0.0,
-                risk_basis="equity",
-                auto_widen_sl=True,
-            )
-        )
-        trader.pipeline_config.use_commission = True
-
-        strategy = MagicMock()
-        strategy.calculate_stops.return_value = (10.0, 20.0)
-        features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
-
-        trader._execute_entry(
-            symbol="XAUUSD",
-            broker_symbol="XAUUSD",
-            signal=1,
-            strategy=strategy,
-            features=features,
-            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01, commission_per_lot=7.0),
-            magic=12345,
-            config=SimpleNamespace(symbol="XAUUSD"),
-            decision_key="risk-intent-commission",
-            bar_time_iso="2026-04-02T15:15:52",
-            best_candidate={
-                "timeframe": "M15",
-                "regime": "CHOP",
-                "strategy_name": "MomentumBurstStrategy",
-                "signal": 1,
-            },
-            positions_snapshot=[],
-            account_info=SimpleNamespace(balance=10000.0, equity=10000.0, margin_level=0.0),
-        )
-
-        actionable_payload = trader._actionable_log.record.call_args[0][1]
-        self.assertEqual(actionable_payload["action"], "BLOCKED_MIN_LOT_EXCEEDS_CAP")
-        self.assertIsNone(actionable_payload["actual_risk_pct"])
-        trader.mt5.send_market_order.assert_not_called()
-
     def test_execute_entry_blocks_before_submit_when_margin_required_exceeds_free_margin(self):
         trader = self._make_trader(
             SimpleNamespace(
@@ -992,7 +964,7 @@ class LiveRiskIntentTests(unittest.TestCase):
             signal=1,
             strategy=strategy,
             features=features,
-            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01, commission_per_lot=7.0),
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
             magic=12345,
             config=SimpleNamespace(symbol="XAUUSD"),
             decision_key="risk-intent-margin",
@@ -1082,7 +1054,7 @@ class LiveRiskIntentTests(unittest.TestCase):
             signal=1,
             strategy=MagicMock(),
             features=features,
-            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01, commission_per_lot=7.0),
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
             magic=12345,
             config=SimpleNamespace(symbol="XAUUSD"),
             decision_key="nonfinite-free-margin",
@@ -1124,7 +1096,7 @@ class LiveRiskIntentTests(unittest.TestCase):
             signal=1,
             strategy=MagicMock(),
             features=features,
-            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01, commission_per_lot=7.0),
+            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
             magic=12345,
             config=SimpleNamespace(symbol="XAUUSD"),
             decision_key="nonfinite-required-margin",
@@ -1143,7 +1115,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         actionable_payload = trader._actionable_log.record.call_args[0][1]
         self.assertEqual(actionable_payload["action"], "SKIPPED_MARGIN_UNAVAILABLE")
 
-    def test_execute_entry_submits_final_refreshed_entry_price(self):
+    def test_execute_entry_uses_gross_stop_risk_and_records_fill_slippage(self):
         trader = self._make_trader(
             SimpleNamespace(
                 risk_per_trade_pct=0.50,
@@ -1162,7 +1134,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         trader.mt5.send_market_order.return_value = SimpleNamespace(
             success=True,
             volume=0.05,
-            price=1.2050,
+            price=1.2052,
             retcode=10009,
             retcode_description="Done",
         )
@@ -1176,7 +1148,13 @@ class LiveRiskIntentTests(unittest.TestCase):
             signal=1,
             strategy=strategy,
             features=features,
-            spec=SimpleNamespace(pip_size=0.01, pip_value=1.0, spread_avg=3.0, point=0.01),
+            spec=SimpleNamespace(
+                pip_size=0.01,
+                pip_value=1.0,
+                spread_avg=3.0,
+                point=0.01,
+                commission_per_lot=7.0,
+            ),
             magic=12345,
             config=SimpleNamespace(symbol="XAUUSD"),
             decision_key="prechecked-price",
@@ -1199,6 +1177,9 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         kwargs = trader.mt5.send_market_order.call_args.kwargs
         self.assertEqual(kwargs["price"], 1.2050)
+        self.assertAlmostEqual(kwargs["volume"], 50.0 / 1000.0, places=9)
+        self.assertGreater(kwargs["volume"], 50.0 / (1000.0 + 7.0))
+        self.assertEqual(kwargs["deviation"], 30)
         self.assertAlmostEqual(kwargs["sl"], 1.1950, places=6)
         self.assertAlmostEqual(kwargs["tp"], 1.2250, places=6)
         self.assertIs(kwargs["symbol_info"], trader.mt5.get_symbol_info.return_value)
@@ -1206,10 +1187,14 @@ class LiveRiskIntentTests(unittest.TestCase):
         self.assertEqual(actionable_payload["action"], "EXECUTED")
         self.assertEqual(actionable_payload["actionable_schema_version"], ACTIONABLE_SCHEMA_VERSION)
         self.assertAlmostEqual(actionable_payload["expected_entry_price"], 1.2050, places=6)
-        self.assertAlmostEqual(actionable_payload["filled_entry_price"], 1.2050, places=6)
-        self.assertAlmostEqual(actionable_payload["entry_slippage_pips"], 0.0, places=6)
-        self.assertAlmostEqual(actionable_payload["entry_slippage_r"], 0.0, places=6)
-        self.assertEqual(actionable_payload["entry_slippage_direction"], "flat")
+        self.assertAlmostEqual(actionable_payload["filled_entry_price"], 1.2052, places=6)
+        self.assertAlmostEqual(actionable_payload["entry_slippage_pips"], 0.02, places=6)
+        self.assertAlmostEqual(
+            actionable_payload["entry_slippage_r"],
+            0.02 / 1.02,
+            places=6,
+        )
+        self.assertEqual(actionable_payload["entry_slippage_direction"], "adverse")
 
     def test_pre_send_reservation_precedes_send_and_fill_binding(self):
         trader = self._make_trader(

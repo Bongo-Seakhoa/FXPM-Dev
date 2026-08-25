@@ -104,7 +104,6 @@ def _fx_spec(**overrides) -> InstrumentSpec:
         "spread_avg": 0.0,
         "min_lot": 0.01,
         "max_lot": 100.0,
-        "commission_per_lot": 0.0,
         "tick_size": 0.0001,
         "tick_value": 10.0,
         "point": 0.0001,
@@ -148,8 +147,6 @@ def test_sub_minimum_risk_size_fails_closed_in_python_and_numba(monkeypatch):
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         discovery_risk_per_trade_pct=1.0,
     )
@@ -198,14 +195,13 @@ def test_empty_frame_returns_attested_result_without_entering_kernel(monkeypatch
         assert result["final_equity"] == pytest.approx(config.initial_capital)
         assert result["equity_curve"] == [config.initial_capital]
         assert result["execution_cost_timing_contract"] == {
-            "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
         }
         assert result["swap_accrual_contract"]["status"] == "UNAVAILABLE"
         assert result["swap_accrual_contract"]["execution_state_compounding"] is False
         attestation = result["numerical_execution_cost_attestation"]
         assert attestation["schema_version"] == (
-            "fxpm-numerical-execution-cost-v1"
+            "fxpm-numerical-execution-cost-v2"
         )
         assert len(attestation["policy_sha256"]) == 64
         assert len(attestation["attestation_sha256"]) == 64
@@ -230,15 +226,11 @@ def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=True,
-        use_commission=True,
-        slippage_pips=0.75,
         backtest_spread_mode="conservative_max",
         swap_model_enabled=False,
     )
     spec = _fx_spec(
         spread_avg=1.0,
-        commission_per_lot=7.0,
         point=0.0001,
     )
     backtester = Backtester(config)
@@ -256,12 +248,15 @@ def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
     attestation = result["numerical_execution_cost_attestation"]
 
     assert attestation["use_spread"] is True
-    assert attestation["use_slippage"] is True
-    assert attestation["use_commission"] is True
-    assert float.fromhex(attestation["slippage_pips_hex"]) == 0.75
-    assert float.fromhex(attestation["slippage_price_hex"]) == pytest.approx(
-        spec.pips_to_price(0.75)
-    )
+    assert set(attestation) == {
+        "schema_version",
+        "use_spread",
+        "spread_mode",
+        "spread_values_sha256",
+        "instrument_spec_sha256",
+        "policy_sha256",
+        "attestation_sha256",
+    }
     assert attestation["spread_values_sha256"] == (
         Backtester._spread_arrays_sha256(
             entry_half_spread,
@@ -274,14 +269,9 @@ def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
     assert spread_policy["bar_column"] == "SpreadMax"
     expected = build_numerical_execution_cost_attestation(
         use_spread=True,
-        use_slippage=True,
-        use_commission=True,
         spread_mode=attestation["spread_mode"],
         spread_values_sha256=attestation["spread_values_sha256"],
-        commission_inputs_sha256=attestation["commission_inputs_sha256"],
         instrument_spec_sha256=attestation["instrument_spec_sha256"],
-        slippage_pips=float.fromhex(attestation["slippage_pips_hex"]),
-        slippage_price=float.fromhex(attestation["slippage_price_hex"]),
     )
     assert attestation == expected
 
@@ -296,12 +286,10 @@ def test_cost_policy_is_stable_but_exact_spread_attestation_is_slice_local(
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=True,
-        use_commission=True,
         backtest_spread_mode="conservative_max",
         swap_model_enabled=False,
     )
-    spec = _fx_spec(spread_avg=1.0, commission_per_lot=7.0)
+    spec = _fx_spec(spread_avg=1.0)
     attestations = []
     for subset in (frame.iloc[:4].copy(), frame.iloc[4:].copy()):
         strategy = _OneShotAtrStrategy(1)
@@ -321,23 +309,19 @@ def test_cost_policy_is_stable_but_exact_spread_attestation_is_slice_local(
     assert first["attestation_sha256"] != second["attestation_sha256"]
 
 
-def test_cost_policy_binds_slippage_commission_and_instrument_spec(monkeypatch):
+def test_cost_policy_binds_instrument_spec(monkeypatch):
     monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
     frame = _flat_daily_frame(rows=3)
     strategy = _OneShotAtrStrategy(1)
 
-    def attestation(*, slippage_pips, commission_per_lot, tick_value):
+    def attestation(*, tick_value):
         config = PipelineConfig(
             research_mode=True,
             use_spread=True,
-            use_slippage=True,
-            use_commission=True,
-            slippage_pips=slippage_pips,
             swap_model_enabled=False,
         )
         spec = _fx_spec(
             spread_avg=1.0,
-            commission_per_lot=commission_per_lot,
             tick_value=tick_value,
         )
         return Backtester(config).run(
@@ -349,33 +333,10 @@ def test_cost_policy_binds_slippage_commission_and_instrument_spec(monkeypatch):
             timeframe="D1",
         )["numerical_execution_cost_attestation"]
 
-    baseline = attestation(
-        slippage_pips=0.5,
-        commission_per_lot=7.0,
-        tick_value=10.0,
-    )
-    changed_slippage = attestation(
-        slippage_pips=0.75,
-        commission_per_lot=7.0,
-        tick_value=10.0,
-    )
-    changed_commission = attestation(
-        slippage_pips=0.5,
-        commission_per_lot=8.0,
-        tick_value=10.0,
-    )
-    changed_spec = attestation(
-        slippage_pips=0.5,
-        commission_per_lot=7.0,
-        tick_value=11.0,
-    )
+    baseline = attestation(tick_value=10.0)
+    changed_spec = attestation(tick_value=11.0)
 
-    assert len({
-        baseline["policy_sha256"],
-        changed_slippage["policy_sha256"],
-        changed_commission["policy_sha256"],
-        changed_spec["policy_sha256"],
-    }) == 4
+    assert baseline["policy_sha256"] != changed_spec["policy_sha256"]
 
 
 def test_disabled_research_costs_are_attested_honestly(monkeypatch):
@@ -385,8 +346,6 @@ def test_disabled_research_costs_are_attested_honestly(monkeypatch):
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
     )
     result = Backtester(config).run(
@@ -400,9 +359,6 @@ def test_disabled_research_costs_are_attested_honestly(monkeypatch):
     attestation = result["numerical_execution_cost_attestation"]
 
     assert attestation["use_spread"] is False
-    assert attestation["use_slippage"] is False
-    assert attestation["use_commission"] is False
-    assert float.fromhex(attestation["slippage_price_hex"]) == 0.0
 
 
 def test_governance_partial_close_uses_broker_executable_volumes(monkeypatch):
@@ -415,8 +371,6 @@ def test_governance_partial_close_uses_broker_executable_volumes(monkeypatch):
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         discovery_risk_per_trade_pct=1.0,
     )
@@ -470,8 +424,6 @@ def test_governance_partial_executes_at_current_side_open_not_prior_close(
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
     )
     result = Backtester(config).run(
@@ -518,8 +470,6 @@ def test_governance_exit_now_executes_at_current_side_open_not_prior_close(
         PipelineConfig(
             research_mode=True,
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
             swap_model_enabled=False,
         )
     ).run(
@@ -548,14 +498,14 @@ def test_governance_exit_now_executes_at_current_side_open_not_prior_close(
 
 
 @pytest.mark.parametrize("direction", [1, -1])
-def test_entry_slippage_matches_fast_slow_and_python_numba(monkeypatch, direction):
+def test_entry_price_has_no_configured_slippage_in_python_and_numba(
+    monkeypatch,
+    direction,
+):
     frame = _flat_daily_frame()
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=True,
-        slippage_pips=1.0,
-        use_commission=False,
         swap_model_enabled=False,
         discovery_risk_per_trade_pct=1.0,
     )
@@ -580,9 +530,8 @@ def test_entry_slippage_matches_fast_slow_and_python_numba(monkeypatch, directio
                 timeframe="D1",
             )
             trade = result["trades"][0]
-            expected_entry = 1.0001 if direction > 0 else 0.9999
-            assert trade["entry_price"] == pytest.approx(expected_entry)
-            assert trade["pnl_pips"] == pytest.approx(-1.0)
+            assert trade["entry_price"] == pytest.approx(1.0)
+            assert trade["pnl_pips"] == pytest.approx(0.0)
             results[(use_numba, structural)] = result
 
         fast = results[(use_numba, False)]
@@ -721,8 +670,6 @@ def test_gap_carry_precedes_exit_and_replacement_sizing_in_both_engines(
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=True,
         discovery_risk_per_trade_pct=1.0,
     )
@@ -889,8 +836,6 @@ def test_new_post_gap_entry_does_not_pay_pre_entry_carry_in_both_engines(
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=True,
         discovery_risk_per_trade_pct=1.0,
     )
@@ -928,8 +873,6 @@ def test_missing_close_axis_is_explicitly_noncausal_and_unavailable(monkeypatch)
         PipelineConfig(
             research_mode=True,
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
             swap_model_enabled=True,
             swap_model_min_holding_hours=0.0,
         )
@@ -943,7 +886,6 @@ def test_missing_close_axis_is_explicitly_noncausal_and_unavailable(monkeypatch)
     )
 
     assert result["execution_cost_timing_contract"] == {
-        "entry_slippage": "entry_slippage_parity_v1",
         "swap_accrual": "causal_swap_accrual_v1",
     }
     assert result["swap_accrual_contract"]["status"] == "UNAVAILABLE"
@@ -964,8 +906,6 @@ def test_causal_swap_changes_the_next_trade_risk_budget_and_size(monkeypatch):
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=True,
         swap_model_min_holding_hours=0.0,
         discovery_risk_per_trade_pct=1.0,
@@ -1001,7 +941,6 @@ def test_causal_swap_changes_the_next_trade_risk_budget_and_size(monkeypatch):
         ] is False
         assert result["swap_accrual_contract"]["execution_state_compounding"] is True
         assert result["execution_cost_timing_contract"] == {
-            "entry_slippage": "entry_slippage_parity_v1",
             "swap_accrual": "causal_swap_accrual_v1",
         }
         assert result["swap_accrual_contract"]["timestamp_source"] == (
@@ -1043,7 +982,7 @@ def test_causal_swap_changes_the_next_trade_risk_budget_and_size(monkeypatch):
 
 
 @pytest.mark.parametrize("direction", [1, -1])
-def test_round_trip_commission_is_included_in_stop_risk_sizing(
+def test_stop_risk_sizing_is_price_only(
     monkeypatch,
     direction,
 ):
@@ -1057,12 +996,10 @@ def test_round_trip_commission_is_included_in_stop_risk_sizing(
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=True,
         swap_model_enabled=False,
         discovery_risk_per_trade_pct=1.0,
     )
-    spec = _fx_spec(commission_per_lot=7.0)
+    spec = _fx_spec()
     original_numba = bool(pm_core.NUMBA_AVAILABLE)
     engine_modes = [False, True] if original_numba else [False]
     results = {}
@@ -1078,11 +1015,11 @@ def test_round_trip_commission_is_included_in_stop_risk_sizing(
             timeframe="D1",
         )
         trade = result["trades"][0]
-        # $100 / ($500 stop + $7 round-trip commission) = 0.1972 lots,
-        # rounded down to the broker's 0.01 step.
+        # $100 / $500 stop loss per lot = 0.20 lots exactly. Research sizing
+        # does not invent a configured round-trip commission.
         assert trade["risk_amount"] == pytest.approx(100.0)
-        assert trade["position_size"] == pytest.approx(0.19)
-        assert trade["gross_pnl_dollars"] == pytest.approx(-96.33)
+        assert trade["position_size"] == pytest.approx(0.20)
+        assert trade["gross_pnl_dollars"] == pytest.approx(-100.0)
         assert abs(trade["pnl_dollars"]) <= trade["risk_amount"]
         results[use_numba] = result
 

@@ -11,13 +11,11 @@ from pm_core import Backtester, InstrumentSpec, PipelineConfig
 from pm_pipeline import RegimeOptimizer, StrategyRegistry, build_artifact_meta
 from pm_statistics import (
     DAILY_NET_MTM_CONTRACT_VERSION,
-    ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION,
     EXECUTION_COST_TIMING_CONTRACT,
     SWAP_ACCRUAL_TIMING_CONTRACT_VERSION,
     STATISTICS_CONTRACT_VERSION,
 )
 from pm_trade_power import (
-    REQUIRED_ENTRY_SLIPPAGE_CONTRACT,
     REQUIRED_SWAP_ACCRUAL_CONTRACT,
     REQUIRED_TRADE_RECORD_SCHEMA,
     build_numerical_execution_cost_attestation,
@@ -87,20 +85,14 @@ class _EquityBacktester:
             "equity_curve": equity.tolist(),
             "trades": trades,
             "execution_cost_timing_contract": {
-                "entry_slippage": REQUIRED_ENTRY_SLIPPAGE_CONTRACT,
                 "swap_accrual": REQUIRED_SWAP_ACCRUAL_CONTRACT,
             },
             "numerical_execution_cost_attestation": (
                 build_numerical_execution_cost_attestation(
                     use_spread=True,
-                    use_slippage=True,
-                    use_commission=True,
                     spread_mode="conservative_max",
                     spread_values_sha256="9" * 64,
-                    commission_inputs_sha256="a" * 64,
                     instrument_spec_sha256="b" * 64,
-                    slippage_pips=0.5,
-                    slippage_price=0.00005,
                 )
             ),
             "swap_accrual_contract": {
@@ -264,9 +256,7 @@ def test_artifact_fingerprint_binds_statistics_and_cost_timing_contracts():
     metadata = build_artifact_meta(_optimizer().config)
 
     assert metadata["statistics_contract_version"] == STATISTICS_CONTRACT_VERSION
-    assert metadata["entry_slippage_timing_contract_version"] == (
-        ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION
-    )
+    assert "entry_slippage_timing_contract_version" not in metadata
     assert metadata["swap_accrual_timing_contract_version"] == (
         SWAP_ACCRUAL_TIMING_CONTRACT_VERSION
     )
@@ -405,9 +395,7 @@ def test_daily_net_mtm_surface_keeps_open_trade_marks_zero_days_and_warmup():
     assert contract["partition"] == "tuning_validation"
     assert contract["scored_start_bar"] == 2
     assert contract["zero_return_days"] == 1
-    assert contract["cost_contract"]["entry_slippage"] == (
-        ENTRY_SLIPPAGE_TIMING_CONTRACT_VERSION
-    )
+    assert contract["cost_contract"]["spread"] == "already_in_equity_curve"
     assert contract["cost_contract"]["swap_accrual"] == (
         SWAP_ACCRUAL_TIMING_CONTRACT_VERSION
     )
@@ -458,8 +446,6 @@ def test_config_disabled_swap_does_not_claim_cost_complete_daily_surface():
         research_mode=True,
         timeframes=["D1"],
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
     )
     optimizer = RegimeOptimizer(config)
@@ -477,7 +463,6 @@ def test_config_disabled_swap_does_not_claim_cost_complete_daily_surface():
             pip_position=4,
             pip_value=10.0,
             spread_avg=0.0,
-            commission_per_lot=0.0,
         ),
         timeframe="D1",
     )
@@ -502,8 +487,6 @@ def test_default_swap_enabled_unauthenticated_schedule_is_not_statistical_eviden
         research_mode=True,
         timeframes=["D1"],
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
     )
     assert config.swap_model_enabled is True
     optimizer = RegimeOptimizer(config)
@@ -520,7 +503,6 @@ def test_default_swap_enabled_unauthenticated_schedule_is_not_statistical_eviden
             pip_position=4,
             pip_value=10.0,
             spread_avg=0.0,
-            commission_per_lot=0.0,
             swap_long=-1.0,
             swap_short=0.5,
         ),

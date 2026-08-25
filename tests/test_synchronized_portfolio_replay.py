@@ -15,8 +15,14 @@ PATCH_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PATCH_ROOT))
 
 from pm_portfolio_replay import (  # noqa: E402
+    CURRENT_REFIT_REPLAY_RECONCILIATION_SCHEMA_VERSION,
+    CURRENT_REFIT_REPLAY_SUCCESSOR_SCHEMA_VERSION,
+    MTM_MARK_COST_CONTRACT_VERSION,
     PORTFOLIO_REPLAY_CANDIDATE_SCHEMA_VERSION,
+    PORTFOLIO_REPLAY_EVIDENCE_SCHEMA_VERSION,
+    PORTFOLIO_REPLAY_INPUT_RECEIPT_VERSION,
     PORTFOLIO_REPLAY_ROSTER_SCHEMA_VERSION,
+    PORTFOLIO_REPLAY_SCHEMA_VERSION,
     CandidateTrade,
     ExitLeg,
     MarkPoint,
@@ -39,7 +45,6 @@ from agent_audit.performance.scripts.run_synchronized_portfolio_replay import ( 
     _marks_for_position,
     replay_cell_candidates,
     resolved_live_governance_mode,
-    stop_risk_per_lot_including_commission,
 )
 
 
@@ -135,17 +140,32 @@ def test_funded_cost_contract_uses_code_owned_defaults_when_json_omits_switches(
                 # These remain operator-owned values while the enablement
                 # switches are deliberately absent from funded JSON.
                 "backtest_spread_mode": "conservative_max",
-                "slippage_pips": 0.75,
                 "swap_model_enabled": True,
             }
         }
     )
 
     assert contract["use_spread"] is resolved.use_spread is True
-    assert contract["use_commission"] is resolved.use_commission is True
-    assert contract["use_slippage"] is resolved.use_slippage is True
     assert contract["backtest_spread_mode"] == "conservative_max"
-    assert contract["slippage_pips"] == pytest.approx(0.75)
+    assert contract["swap_model_enabled"] is resolved.swap_model_enabled is True
+    assert set(contract) == {
+        "use_spread",
+        "backtest_spread_mode",
+        "swap_model_enabled",
+        "swap_model_min_holding_hours",
+        "swap_model_triple_rollover_day",
+    }
+
+
+@pytest.mark.parametrize(
+    "retired_key",
+    ["use_commission", "use_slippage", "slippage_pips"],
+)
+def test_funded_cost_contract_rejects_retired_execution_keys(
+    retired_key: str,
+) -> None:
+    with pytest.raises(ValueError, match="retired scoring config keys"):
+        portfolio_cost_contract({"pipeline": {retired_key: True}})
 
 
 def test_funded_policy_disables_replay_only_pair_correlation_gate() -> None:
@@ -176,31 +196,98 @@ def test_replay_governance_uses_resolved_funded_default_when_json_omits_key() ->
     assert resolved_live_governance_mode(PipelineConfig()) == "off"
 
 
-def test_candidate_stop_risk_includes_same_round_trip_commission_as_live():
+def test_candidate_stop_risk_uses_broker_price_loss_only(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from agent_audit.performance.scripts import (
+        run_synchronized_portfolio_replay as replay_cli,
+    )
+
+    index = pd.date_range("2025-01-01", periods=220, freq="h")
+    frame = pd.DataFrame(
+        {
+            "Open": 1.1,
+            "High": 1.101,
+            "Low": 1.099,
+            "Close": 1.1,
+            "Volume": 1.0,
+            "REGIME_LIVE": "TREND",
+        },
+        index=index,
+    )
+    signals = pd.Series(0, index=index, dtype=int)
+    signals.iloc[10] = 1
+    strategy = SimpleNamespace(generate_signals=lambda *_args: signals)
+    fake_backtester = SimpleNamespace(
+        run=lambda *_args, **_kwargs: {
+            "trades": [
+                {
+                    "entry_bar": 10,
+                    "signal_bar": 9,
+                    "entry_time": index[10],
+                    "exit_time": index[20],
+                    "direction": "LONG",
+                    "entry_price": 1.1,
+                    "exit_price": 1.101,
+                    "position_size": 1.0,
+                    "entry_to_stop_pips": 10.0,
+                    "pnl_dollars": 100.0,
+                    "swap_dollars": 0.0,
+                }
+            ]
+        },
+        _build_half_spread_arrays=lambda *_args: (
+            np.zeros(len(frame)),
+            np.zeros(len(frame)),
+            {},
+        ),
+    )
     spec = SimpleNamespace(
-        commission_per_lot=7.0,
-        calculate_loss_at_stop=lambda *_args: 100.0,
+        pip_size=0.0001,
+        asset_class="fx",
+        contract_size=100_000.0,
+        min_lot=0.01,
+        max_lot=100.0,
+        volume_step=0.01,
+        commission_per_lot=7.0,  # Retired sentinel must have no effect.
+        calculate_loss_at_stop=lambda *_args: 1_000.0,
+        calculate_tick_profit=lambda *_args: 100.0,
     )
-    assert (
-        stop_risk_per_lot_including_commission(
-            spec,
-            entry_price=1.10,
-            stop_price=1.09,
-            direction=1,
-            use_commission=True,
-        )
-        == 107.0
+    monkeypatch.setattr(
+        replay_cli.FeatureComputer, "compute_all", lambda *_args, **_kwargs: frame
     )
-    assert (
-        stop_risk_per_lot_including_commission(
-            spec,
-            entry_price=1.10,
-            stop_price=1.09,
-            direction=1,
-            use_commission=False,
-        )
-        == 100.0
+    monkeypatch.setattr(
+        replay_cli.StrategyRegistry, "get", lambda *_args, **_kwargs: strategy
     )
+    monkeypatch.setattr(replay_cli, "Backtester", lambda _cfg: fake_backtester)
+    monkeypatch.setattr(replay_cli, "_priority_score", lambda _cell: 1.0)
+
+    candidates, report = replay_cell_candidates(
+        PipelineConfig(),
+        {
+            "symbol": "EURUSD",
+            "timeframe": "H1",
+            "regime": "TREND",
+            "strategy_name": "Test",
+            "parameters": {},
+            "promotion_status": "PROMOTED",
+        },
+        frame,
+        spec,
+        "EURUSD",
+        evaluation_start=index[0],
+        evaluation_end=index[-1] + pd.Timedelta(hours=1),
+        apply_governance=False,
+        include_marks=False,
+    )
+
+    assert report["error"] == ""
+    assert len(candidates) == 1
+    assert candidates[0].stop_risk_per_lot == 1_000.0
+    assert "commission_per_entry_lot" not in current_refit_candidate_record(
+        candidates[0]
+    )["legs"][0]
+    assert not hasattr(replay_cli, "stop_risk_per_lot_including_commission")
 
 
 def candidate(
@@ -224,7 +311,16 @@ def candidate(
     marks=(),
 ) -> CandidateTrade:
     if legs is None:
-        legs = (ExitLeg(exit, 1.0, net_per_lot, net_per_lot + 7.0, 7.0, 0.0, "exit"),)
+        legs = (
+            ExitLeg(
+                exit_time=exit,
+                fraction=1.0,
+                net_pnl_per_entry_lot=net_per_lot,
+                price_pnl_per_entry_lot=net_per_lot,
+                swap_per_entry_lot=0.0,
+                exit_reason="exit",
+            ),
+        )
     return CandidateTrade(
         candidate_id=candidate_id,
         cell_id=f"{symbol}|{timeframe}|TREND",
@@ -249,6 +345,25 @@ def candidate(
 
 
 def test_public_candidate_trade_codec_is_exact_and_supplies_no_defaults() -> None:
+    assert PORTFOLIO_REPLAY_SCHEMA_VERSION == (
+        "2026-08-24-synchronized-spread-swap-v10"
+    )
+    assert PORTFOLIO_REPLAY_EVIDENCE_SCHEMA_VERSION == (
+        "2026-08-24-funded-portfolio-evidence-v8"
+    )
+    assert PORTFOLIO_REPLAY_CANDIDATE_SCHEMA_VERSION == (
+        "2026-08-24-native-final-lockbox-spread-swap-position-v6"
+    )
+    assert MTM_MARK_COST_CONTRACT_VERSION == "causal-common-valuation-tape-v2"
+    assert PORTFOLIO_REPLAY_INPUT_RECEIPT_VERSION == (
+        "fxpm.synchronized-replay-input-receipt.v2"
+    )
+    assert CURRENT_REFIT_REPLAY_SUCCESSOR_SCHEMA_VERSION == (
+        "fxpm.current-refit-synchronized-replay.v2"
+    )
+    assert CURRENT_REFIT_REPLAY_RECONCILIATION_SCHEMA_VERSION == (
+        "fxpm.current-refit-replay-reconciliation.v2"
+    )
     original = candidate(
         "candidate-codec",
         marks=(MarkPoint("2025-01-01T12:00:00Z", 12.5, "2025-01-01T12:00:00Z"),),
@@ -413,8 +528,6 @@ def test_current_refit_successor_recomputes_synchronized_result() -> None:
         },
         expected_cost_contract={
             "use_spread": True,
-            "use_commission": True,
-            "use_slippage": True,
             "swap_model_enabled": True,
         },
         expected_policies=policies,
@@ -511,14 +624,13 @@ def test_unique_same_symbol_specialists_obey_same_symbol_risk_cap():
     assert result["summary"]["blocked_by_reason"] == {"SAME_SYMBOL_OPEN_RISK_CAP": 1}
 
 
-def test_legacy_d1_lower_flag_cannot_reenable_exact_cell_pyramiding():
+def test_exact_cell_pyramiding_is_forbidden():
     first = candidate("first", timeframe="M5", exit="2025-01-06")
     duplicate = candidate(
         "duplicate", timeframe="M5", entry="2025-01-02", exit="2025-01-05"
     )
     result = SynchronizedPortfolioSimulator(
         policy(
-            allow_d1_plus_lower_tf=True,
             max_same_symbol_open_risk_pct=2.0,
         )
     ).run([first, duplicate])
@@ -560,7 +672,6 @@ def test_funded_policy_has_no_hidden_six_specialist_ceiling():
                 "max_new_entries_when_total_open_risk_above_pct": 20.0,
                 "max_combined_risk_pct": 10.0,
                 "production_symbol_pool_target_count": 8,
-                "allow_d1_plus_lower_tf": False,
                 "margin_reopen_level": 300.0,
                 "live_allowed_promotion_statuses": ["PROMOTED"],
             },
@@ -596,12 +707,12 @@ def test_structural_ceiling_is_one_slot_per_symbol_timeframe_regime():
             "max_new_entries_when_total_open_risk_above_pct": 2.0,
             "max_combined_risk_pct": 1.0,
             "production_symbol_pool_target_count": 3,
-            "allow_d1_plus_lower_tf": True,
         },
         "position": {"risk_per_trade_pct": 0.25, "max_risk_pct": 0.50},
     }
     funded_policy = portfolio_policy_from_config_payload(payload, 10_000.0)
     assert funded_policy.max_concurrent_positions == 3 * 6 * 4
+    assert not hasattr(funded_policy, "allow_d1_plus_lower_tf")
 
 
 def test_production_structural_ceiling_covers_exact_100_by_6_by_4_roster():
@@ -615,7 +726,6 @@ def test_production_structural_ceiling_covers_exact_100_by_6_by_4_roster():
                 "max_combined_risk_pct": 90.0,
                 "max_factor_group_open_risk_pct": 90.0,
                 "production_symbol_pool_target_count": 100,
-                "allow_d1_plus_lower_tf": False,
             },
             "position": {"risk_per_trade_pct": 0.25, "max_risk_pct": 0.50},
         },
@@ -994,7 +1104,6 @@ def test_mtm_marks_accrue_swap_causally_with_broker_triple_day():
     spec = InstrumentSpec(
         "TEST",
         pip_position=2,
-        commission_per_lot=0.0,
         swap_long=-5.0,
         swap_short=1.0,
         swap_mode=-1,
@@ -1010,7 +1119,6 @@ def test_mtm_marks_accrue_swap_causally_with_broker_triple_day():
         index[-1],
         100.0,
         1,
-        0.0,
         backtester,
         "D1",
     )
@@ -1033,7 +1141,7 @@ def test_m5_valuation_uses_observable_open_not_future_close():
         index=index,
     )
     backtester = Backtester(PipelineConfig(swap_model_enabled=False))
-    spec = InstrumentSpec("TEST", pip_position=2, commission_per_lot=0.0)
+    spec = InstrumentSpec("TEST", pip_position=2)
     spec.calculate_tick_profit = lambda entry, exit_price, volume, direction: (
         (exit_price - entry) * volume * direction
     )
@@ -1046,7 +1154,6 @@ def test_m5_valuation_uses_observable_open_not_future_close():
         index[-1],
         100.0,
         1,
-        0.0,
         backtester,
         "M5",
         valuation_price_field="Open",

@@ -48,7 +48,6 @@ def _spec(**overrides) -> InstrumentSpec:
         "pip_position": 4,
         "pip_value": 10.0,
         "spread_avg": 0.0,
-        "commission_per_lot": 0.0,
         "tick_size": 0.0001,
         "tick_value": 10.0,
         "point": 0.0001,
@@ -110,8 +109,6 @@ def test_overnight_full_path_matches_python_and_numba(monkeypatch) -> None:
     config = PipelineConfig(
         research_mode=True,
         use_spread=False,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         discovery_risk_per_trade_pct=1.0,
     )
@@ -124,6 +121,20 @@ def test_overnight_full_path_matches_python_and_numba(monkeypatch) -> None:
         results.append(result)
 
     surface = results[0]["winner_daily_r_surface"]
+    assert surface["schema_version"] == "fxpm.backtester-winner-daily-r.v2"
+    assert surface["risk_unit_contract"] == {
+        "schema_version": "fxpm.precommitted-cell-risk-unit.v2",
+        "unit": "PRECOMMITTED_CELL_RISK_UNIT",
+        "position_denominator": "ENTRY_BROKER_STOP_PRICE_LOSS_DOLLARS",
+        "daily_surface": "SEARCH_TIME_FULL_PATH_POSITION_NORMALIZED_NET_MTM",
+        "inventory_boundary": "FLAT_TO_FLAT_LIQUIDATED_POST_COST",
+        "accounting_identity": (
+            "EXACT_DECIMAL_SUM_DAILY_NET_MTM_EQUALS_COMPLETED_TRADE_NET_MTM_"
+            "IN_SAME_PRECOMMITTED_CELL_RISK_UNIT"
+        ),
+        "r_decimal_places": 12,
+        "r_rounding": "ROUND_HALF_EVEN",
+    }
     assert surface["daily_dates_utc"] == [
         "2026-01-05",
         "2026-01-06",
@@ -146,8 +157,6 @@ def test_partial_close_reconciles_one_flat_to_flat_position(monkeypatch) -> None
         config=PipelineConfig(
             research_mode=True,
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
             swap_model_enabled=False,
             discovery_risk_per_trade_pct=1.0,
         ),
@@ -168,7 +177,7 @@ def test_partial_close_reconciles_one_flat_to_flat_position(monkeypatch) -> None
     _assert_accounting(result)
 
 
-def test_spread_slippage_commission_and_carry_are_in_daily_r() -> None:
+def test_spread_and_carry_are_in_daily_r() -> None:
     frame = _frame()
     common = {
         "research_mode": True,
@@ -181,8 +190,6 @@ def test_spread_slippage_commission_and_carry_are_in_daily_r() -> None:
         config=PipelineConfig(
             **common,
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
         ),
         spec=_spec(swap_long=-1.0),
     )
@@ -191,13 +198,9 @@ def test_spread_slippage_commission_and_carry_are_in_daily_r() -> None:
         config=PipelineConfig(
             **common,
             use_spread=True,
-            use_slippage=True,
-            slippage_pips=0.5,
-            use_commission=True,
         ),
         spec=_spec(
             spread_avg=1.0,
-            commission_per_lot=7.0,
             swap_long=-1.0,
         ),
     )
@@ -225,8 +228,6 @@ def test_frozen_path_cost_stress_uses_genuine_arrays_and_preserves_positions() -
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         backtest_spread_mode="conservative_max",
         discovery_risk_per_trade_pct=1.0,
@@ -351,8 +352,6 @@ def test_frozen_path_cost_stress_rejects_base_from_other_signals() -> None:
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         backtest_spread_mode="conservative_max",
         discovery_risk_per_trade_pct=1.0,
@@ -395,8 +394,6 @@ def test_spread_only_frozen_path_stress_uses_closed_partition_p95() -> None:
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         backtest_spread_mode="conservative_max",
         discovery_risk_per_trade_pct=1.0,
@@ -447,8 +444,6 @@ def test_trade_bearing_equal_cost_vectors_are_explicitly_non_adverse() -> None:
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         backtest_spread_mode="conservative_max",
         discovery_risk_per_trade_pct=1.0,
@@ -501,8 +496,6 @@ def test_equal_swap_inputs_preserve_already_settled_base_cents() -> None:
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=True,
         swap_model_min_holding_hours=0.0,
         backtest_spread_mode="conservative_max",
@@ -614,8 +607,6 @@ def test_mode6_entry_notional_delta_remains_economic_and_fail_closed(
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=True,
         swap_model_min_holding_hours=0.0,
         backtest_spread_mode="conservative_max",
@@ -680,8 +671,6 @@ def test_mode6_rollover_rebound_passes_cumulative_stress_rule() -> None:
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=True,
         swap_model_min_holding_hours=0.0,
         backtest_spread_mode="conservative_max",
@@ -753,8 +742,6 @@ def test_changed_spread_without_realized_degradation_is_insufficient() -> None:
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=False,
-        use_commission=False,
         swap_model_enabled=False,
         backtest_spread_mode="conservative_max",
     )
@@ -813,8 +800,6 @@ def test_tampered_position_event_fails_reconciliation(monkeypatch) -> None:
         config=PipelineConfig(
             research_mode=True,
             use_spread=False,
-            use_slippage=False,
-            use_commission=False,
             swap_model_enabled=False,
         ),
         spec=spec,
@@ -831,7 +816,6 @@ def test_tampered_position_event_fails_reconciliation(monkeypatch) -> None:
             spec=spec,
             half_spread_arr=np.zeros(len(frame)),
             use_spread=False,
-            use_commission=False,
             swap_model_enabled=False,
             causal_swap_enabled=False,
             pre_open_rollover_units_arr=np.zeros(len(frame)),
@@ -849,8 +833,6 @@ def test_mark_operation_bound_fails_without_approximation(monkeypatch) -> None:
             config=PipelineConfig(
                 research_mode=True,
                 use_spread=False,
-                use_slippage=False,
-                use_commission=False,
                 swap_model_enabled=False,
             ),
             spec=_spec(),

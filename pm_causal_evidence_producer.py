@@ -1,4 +1,4 @@
-"""Bounded production of decision-v8 historical causal evidence.
+"""Bounded production of decision-v9 historical causal evidence.
 
 The producer in this module is deliberately an adapter, not an authority.  It
 reopens an already verified historical-anchor orchestration run and a sealed,
@@ -8,7 +8,7 @@ derived from those bytes.  Callers cannot supply return vectors or evidence
 hashes.
 
 The resulting payloads still have to pass :mod:`pm_causal_process`'s released
-decision-v8 evaluator and verifier before a ``CausalEvidenceProduct`` is
+decision-v9 evaluator and verifier before a ``CausalEvidenceProduct`` is
 returned.  No current-refit, capital, publication, or trading authority is
 created here.
 """
@@ -38,7 +38,7 @@ import pm_winner_selection as winner_selection
 EVENT_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-portfolio-event-ledger.v1"
 FILL_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-fill-ledger.v1"
 MTM_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-daily-mtm-ledger.v1"
-COST_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-cost-ledger.v1"
+COST_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-cost-ledger.v2"
 EXPOSURE_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-exposure-ledger.v1"
 MARGIN_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-margin-ledger.v1"
 SPECIALIST_SCHEMA: Final = "fxpm.anchor-replayed-specialist.v1"
@@ -82,8 +82,6 @@ _FORWARD_PRODUCER_RECEIPT_FIELDS: Final = frozenset(
         "capital_phase_window_contract",
         "valuation_contract",
         "valuation_event_order",
-        "full_round_trip_commission_in_every_candidate_mark",
-        "stop_risk_includes_adverse_configured_stop_slippage",
         "candidate_marks_thinned_or_sampled",
         "causal_consumer_reopened_and_verified",
         "causal_binding_followup_required",
@@ -239,7 +237,7 @@ _FILL_LEDGER_FIELDS: Final = frozenset({*_COMMON_LEDGER_FIELDS, "initial_positio
 _DAY_EVENT_FIELDS: Final = frozenset({"date", "entries", "marks", "exits"})
 _DAY_FILL_FIELDS: Final = frozenset({"date", "entries", "exits"})
 _DAY_MTM_FIELDS: Final = frozenset({"date", "equity_basis_cash", "position_marks"})
-_DAY_COST_FIELDS: Final = frozenset({"date", "entries", "marks", "exits"})
+_DAY_COST_FIELDS: Final = frozenset({"date", "marks"})
 _DAY_EXPOSURE_FIELDS: Final = frozenset({"date", "positions"})
 _DAY_MARGIN_FIELDS: Final = frozenset(
     {"date", "equity_basis_cash", "used_margin_cash", "free_margin_cash"}
@@ -286,15 +284,6 @@ _RAW_MARK_FIELDS: Final = frozenset(
         "mark_price",
         "mark_bid_price",
         "mark_ask_price",
-    }
-)
-_OPEN_COST_FIELDS: Final = frozenset(
-    {
-        "event_id",
-        "base_commission_cash",
-        "stress_commission_cash",
-        "base_fee_cash",
-        "stress_fee_cash",
     }
 )
 _MARK_COST_FIELDS: Final = frozenset(
@@ -495,7 +484,7 @@ def _forward_oos_replay_lineage(
     dict[str, tuple[Any, ...]],
     dict[str, dict[str, Any]],
 ]:
-    """Verify the sealed forward product and derive its persistent v8 lineage."""
+    """Verify the sealed forward product and derive its persistent v9 lineage."""
 
     try:
         # Local import avoids the intentional module cycle: the forward
@@ -634,9 +623,6 @@ def _forward_oos_replay_lineage(
         != "EXACT_FORWARD_END_EXCLUSIVE_NO_LATER_ROWS"
         or receipt.get("valuation_event_order")
         != "close_existing_then_mark_existing_then_admit"
-        or receipt.get("full_round_trip_commission_in_every_candidate_mark") is not True
-        or receipt.get("stop_risk_includes_adverse_configured_stop_slippage")
-        is not True
         or receipt.get("candidate_marks_thinned_or_sampled") is not False
         or forward_precommit.get("created_before_first_forward_oos_frame_access")
         is not True
@@ -844,7 +830,7 @@ class AnchorReplayArtifactDescriptors:
 
 @dataclass(frozen=True, slots=True)
 class FrozenCausalProcessPrecommit:
-    """Immutable canonical decision-v8 precommitment and identity manifest."""
+    """Immutable canonical decision-v9 precommitment and identity manifest."""
 
     _body_json: bytes
     _identity_manifest_json: bytes
@@ -990,7 +976,7 @@ def _policy_identities(
     return identities, manifests
 
 
-def freeze_causal_process_precommit_v8(
+def freeze_causal_process_precommit_v9(
     *,
     context: authority_spool.GenerationSpoolContext,
     search_process: Any,
@@ -1056,7 +1042,7 @@ def freeze_causal_process_precommit_v8(
             )
             for value in anchors
         ]
-        # Decision-v8 owns ordering, purge, overlap, and 4-16 bounds.
+        # Decision-v9 owns ordering, purge, overlap, and 4-16 bounds.
         causal._validate_anchor_plan(normalized_anchors)
         root = (
             Path(__file__).resolve().parent
@@ -1082,7 +1068,7 @@ def freeze_causal_process_precommit_v8(
         access_not_before = authorized
         deadline = authorized + timedelta(seconds=evidence_access_window_seconds)
         definition = {
-            "schema": "fxpm-frozen-historical-institution-process-v8",
+            "schema": "fxpm-frozen-historical-institution-process-v9",
             "symbols": list(causal.SYMBOLS),
             "timeframes": list(causal.TIMEFRAMES),
             "regimes": list(causal.REGIMES),
@@ -1153,7 +1139,7 @@ def freeze_causal_process_precommit_v8(
     except CausalEvidenceProductionError:
         raise
     except causal.ProcessVerificationError as exc:
-        raise CausalEvidenceProductionError("PRECOMMIT_V8_REJECTED") from exc
+        raise CausalEvidenceProductionError("PRECOMMIT_V9_REJECTED") from exc
     except Exception as exc:
         raise CausalEvidenceProductionError("PRECOMMIT_FREEZE_FAILED") from exc
 
@@ -1804,7 +1790,6 @@ def _event_decision_hashes(
 
 def _causal_open_fill(
     raw: Mapping[str, Any],
-    cost: Mapping[str, Any],
     *,
     cell: Mapping[str, Any],
     anchor_id: str,
@@ -1831,10 +1816,9 @@ def _causal_open_fill(
     }
     primitive["cell_decision_sha256"] = cell["cell_decision_sha256"]
     primitive["timeframe"] = cell["timeframe"]
-    primitive.update({key: cost[key] for key in _OPEN_COST_FIELDS if key != "event_id"})
     payload_sha = _sha(
         {
-            "schema": "fxpm-position-opening-fill-payload-v2",
+            "schema": "fxpm-position-opening-fill-payload-v3",
             "anchor_id": anchor_id,
             "fill": primitive,
         }
@@ -1877,7 +1861,7 @@ def _causal_open_fill(
     return result
 
 
-def _opening_cost(fill: Mapping[str, Any], *, stress: bool) -> Decimal:
+def _opening_execution_cost(fill: Mapping[str, Any], *, stress: bool) -> Decimal:
     side = Decimal(1) if fill["side"] == "LONG" else Decimal(-1)
     unit = _decimal(fill["quantity"], "QUANTITY_INVALID", positive=True) * _decimal(
         fill["contract_multiplier"], "CONTRACT_MULTIPLIER_INVALID", positive=True
@@ -1893,16 +1877,11 @@ def _opening_cost(fill: Mapping[str, Any], *, stress: bool) -> Decimal:
         fill[f"{lane}_fill_price"], "FILL_PRICE_INVALID", positive=True
     )
     spread = side * (executable - mid) * unit
-    slippage = side * (lane_fill - executable) * unit
-    execution = max(Decimal(0), spread + slippage)
-    return (
-        execution
-        + _decimal(fill[f"{lane}_commission_cash"], "COMMISSION_INVALID")
-        + _decimal(fill[f"{lane}_fee_cash"], "FEE_INVALID")
-    )
+    fill_degradation = side * (lane_fill - executable) * unit
+    return max(Decimal(0), spread + fill_degradation)
 
 
-def _closing_cost(
+def _closing_execution_cost(
     fill: Mapping[str, Any], state: Mapping[str, Any], *, stress: bool
 ) -> Decimal:
     side = state["side_sign"]
@@ -1918,13 +1897,8 @@ def _closing_cost(
         fill[f"{lane}_fill_price"], "FILL_PRICE_INVALID", positive=True
     )
     spread = side * (mid - executable) * unit
-    slippage = side * (executable - lane_fill) * unit
-    execution = max(Decimal(0), spread + slippage)
-    return (
-        execution
-        + _decimal(fill[f"{lane}_commission_cash"], "COMMISSION_INVALID")
-        + _decimal(fill[f"{lane}_fee_cash"], "FEE_INVALID")
-    )
+    fill_degradation = side * (executable - lane_fill) * unit
+    return max(Decimal(0), spread + fill_degradation)
 
 
 def _assemble_activity(
@@ -1947,7 +1921,7 @@ def _assemble_activity(
     exposure = ledgers["EXPOSURE_LEDGER"]
     margin = ledgers["MARGIN_LEDGER"]
     if event["initial_positions"] != [] or fill["initial_positions"] != []:
-        # Carried positions are valid in decision-v8, but a production replay
+        # Carried positions are valid in decision-v9, but a production replay
         # seam must provide a dedicated forward-boundary valuation artifact.
         # The raw v1 contract intentionally fails closed until that descriptor
         # is available rather than inventing an opening mark receipt.
@@ -1960,6 +1934,15 @@ def _assemble_activity(
     stress_cost_vector: list[Decimal] = []
     seen_event_ids: set[str] = set()
     seen_positions: set[str] = set()
+    cumulative_base_cost_return = Decimal(0)
+    cumulative_stress_cost_return = Decimal(0)
+
+    def require_position_cost_prefix(state: Mapping[str, Any]) -> None:
+        if (
+            state["stress_cost_prefix"] + causal._RETURN_QUANTUM
+            < state["base_cost_prefix"]
+        ):
+            _fail("STRESS_POSITION_COST_PREFIX_IMPROVEMENT")
 
     for index, date_text in enumerate(dates):
         event_day = event["days"][index]
@@ -1981,16 +1964,11 @@ def _assemble_activity(
         raw_entries = _unique_records(
             fill_day["entries"], _RAW_OPEN_FIELDS, "OPENING_FILL_ROSTER_INVALID"
         )
-        entry_costs = _unique_records(
-            cost_day["entries"], _OPEN_COST_FIELDS, "OPENING_COST_ROSTER_INVALID"
-        )
         entry_events = _unique_records(
             event_day["entries"], _EVENT_RECORD_FIELDS, "OPEN_EVENT_ROSTER_INVALID"
         )
-        if set(raw_entries) != set(entry_costs) or set(raw_entries) != set(
-            entry_events
-        ):
-            _fail("OPEN_EVENT_FILL_COST_ROSTER_MISMATCH")
+        if set(raw_entries) != set(entry_events):
+            _fail("OPEN_EVENT_FILL_ROSTER_MISMATCH")
 
         entries: list[dict[str, Any]] = []
         for event_id in sorted(
@@ -2013,7 +1991,6 @@ def _assemble_activity(
             )
             opened = _causal_open_fill(
                 raw_open,
-                entry_costs[event_id],
                 cell=cell,
                 anchor_id=anchor["anchor_id"],
                 decisions=decisions,
@@ -2032,6 +2009,10 @@ def _assemble_activity(
                 "CONTRACT_MULTIPLIER_INVALID",
                 positive=True,
             )
+            base_open_cost = _opening_execution_cost(opened, stress=False)
+            stress_open_cost = _opening_execution_cost(opened, stress=True)
+            if stress_open_cost < base_open_cost:
+                _fail("STRESS_OPEN_COST_LESS_SEVERE")
             open_states[position_id] = {
                 "side": opened["side"],
                 "side_sign": side_sign,
@@ -2042,10 +2023,13 @@ def _assemble_activity(
                 "last_mark": _decimal(
                     opened["reference_mid_price"], "OPENING_MID_INVALID", positive=True
                 ),
-                "pending_base_cost": _opening_cost(opened, stress=False),
-                "pending_stress_cost": _opening_cost(opened, stress=True),
+                "pending_base_cost": base_open_cost,
+                "pending_stress_cost": stress_open_cost,
+                "base_cost_prefix": base_open_cost,
+                "stress_cost_prefix": stress_open_cost,
                 "cell_id": raw_open["cell_id"],
             }
+            require_position_cost_prefix(open_states[position_id])
             entries.append(opened)
 
         mark_events = _unique_records(
@@ -2136,10 +2120,11 @@ def _assemble_activity(
             stress_finance = _decimal(
                 mark["stress_financing_cash"], "STRESS_FINANCING_INVALID"
             )
-            if stress_finance < base_finance:
-                _fail("STRESS_FINANCING_LESS_SEVERE")
             base_cost_cash += state["pending_base_cost"] + base_finance
             stress_cost_cash += state["pending_stress_cost"] + stress_finance
+            state["base_cost_prefix"] += base_finance
+            state["stress_cost_prefix"] += stress_finance
+            require_position_cost_prefix(state)
             state["pending_base_cost"] = Decimal(0)
             state["pending_stress_cost"] = Decimal(0)
             state["last_mark"] = mark_price
@@ -2179,14 +2164,11 @@ def _assemble_activity(
         raw_exits = _unique_records(
             fill_day["exits"], _RAW_CLOSE_FIELDS, "CLOSING_FILL_ROSTER_INVALID"
         )
-        exit_costs = _unique_records(
-            cost_day["exits"], _OPEN_COST_FIELDS, "CLOSING_COST_ROSTER_INVALID"
-        )
         exit_events = _unique_records(
             event_day["exits"], _EVENT_RECORD_FIELDS, "CLOSE_EVENT_ROSTER_INVALID"
         )
-        if set(raw_exits) != set(exit_costs) or set(raw_exits) != set(exit_events):
-            _fail("CLOSE_EVENT_FILL_COST_ROSTER_MISMATCH")
+        if set(raw_exits) != set(exit_events):
+            _fail("CLOSE_EVENT_FILL_ROSTER_MISMATCH")
         exits: list[dict[str, Any]] = []
         for event_id in sorted(
             raw_exits, key=lambda key: raw_exits[key]["position_id"]
@@ -2221,16 +2203,9 @@ def _assemble_activity(
                     "stress_fill_price",
                 )
             }
-            primitive.update(
-                {
-                    key: exit_costs[event_id][key]
-                    for key in _OPEN_COST_FIELDS
-                    if key != "event_id"
-                }
-            )
             payload_sha = _sha(
                 {
-                    "schema": "fxpm-position-closing-fill-payload-v2",
+                    "schema": "fxpm-position-closing-fill-payload-v3",
                     "anchor_id": anchor["anchor_id"],
                     "fill": primitive,
                 }
@@ -2252,12 +2227,15 @@ def _assemble_activity(
                     }
                 ),
             }
-            base_exit = _closing_cost(closing, state, stress=False)
-            stress_exit = _closing_cost(closing, state, stress=True)
+            base_exit = _closing_execution_cost(closing, state, stress=False)
+            stress_exit = _closing_execution_cost(closing, state, stress=True)
             if stress_exit < base_exit:
                 _fail("STRESS_CLOSE_COST_LESS_SEVERE")
             base_cost_cash += base_exit
             stress_cost_cash += stress_exit
+            state["base_cost_prefix"] += base_exit
+            state["stress_cost_prefix"] += stress_exit
+            require_position_cost_prefix(state)
             exits.append(closing)
             del open_states[position_id]
 
@@ -2275,8 +2253,15 @@ def _assemble_activity(
             raise CausalEvidenceProductionError(
                 "DAILY_RETURN_DERIVATION_FAILED"
             ) from exc
-        if stress_cost_return > base_cost_return:
-            _fail("STRESS_DAILY_COST_LESS_SEVERE")
+        cumulative_base_cost_return += base_cost_return
+        cumulative_stress_cost_return += stress_cost_return
+        if (
+            cumulative_stress_cost_return
+            > cumulative_base_cost_return + causal._RETURN_QUANTUM
+        ):
+            _fail("STRESS_CUMULATIVE_COST_PREFIX_IMPROVEMENT")
+        for state in open_states.values():
+            require_position_cost_prefix(state)
         gross_vector.append(gross_return)
         base_cost_vector.append(base_cost_return)
         stress_cost_vector.append(stress_cost_return)
@@ -2289,11 +2274,13 @@ def _assemble_activity(
                 "exits": exits,
             }
         )
+    for state in open_states.values():
+        require_position_cost_prefix(state)
     if open_states:
         _fail("FORWARD_REPLAY_ENDS_WITH_UNVALUED_OPEN_POSITIONS")
     return (
         {
-            "schema": "fxpm-anchor-economic-position-activity-ledger-v2",
+            "schema": "fxpm-anchor-economic-position-activity-ledger-v3",
             "initial_positions": [],
             "days": activity_days,
         },
@@ -3049,7 +3036,7 @@ class BoundedCausalEvidenceProducer:
         except CausalEvidenceProductionError:
             raise
         except causal.ProcessVerificationError as exc:
-            raise CausalEvidenceProductionError("CAUSAL_DECISION_V8_REJECTED") from exc
+            raise CausalEvidenceProductionError("CAUSAL_DECISION_V9_REJECTED") from exc
         except (DecimalException, ArithmeticError) as exc:
             raise CausalEvidenceProductionError("ECONOMIC_REPLAY_FAILED") from exc
         except Exception as exc:
@@ -3077,5 +3064,5 @@ __all__ = [
     "MTM_LEDGER_SCHEMA",
     "ORDER_EVENT_SCHEMA",
     "SPECIALIST_SCHEMA",
-    "freeze_causal_process_precommit_v8",
+    "freeze_causal_process_precommit_v9",
 ]

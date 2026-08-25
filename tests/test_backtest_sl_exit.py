@@ -44,8 +44,7 @@ class BacktestSLExitTests(unittest.TestCase):
 
     def _make_config(self):
         return PipelineConfig(
-            use_spread=False, use_slippage=False,
-            use_commission=False, risk_per_trade_pct=1.0,
+            use_spread=False, risk_per_trade_pct=1.0,
         )
 
     def test_long_sl_hit(self):
@@ -68,6 +67,7 @@ class BacktestSLExitTests(unittest.TestCase):
         self.assertTrue(len(trades) >= 1, "Expected at least one trade")
         t0 = trades[0]
         self.assertIn(t0.get("exit_reason", ""), ["SL", "sl", "closed_sl"])
+        self.assertAlmostEqual(t0["exit_price"], t0["stop_loss"])
 
     def test_short_sl_hit(self):
         """A short trade should exit at SL when price rises."""
@@ -86,6 +86,7 @@ class BacktestSLExitTests(unittest.TestCase):
         res = bt.run(df, signals, "EURUSD", strat, spec=spec)
         trades = res.get("trades", [])
         self.assertTrue(len(trades) >= 1, "Expected at least one trade")
+        self.assertAlmostEqual(trades[0]["exit_price"], trades[0]["stop_loss"])
 
 
 if __name__ == "__main__":

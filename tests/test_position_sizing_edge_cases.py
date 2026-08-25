@@ -160,7 +160,6 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
             max_combined_risk_pct=25.0,
             margin_entry_block_level=100.0,
             target_annual_vol=0.10,
-            use_commission=False,
         )
         trader._funded_capital_envelope = {
             "max_total_stop_risk_pct": 8.0,

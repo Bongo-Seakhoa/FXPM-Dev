@@ -29,8 +29,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         signals = strat.generate_signals(features, 'TEST')
 
         cfg = PipelineConfig(
-            use_spread=False, use_slippage=False,
-            use_commission=False, risk_per_trade_pct=1.0,
+            use_spread=False, risk_per_trade_pct=1.0,
         )
         bt = Backtester(cfg)
         spec = InstrumentSpec(symbol="TEST", pip_position=2, pip_value=10.0)

@@ -19,7 +19,6 @@
     "log_dir": "./logs/production_live",
     "initial_capital": 10000.0,
     "discovery_risk_per_trade_pct": 1,
-    "slippage_pips": 0.5,
     "backtest_spread_mode": "conservative_max",
     "production_split_mode": "calendar_lockbox_v2",
     "evidence_sufficiency_enabled": true,
@@ -275,9 +274,6 @@
     "live_min_account_equity_currency": "USD"
   },
   "broker_specs_path": "broker_specs.json",
-  "instrument_spec_defaults": {
-    "commission_per_lot": 7.0
-  },
   "symbols": [
     "AUDUSD",
     "EURUSD",
@@ -406,7 +402,6 @@
       "spread_avg": 1.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -6.5,
       "swap_short": 1.2
     },
@@ -416,7 +411,6 @@
       "spread_avg": 1.2,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -5.0,
       "swap_short": 0.8
     },
@@ -426,7 +420,6 @@
       "spread_avg": 1.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 8.5,
       "swap_short": -15.0
     },
@@ -436,7 +429,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 5.0,
       "swap_short": -10.0
     },
@@ -446,7 +438,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 2.5,
       "swap_short": -8.0
     },
@@ -456,7 +447,6 @@
       "spread_avg": 1.2,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -4.0,
       "swap_short": 0.5
     },
@@ -466,7 +456,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -3.5,
       "swap_short": 0.3
     },
@@ -476,7 +465,6 @@
       "spread_avg": 2.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 8.0,
       "swap_long": -2.0,
       "swap_short": -1.5
     },
@@ -486,7 +474,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -4.0,
       "swap_short": 0.5
     },
@@ -496,7 +483,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 3.0,
       "swap_short": -10.0
     },
@@ -506,7 +492,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 5.0,
       "swap_short": -12.0
     },
@@ -516,7 +501,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -4.0,
       "swap_short": 1.0
     },
@@ -526,7 +510,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -4.0,
       "swap_short": 0.5
     },
@@ -536,7 +519,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -3.0,
       "swap_short": 0.5
     },
@@ -546,7 +528,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -4.0,
       "swap_short": 0.5
     },
@@ -556,7 +537,6 @@
       "spread_avg": 3.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -4.0,
       "swap_short": 0.5
     },
@@ -566,7 +546,6 @@
       "spread_avg": 2.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -5.0,
       "swap_short": 0.8
     },
@@ -576,7 +555,6 @@
       "spread_avg": 2.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -5.0,
       "swap_short": 0.8
     },
@@ -586,7 +564,6 @@
       "spread_avg": 2.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -5.0,
       "swap_short": 0.8
     },
@@ -596,7 +573,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -2.0,
       "swap_short": 0.5
     },
@@ -606,7 +582,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -2.0,
       "swap_short": 0.5
     },
@@ -616,7 +591,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 2.5,
       "swap_short": -8.0
     },
@@ -626,7 +600,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -3.0,
       "swap_short": 0.5
     },
@@ -636,7 +609,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -3.0,
       "swap_short": 0.5
     },
@@ -646,7 +618,6 @@
       "spread_avg": 1.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 8.5,
       "swap_short": -15.0
     },
@@ -656,7 +627,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": 2.5,
       "swap_short": -8.0
     },
@@ -666,7 +636,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -3.0,
       "swap_short": 0.5
     },
@@ -676,7 +645,6 @@
       "spread_avg": 3.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 7.0,
       "swap_long": -4.0,
       "swap_short": 0.5
     },
@@ -686,7 +654,6 @@
       "spread_avg": 30.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 2.0,
       "swap_short": -10.0
     },
@@ -696,7 +663,6 @@
       "spread_avg": 30.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 12.0,
       "swap_long": 20.0,
       "swap_short": -45.0
     },
@@ -706,7 +672,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 8.0,
       "swap_long": 1.5,
       "swap_short": -6.0
     },
@@ -716,7 +681,6 @@
       "spread_avg": 50.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 15.0,
       "swap_long": 12.0,
       "swap_short": -35.0
     },
@@ -726,7 +690,6 @@
       "spread_avg": 25.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 3.0,
       "swap_short": -12.0
     },
@@ -736,7 +699,6 @@
       "spread_avg": 30.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 2.0,
       "swap_short": -10.0
     },
@@ -746,7 +708,6 @@
       "spread_avg": 20.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 2.0,
       "swap_short": -10.0
     },
@@ -756,7 +717,6 @@
       "spread_avg": 25.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 3.0,
       "swap_short": -12.0
     },
@@ -772,7 +732,6 @@
       "spread_avg": 10.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 2.0,
       "swap_short": -10.0
     },
@@ -782,7 +741,6 @@
       "spread_avg": 35.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 2.0,
       "swap_short": -12.0
     },
@@ -792,7 +750,6 @@
       "spread_avg": 35.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 10.0,
       "swap_long": 2.0,
       "swap_short": -12.0
     },
@@ -806,7 +763,6 @@
       "spread_avg": 3.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 5.0,
       "swap_long": -8.0,
       "swap_short": -5.0
     },
@@ -816,7 +772,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 5.0,
       "swap_long": -3.0,
       "swap_short": -2.0
     },
@@ -838,7 +793,6 @@
       "spread_avg": 5.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 5.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -848,7 +802,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -858,7 +811,6 @@
       "spread_avg": 3.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -868,7 +820,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -878,7 +829,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -888,7 +838,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -898,7 +847,6 @@
       "spread_avg": 8.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -908,7 +856,6 @@
       "spread_avg": 8.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -918,7 +865,6 @@
       "spread_avg": 12.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -928,7 +874,6 @@
       "spread_avg": 12.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -938,7 +883,6 @@
       "spread_avg": 8.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -948,7 +892,6 @@
       "spread_avg": 60.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 15.0,
       "swap_long": 10.0,
       "swap_short": -30.0
     },
@@ -958,7 +901,6 @@
       "spread_avg": 70.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 15.0,
       "swap_long": 8.0,
       "swap_short": -28.0
     },
@@ -968,7 +910,6 @@
       "spread_avg": 1.5,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -978,7 +919,6 @@
       "spread_avg": 2.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -988,7 +928,6 @@
       "spread_avg": 5.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -998,7 +937,6 @@
       "spread_avg": 8.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1008,7 +946,6 @@
       "spread_avg": 3.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1018,7 +955,6 @@
       "spread_avg": 15.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1028,7 +964,6 @@
       "spread_avg": 5.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1038,7 +973,6 @@
       "spread_avg": 5.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1048,7 +982,6 @@
       "spread_avg": 5.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1058,7 +991,6 @@
       "spread_avg": 10.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1068,7 +1000,6 @@
       "spread_avg": 10.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 0.0,
       "swap_long": 0.0,
       "swap_short": 0.0
     },
@@ -1078,7 +1009,6 @@
       "spread_avg": 3.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 5.0,
       "swap_long": -5.0,
       "swap_short": -3.0
     },
@@ -1088,7 +1018,6 @@
       "spread_avg": 3.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 5.0,
       "swap_long": -5.0,
       "swap_short": -3.0
     },
@@ -1098,7 +1027,6 @@
       "spread_avg": 5.0,
       "min_lot": 0.01,
       "max_lot": 100.0,
-      "commission_per_lot": 5.0,
       "swap_long": -3.0,
       "swap_short": -2.0
     }

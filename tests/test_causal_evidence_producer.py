@@ -30,6 +30,7 @@ import pm_production_authority_coordinator as coordinator
 import pm_production_search_planner as search_planner
 from tests import test_book_multiplicity as book_fixture
 from tests import test_causal_process as causal_fixture
+from tests import test_forward_oos_replay_producer as forward_fixture
 from tests import test_historical_production_adapter as adapter_fixture
 from tests import test_native_prefix_production as native_prefix_fixture
 from tests import test_production_capital_bootstrap as capital_fixture
@@ -112,7 +113,6 @@ def _capital_candidate(
                 fraction=1.0,
                 net_pnl_per_entry_lot=10.0,
                 price_pnl_per_entry_lot=17.0,
-                commission_per_entry_lot=7.0,
                 exit_reason="fixture-exit",
             ),
         ),
@@ -917,11 +917,9 @@ def _decompose_activity(
         mark_events = []
         exit_events = []
         raw_entries = []
-        entry_costs = []
         raw_marks = []
         mark_costs = []
         raw_exits = []
-        exit_costs = []
         exposures = []
         for raw in day["entries"]:
             event_id = f"{raw['position_id']}:open-event"
@@ -944,20 +942,6 @@ def _decompose_activity(
                             "reference_ask_price",
                             "base_fill_price",
                             "stress_fill_price",
-                        )
-                    },
-                }
-            )
-            entry_costs.append(
-                {
-                    "event_id": event_id,
-                    **{
-                        key: raw[key]
-                        for key in (
-                            "base_commission_cash",
-                            "stress_commission_cash",
-                            "base_fee_cash",
-                            "stress_fee_cash",
                         )
                     },
                 }
@@ -1034,20 +1018,6 @@ def _decompose_activity(
                     },
                 }
             )
-            exit_costs.append(
-                {
-                    "event_id": event_id,
-                    **{
-                        key: raw[key]
-                        for key in (
-                            "base_commission_cash",
-                            "stress_commission_cash",
-                            "base_fee_cash",
-                            "stress_fee_cash",
-                        )
-                    },
-                }
-            )
             decided = raw["closed_at_utc"]
             exit_events.append(
                 _event_record(
@@ -1083,9 +1053,7 @@ def _decompose_activity(
         cost_days.append(
             {
                 "date": date_text,
-                "entries": entry_costs,
                 "marks": mark_costs,
-                "exits": exit_costs,
             }
         )
         exposure_days.append({"date": date_text, "positions": exposures})
@@ -1207,6 +1175,22 @@ class Corpus:
     callback: producer.BoundedCausalEvidenceProducer
 
 
+def test_causal_v9_raw_cost_contract_is_financing_only_and_exact() -> None:
+    assert producer.COST_LEDGER_SCHEMA == "fxpm.anchor-raw-cost-ledger.v2"
+    assert producer._DAY_COST_FIELDS == frozenset({"date", "marks"})
+    assert producer._MARK_COST_FIELDS == frozenset(
+        {"event_id", "base_financing_cash", "stress_financing_cash"}
+    )
+    assert not hasattr(producer, "_OPEN_COST_FIELDS")
+    assert {
+        "base_commission_cash",
+        "stress_commission_cash",
+        "commission_per_entry_lot",
+        "full_round_trip_commission_in_every_candidate_mark",
+        "stop_risk_includes_adverse_configured_stop_slippage",
+    }.isdisjoint(producer._FORWARD_PRODUCER_RECEIPT_FIELDS)
+
+
 def test_production_precommit_freezes_real_code_policy_and_geometry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1226,10 +1210,10 @@ def test_production_precommit_freezes_real_code_policy_and_geometry(
         context,
         run_id="causal-precommit-run",
     )
-    frozen = producer.freeze_causal_process_precommit_v8(
+    frozen = producer.freeze_causal_process_precommit_v9(
         context=context,
         search_process=search_process,
-        process_id="production-causal-process-v8",
+        process_id="production-causal-process-v9",
         anchors=plans,
         evidence_access_window_seconds=3 * 24 * 60 * 60,
     )
@@ -1261,20 +1245,20 @@ def test_production_precommit_freezes_real_code_policy_and_geometry(
         producer.CausalEvidenceProductionError,
         match="SEARCH_PROCESS_REVERIFY_FAILED",
     ):
-        producer.freeze_causal_process_precommit_v8(
+        producer.freeze_causal_process_precommit_v9(
             context=wrong_context,
             search_process=search_process,
-            process_id="production-causal-process-v8",
+            process_id="production-causal-process-v9",
             anchors=plans,
         )
     with pytest.raises(
         producer.CausalEvidenceProductionError,
         match="SEARCH_PROCESS_REVERIFY_FAILED",
     ):
-        producer.freeze_causal_process_precommit_v8(
+        producer.freeze_causal_process_precommit_v9(
             context=context,
             search_process=search_process.receipt_sha256,
-            process_id="production-causal-process-v8",
+            process_id="production-causal-process-v9",
             anchors=plans,
         )
 
@@ -2565,8 +2549,6 @@ def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
         ),
         "valuation_contract": forward.VALUATION_CONTRACT,
         "valuation_event_order": "close_existing_then_mark_existing_then_admit",
-        "full_round_trip_commission_in_every_candidate_mark": True,
-        "stop_risk_includes_adverse_configured_stop_slippage": True,
         "candidate_marks_thinned_or_sampled": False,
         "causal_consumer_reopened_and_verified": False,
         "causal_binding_followup_required": True,
@@ -2642,6 +2624,186 @@ def test_valid_four_anchor_genuine_replay_produces_verified_product(
         len(anchor["book_cells"]) == causal.CELL_COUNT
         for anchor in product.evidence_payload["anchors"]
     )
+
+
+def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
+    (
+        frame,
+        config,
+        spec,
+        strategy,
+        base,
+        stress,
+        source_position,
+        valuation_tape,
+    ) = forward_fixture._genuine_position_evidence(
+        mode6_short=True,
+        return_tape=True,
+    )
+    valuation_frame = valuation_tape.frame.copy()
+    valuation_frame.loc[valuation_frame.index[-1], "Open"] = float(
+        source_position.exit_mid
+    )
+    valuation_half_spread = valuation_tape.entry_half_spread.copy()
+    valuation_half_spread[-1] = float(
+        source_position.exit_ask - source_position.exit_mid
+    )
+    valuation_tape = replace(
+        valuation_tape,
+        frame=valuation_frame,
+        entry_half_spread=valuation_half_spread,
+    )
+    specialist = forward_fixture._specialist()
+    position = forward._position_evidence(
+        specialist=specialist,
+        capital_phase=forward.CAPITAL_OUTER_EVALUATION,
+        strategy=strategy,
+        features=frame,
+        spec=spec,
+        config=config,
+        base_result=base,
+        stress_result=stress,
+        valuation_tape=valuation_tape,
+        resource_budget=forward._ResourceBudget(),
+    )[0]
+    volume = Decimal("0.01")
+    replay = forward._AnchorRawReplay(
+        anchor=forward_fixture._anchor_for(position),
+        specialists=(specialist,),
+        positions=(position,),
+        accepted_volume_by_position_id={position.position_id: volume},
+    )
+    ledgers = forward._ledger_bodies(replay, starting_balance=Decimal("10000"))
+    cell_sha = _tag_sha("mode6-causal-cell")
+    projected_cell = {
+        "cell_id": specialist.cell_id,
+        "status": "WINNER",
+        "cell_decision_sha256": cell_sha,
+        "timeframe": "D1",
+    }
+    raw_cell = {"cell_id": specialist.cell_id, "regime": "TREND"}
+    descriptor_hashes = {
+        role: str(index) * 64
+        for index, role in enumerate(
+            (
+                "EVENT_LEDGER",
+                "FILL_LEDGER",
+                "MTM_LEDGER",
+                "COST_LEDGER",
+                "EXPOSURE_LEDGER",
+                "MARGIN_LEDGER",
+            ),
+            1,
+        )
+    }
+
+    activity, gross, base_cost, stress_cost = producer._assemble_activity(
+        anchor=replay.anchor,
+        ledgers=ledgers,
+        descriptor_hashes=descriptor_hashes,
+        projected_cells=[projected_cell],
+        book_cells=[raw_cell],
+    )
+    marks = [mark for day in activity["days"] for mark in day["position_marks"]]
+    assert forward.REPLAY_PRECOMMIT_SCHEMA == "fxpm.forward-oos-replay-precommit.v4"
+    assert causal.PROCESS_AUTHORITY_VERSION == "fxpm-offline-process-validation-v9"
+    assert spec.swap_mode == 6
+    assert position.side == "SHORT"
+    assert any(
+        Decimal(mark["stress_financing_cash"])
+        < Decimal(mark["base_financing_cash"])
+        for mark in marks
+    )
+    assert stress_cost[1] > base_cost[1]
+    assert stress["trades"][0]["pnl_dollars"] < base["trades"][0]["pnl_dollars"]
+    cumulative_base = Decimal(0)
+    cumulative_stress = Decimal(0)
+    for base_value, stress_value in zip(base_cost, stress_cost, strict=True):
+        cumulative_base += base_value
+        cumulative_stress += stress_value
+        assert cumulative_stress <= cumulative_base + causal._RETURN_QUANTUM
+
+    verifier_anchor = {
+        "anchor_id": replay.anchor["anchor_id"],
+        "book_cells": [projected_cell],
+        "activity_ledger": activity,
+    }
+    completed, *_ = causal._validate_activity_ledger(
+        verifier_anchor,
+        [day["date"] for day in activity["days"]],
+        gross,
+        base_cost,
+        stress_cost,
+    )
+    assert len(completed) == 1
+
+    tampered_activity = copy.deepcopy(activity)
+    tampered_activity["days"][0]["position_marks"][0][
+        "stress_financing_cash"
+    ] = "0"
+    with pytest.raises(
+        causal.ProcessVerificationError,
+        match="stress cumulative cost prefix improves on base",
+    ):
+        causal._validate_activity_ledger(
+            {**verifier_anchor, "activity_ledger": tampered_activity},
+            [day["date"] for day in tampered_activity["days"]],
+            gross,
+            base_cost,
+            stress_cost,
+        )
+
+    masked_position = replace(
+        position,
+        position_id="btp:" + "9" * 64,
+        candidate=replace(position.candidate, candidate_id="oos:" + "8" * 64),
+    )
+    masked_replay = replace(
+        replay,
+        positions=(position, masked_position),
+        accepted_volume_by_position_id={
+            position.position_id: volume,
+            masked_position.position_id: volume,
+        },
+    )
+    masked_ledgers = forward._ledger_bodies(
+        masked_replay, starting_balance=Decimal("10000")
+    )
+    first_mtm_marks = masked_ledgers["MTM_LEDGER"]["days"][0]["position_marks"]
+    event_id_by_position = {
+        mark["position_id"]: mark["event_id"] for mark in first_mtm_marks
+    }
+    first_cost_marks = {
+        mark["event_id"]: mark
+        for mark in masked_ledgers["COST_LEDGER"]["days"][0]["marks"]
+    }
+    first_cost_marks[event_id_by_position[position.position_id]][
+        "stress_financing_cash"
+    ] = "0"
+    first_cost_marks[event_id_by_position[masked_position.position_id]][
+        "stress_financing_cash"
+    ] = "10"
+    opening_entry = activity["days"][0]["entries"][0]
+    base_open = producer._opening_execution_cost(opening_entry, stress=False)
+    stress_open = producer._opening_execution_cost(opening_entry, stress=True)
+    aggregate_base_prefix = base_open * 2 + sum(
+        Decimal(mark["base_financing_cash"]) for mark in first_cost_marks.values()
+    )
+    aggregate_stress_prefix = stress_open * 2 + sum(
+        Decimal(mark["stress_financing_cash"]) for mark in first_cost_marks.values()
+    )
+    assert aggregate_stress_prefix > aggregate_base_prefix
+    with pytest.raises(
+        producer.CausalEvidenceProductionError,
+        match="STRESS_POSITION_COST_PREFIX_IMPROVEMENT",
+    ):
+        producer._assemble_activity(
+            anchor=masked_replay.anchor,
+            ledgers=masked_ledgers,
+            descriptor_hashes=descriptor_hashes,
+            projected_cells=[projected_cell],
+            book_cells=[raw_cell],
+        )
 
 
 def test_bare_replay_descriptors_cannot_bypass_issued_forward_product(

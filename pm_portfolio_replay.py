@@ -46,11 +46,11 @@ from pm_risk_admission import (
 
 
 LEGACY_PORTFOLIO_REPLAY_SCHEMA_VERSION = "2026-07-13-synchronized-shared-capital-v7"
-PORTFOLIO_REPLAY_SCHEMA_VERSION = "2026-07-16-synchronized-specialist-slots-v9"
-PORTFOLIO_REPLAY_EVIDENCE_SCHEMA_VERSION = "2026-07-13-funded-portfolio-evidence-v7"
+PORTFOLIO_REPLAY_SCHEMA_VERSION = "2026-08-24-synchronized-spread-swap-v10"
+PORTFOLIO_REPLAY_EVIDENCE_SCHEMA_VERSION = "2026-08-24-funded-portfolio-evidence-v8"
 PORTFOLIO_REPLAY_EVIDENCE_SEAL_ALGORITHM = "sha256-canonical-json-v1"
 PORTFOLIO_REPLAY_CANDIDATE_SCHEMA_VERSION = (
-    "2026-07-13-native-final-lockbox-exact-regime-position-v5"
+    "2026-08-24-native-final-lockbox-spread-swap-position-v6"
 )
 PORTFOLIO_REPLAY_REQUIRED_TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
 PORTFOLIO_REPLAY_REQUIRED_REGIMES = ("TREND", "RANGE", "BREAKOUT", "CHOP")
@@ -59,15 +59,15 @@ PORTFOLIO_REPLAY_BOOK_ACCOUNTING_SCHEMA_VERSION = (
     "fxpm.portfolio-replay-book-accounting.v2"
 )
 CURRENT_REFIT_REPLAY_SUCCESSOR_SCHEMA_VERSION = (
-    "fxpm.current-refit-synchronized-replay.v1"
+    "fxpm.current-refit-synchronized-replay.v2"
 )
 CURRENT_REFIT_REPLAY_RECONCILIATION_SCHEMA_VERSION = (
-    "fxpm.current-refit-replay-reconciliation.v1"
+    "fxpm.current-refit-replay-reconciliation.v2"
 )
 MINIMUM_BOOTSTRAP_DAILY_RETURN_OBSERVATIONS = 500
-MTM_MARK_COST_CONTRACT_VERSION = "causal-common-valuation-tape-v1"
+MTM_MARK_COST_CONTRACT_VERSION = "causal-common-valuation-tape-v2"
 MTM_SWAP_ACCRUAL_CONTRACT_VERSION = "causal-calendar-rollover-accrual-v2"
-PORTFOLIO_REPLAY_INPUT_RECEIPT_VERSION = "fxpm.synchronized-replay-input-receipt.v1"
+PORTFOLIO_REPLAY_INPUT_RECEIPT_VERSION = "fxpm.synchronized-replay-input-receipt.v2"
 PORTFOLIO_REPLAY_PATH_CONTRACT_VERSION = "fxpm.synchronized-capital-path.v1"
 MAX_PORTFOLIO_REPLAY_CANDIDATES = 500_000
 MAX_PORTFOLIO_REPLAY_TIMESTAMPS = 2_000_000
@@ -958,15 +958,11 @@ def portfolio_cost_contract(config_payload: Mapping[str, Any]) -> Dict[str, Any]
     """Resolve the replay cost contract exactly as ``PipelineConfig`` does.
 
     Funded JSON intentionally omits several code-owned invariants.  An omitted
-    key therefore means the production dataclass default, not ``False``.  Using
-    permissive mapping defaults here previously disabled spread, commission and
-    slippage in the synchronized replay even though both optimization and live
-    execution had them enabled, making every production evidence run fail (and
-    any diagnostic contract mathematically inconsistent).
+    key therefore means the production dataclass default, not ``False``.  The
+    replay contract binds only the costs the historical engine can legitimately
+    reconstruct: executable spread and causal swap.
     """
-    from dataclasses import MISSING, fields
-
-    from pm_core import PipelineConfig
+    from pm_core import PipelineConfig, strict_pipeline_config_kwargs
 
     pipeline = (
         config_payload.get("pipeline")
@@ -974,26 +970,17 @@ def portfolio_cost_contract(config_payload: Mapping[str, Any]) -> Dict[str, Any]
         else {}
     )
 
-    defaults: Dict[str, Any] = {}
-    for item in fields(PipelineConfig):
-        if item.default is not MISSING:
-            defaults[item.name] = item.default
-
-    def resolved(name: str) -> Any:
-        return pipeline[name] if name in pipeline else defaults.get(name)
+    resolved = PipelineConfig(**strict_pipeline_config_kwargs(pipeline))
 
     return {
-        "use_spread": bool(resolved("use_spread")),
-        "backtest_spread_mode": str(resolved("backtest_spread_mode") or ""),
-        "use_commission": bool(resolved("use_commission")),
-        "use_slippage": bool(resolved("use_slippage")),
-        "slippage_pips": _finite(resolved("slippage_pips"), 0.0),
-        "swap_model_enabled": bool(resolved("swap_model_enabled")),
+        "use_spread": bool(resolved.use_spread),
+        "backtest_spread_mode": str(resolved.backtest_spread_mode or ""),
+        "swap_model_enabled": bool(resolved.swap_model_enabled),
         "swap_model_min_holding_hours": _finite(
-            resolved("swap_model_min_holding_hours"), 0.0
+            resolved.swap_model_min_holding_hours, 0.0
         ),
         "swap_model_triple_rollover_day": str(
-            resolved("swap_model_triple_rollover_day") or ""
+            resolved.swap_model_triple_rollover_day or ""
         ).lower(),
     }
 
@@ -1014,7 +1001,6 @@ def portfolio_mark_cost_contract(
         "observation_time_rule": "observation_time_lte_effective_time",
         "event_order": "close_existing_then_mark_existing_then_admit",
         "spread_at_mark": bool(cost_contract.get("use_spread")),
-        "round_trip_commission_at_mark": bool(cost_contract.get("use_commission")),
         "swap_accrued_through_mark": bool(cost_contract.get("swap_model_enabled")),
         "swap_accrual_model": MTM_SWAP_ACCRUAL_CONTRACT_VERSION,
     }
@@ -1075,12 +1061,6 @@ def portfolio_policy_from_config_payload(
     max_margin_utilization_pct = 10_000.0 / margin_entry_block_level
     if not (0.0 < max_margin_utilization_pct < 100.0):
         raise ValueError("derived margin utilization must be in (0, 100)")
-    # Retained in the serialized policy only so older callers can be decoded
-    # without silently changing their policy hash.  It no longer controls
-    # admission: production has one concurrent slot per authenticated
-    # symbol/timeframe/regime specialist and the selected Capital envelope
-    # governs aggregate same-symbol exposure.
-    allow_d1_plus_lower = bool(pipeline.get("allow_d1_plus_lower_tf", False))
     raw_symbols = config_payload.get("symbols")
     configured_symbols = {
         str(symbol).strip().upper()
@@ -1113,7 +1093,6 @@ def portfolio_policy_from_config_payload(
         max_risk_per_trade_pct=max_trade_risk,
         max_open_risk_pct=effective_open_cap,
         max_concurrent_positions=structural_position_ceiling,
-        allow_d1_plus_lower_tf=allow_d1_plus_lower,
         max_same_symbol_open_risk_pct=_finite(
             pipeline.get("max_combined_risk_pct"), 1.0
         ),
@@ -1191,7 +1170,6 @@ class ExitLeg:
     fraction: float
     net_pnl_per_entry_lot: float
     price_pnl_per_entry_lot: float = 0.0
-    commission_per_entry_lot: float = 0.0
     swap_per_entry_lot: float = 0.0
     exit_reason: str = ""
 
@@ -1204,9 +1182,6 @@ class ExitLeg:
             ),
             price_pnl_per_entry_lot=_required_finite(
                 self.price_pnl_per_entry_lot, "exit leg price P&L"
-            ),
-            commission_per_entry_lot=_required_finite(
-                self.commission_per_entry_lot, "exit leg commission"
             ),
             swap_per_entry_lot=_required_finite(
                 self.swap_per_entry_lot, "exit leg swap"
@@ -1351,11 +1326,6 @@ class PortfolioPolicy:
     max_risk_per_trade_pct: float = 0.50
     max_open_risk_pct: float = 2.0
     max_concurrent_positions: int = 6
-    # Deprecated compatibility field.  Synchronized v9 admission always allows
-    # distinct authenticated specialist cells to compete under the selected
-    # same-symbol/factor/total/margin envelope.  Exact-cell pyramiding remains
-    # forbidden independently of this legacy value.
-    allow_d1_plus_lower_tf: bool = False
     max_same_symbol_open_risk_pct: float = 1.0
     max_factor_group_open_risk_pct: float = 1.0
     # Research-only overlay. The funded policy builder fixes this false because
@@ -1426,7 +1396,6 @@ _EXIT_RECORD_FIELDS = {
     "fraction",
     "net_pnl_per_entry_lot",
     "price_pnl_per_entry_lot",
-    "commission_per_entry_lot",
     "swap_per_entry_lot",
     "exit_reason",
 }
@@ -1459,7 +1428,6 @@ def current_refit_candidate_record(candidate: CandidateTrade) -> Dict[str, Any]:
                 "fraction": leg.fraction,
                 "net_pnl_per_entry_lot": leg.net_pnl_per_entry_lot,
                 "price_pnl_per_entry_lot": leg.price_pnl_per_entry_lot,
-                "commission_per_entry_lot": leg.commission_per_entry_lot,
                 "swap_per_entry_lot": leg.swap_per_entry_lot,
                 "exit_reason": leg.exit_reason,
             }
@@ -1556,7 +1524,6 @@ def candidate_trade_from_record(record: Any) -> CandidateTrade:
                 fraction=row["fraction"],
                 net_pnl_per_entry_lot=row["net_pnl_per_entry_lot"],
                 price_pnl_per_entry_lot=row["price_pnl_per_entry_lot"],
-                commission_per_entry_lot=row["commission_per_entry_lot"],
                 swap_per_entry_lot=row["swap_per_entry_lot"],
                 exit_reason=row["exit_reason"],
             )
@@ -2276,8 +2243,6 @@ def validate_funded_portfolio_replay_evidence(
         bool(expected_cost_contract.get(key))
         for key in (
             "use_spread",
-            "use_commission",
-            "use_slippage",
             "swap_model_enabled",
         )
     ):
@@ -2593,7 +2558,6 @@ class _OpenPosition:
     last_mark_per_current_lot: float = 0.0
     realized_pnl: float = 0.0
     price_pnl: float = 0.0
-    commission: float = 0.0
     swap: float = 0.0
     closed_legs: int = 0
 
@@ -2839,7 +2803,6 @@ class SynchronizedPortfolioSimulator:
             cashflow = position.volume * leg.net_pnl_per_entry_lot
             position.realized_pnl += cashflow
             position.price_pnl += position.volume * leg.price_pnl_per_entry_lot
-            position.commission += position.volume * leg.commission_per_entry_lot
             position.swap += position.volume * leg.swap_per_entry_lot
             position.remaining_fraction = max(
                 0.0, position.remaining_fraction - leg.fraction
@@ -2866,7 +2829,6 @@ class SynchronizedPortfolioSimulator:
                         "initial_margin": position.initial_margin,
                         "net_pnl": position.realized_pnl,
                         "price_pnl": position.price_pnl,
-                        "commission": position.commission,
                         "swap": position.swap,
                         "exit_legs": position.closed_legs,
                         "priority_score": position.candidate.priority_score,
@@ -3116,9 +3078,6 @@ class SynchronizedPortfolioSimulator:
             "total_price_pnl": round(
                 sum(trade["price_pnl"] for trade in closed_positions), 8
             ),
-            "total_commission": round(
-                sum(trade["commission"] for trade in closed_positions), 8
-            ),
             "total_swap": round(sum(trade["swap"] for trade in closed_positions), 8),
             "known_correlation_checks": known_correlation_checks,
             "unknown_correlation_checks": unknown_correlation_checks,
@@ -3148,7 +3107,7 @@ class SynchronizedPortfolioSimulator:
                 "offline margin is an approximation unless broker historical margin-per-lot is supplied",
                 "mark-to-market uses the independently loaded native M5 Open observable at each bar-open timestamp; intrabar portfolio equity can be worse",
                 "replay stop-equity remains the legacy immutable initial-stop model until the separate causal stop-state lane is implemented",
-                "spread and slippage are embedded in price P&L and are not separately identifiable from the current trade schema",
+                "spread is embedded in executable price P&L and is not separately identifiable from the current trade schema",
                 "bootstrap ruin is a conditional sequence stress test, not a forecast or profitability guarantee",
             ],
         }
@@ -3434,8 +3393,3 @@ def bootstrap_ruin_probability(
         "median_max_drawdown_pct": round(float(np.quantile(max_drawdowns, 0.50)), 6),
         "p95_max_drawdown_pct": round(float(np.quantile(max_drawdowns, 0.95)), 6),
     }
-
-
-def infer_risk_groups(symbol: str, asset_class: str) -> Tuple[str, ...]:
-    """Compatibility alias for the shared funded/live factor taxonomy."""
-    return infer_factor_groups(symbol, asset_class)

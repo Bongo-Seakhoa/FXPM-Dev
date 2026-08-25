@@ -50,27 +50,44 @@ def _specialist(
 
 
 def _genuine_position_evidence(
-    *, use_slippage: bool = False, return_tape: bool = False
+    *,
+    return_tape: bool = False,
+    mode6_short: bool = False,
 ):
     frame = backtester_fixture._frame().assign(
         SpreadOpen=[1, 1, 1, 1, 1],
         SpreadMax=[5, 5, 5, 5, 5],
         SpreadP95=[4, 4, 4, 4, 4],
     )
+    if mode6_short:
+        frame = frame.iloc[:3].copy()
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
-        use_slippage=use_slippage,
-        slippage_pips=0.5,
-        use_commission=True,
-        swap_model_enabled=False,
+        swap_model_enabled=mode6_short,
+        swap_model_min_holding_hours=0.0,
         backtest_spread_mode="conservative_max",
         oos_evidence_execution_stress_mode="stress_p95",
         discovery_risk_per_trade_pct=1.0,
     )
-    spec = backtester_fixture._spec(commission_per_lot=7.0)
+    spec = backtester_fixture._spec(
+        **(
+            {
+                "swap_long": -36.0,
+                "swap_short": -36.0,
+                "swap_mode": 6,
+                "contract_size": 100_000.0,
+            }
+            if mode6_short
+            else {}
+        )
+    )
     strategy = backtester_fixture._AtrHoldStrategy()
-    signals = backtester_fixture._signals(frame)
+    signals = (
+        pd.Series([-1, 0, 0], index=frame.index, dtype=np.int32)
+        if mode6_short
+        else backtester_fixture._signals(frame)
+    )
     backtester = Backtester(config)
     base = backtester.run(
         frame,
@@ -481,9 +498,7 @@ def test_conservative_margin_model_and_amount_are_candidate_roster_bound() -> No
     assert reduced["candidate_roster_sha256"] != original["candidate_roster_sha256"]
 
 
-def test_common_m5_open_marks_use_executable_bid_and_full_round_trip_commission() -> (
-    None
-):
+def test_common_m5_open_marks_use_executable_bid_and_swap_only() -> None:
     _, _, spec, _, _, _, position, tape = _genuine_position_evidence(return_tape=True)
     assert position.candidate.marks
     first = position.candidate.marks[0]
@@ -494,7 +509,7 @@ def test_common_m5_open_marks_use_executable_bid_and_full_round_trip_commission(
     executable_bid = mid - half
     expected = (
         executable_bid - position.base_entry_fill
-    ) * position.contract_multiplier - position.base_commission_per_lot
+    ) * position.contract_multiplier
     assert first.pnl_per_current_lot == pytest.approx(float(expected))
     assert position.marks[0].mid_price == Decimal(
         str(
@@ -518,15 +533,56 @@ def test_common_m5_open_marks_use_executable_bid_and_full_round_trip_commission(
     )
 
 
-def test_stop_risk_includes_adverse_configured_stop_slippage() -> None:
-    _, config, spec, _, _, _, position = _genuine_position_evidence(use_slippage=True)
-    slippage = Decimal(str(spec.pips_to_price(config.slippage_pips)))
-    adverse_stop_fill = position.stop_price - slippage
+def test_stop_risk_uses_gross_broker_price_loss() -> None:
+    _, _, _, _, _, _, position = _genuine_position_evidence()
     expected = (
-        abs(position.base_entry_fill - adverse_stop_fill) * position.contract_multiplier
-        + position.base_commission_per_lot
+        abs(position.base_entry_fill - position.stop_price)
+        * position.contract_multiplier
     )
     assert position.candidate.stop_risk_per_lot == pytest.approx(float(expected))
+
+
+def test_mode6_short_rollover_rebound_passes_cumulative_forward_cost_rule() -> None:
+    _, _, _, _, base, stress, position = _genuine_position_evidence(
+        mode6_short=True
+    )
+    base_trade = base["trades"][0]
+    stress_trade = stress["trades"][0]
+    assert position.side == "SHORT"
+    assert position.stress_entry_fill < position.base_entry_fill
+    assert stress_trade["swap_dollars"] > base_trade["swap_dollars"]
+    assert stress_trade["pnl_dollars"] < base_trade["pnl_dollars"]
+    assert any(
+        mark.stress_financing_per_lot < mark.base_financing_per_lot
+        for mark in position.marks
+    )
+
+    volume = Decimal("0.01")
+    unit = volume * position.contract_multiplier
+    sign = Decimal(-1)
+    executable = position.entry_bid
+    spread = sign * (executable - position.entry_mid) * unit
+    base_prefix = max(
+        Decimal(0),
+        spread + sign * (position.base_entry_fill - executable) * unit,
+    )
+    stress_prefix = max(
+        Decimal(0),
+        spread + sign * (position.stress_entry_fill - executable) * unit,
+    )
+    for mark in position.marks:
+        base_prefix += mark.base_financing_per_lot * volume
+        stress_prefix += mark.stress_financing_per_lot * volume
+        assert stress_prefix + Decimal("1e-12") >= base_prefix
+
+    replay = producer._AnchorRawReplay(
+        anchor=_anchor_for(position),
+        specialists=(_specialist(),),
+        positions=(position,),
+        accepted_volume_by_position_id={position.position_id: volume},
+    )
+    ledgers = producer._ledger_bodies(replay, starting_balance=Decimal("10000"))
+    assert len(ledgers["COST_LEDGER"]["days"]) == len(position.marks)
 
 
 def test_candidate_mark_budget_fails_before_unbounded_materialization(
@@ -559,7 +615,7 @@ def test_deployment_and_broker_files_are_immutably_bound_and_rechecked(
     producer._assert_deployment_config_unchanged(binding, config)
 
     broker_path.write_text(
-        '{"AUDUSD":{"symbol":"AUDUSD","commission":7}}', encoding="utf-8"
+        '{"AUDUSD":{"symbol":"AUDUSD","tampered":true}}', encoding="utf-8"
     )
     with pytest.raises(
         producer.ForwardOOSReplayProductionError,
@@ -940,6 +996,20 @@ def test_seventh_producer_receipt_is_content_addressed_reopened_and_non_authoriz
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    assert producer.PRODUCTION_CONTRACT_VERSION == (
+        "fxpm.forward-oos-replay-producer.v4"
+    )
+    assert producer.REPLAY_PRECOMMIT_SCHEMA == "fxpm.forward-oos-replay-precommit.v4"
+    assert producer.PRODUCER_RECEIPT_SCHEMA == (
+        "fxpm.forward-oos-replay-producer-receipt.v4"
+    )
+    assert producer.CAPITAL_CANDIDATE_CHUNK_SCHEMA == (
+        "fxpm.forward-oos-capital-candidate-chunk.v2"
+    )
+    assert producer.POSITION_SOURCE_SCHEMA == "fxpm.forward-oos-backtester-position.v2"
+    assert producer.VALUATION_CONTRACT == (
+        "AUTHENTICATED_NATIVE_M5_OPEN_EXECUTABLE_BID_ASK_PLUS_SWAP_V2"
+    )
     context = authority_spool.freeze_generation_context(
         tmp_path / "spool",
         generation_id="forward-oos-product-test",
@@ -1186,8 +1256,6 @@ def test_seventh_producer_receipt_is_content_addressed_reopened_and_non_authoriz
         ),
         "valuation_contract": producer.VALUATION_CONTRACT,
         "valuation_event_order": "close_existing_then_mark_existing_then_admit",
-        "full_round_trip_commission_in_every_candidate_mark": True,
-        "stop_risk_includes_adverse_configured_stop_slippage": True,
         "candidate_marks_thinned_or_sampled": False,
         "causal_consumer_reopened_and_verified": False,
         "causal_binding_followup_required": True,
@@ -1380,7 +1448,9 @@ def test_genuine_public_d1_execution_and_separate_m5_valuation_products_reopen(
     assert len(tape.entry_half_spread) == len(tape.frame) == 3
     assert spec.symbol == native_fixture.SYMBOL
     assert tape.spread_meta["valuation_price_field"] == "Open"
-    assert tape.spread_meta["round_trip_commission_deducted_at_every_mark"] is True
+    assert tape.spread_meta["mark_cost_basis"] == (
+        "EXECUTABLE_BID_ASK_PLUS_ACCRUED_SWAP"
+    )
 
 
 def test_reopen_rejects_post_precommit_native_source_tamper(tmp_path) -> None:

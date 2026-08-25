@@ -54,11 +54,11 @@ from pm_strategies import StrategyRegistry
 
 
 UTC: Final = timezone.utc
-PRODUCTION_CONTRACT_VERSION: Final = "fxpm.forward-oos-replay-producer.v3"
-REPLAY_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v3"
-PRODUCER_RECEIPT_SCHEMA: Final = "fxpm.forward-oos-replay-producer-receipt.v3"
+PRODUCTION_CONTRACT_VERSION: Final = "fxpm.forward-oos-replay-producer.v4"
+REPLAY_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v4"
+PRODUCER_RECEIPT_SCHEMA: Final = "fxpm.forward-oos-replay-producer-receipt.v4"
 CAPITAL_CANDIDATE_CHUNK_SCHEMA: Final = (
-    "fxpm.forward-oos-capital-candidate-chunk.v1"
+    "fxpm.forward-oos-capital-candidate-chunk.v2"
 )
 CAPITAL_PHASE_MANIFEST_SCHEMA: Final = "fxpm.forward-oos-capital-phase-manifest.v1"
 CAPITAL_INNER_SELECTION: Final = "INNER_SELECTION"
@@ -66,9 +66,9 @@ CAPITAL_OUTER_EVALUATION: Final = "OUTER_EVALUATION"
 CAPITAL_PHASES: Final = (CAPITAL_INNER_SELECTION, CAPITAL_OUTER_EVALUATION)
 CAPITAL_SELECTION_CALENDAR_DAYS: Final = 365
 MARGIN_MODEL: Final = "AUTHENTICATED_TICK_CASH_NOTIONAL_100PCT_V1"
-POSITION_SOURCE_SCHEMA: Final = "fxpm.forward-oos-backtester-position.v1"
+POSITION_SOURCE_SCHEMA: Final = "fxpm.forward-oos-backtester-position.v2"
 VALUATION_CONTRACT: Final = (
-    "AUTHENTICATED_NATIVE_M5_OPEN_EXECUTABLE_BID_ASK_FULL_ROUND_TRIP_COST_V1"
+    "AUTHENTICATED_NATIVE_M5_OPEN_EXECUTABLE_BID_ASK_PLUS_SWAP_V2"
 )
 
 _HEX64: Final = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
@@ -109,8 +109,6 @@ _PRODUCER_RECEIPT_FIELDS: Final = frozenset(
         "capital_phase_window_contract",
         "valuation_contract",
         "valuation_event_order",
-        "full_round_trip_commission_in_every_candidate_mark",
-        "stop_risk_includes_adverse_configured_stop_slippage",
         "candidate_marks_thinned_or_sampled",
         "causal_consumer_reopened_and_verified",
         "causal_binding_followup_required",
@@ -755,10 +753,6 @@ def _verify_forward_oos_replay_product_complete(
         != "EXACT_FORWARD_END_EXCLUSIVE_NO_LATER_ROWS"
         or body.get("valuation_event_order")
         != "close_existing_then_mark_existing_then_admit"
-        or body.get("full_round_trip_commission_in_every_candidate_mark")
-        is not True
-        or body.get("stop_risk_includes_adverse_configured_stop_slippage")
-        is not True
         or body.get("candidate_marks_thinned_or_sampled") is not False
         or body.get("capital_candidate_records_complete_pre_policy") is not True
         or body.get("capital_phase_window_contract")
@@ -1409,8 +1403,6 @@ class _PositionEvidence:
     exit_ask: Decimal
     base_exit_fill: Decimal
     stress_exit_fill: Decimal
-    base_commission_per_lot: Decimal
-    stress_commission_per_lot: Decimal
     margin_per_lot: Decimal
     marks: tuple[_DailyMark, ...]
 
@@ -1482,9 +1474,6 @@ def _pipeline_config_identity(config: PipelineConfig) -> dict[str, Any]:
         "initial_capital",
         "discovery_risk_per_trade_pct",
         "use_spread",
-        "use_commission",
-        "use_slippage",
-        "slippage_pips",
         "backtest_spread_mode",
         "swap_model_enabled",
         "swap_model_triple_rollover_day",
@@ -2423,7 +2412,6 @@ def _exit_quote(
     trade: Mapping[str, Any],
     features: pd.DataFrame,
     half_spread: np.ndarray,
-    slippage_price: float,
 ) -> tuple[Decimal, Decimal, Decimal, pd.Timestamp]:
     exit_bar = int(trade["exit_bar"])
     if not 0 <= exit_bar < len(features):
@@ -2457,8 +2445,7 @@ def _exit_quote(
         )
     elif "sl" in reason or "stop" in reason:
         stop = float(trade["stop_loss"])
-        expected = stop - (sign * slippage_price)
-        if not math.isclose(fill, expected, rel_tol=0.0, abs_tol=tolerance):
+        if not math.isclose(fill, stop, rel_tol=0.0, abs_tol=tolerance):
             _fail("BACKTEST_STOP_FILL_NOT_RECONSTRUCTIBLE")
         mid = stop + (sign * half)
         effective_time = _timestamp(
@@ -2568,14 +2555,12 @@ def _executable_mark_net_per_lot(
     ask: Decimal,
     base_entry_fill: Decimal,
     contract_multiplier: Decimal,
-    commission_per_lot: Decimal,
     accumulated_financing_cost: Decimal,
 ) -> Decimal:
     sign = Decimal(1) if side == "LONG" else Decimal(-1)
     liquidation = bid if side == "LONG" else ask
     return (
         sign * contract_multiplier * (liquidation - base_entry_fill)
-        - commission_per_lot
         - accumulated_financing_cost
     )
 
@@ -2590,7 +2575,6 @@ def _m5_valuation_marks(
     stop_price: Decimal,
     effective_exit_time: pd.Timestamp,
     contract_multiplier: Decimal,
-    commission_per_lot: Decimal,
 ) -> tuple[tuple[portfolio.MarkPoint, ...], tuple[_DailyMark, ...]]:
     side = str(trade["direction"]).upper()
     if side not in {"LONG", "SHORT"}:
@@ -2617,7 +2601,6 @@ def _m5_valuation_marks(
             ask=ask,
             base_entry_fill=base_entry_fill,
             contract_multiplier=contract_multiplier,
-            commission_per_lot=commission_per_lot,
             accumulated_financing_cost=_accumulated_swap_cost(
                 base_swap_cost, marked_at
             ),
@@ -2656,15 +2639,12 @@ def _m5_valuation_marks(
             _fail("M5_DAILY_VALUATION_TIME_INVALID", tape.symbol, day_text)
         base_finance = base_swap_cost.daily_costs.get(day_text, Decimal(0))
         stress_finance = stress_swap_cost.daily_costs.get(day_text, Decimal(0))
-        if stress_finance < base_finance:
-            _fail("STRESS_FINANCING_LESS_SEVERE")
         net = _executable_mark_net_per_lot(
             side=side,
             bid=bid,
             ask=ask,
             base_entry_fill=base_entry_fill,
             contract_multiplier=contract_multiplier,
-            commission_per_lot=commission_per_lot,
             accumulated_financing_cost=_accumulated_swap_cost(
                 base_swap_cost, marked_at
             ),
@@ -2783,10 +2763,9 @@ def _position_evidence(
     base_entry_spread, base_half_spread, _ = base_backtester._build_half_spread_arrays(
         features, spec
     )
-    _, stress_half_spread, _ = stress_backtester._build_half_spread_arrays(
+    stress_entry_spread, _, _ = stress_backtester._build_half_spread_arrays(
         features, spec
     )
-    slippage = spec.pips_to_price(config.slippage_pips) if config.use_slippage else 0.0
     entry_prices = np.full(len(features), np.nan, dtype=np.float64)
     stress_entry_prices = np.full(len(features), np.nan, dtype=np.float64)
     for trade, stress_trade in by_position.values():
@@ -2823,13 +2802,6 @@ def _position_evidence(
     contract_multiplier = _decimal(
         spec.tick_value, "TICK_VALUE_INVALID", positive=True
     ) / _decimal(spec.tick_size, "TICK_SIZE_INVALID", positive=True)
-    commission = (
-        _decimal(spec.commission_per_lot, "COMMISSION_INVALID")
-        if config.use_commission
-        else Decimal(0)
-    )
-    if commission < 0:
-        _fail("COMMISSION_NEGATIVE")
     positions: list[_PositionEvidence] = []
     for position_id in sorted(by_position):
         trade, stress_trade = by_position[position_id]
@@ -2846,21 +2818,25 @@ def _position_evidence(
             stress_trade["entry_price"], "STRESS_ENTRY_FILL_INVALID", positive=True
         )
         executable_entry = entry_ask if side == "LONG" else entry_bid
-        expected_base_entry = executable_entry + sign * _decimal(
-            slippage, "SLIPPAGE_PRICE_INVALID"
+        _, stress_entry_bid, stress_entry_ask = _quote(
+            features["Open"].iloc[entry_bar], stress_entry_spread[entry_bar]
+        )
+        expected_stress_entry = (
+            stress_entry_ask if side == "LONG" else stress_entry_bid
         )
         tolerance = max(
             Decimal("0.000000000001"), abs(base_entry) * Decimal("0.000000000001")
         )
-        if abs(base_entry - expected_base_entry) > tolerance:
+        if abs(base_entry - executable_entry) > tolerance:
             _fail("BACKTEST_ENTRY_FILL_RECONSTRUCTION_FAILED", position_id)
+        if abs(stress_entry - expected_stress_entry) > tolerance:
+            _fail("BACKTEST_STRESS_ENTRY_FILL_RECONSTRUCTION_FAILED", position_id)
         if sign * (stress_entry - base_entry) < 0:
             _fail("BACKTEST_STRESS_ENTRY_IMPROVES", position_id)
         exit_mid, exit_bid, exit_ask, effective_exit_time = _exit_quote(
             trade=trade,
             features=features,
             half_spread=base_half_spread,
-            slippage_price=slippage,
         )
         base_exit = _decimal(
             trade["exit_price"], "BASE_EXIT_FILL_INVALID", positive=True
@@ -2916,7 +2892,6 @@ def _position_evidence(
             stop_price=stop,
             effective_exit_time=effective_exit_time,
             contract_multiplier=contract_multiplier,
-            commission_per_lot=commission,
         )
         if any(
             (side == "LONG" and stop >= mark.bid_price)
@@ -2926,8 +2901,8 @@ def _position_evidence(
             _fail("OPEN_POSITION_MARK_CROSSES_PROTECTIVE_STOP", position_id)
         base_swap_per_lot = -sum(base_swap.daily_costs.values(), Decimal(0))
         price_pnl_per_lot = sign * (base_exit - base_entry) * contract_multiplier
-        exact_net_per_lot = price_pnl_per_lot - commission + base_swap_per_lot
-        exact_gross_cash = (price_pnl_per_lot - commission) * size
+        exact_net_per_lot = price_pnl_per_lot + base_swap_per_lot
+        exact_gross_cash = price_pnl_per_lot * size
         exact_net_cash = exact_net_per_lot * size
         if _money_round(exact_gross_cash) != _decimal(
             trade["gross_pnl_dollars"], "BACKTEST_GROSS_PNL_INVALID"
@@ -2935,12 +2910,7 @@ def _position_evidence(
             trade["pnl_dollars"], "BACKTEST_NET_PNL_INVALID"
         ):
             _fail("BACKTEST_POSITION_CASH_RECONCILIATION_FAILED", position_id)
-        adverse_stop_fill = stop - sign * _decimal(
-            slippage, "STOP_SLIPPAGE_PRICE_INVALID"
-        )
-        stop_risk = (
-            abs(base_entry - adverse_stop_fill) * contract_multiplier + commission
-        )
+        stop_risk = abs(base_entry - stop) * contract_multiplier
         margin_per_lot = abs(base_entry) * contract_multiplier
         candidate_id = (
             "oos:"
@@ -2975,7 +2945,6 @@ def _position_evidence(
                     fraction=1.0,
                     net_pnl_per_entry_lot=float(exact_net_per_lot),
                     price_pnl_per_entry_lot=float(price_pnl_per_lot),
-                    commission_per_entry_lot=float(-commission),
                     swap_per_entry_lot=float(base_swap_per_lot),
                     exit_reason=str(trade["exit_reason"]),
                 ),
@@ -3005,8 +2974,6 @@ def _position_evidence(
                 exit_ask=exit_ask,
                 base_exit_fill=base_exit,
                 stress_exit_fill=stress_exit,
-                base_commission_per_lot=commission,
-                stress_commission_per_lot=commission,
                 margin_per_lot=margin_per_lot,
                 marks=marks,
             )
@@ -3072,14 +3039,10 @@ def _open_m5_valuation_tape(
         entry_half, intrabar_half, spread_meta = backtester._build_half_spread_arrays(
             frame, spec
         )
-        slippage_price = (
-            spec.pips_to_price(config.slippage_pips) if config.use_slippage else 0.0
-        )
         cost_attestation = backtester._numerical_execution_cost_attestation(
             entry_half_spread=entry_half,
             intrabar_half_spread=intrabar_half,
             spread_meta=spread_meta,
-            slippage_price=slippage_price,
             spec=spec,
         )
     except Exception as exc:
@@ -3100,7 +3063,7 @@ def _open_m5_valuation_tape(
             "valuation_price_field": "Open",
             "valuation_timeframe": "M5",
             "executable_liquidation": "BID_FOR_LONG_ASK_FOR_SHORT",
-            "round_trip_commission_deducted_at_every_mark": True,
+            "mark_cost_basis": "EXECUTABLE_BID_ASK_PLUS_ACCRUED_SWAP",
         },
         execution_spec_receipt=spec_receipt,
         native_product_identity=dict(expected_identity),
@@ -3494,8 +3457,8 @@ def _execute_anchor_replay(
                 "abs(authenticated_entry_fill)*tick_value/tick_size*volume"
             ),
             "stop_risk_formula": (
-                "abs(authenticated_entry_fill-adverse_stop_fill_with_configured_"
-                "slippage)*tick_value/tick_size+full_round_trip_commission"
+                "abs(authenticated_entry_fill-initial_stop_price)"
+                "*tick_value/tick_size"
             ),
             "position_source_schema": POSITION_SOURCE_SCHEMA,
             "backtester_position_event_schema": (
@@ -4771,8 +4734,6 @@ def produce_forward_oos_replay_artifacts(
             ),
             "valuation_contract": VALUATION_CONTRACT,
             "valuation_event_order": ("close_existing_then_mark_existing_then_admit"),
-            "full_round_trip_commission_in_every_candidate_mark": True,
-            "stop_risk_includes_adverse_configured_stop_slippage": True,
             "candidate_marks_thinned_or_sampled": False,
             # Causal evidence may be produced only after this receipt/product
             # exists and passes its standalone verifier.  The former v1
@@ -4903,12 +4864,13 @@ def _ledger_bodies(
     margin_days: list[dict[str, Any]] = []
     open_states: dict[str, tuple[_PositionEvidence, Decimal, Decimal]] = {}
     equity = starting_balance
+    cumulative_base_cost = Decimal(0)
+    cumulative_stress_cost = Decimal(0)
     if not equity.is_finite() or equity <= 0:
         _fail("REPLAY_STARTING_BALANCE_INVALID")
     for day_text in dates:
         entries_event: list[dict[str, Any]] = []
         entries_fill: list[dict[str, Any]] = []
-        entries_cost: list[dict[str, Any]] = []
         for position, volume in sorted(
             by_entry.get(day_text, []), key=lambda item: item[0].position_id
         ):
@@ -4950,19 +4912,6 @@ def _ledger_bodies(
                     "reference_ask_price": _decimal_text(position.entry_ask),
                     "base_fill_price": _decimal_text(position.base_entry_fill),
                     "stress_fill_price": _decimal_text(position.stress_entry_fill),
-                }
-            )
-            entries_cost.append(
-                {
-                    "event_id": event_id,
-                    "base_commission_cash": _decimal_text(
-                        position.base_commission_per_lot * volume / Decimal(2)
-                    ),
-                    "stress_commission_cash": _decimal_text(
-                        position.stress_commission_per_lot * volume / Decimal(2)
-                    ),
-                    "base_fee_cash": "0",
-                    "stress_fee_cash": "0",
                 }
             )
             open_states[position.position_id] = (
@@ -5024,15 +4973,17 @@ def _ledger_bodies(
                     else position.entry_bid
                 )
                 spread = sign * (executable - position.entry_mid) * unit
-                base_slip = sign * (position.base_entry_fill - executable) * unit
-                stress_slip = sign * (position.stress_entry_fill - executable) * unit
-                daily_base_cost += max(Decimal(0), spread + base_slip)
-                daily_stress_cost += max(Decimal(0), spread + stress_slip)
-                daily_base_cost += (
-                    position.base_commission_per_lot * volume / Decimal(2)
+                base_fill_degradation = (
+                    sign * (position.base_entry_fill - executable) * unit
                 )
-                daily_stress_cost += (
-                    position.stress_commission_per_lot * volume / Decimal(2)
+                stress_fill_degradation = (
+                    sign * (position.stress_entry_fill - executable) * unit
+                )
+                daily_base_cost += max(
+                    Decimal(0), spread + base_fill_degradation
+                )
+                daily_stress_cost += max(
+                    Decimal(0), spread + stress_fill_degradation
                 )
             required_margin = position.margin_per_lot * volume
             exposure_positions.append(
@@ -5048,7 +4999,6 @@ def _ledger_bodies(
 
         exits_event: list[dict[str, Any]] = []
         exits_fill: list[dict[str, Any]] = []
-        exits_cost: list[dict[str, Any]] = []
         for position, volume in sorted(
             by_exit.get(day_text, []), key=lambda item: item[0].position_id
         ):
@@ -5088,37 +5038,26 @@ def _ledger_bodies(
                     "stress_fill_price": _decimal_text(position.stress_exit_fill),
                 }
             )
-            exits_cost.append(
-                {
-                    "event_id": event_id,
-                    "base_commission_cash": _decimal_text(
-                        position.base_commission_per_lot * volume / Decimal(2)
-                    ),
-                    "stress_commission_cash": _decimal_text(
-                        position.stress_commission_per_lot * volume / Decimal(2)
-                    ),
-                    "base_fee_cash": "0",
-                    "stress_fee_cash": "0",
-                }
-            )
             sign = Decimal(1) if position.side == "LONG" else Decimal(-1)
             unit = volume * position.contract_multiplier
             # The daily mark is an independently acquired M5 Open, while the
             # close is the exact specialist execution fill.  Realize the gross
             # mid-price move from that last common valuation to the execution
-            # reference before charging closing spread/slippage/commission.
+            # reference before charging the executable spread/fill degradation.
             daily_gross += sign * unit * (position.exit_mid - state[2])
             executable = (
                 position.exit_bid if position.side == "LONG" else position.exit_ask
             )
             spread = sign * (position.exit_mid - executable) * unit
-            base_slip = sign * (executable - position.base_exit_fill) * unit
-            stress_slip = sign * (executable - position.stress_exit_fill) * unit
-            daily_base_cost += max(Decimal(0), spread + base_slip)
-            daily_stress_cost += max(Decimal(0), spread + stress_slip)
-            daily_base_cost += position.base_commission_per_lot * volume / Decimal(2)
-            daily_stress_cost += (
-                position.stress_commission_per_lot * volume / Decimal(2)
+            base_fill_degradation = (
+                sign * (executable - position.base_exit_fill) * unit
+            )
+            stress_fill_degradation = (
+                sign * (executable - position.stress_exit_fill) * unit
+            )
+            daily_base_cost += max(Decimal(0), spread + base_fill_degradation)
+            daily_stress_cost += max(
+                Decimal(0), spread + stress_fill_degradation
             )
             del open_states[position.position_id]
 
@@ -5158,9 +5097,7 @@ def _ledger_bodies(
         cost_days.append(
             {
                 "date": day_text,
-                "entries": entries_cost,
                 "marks": mark_costs,
-                "exits": exits_cost,
             }
         )
         exposure_days.append({"date": day_text, "positions": exposure_positions})
@@ -5175,7 +5112,13 @@ def _ledger_bodies(
         equity += daily_gross - daily_base_cost
         if not equity.is_finite() or equity <= 0:
             _fail("FORWARD_REPLAY_EQUITY_RUIN", anchor["anchor_id"], day_text)
-        if daily_stress_cost < daily_base_cost:
+        cumulative_base_cost += daily_base_cost
+        cumulative_stress_cost += daily_stress_cost
+        # MT5 swap mode 6 can make one stressed SHORT rollover day less costly
+        # because its rate depends on the worse opening notional.  Protect the
+        # shared gross event stream and still-open positions by comparing every
+        # cumulative cost prefix instead of each daily first difference.
+        if cumulative_stress_cost + Decimal("1e-12") < cumulative_base_cost:
             _fail("FORWARD_REPLAY_STRESS_COST_IMPROVES", anchor["anchor_id"], day_text)
     if open_states:
         _fail("FORWARD_REPLAY_ENDS_WITH_OPEN_POSITIONS", anchor["anchor_id"])

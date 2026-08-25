@@ -156,6 +156,7 @@ class MT5ConnectorTests(unittest.TestCase):
         self.assertIsNotNone(self.fake_mt5.order_send_request)
         self.assertEqual(self.fake_mt5.order_check_request["symbol"], "EURUSD.a")
         self.assertEqual(self.fake_mt5.order_send_request["symbol"], "EURUSD.a")
+        self.assertEqual(self.fake_mt5.order_send_request["deviation"], 30)
         self.assertEqual(
             self.fake_mt5.order_send_request["type_filling"],
             self.fake_mt5.ORDER_FILLING_FOK,

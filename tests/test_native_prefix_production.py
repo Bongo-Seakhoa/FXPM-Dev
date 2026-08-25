@@ -1179,8 +1179,6 @@ def _execution_config(
     config = {
         "_meta": {"scope": "funded_live_v1"},
         "broker_specs_path": "broker_specs.json",
-        "instrument_spec_defaults": {"commission_per_lot": 7.0},
-        "instrument_specs": {symbol: {"commission_per_lot": 7.0}},
     }
     path = tmp_path / "config.json"
     _write_json(path, config)
@@ -1202,14 +1200,17 @@ def test_execution_spec_is_derived_from_frozen_native_config_and_broker_bytes(
 
     assert spec.symbol == SYMBOL
     assert spec.tick_value == pytest.approx(1.0)
-    assert spec.commission_per_lot == pytest.approx(7.0)
+    assert not hasattr(spec, "commission_per_lot")
     assert spec.max_lot == pytest.approx(500.0)
+    assert receipt["schema_version"] == execution.EXECUTION_SPEC_RECEIPT_SCHEMA
+    assert "configured_instrument_record_sha256" not in receipt
+    assert "commission_source" not in receipt
     assert receipt["native_prefix_index_sha256"] == product.index_sha256
     assert receipt[
         "instrument_spec_sha256"
     ] == pm_core.Backtester._cost_attestation_json_sha256(
         {
-            "schema_version": "fxpm-backtester-instrument-spec-v1",
+            "schema_version": pm_core.BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
             "instrument_spec": receipt["instrument_spec"],
         }
     )
@@ -1343,7 +1344,6 @@ def test_execution_spec_rejects_caller_override_but_uses_native_structural_terms
                 symbol=SYMBOL,
                 pip_position=4,
                 tick_value=99.0,
-                commission_per_lot=0.0,
             ),
         )
 

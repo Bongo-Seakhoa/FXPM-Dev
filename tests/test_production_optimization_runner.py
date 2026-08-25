@@ -334,7 +334,7 @@ def _install_success_chain(
     )
     monkeypatch.setattr(
         runner.causal_evidence,
-        "freeze_causal_process_precommit_v8",
+        "freeze_causal_process_precommit_v9",
         freeze_causal,
     )
     monkeypatch.setattr(
@@ -650,7 +650,7 @@ def test_runner_does_not_sleep_or_access_evidence_before_not_before(
 
     monkeypatch.setattr(
         runner.causal_evidence,
-        "freeze_causal_process_precommit_v8",
+        "freeze_causal_process_precommit_v9",
         future_precommit,
     )
 

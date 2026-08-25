@@ -101,8 +101,6 @@ class TradeIntentRegimeTpMultiplierTests(unittest.TestCase):
         set_regime_tp_multipliers({"TREND": 1.25})
         config = PipelineConfig(
             use_spread=False,
-            use_commission=False,
-            use_slippage=False,
             regime_tp_multipliers={"TREND": 1.25},
         )
         spec = get_instrument_spec("EURUSD")

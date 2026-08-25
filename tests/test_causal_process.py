@@ -162,6 +162,30 @@ def test_forward_oos_lineage_replays_nonlexicographic_anchor_order_and_exact_rol
         process._validate_forward_oos_replay_lineage(attacked, plans, precommit_sha)
 
 
+def test_v9_process_and_v3_cumulative_cost_policy_are_exact() -> None:
+    assert process.PROCESS_AUTHORITY_VERSION == "fxpm-offline-process-validation-v9"
+    assert process.PRECOMMIT_SCHEMA == "fxpm-historical-process-precommit-v9"
+    assert process.EVIDENCE_SCHEMA == "fxpm-historical-process-evidence-v9"
+    assert process.RECONCILIATION_SCHEMA == "fxpm-historical-process-reconciliation-v9"
+    assert process.DECISION_SCHEMA == "fxpm-offline-process-validation-decision-v9"
+    assert process.PINNED_FORWARD_OOS_PRODUCTION_CONTRACT_VERSION == (
+        "fxpm.forward-oos-replay-producer.v4"
+    )
+    assert process._FROZEN_COST_POLICY == {
+        "schema": "fxpm-historical-process-cost-policy-v3",
+        "base_lane": "GROSS_MTM_PLUS_OBSERVED_EXECUTION_COST_DEBITS",
+        "stress_lane": (
+            "SAME_EVENTS_WITH_PER_POSITION_AND_AGGREGATE_CUMULATIVE_COST_PREFIX_"
+            "NON_IMPROVEMENT_AND_COMPONENT_DAY_REBOUND_ALLOWED"
+        ),
+        "require_same_gross_event_stream": True,
+        "require_daily_gross_cost_decomposition": True,
+    }
+    assert _sha(process._FROZEN_COST_POLICY) == (
+        "2c6cd01d8141449f0bfb50b9920ea8cb8128731175c9f7ae5f436c95c3b4fdb4"
+    )
+
+
 def _detector_parameters() -> dict[str, int | float]:
     return {
         "k_confirm": 3,
@@ -206,9 +230,12 @@ def _risk_policy() -> dict:
 
 def _cost_policy() -> dict:
     return {
-        "schema": "fxpm-historical-process-cost-policy-v2",
+        "schema": "fxpm-historical-process-cost-policy-v3",
         "base_lane": "GROSS_MTM_PLUS_OBSERVED_EXECUTION_COST_DEBITS",
-        "stress_lane": "SAME_EVENTS_WITH_COST_DEBITS_NOT_LESS_SEVERE_THAN_BASE",
+        "stress_lane": (
+            "SAME_EVENTS_WITH_PER_POSITION_AND_AGGREGATE_CUMULATIVE_COST_PREFIX_"
+            "NON_IMPROVEMENT_AND_COMPONENT_DAY_REBOUND_ALLOWED"
+        ),
         "require_same_gross_event_stream": True,
         "require_daily_gross_cost_decomposition": True,
     }
@@ -883,10 +910,6 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
         "reference_ask_price",
         "base_fill_price",
         "stress_fill_price",
-        "base_commission_cash",
-        "stress_commission_cash",
-        "base_fee_cash",
-        "stress_fee_cash",
     )
     closing_primitive_keys = (
         "position_id",
@@ -897,10 +920,6 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
         "reference_ask_price",
         "base_fill_price",
         "stress_fill_price",
-        "base_commission_cash",
-        "stress_commission_cash",
-        "base_fee_cash",
-        "stress_fee_cash",
     )
     equity = Decimal("1000")
     opening_mid = Decimal("100")
@@ -929,14 +948,10 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
             "reference_ask_price": format(opening_mid + Decimal("0.01"), ".12f"),
             "base_fill_price": format(opening_mid + base_half_cost, ".12f"),
             "stress_fill_price": format(opening_mid + stress_half_cost, ".12f"),
-            "base_commission_cash": "0",
-            "stress_commission_cash": "0",
-            "base_fee_cash": "0",
-            "stress_fee_cash": "0",
         }
         entry["opening_fill_payload_sha256"] = _sha(
             {
-                "schema": "fxpm-position-opening-fill-payload-v2",
+                "schema": "fxpm-position-opening-fill-payload-v3",
                 "anchor_id": anchor["anchor_id"],
                 "fill": {key: entry[key] for key in opening_primitive_keys},
             }
@@ -973,14 +988,10 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
             "reference_ask_price": mark["mark_ask_price"],
             "base_fill_price": format(mark_price - base_half_cost, ".12f"),
             "stress_fill_price": format(mark_price - stress_half_cost, ".12f"),
-            "base_commission_cash": "0",
-            "stress_commission_cash": "0",
-            "base_fee_cash": "0",
-            "stress_fee_cash": "0",
         }
         exit_fill["closing_fill_payload_sha256"] = _sha(
             {
-                "schema": "fxpm-position-closing-fill-payload-v2",
+                "schema": "fxpm-position-closing-fill-payload-v3",
                 "anchor_id": anchor["anchor_id"],
                 "fill": {key: exit_fill[key] for key in closing_primitive_keys},
             }
@@ -998,7 +1009,7 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
             }
         )
     anchor["activity_ledger"] = {
-        "schema": "fxpm-anchor-economic-position-activity-ledger-v2",
+        "schema": "fxpm-anchor-economic-position-activity-ledger-v3",
         "initial_positions": [],
         "days": days,
     }
@@ -1020,14 +1031,10 @@ def _refresh_opening_fill_payload(anchor: dict, fill: dict) -> None:
         "reference_ask_price",
         "base_fill_price",
         "stress_fill_price",
-        "base_commission_cash",
-        "stress_commission_cash",
-        "base_fee_cash",
-        "stress_fee_cash",
     )
     fill["opening_fill_payload_sha256"] = _sha(
         {
-            "schema": "fxpm-position-opening-fill-payload-v2",
+            "schema": "fxpm-position-opening-fill-payload-v3",
             "anchor_id": anchor["anchor_id"],
             "fill": {key: fill[key] for key in keys},
         }
@@ -1044,14 +1051,10 @@ def _refresh_closing_fill_payload(anchor: dict, fill: dict) -> None:
         "reference_ask_price",
         "base_fill_price",
         "stress_fill_price",
-        "base_commission_cash",
-        "stress_commission_cash",
-        "base_fee_cash",
-        "stress_fee_cash",
     )
     fill["closing_fill_payload_sha256"] = _sha(
         {
-            "schema": "fxpm-position-closing-fill-payload-v2",
+            "schema": "fxpm-position-closing-fill-payload-v3",
             "anchor_id": anchor["anchor_id"],
             "fill": {key: fill[key] for key in keys},
         }
@@ -1249,7 +1252,7 @@ def _build_corpus() -> Corpus:
         },
     ]
     definition = {
-        "schema": "fxpm-frozen-historical-institution-process-v8",
+        "schema": "fxpm-frozen-historical-institution-process-v9",
         "symbols": list(process.SYMBOLS),
         "timeframes": list(process.TIMEFRAMES),
         "regimes": list(process.REGIMES),
@@ -3174,7 +3177,7 @@ def test_empty_anchor_evidence_cannot_create_a_process_pass(valid_corpus) -> Non
     anchor["daily_base_net_mtm_returns"] = list(zeros)
     anchor["daily_stress_net_mtm_returns"] = list(zeros)
     anchor["activity_ledger"] = {
-        "schema": "fxpm-anchor-economic-position-activity-ledger-v2",
+        "schema": "fxpm-anchor-economic-position-activity-ledger-v3",
         "initial_positions": [],
         "days": [
             {
@@ -3507,9 +3510,22 @@ def test_risk_cost_and_cell_lineage_are_executable_not_opaque(valid_corpus) -> N
     _refresh_anchor_hashes(anchor, derive_activity=False)
     cost.refresh_reconciliation()
     with pytest.raises(
-        process.ProcessVerificationError, match="not at least as severe"
+        process.ProcessVerificationError,
+        match="stress cumulative cost prefix improves on base",
     ):
         _evaluate(cost)
+
+    positive_cost = _owned(valid_corpus)
+    anchor = positive_cost.evidence_payload["anchors"][0]
+    gross = Decimal(anchor["daily_gross_mtm_returns"][0])
+    anchor["daily_base_cost_returns"][0] = "0.000100000000"
+    anchor["daily_base_net_mtm_returns"][0] = format(
+        gross + Decimal("0.0001"), ".12f"
+    )
+    _refresh_anchor_hashes(anchor, derive_activity=False)
+    positive_cost.refresh_reconciliation()
+    with pytest.raises(process.ProcessVerificationError, match="not a debit"):
+        _evaluate(positive_cost)
 
     lineage = _owned(valid_corpus)
     anchor = lineage.evidence_payload["anchors"][0]

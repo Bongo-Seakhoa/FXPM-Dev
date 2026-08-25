@@ -52,20 +52,14 @@ def _with_authenticated_trade_evidence(
     result["trades"] = trades
     result["position_events"] = trades
     result["execution_cost_timing_contract"] = {
-        "entry_slippage": "entry_slippage_parity_v1",
         "swap_accrual": "causal_swap_accrual_v1",
     }
     result["numerical_execution_cost_attestation"] = (
         build_numerical_execution_cost_attestation(
             use_spread=True,
-            use_slippage=True,
-            use_commission=True,
             spread_mode="conservative_max",
             spread_values_sha256="7" * 64,
-            commission_inputs_sha256="8" * 64,
             instrument_spec_sha256="9" * 64,
-            slippage_pips=0.5,
-            slippage_price=0.00005,
         )
     )
     result["swap_accrual_contract"] = {

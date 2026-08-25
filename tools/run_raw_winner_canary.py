@@ -269,7 +269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             process = search_planner.freeze_production_search_process(
                 context, run_id=generation_id
             )
-            causal_precommit = causal_producer.freeze_causal_process_precommit_v8(
+            causal_precommit = causal_producer.freeze_causal_process_precommit_v9(
                 context=context,
                 search_process=process,
                 process_id=generation_id,

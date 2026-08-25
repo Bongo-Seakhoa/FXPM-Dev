@@ -217,7 +217,7 @@ def test_pre_evidence_and_post_precommit_requests_build_identical_anchor_body(
             }
         )
         cutoff = end + timedelta(days=36)
-    causal_precommit = causal_producer.freeze_causal_process_precommit_v8(
+    causal_precommit = causal_producer.freeze_causal_process_precommit_v9(
         context=context,
         search_process=process,
         process_id="planner-pre-evidence-process",
