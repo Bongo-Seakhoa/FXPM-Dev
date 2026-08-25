@@ -840,7 +840,7 @@ def build_risk_factors(story):
         [
             "Execution risk:\nSlippage, spread, gaps",
             "MEDIUM",
-            "Built-in spread, commission, and slippage\nmodeling in backtester"
+            "Spread/swap modeling, gap-through exits,\nand live fill telemetry"
         ],
         [
             "Technology risk:\nSystem failures",
@@ -855,7 +855,7 @@ def build_risk_factors(story):
         [
             "Liquidity risk:\nExotic instruments",
             "LOW",
-            "Per-instrument spread/commission specs,\nminimum trade requirements"
+            "Per-instrument spread/swap terms,\nminimum trade requirements"
         ],
     ]
     story.append(make_table(risk_data, col_widths=[120, 60, 260]))

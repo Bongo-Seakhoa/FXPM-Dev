@@ -128,12 +128,11 @@ The active-recent M5 workflow drives all selection windows from the bar counts i
 | Key | Type | Default | Description |
 |---|---|---:|---|
 | `use_spread` | bool | `true` | Apply spread cost in backtests. |
-| `use_commission` | bool | `true` | Apply commission per lot in backtests. |
-| `use_slippage` | bool | `true` | Apply slippage modeling for stop-based exits. |
-| `slippage_pips` | float | `0.5` | Slippage in pips for modeled stop exits. |
 | `swap_model_enabled` | bool | `true` | Applies signed overnight swap/carry costs to closed-trade P&L and the backtest equity curve. |
 | `swap_model_triple_rollover_day` | enum | `"wednesday"` | Weekday that receives triple rollover in the swap model. Invalid values normalize to `"wednesday"`. |
 | `swap_model_min_holding_hours` | float | `20.0` | Minimum holding time before swap rollover is considered. |
+
+The pipeline keys `use_commission`, `use_slippage`, and `slippage_pips` are retired and rejected at the configuration boundary. The instrument-spec key `commission_per_lot` is likewise retired and rejected in shared defaults and per-symbol overrides. Backtests do not synthesize commission or configured slippage. Actual commission, swap, and fee values reported by MT5 deals remain preserved in realized live-trade reconciliation.
 
 ### 2.5 Optimization controls
 
@@ -434,14 +433,14 @@ These settings live under `"position"` and primarily affect live trading.
 | `max_scale_ins` | int | `3` | Max number of additions. |
 | `scale_in_pct` | float | `50.0` | Size of each scale-in as percentage of the original trade. |
 
-### 3.5 Optional duration and mirrored cost fields
+### 3.5 Optional duration and live execution-cost fields
 
 | Key | Type | Default | Description |
 |---|---|---:|---|
 | `max_trade_duration_bars` | int | `0` | Force-close trade after N bars. `0` disables time-based close. |
-| `use_spread` | bool | `true` | Mirrors spread modeling preference into live helper code paths. |
-| `use_slippage` | bool | `true` | Mirrors slippage modeling preference into live helper code paths. |
-| `slippage_pips` | float | `0.5` | Mirrored slippage setting. |
+| `use_spread` | bool | `true` | Apply spread-aware bid/ask adjustments in position-management helpers. Funded scope binds this switch to `pipeline.use_spread`. |
+| `use_slippage` | bool | `true` | `PositionConfig` flag required by funded readiness for the independent C2 entry-buffer contract. The active order path does not currently call `PositionCalculator.calculate_entry_price`; this is not a backtest slippage control. |
+| `slippage_pips` | float | `0.5` | Retained C2 buffer value, validated by funded readiness as finite and non-negative. It is not currently applied by the active order path; activation and thresholding belong to the approved pre-demo quote-lease work. |
 | `regime_tp_multipliers` | dict[str,float] | `{"TREND":1.0,"BREAKOUT":1.0,"RANGE":1.0,"CHOP":1.0}` | Optional live-only TP multipliers applied when `BaseStrategy.build_trade_intent()` prepares a live trade. Defaults are neutral, and backtest/discovery scoring explicitly disables this overlay so Stage 1 and Stage 2 trade the discovered SL/TP surface. Empty dict resets to the neutral module default; unknown labels / non-positive values are silently dropped. |
 
 Important:
@@ -472,7 +471,6 @@ Important:
 | Key | Type | Default | Description |
 |---|---|---:|---|
 | `broker_specs_path` | string | `"broker_specs.json"` | Cached broker specs file path. |
-| `instrument_spec_defaults.commission_per_lot` | float | `7.0` | Default commission fallback. |
 
 ### 5.2 Per-symbol fields
 
@@ -483,9 +481,8 @@ Important:
 | `spread_avg` | float | Average spread used mainly in backtests/fallback modeling. |
 | `min_lot` | float | Minimum lot size. |
 | `max_lot` | float | Maximum lot size. |
-| `commission_per_lot` | float | Commission per standard lot. |
-| `swap_long` | float | Informational long swap field. |
-| `swap_short` | float | Informational short swap field. |
+| `swap_long` | float | Signed daily long swap/carry input for offline fallback modeling. |
+| `swap_short` | float | Signed daily short swap/carry input for offline fallback modeling. |
 
 Live trading prefers broker metadata from MT5 when available, with these static values used as fallbacks.
 

@@ -223,7 +223,7 @@ def build_rows(root: Path, config: Mapping[str, Any]) -> List[Dict[str, Any]]:
                     "key": str(symbol),
                     "stage": "broker_execution_math",
                     "current_effect": "active_or_fail_closed_gate",
-                    "effect_reason": "symbol-specific lot, tick, spread, commission, and swap contract",
+                    "effect_reason": "symbol-specific pip, tick, volume, spread, and swap contract",
                     "consumer_hits": 0,
                     "consumer_locations": "pm_main.set_instrument_specs -> pm_core instrument registry",
                     "configured_value": json.dumps(specs[symbol], sort_keys=True, default=str),
