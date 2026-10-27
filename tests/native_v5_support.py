@@ -205,6 +205,7 @@ def _bars_for_index(
     index: pd.DatetimeIndex,
     *,
     price_offset: float = 0.0,
+    oscillation_period_days: Optional[float] = None,
 ) -> pd.DataFrame:
     """Build associative OHLCV values for a sparse, UTC-native test clock."""
 
@@ -219,6 +220,12 @@ def _bars_for_index(
     bucket_ns = pd.Timedelta(minutes=15).value
     buckets = index.asi8 // bucket_ns
     value = 100.0 + float(price_offset) + (buckets - buckets.min()) * 0.000001
+    if oscillation_period_days is not None:
+        period = float(oscillation_period_days)
+        if not np.isfinite(period) or period <= 0:
+            raise ValueError("SYNTHETIC_OSCILLATION_PERIOD_INVALID")
+        value = (1.5 + float(price_offset)
+                 + 0.03 * np.sin(2.0 * np.pi * (buckets / 96.0) / period))
     return pd.DataFrame(
         {
             "Open": value,
@@ -253,6 +260,8 @@ def _full_span_sparse_frames(
     *,
     price_offset: float,
     include_dense_comparison_band: bool = True,
+    dense_band_utc: Optional[tuple[Any, Any]] = None,
+    oscillation_period_days: Optional[float] = None,
 ) -> dict[str, pd.DataFrame]:
     """Return compact native frames with authenticated data on every page.
 
@@ -300,15 +309,22 @@ def _full_span_sparse_frames(
     # Preserve a bounded, high-density common band only where corruption tests
     # need it. The other 99 production-grid symbols remain byte-backed but use
     # only the page-boundary rows needed for source-integrity verification.
-    if include_dense_comparison_band:
+    if include_dense_comparison_band and dense_band_utc is None:
         dense_origin = partitions_by_timeframe["M5"]["final_lockbox"][0] - pd.Timedelta(
             days=10
         )
         points.update(pd.date_range(dense_origin, periods=100 * 24 * 12, freq="5min"))
-    base = _bars_for_index(
-        pd.DatetimeIndex(sorted(points)),
-        price_offset=price_offset,
-    )
+    point_axis = pd.DatetimeIndex(sorted(points))
+    if include_dense_comparison_band and dense_band_utc is not None:
+        start, end = (pd.Timestamp(value) for value in dense_band_utc)
+        if (start.tzinfo is None or end.tzinfo is None or start >= end
+                or end > common_as_of or end - start > pd.Timedelta(days=1500)
+                or start.ceil("5min") != start or end.ceil("5min") != end):
+            raise ValueError("SYNTHETIC_DENSE_BAND_INVALID")
+        point_axis = point_axis.union(pd.date_range(start, end,
+            freq="5min", inclusive="left"))
+    base = _bars_for_index(point_axis, price_offset=price_offset,
+        oscillation_period_days=oscillation_period_days)
 
     frames: dict[str, pd.DataFrame] = {}
     for timeframe, leaf in leaves.items():
@@ -331,6 +347,8 @@ def _pagination(
     timeframe: str,
     leaf_contract: dict[str, Any],
     frame: pd.DataFrame,
+    *,
+    canonical_broker_symbols: bool = False,
 ):
     start = pd.Timestamp(leaf_contract["source_request_interval"]["start_utc"])
     end = pd.Timestamp(leaf_contract["source_request_interval"]["end_exclusive_utc"])
@@ -392,6 +410,8 @@ def _pagination(
             )
             page["copy_rates_range_attempts"] = 2
             empty_pages.append(dict(page))
+        if canonical_broker_symbols:
+            page["connector_diagnostics"]["broker_symbol"] = symbol
         attempts.append(page)
         cursor_end = page_start
     attempts.sort(key=lambda item: item["start_utc"])
@@ -441,12 +461,24 @@ def _write_leaf(
     frame: pd.DataFrame,
     partitions: dict[str, tuple[pd.Timestamp, pd.Timestamp]],
     leaf_contract: dict[str, Any],
+    *,
+    spread_points: int = 0,
+    spread_cycle_points: Optional[tuple[int, ...] | list[int]] = None,
+    canonical_broker_symbols: bool = False,
+    instrument_snapshot: Optional[dict[str, Any]] = None,
+    synthetic_candidate: bool = False,
 ):
     leaf = native_root / "runs" / run_id / symbol / timeframe
     leaf.mkdir(parents=True, exist_ok=False)
     seconds = TIMEFRAME_SECONDS[timeframe]
     frame = frame.copy()
-    frame["Spread"] = 0
+    if spread_cycle_points is None:
+        frame["Spread"] = spread_points
+    else:
+        source_days = frame.index.tz_convert("UTC").asi8 // pd.Timedelta(days=1).value
+        frame["Spread"] = [
+            spread_cycle_points[day % len(spread_cycle_points)] for day in source_days
+        ]
     frame["RealVolume"] = frame["Volume"]
     frame["_SOURCE_FIRST_TS"] = frame.index
     frame["_SOURCE_LAST_TS"] = (
@@ -466,7 +498,8 @@ def _write_leaf(
         )
         for name, (start, end) in partitions.items()
     }
-    request, pagination = _pagination(symbol, timeframe, leaf_contract, frame)
+    request, pagination = _pagination(symbol, timeframe, leaf_contract, frame,
+        canonical_broker_symbols=canonical_broker_symbols)
     status = "partial" if pagination["empty_pages"] else "success"
     # An empty exact MT5 page is a technical observation, never proof that the
     # broker has no history at a leading or trailing boundary.  Synthetic V5
@@ -503,7 +536,7 @@ def _write_leaf(
         "run_id": run_id,
         "symbol": symbol,
         "canonical_symbol": symbol,
-        "broker_symbol": f"{symbol}.a",
+        "broker_symbol": symbol if canonical_broker_symbols else f"{symbol}.a",
         "timeframe": timeframe,
         "timeframe_seconds": seconds,
         "source_kind": "broker_native",
@@ -580,6 +613,11 @@ def _write_leaf(
         "request": request,
         "pagination": pagination,
     }
+    if instrument_snapshot is not None:
+        provenance["instrument"] = dict(instrument_snapshot)
+    if synthetic_candidate:
+        provenance["fixture_provenance"] = (
+            "SYNTHETIC_NATIVE_ENGINEERING_INPUT_NO_MARKET_OR_TRADING_AUTHORITY")
     (leaf / "provenance.json").write_text(
         json.dumps(provenance, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -606,6 +644,14 @@ def write_v5_run(
     context_only: bool = False,
     price_offset: float = 0.0,
     production_grid: bool = False,
+    information_cutoff_utc: Any = None,
+    dense_symbol: str = SYMBOL,
+    dense_band_utc: Optional[tuple[Any, Any]] = None,
+    oscillation_period_days: Optional[float] = None,
+    spread_points: int = 0,
+    spread_cycle_points: Optional[tuple[int, ...] | list[int]] = None,
+    canonical_broker_symbols: bool = False,
+    instrument_snapshot: Optional[dict[str, Any]] = None,
 ) -> None:
     """Write a bounded V5 run.
 
@@ -617,7 +663,22 @@ def write_v5_run(
     never accepts the subset form.
     """
 
-    cutoff = pd.Timestamp("2025-04-11", tz="UTC")
+    if dense_symbol not in PRODUCTION_SYMBOL_ORDER or (not production_grid and dense_symbol != SYMBOL):
+        raise ValueError("SYNTHETIC_DENSE_SYMBOL_INVALID")
+    if type(spread_points) is not int or spread_points < 0:
+        raise ValueError("SYNTHETIC_SPREAD_POINTS_INVALID")
+    if spread_cycle_points is not None:
+        if (not isinstance(spread_cycle_points, (tuple, list))
+                or not spread_cycle_points
+                or any(type(point) is not int or point < 0 for point in spread_cycle_points)):
+            raise ValueError("SYNTHETIC_SPREAD_CYCLE_POINTS_INVALID")
+        spread_cycle_points = tuple(spread_cycle_points)
+    if type(canonical_broker_symbols) is not bool:
+        raise ValueError("SYNTHETIC_CANONICAL_BROKER_SYMBOLS_INVALID")
+    if instrument_snapshot is not None and instrument_snapshot.get("symbol") != dense_symbol:
+        raise ValueError("SYNTHETIC_INSTRUMENT_SYMBOL_INVALID")
+    cutoff = (pd.Timestamp("2025-04-11", tz="UTC") if information_cutoff_utc is None
+              else pd.Timestamp(information_cutoff_utc))
     contract, leaves, partitions_by_timeframe = _v5_contract(
         cutoff - pd.Timedelta(days=100), cutoff
     )
@@ -625,6 +686,8 @@ def write_v5_run(
         leaves,
         partitions_by_timeframe,
         price_offset=price_offset,
+        dense_band_utc=dense_band_utc,
+        oscillation_period_days=oscillation_period_days,
     )
     if corrupt_timeframe:
         frame = frames[corrupt_timeframe].copy()
@@ -654,16 +717,21 @@ def write_v5_run(
         _write_leaf(
             native_root,
             run_id,
-            SYMBOL,
+            dense_symbol,
             timeframe,
             frames[timeframe],
             partitions_by_timeframe[timeframe],
             leaves[timeframe],
+            spread_points=spread_points,
+            spread_cycle_points=spread_cycle_points,
+            canonical_broker_symbols=canonical_broker_symbols,
+            instrument_snapshot=instrument_snapshot,
+            synthetic_candidate=(dense_band_utc is not None),
         )
         for timeframe in DEFAULT_TIMEFRAMES
     ]
     if production_grid:
-        assert SYMBOL in PRODUCTION_SYMBOL_ORDER
+        assert dense_symbol in PRODUCTION_SYMBOL_ORDER
         sparse_frames = _full_span_sparse_frames(
             leaves,
             partitions_by_timeframe,
@@ -679,9 +747,10 @@ def write_v5_run(
                 sparse_frames[timeframe],
                 partitions_by_timeframe[timeframe],
                 leaves[timeframe],
+                canonical_broker_symbols=canonical_broker_symbols,
             )
             for symbol in PRODUCTION_SYMBOL_ORDER
-            if symbol != SYMBOL
+            if symbol != dense_symbol
             for timeframe in DEFAULT_TIMEFRAMES
         )
         manifest_request = build_v5_manifest_request(
@@ -717,6 +786,9 @@ def write_v5_run(
             "total": len(results),
         },
     }
+    if dense_band_utc is not None:
+        manifest["fixture_provenance"] = (
+            "SYNTHETIC_NATIVE_ENGINEERING_INPUT_NO_MARKET_OR_TRADING_AUTHORITY")
     (native_root / "runs" / run_id / "run_manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1031,6 +1103,7 @@ def activate_v5_run(
     activation_id: str,
     *,
     production_only_pointer: bool = False,
+    now_utc: Optional[datetime] = None,
 ):
     manifest = json.loads(
         (native_root / "runs" / run_id / "run_manifest.json").read_text(
@@ -1046,7 +1119,7 @@ def activate_v5_run(
         timeframes=DEFAULT_TIMEFRAMES,
         activation_id=activation_id,
         thresholds=ParityThresholds(min_compared_native_bars=20),
-        now=datetime(2026, 1, 1, tzinfo=UTC),
+        now=(datetime(2026, 1, 1, tzinfo=UTC) if now_utc is None else now_utc),
         # This is a test helper, not production authorization. Existing
         # cross-suite fixtures use its default pointer publication to build a
         # later contract under test. Production-like consensus tests opt into

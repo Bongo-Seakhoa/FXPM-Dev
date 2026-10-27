@@ -1,14 +1,9 @@
-"""Genuine repeated-anchor forward-OOS synchronized replay production.
+"""Source-bound frozen-tier R&D replay and strict legacy archive verification.
 
-This module is an evidence producer, never an authority.  It reopens a complete
-historical-anchor run, independently replays each selected Winner V11 decision,
-materializes only its frozen strategy/detector process, executes that process on
-verifier-sealed native data that extends the anchor, and emits the six raw
-ledgers consumed by :class:`pm_causal_evidence_producer.BoundedCausalEvidenceProducer`.
-
-No return vector, selected parameter, fill, risk limit, margin amount, or clock
-is accepted from a caller.  A failed replay leaves all prior production books
-untouched; this module has no publication or trading capability.
+The private replay transports one fixed owner's independently executed P75/P95
+accounts from a declared new simulated genesis. It does not qualify either
+account. Public production entry points remain retired until the interval
+qualification replacement is implemented and independently accepted.
 """
 
 from __future__ import annotations
@@ -39,14 +34,20 @@ import pm_historical_production_adapter as historical_adapter
 import pm_native_prefix_production as native_prefix
 import pm_portfolio_replay as portfolio
 import pm_production_capital_bootstrap as capital_bootstrap
+import pm_production_config_binding as config_binding
 import pm_regime
-import pm_winner_selection as winner_v11
+import pm_spread_profile as spread_profile
+import pm_winner_raw_evidence as raw_winner
+import pm_winner_selection as winner
 from pm_core import (
-    BACKTEST_POSITION_EVENT_SCHEMA_VERSION,
     Backtester,
+    ContinuousEntryOwner,
+    ContinuousEntrySchedule,
+    ContinuousEntrySlot,
     FeatureComputer,
     InstrumentSpec,
     PipelineConfig,
+    build_backtest_equity_growth,
     build_backtest_position_events,
 )
 from pm_current_refit_parameters import decode_parameter_mapping
@@ -54,9 +55,9 @@ from pm_strategies import StrategyRegistry
 
 
 UTC: Final = timezone.utc
-PRODUCTION_CONTRACT_VERSION: Final = "fxpm.forward-oos-replay-producer.v4"
-REPLAY_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v4"
-PRODUCER_RECEIPT_SCHEMA: Final = "fxpm.forward-oos-replay-producer-receipt.v4"
+PRODUCTION_CONTRACT_VERSION: Final = "fxpm.forward-oos-replay-producer.v5"
+REPLAY_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v5"
+PRODUCER_RECEIPT_SCHEMA: Final = "fxpm.forward-oos-replay-producer-receipt.v5"
 CAPITAL_CANDIDATE_CHUNK_SCHEMA: Final = (
     "fxpm.forward-oos-capital-candidate-chunk.v2"
 )
@@ -67,6 +68,11 @@ CAPITAL_PHASES: Final = (CAPITAL_INNER_SELECTION, CAPITAL_OUTER_EVALUATION)
 CAPITAL_SELECTION_CALENDAR_DAYS: Final = 365
 MARGIN_MODEL: Final = "AUTHENTICATED_TICK_CASH_NOTIONAL_100PCT_V1"
 POSITION_SOURCE_SCHEMA: Final = "fxpm.forward-oos-backtester-position.v2"
+FROZEN_TIER_RAW_ACCOUNTS_SCHEMA: Final = "fxpm.frozen-tier-raw-accounts.v3"
+DECLARED_CELL_RAW_ACCOUNT_SCHEMA: Final = "fxpm.declared-cell-raw-account.v4"
+RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA: Final = "fxpm.frozen-tier-raw-accounts.v2"
+ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA: Final = "fxpm.frozen-tier-raw-accounts.v1"
+NEW_SIMULATED_FLAT_GENESIS: Final = "NEW_SIMULATED_FLAT_GENESIS"
 VALUATION_CONTRACT: Final = (
     "AUTHENTICATED_NATIVE_M5_OPEN_EXECUTABLE_BID_ASK_PLUS_SWAP_V2"
 )
@@ -392,6 +398,20 @@ def _capital_window_datetimes(
     if end <= start:
         _fail("CAPITAL_PHASE_WINDOW_INVALID", phase_id)
     return pd.Timestamp(start, tz="UTC"), pd.Timestamp(end, tz="UTC")
+
+
+def _original_capital_window(anchor, precommit_anchor, phase):
+    """Reapply the existing anchor/phase geometry to the retained precommit."""
+    windows = precommit_anchor.get("capital_phase_windows", {})
+    try:
+        derived = _capital_phase_windows([anchor], {"anchor_plan": [{
+            "anchor_id": anchor["anchor_id"],
+            "inner_window": windows[CAPITAL_INNER_SELECTION],
+            "outer_window": windows[CAPITAL_OUTER_EVALUATION],
+        }]})
+        return derived[anchor["anchor_id"]][phase]
+    except (KeyError, TypeError) as exc:
+        raise ForwardOOSReplayProductionError("FROZEN_TIER_ORIGINAL_WINDOW_GEOMETRY_UNAVAILABLE") from exc
 
 
 def _decimal(value: Any, code: str, *, positive: bool = False) -> Decimal:
@@ -951,10 +971,6 @@ class _ResourceBudget:
         self.candidate_marks = projected
 
 
-@dataclass(frozen=True, slots=True)
-class _SwapCostEvidence:
-    daily_costs: Mapping[str, Decimal]
-    events: tuple[tuple[pd.Timestamp, Decimal], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1282,6 +1298,7 @@ def _reopen_bound_native_product(
     expected_identity: Mapping[str, Any],
     config: PipelineConfig,
     production_contract_required: bool = True,
+    pin_consumed_activation: bool = False,
 ) -> native_prefix.NativePrefixProduct:
     if type(expected_identity) is not dict:
         _fail("FORWARD_NATIVE_PRECOMMIT_IDENTITY_INVALID")
@@ -1299,6 +1316,8 @@ def _reopen_bound_native_product(
             ],
             production_contract_required=production_contract_required,
             require_current_activation=False,
+            **({"pinned_activation_manifest_sha256": expected_identity[
+                "activation_manifest_sha256"]} if pin_consumed_activation else {}),
         )
     except Exception as exc:
         raise ForwardOOSReplayProductionError(
@@ -1331,6 +1350,10 @@ def _freeze_execution_spec(
         raise ForwardOOSReplayProductionError(
             "FORWARD_EXECUTION_SPEC_FREEZE_FAILED", (type(exc).__name__, str(exc))
         ) from exc
+    return _checked_execution_spec_receipt(product=product, deployment=deployment, spec=spec, receipt=receipt)
+
+
+def _checked_execution_spec_receipt(*, product, deployment, spec, receipt):
     if type(receipt) is not dict:
         _fail("FORWARD_EXECUTION_SPEC_RECEIPT_INVALID")
     owned = dict(receipt)
@@ -1348,6 +1371,18 @@ def _freeze_execution_spec(
     ):
         _fail("FORWARD_EXECUTION_SPEC_RECEIPT_BINDING_INVALID")
     return spec, json.loads(_canonical_bytes(receipt).decode("ascii"))
+
+
+def _derive_retained_execution_spec(*, product, deployment, source_bytes):
+    """Reuse canonical economics with already reopened original source bytes."""
+    try:
+        spec, receipt = search_execution._derive_bound_execution_spec(
+            product=product, deployment_config_bytes=source_bytes["config"],
+            broker_specs_bytes=source_bytes["broker"],
+            broker_specs_relative_path=deployment.broker_relative_path)
+    except search_execution.AuthoritativeSearchExecutionError as exc:
+        raise ForwardOOSReplayProductionError("FORWARD_EXECUTION_SPEC_FREEZE_FAILED", (exc.code,)) from exc
+    return _checked_execution_spec_receipt(product=product, deployment=deployment, spec=spec, receipt=receipt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1368,52 +1403,24 @@ class _VerifiedSpecialist:
     detector_parameters: Mapping[str, Any]
     detector_parameters_sha256: str
     detector_record: Mapping[str, Any]
+    origin_symbol_receipt: Mapping[str, Any] | None = None
+    origin_adapter_index_descriptor: Mapping[str, Any] | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class _DailyMark:
-    date: str
-    marked_at_utc: str
-    mid_price: Decimal
-    bid_price: Decimal
-    ask_price: Decimal
-    base_financing_per_lot: Decimal
-    stress_financing_per_lot: Decimal
-    candidate_net_pnl_per_lot: float
 
 
-@dataclass(frozen=True, slots=True)
-class _PositionEvidence:
-    candidate: portfolio.CandidateTrade
-    position_id: str
-    cell_id: str
-    symbol: str
-    timeframe: str
-    regime: str
-    side: str
-    contract_multiplier: Decimal
-    stop_price: Decimal
-    entry_mid: Decimal
-    entry_bid: Decimal
-    entry_ask: Decimal
-    base_entry_fill: Decimal
-    stress_entry_fill: Decimal
-    exit_mid: Decimal
-    exit_bid: Decimal
-    exit_ask: Decimal
-    base_exit_fill: Decimal
-    stress_exit_fill: Decimal
-    margin_per_lot: Decimal
-    marks: tuple[_DailyMark, ...]
+
+
 
 
 @dataclass(frozen=True, slots=True)
 class _AnchorRawReplay:
+    """One new simulated account per frozen tier, never a qualified Book."""
+
     anchor: Mapping[str, Any]
     specialists: tuple[_VerifiedSpecialist, ...]
-    positions: tuple[_PositionEvidence, ...]
-    accepted_volume_by_position_id: Mapping[str, Decimal]
-    production_metadata: Mapping[str, Any] | None = None
+    raw_accounts: Mapping[str, Any]
+    production_metadata: Mapping[str, Any]
 
 
 def _bound_json_file(
@@ -1478,7 +1485,6 @@ def _pipeline_config_identity(config: PipelineConfig) -> dict[str, Any]:
         "swap_model_enabled",
         "swap_model_triple_rollover_day",
         "swap_model_min_holding_hours",
-        "oos_evidence_execution_stress_mode",
     )
     cost = {name: _config_identity_value(getattr(config, name)) for name in cost_fields}
     return {
@@ -1719,9 +1725,278 @@ def _manifest_body(
     )
 
 
+def _read_descriptor_bytes(
+    context: authority_spool.GenerationSpoolContext,
+    value: Any,
+    *,
+    code: str,
+    maximum: int | None = None,
+) -> bytes:
+    """Read sealed canonical objects or lists without changing the object reader."""
+    descriptor = _descriptor(value, f"{code}_DESCRIPTOR_INVALID")
+    limit = int(maximum or context.limits.max_json_bytes)
+    if (
+        descriptor["format"] not in (
+            authority_spool.CANONICAL_JSON_FORMAT, "fxpm-ascii-json-v1"
+        )
+        or descriptor["size_bytes"] > limit
+    ):
+        _fail(f"{code}_FORMAT_OR_BOUND_INVALID")
+    try:
+        root = Path(context.root).resolve(strict=True)
+        target = root.joinpath(*Path(descriptor["relative_path"]).parts)
+        if target.is_symlink():
+            _fail(f"{code}_OBJECT_INVALID")
+        path = target.resolve(strict=True)
+        path.relative_to(root)
+        if not path.is_file():
+            _fail(f"{code}_OBJECT_INVALID")
+        with path.open("rb") as handle:
+            encoded = handle.read(limit + 1)
+    except ForwardOOSReplayProductionError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ForwardOOSReplayProductionError(f"{code}_UNAVAILABLE") from exc
+    if (
+        len(encoded) != descriptor["size_bytes"]
+        or len(encoded) > limit
+        or hashlib.sha256(encoded).hexdigest() != descriptor["sha256"]
+    ):
+        _fail(f"{code}_INTEGRITY_MISMATCH")
+    try:
+        body = json.loads(encoded.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ForwardOOSReplayProductionError(f"{code}_JSON_INVALID") from exc
+    if type(body) not in {dict, list} or _canonical_bytes(body, limit) != encoded:
+        _fail(f"{code}_CANONICAL_MISMATCH")
+    return encoded
+
+
+def _selected_owner_generation(
+    book_body: Mapping[str, Any],
+    request_body: Mapping[str, Any],
+    decision_body: Mapping[str, Any],
+) -> Any:
+    if any(type(body) is not dict for body in (book_body, request_body, decision_body)):
+        _fail("SELECTED_OWNER_GENERATION_TUPLE_INVALID")
+    payload_versions = []
+    for name in ("precommitment", "evidence_ledger"):
+        wrapper = request_body.get(name)
+        payload = wrapper.get("payload") if type(wrapper) is dict else None
+        payload_versions.append(payload.get("contract_version") if type(payload) is dict else None)
+    observed = (
+        book_body.get("contract_version"), request_body.get("contract_version"),
+        *payload_versions, decision_body.get("contract_version"),
+    )
+    for generation in (book.ARCHIVED_GENERATION, book.CURRENT_GENERATION, book.V16_GENERATION):
+        expected = generation.winner_generation
+        if observed == (
+            generation.version, expected.request_version,
+            expected.precommitment_version, expected.evidence_version,
+            expected.selection_version,
+        ):
+            return generation
+    _fail("SELECTED_OWNER_GENERATION_TUPLE_INVALID")
+
+
+def _restore_current_owner_frozen_binding(
+    *,
+    context: authority_spool.GenerationSpoolContext,
+    entries: Mapping[str, Mapping[str, Any]],
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    namespace: str,
+    cross: Mapping[str, Any],
+    _generation: Any = book.CURRENT_GENERATION,
+) -> tuple[Any, dict[str, Any], tuple[dict[str, Any], ...], dict[str, Any]]:
+    """Restore only the sealed current historical owner, without an issuer or sink."""
+    schema = cross.get("schema_version")
+    if schema in (
+        raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA,
+        raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
+    ) or (_generation is book.V16_GENERATION
+          and schema == raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5):
+        _fail("CURRENT_OWNER_CROSS_BINDING_MODE_FORBIDDEN")
+    if (_generation is not book.CURRENT_GENERATION and _generation is not book.V16_GENERATION
+            or schema != _generation.cross_binding_schema):
+        _fail("CURRENT_OWNER_CROSS_BINDING_SCHEMA_INVALID")
+    prefix = f"{namespace}/winner-search/{timeframe}/{regime}/frozen/"
+    selected_entries = [
+        dict(entry) for artifact_id, entry in sorted(entries.items())
+        if artifact_id.startswith(prefix)
+    ]
+    bodies = [
+        _read_descriptor_bytes(context, entry.get("descriptor"),
+            code="CURRENT_OWNER_FROZEN_ARTIFACT", maximum=winner.MAX_REQUEST_BYTES)
+        for entry in selected_entries
+    ]
+    try:
+        restore = (raw_winner.restore_frozen_winner_search_plan_v5
+                   if _generation is book.V16_GENERATION
+                   else raw_winner.restore_frozen_winner_search_plan_v4)
+        frozen = restore(
+            context_identity={
+                "generation_id": context.generation_id,
+                "generation_context_sha256": context.context_sha256,
+                "native_universe_sha256": context.native_universe_sha256,
+                "config_sha256": context.config_sha256,
+            },
+            symbol=symbol, timeframe=timeframe, regime=regime,
+            artifact_namespace=namespace,
+            manifest_entries=selected_entries, body_bytes=bodies,
+        )
+    except raw_winner.WinnerRawEvidenceError as exc:
+        raise ForwardOOSReplayProductionError(
+            "CURRENT_OWNER_FROZEN_RESTORE_FAILED", (exc.code,)
+        ) from exc
+    if not frozen.frozen_tier_pair_contract_bytes:
+        _fail("CURRENT_OWNER_FROZEN_PAIR_GENERATION_MISMATCH")
+    if (_generation is book.V16_GENERATION
+            and frozen.selection_generation is not winner.V16_GENERATION):
+        _fail("CURRENT_OWNER_FROZEN_PAIR_GENERATION_MISMATCH")
+    try:
+        binding, attempts, binding_context = raw_winner.verify_historical_frozen_winner_cross_binding(
+            _canonical_bytes(dict(cross), winner.MAX_REQUEST_BYTES), frozen=frozen
+        )
+    except raw_winner.WinnerRawEvidenceError as exc:
+        raise ForwardOOSReplayProductionError(
+            "CURRENT_OWNER_CROSS_BINDING_REVERIFY_FAILED", (exc.code,)
+        ) from exc
+    return frozen, binding, attempts, binding_context
+
+
+def _verify_current_owner_capture_binding(
+    *,
+    context: authority_spool.GenerationSpoolContext,
+    entries: Mapping[str, Mapping[str, Any]],
+    anchor: Mapping[str, Any],
+    index: Mapping[str, Any],
+    record: Mapping[str, Any],
+    request: winner.WinnerSelectionRequest,
+    decision: winner.WinnerSelectionDecision,
+    frozen: Any,
+    cross: Mapping[str, Any],
+    cell_id: str,
+    _generation: Any = book.CURRENT_GENERATION,
+) -> None:
+    """Bind the restored pre-search graph to its original adapter and raw result."""
+    symbol, timeframe, regime = frozen.symbol, frozen.timeframe, frozen.regime
+    cell = {"symbol": symbol, "timeframe": timeframe, "regime": regime}
+    prefix = f"{frozen.artifact_namespace}/winner-search/{timeframe}/{regime}"
+    if (
+        index.get("schema_version") != historical_adapter.SYMBOL_INDEX_SCHEMA
+        or index.get("generation_id") != context.generation_id
+        or index.get("generation_context_sha256") != context.context_sha256
+        or index.get("anchor") != anchor
+        or index.get("symbol") != symbol
+        or cross.get("producer_request_sha256") != index.get("producer_request_sha256")
+        or frozen.precommitment != request.precommitment.to_dict()
+        or frozen.attempt_ledger != request.attempt_ledger.to_dict()
+    ):
+        _fail("CURRENT_OWNER_INDEX_BINDING_MISMATCH", cell_id)
+    bindings = index.get("horizon_bindings")
+    if type(bindings) is not list:
+        _fail("CURRENT_OWNER_HORIZON_BINDING_INVALID", cell_id)
+    matches = [row for row in bindings if type(row) is dict and row.get("cell") == cell]
+    if len(matches) != 1:
+        _fail("CURRENT_OWNER_HORIZON_BINDING_INVALID", cell_id)
+    binding = matches[0]
+    if (
+        binding.get("schema_version") != historical.CURRENT_HORIZON_BINDING_SCHEMA
+        or binding.get("anchor_id") != anchor["anchor_id"]
+        or binding.get("selection_cutoff_utc") != anchor["selection_cutoff_utc"]
+        or binding.get("process_precommit_receipt_sha256")
+        != cross.get("process_precommit_receipt_sha256")
+        or cross.get("selection_cutoff_utc") != anchor["selection_cutoff_utc"]
+        or cross.get("horizon_roster") != {
+            name: binding.get(name) for name in (
+                "plan_receipt_sha256", "source_prefix_receipt_sha256",
+                "candidate_registry_sha256", "trial_registry_sha256",
+                "attempt_roster_sha256", "evidence_roster_sha256",
+            )
+        }
+    ):
+        _fail("CURRENT_OWNER_HORIZON_BINDING_SPLICE", cell_id)
+    try:
+        group_ordinal = book.TIMEFRAME_ORDER.index(timeframe)
+        sources, fits = index["source_groups"], index["regime_fits"]
+        if (type(sources) is not list or type(fits) is not list
+                or len(sources) != len(book.TIMEFRAME_ORDER) or len(fits) != len(sources)):
+            _fail("CURRENT_OWNER_GROUP_ROSTER_INVALID", cell_id)
+        source, fit = sources[group_ordinal], fits[group_ordinal]
+        for group in (source, fit):
+            if (type(group) is not dict or group.get("symbol") != symbol
+                    or group.get("timeframe") != timeframe
+                    or group.get("receipt_sha256")
+                    != _sha({key: value for key, value in group.items() if key != "receipt_sha256"})):
+                _fail("CURRENT_OWNER_GROUP_BINDING_INVALID", cell_id)
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ForwardOOSReplayProductionError("CURRENT_OWNER_GROUP_ROSTER_INVALID", (cell_id,)) from exc
+    if (
+        cross.get("source_group_decision_sha256") != source["receipt_sha256"]
+        or cross.get("regime_fit_decision_sha256") != fit["receipt_sha256"]
+        or fit.get("source_group_decision_sha256") != source["receipt_sha256"]
+        or source.get("source_contract_sha256") != frozen.precommitment.get("source_contract_sha256")
+    ):
+        _fail("CURRENT_OWNER_GROUP_BINDING_SPLICE", cell_id)
+    native_index = _hex(cross.get("native_prefix_index_sha256"), "CURRENT_OWNER_NATIVE_PREFIX_INDEX_INVALID")
+    if source.get("source_group_evidence_sha256") != native_index:
+        _fail("CURRENT_OWNER_NATIVE_PREFIX_INDEX_SPLICE", cell_id)
+    for mapped in cross["mapping"]:
+        count = mapped["source_count_receipt"]
+        if (count["native_prefix_index_sha256"] != native_index
+                or count["horizon_plan_receipt_sha256"] != binding["plan_receipt_sha256"]):
+            _fail("CURRENT_OWNER_SOURCE_COUNT_SPLICE", cell_id)
+    frozen_entry = entries.get(f"{prefix}/frozen/receipt")
+    if (type(frozen_entry) is not dict
+            or _descriptor(record.get("frozen_plan_receipt"), "CURRENT_OWNER_FROZEN_RECEIPT_INVALID")
+            != frozen_entry.get("descriptor")
+            or frozen_entry["descriptor"]["sha256"]
+            != cross["winner_roster"]["frozen_receipt_sha256"]):
+        _fail("CURRENT_OWNER_FROZEN_RECEIPT_SPLICE", cell_id)
+    production_id = f"{prefix}/authority/production-receipt"
+    production = _manifest_body(context, entries, production_id,
+        code="CURRENT_OWNER_RAW_PRODUCTION", expected_descriptor=record.get("raw_production_receipt"),
+        maximum=winner.MAX_REQUEST_BYTES)
+    production_fields = {
+        "schema_version", "generation_context_sha256", "run_id", "artifact_namespace",
+        "symbol", "timeframe", "regime", "precommitment_sha256", "attempt_ledger_sha256",
+        "provenance_cross_binding_sha256", "evidence_ledger_sha256", "request_sha256",
+        "decision_receipt_sha256", "artifact_roster",
+    }
+    roster = production.get("artifact_roster")
+    if (
+        set(production) != production_fields
+        or entries[production_id].get("artifact_type") != "winner_raw_evidence_production_receipt"
+        or production.get("schema_version") != _generation.raw_schema
+        or production.get("generation_context_sha256") != context.context_sha256
+        or production.get("run_id") != frozen.precommitment["run_id"]
+        or production.get("artifact_namespace") != frozen.artifact_namespace
+        or {name: production.get(name) for name in cell} != cell
+        or production.get("precommitment_sha256") != request.precommitment.payload_sha256
+        or production.get("attempt_ledger_sha256") != request.attempt_ledger.payload_sha256
+        or production.get("evidence_ledger_sha256") != request.evidence_ledger.payload_sha256
+        or production.get("request_sha256") != request.request_sha256
+        or production.get("decision_receipt_sha256") != decision.receipt_sha256
+        or production.get("provenance_cross_binding_sha256") != _sha(dict(cross))
+        or type(roster) is not dict
+    ):
+        _fail("CURRENT_OWNER_RAW_PRODUCTION_SPLICE", cell_id)
+    sealed_descriptors = {_canonical_bytes(entry["descriptor"]) for entry in entries.values()}
+    for descriptor in roster.values():
+        normalized = _descriptor(descriptor, "CURRENT_OWNER_RAW_ROSTER_DESCRIPTOR_INVALID")
+        if _canonical_bytes(normalized) not in sealed_descriptors:
+            _fail("CURRENT_OWNER_RAW_ROSTER_SPLICE", cell_id)
+    for name in ("evidence-ledger", "winner-request", "winner-decision"):
+        entry = entries.get(f"{prefix}/authority/{name}")
+        if type(entry) is not dict or roster.get(name) != entry.get("descriptor"):
+            _fail("CURRENT_OWNER_RAW_ROSTER_SPLICE", cell_id)
+
+
 def _winner_request(
     body: Mapping[str, Any], expected_sha256: str
-) -> winner_v11.WinnerSelectionRequest:
+) -> winner.WinnerSelectionRequest:
     if type(body) is not dict or set(body) != {
         "contract_version",
         "precommitment",
@@ -1738,9 +2013,15 @@ def _winner_request(
         if type(payload) is not dict or _sha(payload) != wrapper.get("payload_sha256"):
             _fail("WINNER_REQUEST_PAYLOAD_HASH_INVALID", name)
         wrappers.append(wrapper)
-    request = winner_v11.create_winner_selection_request(
-        wrappers[0]["payload"], wrappers[1]["payload"], wrappers[2]["payload"]
-    )
+    try:
+        request = winner.create_winner_selection_request(
+            wrappers[0]["payload"], wrappers[1]["payload"], wrappers[2]["payload"]
+        )
+    except ValueError as exc:
+        if body["contract_version"] == winner.V16_GENERATION.request_version:
+            code = str(exc) if str(exc).startswith("V16_") else "WINNER_REQUEST_RAW_REPLAY_FAILED"
+            raise ForwardOOSReplayProductionError(code, (str(exc),)) from exc
+        raise
     if (
         request is None
         or request.request_sha256 != expected_sha256
@@ -1752,22 +2033,22 @@ def _winner_request(
 
 def _winner_decision(
     body: Mapping[str, Any],
-    request: winner_v11.WinnerSelectionRequest,
+    request: winner.WinnerSelectionRequest,
     expected_sha256: str,
-) -> winner_v11.WinnerSelectionDecision:
+) -> winner.WinnerSelectionDecision:
     if type(body) is not dict:
         _fail("WINNER_DECISION_NOT_OBJECT")
     owned = json.loads(
-        _canonical_bytes(body, winner_v11.MAX_DECISION_BYTES).decode("ascii")
+        _canonical_bytes(body, winner.MAX_DECISION_BYTES).decode("ascii")
     )
     receipt = owned.pop("receipt_sha256", None)
     if receipt != expected_sha256 or _sha(owned) != receipt:
         _fail("WINNER_DECISION_RECEIPT_MISMATCH")
-    decision = winner_v11.WinnerSelectionDecision(
-        _canonical_bytes(owned, winner_v11.MAX_DECISION_BYTES), receipt
+    decision = winner.WinnerSelectionDecision(
+        _canonical_bytes(owned, winner.MAX_DECISION_BYTES), receipt
     )
     if (
-        winner_v11.verify_historical_cell_winner_decision(decision, request) is not True
+        winner.verify_historical_cell_winner_decision(decision, request) is not True
         or decision.to_dict() != body
     ):
         _fail("WINNER_DECISION_RAW_REPLAY_FAILED")
@@ -1827,14 +2108,31 @@ def _selected_group_records(
         _fail("SELECTED_BOOK_GROUP_IDENTITY_INVALID", cell_id)
     source = index_sources[local_group_ordinal]
     fit = index_fits[local_group_ordinal]
-    if (
-        type(source) is not dict
-        or type(fit) is not dict
-        or source != book_sources[global_group_ordinal]
-        or fit != book_fits[global_group_ordinal]
-    ):
-        _fail("SELECTED_ADAPTER_BOOK_GROUP_SPLICE", cell_id)
-    return dict(source), dict(fit)
+    original_source = book_sources[global_group_ordinal]
+    original_fit = book_fits[global_group_ordinal]
+    # The verified adapter index retains Decision.to_dict(); the verified Book
+    # retains _serialized_owned(). Bridge representation only, comparing every
+    # original payload field AND its unchanged original receipt. This is not
+    # standalone authentication of a caller-supplied self hash.
+    for flat, envelope in ((source, original_source), (fit, original_fit)):
+        if (type(flat) is not dict or type(envelope) is not dict
+                or set(envelope) != {"payload", "receipt_sha256"}
+                or type(envelope["payload"]) is not dict
+                or "receipt_sha256" not in flat
+                or flat["receipt_sha256"] != envelope["receipt_sha256"]
+                or {key: value for key, value in flat.items() if key != "receipt_sha256"} != envelope["payload"]):
+            _fail("SELECTED_ADAPTER_BOOK_GROUP_SPLICE", cell_id)
+    return dict(original_source), dict(original_fit)
+
+
+def _selected_regime_cutoff_matches_source(
+    *, detector_cutoff_utc: Any, source_prefix_end_utc: Any, selection_cutoff_utc: Any,
+) -> bool:
+    """The detector owns its exact closed prefix, which may precede selection."""
+    detector_cutoff = _utc(detector_cutoff_utc, "SELECTED_REGIME_CUTOFF_INVALID")
+    source_end = _utc(source_prefix_end_utc, "SELECTED_SOURCE_PREFIX_END_INVALID")
+    selection_cutoff = _utc(selection_cutoff_utc, "SELECTION_CUTOFF_INVALID")
+    return detector_cutoff == source_end and source_end <= selection_cutoff
 
 
 def _selected_artifacts(
@@ -1881,7 +2179,9 @@ def _selected_artifacts(
         entries,
         f"{cell_namespace}/authority/winner-request",
         code="WINNER_REQUEST",
-        maximum=winner_v11.MAX_REQUEST_BYTES,
+        maximum=(winner.MAX_SUPPORTED_WINNER_REQUEST_BYTES
+                 if book_body.get("contract_version") == book.V16_GENERATION.version
+                 else winner.MAX_REQUEST_BYTES),
     )
     request = _winner_request(request_body, book_cell["winner_request_sha256"])
     decision_body = _manifest_body(
@@ -1889,11 +2189,12 @@ def _selected_artifacts(
         entries,
         f"{cell_namespace}/authority/winner-decision",
         code="WINNER_DECISION",
-        maximum=winner_v11.MAX_DECISION_BYTES,
+        maximum=winner.MAX_DECISION_BYTES,
     )
     decision = _winner_decision(
         decision_body, request, book_cell["winner_decision_sha256"]
     )
+    generation = _selected_owner_generation(book_body, request.to_dict(), decision.to_dict())
     decision_winner = decision.to_dict().get("winner")
     process_candidate_id = book_cell.get("local_process_candidate_id")
     process_sha256 = book_cell.get("local_process_sha256")
@@ -1903,14 +2204,14 @@ def _selected_artifacts(
         or decision_winner.get("process_candidate_id") != process_candidate_id
         or decision_winner.get("process_sha256") != process_sha256
     ):
-        _fail("BOOK_SELECTED_PROCESS_NOT_WINNER_V11", cell_id)
+        _fail("BOOK_SELECTED_PROCESS_NOT_WINNER_V14", cell_id)
 
     attempt_ledger = _manifest_body(
         context,
         entries,
         f"{cell_namespace}/frozen/attempt_ledger",
         code="WINNER_ATTEMPT_LEDGER",
-        maximum=winner_v11.MAX_REQUEST_BYTES,
+        maximum=winner.MAX_REQUEST_BYTES,
     )
     if attempt_ledger != request.attempt_ledger.to_dict() or _sha(
         attempt_ledger
@@ -1937,10 +2238,23 @@ def _selected_artifacts(
         code="HORIZON_WINNER_CROSS_BINDING",
         expected_descriptor=record.get("horizon_winner_cross_binding"),
     )
+    if generation is book.CURRENT_GENERATION or generation is book.V16_GENERATION:
+        frozen, cross, _verified_attempts, _binding_context = _restore_current_owner_frozen_binding(
+            context=context, entries=entries, symbol=symbol, timeframe=timeframe,
+            regime=regime, namespace=namespace, cross=cross, _generation=generation,
+        )
+        _verify_current_owner_capture_binding(
+            context=context, entries=entries, anchor=anchor, index=index, record=record,
+            request=request, decision=decision, frozen=frozen, cross=cross, cell_id=cell_id,
+            _generation=generation,
+        )
+    expected_cross_schema = (generation.cross_binding_schema
+        if not generation.winner_generation.archived
+        else historical_adapter.HORIZON_WINNER_CROSS_BINDING_SCHEMA)
     mapping = cross.get("mapping")
     if (
         cross.get("schema_version")
-        != historical_adapter.HORIZON_WINNER_CROSS_BINDING_SCHEMA
+        != expected_cross_schema
         or cross.get("anchor_id") != anchor["anchor_id"]
         or cross.get("symbol") != symbol
         or cross.get("timeframe") != timeframe
@@ -2079,7 +2393,11 @@ def _selected_artifacts(
     detector_parameters_sha = _sha(detector_parameters)
     if (
         detector_sha != _sha(detector_body)
-        or detector_record.get("fit_cutoff_utc") != anchor["selection_cutoff_utc"]
+        or not _selected_regime_cutoff_matches_source(
+            detector_cutoff_utc=detector_record.get("fit_cutoff_utc"),
+            source_prefix_end_utc=count_receipt.get("fit_end_exclusive_utc"),
+            selection_cutoff_utc=anchor["selection_cutoff_utc"],
+        )
         or detector_record.get("detector_code_sha256")
         != pm_regime.detector_code_sha256()
         or detector_record.get("parameters_sha256") != detector_parameters_sha
@@ -2182,14 +2500,15 @@ def _reopen_specialists(
             ]
             for winner_cell in winner_cells:
                 by_anchor[anchor_id].append(
-                    _selected_artifacts(
+                    replace(_selected_artifacts(
                         context=context,
                         entries=entries,
                         anchor=anchor,
                         book_body=books[anchor_id],
                         book_cell=winner_cell,
                         index=index,
-                    )
+                    ), origin_symbol_receipt=dict(symbol_receipt),
+                       origin_adapter_index_descriptor=dict(payload["production_index"]))
                 )
     result: dict[str, tuple[_VerifiedSpecialist, ...]] = {}
     for plan in plans:
@@ -2407,578 +2726,18 @@ def _features_and_prefix_parity(
     return full_features, signals
 
 
-def _exit_quote(
-    *,
-    trade: Mapping[str, Any],
-    features: pd.DataFrame,
-    half_spread: np.ndarray,
-) -> tuple[Decimal, Decimal, Decimal, pd.Timestamp]:
-    exit_bar = int(trade["exit_bar"])
-    if not 0 <= exit_bar < len(features):
-        _fail("BACKTEST_EXIT_BAR_INVALID")
-    side = str(trade.get("direction") or "").upper()
-    sign = 1 if side == "LONG" else -1 if side == "SHORT" else 0
-    if not sign:
-        _fail("BACKTEST_DIRECTION_INVALID")
-    fill = float(trade["exit_price"])
-    half = float(half_spread[exit_bar])
-    opened = float(features["Open"].iloc[exit_bar])
-    closed = float(features["Close"].iloc[exit_bar])
-    executable_open = opened - (sign * half)
-    reason = str(trade.get("exit_reason") or "").lower()
-    tolerance = max(1e-12, abs(fill) * 1e-12)
-    if math.isclose(fill, executable_open, rel_tol=0.0, abs_tol=tolerance):
-        mid = opened
-        effective_time = _timestamp(
-            features.index[exit_bar], "BACKTEST_EXIT_OPEN_TIME_INVALID"
-        )
-    elif reason in _EOD_EXIT_REASONS:
-        mid = closed
-        effective_time = _timestamp(
-            features["_BAR_CLOSE_TS"].iloc[exit_bar],
-            "BACKTEST_EXIT_CLOSE_TIME_INVALID",
-        ) - pd.Timedelta(seconds=1)
-    elif "governance" in reason or "policy" in reason:
-        mid = opened
-        effective_time = _timestamp(
-            features.index[exit_bar], "BACKTEST_EXIT_OPEN_TIME_INVALID"
-        )
-    elif "sl" in reason or "stop" in reason:
-        stop = float(trade["stop_loss"])
-        if not math.isclose(fill, stop, rel_tol=0.0, abs_tol=tolerance):
-            _fail("BACKTEST_STOP_FILL_NOT_RECONSTRUCTIBLE")
-        mid = stop + (sign * half)
-        effective_time = _timestamp(
-            features["_BAR_CLOSE_TS"].iloc[exit_bar],
-            "BACKTEST_EXIT_CLOSE_TIME_INVALID",
-        ) - pd.Timedelta(seconds=1)
-    elif "tp" in reason or "target" in reason:
-        target = float(trade["take_profit"])
-        if not math.isclose(fill, target, rel_tol=0.0, abs_tol=tolerance):
-            _fail("BACKTEST_TARGET_FILL_NOT_RECONSTRUCTIBLE")
-        mid = target + (sign * half)
-        effective_time = _timestamp(
-            features["_BAR_CLOSE_TS"].iloc[exit_bar],
-            "BACKTEST_EXIT_CLOSE_TIME_INVALID",
-        ) - pd.Timedelta(seconds=1)
-    else:
-        _fail("BACKTEST_EXIT_REASON_UNSUPPORTED", reason)
-    recorded = _timestamp(trade.get("exit_time"), "BACKTEST_EXIT_TIME_INVALID")
-    bar_open = _timestamp(features.index[exit_bar], "BACKTEST_EXIT_OPEN_TIME_INVALID")
-    bar_close = _timestamp(
-        features["_BAR_CLOSE_TS"].iloc[exit_bar], "BACKTEST_EXIT_CLOSE_TIME_INVALID"
-    )
-    if recorded != bar_open or not bar_open <= effective_time < bar_close:
-        _fail("BACKTEST_EXIT_TIME_AXIS_INVALID")
-    return (*_quote(mid, half), effective_time)
 
 
-def _daily_swap_costs_per_lot(
-    *,
-    trade: Mapping[str, Any],
-    features: pd.DataFrame,
-    pre_open_units: np.ndarray,
-    close_units: np.ndarray,
-    per_lot_rate: np.ndarray,
-) -> _SwapCostEvidence:
-    entry_bar = int(trade["entry_bar"])
-    exit_bar = int(trade["exit_bar"])
-    if not 0 <= entry_bar <= exit_bar < len(features):
-        _fail("BACKTEST_SWAP_POSITION_AXIS_INVALID")
-    opens, closes = _frame_interval(features)
-    is_eod = str(trade.get("exit_reason") or "").lower() in _EOD_EXIT_REASONS
-    units_by_day: dict[str, int] = {}
-    events: list[tuple[pd.Timestamp, Decimal]] = []
-    total_units = 0
-    rate = _decimal(per_lot_rate[entry_bar], "BACKTEST_SWAP_RATE_INVALID")
-    for index in range(entry_bar, exit_bar + 1):
-        pre_units = int(pre_open_units[index]) if index > entry_bar else 0
-        close_count = int(close_units[index]) if index < exit_bar or is_eod else 0
-        if pre_units:
-            day = opens[index].date().isoformat()
-            units_by_day[day] = units_by_day.get(day, 0) + pre_units
-            events.append((opens[index], -(rate * Decimal(pre_units))))
-        if close_count:
-            effective_close = closes[index] - pd.Timedelta(nanoseconds=1)
-            day = effective_close.date().isoformat()
-            units_by_day[day] = units_by_day.get(day, 0) + close_count
-            events.append((effective_close, -(rate * Decimal(close_count))))
-        total_units += pre_units + close_count
-    if total_units != int(trade.get("swap_rollover_units", -1)):
-        _fail("BACKTEST_SWAP_UNIT_RECONCILIATION_FAILED")
-    size = _decimal(
-        trade.get("position_size"), "BACKTEST_POSITION_SIZE_INVALID", positive=True
-    )
-    exact_cash = rate * Decimal(total_units) * size
-    if _money_round(exact_cash) != _decimal(
-        trade.get("swap_dollars"), "BACKTEST_SWAP_CASH_INVALID"
-    ):
-        _fail("BACKTEST_SWAP_CASH_RECONCILIATION_FAILED")
-    daily = {day: -(rate * Decimal(units)) for day, units in units_by_day.items()}
-    if sum((value for _, value in events), Decimal(0)) != sum(
-        daily.values(), Decimal(0)
-    ):
-        _fail("BACKTEST_SWAP_EVENT_DAILY_RECONCILIATION_FAILED")
-    return _SwapCostEvidence(
-        daily_costs=daily,
-        events=tuple(sorted(events, key=lambda value: value[0])),
-    )
 
 
-def _valuation_mark_indices(
-    tape: _M5ValuationTape,
-    entry_time: pd.Timestamp,
-    exit_time: pd.Timestamp,
-) -> tuple[int, int]:
-    # A same-timestamp mark is processed before admission by the synchronized
-    # simulator, so exclude it instead of manufacturing a pre-entry valuation.
-    left = int(tape.opens.searchsorted(entry_time, side="right"))
-    right = int(tape.opens.searchsorted(exit_time, side="right"))
-    if left > right or left < 0 or right > len(tape.frame):
-        _fail("M5_VALUATION_POSITION_AXIS_INVALID", tape.symbol)
-    return left, right
 
 
-def _accumulated_swap_cost(
-    evidence: _SwapCostEvidence, effective_time: pd.Timestamp
-) -> Decimal:
-    return sum(
-        (cost for stamp, cost in evidence.events if stamp <= effective_time),
-        Decimal(0),
-    )
 
 
-def _executable_mark_net_per_lot(
-    *,
-    side: str,
-    bid: Decimal,
-    ask: Decimal,
-    base_entry_fill: Decimal,
-    contract_multiplier: Decimal,
-    accumulated_financing_cost: Decimal,
-) -> Decimal:
-    sign = Decimal(1) if side == "LONG" else Decimal(-1)
-    liquidation = bid if side == "LONG" else ask
-    return (
-        sign * contract_multiplier * (liquidation - base_entry_fill)
-        - accumulated_financing_cost
-    )
 
 
-def _m5_valuation_marks(
-    *,
-    trade: Mapping[str, Any],
-    tape: _M5ValuationTape,
-    base_swap_cost: _SwapCostEvidence,
-    stress_swap_cost: _SwapCostEvidence,
-    base_entry_fill: Decimal,
-    stop_price: Decimal,
-    effective_exit_time: pd.Timestamp,
-    contract_multiplier: Decimal,
-) -> tuple[tuple[portfolio.MarkPoint, ...], tuple[_DailyMark, ...]]:
-    side = str(trade["direction"]).upper()
-    if side not in {"LONG", "SHORT"}:
-        _fail("BACKTEST_DIRECTION_INVALID")
-    entry_time = _timestamp(trade["entry_time"], "BACKTEST_ENTRY_TIME_INVALID")
-    exit_time = _timestamp(effective_exit_time, "BACKTEST_EXIT_TIME_INVALID")
-    if exit_time < entry_time:
-        _fail("M5_VALUATION_POSITION_TIME_INVALID")
-    left, right = _valuation_mark_indices(tape, entry_time, exit_time)
-    candidate_marks: list[portfolio.MarkPoint] = []
-    for index in range(left, right):
-        marked_at = tape.opens[index]
-        mid, bid, ask = _quote(
-            tape.frame["Open"].iloc[index], tape.entry_half_spread[index]
-        )
-        if marked_at < exit_time and (
-            (side == "LONG" and bid <= stop_price)
-            or (side == "SHORT" and ask >= stop_price)
-        ):
-            _fail("M5_OPEN_MARK_CROSSES_PROTECTIVE_STOP", tape.symbol)
-        net = _executable_mark_net_per_lot(
-            side=side,
-            bid=bid,
-            ask=ask,
-            base_entry_fill=base_entry_fill,
-            contract_multiplier=contract_multiplier,
-            accumulated_financing_cost=_accumulated_swap_cost(
-                base_swap_cost, marked_at
-            ),
-        )
-        candidate_marks.append(
-            portfolio.MarkPoint(
-                time=marked_at,
-                observation_time=marked_at,
-                pnl_per_current_lot=float(net),
-            )
-        )
-
-    entry_day = entry_time.date()
-    exit_day = exit_time.date()
-    daily: list[_DailyMark] = []
-    for offset in range((exit_day - entry_day).days + 1):
-        current = entry_day + timedelta(days=offset)
-        day_text = current.isoformat()
-        day_start = pd.Timestamp(current, tz="UTC")
-        day_end = day_start + pd.Timedelta(days=1)
-        boundary = min(day_end - pd.Timedelta(seconds=1), exit_time)
-        candidate_index = int(tape.opens.searchsorted(boundary, side="right") - 1)
-        if candidate_index < 0 or tape.opens[candidate_index] < entry_time:
-            _fail("M5_DAILY_VALUATION_QUOTE_UNAVAILABLE", tape.symbol, day_text)
-        observed_at = tape.opens[candidate_index]
-        mid, bid, ask = _quote(
-            tape.frame["Open"].iloc[candidate_index],
-            tape.entry_half_spread[candidate_index],
-        )
-        # On a broker closure the last authenticated M5 Open is carried
-        # forward only after it was observed.  The effective mark remains in
-        # the current UTC day because the causal ledger has no observation-time
-        # field; candidate marks retain the exact original M5 observation time.
-        marked_at = observed_at if observed_at >= day_start else boundary
-        if marked_at < entry_time or marked_at > exit_time:
-            _fail("M5_DAILY_VALUATION_TIME_INVALID", tape.symbol, day_text)
-        base_finance = base_swap_cost.daily_costs.get(day_text, Decimal(0))
-        stress_finance = stress_swap_cost.daily_costs.get(day_text, Decimal(0))
-        net = _executable_mark_net_per_lot(
-            side=side,
-            bid=bid,
-            ask=ask,
-            base_entry_fill=base_entry_fill,
-            contract_multiplier=contract_multiplier,
-            accumulated_financing_cost=_accumulated_swap_cost(
-                base_swap_cost, marked_at
-            ),
-        )
-        daily.append(
-            _DailyMark(
-                date=day_text,
-                marked_at_utc=_utc_seconds(
-                    marked_at.isoformat(), "DAILY_MARK_TIME_INVALID"
-                ),
-                mid_price=mid,
-                bid_price=bid,
-                ask_price=ask,
-                base_financing_per_lot=base_finance,
-                stress_financing_per_lot=stress_finance,
-                candidate_net_pnl_per_lot=float(net),
-            )
-        )
-    return tuple(candidate_marks), tuple(daily)
 
 
-def _position_evidence(
-    *,
-    specialist: _VerifiedSpecialist,
-    capital_phase: str,
-    strategy: Any,
-    features: pd.DataFrame,
-    spec: InstrumentSpec,
-    config: PipelineConfig,
-    base_result: Mapping[str, Any],
-    stress_result: Mapping[str, Any],
-    valuation_tape: _M5ValuationTape,
-    resource_budget: _ResourceBudget,
-) -> tuple[_PositionEvidence, ...]:
-    if capital_phase not in CAPITAL_PHASES:
-        _fail("CAPITAL_PHASE_INVALID", capital_phase)
-    if (
-        type(valuation_tape) is not _M5ValuationTape
-        or valuation_tape.symbol != specialist.symbol
-        or valuation_tape.execution_spec_receipt.get("instrument_spec") != asdict(spec)
-    ):
-        _fail("M5_VALUATION_EXECUTION_SPEC_SPLICE", specialist.cell_id)
-    base_trades = base_result.get("trades")
-    base_events = base_result.get("position_events")
-    stress_trades = stress_result.get("trades")
-    stress_events = stress_result.get("position_events")
-    if not all(
-        type(value) is list
-        for value in (base_trades, base_events, stress_trades, stress_events)
-    ):
-        _fail("BACKTEST_POSITION_EVIDENCE_MISSING", specialist.cell_id)
-    if len(base_trades) != len(stress_trades) or len(base_events) != len(stress_events):
-        _fail("BACKTEST_STRESS_POSITION_ROSTER_MISMATCH", specialist.cell_id)
-    namespace = "|".join(
-        (
-            specialist.symbol,
-            specialist.timeframe,
-            str(getattr(strategy, "name", type(strategy).__name__)),
-        )
-    )
-    try:
-        rebuilt_base_events = build_backtest_position_events(
-            base_trades, namespace=namespace
-        )
-        rebuilt_stress_events = build_backtest_position_events(
-            stress_trades, namespace=namespace
-        )
-    except Exception as exc:
-        raise ForwardOOSReplayProductionError(
-            "BACKTEST_POSITION_EVENTS_V2_REBUILD_FAILED",
-            (specialist.cell_id, type(exc).__name__, str(exc)),
-        ) from exc
-    if rebuilt_base_events != base_events or rebuilt_stress_events != stress_events:
-        _fail("BACKTEST_POSITION_EVENTS_V2_RAW_REVERIFY_FAILED", specialist.cell_id)
-    by_position: dict[str, tuple[Mapping[str, Any], Mapping[str, Any]]] = {}
-    for trade, stress_trade in zip(base_trades, stress_trades, strict=True):
-        if type(trade) is not dict or type(stress_trade) is not dict:
-            _fail("BACKTEST_TRADE_RECORD_INVALID")
-        single = build_backtest_position_events([trade], namespace=namespace)
-        stress_single = build_backtest_position_events(
-            [stress_trade], namespace=namespace
-        )
-        if (
-            len(single) != 1
-            or single[0]["position_id"] != stress_single[0]["position_id"]
-        ):
-            _fail("BACKTEST_POSITION_IDENTITY_INVALID")
-        position_id = single[0]["position_id"]
-        if position_id in by_position:
-            _fail("PARTIAL_OR_MULTI_LEG_POSITION_NOT_REPRESENTABLE", position_id)
-        by_position[position_id] = (trade, stress_trade)
-    base_event_ids = {value.get("position_id") for value in base_events}
-    stress_event_ids = {value.get("position_id") for value in stress_events}
-    if base_event_ids != set(by_position) or stress_event_ids != set(by_position):
-        _fail("BACKTEST_STRESS_POSITION_ROSTER_MISMATCH", specialist.cell_id)
-    resource_budget.reserve_positions(len(by_position), specialist.anchor_id)
-    # P&L differs by lane, so exact event equality is not expected.  The
-    # immutable event identities and ordering must nevertheless match.
-    for left, right in zip(base_events, stress_events, strict=True):
-        if any(
-            left.get(name) != right.get(name)
-            for name in (
-                "trade_record_schema_version",
-                "position_id",
-                "entry_time",
-                "exit_time",
-                "entry_event_order",
-                "exit_event_order",
-                "risk_amount",
-            )
-        ):
-            _fail("BACKTEST_STRESS_POSITION_IDENTITY_MISMATCH")
-    base_backtester = Backtester(config)
-    stress_mode = str(config.oos_evidence_execution_stress_mode).strip().lower()
-    stress_backtester = Backtester(replace(config, backtest_spread_mode=stress_mode))
-    base_entry_spread, base_half_spread, _ = base_backtester._build_half_spread_arrays(
-        features, spec
-    )
-    stress_entry_spread, _, _ = stress_backtester._build_half_spread_arrays(
-        features, spec
-    )
-    entry_prices = np.full(len(features), np.nan, dtype=np.float64)
-    stress_entry_prices = np.full(len(features), np.nan, dtype=np.float64)
-    for trade, stress_trade in by_position.values():
-        entry_prices[int(trade["entry_bar"])] = float(trade["entry_price"])
-        stress_entry_prices[int(stress_trade["entry_bar"])] = float(
-            stress_trade["entry_price"]
-        )
-    (
-        base_pre,
-        base_close,
-        base_long,
-        base_short,
-        base_causal,
-        _,
-    ) = base_backtester._build_causal_swap_inputs(
-        features, spec, entry_prices, timeframe=specialist.timeframe
-    )
-    (
-        stress_pre,
-        stress_close,
-        stress_long,
-        stress_short,
-        stress_causal,
-        _,
-    ) = stress_backtester._build_causal_swap_inputs(
-        features, spec, stress_entry_prices, timeframe=specialist.timeframe
-    )
-    if (
-        base_causal != stress_causal
-        or not np.array_equal(base_pre, stress_pre)
-        or not np.array_equal(base_close, stress_close)
-    ):
-        _fail("BACKTEST_SWAP_PROJECTION_STRESS_DRIFT")
-    contract_multiplier = _decimal(
-        spec.tick_value, "TICK_VALUE_INVALID", positive=True
-    ) / _decimal(spec.tick_size, "TICK_SIZE_INVALID", positive=True)
-    positions: list[_PositionEvidence] = []
-    for position_id in sorted(by_position):
-        trade, stress_trade = by_position[position_id]
-        entry_bar = int(trade["entry_bar"])
-        side = str(trade["direction"]).upper()
-        sign = Decimal(1) if side == "LONG" else Decimal(-1)
-        entry_mid, entry_bid, entry_ask = _quote(
-            features["Open"].iloc[entry_bar], base_entry_spread[entry_bar]
-        )
-        base_entry = _decimal(
-            trade["entry_price"], "BASE_ENTRY_FILL_INVALID", positive=True
-        )
-        stress_entry = _decimal(
-            stress_trade["entry_price"], "STRESS_ENTRY_FILL_INVALID", positive=True
-        )
-        executable_entry = entry_ask if side == "LONG" else entry_bid
-        _, stress_entry_bid, stress_entry_ask = _quote(
-            features["Open"].iloc[entry_bar], stress_entry_spread[entry_bar]
-        )
-        expected_stress_entry = (
-            stress_entry_ask if side == "LONG" else stress_entry_bid
-        )
-        tolerance = max(
-            Decimal("0.000000000001"), abs(base_entry) * Decimal("0.000000000001")
-        )
-        if abs(base_entry - executable_entry) > tolerance:
-            _fail("BACKTEST_ENTRY_FILL_RECONSTRUCTION_FAILED", position_id)
-        if abs(stress_entry - expected_stress_entry) > tolerance:
-            _fail("BACKTEST_STRESS_ENTRY_FILL_RECONSTRUCTION_FAILED", position_id)
-        if sign * (stress_entry - base_entry) < 0:
-            _fail("BACKTEST_STRESS_ENTRY_IMPROVES", position_id)
-        exit_mid, exit_bid, exit_ask, effective_exit_time = _exit_quote(
-            trade=trade,
-            features=features,
-            half_spread=base_half_spread,
-        )
-        base_exit = _decimal(
-            trade["exit_price"], "BASE_EXIT_FILL_INVALID", positive=True
-        )
-        stress_exit = _decimal(
-            stress_trade["exit_price"], "STRESS_EXIT_FILL_INVALID", positive=True
-        )
-        if stress_exit != base_exit:
-            _fail("FROZEN_PATH_STRESS_EXIT_FILL_CHANGED", position_id)
-        stop = _decimal(trade["stop_loss"], "BACKTEST_STOP_INVALID", positive=True)
-        if (side == "LONG" and stop >= entry_mid) or (
-            side == "SHORT" and stop <= entry_mid
-        ):
-            _fail("BACKTEST_OPENING_STOP_NOT_ADVERSE", position_id)
-        size = _decimal(
-            trade["position_size"], "BACKTEST_POSITION_SIZE_INVALID", positive=True
-        )
-        stress_size = _decimal(
-            stress_trade["position_size"], "BACKTEST_STRESS_SIZE_INVALID", positive=True
-        )
-        if size != stress_size:
-            _fail("BACKTEST_STRESS_POSITION_SIZE_CHANGED", position_id)
-        base_rates = base_long if side == "LONG" else base_short
-        stress_rates = stress_long if side == "LONG" else stress_short
-        base_swap = _daily_swap_costs_per_lot(
-            trade=trade,
-            features=features,
-            pre_open_units=base_pre,
-            close_units=base_close,
-            per_lot_rate=base_rates,
-        )
-        stress_swap = _daily_swap_costs_per_lot(
-            trade=stress_trade,
-            features=features,
-            pre_open_units=stress_pre,
-            close_units=stress_close,
-            per_lot_rate=stress_rates,
-        )
-        valuation_left, valuation_right = _valuation_mark_indices(
-            valuation_tape,
-            _timestamp(trade["entry_time"], "BACKTEST_ENTRY_TIME_INVALID"),
-            effective_exit_time,
-        )
-        resource_budget.reserve_marks(
-            valuation_right - valuation_left, specialist.anchor_id
-        )
-        candidate_marks, marks = _m5_valuation_marks(
-            trade=trade,
-            tape=valuation_tape,
-            base_swap_cost=base_swap,
-            stress_swap_cost=stress_swap,
-            base_entry_fill=base_entry,
-            stop_price=stop,
-            effective_exit_time=effective_exit_time,
-            contract_multiplier=contract_multiplier,
-        )
-        if any(
-            (side == "LONG" and stop >= mark.bid_price)
-            or (side == "SHORT" and stop <= mark.ask_price)
-            for mark in marks[:-1]
-        ):
-            _fail("OPEN_POSITION_MARK_CROSSES_PROTECTIVE_STOP", position_id)
-        base_swap_per_lot = -sum(base_swap.daily_costs.values(), Decimal(0))
-        price_pnl_per_lot = sign * (base_exit - base_entry) * contract_multiplier
-        exact_net_per_lot = price_pnl_per_lot + base_swap_per_lot
-        exact_gross_cash = price_pnl_per_lot * size
-        exact_net_cash = exact_net_per_lot * size
-        if _money_round(exact_gross_cash) != _decimal(
-            trade["gross_pnl_dollars"], "BACKTEST_GROSS_PNL_INVALID"
-        ) or _money_round(exact_net_cash) != _decimal(
-            trade["pnl_dollars"], "BACKTEST_NET_PNL_INVALID"
-        ):
-            _fail("BACKTEST_POSITION_CASH_RECONCILIATION_FAILED", position_id)
-        stop_risk = abs(base_entry - stop) * contract_multiplier
-        margin_per_lot = abs(base_entry) * contract_multiplier
-        candidate_id = (
-            "oos:"
-            + hashlib.sha256(
-                (
-                    f"{specialist.anchor_id}|{capital_phase}|"
-                    f"{specialist.cell_id}|{position_id}"
-                ).encode("ascii")
-            ).hexdigest()
-        )
-        candidate = portfolio.CandidateTrade(
-            candidate_id=candidate_id,
-            cell_id=specialist.cell_id,
-            symbol=specialist.symbol,
-            timeframe=specialist.timeframe,
-            regime=specialist.regime,
-            strategy_name=specialist.strategy_id,
-            promotion_status="HISTORICAL_OOS_REPLAY",
-            asset_class=str(spec.asset_class),
-            risk_groups=(),
-            entry_time=trade["entry_time"],
-            direction=1 if side == "LONG" else -1,
-            stop_risk_per_lot=float(stop_risk),
-            margin_per_lot=float(margin_per_lot),
-            volume_min=float(spec.min_lot),
-            volume_max=float(spec.max_lot),
-            volume_step=float(spec.volume_step),
-            priority_score=specialist.priority_score,
-            legs=(
-                portfolio.ExitLeg(
-                    exit_time=effective_exit_time.isoformat(),
-                    fraction=1.0,
-                    net_pnl_per_entry_lot=float(exact_net_per_lot),
-                    price_pnl_per_entry_lot=float(price_pnl_per_lot),
-                    swap_per_entry_lot=float(base_swap_per_lot),
-                    exit_reason=str(trade["exit_reason"]),
-                ),
-            ),
-            marks=candidate_marks,
-            source_schema=POSITION_SOURCE_SCHEMA,
-            margin_model=MARGIN_MODEL,
-        ).normalized()
-        positions.append(
-            _PositionEvidence(
-                candidate=candidate,
-                position_id=position_id,
-                cell_id=specialist.cell_id,
-                symbol=specialist.symbol,
-                timeframe=specialist.timeframe,
-                regime=specialist.regime,
-                side=side,
-                contract_multiplier=contract_multiplier,
-                stop_price=stop,
-                entry_mid=entry_mid,
-                entry_bid=entry_bid,
-                entry_ask=entry_ask,
-                base_entry_fill=base_entry,
-                stress_entry_fill=stress_entry,
-                exit_mid=exit_mid,
-                exit_bid=exit_bid,
-                exit_ask=exit_ask,
-                base_exit_fill=base_exit,
-                stress_exit_fill=stress_exit,
-                margin_per_lot=margin_per_lot,
-                marks=marks,
-            )
-        )
-    return tuple(positions)
 
 
 def _open_m5_valuation_tape(
@@ -2990,6 +2749,7 @@ def _open_m5_valuation_tape(
     deployment: _DeploymentBinding,
     forward_start: pd.Timestamp,
     forward_end_exclusive: pd.Timestamp,
+    spread_tier: spread_profile.FrozenSpreadTier,
 ) -> tuple[_M5ValuationTape, InstrumentSpec]:
     reopened = _reopen_bound_native_product(
         context=context,
@@ -3037,7 +2797,7 @@ def _open_m5_valuation_tape(
     backtester = Backtester(config)
     try:
         entry_half, intrabar_half, spread_meta = backtester._build_half_spread_arrays(
-            frame, spec
+            frame, spec, spread_tier=spread_tier, timeframe=spread_tier.timeframe
         )
         cost_attestation = backtester._numerical_execution_cost_attestation(
             entry_half_spread=entry_half,
@@ -3071,442 +2831,1366 @@ def _open_m5_valuation_tape(
     return tape, spec
 
 
+def _raw_json(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _raw_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return [_raw_json(item) for item in value]
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return pd.Timestamp(value).isoformat()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _owner_provenance(owner: _VerifiedSpecialist) -> dict[str, Any]:
+    return {"parameters": _raw_json(owner.parameters), "source_count_receipt": dict(owner.source_count_receipt),
+            "detector_parameters_sha256": owner.detector_parameters_sha256,
+            "strategy_id": owner.strategy_id, "strategy_class": owner.strategy_class,
+            "strategy_module": owner.strategy_module, "qualification_authority": False}
+
+
+def _reopen_owner_capture(*, context, anchor, book_body, cell_id, symbol_receipt, adapter_index_descriptor):
+    if type(symbol_receipt) is not dict or type(adapter_index_descriptor) is not dict:
+        _fail("FROZEN_TIER_ORIGINAL_OWNER_CAPTURE_UNAVAILABLE")
+    matches = [cell for cell in book_body.get("cells", ()) if cell.get("cell_id") == cell_id]
+    if len(matches) != 1:
+        _fail("FROZEN_TIER_ORIGINAL_BOOK_OWNER_MISMATCH")
+    cell = matches[0]
+    _, entries = _verified_manifest(context, symbol_receipt, cell["symbol"])
+    index = _manifest_body(context, entries, f"{anchor['anchor_id']}/adapter/production-index",
+        code="FROZEN_TIER_ORIGINAL_ADAPTER_INDEX", expected_descriptor=adapter_index_descriptor,
+        maximum=32 * 1024 * 1024)
+    if book_body.get("contract_version") in (book.CURRENT_GENERATION.version, book.V16_GENERATION.version):
+        stored_anchor = index.get("anchor")
+        if (type(anchor) is dict and type(stored_anchor) is dict
+                and anchor.keys() == stored_anchor.keys()
+                and all(type(anchor[key]) is type(stored_anchor[key])
+                        and anchor[key] == stored_anchor[key]
+                        for key in anchor if key != "selection_cutoff_utc")):
+            cutoff, stored_cutoff = (value.get("selection_cutoff_utc")
+                                     for value in (anchor, stored_anchor))
+            utc_form = r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)"
+            if all(type(value) is str and re.fullmatch(utc_form, value)
+                   for value in (cutoff, stored_cutoff)):
+                try:
+                    same_instant = datetime.fromisoformat(cutoff) == datetime.fromisoformat(stored_cutoff)
+                except ValueError:
+                    same_instant = False
+                if same_instant:
+                    # Resolve caller notation; keep every sealed binding byte unchanged.
+                    anchor = stored_anchor
+        else:
+            _fail("CURRENT_OWNER_INDEX_BINDING_MISMATCH", cell_id)
+    return _selected_artifacts(context=context, entries=entries, anchor=anchor, book_body=book_body,
+                              book_cell=cell, index=index)
+
+
+def _reopen_original_global_precommit(*, context, descriptor, precommit_anchor, deployment):
+    """Bind original input bytes; this is not issued-release authentication."""
+    if type(descriptor) is not dict:
+        _fail("FROZEN_TIER_ORIGINAL_GLOBAL_PRECOMMIT_UNAVAILABLE")
+    original = _read_descriptor_json(context, descriptor, code="FROZEN_TIER_ORIGINAL_GLOBAL_PRECOMMIT")
+    anchors = original.get("anchor_product_identities")
+    if (original.get("schema_version") != REPLAY_PRECOMMIT_SCHEMA
+            or original.get("generation_id") != context.generation_id
+            or original.get("generation_context_sha256") != context.context_sha256
+            or original.get("native_universe_sha256") != context.native_universe_sha256
+            or original.get("config_sha256") != context.config_sha256
+            or original.get("deployment_binding") != deployment.receipt_body()
+            or type(anchors) is not list or original.get("anchor_product_identities_sha256") != _sha(anchors)
+            or sum(value == precommit_anchor for value in anchors) != 1):
+        _fail("FROZEN_TIER_ORIGINAL_GLOBAL_PRECOMMIT_BINDING_CHANGED")
+    return original
+
+
+def _reopen_retained_deployment(*, context, descriptors, original_receipt, config_record):
+    """Rebuild the original effective config without opening live config files."""
+    original = _validate_deployment_binding_projection(original_receipt)
+    if (type(config_record) is not dict
+            or set(config_record) != {"active_config_path", "config_sha256", "effective_config_sha256"}
+            or config_record["active_config_path"] != original["deployment_config_path"]):
+        _fail("FROZEN_TIER_ORIGINAL_PIPELINE_CONFIG_CHANGED")
+    sources, source_bytes = {}, {}
+    for role, prefix in (("config", "deployment_config"), ("broker", "broker_specs")):
+        descriptor, raw = native_prefix._read_spool_descriptor(context, descriptors[role],
+            expected_format="json-" + role, collect=True)
+        if (descriptor["sha256"] != original[prefix + "_sha256"]
+                or descriptor["size_bytes"] != original[prefix + "_size_bytes"]):
+            _fail("FROZEN_TIER_DEPLOYMENT_SOURCE_PRECOMMIT_SPLICE")
+        try:
+            body = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=search_execution._strict_pairs,
+                              parse_constant=search_execution._reject_json_constant)
+        except (search_execution.AuthoritativeSearchExecutionError, UnicodeError, ValueError) as exc:
+            raise ForwardOOSReplayProductionError("FROZEN_TIER_RETAINED_DEPLOYMENT_JSON_INVALID") from exc
+        if type(body) is not dict:
+            _fail("FROZEN_TIER_RETAINED_DEPLOYMENT_JSON_INVALID")
+        sources[role] = body
+        source_bytes[role] = raw
+    payload, broker = sources["config"], sources["broker"]
+    canonical_sha = config_binding.cap.canonical_json_sha256(payload)
+    if canonical_sha != context.config_sha256 or canonical_sha != config_record["config_sha256"]:
+        _fail("FROZEN_TIER_ORIGINAL_PIPELINE_CONFIG_CHANGED")
+    config_binding._verify_context(context, canonical_sha)
+    path = Path(original["deployment_config_path"])
+    if (not path.is_absolute() or type(payload.get("pipeline")) is not dict
+            or type(payload.get("position")) is not dict or type(payload.get("_meta")) is not dict
+            or not str(payload["_meta"].get("scope") or "").strip()):
+        _fail("FROZEN_TIER_RETAINED_DEPLOYMENT_POLICY_INVALID")
+    config = config_binding._derive_pipeline_config(payload, path)
+    effective = {"schema_version": config_binding.BINDING_SCHEMA,
+                 "pipeline_config": config_binding._snapshot(config)}
+    effective_sha = hashlib.sha256(config_binding._canonical_bytes(
+        effective, maximum=config_binding.MAX_SNAPSHOT_BYTES)).hexdigest()
+    identity = _pipeline_config_identity(config)
+    if (effective_sha != config_record["effective_config_sha256"]
+            or identity != original["pipeline_config_identity"]
+            or _sha(identity) != original["pipeline_config_identity_sha256"]
+            or float(payload["pipeline"].get("initial_capital")) != float(config.initial_capital)):
+        _fail("FROZEN_TIER_ORIGINAL_PIPELINE_CONFIG_CHANGED")
+    broker_relative = payload.get("broker_specs_path")
+    if type(broker_relative) is not str or not broker_relative.strip():
+        _fail("FROZEN_TIER_RETAINED_DEPLOYMENT_POLICY_INVALID")
+    broker_path = Path(broker_relative)
+    if not broker_path.is_absolute():
+        broker_path = path.parent / broker_path
+    broker_path = broker_path.resolve()
+    if broker_relative != original["broker_specs_relative_path"] or str(broker_path) != original["broker_specs_path"]:
+        _fail("FROZEN_TIER_DEPLOYMENT_SOURCE_PRECOMMIT_SPLICE")
+    deployment = _DeploymentBinding(payload, path, original["deployment_config_sha256"], original["deployment_config_size_bytes"],
+        broker, broker_path, broker_relative, original["broker_specs_sha256"], original["broker_specs_size_bytes"],
+        identity, _sha(identity))
+    if deployment.receipt_body() != original:
+        _fail("FROZEN_TIER_DEPLOYMENT_SOURCE_PRECOMMIT_SPLICE")
+    return config, deployment, source_bytes
+
+
+def _reconcile_tier_account(account: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebuild derived state from actual fills, model events and close quotes.
+
+    Cash is a derivation, not an engine observation. Matching float operations
+    and JSON round-trip precision permit exact comparison with the unrounded
+    engine curve; a mismatch is an error, never missing coverage.
+    """
+    if type(account) is not dict:
+        _fail("FROZEN_TIER_ACCOUNT_INVALID")
+    rows, trades, events = (account.get(key) for key in ("source_rows", "trades", "position_events"))
+    if not all(type(value) is list for value in (rows, trades, events)) or not rows:
+        _fail("FROZEN_TIER_ACCOUNT_RECORDS_MISSING")
+    if any(row.get("engine_equity") is None for row in rows):
+        _fail("FROZEN_TIER_ENGINE_EQUITY_MARK_UNAVAILABLE")
+    if (type(account.get("warmup_bars")) is not int or not 1 <= account["warmup_bars"] < len(rows)
+            or not math.isfinite(float(account.get("initial_cash", 0))) or account["initial_cash"] <= 0):
+        _fail("FROZEN_TIER_ACCOUNT_GENESIS_INVALID")
+    if len(trades) > _MAX_CANDIDATE_POSITIONS_PER_ANCHOR:
+        _fail("FORWARD_POSITION_COUNT_BOUND_EXCEEDED")
+    spec = InstrumentSpec(**account["instrument_spec"])
+    tier = account["tier"]
+    if tier.get("tier") not in ("P75", "P95") or tier.get("qualification_authority") is not False:
+        _fail("FROZEN_TIER_ACCOUNT_DESCRIPTOR_INVALID")
+    if (tier.get("symbol"), tier.get("timeframe"), tier.get("point_price")) != (
+        account["symbol"], account["timeframe"], spec.point
+    ):
+        _fail("FROZEN_TIER_ACCOUNT_DESCRIPTOR_SPLICE")
+    floor = float(tier["full_spread_price"]) / 2.0
+    if floor != float(tier["spread_points"]) * spec.point / 2.0 or floor <= 0:
+        _fail("FROZEN_TIER_ACCOUNT_WIDTH_INVALID")
+    namespace = account["position_namespace"]
+    rebuilt = _raw_json(build_backtest_position_events(trades, namespace=namespace))
+    if rebuilt != events:
+        _fail("BACKTEST_POSITION_EVENTS_V2_RAW_REVERIFY_FAILED", account["cell_id"])
+    position_ids = []
+    for trade in trades:
+        single = build_backtest_position_events([trade], namespace=namespace)
+        if len(single) != 1:
+            _fail("PARTIAL_OR_MULTI_LEG_POSITION_NOT_REPRESENTABLE")
+        position_ids.append(single[0]["position_id"])
+    if len(set(position_ids)) != len(position_ids) or len(rebuilt) != len(trades):
+        _fail("PARTIAL_OR_MULTI_LEG_POSITION_NOT_REPRESENTABLE")
+    model = account["financing_model"]
+    pre, close = model["pre_open_units"], model["close_units"]
+    long_rates, short_rates = model["long_per_lot"], model["short_per_lot"]
+    if any(len(value) != len(rows) for value in (pre, close, long_rates, short_rates)):
+        _fail("FROZEN_TIER_FINANCING_AXIS_INVALID")
+    if any(type(value) is not int or value < 0 for value in (*pre, *close)):
+        _fail("FROZEN_TIER_FINANCING_UNITS_INVALID")
+    if model["enabled"] is not True and (any(pre) or any(close)):
+        _fail("FROZEN_TIER_FINANCING_DISABLED_WITH_EVENTS")
+    opens = pd.DatetimeIndex([row["open_utc"] for row in rows])
+    closes = pd.DatetimeIndex([row["close_utc"] for row in rows])
+    if (opens.tz is None or closes.tz is None or opens.has_duplicates or closes.has_duplicates
+            or not opens.is_monotonic_increasing or not closes.is_monotonic_increasing
+            or bool((opens >= closes).any()) or bool((closes[:-1] > opens[1:]).any())):
+        _fail("FROZEN_TIER_SOURCE_AXIS_INVALID")
+    for row in rows:
+        for key, recorded in (("entry_half_spread", "recorded_entry_points"),
+                              ("intrabar_half_spread", "recorded_intrabar_points")):
+            points = row[recorded]
+            if points is not None and (type(points) not in (int, float) or not math.isfinite(points)
+                                       or points < 0 or points != math.floor(points)):
+                _fail("RECORDED_SPREAD_POINTS_INVALID")
+            expected = max(floor, floor if points is None else float(points) * spec.point / 2.0)
+            if row[key] != expected:
+                _fail("FROZEN_TIER_SOURCE_QUOTE_MISMATCH")
+    spread_meta = account["engine_spread_model"]
+    if spread_meta.get("frozen_spread_tier") != tier:
+        _fail("FROZEN_TIER_ENGINE_COST_DESCRIPTOR_CHANGED")
+    attestation = Backtester(PipelineConfig(use_spread=True))._numerical_execution_cost_attestation(
+        entry_half_spread=np.asarray([row["entry_half_spread"] for row in rows], dtype=np.float64),
+        intrabar_half_spread=np.asarray([row["intrabar_half_spread"] for row in rows], dtype=np.float64),
+        spread_meta=spread_meta, spec=spec)
+    if attestation != account["numerical_execution_cost_attestation"]:
+        _fail("FROZEN_TIER_ENGINE_COST_ATTESTATION_CHANGED")
+    positions, transactions = [], []
+    multiplier = spec.tick_value / spec.tick_size
+    for pid, trade in zip(position_ids, trades, strict=True):
+        entry, exit_bar = trade["entry_bar"], trade["exit_bar"]
+        if (type(entry) is not int or type(exit_bar) is not int
+                or not account["warmup_bars"] <= entry <= exit_bar < len(rows)):
+            _fail("FROZEN_TIER_TRADE_AXIS_INVALID")
+        side = trade["direction"]
+        sign = 1 if side == "LONG" else -1 if side == "SHORT" else 0
+        lots = float(trade["position_size"])
+        if not sign or not math.isfinite(lots) or not spec.min_lot <= lots <= spec.max_lot:
+            _fail("BACKTEST_POSITION_SIZE_INVALID")
+        entry_price, exit_price = float(trade["entry_price"]), float(trade["exit_price"])
+        expected_entry = rows[entry]["open"] + sign * rows[entry]["entry_half_spread"]
+        if entry_price != expected_entry or pd.Timestamp(trade["entry_time"]) != opens[entry]:
+            _fail("BACKTEST_ENTRY_FILL_RECONSTRUCTION_FAILED", pid)
+        stop = float(trade["stop_loss"])
+        gross = spec.calculate_tick_profit(entry_price, exit_price, lots, sign)
+        eod = str(trade["exit_reason"]).lower() in _EOD_EXIT_REASONS
+        open_exit = rows[exit_bar]["open"] - sign * rows[exit_bar]["intrabar_half_spread"]
+        reason = str(trade["exit_reason"]).lower()
+        if eod:
+            if exit_bar != len(rows) - 1 or exit_price != rows[exit_bar]["close"] - sign * rows[exit_bar]["intrabar_half_spread"]:
+                _fail("BACKTEST_TERMINAL_FILL_RECONSTRUCTION_FAILED", pid)
+            exit_phase = "TERMINAL_AFTER_CLOSE_ROLLOVER"
+        elif ("sl" in reason or "stop" in reason) and exit_price == open_exit and (
+                (sign == 1 and open_exit <= stop) or (sign == -1 and open_exit >= stop)):
+            exit_phase = "BAR_OPEN"
+        elif ("sl" in reason or "stop" in reason) and exit_price == stop and (
+                (sign == 1 and rows[exit_bar]["low"] - rows[exit_bar]["intrabar_half_spread"] <= stop)
+                or (sign == -1 and rows[exit_bar]["high"] + rows[exit_bar]["intrabar_half_spread"] >= stop)):
+            exit_phase = "INTRABAR_ORDER_ONLY"
+        elif ("tp" in reason or "target" in reason) and exit_price == float(trade["take_profit"]) and (
+                (sign == 1 and rows[exit_bar]["high"] - rows[exit_bar]["intrabar_half_spread"] >= exit_price)
+                or (sign == -1 and rows[exit_bar]["low"] + rows[exit_bar]["intrabar_half_spread"] <= exit_price)):
+            exit_phase = "INTRABAR_ORDER_ONLY"
+        else:
+            _fail("BACKTEST_EXIT_FILL_NOT_RECONSTRUCTIBLE", pid)
+        if pd.Timestamp(trade["exit_time"]) != opens[exit_bar]:
+            _fail("BACKTEST_EXIT_TIME_AXIS_INVALID", pid)
+        if (sign == 1 and stop >= rows[entry]["open"]) or (sign == -1 and stop <= rows[entry]["open"]):
+            _fail("BACKTEST_OPENING_STOP_NOT_ADVERSE", pid)
+        rate = float((long_rates if sign == 1 else short_rates)[entry])
+        swap_events, units, swap_cash = [], 0, 0.0
+        for index in range(entry, exit_bar + 1):
+            for phase, count in (("PRE_OPEN", pre[index] if index > entry else 0),
+                                 ("BAR_CLOSE", close[index] if index < exit_bar or eod else 0)):
+                if count:
+                    cash = rate * lots * count
+                    stamp = opens[index] if phase == "PRE_OPEN" else closes[index]
+                    event = {"bar": index, "phase": phase, "effective_at_utc": stamp.isoformat(),
+                             "units": count, "rate_per_lot": rate, "cash": cash, "position_id": pid}
+                    swap_events.append(event)
+                    transactions.append({**event, "kind": "SWAP"})
+                    units += count
+                    swap_cash += cash
+        if (units != trade["swap_rollover_units"] or round(swap_cash, 2) != trade["swap_dollars"]
+                or round(gross, 2) != trade["gross_pnl_dollars"]
+                or round(gross + swap_cash, 2) != trade["pnl_dollars"]):
+            _fail("BACKTEST_POSITION_CASH_RECONCILIATION_FAILED", pid)
+        transactions.append({"bar": exit_bar, "phase": exit_phase,
+                             "effective_at_utc": (opens[exit_bar] if exit_phase == "BAR_OPEN" else closes[exit_bar]).isoformat(),
+                             "cash": gross, "position_id": pid, "kind": "REALIZED_GROSS"})
+        positions.append({"position_id": pid, "entry_bar": entry, "exit_bar": exit_bar,
+                          "side": side, "lots": lots, "entry_fill": entry_price, "exit_fill": exit_price,
+                          "stop_price": stop, "exit_phase": exit_phase,
+                          "gross_stop_risk_per_lot": abs(entry_price - stop) * multiplier,
+                          "margin_per_lot": abs(entry_price) * multiplier,
+                          "margin_amount": abs(entry_price) * multiplier * lots,
+                          "margin_model": MARGIN_MODEL, "financing_events": swap_events})
+    phase_order = {"PRE_OPEN": 0, "BAR_OPEN": 1, "INTRABAR_ORDER_ONLY": 1,
+                   "BAR_CLOSE": 2, "TERMINAL_AFTER_CLOSE_ROLLOVER": 3}
+    transactions.sort(key=lambda event: (event["bar"], phase_order[event["phase"]]))
+    cash = float(account["initial_cash"])
+    cash_rows = []
+    transactions_by_bar = {}
+    for transaction in transactions:
+        transactions_by_bar.setdefault(transaction["bar"], []).append(transaction)
+    for index, row in enumerate(rows):
+        for transaction in transactions_by_bar.get(index, ()):
+            cash += transaction["cash"]
+        inventory = [position for position in positions if position["entry_bar"] <= index < position["exit_bar"]]
+        if len(inventory) > 1:
+            _fail("FROZEN_TIER_ENGINE_INVENTORY_OVERLAP")
+        marked = cash
+        for position in inventory:
+            sign = 1 if position["side"] == "LONG" else -1
+            quote = row["close"] - sign * row["intrabar_half_spread"]
+            marked += spec.calculate_tick_profit(position["entry_fill"], quote, position["lots"], sign)
+        if index >= account["warmup_bars"]:
+            observed = row["engine_equity"]
+            if not math.isfinite(observed) or marked != observed:
+                _fail("FROZEN_TIER_INTERIOR_EQUITY_RECONCILIATION_FAILED", index, marked, observed)
+            else:
+                state = "DEPLETED" if observed <= 0 else "AVAILABLE"
+            cash_rows.append({"bar": index, "effective_at_utc": row["close_utc"],
+                              "engine_recording_phase": "AFTER_INTRABAR_EXITS_AND_CLOSE_ROLLOVER",
+                              "cash_basis": "DERIVED_FROM_ACTUAL_FILLS_AND_MODEL_EVENTS", "cash": cash,
+                              "inventory": [{"position_id": p["position_id"], "lots": p["lots"]} for p in inventory],
+                              "derived_equity": marked, "engine_equity": observed, "state": state})
+    close_frame = pd.DataFrame({"_BAR_CLOSE_TS": closes}, index=opens)
+    growth = build_backtest_equity_growth(close_frame, [row["engine_equity"] for row in rows],
+        initial_equity=account["initial_cash"], warmup_bars=account["warmup_bars"])
+    if _raw_json(growth) != account["engine_equity_growth"]:
+        _fail("FROZEN_TIER_ENGINE_GROWTH_RECONCILIATION_FAILED")
+    return {"positions": positions, "transactions": transactions, "cash_inventory": cash_rows,
+            "terminal_inventory": [], "terminal_simulation": "END_OF_DATA_LIQUIDATED",
+            "reconciliation": "EXACT_FLOAT64_AT_EVERY_AVAILABLE_ENGINE_CLOSE"}
+
+
+def _spread_source_observations(observations: pd.Series, matched_closes: pd.Series) -> list[dict[str, Any]]:
+    if not observations.index.equals(matched_closes.index):
+        _fail("FROZEN_TIER_ACCOUNT_OBSERVATION_AXIS_SPLICE")
+    return [{"target_open_utc": pd.Timestamp(stamp).isoformat(),
+             "expected_prior_fine_close_utc": pd.Timestamp(stamp).isoformat(),
+             "prior_fine_close_utc": None if pd.isna(matched_closes.iloc[index])
+                 else pd.Timestamp(matched_closes.iloc[index]).isoformat(),
+             "points": None if pd.isna(value) else float(value)}
+            for index, (stamp, value) in enumerate(observations.items())]
+
+
+def _tier_source_rows(features, entry_half, intrabar_half, spread_meta, curve):
+    opens, closes = _frame_interval(features)
+    source_rows = []
+    for index in range(len(features)):
+        def recorded(column):
+            value = features[column].iloc[index] if column in features else None
+            return None if value is None or pd.isna(value) else float(value)
+        source_rows.append({"open_utc": opens[index].isoformat(), "close_utc": closes[index].isoformat(),
+                            "open": float(features["Open"].iloc[index]), "close": float(features["Close"].iloc[index]),
+                            "high": float(features["High"].iloc[index]), "low": float(features["Low"].iloc[index]),
+                            "recorded_entry_points": recorded(spread_meta["entry_column"]),
+                            "recorded_intrabar_points": recorded(spread_meta["bar_column"]),
+                            "entry_half_spread": float(entry_half[index]), "intrabar_half_spread": float(intrabar_half[index]),
+                            "engine_equity": None if not np.isfinite(curve[index]) else float(curve[index])})
+    return source_rows
+
+
+def _position_evidence(*, specialist: _VerifiedSpecialist, strategy: Any,
+                       features: pd.DataFrame, spec: InstrumentSpec, config: PipelineConfig,
+                       result: Mapping[str, Any], tier: spread_profile.FrozenSpreadTier,
+                       warmup_bars: int, valuation_tape: _M5ValuationTape) -> dict[str, Any]:
+    backtester = Backtester(config)
+    entry_half, intrabar_half, spread_meta = backtester._build_half_spread_arrays(
+        features, spec, spread_tier=tier, timeframe=specialist.timeframe)
+    trades = result.get("trades")
+    if type(trades) is not list or type(result.get("position_events")) is not list:
+        _fail("BACKTEST_POSITION_EVIDENCE_MISSING", specialist.cell_id)
+    admission = result.get("spread_admission")
+    model = result.get("spread_model")
+    if (type(admission) is not dict or type(model) is not dict
+            or admission.get("schema_version") != spread_profile.ADMISSION_SCHEMA
+            or admission.get("entry_admission_policy") != spread_profile.ADMISSION_POLICY
+            or model.get("entry_admission_schema") != spread_profile.ADMISSION_SCHEMA
+            or model.get("entry_admission_policy") != spread_profile.ADMISSION_POLICY
+            or admission.get("missing_executed_legs") != 0):
+        _fail("FROZEN_TIER_CURRENT_ADMISSION_POLICY_REQUIRED")
+    entry_prices = np.full(len(features), np.nan)
+    for trade in trades:
+        entry_prices[int(trade["entry_bar"])] = trade["entry_price"]
+    pre, close, long_rates, short_rates, enabled, swap_contract = backtester._build_causal_swap_inputs(
+        features, spec, entry_prices, timeframe=specialist.timeframe)
+    if _raw_json(swap_contract) != _raw_json(result.get("swap_accrual_contract")):
+        _fail("FROZEN_TIER_FINANCING_MODEL_CHANGED_AFTER_ENGINE")
+    if not enabled and swap_contract.get("status") != "DISABLED":
+        _fail("FROZEN_TIER_FINANCING_TIMING_UNAVAILABLE")
+    curve = result.get("equity_curve")
+    if curve is None or len(curve) != len(features):
+        _fail("FROZEN_TIER_ENGINE_EQUITY_AXIS_MISSING", "source_rows", len(features),
+              "exported_curve_type", type(curve).__name__,
+              "exported_curve_rows", None if curve is None else len(curve),
+              "exported_trade_count", len(trades),
+              "reduced_raw_mark_count", result.get("equity_growth", {}).get("raw_mark_count"))
+    source_rows = _tier_source_rows(features, entry_half, intrabar_half, spread_meta, curve)
+    account = {"symbol": specialist.symbol, "timeframe": specialist.timeframe, "cell_id": specialist.cell_id,
+               "tier": tier.descriptor(), "initial_cash": float(config.initial_capital), "warmup_bars": warmup_bars,
+               "instrument_spec": asdict(spec), "position_namespace": "|".join((specialist.symbol, specialist.timeframe,
+                   str(getattr(strategy, "name", type(strategy).__name__)))),
+               "trades": _raw_json(trades), "position_events": _raw_json(result["position_events"]),
+               "source_rows": source_rows, "engine_equity_growth": _raw_json(result.get("equity_growth")),
+               "engine_spread_admission": _raw_json(result.get("spread_admission")),
+               "engine_spread_model": _raw_json(result.get("spread_model")),
+               "execution_cost_timing_contract": _raw_json(result.get("execution_cost_timing_contract")),
+               "numerical_execution_cost_attestation": _raw_json(result.get("numerical_execution_cost_attestation")),
+               "financing_model": {"pre_open_units": _raw_json(pre), "close_units": _raw_json(close),
+                   "long_per_lot": _raw_json(long_rates), "short_per_lot": _raw_json(short_rates),
+                   "enabled": bool(enabled), "contract": _raw_json(swap_contract)}}
+    account["derived"] = _reconcile_tier_account(account)
+    entry_column = valuation_tape.spread_meta["spread_model"]["entry_column"]
+    account["valuation_rows"] = [
+        {"open_utc": stamp.isoformat(), "open": float(valuation_tape.frame["Open"].iloc[index]),
+         "recorded_entry_points": (None if entry_column not in valuation_tape.frame or pd.isna(valuation_tape.frame[entry_column].iloc[index])
+                                   else float(valuation_tape.frame[entry_column].iloc[index]))}
+        for index, stamp in enumerate(valuation_tape.opens)
+    ]
+    account["m5_marks"] = _tier_m5_marks(account, valuation_tape)
+    account["valuation_source"] = {"native_product_identity": dict(valuation_tape.native_product_identity),
+                                    "execution_spec_receipt": dict(valuation_tape.execution_spec_receipt),
+                                    "spread_and_cost_surface": dict(valuation_tape.spread_meta)}
+    return account
+
+
+def _compact_tier_account(account: Mapping[str, Any]) -> dict[str, Any]:
+    view_fields = ("source_rows", "valuation_rows", "m5_marks")
+    if (type(account) is not dict or "engine_equity" in account
+            or any(type(account.get(key)) is not list for key in view_fields)
+            or not account["source_rows"]):
+        _fail("FROZEN_TIER_COMPACT_ACCOUNT_INPUT_INVALID")
+    curve = []
+    for row in account["source_rows"]:
+        value = row.get("engine_equity") if type(row) is dict else None
+        valid = type(value) in (int, float)
+        if valid:
+            try:
+                valid = math.isfinite(value)
+            except OverflowError:
+                valid = False
+        if not valid:
+            _fail("FROZEN_TIER_ENGINE_EQUITY_MARK_UNAVAILABLE")
+        curve.append(value)
+    compact = {key: value for key, value in account.items() if key not in view_fields}
+    compact["engine_equity"] = curve
+    return compact
+
+
+def _tier_m5_marks(account: Mapping[str, Any], tape: _M5ValuationTape) -> list[dict[str, Any]]:
+    if tape.symbol != account["symbol"] or tape.execution_spec_receipt.get("instrument_spec") != account["instrument_spec"]:
+        _fail("M5_VALUATION_EXECUTION_SPEC_SPLICE")
+    spec = InstrumentSpec(**account["instrument_spec"])
+    positions, transactions = account["derived"]["positions"], account["derived"]["transactions"]
+    rows = account["source_rows"]
+    marks = []
+    for index, stamp in enumerate(tape.opens):
+        if stamp < pd.Timestamp(rows[account["warmup_bars"]]["open_utc"]):
+            continue
+        mid, bid, ask = _quote(tape.frame["Open"].iloc[index], tape.entry_half_spread[index])
+        unknown = any(p["exit_phase"] == "INTRABAR_ORDER_ONLY"
+                      and pd.Timestamp(rows[p["exit_bar"]]["open_utc"]) <= stamp < pd.Timestamp(rows[p["exit_bar"]]["close_utc"])
+                      for p in positions)
+        cash = float(account["initial_cash"])
+        for transaction in transactions:
+            if pd.Timestamp(transaction["effective_at_utc"]) <= stamp:
+                cash += transaction["cash"]
+        inventory = [p for p in positions if pd.Timestamp(rows[p["entry_bar"]]["open_utc"]) < stamp
+                     and (pd.Timestamp(rows[p["exit_bar"]]["close_utc"])
+                          if p["exit_phase"] != "BAR_OPEN" else pd.Timestamp(rows[p["exit_bar"]]["open_utc"])) > stamp]
+        value = cash
+        for position in inventory:
+            sign = 1 if position["side"] == "LONG" else -1
+            quote = float(bid if sign == 1 else ask)
+            value += spec.calculate_tick_profit(position["entry_fill"], quote, position["lots"], sign)
+        marks.append({"effective_at_utc": stamp.isoformat(), "mid": float(mid), "bid": float(bid), "ask": float(ask),
+                      "half_spread": float(tape.entry_half_spread[index]),
+                      "cash_basis": "DERIVED", "cash": None if unknown else cash,
+                      "inventory": None if unknown else [{"position_id": p["position_id"], "lots": p["lots"]} for p in inventory],
+                      "equity": None if unknown else value,
+                      "state": "UNAVAILABLE_INTRABAR_EXIT_TIME" if unknown else "AVAILABLE",
+                      "mark_phase": "M5_OPEN_AFTER_EXISTING_CASH_EVENTS_BEFORE_NEW_ENTRY"})
+    return marks
+
+
 def _execute_anchor_replay(
-    *,
-    context: authority_spool.GenerationSpoolContext,
-    anchor: Mapping[str, Any],
+    *, context: authority_spool.GenerationSpoolContext, anchor: Mapping[str, Any],
     specialists: Sequence[_VerifiedSpecialist],
     native_products: Mapping[str, native_prefix.NativePrefixProduct],
     valuation_products: Mapping[str, native_prefix.NativePrefixProduct],
-    precommit_anchor: Mapping[str, Any],
-    capital_phase: str,
-    capital_window: Mapping[str, Any],
-    config: PipelineConfig,
-    deployment: _DeploymentBinding,
+    precommit_anchor: Mapping[str, Any], capital_phase: str,
+    capital_window: Mapping[str, Any], config: PipelineConfig, deployment: _DeploymentBinding,
+    account_genesis: Mapping[str, Any] | None = None,
+    cell_projection: Mapping[str, Any] | None = None,
+    spread_source_products: Mapping[str, native_prefix.NativePrefixProduct] | None = None,
+    frozen_profile_path: Path | None = None,
+    full_book_body: Mapping[str, Any] | None = None,
+    frozen_pipeline_config: config_binding.FrozenProductionPipelineConfig | None = None,
+    owner_symbol_receipt: Mapping[str, Any] | None = None,
+    original_adapter_index_descriptor: Mapping[str, Any] | None = None,
+    original_global_precommit_descriptor: Mapping[str, Any] | None = None,
 ) -> _AnchorRawReplay:
-    phase_id = _capital_phase_id(str(anchor.get("anchor_id")), capital_phase)
-    grouped: dict[str, list[_VerifiedSpecialist]] = {}
-    for specialist in specialists:
-        grouped.setdefault(
-            native_product_key(specialist.symbol, specialist.timeframe), []
-        ).append(specialist)
-    expected_valuation_keys = sorted(
-        {native_product_key(value.symbol, "M5") for value in specialists}
-    )
-    if type(native_products) is not dict or set(native_products) != set(grouped):
-        _fail("ANCHOR_NATIVE_PRODUCT_ROSTER_MISMATCH", anchor["anchor_id"])
-    if (
-        type(valuation_products) is not dict
-        or sorted(valuation_products) != expected_valuation_keys
-    ):
-        _fail("ANCHOR_M5_VALUATION_PRODUCT_ROSTER_MISMATCH", anchor["anchor_id"])
-    forward_start, forward_end_exclusive = _capital_window_datetimes(
-        capital_window, phase_id=phase_id
-    )
-    outer_end_exclusive = pd.Timestamp(
-        _date(anchor["forward_end_date"], "FORWARD_END_INVALID") + timedelta(days=1),
-        tz="UTC",
-    )
-    expected_phase_windows = precommit_anchor.get("capital_phase_windows")
-    if (
-        type(precommit_anchor) is not dict
-        or precommit_anchor.get("anchor_id") != anchor["anchor_id"]
-        or precommit_anchor.get("forward_end_exclusive_utc")
-        != _utc_seconds(
-            outer_end_exclusive.isoformat(), "FORWARD_END_EXCLUSIVE_INVALID"
-        )
-        or type(expected_phase_windows) is not dict
-        or expected_phase_windows.get(capital_phase) != dict(capital_window)
-        or type(precommit_anchor.get("execution_products")) is not list
-        or type(precommit_anchor.get("valuation_m5_products")) is not list
-        or precommit_anchor.get("execution_product_roster_sha256")
-        != _sha(precommit_anchor.get("execution_products"))
-        or precommit_anchor.get("valuation_m5_product_roster_sha256")
-        != _sha(precommit_anchor.get("valuation_m5_products"))
-        or precommit_anchor.get("valuation_products_supplied_separately") is not True
-    ):
-        _fail("FORWARD_PRECOMMIT_ANCHOR_IDENTITY_INVALID", anchor["anchor_id"])
-    execution_identities = {
-        str(value.get("role")).rsplit(":", 1)[-1]: value
-        for value in precommit_anchor["execution_products"]
-        if type(value) is dict
-    }
-    valuation_identities = {
-        str(value.get("role")).rsplit(":", 1)[-1]: value
-        for value in precommit_anchor["valuation_m5_products"]
-        if type(value) is dict
-    }
-    if (
-        set(execution_identities) != set(grouped)
-        or set(valuation_identities) != set(expected_valuation_keys)
-        or len(execution_identities) != len(precommit_anchor["execution_products"])
-        or len(valuation_identities) != len(precommit_anchor["valuation_m5_products"])
-    ):
-        _fail("FORWARD_PRECOMMIT_PRODUCT_ROSTER_INVALID", anchor["anchor_id"])
-    native_rows = sum(
-        int(value["prefix_rows"])
-        for value in (*execution_identities.values(), *valuation_identities.values())
-    )
-    native_bytes = sum(
-        int(value["prefix_bytes"])
-        for value in (*execution_identities.values(), *valuation_identities.values())
-    )
-    if native_rows > _MAX_NATIVE_ROWS_PER_ANCHOR:
-        _fail("FORWARD_NATIVE_ROW_BOUND_EXCEEDED", anchor["anchor_id"], native_rows)
-    if native_bytes > _MAX_NATIVE_BYTES_PER_ANCHOR:
-        _fail("FORWARD_NATIVE_BYTE_BOUND_EXCEEDED", anchor["anchor_id"], native_bytes)
-    resource_budget = _ResourceBudget(
-        native_rows=native_rows,
-        native_bytes=native_bytes,
-    )
-    positions: list[_PositionEvidence] = []
-    execution_spec_rows: list[dict[str, Any]] = []
-    valuation_rows: list[dict[str, Any]] = []
-    grouped_by_symbol: dict[str, list[str]] = {}
-    for key in grouped:
-        grouped_by_symbol.setdefault(key.split("|", 1)[0], []).append(key)
-    for symbol in sorted(grouped_by_symbol):
-        valuation_key = native_product_key(symbol, "M5")
-        symbol_bytes = int(valuation_identities[valuation_key]["prefix_bytes"]) + sum(
-            int(execution_identities[key]["prefix_bytes"])
-            for key in grouped_by_symbol[symbol]
-        )
-        if symbol_bytes > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
-            _fail(
-                "FORWARD_ACTIVE_SYMBOL_NATIVE_BYTE_BOUND_EXCEEDED",
-                anchor["anchor_id"],
-                symbol,
-                symbol_bytes,
-            )
-        tape, valuation_spec = _open_m5_valuation_tape(
-            context=context,
-            product=valuation_products[valuation_key],
-            expected_identity=valuation_identities[valuation_key],
-            config=config,
-            deployment=deployment,
-            forward_start=forward_start,
-            forward_end_exclusive=forward_end_exclusive,
-        )
-        valuation_rows.append(
-            {
-                "symbol": symbol,
-                "native_product_identity_sha256": _sha(tape.native_product_identity),
-                "execution_spec_receipt_sha256": tape.execution_spec_receipt[
-                    "receipt_sha256"
-                ],
-                "spread_and_cost_surface": dict(tape.spread_meta),
-                "m5_rows_opened": len(tape.frame),
-                "m5_frame_memory_bytes": int(
-                    tape.frame.memory_usage(index=True, deep=True).sum()
-                ),
-            }
-        )
-        try:
-            for key in sorted(grouped_by_symbol[symbol]):
-                expected_identity = execution_identities[key]
-                product = _reopen_bound_native_product(
-                    context=context,
-                    product=native_products[key],
-                    expected_identity=expected_identity,
-                    config=config,
-                    production_contract_required=not bool(config.research_mode),
-                )
-                spec, spec_receipt = _freeze_execution_spec(
-                    product=product, config=config, deployment=deployment
-                )
-                if (
-                    asdict(spec) != asdict(valuation_spec)
-                    or spec_receipt.get("instrument_spec_sha256")
-                    != tape.execution_spec_receipt.get("instrument_spec_sha256")
-                    or spec_receipt.get("broker_record_sha256")
-                    != tape.execution_spec_receipt.get("broker_record_sha256")
-                    or spec_receipt.get("configured_instrument_record_sha256")
-                    != tape.execution_spec_receipt.get(
-                        "configured_instrument_record_sha256"
-                    )
-                ):
-                    _fail(
-                        "EXECUTION_AND_M5_VALUATION_SPEC_MISMATCH",
-                        anchor["anchor_id"],
-                        key,
-                    )
-                execution_spec_rows.append(
-                    {
-                        "product_key": key,
-                        "native_product_identity_sha256": _sha(expected_identity),
-                        "execution_spec_receipt": spec_receipt,
-                    }
-                )
-                try:
-                    opened = native_prefix.open_verified_prefix_frame(product)
-                except Exception as exc:
-                    raise ForwardOOSReplayProductionError(
-                        "FORWARD_NATIVE_PRODUCT_FRAME_REOPEN_FAILED",
-                        (anchor["anchor_id"], key, type(exc).__name__, str(exc)),
-                    ) from exc
-                _, closes = _frame_interval(opened)
-                frame = opened.loc[closes <= forward_end_exclusive].copy(deep=True)
-                del opened
-                if frame.empty or not bool(
-                    (pd.DatetimeIndex(frame.index) < forward_end_exclusive).all()
-                ):
-                    _fail(
-                        "FORWARD_NATIVE_FRAME_EMPTY_OR_FUTURE",
-                        anchor["anchor_id"],
-                        key,
-                    )
-                active_frame_bytes = int(
-                    frame.memory_usage(index=True, deep=True).sum()
-                ) + int(tape.frame.memory_usage(index=True, deep=True).sum())
-                if active_frame_bytes > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
-                    _fail(
-                        "FORWARD_ACTIVE_SYMBOL_FRAME_MEMORY_BOUND_EXCEEDED",
-                        anchor["anchor_id"],
-                        key,
-                        active_frame_bytes,
-                    )
-                for specialist in grouped[key]:
-                    _selection_prefix_match(frame, specialist)
-                features: pd.DataFrame | None = None
-                signals: dict[str, pd.Series] | None = None
-                try:
-                    features, signals = _features_and_prefix_parity(frame, grouped[key])
-                    active_feature_bytes = int(
-                        features.memory_usage(index=True, deep=True).sum()
-                    ) + int(tape.frame.memory_usage(index=True, deep=True).sum())
-                    if active_feature_bytes > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
-                        _fail(
-                            "FORWARD_ACTIVE_SYMBOL_FEATURE_MEMORY_BOUND_EXCEEDED",
-                            anchor["anchor_id"],
-                            key,
-                            active_feature_bytes,
-                        )
-                    feature_opens, _ = _frame_interval(features)
-                    warmup = int(feature_opens.searchsorted(forward_start, side="left"))
-                    if not 1 <= warmup < len(features):
-                        _fail(
-                            "FORWARD_SCORING_WINDOW_HAS_NO_NATIVE_BARS",
-                            anchor["anchor_id"],
-                            key,
-                        )
-                    for specialist in grouped[key]:
-                        materialized = _strategy(specialist)
-                        base_backtester = Backtester(config)
-                        try:
-                            base = base_backtester.run(
-                                features,
-                                signals[specialist.cell_id],
-                                specialist.symbol,
-                                materialized,
-                                spec=spec,
-                                timeframe=specialist.timeframe,
-                                warmup_bars=warmup,
-                            )
-                            stressed = base_backtester.replay_frozen_path_cost_stress(
-                                features,
-                                signals[specialist.cell_id],
-                                specialist.symbol,
-                                materialized,
-                                base,
-                                stress_mode=str(
-                                    config.oos_evidence_execution_stress_mode
-                                )
-                                .strip()
-                                .lower(),
-                                spec=spec,
-                                timeframe=specialist.timeframe,
-                                warmup_bars=warmup,
-                            )
-                        except Exception as exc:
-                            raise ForwardOOSReplayProductionError(
-                                "FORWARD_BACKTEST_OR_STRESS_FAILED",
-                                (specialist.cell_id, type(exc).__name__, str(exc)),
-                            ) from exc
-                        produced = _position_evidence(
-                            specialist=specialist,
-                            strategy=materialized,
-                            features=features,
-                            spec=spec,
-                            config=config,
-                            base_result=base,
-                            stress_result=stressed,
-                            valuation_tape=tape,
-                            resource_budget=resource_budget,
-                            capital_phase=capital_phase,
-                        )
-                        for position in produced:
-                            entry = _timestamp(
-                                position.candidate.entry_time,
-                                "FORWARD_ENTRY_TIME_INVALID",
-                            )
-                            exit_time = _timestamp(
-                                position.candidate.legs[-1].exit_time,
-                                "FORWARD_EXIT_TIME_INVALID",
-                            )
-                            if (
-                                entry < forward_start
-                                or exit_time < entry
-                                or exit_time >= forward_end_exclusive
-                            ):
-                                _fail(
-                                    "FORWARD_POSITION_OUTSIDE_ANCHOR",
-                                    position.position_id,
-                                )
-                        positions.extend(produced)
-                finally:
-                    FeatureComputer.clear_cache()
-                    features = None
-                    signals = None
-                    del frame
-        finally:
-            FeatureComputer.clear_cache()
-            del tape
-    identifiers = [position.candidate.candidate_id for position in positions]
-    if len(set(identifiers)) != len(identifiers):
-        _fail("FORWARD_CANDIDATE_ID_REUSED", anchor["anchor_id"])
-    accepted: dict[str, Decimal] = {}
-    if positions:
-        try:
-            policy = portfolio.portfolio_policy_from_config_payload(
-                deployment.config_body, float(config.initial_capital)
-            )
-            policy = replace(
-                policy,
-                allowed_promotion_statuses=("HISTORICAL_OOS_REPLAY",),
-            )
-            simulation = portfolio.SynchronizedPortfolioSimulator(policy).run(
-                [position.candidate for position in positions]
-            )
-        except Exception as exc:
-            raise ForwardOOSReplayProductionError(
-                "SYNCHRONIZED_PORTFOLIO_REPLAY_FAILED",
-                (anchor["anchor_id"], type(exc).__name__, str(exc)),
-            ) from exc
-        expected_roster_receipt = portfolio.portfolio_replay_candidate_roster_receipt(
-            [position.candidate for position in positions]
-        )
-        input_receipt = simulation.get("input_receipt")
-        if (
-            type(input_receipt) is not dict
-            or any(
-                input_receipt.get(name) != value
-                for name, value in expected_roster_receipt.items()
-            )
-            or simulation.get("policy") != asdict(policy)
-        ):
-            _fail("SYNCHRONIZED_PORTFOLIO_RECEIPT_MISMATCH", anchor["anchor_id"])
-        closed = simulation.get("closed_positions")
-        blocked = simulation.get("blocked_positions")
-        if type(closed) is not list or type(blocked) is not list:
-            _fail("SYNCHRONIZED_PORTFOLIO_OUTPUT_INVALID", anchor["anchor_id"])
-        for row in closed:
-            candidate_id = row.get("candidate_id") if type(row) is dict else None
-            volume = row.get("volume") if type(row) is dict else None
-            if candidate_id not in identifiers or candidate_id in accepted:
-                _fail("SYNCHRONIZED_ACCEPTED_POSITION_INVALID", anchor["anchor_id"])
-            accepted[candidate_id] = _decimal(
-                volume, "SYNCHRONIZED_ACCEPTED_VOLUME_INVALID", positive=True
-            )
-        blocked_ids = {row.get("candidate_id") for row in blocked if type(row) is dict}
-        if (
-            set(identifiers) != set(accepted) | blocked_ids
-            or set(accepted) & blocked_ids
-        ):
-            _fail("SYNCHRONIZED_PORTFOLIO_COVERAGE_INVALID", anchor["anchor_id"])
-        candidate_roster_receipt: Mapping[str, Any] | None = expected_roster_receipt
-        simulation_input_receipt: Mapping[str, Any] | None = input_receipt
-    else:
-        candidate_roster_receipt = None
-        simulation_input_receipt = None
-    return _AnchorRawReplay(
-        anchor=dict(anchor),
-        specialists=tuple(specialists),
-        positions=tuple(positions),
-        accepted_volume_by_position_id={
-            position.position_id: accepted[position.candidate.candidate_id]
-            for position in positions
-            if position.candidate.candidate_id in accepted
-        },
-        production_metadata={
-            "candidate_roster_receipt": candidate_roster_receipt,
-            "simulation_input_receipt": simulation_input_receipt,
-            "capital_phase_id": phase_id,
-            "capital_phase": capital_phase,
+    """Execute one fixed owner in independently funded, new R&D tier accounts.
+
+    The retired public entry points remain closed. These internals cannot
+    continue an existing account or qualify a strategy/cell.
+    """
+    if (type(account_genesis) is not dict or account_genesis != {
+            "mode": NEW_SIMULATED_FLAT_GENESIS, "initial_cash": float(config.initial_capital),
+            "initial_inventory": [], "owner_changes": []}):
+        _fail("FROZEN_TIER_ACCOUNT_GENESIS_OR_CARRY_UNAVAILABLE")
+    if (type(cell_projection) is not dict or set(cell_projection) != {"cell_id", "process_sha256"}
+            or len(specialists) != 1):
+        _fail("FROZEN_TIER_FIXED_SINGLE_CELL_PROJECTION_REQUIRED")
+    owner = specialists[0]
+    if (cell_projection != {"cell_id": owner.cell_id, "process_sha256": owner.process_sha256}
+            or owner.anchor_id != anchor.get("anchor_id")):
+        _fail("FROZEN_TIER_OWNER_PROJECTION_MISMATCH")
+    if config.backtest_spread_mode != "conservative_max" or not config.use_spread:
+        _fail("FROZEN_TIER_ACCOUNT_COST_POLICY_REQUIRED")
+    if frozen_profile_path is None or type(spread_source_products) is not dict:
+        _fail("FROZEN_TIER_PROFILE_SOURCE_UNAVAILABLE")
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("FROZEN_TIER_ORIGINAL_PIPELINE_CONFIG_UNAVAILABLE")
+    try:
+        bound_config = frozen_pipeline_config.materialize(context)
+    except config_binding.ProductionConfigBindingError as exc:
+        raise ForwardOOSReplayProductionError("FROZEN_TIER_ORIGINAL_PIPELINE_CONFIG_INVALID", (str(exc),)) from exc
+    if _pipeline_config_identity(bound_config) != _pipeline_config_identity(config):
+        _fail("FROZEN_TIER_PIPELINE_CONFIG_SUBSTITUTED")
+    _assert_deployment_config_unchanged(deployment, bound_config)
+    _reopen_original_global_precommit(context=context, descriptor=original_global_precommit_descriptor,
+                                      precommit_anchor=precommit_anchor, deployment=deployment)
+    config = bound_config
+    # Keep the full original Book/precommit; projection never rewrites either.
+    descriptor = precommit_anchor.get("full_book_descriptor")
+    if type(descriptor) is not dict or precommit_anchor.get("full_book_sha256") != descriptor.get("sha256"):
+        _fail("FROZEN_TIER_ORIGINAL_BOOK_BINDING_UNAVAILABLE")
+    original_book = _read_descriptor_json(context, descriptor, code="FROZEN_TIER_ORIGINAL_BOOK")
+    original_book = _owned_book(original_book, original_book.get("receipt_sha256"))
+    if full_book_body is not None and original_book != full_book_body:
+        _fail("FROZEN_TIER_ORIGINAL_BOOK_SUBSTITUTED")
+    book_cells = original_book.get("cells")
+    matches = [value for value in book_cells if type(value) is dict and value.get("cell_id") == owner.cell_id] if type(book_cells) is list else []
+    if len(matches) != 1 or matches[0].get("local_process_sha256") != owner.process_sha256:
+        _fail("FROZEN_TIER_ORIGINAL_BOOK_OWNER_MISMATCH")
+    owner_symbol_receipt = owner_symbol_receipt or owner.origin_symbol_receipt
+    original_adapter_index_descriptor = original_adapter_index_descriptor or owner.origin_adapter_index_descriptor
+    original_owner = _reopen_owner_capture(context=context, anchor=anchor, book_body=original_book, cell_id=owner.cell_id,
+        symbol_receipt=owner_symbol_receipt, adapter_index_descriptor=original_adapter_index_descriptor)
+    if (_owner_provenance(original_owner) != _owner_provenance(owner)
+            or original_owner.detector_record != owner.detector_record
+            or original_owner.detector_parameters != owner.detector_parameters
+            or original_owner.process_sha256 != owner.process_sha256):
+        _fail("FROZEN_TIER_ORIGINAL_OWNER_SUBSTITUTED")
+    owner = original_owner
+    start, end = _capital_window_datetimes(capital_window, phase_id=_capital_phase_id(owner.anchor_id, capital_phase))
+    if (precommit_anchor.get("anchor_id") != owner.anchor_id
+            or _original_capital_window(anchor, precommit_anchor, capital_phase) != capital_window):
+        _fail("FORWARD_PRECOMMIT_ANCHOR_IDENTITY_INVALID")
+    def identities(field, supplied):
+        values = precommit_anchor.get(field)
+        roster_key = {"execution_products": "execution_product_roster_sha256",
+                      "valuation_m5_products": "valuation_m5_product_roster_sha256",
+                      "spread_source_products": "spread_source_product_roster_sha256"}[field]
+        if type(values) is not list or precommit_anchor.get(roster_key) != _sha(values):
+            _fail("FORWARD_PRECOMMIT_PRODUCT_ROSTER_INVALID", field)
+        result = {str(value.get("role")).rsplit(":", 1)[-1]: value for value in values if type(value) is dict}
+        if type(supplied) is not dict or len(result) != len(values) or set(result) != set(supplied):
+            _fail("ANCHOR_NATIVE_PRODUCT_ROSTER_MISMATCH", field)
+        return result
+    execution_ids = identities("execution_products", native_products)
+    valuation_ids = identities("valuation_m5_products", valuation_products)
+    source_ids = identities("spread_source_products", spread_source_products)
+    all_identities = (*execution_ids.values(), *valuation_ids.values(), *source_ids.values())
+    if (sum(int(value["prefix_rows"]) for value in all_identities) > _MAX_NATIVE_ROWS_PER_ANCHOR
+            or sum(int(value["prefix_bytes"]) for value in all_identities) > _MAX_NATIVE_BYTES_PER_ANCHOR):
+        _fail("FROZEN_TIER_NATIVE_RESOURCE_BOUND_EXCEEDED")
+    key = native_product_key(owner.symbol, owner.timeframe)
+    valuation_key = native_product_key(owner.symbol, "M5")
+    if key not in execution_ids or valuation_key not in valuation_ids:
+        _fail("FROZEN_TIER_REQUIRED_NATIVE_PRODUCT_UNAVAILABLE")
+    product = _reopen_bound_native_product(context=context, product=native_products[key], expected_identity=execution_ids[key],
+                                         config=config, production_contract_required=not config.research_mode)
+    spec, spec_receipt = _freeze_execution_spec(product=product, config=config, deployment=deployment)
+    try:
+        profile = spread_profile.load_spread_profile(frozen_profile_path)
+        tiers = {level: profile.resolve(owner.symbol, owner.timeframe, level, point=spec.point,
+                                       source_identity_sha256=execution_ids[key]["source_identity_sha256"])
+                 for level in ("P75", "P95")}
+    except (spread_profile.SpreadProfileError, OSError, ValueError) as exc:
+        raise ForwardOOSReplayProductionError("FROZEN_TIER_PROFILE_UNAVAILABLE", (str(exc),)) from exc
+    descriptor_tier = tiers["P75"].descriptor()
+    source_key = native_product_key(owner.symbol, tiers["P75"].source_timeframe)
+    if source_key not in source_ids:
+        _fail("FROZEN_TIER_CAPTURED_FINE_TIMEFRAME_UNAVAILABLE", source_key)
+    source_identity = source_ids[source_key]
+    binding = descriptor_tier["source_binding"]
+    if (source_identity["source_bars_sha256"] != binding["bars_sha256"]
+            or source_identity["source_audit_sidecar_sha256"] != binding["sidecar_sha256"]
+            or source_identity["source_provenance_sha256"] != binding["provenance_sha256"]
+            or execution_ids[key]["source_bars_sha256"] != binding["target_bars_sha256"]
+            or source_identity["activation_id"] != descriptor_tier["activation"]["id"]
+            or source_identity["activation_manifest_sha256"] != descriptor_tier["activation"]["manifest_sha256"]
+            or source_identity["source_identity_sha256"] != execution_ids[key]["source_identity_sha256"]):
+        _fail("FROZEN_TIER_PROFILE_SOURCE_BINDING_MISMATCH")
+    fine_product = _reopen_bound_native_product(context=context, product=spread_source_products[source_key],
+        expected_identity=source_identity, config=config, production_contract_required=not config.research_mode)
+    fine_spec, fine_receipt = _freeze_execution_spec(product=fine_product, config=config, deployment=deployment)
+    if asdict(fine_spec) != asdict(spec):
+        _fail("FROZEN_TIER_PROFILE_SOURCE_TERMS_MISMATCH")
+    opened = native_prefix.open_verified_prefix_frame(product)
+    _, closes = _frame_interval(opened)
+    frame = opened.loc[closes <= end].copy(deep=True)
+    _selection_prefix_match(frame, owner)
+    features, signals = _features_and_prefix_parity(frame, [owner])
+    if int(features.memory_usage(index=True, deep=True).sum()) > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
+        _fail("FORWARD_ACTIVE_SYMBOL_FEATURE_MEMORY_BOUND_EXCEEDED")
+    opens, _ = _frame_interval(features)
+    warmup = int(opens.searchsorted(start, side="left"))
+    if not 1 <= warmup < len(features):
+        _fail("FORWARD_SCORING_WINDOW_HAS_NO_NATIVE_BARS")
+    fine_frame = native_prefix.open_verified_prefix_frame(fine_product)
+    observations, matched_closes = spread_profile.align_prior_completed_spreads(
+        features.index, fine_frame, tiers["P75"].source_timeframe, include_matched_closes=True)
+    strategy = _strategy(owner)
+    accounts = {}
+    for level, tier in tiers.items():
+        tape, valuation_spec = _open_m5_valuation_tape(context=context, product=valuation_products[valuation_key],
+            expected_identity=valuation_ids[valuation_key], config=config, deployment=deployment,
+            forward_start=start, forward_end_exclusive=end, spread_tier=tier)
+        if asdict(valuation_spec) != asdict(spec):
+            _fail("EXECUTION_AND_M5_VALUATION_SPEC_MISMATCH")
+        result = Backtester(config).run(features, signals[owner.cell_id], owner.symbol, strategy, spec=spec,
+            timeframe=owner.timeframe, warmup_bars=warmup, spread_tier=tier, entry_spread_observations=observations)
+        accounts[level] = _compact_tier_account(_position_evidence(
+            specialist=owner, strategy=strategy, features=features,
+            spec=spec, config=config, result=result, tier=tier, warmup_bars=warmup, valuation_tape=tape))
+    profile_descriptor = _persist_frozen_profile(context, frozen_profile_path, profile.sha256)
+    body = {"schema_version": FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+            "generation_id": context.generation_id, "anchor": dict(anchor), "capital_phase": capital_phase,
             "capital_window": dict(capital_window),
-            "complete_pre_policy_candidate_roster": True,
-            "execution_spec_receipts": execution_spec_rows,
-            "valuation_tapes": valuation_rows,
-            "resource_usage": {
-                "native_rows_bound_before_open": resource_budget.native_rows,
-                "native_bytes_bound_before_open": resource_budget.native_bytes,
-                "candidate_positions_reserved_before_materialization": (
-                    resource_budget.candidate_positions
-                ),
-                "candidate_marks_reserved_before_materialization": (
-                    resource_budget.candidate_marks
-                ),
-                "candidate_mark_estimated_bytes": (
-                    resource_budget.candidate_marks * _ESTIMATED_CANDIDATE_MARK_BYTES
-                ),
-                "candidate_marks_thinned_or_sampled": False,
-            },
-            "valuation_contract": VALUATION_CONTRACT,
-            "valuation_event_order": ("close_existing_then_mark_existing_then_admit"),
-            "margin_model": MARGIN_MODEL,
-            "margin_formula": (
-                "abs(authenticated_entry_fill)*tick_value/tick_size*volume"
-            ),
-            "stop_risk_formula": (
-                "abs(authenticated_entry_fill-initial_stop_price)"
-                "*tick_value/tick_size"
-            ),
-            "position_source_schema": POSITION_SOURCE_SCHEMA,
-            "backtester_position_event_schema": (
-                BACKTEST_POSITION_EVENT_SCHEMA_VERSION
-            ),
-            "position_events_v2_raw_rebuilt_and_exact_compared": True,
-            "partial_exit_policy": (
-                "FAIL_TYPED_WHILE_RAW_CAUSAL_LEDGER_V1_HAS_NO_PARTIAL_QUANTITY"
-            ),
-        },
-    )
+            "genesis": dict(account_genesis), "full_book_descriptor": dict(descriptor),
+            "original_precommit_anchor": dict(precommit_anchor), "cell_projection": dict(cell_projection),
+            "owner_provenance": _owner_provenance(owner),
+            "owner_source": {"symbol_receipt": dict(owner_symbol_receipt),
+                             "adapter_index_descriptor": dict(original_adapter_index_descriptor)},
+            "original_global_precommit_descriptor": dict(original_global_precommit_descriptor),
+            "pipeline_config_binding": {"active_config_path": str(frozen_pipeline_config.active_config_path),
+                "config_sha256": frozen_pipeline_config.config_sha256,
+                "effective_config_sha256": frozen_pipeline_config.effective_config_sha256},
+            "deployment_source_descriptors": _persist_deployment_sources(context, deployment),
+            "execution_source": execution_ids[key], "execution_spec_receipt": spec_receipt,
+            "frozen_profile_descriptor": profile_descriptor,
+            "spread_source": source_identity, "spread_source_execution_spec_receipt": fine_receipt,
+            "accounts": accounts, "qualification_authority": False,
+            "precommit_binding_scope": "REOPENED_INPUT_DESCRIPTOR_IDENTITY_NOT_ISSUED_RELEASE_AUTHORITY",
+            "release_authority_status": "UNAVAILABLE_AUTHORITY_MIGRATION_NOT_IMPLEMENTED",
+            "coverage_contract": "ACTUAL_CLOSE_AND_AVAILABLE_M5_MARKS_NOT_COMPLETE_DAILY_VALUATION",
+            "selection_policy": "P75_REQUIRED_P95_PREFERRED_AMONG_P75_PASSES"}
+    return _AnchorRawReplay(dict(anchor), (owner,), body, {"schema_version": FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+        "qualification_authority": False, "source_observations_internally_derived": True})
 
 
-def _event_decisions(
-    *,
-    event_id: str,
-    position_id: str,
-    cell_id: str,
-    regime: str,
-    decided_at_utc: str,
-    action: str,
-) -> dict[str, Any]:
-    return {
-        "event_id": event_id,
-        "position_id": position_id,
-        "cell_id": cell_id,
-        "controller": {
-            "schema_version": causal_producer.CONTROLLER_EVENT_SCHEMA,
-            "event_id": event_id,
-            "cell_id": cell_id,
-            "regime": regime,
-            "decided_at_utc": decided_at_utc,
-        },
-        "arbitration": {
-            "schema_version": causal_producer.ARBITRATION_EVENT_SCHEMA,
-            "event_id": event_id,
-            "cell_id": cell_id,
-            "decision": "ADMIT" if action == "OPEN" else "EXIT",
-            "decided_at_utc": decided_at_utc,
-        },
-        "order": {
-            "schema_version": causal_producer.ORDER_EVENT_SCHEMA,
-            "event_id": event_id,
-            "position_id": position_id,
-            "action": action,
-            "decided_at_utc": decided_at_utc,
-        },
-    }
+def _persist_frozen_profile(context, path, expected_sha256):
+    raw = Path(path).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        _fail("FROZEN_TIER_PROFILE_CHANGED_AFTER_RESOLVE")
+    return _descriptor(authority_spool.write_opaque_artifact(context, (raw,), format="json-profile"),
+                       "FROZEN_TIER_PROFILE_DESCRIPTOR_INVALID")
+
+
+def _persist_deployment_sources(context, deployment):
+    result = {}
+    for role, path, expected in (("config", deployment.config_path, deployment.config_sha256),
+                                 ("broker", deployment.broker_path, deployment.broker_sha256)):
+        raw = Path(path).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != expected:
+            _fail("FROZEN_TIER_PRECOMMITTED_DEPLOYMENT_SOURCE_CHANGED", role)
+        result[role] = _descriptor(authority_spool.write_opaque_artifact(context, (raw,), format="json-" + role),
+                                  "FROZEN_TIER_DEPLOYMENT_SOURCE_DESCRIPTOR_INVALID")
+    return result
+
+
+_DECLARED_CELL_MAX_RAW_BYTES = 48 * 1024 * 1024
+_DECLARED_CELL_FIELDS = frozenset({
+    "schema_version", "generation_id", "generation_context_sha256", "native_universe_sha256",
+    "config_sha256", "declared_precommit_sha256", "search_process_receipt_sha256", "cell",
+    "pipeline_config_binding", "declared_commit_artifacts", "slot_summaries", "slot_schedule",
+    "progress_status", "reason_code", "measurement", "genesis", "owner_records",
+    "execution_source", "spread_source", "execution_spec_receipt",
+    "spread_source_execution_spec_receipt", "frozen_profile_descriptor",
+    "deployment_source_descriptors", "original_config_identity", "measured_config_identity",
+    "account", "qualification_authority", "capital_authority", "live_authority", "order_authority",
+})
+_DECLARED_CELL_MARKET_FIELDS = (
+    "execution_source", "spread_source", "execution_spec_receipt",
+    "spread_source_execution_spec_receipt", "frozen_profile_descriptor",
+    "deployment_source_descriptors", "original_config_identity", "measured_config_identity",
+)
+
+
+def _declared_cell_measured_config(config):
+    if (type(config) is not PipelineConfig or config.initial_capital != 10000.0
+            or config.discovery_risk_per_trade_pct != 1.0
+            or config.backtest_spread_mode != "conservative_max" or config.use_spread is not True):
+        _fail("DECLARED_CELL_ORIGINAL_CONFIG_INVALID")
+    measured = replace(config, discovery_risk_per_trade_pct=0.25)
+    for name in ("_deployment_config_path", "_funded_live_execution"):
+        if hasattr(config, name):
+            setattr(measured, name, getattr(config, name))
+    return measured
+
+
+def _run_declared_cell_account(*, config, features, symbol, timeframe, spec, warmup_bars,
+                               entry_schedule, entry_spread_observations):
+    """One account, including positions and debt carried across every refit."""
+    return Backtester(config).run(features, None, symbol, None, spec=spec,
+        timeframe=timeframe, warmup_bars=warmup_bars, entry_schedule=entry_schedule,
+        entry_spread_observations=entry_spread_observations, terminal_policy="MARK_OPEN")
+
+
+def _declared_cell_measurement(parent):
+    slots = parent["slot_roster"]["slots"]
+    if type(slots) is not list or len(slots) != 13:
+        _fail("DECLARED_CELL_H364_GEOMETRY_INVALID")
+    previous = None
+    for ordinal, slot in enumerate(slots, 1):
+        start = _timestamp(slot["activation_utc"], "DECLARED_CELL_SLOT_TIME_INVALID")
+        end = _timestamp(slot["end_exclusive_utc"], "DECLARED_CELL_SLOT_TIME_INVALID")
+        if (slot["ordinal"] != ordinal or end - start != pd.Timedelta(days=28)
+                or (previous is not None and start != previous)):
+            _fail("DECLARED_CELL_H364_GEOMETRY_INVALID")
+        previous = end
+    return {"calendar_days": 364, "refit_cycles": 13, "cycle_days": 28,
+        "risk_per_trade_pct": 0.25, "terminal_policy": "MARK_OPEN",
+        "start_utc": slots[0]["activation_utc"],
+        "end_exclusive_utc": slots[-1]["end_exclusive_utc"]}
+
+
+def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline_config):
+    import pm_historical_search_producer as producer
+
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
+    try:
+        parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        config = frozen_pipeline_config.materialize(context)
+        _declared_cell_measured_config(config)
+        _declared_cell_measurement(parent)
+        cell = parent["cells"][0]
+        progress = producer.reopen_declared_cell_owner_progress(context, precommit=precommit,
+            process=process, cell_id=cell["cell_id"], frozen_pipeline_config=frozen_pipeline_config)
+    except ForwardOOSReplayProductionError:
+        raise
+    except Exception as exc:
+        raise ForwardOOSReplayProductionError("DECLARED_CELL_OWNER_PROGRESS_INVALID",
+            (type(exc).__name__, getattr(exc, "code", ""))) from exc
+    if len(progress.slot_commit_artifacts) != len(progress.slot_summaries):
+        _fail("DECLARED_CELL_COMMIT_ROSTER_INVALID")
+    commits, records, schedule = [], [], []
+    for summary, entry in zip(progress.slot_summaries, progress.slot_commit_artifacts, strict=True):
+        commit = _read_descriptor_json(context, entry["descriptor"], code="DECLARED_CELL_COMMIT")
+        if (entry["descriptor"]["sha256"] != summary["commit_sha256"]
+                or commit["cell_id"] != cell["cell_id"] or commit["slot_id"] != summary["slot_id"]
+                or commit["ordinal"] != summary["ordinal"]
+                or commit["completion"]["status"] != summary["status"]):
+            _fail("DECLARED_CELL_COMMIT_BINDING_MISMATCH")
+        completion = commit["completion"]
+        if completion["status"] == "OWNER":
+            owner = completion["owner"]
+            cross = _read_descriptor_json(context, completion["horizon_winner_cross_binding"],
+                code="DECLARED_CELL_OWNER_CROSS_BINDING")
+            selected = owner["selected_attempt"]
+            matches = [row for row in cross["mapping"]
+                if row.get("winner_process_candidate_id") == selected["process_candidate_id"]
+                and row.get("process_sha256") == selected["process_sha256"]]
+            if len(matches) != 1 or type(matches[0].get("source_count_receipt")) is not dict:
+                _fail("DECLARED_CELL_OWNER_SOURCE_COUNT_INVALID")
+            count = matches[0]["source_count_receipt"]
+            if count.get("receipt_sha256") != _sha({k: v for k, v in count.items() if k != "receipt_sha256"}):
+                _fail("DECLARED_CELL_OWNER_SOURCE_COUNT_INVALID")
+            records.append({"owner": owner, "source_count_receipt": count})
+        commits.append(commit)
+    by_slot = {commit["slot_id"]: commit["completion"] for commit in commits}
+    for slot in parent["slot_roster"]["slots"]:
+        completion = by_slot.get(slot["slot_id"])
+        schedule.append({"slot_id": slot["slot_id"], "ordinal": slot["ordinal"],
+            "start_utc": slot["activation_utc"], "end_exclusive_utc": slot["end_exclusive_utc"],
+            "status": "MISSING" if completion is None else completion["status"],
+            "owner_id": completion["owner"]["owner_id"]
+                if completion is not None and completion["status"] == "OWNER" else None})
+    status = "STOP" if progress.terminal_stop else "INCOMPLETE" if (
+        progress.first_uncommitted_slot is not None or len(commits) != 13
+        or any(row["status"] == "MISSING" for row in schedule)) else "COMPLETE"
+    if status == "COMPLETE" and any(row["status"] not in ("OWNER", "NO_TRADE") for row in schedule):
+        _fail("DECLARED_CELL_COMPLETED_SCHEDULE_INVALID")
+    return {"parent": parent, "config": config, "progress": progress, "commits": commits,
+        "owner_records": records, "slot_schedule": schedule, "progress_status": status,
+        "reason_code": None if status == "COMPLETE" else "DECLARED_CELL_OWNER_PREFIX_" + status}
+
+
+def _declared_cell_transport_symbol(body):
+    identity = {"schema_version": DECLARED_CELL_RAW_ACCOUNT_SCHEMA,
+        "precommit_sha256": body["declared_precommit_sha256"], "cell_id": body["cell"]["cell_id"],
+        "commit_sha256s": [row["commit_sha256"] for row in body["slot_summaries"]],
+        "progress_status": body["progress_status"]}
+    return "DECLARED_CELL_ACCOUNT:" + _sha(identity)
+
+
+@dataclass(frozen=True, slots=True)
+class _DeclaredCellSpecialist:
+    anchor_id: str
+    cell_id: str
+    symbol: str
+    timeframe: str
+    regime: str
+    strategy_id: str
+    strategy_class: str
+    strategy_module: str
+    parameters: Mapping[str, Any]
+    source_count_receipt: Mapping[str, Any]
+    detector_parameters: Mapping[str, Any]
+    detector_parameters_sha256: str
+    detector_record: Mapping[str, Any]
+
+
+def _declared_cell_specialist(record, cell):
+    owner, count = record["owner"], record["source_count_receipt"]
+    process = owner["selected_artifacts"]["winner_process"]
+    detector = owner["regime_detector_record"]
+    parameters = json.loads(detector["parameters_canonical_json"])
+    if (process.get("strategy_id") != owner["selected_attempt"]["strategy_id"]
+            or _sha(process) != owner["selected_attempt"]["process_sha256"]
+            or detector.get("parameters_sha256") != _sha(parameters)
+            or owner["cell_id"] != cell["cell_id"]
+            or any(count.get(k) != cell[k] for k in ("symbol", "timeframe", "regime"))):
+        _fail("DECLARED_CELL_OWNER_MATERIALIZATION_INVALID")
+    return _DeclaredCellSpecialist(owner["slot_id"], cell["cell_id"], cell["symbol"],
+        cell["timeframe"], cell["regime"], process["strategy_id"], process["strategy_class"],
+        process["strategy_module"], owner["selected_attempt"]["encoded_parameters"], count,
+        parameters, detector["parameters_sha256"], detector)
+
+
+def _declared_cell_native_frames(*, inputs, execution_frame, fine_frame, profile, spec,
+                                 execution_identity, spread_identity):
+    cell, measurement = inputs["parent"]["cells"][0], _declared_cell_measurement(inputs["parent"])
+    start = _timestamp(measurement["start_utc"], "DECLARED_CELL_WINDOW_INVALID")
+    end = _timestamp(measurement["end_exclusive_utc"], "DECLARED_CELL_WINDOW_INVALID")
+    _, closes = _frame_interval(execution_frame)
+    retained_closes = closes[closes <= end]
+    if len(retained_closes) == 0 or retained_closes[-1] != end:
+        _fail("DECLARED_CELL_TERMINAL_BOUNDARY_UNAVAILABLE")
+    frame = execution_frame.loc[closes <= end].copy(deep=True)
+    opens, _ = _frame_interval(frame)
+    warmup = int(opens.searchsorted(start, side="left"))
+    if not 1 <= warmup < len(frame):
+        _fail("DECLARED_CELL_SCORING_WINDOW_EMPTY")
+    tiers = {level: profile.resolve(cell["symbol"], cell["timeframe"], level, point=spec.point,
+        source_identity_sha256=execution_identity["source_identity_sha256"]) for level in ("P75", "P95")}
+    descriptor = tiers["P75"].descriptor()
+    binding = descriptor["source_binding"]
+    if (spread_identity["timeframe"] != tiers["P75"].source_timeframe
+            or spread_identity["source_bars_sha256"] != binding["bars_sha256"]
+            or spread_identity["source_audit_sidecar_sha256"] != binding["sidecar_sha256"]
+            or spread_identity["source_provenance_sha256"] != binding["provenance_sha256"]
+            or execution_identity["source_bars_sha256"] != binding["target_bars_sha256"]
+            or spread_identity["activation_id"] != descriptor["activation"]["id"]
+            or spread_identity["activation_manifest_sha256"] != descriptor["activation"]["manifest_sha256"]
+            or spread_identity["source_identity_sha256"] != execution_identity["source_identity_sha256"]):
+        _fail("DECLARED_CELL_PROFILE_SOURCE_BINDING_MISMATCH")
+    owners = []
+    for record in inputs["owner_records"]:
+        owner = record["owner"]
+        specialist = _declared_cell_specialist(record, cell)
+        _selection_prefix_match(frame, specialist)
+        own_features, own_signals = _features_and_prefix_parity(frame, [specialist])
+        tier = profile.from_descriptor(owner["selected_tier_contract"]["frozen_spread_tier"], symbol=cell["symbol"],
+            timeframe=cell["timeframe"], point=spec.point,
+            source_identity_sha256=execution_identity["source_identity_sha256"])
+        if tier.tier != owner["selected_tier"]:
+            _fail("DECLARED_CELL_OWNER_TIER_BINDING_MISMATCH")
+        owners.append(ContinuousEntryOwner(owner["owner_id"], _strategy(specialist),
+            own_features, own_signals[cell["cell_id"]], tier))
+    features = owners[0].features if owners else frame
+    feature_bytes = sum(int(owner.features.memory_usage(index=True, deep=True).sum()) for owner in owners)
+    if max(feature_bytes, int(features.memory_usage(index=True, deep=True).sum())) > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
+        _fail("FORWARD_ACTIVE_SYMBOL_FEATURE_MEMORY_BOUND_EXCEEDED")
+    observations, matched_closes = spread_profile.align_prior_completed_spreads(
+        features.index, fine_frame, tiers["P75"].source_timeframe, include_matched_closes=True)
+    schedule = ContinuousEntrySchedule(tuple(owners), tuple(ContinuousEntrySlot(
+        row["slot_id"], _timestamp(row["start_utc"], "DECLARED_CELL_SLOT_TIME_INVALID"),
+        _timestamp(row["end_exclusive_utc"], "DECLARED_CELL_SLOT_TIME_INVALID"), row["owner_id"])
+        for row in inputs["slot_schedule"]))
+    return features, tuple(owners), schedule, observations, matched_closes, warmup
+
+
+def _declared_cell_financing(result, *, frame, spec, config, timeframe):
+    prices = np.full(len(frame), np.nan)
+    for trade in result["trades"]:
+        prices[int(trade["entry_bar"])] = trade["entry_price"]
+    position = result["terminal"]["open_position"]
+    if position is not None:
+        prices[int(position["entry_bar"])] = position["entry_price"]
+    pre, close, long_rates, short_rates, enabled, contract = Backtester(config)._build_causal_swap_inputs(
+        frame, spec, prices, timeframe=timeframe)
+    if (_raw_json(contract) != result["swap_accrual_contract"]
+            or (config.swap_model_enabled and not enabled)):
+        _fail("DECLARED_CELL_FINANCING_BINDING_MISMATCH")
+    return {"pre_open_units": _raw_json(pre), "close_units": _raw_json(close),
+        "long_per_lot": _raw_json(long_rates), "short_per_lot": _raw_json(short_rates),
+        "enabled": bool(enabled), "contract": _raw_json(contract)}
+
+
+def _declared_cell_owner_input_bindings(owners):
+    return [{"owner_id": owner.owner_id, "features_sha256": _frame_sha256(owner.features),
+        "signals_sha256": hashlib.sha256(pd.util.hash_pandas_object(
+            owner.signals, index=True).values.tobytes()).hexdigest()} for owner in owners]
+
+
+def _declared_account_payload(*, result, frame, owner_inputs, spec, config, observations,
+                              matched_closes, timeframe, warmup_bars):
+    result = _raw_json(result)
+    return {"engine_result": result, "source_frame_sha256": _frame_sha256(frame),
+        "warmup_bars": warmup_bars, "owner_input_bindings": _declared_cell_owner_input_bindings(owner_inputs),
+        "entry_spread_observations": _spread_source_observations(observations, matched_closes),
+        "financing_model": _declared_cell_financing(result, frame=frame, spec=spec,
+            config=config, timeframe=timeframe)}
+
+
+def _declared_cell_close(actual, expected, code):
+    if (type(actual) not in (int, float) or not math.isfinite(float(actual))
+            or abs(float(actual) - float(expected)) > max(1e-8, 64 * math.ulp(max(abs(float(expected)), 1.0)))):
+        _fail(code)
+
+
+def _declared_cell_stop_prices(owner, *, entry_bar, entry_price, direction, symbol, timeframe, spec):
+    strategy, features, signal_bar = owner.strategy, owner.features, entry_bar - 1
+    try:
+        if callable(getattr(strategy, "build_trade_intent", None)):
+            regime_column = "REGIME_LIVE" if "REGIME_LIVE" in features else "REGIME" if "REGIME" in features else None
+            intent = strategy.build_trade_intent(features, symbol=symbol, timeframe=timeframe,
+                regime="" if regime_column is None else str(features[regime_column].iloc[signal_bar]),
+                signal=direction, spec=spec, bar_index=signal_bar, apply_regime_tp_multiplier=False)
+            stop_pips, target_pips = float(intent.stop_loss_pips), float(intent.take_profit_pips)
+        else:
+            stop_pips, target_pips = strategy.calculate_stops(features, direction, symbol,
+                spec=spec, bar_index=signal_bar)
+    except TypeError:
+        stop_pips, target_pips = strategy.calculate_stops(features.iloc[:signal_bar + 1].copy(), direction, symbol)
+    if (not math.isfinite(stop_pips) or not math.isfinite(target_pips)
+            or stop_pips <= 0 or target_pips <= 0):
+        _fail("DECLARED_CELL_POSITION_STOPS_INVALID")
+    return (entry_price - direction * spec.pips_to_price(stop_pips),
+        entry_price + direction * spec.pips_to_price(target_pips))
+
+
+def _declared_cell_exit_at(frame, bar, *, direction, half_spread, stop, target):
+    open_quote = float(frame["Open"].iloc[bar]) - direction * half_spread
+    adverse = float(frame["Low" if direction == 1 else "High"].iloc[bar]) - direction * half_spread
+    favourable = float(frame["High" if direction == 1 else "Low"].iloc[bar]) - direction * half_spread
+    if direction * (open_quote - stop) <= 0:
+        return open_quote, "closed_sl", True
+    if direction * (adverse - stop) <= 0:
+        return stop, "closed_sl", False
+    if direction * (favourable - target) >= 0:
+        return target, "closed_tp", False
+    return None
+
+
+def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, config,
+                                     observations, matched_closes, timeframe, schedule):
+    expected_fields = {"engine_result", "source_frame_sha256", "warmup_bars", "owner_input_bindings",
+        "entry_spread_observations", "financing_model"}
+    if type(account) is not dict or set(account) != expected_fields:
+        _fail("DECLARED_CELL_ACCOUNT_FIELDS_INVALID")
+    result = account["engine_result"]
+    result_fields = {"schema_version", "terminal_policy", "cash", "final_equity", "net_account_profit",
+        "equity_curve", "max_drawdown_pct", "total_trades", "trades", "closed_trade_statistics_basis",
+        "closed_trade_gross_profit", "terminal", "first_depletion_bar", "swap_accrual_contract",
+        "qualification_authority", "tier_entry_counts", "spread_admission"}
+    if (type(result) is not dict or set(result) != result_fields
+            or result.get("schema_version") != "fxpm.continuous-account-result.v1"
+            or result.get("terminal_policy") != "MARK_OPEN" or result.get("qualification_authority") is not False
+            or result.get("closed_trade_statistics_basis") != "CLOSED_TRADES_ONLY_EXCLUDES_OPEN_INVENTORY"
+            or account["source_frame_sha256"] != _frame_sha256(frame)
+            or account["owner_input_bindings"] != _declared_cell_owner_input_bindings(owner_inputs)
+            or account["entry_spread_observations"] != _spread_source_observations(
+                observations, matched_closes)):
+        _fail("DECLARED_CELL_ACCOUNT_SOURCE_BINDING_MISMATCH")
+    n = len(frame)
+    warmup = account["warmup_bars"]
+    if type(warmup) is not int or not 1 <= warmup < n:
+        _fail("DECLARED_CELL_ACCOUNT_WARMUP_INVALID")
+    curve, trades, terminal = result.get("equity_curve"), result.get("trades"), result.get("terminal")
+    terminal_fields = {"schema_version", "policy", "valuation_status", "cash", "marked_equity", "asof_bar",
+        "asof_open", "asof_close", "bid", "ask", "unrealized_gross", "open_position", "first_depletion_bar"}
+    if (type(curve) is not list or len(curve) != n or type(trades) is not list
+            or len(trades) > _MAX_CANDIDATE_POSITIONS_PER_ANCHOR or result.get("total_trades") != len(trades)
+            or type(terminal) is not dict or set(terminal) != terminal_fields
+            or terminal.get("schema_version") != "fxpm.continuous-account-terminal.v1"
+            or terminal.get("policy") != "MARK_OPEN" or terminal.get("asof_bar") != n - 1
+            or terminal.get("asof_open") != _raw_json(frame.index[-1])
+            or terminal.get("asof_close") != _raw_json(frame["_BAR_CLOSE_TS"].iloc[-1])):
+        _fail("DECLARED_CELL_ACCOUNT_TERMINAL_OR_AXIS_INVALID")
+    financing = _declared_cell_financing(result, frame=frame, spec=spec, config=config, timeframe=timeframe)
+    if account["financing_model"] != financing:
+        _fail("DECLARED_CELL_FINANCING_BINDING_MISMATCH")
+    owners = {owner.owner_id: owner for owner in owner_inputs}
+    slots = {slot.slot_id: slot for slot in schedule.slots}
+    bt = Backtester(config)
+    spreads = {}
+    for owner_id, owner in owners.items():
+        entry, bar, _ = bt._build_half_spread_arrays(frame, spec, spread_tier=owner.spread_tier, timeframe=timeframe)
+        states, _ = bt._entry_spread_admission_inputs(frame, owner.spread_tier, observations)
+        spreads[owner_id] = (entry, bar, states)
+    tier_counts = {owner.spread_tier.tier: {"admitted": 0, "refused": 0, "missing": 0}
+        for owner in owner_inputs}
+    counters = {"known_cap_refused_opportunities": 0, "known_cap_pass_opportunities": 0,
+        "missing_refused_opportunities": 0, "no_trade_scored_bar_count": 0}
+    entry_owners = [None] * n
+    for slot in schedule.slots:
+        mask = (frame.index >= slot.start_utc) & (frame.index < slot.end_utc)
+        for i in np.flatnonzero(mask & (np.arange(n) >= warmup)):
+            if slot.owner_id is None:
+                counters["no_trade_scored_bar_count"] += 1
+                continue
+            owner = owners.get(slot.owner_id)
+            if owner is None:
+                _fail("DECLARED_CELL_POSITION_OWNER_OR_SLOT_INVALID")
+            entry_owners[i] = owner
+            if owner.signals.iloc[i - 1] == 0:
+                continue
+            state = spreads[owner.owner_id][2][i]
+            key, counter = {"ADMIT": ("admitted", "known_cap_pass_opportunities"),
+                "REFUSE": ("refused", "known_cap_refused_opportunities"),
+                "MISSING": ("missing", "missing_refused_opportunities")}[state]
+            tier_counts[owner.spread_tier.tier][key] += 1
+            counters[counter] += 1
+    if result.get("tier_entry_counts") != tier_counts or result.get("spread_admission") != counters:
+        _fail("DECLARED_CELL_SPREAD_ADMISSION_BINDING_MISMATCH")
+    gross_gap_events, ordinary_exit_events = np.zeros(n), np.zeros(n)
+    pre_open_swap_events, close_swap_events = np.zeros(n), np.zeros(n)
+    entry_counts, gap_exit_counts = np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.int32)
+    inventory = np.zeros(n, dtype=np.int32)
+    unrealized = np.zeros(n)
+    positions = [(trade, False) for trade in trades]
+    position = terminal.get("open_position")
+    if position is not None:
+        if type(position) is not dict:
+            _fail("DECLARED_CELL_OPEN_POSITION_INVALID")
+        positions.append((position, True))
+    previous_exit, previous_gap = -1, False
+    risk_joins = []
+    for leg, is_open in positions:
+        owner = owners.get(leg.get("owner_id"))
+        slot = slots.get(leg.get("slot_id"))
+        entry_bar, signal_bar = leg.get("entry_bar"), leg.get("signal_bar")
+        exit_bar = n - 1 if is_open else leg.get("exit_bar")
+        direction = leg.get("direction") if is_open else {"LONG": 1, "SHORT": -1}.get(leg.get("direction"))
+        if (owner is None or slot is None or slot.owner_id != owner.owner_id
+                or type(entry_bar) is not int or type(exit_bar) is not int or type(signal_bar) is not int
+                or not warmup <= entry_bar <= exit_bar < n or signal_bar != entry_bar - 1
+                or direction not in (-1, 1) or entry_bar < previous_exit
+                or (entry_bar == previous_exit and not previous_gap)
+                or not slot.start_utc <= frame.index[entry_bar] < slot.end_utc
+                or int(owner.signals.iloc[signal_bar]) != direction
+                or (leg.get("tier") if is_open else leg.get("frozen_spread_tier")) != owner.spread_tier.descriptor()
+                or spreads[owner.owner_id][2][entry_bar] != "ADMIT"):
+            _fail("DECLARED_CELL_POSITION_OWNER_OR_SLOT_INVALID")
+        previous_exit = exit_bar
+        entry_counts[entry_bar] += 1
+        entry_price = float(leg["entry_price"])
+        lots = float(leg["lots"] if is_open else leg["position_size"])
+        if (not math.isfinite(lots) or lots <= 0 or spec.round_volume(lots) != lots
+                or not math.isfinite(entry_price)):
+            _fail("DECLARED_CELL_POSITION_SIZE_INVALID")
+        expected_entry = float(frame["Open"].iloc[entry_bar]) + direction * spreads[owner.owner_id][0][entry_bar]
+        _declared_cell_close(entry_price, expected_entry, "DECLARED_CELL_ENTRY_COST_INVALID")
+        stop, target = _declared_cell_stop_prices(owner, entry_bar=entry_bar, entry_price=entry_price,
+            direction=direction, symbol=owner.spread_tier.symbol, timeframe=timeframe, spec=spec)
+        _declared_cell_close(leg.get("stop_loss"), stop, "DECLARED_CELL_POSITION_STOPS_INVALID")
+        _declared_cell_close(leg.get("take_profit"), target, "DECLARED_CELL_POSITION_STOPS_INVALID")
+        time_field = "entry_utc_open" if is_open else "entry_time"
+        if leg.get(time_field) != _raw_json(frame.index[entry_bar]):
+            _fail("DECLARED_CELL_POSITION_TIME_INVALID")
+        rates = financing["long_per_lot"] if direction == 1 else financing["short_per_lot"]
+        rate = float(rates[entry_bar]) if financing["enabled"] else 0.0
+        last_close = exit_bar + 1 if is_open else exit_bar
+        accrued_swap, units = 0.0, 0
+        for i in range(entry_bar, exit_bar + 1):
+            pre_units = financing["pre_open_units"][i] if i > entry_bar else 0
+            if pre_units > 0:
+                flow = rate * lots * pre_units
+                accrued_swap += flow
+                units += pre_units
+                pre_open_swap_events[i] += flow
+            close_units = financing["close_units"][i] if i < last_close else 0
+            if close_units > 0:
+                flow = rate * lots * close_units
+                accrued_swap += flow
+                units += close_units
+                close_swap_events[i] += flow
+        if (leg.get("posted_swap_units") if is_open else leg.get("swap_rollover_units")) != units:
+            _fail("DECLARED_CELL_POSITION_FINANCING_INVALID")
+        for i in range(entry_bar, exit_bar + 1):
+            exit_at = _declared_cell_exit_at(frame, i, direction=direction,
+                half_spread=spreads[owner.owner_id][1][i], stop=stop, target=target)
+            if (i < exit_bar or is_open) and exit_at is not None:
+                _fail("DECLARED_CELL_POSITION_EXIT_TIMING_INVALID")
+        if is_open:
+            _declared_cell_close(leg["posted_swap_cash"], accrued_swap, "DECLARED_CELL_POSITION_FINANCING_INVALID")
+            _declared_cell_close(leg["latched_rate_per_lot"], rate, "DECLARED_CELL_POSITION_FINANCING_INVALID")
+        else:
+            if leg.get("exit_reason") in _EOD_EXIT_REASONS or str(leg.get("exit_reason", "")).lower() in _EOD_EXIT_REASONS:
+                _fail("DECLARED_CELL_FORCED_TERMINAL_EXIT_INVALID")
+            gross = spec.calculate_tick_profit(entry_price, float(leg["exit_price"]), lots, direction)
+            if exit_at is None or str(leg.get("exit_reason", "")).lower() != exit_at[1]:
+                _fail("DECLARED_CELL_EXIT_COST_INVALID")
+            _declared_cell_close(leg.get("exit_price"), exit_at[0], "DECLARED_CELL_EXIT_COST_INVALID")
+            previous_gap = bool(exit_at[2] and exit_bar > entry_bar)
+            if previous_gap:
+                gross_gap_events[exit_bar] += gross
+                gap_exit_counts[exit_bar] += 1
+            else:
+                ordinary_exit_events[exit_bar] += gross
+            if (leg.get("gross_pnl_dollars") != round(gross, 2)
+                    or leg.get("swap_dollars") != round(accrued_swap, 2)
+                    or leg.get("pnl_dollars") != round(gross + accrued_swap, 2)
+                    or leg.get("exit_time") != _raw_json(frame.index[exit_bar])):
+                _fail("DECLARED_CELL_CLOSED_TRADE_ACCOUNTING_INVALID")
+        risk_joins.append((leg, is_open, entry_bar, lots, direction))
+        for i in range(entry_bar, last_close):
+            inventory[i] += 1
+            quote = float(frame["Close"].iloc[i]) - direction * spreads[owner.owner_id][1][i]
+            unrealized[i] += spec.calculate_tick_profit(entry_price, quote, lots, direction)
+    if bool((inventory > 1).any()):
+        _fail("DECLARED_CELL_OVERLAPPING_POSITIONS_INVALID")
+    cash_curve, entry_cash = np.empty(n), np.empty(n)
+    cash = float(config.initial_capital)
+    for i in range(n):
+        # Match the kernel's binary64 cash additions, not a reduced event sum.
+        cash += float(pre_open_swap_events[i])
+        cash += float(gross_gap_events[i])
+        entry_cash[i] = cash
+        cash += float(ordinary_exit_events[i])
+        cash += float(close_swap_events[i])
+        cash_curve[i] = cash
+    for leg, is_open, entry_bar, lots, direction in risk_joins:
+        requested = float(entry_cash[entry_bar]) * (config.discovery_risk_per_trade_pct / 100.0)
+        loss_per_lot = spec.calculate_loss_at_stop(leg["entry_price"], leg["stop_loss"], 1.0, direction)
+        if loss_per_lot <= 0 or lots != spec.round_volume(requested / loss_per_lot):
+            _fail("DECLARED_CELL_RISK_SIZING_INVALID")
+        if is_open:
+            _declared_cell_close(leg.get("requested_risk_amount"), requested, "DECLARED_CELL_RISK_SIZING_INVALID")
+        elif leg.get("risk_amount") != round(requested, 2):
+            _fail("DECLARED_CELL_RISK_SIZING_INVALID")
+    for i in range(warmup, n):
+        # An intrabar exit cannot enable a replacement at that bar's open.
+        flat_at_entry = inventory[i - 1] == 0 or gap_exit_counts[i] == 1
+        owner = entry_owners[i]
+        expected_entry_count = 0
+        if flat_at_entry and owner is not None:
+            direction = int(owner.signals.iloc[i - 1])
+            if direction != 0 and spreads[owner.owner_id][2][i] == "ADMIT":
+                entry_price = float(frame["Open"].iloc[i]) + direction * spreads[owner.owner_id][0][i]
+                stop, _ = _declared_cell_stop_prices(owner, entry_bar=i, entry_price=entry_price,
+                    direction=direction, symbol=owner.spread_tier.symbol, timeframe=timeframe, spec=spec)
+                loss_per_lot = spec.calculate_loss_at_stop(entry_price, stop, 1.0, direction)
+                cash_at_entry = float(entry_cash[i])
+                requested = cash_at_entry * (config.discovery_risk_per_trade_pct / 100.0)
+                expected_entry_count = int(loss_per_lot > 0 and spec.round_volume(requested / loss_per_lot) > 0)
+        if entry_counts[i] != expected_entry_count:
+            _fail("DECLARED_CELL_ENTRY_COMPLETENESS_INVALID")
+    expected_curve = cash_curve + unrealized
+    for actual, expected in zip(curve, expected_curve, strict=True):
+        _declared_cell_close(actual, expected, "DECLARED_CELL_EQUITY_RECONCILIATION_FAILED")
+    _declared_cell_close(result.get("cash"), cash_curve[-1], "DECLARED_CELL_CASH_RECONCILIATION_FAILED")
+    _declared_cell_close(terminal.get("cash"), cash_curve[-1], "DECLARED_CELL_CASH_RECONCILIATION_FAILED")
+    _declared_cell_close(result.get("final_equity"), expected_curve[-1], "DECLARED_CELL_TERMINAL_RECONCILIATION_FAILED")
+    _declared_cell_close(terminal.get("marked_equity"), expected_curve[-1], "DECLARED_CELL_TERMINAL_RECONCILIATION_FAILED")
+    _declared_cell_close(terminal.get("unrealized_gross"), unrealized[-1], "DECLARED_CELL_TERMINAL_RECONCILIATION_FAILED")
+    _declared_cell_close(result.get("net_account_profit"), expected_curve[-1] - config.initial_capital,
+        "DECLARED_CELL_PROFIT_RECONCILIATION_FAILED")
+    _declared_cell_close(result.get("closed_trade_gross_profit"), sum(t["gross_pnl_dollars"] for t in trades),
+        "DECLARED_CELL_CLOSED_TRADE_ACCOUNTING_INVALID")
+    depletion = next((i for i, value in enumerate(expected_curve) if value <= 0), None)
+    if result.get("first_depletion_bar") != depletion or terminal.get("first_depletion_bar") != depletion:
+        _fail("DECLARED_CELL_DEPLETION_RECONCILIATION_FAILED")
+    peak, drawdown = float(config.initial_capital), 0.0
+    for value in expected_curve:
+        peak = max(peak, float(value))
+        drawdown = max(drawdown, (peak - value) / peak * 100 if peak > 0 else 0.0)
+    _declared_cell_close(result.get("max_drawdown_pct"), drawdown, "DECLARED_CELL_DRAWDOWN_RECONCILIATION_FAILED")
+    if terminal.get("valuation_status") != ("MARKED_OPEN" if position is not None else "FLAT_CASH_ONLY"):
+        _fail("DECLARED_CELL_TERMINAL_STATUS_INVALID")
+    if position is None:
+        if terminal.get("bid") is not None or terminal.get("ask") is not None:
+            _fail("DECLARED_CELL_TERMINAL_QUOTE_INVALID")
+    else:
+        half = spreads[position["owner_id"]][1][-1]
+        _declared_cell_close(terminal.get("bid"), float(frame["Close"].iloc[-1]) - half,
+            "DECLARED_CELL_TERMINAL_QUOTE_INVALID")
+        _declared_cell_close(terminal.get("ask"), float(frame["Close"].iloc[-1]) + half,
+            "DECLARED_CELL_TERMINAL_QUOTE_INVALID")
+        risk = abs(spec.calculate_tick_profit(position["entry_price"], position["stop_loss"],
+            position["lots"], position["direction"]))
+        _declared_cell_close(position["executed_stop_risk"], risk, "DECLARED_CELL_OPEN_RISK_INVALID")
+
+
+def _declared_cell_body(context, *, precommit, process, frozen_pipeline_config, inputs):
+    return {"schema_version": DECLARED_CELL_RAW_ACCOUNT_SCHEMA,
+        "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
+        "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
+        "declared_precommit_sha256": precommit.receipt_sha256,
+        "search_process_receipt_sha256": process.receipt_sha256, "cell": inputs["parent"]["cells"][0],
+        "pipeline_config_binding": {"active_config_path": str(frozen_pipeline_config.active_config_path),
+            "config_sha256": frozen_pipeline_config.config_sha256,
+            "effective_config_sha256": frozen_pipeline_config.effective_config_sha256},
+        "declared_commit_artifacts": list(inputs["progress"].slot_commit_artifacts),
+        "slot_summaries": list(inputs["progress"].slot_summaries),
+        "slot_schedule": inputs["slot_schedule"], "progress_status": inputs["progress_status"],
+        "reason_code": inputs["reason_code"], "measurement": _declared_cell_measurement(inputs["parent"]),
+        "genesis": {"mode": NEW_SIMULATED_FLAT_GENESIS, "initial_cash": 10000.0, "initial_inventory": []},
+        "owner_records": inputs["owner_records"], **{name: None for name in _DECLARED_CELL_MARKET_FIELDS},
+        "account": None, "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+
+
+def produce_declared_cell_account_artifact(context, *, precommit, process, frozen_pipeline_config,
+        execution_product=None, spread_source_product=None, frozen_profile_path=None):
+    """Write a raw historical cell account, never a qualified trading decision."""
+    inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config)
+    body = _declared_cell_body(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    if inputs["progress_status"] == "COMPLETE":
+        if execution_product is None or spread_source_product is None or frozen_profile_path is None:
+            _fail("DECLARED_CELL_NATIVE_INPUTS_REQUIRED")
+        config = inputs["config"]
+        measured = _declared_cell_measured_config(config)
+        deployment = _deployment_config(config)
+        cell, end = body["cell"], body["measurement"]["end_exclusive_utc"]
+        execution_identity = _native_product_identity(execution_product, expected_symbol=cell["symbol"],
+            expected_timeframe=cell["timeframe"], expected_cutoff_utc=end, role="DECLARED_CELL_EXECUTION")
+        profile = spread_profile.load_spread_profile(frozen_profile_path)
+        if profile.sha256 != inputs["parent"]["spread_profile_identity"]["profile_sha256"]:
+            _fail("DECLARED_CELL_PROFILE_CHANGED")
+        product = _reopen_bound_native_product(context=context, product=execution_product,
+            expected_identity=execution_identity, config=config,
+            production_contract_required=not config.research_mode, pin_consumed_activation=True)
+        spec, execution_receipt = _freeze_execution_spec(product=product, config=config, deployment=deployment)
+        source_tf = profile.resolve(cell["symbol"], cell["timeframe"], "P75", point=spec.point,
+            source_identity_sha256=execution_identity["source_identity_sha256"]).source_timeframe
+        source_identity = _native_product_identity(spread_source_product, expected_symbol=cell["symbol"],
+            expected_timeframe=source_tf, expected_cutoff_utc=end, role="DECLARED_CELL_SPREAD")
+        fine = _reopen_bound_native_product(context=context, product=spread_source_product,
+            expected_identity=source_identity, config=config,
+            production_contract_required=not config.research_mode, pin_consumed_activation=True)
+        fine_spec, fine_receipt = _freeze_execution_spec(product=fine, config=config, deployment=deployment)
+        if asdict(spec) != asdict(fine_spec):
+            _fail("DECLARED_CELL_EXECUTION_SOURCE_TERMS_MISMATCH")
+        frame, owners, schedule, observations, matched, warmup = _declared_cell_native_frames(
+            inputs=inputs, execution_frame=native_prefix.open_verified_prefix_frame(product),
+            fine_frame=native_prefix.open_verified_prefix_frame(fine), profile=profile, spec=spec,
+            execution_identity=execution_identity, spread_identity=source_identity)
+        # All external inputs are bound before entering the single continuous account.
+        body.update({"execution_source": execution_identity, "spread_source": source_identity,
+            "execution_spec_receipt": execution_receipt, "spread_source_execution_spec_receipt": fine_receipt,
+            "frozen_profile_descriptor": _persist_frozen_profile(context, frozen_profile_path, profile.sha256),
+            "deployment_source_descriptors": _persist_deployment_sources(context, deployment),
+            "original_config_identity": _pipeline_config_identity(config),
+            "measured_config_identity": _pipeline_config_identity(measured)})
+        result = _raw_json(_run_declared_cell_account(config=measured, features=frame,
+            symbol=cell["symbol"], timeframe=cell["timeframe"], spec=spec, warmup_bars=warmup,
+            entry_schedule=schedule, entry_spread_observations=observations))
+        account = _declared_account_payload(result=result, frame=frame, owner_inputs=owners,
+            spec=spec, config=measured, observations=observations, matched_closes=matched,
+            timeframe=cell["timeframe"], warmup_bars=warmup)
+        _reconcile_declared_cell_account(account, frame=frame, owner_inputs=owners, spec=spec,
+            config=measured, observations=observations, matched_closes=matched,
+            timeframe=cell["timeframe"], schedule=schedule)
+        body["account"] = account
+        _assert_deployment_config_unchanged(deployment, config)
+    _canonical_bytes(body, _DECLARED_CELL_MAX_RAW_BYTES)
+    sink = authority_spool.open_symbol_sink(context, _declared_cell_transport_symbol(body),
+        manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
+    entry = sink.put_json("declared-cell-account", "declared_cell_raw_account", body)
+    sink.seal()
+    return causal_producer.DeclaredCellRawAccountArtifact(dict(entry["descriptor"]))
+
+
+def verify_declared_cell_account_transport(context, body, *, process, frozen_pipeline_config, reopen_source):
+    if type(body) is not dict or set(body) != _DECLARED_CELL_FIELDS or body.get("schema_version") != DECLARED_CELL_RAW_ACCOUNT_SCHEMA:
+        _fail("DECLARED_CELL_TRANSPORT_FIELDS_INVALID")
+    try:
+        precommit = historical.reopen_declared_slot_owner_run_precommit(context,
+            receipt_sha256=body["declared_precommit_sha256"], process=process,
+            frozen_pipeline_config=frozen_pipeline_config)
+        inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config)
+        expected = _declared_cell_body(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+        for name in _DECLARED_CELL_FIELDS - set(_DECLARED_CELL_MARKET_FIELDS) - {"account"}:
+            if body[name] != expected[name]:
+                _fail("DECLARED_CELL_TRANSPORT_BINDING_MISMATCH", name)
+        if inputs["progress_status"] != "COMPLETE":
+            if body["account"] is not None or any(body[name] is not None for name in _DECLARED_CELL_MARKET_FIELDS):
+                _fail("DECLARED_CELL_INCOMPLETE_ACCOUNT_FORBIDDEN")
+            return body
+        if type(body["account"]) is not dict or not callable(reopen_source):
+            _fail("DECLARED_CELL_COMPLETE_ACCOUNT_REQUIRED")
+        config, cell = inputs["config"], body["cell"]
+        measured = _declared_cell_measured_config(config)
+        if (body["original_config_identity"] != _pipeline_config_identity(config)
+                or body["measured_config_identity"] != _pipeline_config_identity(measured)):
+            _fail("DECLARED_CELL_CONFIG_DERIVATION_CHANGED")
+        deployment = _deployment_config(config)
+        sources = body["deployment_source_descriptors"]
+        if type(sources) is not dict or set(sources) != {"config", "broker"}:
+            _fail("DECLARED_CELL_DEPLOYMENT_SOURCES_INVALID")
+        for role, digest, size in (("config", deployment.config_sha256, deployment.config_size_bytes),
+                ("broker", deployment.broker_sha256, deployment.broker_size_bytes)):
+            descriptor = _descriptor(sources[role], "DECLARED_CELL_DEPLOYMENT_DESCRIPTOR_INVALID")
+            observed, actual_size, _ = authority_spool._stream_file(context.root, descriptor["relative_path"],
+                maximum_bytes=size, expected_size=size, collect=False)
+            if (descriptor["format"] != "json-" + role or descriptor["sha256"] != digest
+                    or descriptor["size_bytes"] != size or observed != digest or actual_size != size):
+                _fail("DECLARED_CELL_DEPLOYMENT_SOURCES_CHANGED")
+        execution_identity, spread_identity = body["execution_source"], body["spread_source"]
+        if (execution_identity["role"] != "DECLARED_CELL_EXECUTION"
+                or spread_identity["role"] != "DECLARED_CELL_SPREAD"
+                or execution_identity["symbol"] != cell["symbol"] or execution_identity["timeframe"] != cell["timeframe"]
+                or spread_identity["symbol"] != cell["symbol"]
+                or any(identity["cutoff_utc"] != body["measurement"]["end_exclusive_utc"]
+                    for identity in (execution_identity, spread_identity))):
+            _fail("DECLARED_CELL_NATIVE_WINDOW_INVALID")
+        execution_frame, product = reopen_source(context, execution_identity, config)
+        fine_frame, fine = reopen_source(context, spread_identity, config)
+        spec, receipt = _freeze_execution_spec(product=product, config=config, deployment=deployment)
+        fine_spec, fine_receipt = _freeze_execution_spec(product=fine, config=config, deployment=deployment)
+        if (receipt != body["execution_spec_receipt"] or fine_receipt != body["spread_source_execution_spec_receipt"]
+                or asdict(spec) != asdict(fine_spec)):
+            _fail("DECLARED_CELL_EXECUTION_SPEC_CHANGED")
+        profile_descriptor = _descriptor(body["frozen_profile_descriptor"], "DECLARED_CELL_PROFILE_DESCRIPTOR_INVALID")
+        profile_sha = inputs["parent"]["spread_profile_identity"]["profile_sha256"]
+        observed, size, _ = authority_spool._stream_file(context.root, profile_descriptor["relative_path"],
+            maximum_bytes=_DECLARED_CELL_MAX_RAW_BYTES, expected_size=profile_descriptor["size_bytes"], collect=False)
+        if (profile_descriptor["format"] != "json-profile" or profile_descriptor["sha256"] != profile_sha
+                or observed != profile_sha or size != profile_descriptor["size_bytes"]):
+            _fail("DECLARED_CELL_PROFILE_CHANGED")
+        profile = spread_profile.load_spread_profile(Path(context.root) / profile_descriptor["relative_path"])
+        frame, owners, schedule, observations, matched, warmup = _declared_cell_native_frames(
+            inputs=inputs, execution_frame=execution_frame, fine_frame=fine_frame, profile=profile, spec=spec,
+            execution_identity=execution_identity, spread_identity=spread_identity)
+        if body["account"]["warmup_bars"] != warmup:
+            _fail("DECLARED_CELL_ACCOUNT_WARMUP_INVALID")
+        _reconcile_declared_cell_account(body["account"], frame=frame, owner_inputs=owners, spec=spec,
+            config=measured, observations=observations, matched_closes=matched,
+            timeframe=cell["timeframe"], schedule=schedule)
+        return body
+    except ForwardOOSReplayProductionError:
+        raise
+    except Exception as exc:
+        raise ForwardOOSReplayProductionError("DECLARED_CELL_TRANSPORT_REVERIFY_FAILED",
+            (type(exc).__name__, getattr(exc, "code", ""))) from exc
+
+
+def _ledger_bodies(replay: _AnchorRawReplay, *, starting_balance: Decimal) -> dict[str, dict[str, Any]]:
+    if type(replay) is not _AnchorRawReplay or float(starting_balance) != replay.raw_accounts["genesis"]["initial_cash"]:
+        _fail("FROZEN_TIER_ACCOUNT_WRITER_INPUT_INVALID")
+    return {"FROZEN_TIER_RAW_ACCOUNTS": dict(replay.raw_accounts)}
+
+
 
 
 def _causal_precommit_geometry(
@@ -3581,29 +4265,6 @@ def _write_raw_ledger(
     return normalized
 
 
-def _write_capital_json_artifact(
-    context: authority_spool.GenerationSpoolContext,
-    body: Mapping[str, Any],
-    *,
-    role: str,
-    maximum: int,
-) -> dict[str, Any]:
-    raw = _canonical_bytes(body, maximum)
-    try:
-        descriptor = authority_spool.write_canonical_json_artifact(context, body)
-    except Exception as exc:
-        raise ForwardOOSReplayProductionError(
-            "CAPITAL_EVIDENCE_SPOOL_FAILED", (role, type(exc).__name__)
-        ) from exc
-    normalized = _descriptor(descriptor, "CAPITAL_EVIDENCE_DESCRIPTOR_INVALID")
-    if (
-        normalized["format"] != authority_spool.CANONICAL_JSON_FORMAT
-        or normalized["size_bytes"] != len(raw)
-        or normalized["sha256"] != hashlib.sha256(raw).hexdigest()
-        or normalized["size_bytes"] > maximum
-    ):
-        _fail("CAPITAL_EVIDENCE_SPOOL_IDENTITY_MISMATCH", role)
-    return normalized
 
 
 def _capital_specialist_roster(
@@ -3768,147 +4429,6 @@ def _capital_candidate_record(
     return record, hashlib.sha256(raw).hexdigest()
 
 
-def _persist_capital_phase_evidence(
-    *,
-    context: authority_spool.GenerationSpoolContext,
-    replay: _AnchorRawReplay,
-    run_anchor: Mapping[str, Any],
-    replay_precommit: ForwardOOSReplayPrecommit,
-    replay_precommit_body: Mapping[str, Any],
-    precommit_anchor: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    phase_id = str(replay.production_metadata.get("capital_phase_id"))
-    phase = str(replay.production_metadata.get("capital_phase"))
-    window = replay.production_metadata.get("capital_window")
-    expected_phase_id = _capital_phase_id(str(replay.anchor["anchor_id"]), phase)
-    if phase_id != expected_phase_id or type(window) is not dict:
-        _fail("CAPITAL_PHASE_REPLAY_METADATA_INVALID", phase_id)
-    ordered_candidates = sorted(
-        (position.candidate for position in replay.positions),
-        key=lambda value: value.candidate_id,
-    )
-    if not ordered_candidates:
-        _fail("CAPITAL_PHASE_CANDIDATE_ROSTER_EMPTY", phase_id)
-    if len(ordered_candidates) > portfolio.MAX_PORTFOLIO_REPLAY_CANDIDATES:
-        _fail("CAPITAL_PHASE_CANDIDATE_COUNT_BOUND_EXCEEDED", phase_id)
-    identifiers = [value.candidate_id for value in ordered_candidates]
-    if len(set(identifiers)) != len(identifiers):
-        _fail("CAPITAL_PHASE_CANDIDATE_ID_REUSED", phase_id)
-    specialist_roster = _capital_specialist_roster(replay.specialists)
-    selected_ids = frozenset(value["cell_id"] for value in specialist_roster)
-    records: list[tuple[dict[str, Any], str]] = [
-        _capital_candidate_record(
-            candidate,
-            phase_id=phase_id,
-            window=window,
-            selected_cell_ids=selected_ids,
-        )
-        for candidate in ordered_candidates
-    ]
-    descriptors: list[dict[str, Any]] = []
-    all_record_hashes: list[str] = []
-    pending_records: list[dict[str, Any]] = []
-    pending_hashes: list[str] = []
-    pending_bytes = 0
-
-    def flush() -> None:
-        nonlocal pending_records, pending_hashes, pending_bytes
-        if not pending_records:
-            return
-        chunk_index = len(descriptors)
-        if chunk_index >= _MAX_CAPITAL_PHASE_CHUNKS:
-            _fail("CAPITAL_PHASE_CHUNK_COUNT_BOUND_EXCEEDED", phase_id)
-        chunk = {
-            "schema_version": CAPITAL_CANDIDATE_CHUNK_SCHEMA,
-            "phase_id": phase_id,
-            "chunk_index": chunk_index,
-            "candidate_count": len(pending_records),
-            "candidate_records": pending_records,
-            "candidate_record_sha256s": pending_hashes,
-            "candidate_record_roster_sha256": _sha(
-                [
-                    {
-                        "candidate_id": record["candidate_id"],
-                        "candidate_record_sha256": record_sha,
-                    }
-                    for record, record_sha in zip(
-                        pending_records, pending_hashes, strict=True
-                    )
-                ]
-            ),
-            "complete_records_not_policy_filtered": True,
-        }
-        descriptors.append(
-            _write_capital_json_artifact(
-                context,
-                chunk,
-                role=f"{phase_id}:CANDIDATE_CHUNK:{chunk_index}",
-                maximum=_MAX_CAPITAL_CANDIDATE_CHUNK_BYTES,
-            )
-        )
-        pending_records = []
-        pending_hashes = []
-        pending_bytes = 0
-
-    for record, record_sha in records:
-        record_bytes = len(
-            _canonical_bytes(record, _MAX_CAPITAL_CANDIDATE_RECORD_BYTES)
-        )
-        if pending_records and (
-            pending_bytes + record_bytes + 64 * 1024
-            > _MAX_CAPITAL_CANDIDATE_CHUNK_BYTES
-        ):
-            flush()
-        pending_records.append(record)
-        pending_hashes.append(record_sha)
-        pending_bytes += record_bytes
-        all_record_hashes.append(record_sha)
-    flush()
-    total_bytes = sum(value["size_bytes"] for value in descriptors)
-    if total_bytes > _MAX_CAPITAL_PHASE_RECORD_BYTES:
-        _fail("CAPITAL_PHASE_RECORD_BYTE_BOUND_EXCEEDED", phase_id, total_bytes)
-    lineage = _capital_operational_lineage(
-        run_anchor=run_anchor,
-        specialists=replay.specialists,
-        precommit_anchor=precommit_anchor,
-        replay_precommit_body=replay_precommit_body,
-    )
-    roster_receipt = portfolio.portfolio_replay_candidate_roster_receipt(
-        ordered_candidates
-    )
-    manifest = {
-        "schema_version": CAPITAL_PHASE_MANIFEST_SCHEMA,
-        "production_contract_version": PRODUCTION_CONTRACT_VERSION,
-        "phase_id": phase_id,
-        "anchor_id": replay.anchor["anchor_id"],
-        "phase": phase,
-        "window": dict(window),
-        "historical_run_receipt_sha256": replay_precommit_body[
-            "historical_run_receipt_sha256"
-        ],
-        "forward_replay_precommit_receipt_sha256": replay_precommit.receipt_sha256,
-        "capital_bootstrap_identity_sha256": replay_precommit_body[
-            "capital_bootstrap_identity_sha256"
-        ],
-        "selected_specialist_roster_sha256": _sha(specialist_roster),
-        "selected_cell_ids": sorted(selected_ids),
-        "candidate_chunk_descriptors": descriptors,
-        "candidate_chunk_descriptor_roster_sha256": _sha(descriptors),
-        "candidate_count": len(ordered_candidates),
-        "candidate_record_sha256s_sha256": _sha(all_record_hashes),
-        "candidate_roster_receipt": roster_receipt,
-        "operational_lineage": lineage,
-        "complete_pre_policy_candidate_roster": True,
-        "candidate_marks_thinned_or_sampled": False,
-        "confers_capital_publication_or_trading_authority": False,
-    }
-    descriptor = _write_capital_json_artifact(
-        context,
-        manifest,
-        role=f"{phase_id}:CAPITAL_PHASE_MANIFEST",
-        maximum=_MAX_JSON_BYTES,
-    )
-    return descriptor, lineage
 
 
 def _binding_windows(value: Mapping[str, Any]) -> dict[str, dict[str, dict[str, str]]]:
@@ -4269,114 +4789,9 @@ def precommit_forward_oos_replay_products(
     is permitted to observe any forward price row.
     """
 
-    try:
-        deployment = _deployment_config(config)
-        run_body, plans, books, _ = _reopen_books(
-            context, historical_precommit, historical_run_receipt
-        )
-        causal_body, _, deadline = _causal_precommit_geometry(
-            causal_precommit_payload, plans
-        )
-        capital_binding_body = capital_bootstrap.verify_capital_forward_phase_binding(
-            context, capital_phase_binding
-        )
-        capital_identity = capital_binding_body.get("bootstrap_identity")
-        if (
-            type(capital_identity) is not dict
-            or capital_identity.get("process_precommitment_sha256")
-            != causal.canonical_sha256(causal_body)
-            or capital_identity.get("process_definition_sha256")
-            != causal_body.get("process_definition_sha256")
-        ):
-            _fail("CAPITAL_FORWARD_PHASE_PROCESS_PRECOMMITMENT_MISMATCH")
-        capital_windows = _capital_phase_windows(plans, capital_binding_body)
-        now = datetime.now(UTC)
-        if now > deadline:
-            _fail("CAUSAL_EVIDENCE_ACCESS_WINDOW_EXPIRED", deadline.isoformat())
-        required = _required_forward_product_rosters(plans, books)
-        product_rows = _product_roster_identities(
-            plans=plans,
-            capital_phase_windows_by_anchor=capital_windows,
-            required=required,
-            execution_products_by_anchor=execution_products_by_anchor,
-            valuation_products_by_anchor=valuation_products_by_anchor,
-        )
-        if any(
-            _utc(
-                identity["source_accessed_at_utc"],
-                "FORWARD_PRODUCT_ACCESS_TIME_INVALID",
-            )
-            > now
-            for row in product_rows
-            for identity in (
-                *row["execution_products"],
-                *row["valuation_m5_products"],
-            )
-        ):
-            _fail("FORWARD_PRODUCT_SOURCE_ACCESSED_AFTER_REPLAY_PRECOMMIT")
-        code_identity = _replay_code_identity(causal_body)
-        body = {
-            "schema_version": REPLAY_PRECOMMIT_SCHEMA,
-            "generation_id": context.generation_id,
-            "generation_context_sha256": context.context_sha256,
-            "native_universe_sha256": context.native_universe_sha256,
-            "config_sha256": context.config_sha256,
-            "historical_precommit_receipt_sha256": (
-                historical_precommit.receipt_sha256
-            ),
-            "historical_run_receipt_sha256": (historical_run_receipt.receipt_sha256),
-            "historical_run_payload_sha256": _sha(run_body),
-            "causal_precommit_payload_sha256": causal.canonical_sha256(causal_body),
-            "created_at_utc": now.isoformat(timespec="microseconds").replace(
-                "+00:00", "Z"
-            ),
-            "created_before_first_forward_oos_frame_access": True,
-            "all_native_source_access_times_not_after_precommit": True,
-            "required_rosters": required,
-            "anchor_product_identities": product_rows,
-            "anchor_product_identities_sha256": _sha(product_rows),
-            "capital_phase_windows_by_anchor": capital_windows,
-            "capital_phase_windows_sha256": _sha(capital_windows),
-            "capital_forward_phase_binding": capital_binding_body,
-            "capital_forward_phase_binding_sha256": _sha(capital_binding_body),
-            "capital_bootstrap_identity_sha256": capital_binding_body[
-                "bootstrap_identity_sha256"
-            ],
-            "capital_precommitment_body_sha256": capital_binding_body[
-                "capital_precommitment_body_sha256"
-            ],
-            "capital_contract_lineage_sha256": _sha(
-                capital_binding_body["contract_lineage"]
-            ),
-            "capital_margin_terms_sha256": capital_binding_body[
-                "margin_terms_sha256"
-            ],
-            "capital_broker_terms_sha256": capital_binding_body[
-                "broker_terms_sha256"
-            ],
-            "deployment_binding": deployment.receipt_body(),
-            "code_identity": code_identity,
-            "valuation_contract": VALUATION_CONTRACT,
-            "product_cutoff_contract": "EXACT_FORWARD_END_EXCLUSIVE_NO_LATER_ROWS",
-            "confers_causal_current_refit_capital_publication_or_trading_authority": False,
-        }
-        descriptor = _write_raw_ledger(
-            context, body, role="FORWARD_OOS_REPLAY_PRECOMMIT"
-        )
-        raw = _canonical_bytes(body)
-        if descriptor["sha256"] != hashlib.sha256(raw).hexdigest():
-            _fail("FORWARD_REPLAY_PRECOMMIT_SPOOL_IDENTITY_MISMATCH")
-        return ForwardOOSReplayPrecommit(
-            raw,
-            descriptor,
-            _issue_precommit(raw, descriptor),
-        )
-    except ForwardOOSReplayProductionError:
-        raise
-    except Exception as exc:
-        raise ForwardOOSReplayProductionError(
-            "FORWARD_REPLAY_PRECOMMIT_FAILED", (type(exc).__name__, str(exc))
-        ) from exc
+    # Archived verifiers remain available.  Replace this paired frozen-path
+    # producer in place when the interval qualification policy is adopted.
+    _fail("RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED")
 
 
 def _verify_forward_replay_precommit(
@@ -4495,288 +4910,7 @@ def produce_forward_oos_replay_artifacts(
     binds the six ledgers but grants no causal, publication, or trading authority.
     """
 
-    try:
-        deployment = _deployment_config(config)
-        run_body, plans, books, symbol_receipts = _reopen_books(
-            context, historical_precommit, historical_run_receipt
-        )
-        causal_body, access_started, deadline = _causal_access_window(
-            causal_precommit_payload, plans
-        )
-        replay_precommit_body = _verify_forward_replay_precommit(
-            context=context,
-            value=replay_precommit,
-            historical_precommit=historical_precommit,
-            historical_run_receipt=historical_run_receipt,
-            causal_precommit_payload=causal_body,
-            deployment=deployment,
-        )
-        required_rosters = _required_forward_product_rosters(plans, books)
-        if (
-            replay_precommit_body.get("required_rosters") != required_rosters
-            or replay_precommit_body.get("historical_run_payload_sha256")
-            != _sha(run_body)
-            or replay_precommit_body.get("anchor_product_identities_sha256")
-            != _sha(replay_precommit_body.get("anchor_product_identities"))
-        ):
-            _fail("FORWARD_REPLAY_PRECOMMIT_HISTORICAL_ROSTER_DRIFT")
-        anchor_ids = [plan["anchor_id"] for plan in plans]
-        if (
-            type(native_products_by_anchor) is not dict
-            or type(valuation_products_by_anchor) is not dict
-            or list(native_products_by_anchor) != anchor_ids
-            or list(valuation_products_by_anchor) != anchor_ids
-        ):
-            _fail("FORWARD_NATIVE_ANCHOR_ROSTER_MISMATCH")
-        precommit_anchors = {
-            value.get("anchor_id"): value
-            for value in replay_precommit_body["anchor_product_identities"]
-            if type(value) is dict
-        }
-        if set(precommit_anchors) != set(anchor_ids):
-            _fail("FORWARD_PRECOMMIT_ANCHOR_ROSTER_INVALID")
-        specialists = _reopen_specialists(context, plans, books, symbol_receipts)
-        execution_started_dt = datetime.now(UTC).replace(microsecond=0)
-        if execution_started_dt > deadline:
-            _fail("CAUSAL_EVIDENCE_ACCESS_WINDOW_EXPIRED_DURING_REVERIFY")
-        execution_started = execution_started_dt.isoformat(timespec="seconds").replace(
-            "+00:00", "Z"
-        )
-
-        pending_events: dict[str, dict[str, Any]] = {}
-        descriptor_rows: dict[str, dict[str, dict[str, Any]]] = {}
-        anchor_metadata: dict[str, dict[str, Any]] = {}
-        capital_phase_manifest_descriptors: dict[str, dict[str, Any]] = {}
-        run_anchors = {
-            value.get("anchor_id"): value
-            for value in run_body.get("anchors", ())
-            if type(value) is dict
-        }
-        if set(run_anchors) != set(anchor_ids):
-            _fail("FORWARD_HISTORICAL_RUN_ANCHOR_ROSTER_INVALID")
-        capital_windows = replay_precommit_body.get(
-            "capital_phase_windows_by_anchor"
-        )
-        if type(capital_windows) is not dict or list(capital_windows) != anchor_ids:
-            _fail("FORWARD_CAPITAL_PHASE_WINDOW_ROSTER_INVALID")
-        total_bytes = 0
-        for plan in plans:
-            anchor_id = plan["anchor_id"]
-            for phase in CAPITAL_PHASES:
-                replay = _execute_anchor_replay(
-                    context=context,
-                    anchor=plan,
-                    specialists=specialists[anchor_id],
-                    native_products=native_products_by_anchor[anchor_id],
-                    valuation_products=valuation_products_by_anchor[anchor_id],
-                    precommit_anchor=precommit_anchors[anchor_id],
-                    capital_phase=phase,
-                    capital_window=capital_windows[anchor_id][phase],
-                    config=config,
-                    deployment=deployment,
-                )
-                phase_id = _capital_phase_id(anchor_id, phase)
-                manifest_descriptor, _ = _persist_capital_phase_evidence(
-                    context=context,
-                    replay=replay,
-                    run_anchor=run_anchors[anchor_id],
-                    replay_precommit=replay_precommit,
-                    replay_precommit_body=replay_precommit_body,
-                    precommit_anchor=precommit_anchors[anchor_id],
-                )
-                capital_phase_manifest_descriptors[phase_id] = manifest_descriptor
-                if phase == CAPITAL_OUTER_EVALUATION:
-                    anchor_metadata[anchor_id] = json.loads(
-                        _canonical_bytes(
-                            dict(replay.production_metadata or {})
-                        ).decode("ascii")
-                    )
-                    bodies = _ledger_bodies(
-                        replay,
-                        starting_balance=_decimal(
-                            config.initial_capital,
-                            "REPLAY_STARTING_BALANCE_INVALID",
-                            positive=True,
-                        ),
-                    )
-                    anchor_size = sum(
-                        len(_canonical_bytes(value)) for value in bodies.values()
-                    )
-                    if anchor_size > _MAX_LEDGER_BYTES_PER_ANCHOR:
-                        _fail(
-                            "RAW_LEDGER_ANCHOR_BOUND_EXCEEDED",
-                            anchor_id,
-                            anchor_size,
-                        )
-                    total_bytes += anchor_size
-                    if total_bytes > _MAX_LEDGER_BYTES_TOTAL:
-                        _fail("RAW_LEDGER_TOTAL_BOUND_EXCEEDED", total_bytes)
-                    pending_events[anchor_id] = bodies.pop("EVENT_LEDGER")
-                    descriptor_rows[anchor_id] = {}
-                    for role in (
-                        "FILL_LEDGER",
-                        "MTM_LEDGER",
-                        "COST_LEDGER",
-                        "EXPOSURE_LEDGER",
-                        "MARGIN_LEDGER",
-                    ):
-                        descriptor_rows[anchor_id][role] = _write_raw_ledger(
-                            context, bodies[role], role=f"{anchor_id}:{role}"
-                        )
-                    del bodies
-                del replay
-                FeatureComputer.clear_cache()
-
-        execution_completed_dt = datetime.now(UTC).replace(microsecond=0)
-        reconciled_dt = datetime.now(UTC).replace(microsecond=0)
-        if reconciled_dt > deadline:
-            _fail("CAUSAL_EVIDENCE_ACCESS_WINDOW_EXPIRED_DURING_REPLAY")
-        execution_completed = execution_completed_dt.isoformat(
-            timespec="seconds"
-        ).replace("+00:00", "Z")
-        reconciled = reconciled_dt.isoformat(timespec="seconds").replace("+00:00", "Z")
-        for plan in plans:
-            anchor_id = plan["anchor_id"]
-            event = pending_events.pop(anchor_id)
-            event.update(
-                {
-                    "evidence_access_started_at_utc": access_started,
-                    "execution_started_at_utc": execution_started,
-                    "execution_completed_at_utc": execution_completed,
-                    "reconciled_at_utc": reconciled,
-                }
-            )
-            descriptor_rows[anchor_id]["EVENT_LEDGER"] = _write_raw_ledger(
-                context, event, role=f"{anchor_id}:EVENT_LEDGER"
-            )
-
-        result: dict[str, causal_producer.AnchorReplayArtifactDescriptors] = {}
-        for plan in plans:
-            anchor_id = plan["anchor_id"]
-            row = descriptor_rows[anchor_id]
-            descriptors = causal_producer.AnchorReplayArtifactDescriptors(
-                event_ledger=row["EVENT_LEDGER"],
-                fill_ledger=row["FILL_LEDGER"],
-                mtm_ledger=row["MTM_LEDGER"],
-                cost_ledger=row["COST_LEDGER"],
-                exposure_ledger=row["EXPOSURE_LEDGER"],
-                margin_ledger=row["MARGIN_LEDGER"],
-            )
-            # Reopen every byte immediately, before allowing it to leave the
-            # producer boundary.
-            causal_producer._load_replay_ledgers(context, descriptors, plan)
-            result[anchor_id] = descriptors
-
-        _assert_deployment_config_unchanged(deployment, config)
-        code_identity = _replay_code_identity(causal_body)
-        if code_identity != replay_precommit_body.get("code_identity"):
-            _fail("FORWARD_REPLAY_CODE_CHANGED_AFTER_PRECOMMIT")
-        producer_receipt_body = {
-            "schema_version": PRODUCER_RECEIPT_SCHEMA,
-            "production_contract_version": PRODUCTION_CONTRACT_VERSION,
-            "generation_id": context.generation_id,
-            "generation_context_sha256": context.context_sha256,
-            "native_universe_sha256": context.native_universe_sha256,
-            "config_sha256": context.config_sha256,
-            "historical_precommit_receipt_sha256": (
-                historical_precommit.receipt_sha256
-            ),
-            "historical_run_receipt_sha256": (historical_run_receipt.receipt_sha256),
-            "causal_precommit_payload_sha256": causal.canonical_sha256(causal_body),
-            "forward_replay_precommit_receipt_sha256": (
-                replay_precommit.receipt_sha256
-            ),
-            "forward_replay_precommit_descriptor": _descriptor(
-                dict(replay_precommit.descriptor),
-                "FORWARD_REPLAY_PRECOMMIT_DESCRIPTOR_INVALID",
-            ),
-            "capital_bootstrap_identity_sha256": replay_precommit_body[
-                "capital_bootstrap_identity_sha256"
-            ],
-            "capital_precommitment_body_sha256": replay_precommit_body[
-                "capital_precommitment_body_sha256"
-            ],
-            "capital_contract_lineage_sha256": replay_precommit_body[
-                "capital_contract_lineage_sha256"
-            ],
-            "capital_margin_terms_sha256": replay_precommit_body[
-                "capital_margin_terms_sha256"
-            ],
-            "capital_broker_terms_sha256": replay_precommit_body[
-                "capital_broker_terms_sha256"
-            ],
-            "evidence_access_started_at_utc": access_started,
-            "execution_started_at_utc": execution_started,
-            "execution_completed_at_utc": execution_completed,
-            "reconciled_at_utc": reconciled,
-            "deployment_binding": deployment.receipt_body(),
-            "code_identity": code_identity,
-            "anchor_ledger_descriptors": {
-                anchor_id: {
-                    role: dict(value)
-                    for role, value in sorted(descriptor_rows[anchor_id].items())
-                }
-                for anchor_id in anchor_ids
-            },
-            "anchor_production_metadata": {
-                anchor_id: anchor_metadata[anchor_id] for anchor_id in anchor_ids
-            },
-            "ordered_anchor_ids": anchor_ids,
-            "capital_phase_manifest_descriptors": (
-                capital_phase_manifest_descriptors
-            ),
-            "ordered_capital_phase_ids": list(
-                capital_phase_manifest_descriptors
-            ),
-            "capital_candidate_records_complete_pre_policy": True,
-            "capital_phase_window_contract": (
-                "SIGNED_BOOTSTRAP_INNER_AND_CAUSAL_OUTER_HALF_OPEN_V1"
-            ),
-            "valuation_contract": VALUATION_CONTRACT,
-            "valuation_event_order": ("close_existing_then_mark_existing_then_admit"),
-            "candidate_marks_thinned_or_sampled": False,
-            # Causal evidence may be produced only after this receipt/product
-            # exists and passes its standalone verifier.  The former v1
-            # pre-receipt callback exposed bare descriptors and is forbidden.
-            "causal_consumer_reopened_and_verified": False,
-            "causal_binding_followup_required": True,
-            "confers_causal_process_current_refit_capital_readiness_publication_"
-            "or_trading_authority": False,
-        }
-        producer_descriptor = _write_raw_ledger(
-            context, producer_receipt_body, role="FORWARD_OOS_PRODUCER_RECEIPT"
-        )
-        producer_raw = _canonical_bytes(producer_receipt_body)
-        if producer_descriptor["sha256"] != hashlib.sha256(producer_raw).hexdigest():
-            _fail("FORWARD_OOS_PRODUCER_RECEIPT_SPOOL_MISMATCH")
-        if (
-            _read_descriptor_json(
-                context,
-                producer_descriptor,
-                code="FORWARD_OOS_PRODUCER_RECEIPT",
-                maximum=_MAX_JSON_BYTES,
-            )
-            != producer_receipt_body
-        ):
-            _fail("FORWARD_OOS_PRODUCER_RECEIPT_REOPEN_MISMATCH")
-        anchor_rows = tuple(
-            (anchor_id, result[anchor_id]) for anchor_id in anchor_ids
-        )
-        product = ForwardOOSReplayProduct(
-            anchor_rows,
-            producer_raw,
-            producer_descriptor,
-            _issue_product(anchor_rows, producer_raw, producer_descriptor),
-        )
-        verify_forward_oos_replay_product(context, product)
-        return product
-    except ForwardOOSReplayProductionError:
-        raise
-    except Exception as exc:
-        raise ForwardOOSReplayProductionError(
-            "FORWARD_OOS_REPLAY_PRODUCTION_FAILED",
-            (type(exc).__name__, str(exc)),
-        ) from exc
+    _fail("RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED")
 
 
 # The issuer remains captured only by the production factory's default; the
@@ -4795,383 +4929,11 @@ __all__ = [
     "PRODUCTION_CONTRACT_VERSION",
     "REPLAY_PRECOMMIT_SCHEMA",
     "VALUATION_CONTRACT",
+    "DECLARED_CELL_RAW_ACCOUNT_SCHEMA",
     "native_product_key",
     "precommit_forward_oos_replay_products",
     "produce_forward_oos_replay_artifacts",
+    "produce_declared_cell_account_artifact",
+    "verify_declared_cell_account_transport",
     "verify_forward_oos_replay_product",
 ]
-
-
-def _raw_event_id(anchor_id: str, position_id: str, lane: str, day: str = "") -> str:
-    raw = f"{anchor_id}|{position_id}|{lane}|{day}".encode("utf-8")
-    return "evt:" + hashlib.sha256(raw).hexdigest()
-
-
-def _broker_fill_id(anchor_id: str, position_id: str, lane: str) -> str:
-    raw = f"{anchor_id}|{position_id}|{lane}".encode("utf-8")
-    return "fill:" + hashlib.sha256(raw).hexdigest()
-
-
-def _ledger_bodies(
-    replay: _AnchorRawReplay,
-    *,
-    starting_balance: Decimal,
-) -> dict[str, dict[str, Any]]:
-    anchor = replay.anchor
-    dates = [
-        (
-            _date(anchor["forward_start_date"], "FORWARD_START_INVALID")
-            + timedelta(days=offset)
-        ).isoformat()
-        for offset in range(
-            (
-                _date(anchor["forward_end_date"], "FORWARD_END_INVALID")
-                - _date(anchor["forward_start_date"], "FORWARD_START_INVALID")
-            ).days
-            + 1
-        )
-    ]
-    accepted = [
-        (position, replay.accepted_volume_by_position_id[position.position_id])
-        for position in replay.positions
-        if position.position_id in replay.accepted_volume_by_position_id
-    ]
-    if len(accepted) > _MAX_CANDIDATE_POSITIONS_PER_ANCHOR:
-        _fail("ACCEPTED_POSITION_BOUND_EXCEEDED", anchor["anchor_id"])
-    by_entry: dict[str, list[tuple[_PositionEvidence, Decimal]]] = {}
-    by_exit: dict[str, list[tuple[_PositionEvidence, Decimal]]] = {}
-    for position, volume in accepted:
-        entry_day = (
-            _timestamp(position.candidate.entry_time, "POSITION_ENTRY_TIME_INVALID")
-            .date()
-            .isoformat()
-        )
-        exit_day = (
-            _timestamp(
-                position.candidate.legs[-1].exit_time, "POSITION_EXIT_TIME_INVALID"
-            )
-            .date()
-            .isoformat()
-        )
-        by_entry.setdefault(entry_day, []).append((position, volume))
-        by_exit.setdefault(exit_day, []).append((position, volume))
-
-    event_days: list[dict[str, Any]] = []
-    fill_days: list[dict[str, Any]] = []
-    mtm_days: list[dict[str, Any]] = []
-    cost_days: list[dict[str, Any]] = []
-    exposure_days: list[dict[str, Any]] = []
-    margin_days: list[dict[str, Any]] = []
-    open_states: dict[str, tuple[_PositionEvidence, Decimal, Decimal]] = {}
-    equity = starting_balance
-    cumulative_base_cost = Decimal(0)
-    cumulative_stress_cost = Decimal(0)
-    if not equity.is_finite() or equity <= 0:
-        _fail("REPLAY_STARTING_BALANCE_INVALID")
-    for day_text in dates:
-        entries_event: list[dict[str, Any]] = []
-        entries_fill: list[dict[str, Any]] = []
-        for position, volume in sorted(
-            by_entry.get(day_text, []), key=lambda item: item[0].position_id
-        ):
-            if position.position_id in open_states:
-                _fail("ACCEPTED_POSITION_REOPENED", position.position_id)
-            opened_at = _utc_seconds(
-                _timestamp(
-                    position.candidate.entry_time, "POSITION_ENTRY_TIME_INVALID"
-                ).isoformat(),
-                "POSITION_ENTRY_TIME_INVALID",
-            )
-            event_id = _raw_event_id(anchor["anchor_id"], position.position_id, "OPEN")
-            quantity = _decimal_text(volume)
-            entries_event.append(
-                _event_decisions(
-                    event_id=event_id,
-                    position_id=position.position_id,
-                    cell_id=position.cell_id,
-                    regime=position.regime,
-                    decided_at_utc=opened_at,
-                    action="OPEN",
-                )
-            )
-            entries_fill.append(
-                {
-                    "event_id": event_id,
-                    "position_id": position.position_id,
-                    "cell_id": position.cell_id,
-                    "opened_at_utc": opened_at,
-                    "side": position.side,
-                    "quantity": quantity,
-                    "contract_multiplier": _decimal_text(position.contract_multiplier),
-                    "stop_price": _decimal_text(position.stop_price),
-                    "broker_fill_id": _broker_fill_id(
-                        anchor["anchor_id"], position.position_id, "OPEN"
-                    ),
-                    "reference_mid_price": _decimal_text(position.entry_mid),
-                    "reference_bid_price": _decimal_text(position.entry_bid),
-                    "reference_ask_price": _decimal_text(position.entry_ask),
-                    "base_fill_price": _decimal_text(position.base_entry_fill),
-                    "stress_fill_price": _decimal_text(position.stress_entry_fill),
-                }
-            )
-            open_states[position.position_id] = (
-                position,
-                volume,
-                position.entry_mid,
-            )
-
-        mark_events: list[dict[str, Any]] = []
-        raw_marks: list[dict[str, Any]] = []
-        mark_costs: list[dict[str, Any]] = []
-        exposure_positions: list[dict[str, Any]] = []
-        daily_gross = Decimal(0)
-        daily_base_cost = Decimal(0)
-        daily_stress_cost = Decimal(0)
-        for position_id in sorted(open_states):
-            position, volume, last_mark = open_states[position_id]
-            match = [mark for mark in position.marks if mark.date == day_text]
-            if len(match) != 1:
-                _fail("ACCEPTED_POSITION_DAILY_MARK_INCOMPLETE", position_id, day_text)
-            mark = match[0]
-            event_id = _raw_event_id(anchor["anchor_id"], position_id, "MARK", day_text)
-            mark_events.append({"event_id": event_id, "position_id": position_id})
-            raw_marks.append(
-                {
-                    "event_id": event_id,
-                    "position_id": position_id,
-                    "marked_at_utc": mark.marked_at_utc,
-                    "mark_price": _decimal_text(mark.mid_price),
-                    "mark_bid_price": _decimal_text(mark.bid_price),
-                    "mark_ask_price": _decimal_text(mark.ask_price),
-                }
-            )
-            base_finance = mark.base_financing_per_lot * volume
-            stress_finance = mark.stress_financing_per_lot * volume
-            mark_costs.append(
-                {
-                    "event_id": event_id,
-                    "base_financing_cash": _decimal_text(base_finance),
-                    "stress_financing_cash": _decimal_text(stress_finance),
-                }
-            )
-            sign = Decimal(1) if position.side == "LONG" else Decimal(-1)
-            unit = volume * position.contract_multiplier
-            daily_gross += sign * unit * (mark.mid_price - last_mark)
-            daily_base_cost += base_finance
-            daily_stress_cost += stress_finance
-            if (
-                day_text
-                == _timestamp(
-                    position.candidate.entry_time, "POSITION_ENTRY_TIME_INVALID"
-                )
-                .date()
-                .isoformat()
-            ):
-                executable = (
-                    position.entry_ask
-                    if position.side == "LONG"
-                    else position.entry_bid
-                )
-                spread = sign * (executable - position.entry_mid) * unit
-                base_fill_degradation = (
-                    sign * (position.base_entry_fill - executable) * unit
-                )
-                stress_fill_degradation = (
-                    sign * (position.stress_entry_fill - executable) * unit
-                )
-                daily_base_cost += max(
-                    Decimal(0), spread + base_fill_degradation
-                )
-                daily_stress_cost += max(
-                    Decimal(0), spread + stress_fill_degradation
-                )
-            required_margin = position.margin_per_lot * volume
-            exposure_positions.append(
-                {
-                    "position_id": position_id,
-                    "quantity": _decimal_text(volume),
-                    "contract_multiplier": _decimal_text(position.contract_multiplier),
-                    "stop_price": _decimal_text(position.stop_price),
-                    "required_margin_cash": _decimal_text(required_margin),
-                }
-            )
-            open_states[position_id] = (position, volume, mark.mid_price)
-
-        exits_event: list[dict[str, Any]] = []
-        exits_fill: list[dict[str, Any]] = []
-        for position, volume in sorted(
-            by_exit.get(day_text, []), key=lambda item: item[0].position_id
-        ):
-            state = open_states.get(position.position_id)
-            if state is None:
-                _fail("ACCEPTED_POSITION_EXIT_NOT_OPEN", position.position_id)
-            closed_at = _utc_seconds(
-                _timestamp(
-                    position.candidate.legs[-1].exit_time,
-                    "POSITION_EXIT_TIME_INVALID",
-                ).isoformat(),
-                "POSITION_EXIT_TIME_INVALID",
-            )
-            event_id = _raw_event_id(anchor["anchor_id"], position.position_id, "CLOSE")
-            exits_event.append(
-                _event_decisions(
-                    event_id=event_id,
-                    position_id=position.position_id,
-                    cell_id=position.cell_id,
-                    regime=position.regime,
-                    decided_at_utc=closed_at,
-                    action="CLOSE",
-                )
-            )
-            exits_fill.append(
-                {
-                    "event_id": event_id,
-                    "position_id": position.position_id,
-                    "closed_at_utc": closed_at,
-                    "broker_fill_id": _broker_fill_id(
-                        anchor["anchor_id"], position.position_id, "CLOSE"
-                    ),
-                    "reference_mid_price": _decimal_text(position.exit_mid),
-                    "reference_bid_price": _decimal_text(position.exit_bid),
-                    "reference_ask_price": _decimal_text(position.exit_ask),
-                    "base_fill_price": _decimal_text(position.base_exit_fill),
-                    "stress_fill_price": _decimal_text(position.stress_exit_fill),
-                }
-            )
-            sign = Decimal(1) if position.side == "LONG" else Decimal(-1)
-            unit = volume * position.contract_multiplier
-            # The daily mark is an independently acquired M5 Open, while the
-            # close is the exact specialist execution fill.  Realize the gross
-            # mid-price move from that last common valuation to the execution
-            # reference before charging the executable spread/fill degradation.
-            daily_gross += sign * unit * (position.exit_mid - state[2])
-            executable = (
-                position.exit_bid if position.side == "LONG" else position.exit_ask
-            )
-            spread = sign * (position.exit_mid - executable) * unit
-            base_fill_degradation = (
-                sign * (executable - position.base_exit_fill) * unit
-            )
-            stress_fill_degradation = (
-                sign * (executable - position.stress_exit_fill) * unit
-            )
-            daily_base_cost += max(Decimal(0), spread + base_fill_degradation)
-            daily_stress_cost += max(
-                Decimal(0), spread + stress_fill_degradation
-            )
-            del open_states[position.position_id]
-
-        used_margin = sum(
-            (
-                _decimal(item["required_margin_cash"], "POSITION_MARGIN_INVALID")
-                for item in exposure_positions
-            ),
-            Decimal(0),
-        )
-        free_margin = equity - used_margin
-        if free_margin < 0:
-            _fail("FORWARD_REPLAY_UNMODELED_MARGIN_CALL", anchor["anchor_id"], day_text)
-        basis_text = _decimal_text(equity)
-        event_days.append(
-            {
-                "date": day_text,
-                "entries": entries_event,
-                "marks": mark_events,
-                "exits": exits_event,
-            }
-        )
-        fill_days.append(
-            {
-                "date": day_text,
-                "entries": entries_fill,
-                "exits": exits_fill,
-            }
-        )
-        mtm_days.append(
-            {
-                "date": day_text,
-                "equity_basis_cash": basis_text,
-                "position_marks": raw_marks,
-            }
-        )
-        cost_days.append(
-            {
-                "date": day_text,
-                "marks": mark_costs,
-            }
-        )
-        exposure_days.append({"date": day_text, "positions": exposure_positions})
-        margin_days.append(
-            {
-                "date": day_text,
-                "equity_basis_cash": basis_text,
-                "used_margin_cash": _decimal_text(used_margin),
-                "free_margin_cash": _decimal_text(free_margin),
-            }
-        )
-        equity += daily_gross - daily_base_cost
-        if not equity.is_finite() or equity <= 0:
-            _fail("FORWARD_REPLAY_EQUITY_RUIN", anchor["anchor_id"], day_text)
-        cumulative_base_cost += daily_base_cost
-        cumulative_stress_cost += daily_stress_cost
-        # MT5 swap mode 6 can make one stressed SHORT rollover day less costly
-        # because its rate depends on the worse opening notional.  Protect the
-        # shared gross event stream and still-open positions by comparing every
-        # cumulative cost prefix instead of each daily first difference.
-        if cumulative_stress_cost + Decimal("1e-12") < cumulative_base_cost:
-            _fail("FORWARD_REPLAY_STRESS_COST_IMPROVES", anchor["anchor_id"], day_text)
-    if open_states:
-        _fail("FORWARD_REPLAY_ENDS_WITH_OPEN_POSITIONS", anchor["anchor_id"])
-
-    common = {
-        "anchor_id": anchor["anchor_id"],
-        "forward_start_date": anchor["forward_start_date"],
-        "forward_end_date": anchor["forward_end_date"],
-    }
-    specialists_body = [
-        {
-            "schema_version": causal_producer.SPECIALIST_SCHEMA,
-            "cell_id": value.cell_id,
-            "strategy_module": value.strategy_module,
-            "strategy_class": value.strategy_class,
-            "parameters": dict(value.parameters),
-            "refit_market_data_end_utc": anchor["selection_cutoff_utc"],
-        }
-        for value in replay.specialists
-    ]
-    return {
-        "EVENT_LEDGER": {
-            "schema_version": causal_producer.EVENT_LEDGER_SCHEMA,
-            **common,
-            "selection_cutoff_utc": anchor["selection_cutoff_utc"],
-            "specialists": specialists_body,
-            "initial_positions": [],
-            "days": event_days,
-        },
-        "FILL_LEDGER": {
-            "schema_version": causal_producer.FILL_LEDGER_SCHEMA,
-            **common,
-            "initial_positions": [],
-            "days": fill_days,
-        },
-        "MTM_LEDGER": {
-            "schema_version": causal_producer.MTM_LEDGER_SCHEMA,
-            **common,
-            "days": mtm_days,
-        },
-        "COST_LEDGER": {
-            "schema_version": causal_producer.COST_LEDGER_SCHEMA,
-            **common,
-            "days": cost_days,
-        },
-        "EXPOSURE_LEDGER": {
-            "schema_version": causal_producer.EXPOSURE_LEDGER_SCHEMA,
-            **common,
-            "days": exposure_days,
-        },
-        "MARGIN_LEDGER": {
-            "schema_version": causal_producer.MARGIN_LEDGER_SCHEMA,
-            **common,
-            "days": margin_days,
-        },
-    }

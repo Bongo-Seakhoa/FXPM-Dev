@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Any, Tuple, Optional, Set
 
 from pm_core import StrategyCategory, get_instrument_spec, InstrumentSpec, FeatureComputer
+from pm_current_refit_parameters import build_parameter_domain
 
 try:
     from numba import njit as _numba_njit
@@ -650,8 +651,9 @@ def _candle_parts(features: pd.DataFrame) -> Tuple[pd.Series, ...]:
     close = pd.to_numeric(features["Close"], errors="coerce")
     body = (close - open_).abs()
     candle_range = (high - low).abs()
-    upper_wick = high - pd.concat([open_, close], axis=1).max(axis=1)
-    lower_wick = pd.concat([open_, close], axis=1).min(axis=1) - low
+    open_close = pd.concat([open_, close], axis=1)
+    upper_wick = high - open_close.max(axis=1)
+    lower_wick = open_close.min(axis=1) - low
     bull = close > open_
     bear = close < open_
     return open_, high, low, close, body, candle_range, upper_wick, lower_wick, bull, bear
@@ -1020,8 +1022,12 @@ class BaseStrategy(ABC):
         """Get parameter grid for optimization."""
         return {}
 
+    def get_param_couplings(self) -> Tuple[Dict[str, Any], ...]:
+        """Legal joint choices for flat parameter keys that must vary together."""
+        return ()
+
     def cartesian_grid_size(self) -> int:
-        """Compute cartesian-product size of `get_param_grid()`.
+        """Compute the legal grid size, including coupled parameter choices.
 
         Returns 0 for an empty grid. Pure observability — used by the optimizer
         log surface and the large-grid WARN. Does not influence search.
@@ -1029,13 +1035,12 @@ class BaseStrategy(ABC):
         grid = self.get_param_grid()
         if not grid:
             return 0
-        size = 1
-        for values in grid.values():
-            n = len(values) if values else 0
-            if n == 0:
-                return 0
-            size *= n
-        return size
+        if any(not values for values in grid.values()):
+            return 0
+        return build_parameter_domain(
+            self.get_default_params(), grid,
+            coupled_groups=self.get_param_couplings(),
+        )['point_count']
 
     def warn_if_param_grid_large(self) -> int:
         """Emit one-time WARN per (strategy, size) when cartesian > threshold.
@@ -2716,11 +2721,11 @@ class EMARibbonADXStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {
-            "ema_fast": [5, 8, 10, 13, 15],
-            "ema_mid": [20, 21, 25, 30, 35],
-            "ema_slow": [50, 100, 150, 200],
+            "ema_fast": [5, 8, 15],
+            "ema_mid": [21, 30, 35],
+            "ema_slow": [50, 100, 200],
             "adx_threshold": [15, 20, 25, 30],
-            "adx_period": [10, 14, 20],
+            "adx_period": [14],
             "use_di_confirmation": [True, False],
             **self._base_sl_tp_grid(),
             **self._structural_sl_grid(),
@@ -2857,14 +2862,18 @@ class MACDHistogramMomentumStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {
-            "macd_fast": [8, 10, 12, 16],
-            "macd_slow": [21, 26, 30, 34],
+            "macd_fast": [8, 12, 16],
+            "macd_slow": [21, 26, 34],
             "macd_signal": [7, 9, 12],
             "ema_filter_period": [0, 20, 50, 100],
             "adx_threshold": [0, 15, 20, 25, 30],
             **self._base_sl_tp_grid(),
             **self._structural_sl_grid(),
         }
+
+    def get_param_couplings(self) -> Tuple[Dict[str, Any], ...]:
+        return ({'names': ('macd_fast', 'macd_slow'),
+                 'choices': ((8, 21), (12, 26), (16, 34))},)
 
 
 class StochRSITrendGateStrategy(BaseStrategy):
@@ -2939,15 +2948,19 @@ class StochRSITrendGateStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {
-            "rsi_period": [5, 7, 10, 14, 21],
+            "rsi_period": [5, 14, 21],
             "stoch_period": [10, 14, 20],
             "smooth_k": [3, 5],
             "smooth_d": [3, 5],
             "lower_band": [10, 15, 20, 30],
             "upper_band": [70, 80, 85, 90],
-            "ema_trend_period": [50, 100, 150, 200],
+            "ema_trend_period": [50, 100, 200],
             **self._base_sl_tp_grid(),
         }
+
+    def get_param_couplings(self) -> Tuple[Dict[str, Any], ...]:
+        return ({'names': ('lower_band', 'upper_band'),
+                 'choices': ((10, 90), (15, 85), (20, 80), (30, 70))},)
 
 
 # Existing configs migrate VWAPDeviationReversionStrategy to the
@@ -3050,11 +3063,15 @@ class SessionVWAPReversionStrategy(BaseStrategy):
             "session_start_hour": [0, 7, 8],
             "session_end_hour": [16, 20, 23],
             "deviation_atr_mult": [0.75, 1.0, 1.25, 1.5, 2.0],
-            "atr_period": [10, 14, 20],
+            "atr_period": [14],
             "trend_ema_period": [0, 50, 100, 200],
             "adx_max": [0, 20, 25, 30],
             **self._base_sl_tp_grid(),
         }
+
+    def get_param_couplings(self) -> Tuple[Dict[str, Any], ...]:
+        return ({'names': ('session_start_hour', 'session_end_hour'),
+                 'choices': ((0, 23), (7, 20), (8, 16))},)
 
 
 class LiquiditySweepReversalStrategy(BaseStrategy):
@@ -3217,13 +3234,13 @@ class RegimeTransitionBreakoutStrategy(BaseStrategy):
 
     def get_param_grid(self) -> Dict[str, List]:
         return {
-            "lookback": [10, 20, 30, 50],
-            "transition_window": [2, 3, 5, 8],
+            "lookback": [10, 20, 50],
+            "transition_window": [2, 5, 8],
             "source_regimes": [("CHOP",), ("RANGE",), ("CHOP", "RANGE")],
             "target_regimes": [("BREAKOUT",), ("TREND",), ("BREAKOUT", "TREND")],
-            "min_regime_gap": [0.0, 0.03, 0.05, 0.08],
-            "adx_threshold": [0, 15, 18, 22, 25],
-            "ema_filter_period": [0, 20, 50, 100],
+            "min_regime_gap": [0.0, 0.05, 0.08],
+            "adx_threshold": [18],
+            "ema_filter_period": [50],
             **self._base_sl_tp_grid(),
             **self._structural_sl_grid(),
         }
@@ -3251,8 +3268,9 @@ class InsideBarBreakoutStrategy(BaseStrategy):
     def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
         min_ib = int(self.params.get('min_inside_bars', 1))
         max_age = max(1, int(self.params.get('setup_max_age_bars', 20)))
-        high, low, close = features['High'], features['Low'], features['Close']
+        high, low, close = (features[key].array for key in ('High', 'Low', 'Close'))
         signals = pd.Series(0, index=features.index, dtype=int)
+        signal_values = signals.array
 
         inside_streak = 0
         pending = False
@@ -3271,8 +3289,8 @@ class InsideBarBreakoutStrategy(BaseStrategy):
                 mother_h = np.nan
                 mother_l = np.nan
 
-            is_inside = ((high.iloc[i] < high.iloc[i - 1])
-                         and (low.iloc[i] > low.iloc[i - 1]))
+            is_inside = ((high[i] < high[i - 1])
+                         and (low[i] > low[i - 1]))
 
             if is_inside:
                 inside_streak += 1
@@ -3281,21 +3299,21 @@ class InsideBarBreakoutStrategy(BaseStrategy):
                     if mother_idx >= 0:
                         pending = True
                         setup_bar = i
-                        mother_h = high.iloc[mother_idx]
-                        mother_l = low.iloc[mother_idx]
+                        mother_h = high[mother_idx]
+                        mother_l = low[mother_idx]
                 continue
 
             if pending:
-                if close.iloc[i] > mother_h:
-                    signals.iloc[i] = 1
+                if close[i] > mother_h:
+                    signal_values[i] = 1
                     pending = False
                     setup_bar = -1
                     inside_streak = 0
                     mother_h = np.nan
                     mother_l = np.nan
                     continue
-                if close.iloc[i] < mother_l:
-                    signals.iloc[i] = -1
+                if close[i] < mother_l:
+                    signal_values[i] = -1
                     pending = False
                     setup_bar = -1
                     inside_streak = 0
@@ -3374,6 +3392,9 @@ class TurtleSoupReversalStrategy(BaseStrategy):
         don_h = h.rolling(ch).max().shift(1)
         don_l = l.rolling(ch).min().shift(1)
         signals = pd.Series(0, index=features.index, dtype=int)
+        close_values = c.array
+        don_high_values, don_low_values = don_h.array, don_l.array
+        signal_values = signals.array
 
         pending_short_bar = -1
         pending_short_level = np.nan
@@ -3381,16 +3402,16 @@ class TurtleSoupReversalStrategy(BaseStrategy):
         pending_long_level = np.nan
 
         for i in range(ch, len(features)):
-            if not np.isnan(don_h.iloc[i]) and c.iloc[i] > don_h.iloc[i]:
+            if not np.isnan(don_high_values[i]) and close_values[i] > don_high_values[i]:
                 pending_short_bar = i
-                pending_short_level = don_h.iloc[i]
-            if not np.isnan(don_l.iloc[i]) and c.iloc[i] < don_l.iloc[i]:
+                pending_short_level = don_high_values[i]
+            if not np.isnan(don_low_values[i]) and close_values[i] < don_low_values[i]:
                 pending_long_bar = i
-                pending_long_level = don_l.iloc[i]
+                pending_long_level = don_low_values[i]
 
             if pending_short_bar >= 0 and i > pending_short_bar:
-                if i - pending_short_bar <= rw and c.iloc[i] < pending_short_level:
-                    signals.iloc[i] = -1
+                if i - pending_short_bar <= rw and close_values[i] < pending_short_level:
+                    signal_values[i] = -1
                     pending_short_bar = -1
                     pending_short_level = np.nan
                 elif i - pending_short_bar > rw:
@@ -3398,8 +3419,8 @@ class TurtleSoupReversalStrategy(BaseStrategy):
                     pending_short_level = np.nan
 
             if pending_long_bar >= 0 and i > pending_long_bar:
-                if i - pending_long_bar <= rw and c.iloc[i] > pending_long_level:
-                    signals.iloc[i] = 1
+                if i - pending_long_bar <= rw and close_values[i] > pending_long_level:
+                    signal_values[i] = 1
                     pending_long_bar = -1
                     pending_long_level = np.nan
                 elif i - pending_long_bar > rw:

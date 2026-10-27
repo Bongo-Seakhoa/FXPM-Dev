@@ -27,14 +27,20 @@ __all__ = (
 )
 
 
-_REQUEST_SCHEMA = "fxpm.historical-horizon-request.v1"
-_UNOBSERVED_REQUEST_SCHEMA = "fxpm.historical-horizon-unobserved-request.v1"
-_PLAN_SCHEMA = "fxpm.historical-horizon-plan.v1"
-_EVIDENCE_SCHEMA = "fxpm.historical-horizon-evidence.v1"
-_SHARD_SCHEMA = "fxpm.historical-horizon-evidence-shard.v1"
+_CURRENT_REQUEST_SCHEMA = "fxpm.historical-horizon-request.v3"
+_CURRENT_UNOBSERVED_REQUEST_SCHEMA = "fxpm.historical-horizon-unobserved-request.v3"
+_CURRENT_PLAN_SCHEMA = "fxpm.historical-horizon-plan.v3"
+_CURRENT_EVIDENCE_SCHEMA = "fxpm.historical-horizon-evidence.v3"
+_CURRENT_SHARD_SCHEMA = "fxpm.historical-horizon-evidence-shard.v3"
+_REQUEST_SCHEMA = "fxpm.historical-horizon-request.v2"
+_UNOBSERVED_REQUEST_SCHEMA = "fxpm.historical-horizon-unobserved-request.v2"
+_PLAN_SCHEMA = "fxpm.historical-horizon-plan.v2"
+_EVIDENCE_SCHEMA = "fxpm.historical-horizon-evidence.v2"
+_SHARD_SCHEMA = "fxpm.historical-horizon-evidence-shard.v2"
 _DEPENDENCY_SCHEMA = "fxpm.historical-dependency-policy.v1"
 _DEPENDENCY_PAYLOAD_SCHEMA = "fxpm.historical-dependency-policy-payload.v1"
-_HORIZON_POLICY_SCHEMA = "fxpm.historical-horizon-policy.v1"
+_CURRENT_HORIZON_POLICY_SCHEMA = "fxpm.historical-horizon-policy.v3"
+_HORIZON_POLICY_SCHEMA = "fxpm.historical-horizon-policy.v2"
 _REGIME_SUPPORT_BINDING_SCHEMA = "fxpm.historical-horizon-regime-support-binding.v1"
 _REGIME_TRAIN_SUPPORT_SCHEMA = "fxpm.regime-train-support/v1"
 _REGIME_TRAIN_SUPPORT_VECTOR_ENCODING = "fxpm.regime-live-labels-nul/v1"
@@ -361,7 +367,7 @@ def _valid_plan(plan: Any) -> bool:
         if plan._seal is not _PLAN_SEAL:
             return False
         body = json.loads(plan._body_json.decode("utf-8"))
-        if type(body) is not dict or body.get("schema_version") != _PLAN_SCHEMA:
+        if type(body) is not dict or body.get("schema_version") not in (_CURRENT_PLAN_SCHEMA, _PLAN_SCHEMA):
             return False
         return (
             plan._receipt_sha256 == _sha256_bytes(plan._body_json) == _sha256_json(body)
@@ -377,7 +383,7 @@ def _valid_evidence(evidence: Any) -> bool:
         if evidence._seal is not _EVIDENCE_SEAL:
             return False
         body = json.loads(evidence._body_json.decode("utf-8"))
-        if type(body) is not dict or body.get("schema_version") != _EVIDENCE_SCHEMA:
+        if type(body) is not dict or body.get("schema_version") not in (_CURRENT_EVIDENCE_SCHEMA, _EVIDENCE_SCHEMA):
             return False
         return (
             evidence._receipt_sha256
@@ -501,6 +507,10 @@ def _normalize_dependency_policy(value: Any) -> tuple[dict[str, Any], dict[str, 
 
 
 def _normalize_horizon_policy(value: Any) -> dict[str, Any]:
+    _require(type(value) is dict, "horizon policy must be an exact mapping")
+    current = value.get("schema_version") == _CURRENT_HORIZON_POLICY_SCHEMA
+    cost_pair_key = ("frozen_tier_pair_contract_sha256" if current
+                     else "cost_ladder_contract_sha256")
     policy = _exact_keys(
         value,
         (
@@ -508,20 +518,20 @@ def _normalize_horizon_policy(value: Any) -> dict[str, Any]:
             "policy_id",
             "policy_release_sha256",
             "cost_contract_sha256",
-            "cost_stress_contract_sha256",
+            cost_pair_key,
             "evaluator_release_sha256",
         ),
         "horizon policy",
     )
     _require(
-        policy["schema_version"] == _HORIZON_POLICY_SCHEMA,
+        policy["schema_version"] in (_CURRENT_HORIZON_POLICY_SCHEMA, _HORIZON_POLICY_SCHEMA),
         "horizon policy schema mismatch",
     )
     _safe_id(policy["policy_id"], "horizon policy id")
     for key in (
         "policy_release_sha256",
         "cost_contract_sha256",
-        "cost_stress_contract_sha256",
+        cost_pair_key,
         "evaluator_release_sha256",
     ):
         _digest(policy[key], key)
@@ -1308,7 +1318,7 @@ def _normalize_request(request: Any) -> dict[str, Any]:
     normalized = _bounded_snapshot(request, _MAX_REQUEST_BYTES)
     _require(type(normalized) is dict, "request must be an exact mapping")
     request_schema = normalized.get("schema_version")
-    if request_schema == _REQUEST_SCHEMA:
+    if request_schema in (_CURRENT_REQUEST_SCHEMA, _REQUEST_SCHEMA):
         request_keys = (
             "schema_version",
             "run_id",
@@ -1321,7 +1331,7 @@ def _normalize_request(request: Any) -> dict[str, Any]:
             "trials",
         )
         unobserved_request = False
-    elif request_schema == _UNOBSERVED_REQUEST_SCHEMA:
+    elif request_schema in (_CURRENT_UNOBSERVED_REQUEST_SCHEMA, _UNOBSERVED_REQUEST_SCHEMA):
         request_keys = (
             "schema_version",
             "run_id",
@@ -1347,6 +1357,11 @@ def _normalize_request(request: Any) -> dict[str, Any]:
     cell = _normalize_cell(root["cell"])
     dependency, derived_bars = _normalize_dependency_policy(root["dependency_policy"])
     policy = _normalize_horizon_policy(root["horizon_policy"])
+    _require(
+        (request_schema in (_CURRENT_REQUEST_SCHEMA, _CURRENT_UNOBSERVED_REQUEST_SCHEMA))
+        == (policy["schema_version"] == _CURRENT_HORIZON_POLICY_SCHEMA),
+        "request and horizon policy generations differ",
+    )
     prefix = _normalize_native_prefix(root["native_prefix"], cell, anchor)
     geometry = _derived_geometry(cell["timeframe"], derived_bars, dependency["payload"])
     _require(type(root["candidates"]) is list, "candidates must be a list")
@@ -1598,10 +1613,11 @@ def _evaluation_context(
             "evaluator_release_sha256"
         ],
         "cost_contract_sha256": request["horizon_policy"]["cost_contract_sha256"],
-        "cost_stress_contract_sha256": request["horizon_policy"][
-            "cost_stress_contract_sha256"
-        ],
     }
+    pair_key = ("frozen_tier_pair_contract_sha256"
+                if request["horizon_policy"]["schema_version"] == _CURRENT_HORIZON_POLICY_SCHEMA
+                else "cost_ladder_contract_sha256")
+    context[pair_key] = request["horizon_policy"][pair_key]
     disposition = trial.get("state_context_disposition")
     if type(disposition) is dict:
         context["state_context_disposition_sha256"] = disposition[
@@ -1748,7 +1764,9 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
         plan_status = "READY_FOR_HISTORICAL_EVIDENCE"
 
     body = {
-        "schema_version": _PLAN_SCHEMA,
+        "schema_version": (_CURRENT_PLAN_SCHEMA
+                           if normalized["horizon_policy"]["schema_version"] == _CURRENT_HORIZON_POLICY_SCHEMA
+                           else _PLAN_SCHEMA),
         "authority_scope": _AUTHORITY_SCOPE,
         "trust_class": _TRUST_CLASS,
         "requires_external_exact_artifact_verification": False,
@@ -1828,11 +1846,113 @@ def _empty_vectors(shard: dict[str, Any]) -> bool:
         for key in (
             "daily_dates_utc",
             "daily_net_mtm_r",
-            "daily_net_mtm_r_cost_stress",
+            "daily_net_mtm_r_p75",
+            "daily_net_mtm_r_p95",
             "completed_trade_close_utc",
             "completed_trade_net_mtm_r",
+            "completed_trade_net_mtm_r_p75",
+            "completed_trade_net_mtm_r_p95",
         )
     )
+
+
+def _normalize_tier_shard(
+    value: Any, expected: dict[str, Any], plan_body: dict[str, Any],
+    remaining_points: int,
+) -> tuple[dict[str, Any], int]:
+    shard = _exact_keys(value, (
+        "schema_version", "attempt_id", "fold_id", "context_sha256", "status",
+        "reason_code", "source_prefix_sha256", "evaluator_release_sha256",
+        "cost_contract_sha256", "frozen_tier_pair_contract_sha256", "evidence_role",
+        "final_oos_authority", "tier_evidence",
+    ), "evidence shard")
+    _require(shard["schema_version"] == _CURRENT_SHARD_SCHEMA, "evidence shard schema mismatch")
+    for key, other, message in (
+        ("attempt_id", expected["attempt_id"], "evidence attempt roster mismatch"),
+        ("fold_id", expected["fold_id"], "evidence fold roster mismatch"),
+        ("context_sha256", expected["context_sha256"], "evidence context mismatch"),
+        ("source_prefix_sha256", _source_prefix_receipt(plan_body), "source prefix receipt mismatch"),
+        ("evidence_role", expected["role"], "evidence role mismatch"),
+    ):
+        _require(shard[key] == other, message)
+    policy = plan_body["horizon_policy"]
+    for key in ("evaluator_release_sha256", "cost_contract_sha256",
+                "frozen_tier_pair_contract_sha256"):
+        _require(shard[key] == policy[key], key + " mismatch")
+    _require(shard["final_oos_authority"] is False,
+             "evidence shard cannot confer final OOS authority")
+    _text_or_none(shard["reason_code"], "shard reason code")
+    if expected["expected_status"] == _PROCESS_REJECTED:
+        _require(shard["status"] == _PROCESS_REJECTED,
+                 "presearch terminal cannot be reclassified")
+        _require(shard["reason_code"] == expected["expected_reason_code"],
+                 "presearch terminal reason mismatch")
+    else:
+        _require(shard["status"] in (_AUTHENTICATED, _PROCESS_REJECTED, _TECHNICAL_SHARD),
+                 "invalid evidence shard status")
+        if shard["status"] == _PROCESS_REJECTED:
+            _require(shard["reason_code"] == _PROCESS_SCREEN_REASON,
+                     "process rejection reason is not preregistered")
+        elif shard["status"] == _TECHNICAL_SHARD:
+            _require(shard["reason_code"] in _TECHNICAL_REASONS,
+                     "invalid technical failure reason")
+        else:
+            _require(shard["reason_code"] is None,
+                     "authenticated shard cannot carry a failure reason")
+    authenticated = shard["status"] == _AUTHENTICATED
+    if not authenticated:
+        _require(type(shard["tier_evidence"]) is dict and shard["tier_evidence"] == {},
+                 "rejected or technical shard cannot carry tier evidence")
+        return shard, 0
+    tiers = _exact_keys(shard["tier_evidence"], ("P75", "P95"), "tier evidence")
+    vector_keys = ("daily_dates_utc", "daily_net_mtm_r",
+                   "completed_trade_close_utc", "completed_trade_net_mtm_r")
+    hash_keys = ("source_contract_sha256", "cost_contract_sha256",
+                 "entry_spread_admission_policy_sha256", "position_activity_ledger_sha256",
+                 "daily_surface_sha256", "trade_vector_sha256")
+    used = 0
+    for name in ("P75", "P95"):
+        tier = _exact_keys(tiers[name], (
+            "spread_tier", *hash_keys, *vector_keys, "trade_power_binding",
+        ), "tier evidence " + name)
+        _require(tier["spread_tier"] == name, "tier evidence identity mismatch")
+        for key in hash_keys:
+            _digest(tier[key], name + " " + key)
+        for key in vector_keys:
+            _require(type(tier[key]) is list, name + " " + key + " must be a list")
+            used += len(tier[key])
+        _require(used <= remaining_points, "evidence vector point ceiling exceeded")
+        _require(tier["trade_power_binding"] is None
+                 or type(tier["trade_power_binding"]) is dict,
+                 "invalid tier trade power binding")
+        _require(len(tier["daily_dates_utc"]) > 0, "authenticated shard requires nonempty daily MTM evidence")
+        _require(len(tier["daily_dates_utc"]) == len(tier["daily_net_mtm_r"]),
+                 "daily vectors are not aligned")
+        _require(len(tier["completed_trade_close_utc"]) == len(tier["completed_trade_net_mtm_r"]),
+                 "completed-trade vectors are not aligned")
+        start = _utc(expected["validation_start_utc"], "expected validation start")
+        end = _utc(expected["validation_end_exclusive_utc"], "expected validation end")
+        _require(start.time() == datetime.min.time() and end.time() == datetime.min.time(),
+                 "daily evidence requires UTC-midnight validation boundaries")
+        previous = None
+        for index, raw in enumerate(tier["daily_dates_utc"]):
+            day = _date(raw, name + " daily date")
+            _require(start.date() <= day.date() < end.date(),
+                     "daily observation lies outside validation interval")
+            _require(previous is None or previous < day,
+                     "daily dates must be strictly increasing and unique")
+            previous = day
+            _decimal_text(tier["daily_net_mtm_r"][index], name + " daily observation")
+        previous = None
+        for index, raw in enumerate(tier["completed_trade_close_utc"]):
+            close = _utc(raw, name + " completed trade close")
+            _require(start <= close < end, "completed trade lies outside validation interval")
+            _require(previous is None or previous <= close, "completed trade closes must not reorder")
+            previous = close
+            _decimal_text(tier["completed_trade_net_mtm_r"][index], name + " completed trade observation")
+    _require(tiers["P75"]["daily_dates_utc"] == tiers["P95"]["daily_dates_utc"],
+             "tier daily dates must share causal validation geometry")
+    return shard, used
 
 
 def _normalize_shard(
@@ -1841,6 +1961,8 @@ def _normalize_shard(
     plan_body: dict[str, Any],
     remaining_points: int,
 ) -> tuple[dict[str, Any], int]:
+    if plan_body["schema_version"] == _CURRENT_PLAN_SCHEMA:
+        return _normalize_tier_shard(value, expected, plan_body, remaining_points)
     shard = _exact_keys(
         value,
         (
@@ -1853,14 +1975,17 @@ def _normalize_shard(
             "source_prefix_sha256",
             "evaluator_release_sha256",
             "cost_contract_sha256",
-            "cost_stress_contract_sha256",
+            "cost_ladder_contract_sha256",
             "evidence_role",
             "final_oos_authority",
             "daily_dates_utc",
             "daily_net_mtm_r",
-            "daily_net_mtm_r_cost_stress",
+            "daily_net_mtm_r_p75",
+            "daily_net_mtm_r_p95",
             "completed_trade_close_utc",
             "completed_trade_net_mtm_r",
+            "completed_trade_net_mtm_r_p75",
+            "completed_trade_net_mtm_r_p95",
         ),
         "evidence shard",
     )
@@ -1888,8 +2013,8 @@ def _normalize_shard(
         "cost contract mismatch",
     )
     _require(
-        shard["cost_stress_contract_sha256"] == policy["cost_stress_contract_sha256"],
-        "cost stress contract mismatch",
+        shard["cost_ladder_contract_sha256"] == policy["cost_ladder_contract_sha256"],
+        "cost ladder contract mismatch",
     )
     _require(shard["evidence_role"] == expected["role"], "evidence role mismatch")
     _require(
@@ -1900,9 +2025,12 @@ def _normalize_shard(
     for key in (
         "daily_dates_utc",
         "daily_net_mtm_r",
-        "daily_net_mtm_r_cost_stress",
+        "daily_net_mtm_r_p75",
+        "daily_net_mtm_r_p95",
         "completed_trade_close_utc",
         "completed_trade_net_mtm_r",
+        "completed_trade_net_mtm_r_p75",
+        "completed_trade_net_mtm_r_p95",
     ):
         _require(type(shard[key]) is list, f"{key} must be a list")
 
@@ -1911,9 +2039,12 @@ def _normalize_shard(
         for key in (
             "daily_dates_utc",
             "daily_net_mtm_r",
-            "daily_net_mtm_r_cost_stress",
+            "daily_net_mtm_r_p75",
+            "daily_net_mtm_r_p95",
             "completed_trade_close_utc",
             "completed_trade_net_mtm_r",
+            "completed_trade_net_mtm_r_p75",
+            "completed_trade_net_mtm_r_p95",
         )
     )
     _require(point_count <= remaining_points, "evidence vector point ceiling exceeded")
@@ -1962,12 +2093,15 @@ def _normalize_shard(
     _require(
         len(shard["daily_dates_utc"])
         == len(shard["daily_net_mtm_r"])
-        == len(shard["daily_net_mtm_r_cost_stress"]),
+        == len(shard["daily_net_mtm_r_p75"])
+        == len(shard["daily_net_mtm_r_p95"]),
         "daily vectors are not aligned",
     )
     _require(
         len(shard["completed_trade_close_utc"])
-        == len(shard["completed_trade_net_mtm_r"]),
+        == len(shard["completed_trade_net_mtm_r"])
+        == len(shard["completed_trade_net_mtm_r_p75"])
+        == len(shard["completed_trade_net_mtm_r_p95"]),
         "completed-trade vectors are not aligned",
     )
     validation_start = _utc(
@@ -1983,6 +2117,7 @@ def _normalize_shard(
             "daily evidence requires UTC-midnight validation boundaries",
         )
     previous_day: datetime | None = None
+    cumulative = {"BASE": Decimal(0), "P75": Decimal(0), "P95": Decimal(0)}
     for index, raw_day in enumerate(shard["daily_dates_utc"]):
         day = _date(raw_day, f"daily date {index}")
         _require(
@@ -1994,10 +2129,32 @@ def _normalize_shard(
                 previous_day < day, "daily dates must be strictly increasing and unique"
             )
         previous_day = day
-        _decimal_text(shard["daily_net_mtm_r"][index], f"daily net observation {index}")
-        _decimal_text(
-            shard["daily_net_mtm_r_cost_stress"][index],
-            f"daily cost-stress observation {index}",
+        lane_values = {
+            "BASE": Decimal(
+                _decimal_text(
+                    shard["daily_net_mtm_r"][index],
+                    f"daily BASE observation {index}",
+                )
+            ),
+            "P75": Decimal(
+                _decimal_text(
+                    shard["daily_net_mtm_r_p75"][index],
+                    f"daily P75 observation {index}",
+                )
+            ),
+            "P95": Decimal(
+                _decimal_text(
+                    shard["daily_net_mtm_r_p95"][index],
+                    f"daily P95 observation {index}",
+                )
+            ),
+        }
+        for lane in cumulative:
+            cumulative[lane] += lane_values[lane]
+        _require(
+            cumulative["P75"] <= cumulative["BASE"] + Decimal("1e-12")
+            and cumulative["P95"] <= cumulative["P75"] + Decimal("1e-12"),
+            "cost ladder improves a cumulative daily prefix",
         )
     previous_close: datetime | None = None
     for index, raw_close in enumerate(shard["completed_trade_close_utc"]):
@@ -2009,9 +2166,28 @@ def _normalize_shard(
         if previous_close is not None:
             _require(previous_close <= close, "completed trade closes must not reorder")
         previous_close = close
-        _decimal_text(
-            shard["completed_trade_net_mtm_r"][index],
-            f"completed trade observation {index}",
+        base_trade = Decimal(
+            _decimal_text(
+                shard["completed_trade_net_mtm_r"][index],
+                f"completed BASE trade observation {index}",
+            )
+        )
+        p75_trade = Decimal(
+            _decimal_text(
+                shard["completed_trade_net_mtm_r_p75"][index],
+                f"completed P75 trade observation {index}",
+            )
+        )
+        p95_trade = Decimal(
+            _decimal_text(
+                shard["completed_trade_net_mtm_r_p95"][index],
+                f"completed P95 trade observation {index}",
+            )
+        )
+        _require(
+            p75_trade <= base_trade + Decimal("1e-12")
+            and p95_trade <= p75_trade + Decimal("1e-12"),
+            "cost ladder improves a completed trade",
         )
     return shard, point_count
 
@@ -2078,7 +2254,8 @@ def _evidence_body(plan_body: dict[str, Any], raw_shards: Any) -> dict[str, Any]
     else:
         evidence_status = "HISTORICAL_EVIDENCE_COMPLETE"
     body = {
-        "schema_version": _EVIDENCE_SCHEMA,
+        "schema_version": (_CURRENT_EVIDENCE_SCHEMA if plan_body["schema_version"] == _CURRENT_PLAN_SCHEMA
+                           else _EVIDENCE_SCHEMA),
         "authority_scope": _AUTHORITY_SCOPE,
         "trust_class": _TRUST_CLASS,
         "requires_external_exact_artifact_verification": False,
@@ -2261,6 +2438,7 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         "_build_plan",
         "_source_prefix_receipt",
         "_empty_vectors",
+        "_normalize_tier_shard",
         "_normalize_shard",
         "_evidence_body",
         "_evidence_worker",
@@ -2277,6 +2455,11 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         for name in critical_names
     )
     constants = (
+        ("_CURRENT_REQUEST_SCHEMA", _CURRENT_REQUEST_SCHEMA),
+        ("_CURRENT_UNOBSERVED_REQUEST_SCHEMA", _CURRENT_UNOBSERVED_REQUEST_SCHEMA),
+        ("_CURRENT_PLAN_SCHEMA", _CURRENT_PLAN_SCHEMA),
+        ("_CURRENT_EVIDENCE_SCHEMA", _CURRENT_EVIDENCE_SCHEMA),
+        ("_CURRENT_SHARD_SCHEMA", _CURRENT_SHARD_SCHEMA),
         ("_REQUEST_SCHEMA", _REQUEST_SCHEMA),
         ("_UNOBSERVED_REQUEST_SCHEMA", _UNOBSERVED_REQUEST_SCHEMA),
         ("_PLAN_SCHEMA", _PLAN_SCHEMA),
@@ -2284,6 +2467,7 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         ("_SHARD_SCHEMA", _SHARD_SCHEMA),
         ("_DEPENDENCY_SCHEMA", _DEPENDENCY_SCHEMA),
         ("_DEPENDENCY_PAYLOAD_SCHEMA", _DEPENDENCY_PAYLOAD_SCHEMA),
+        ("_CURRENT_HORIZON_POLICY_SCHEMA", _CURRENT_HORIZON_POLICY_SCHEMA),
         ("_HORIZON_POLICY_SCHEMA", _HORIZON_POLICY_SCHEMA),
         ("_REGIME_SUPPORT_BINDING_SCHEMA", _REGIME_SUPPORT_BINDING_SCHEMA),
         ("_REGIME_TRAIN_SUPPORT_SCHEMA", _REGIME_TRAIN_SUPPORT_SCHEMA),

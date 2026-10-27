@@ -35,6 +35,7 @@ from typing import (
 import numpy as np
 import pandas as pd
 
+from pm_metrics import EquityReductionError, reduce_equity_path
 from pm_risk_admission import (
     GrossRiskLimits,
     StopRiskExposure,
@@ -2983,7 +2984,7 @@ class SynchronizedPortfolioSimulator:
                     "timestamp": stamp.isoformat(),
                     "balance": round(balance, 8),
                     "unrealized_pnl": round(unrealized, 8),
-                    "mtm_equity": round(equity, 8),
+                    "mtm_equity": equity,
                     "stop_equity": round(stop_equity, 8),
                     "open_risk": round(open_risk, 8),
                     "open_risk_pct": round(open_risk_pct, 8),
@@ -3013,12 +3014,19 @@ class SynchronizedPortfolioSimulator:
                 "portfolio replay ended with open positions; every candidate must have a final exit"
             )
 
-        daily_returns = self._daily_equity_returns(path) if closed_positions else []
+        equity_growth = self._equity_growth(path)
+        daily_returns = [
+            math.expm1(value)
+            for value in equity_growth["inference_daily_log_returns"]
+        ]
         ruin = bootstrap_ruin_probability(
             daily_returns,
             starting_balance=self.policy.starting_balance,
             ruin_equity_pct=self.policy.ruin_equity_pct,
         )
+        ruin["input_coverage_status"] = equity_growth["coverage_status"]
+        if not daily_returns:
+            ruin["unavailable_reason"] = equity_growth["coverage_reason"]
         wins = sum(1 for trade in closed_positions if trade["net_pnl"] > 0.0)
         gross_profit = sum(max(0.0, trade["net_pnl"]) for trade in closed_positions)
         gross_loss = -sum(min(0.0, trade["net_pnl"]) for trade in closed_positions)
@@ -3101,6 +3109,7 @@ class SynchronizedPortfolioSimulator:
                 min(min_equity, min_stop_equity)
                 <= self.policy.starting_balance * self.policy.ruin_equity_pct / 100.0
             ),
+            "equity_growth": equity_growth,
             "exploratory_sequence_bootstrap": ruin,
             "limitations": [
                 "candidate strategies and parameters remain selection-contaminated unless generated solely from an untouched lockbox",
@@ -3109,6 +3118,7 @@ class SynchronizedPortfolioSimulator:
                 "replay stop-equity remains the legacy immutable initial-stop model until the separate causal stop-state lane is implemented",
                 "spread is embedded in executable price P&L and is not separately identifiable from the current trade schema",
                 "bootstrap ruin is a conditional sequence stress test, not a forecast or profitability guarantee",
+                "the event-bounded equity path has no authenticated evaluation window or complete temporal valuation coverage; full-day bootstrap input is unavailable",
             ],
         }
         return {
@@ -3290,22 +3300,42 @@ class SynchronizedPortfolioSimulator:
     def _drawdown(peak: float, value: float) -> float:
         return max(0.0, (peak - value) / peak * 100.0) if peak > 0.0 else 100.0
 
-    @staticmethod
-    def _daily_equity_returns(path: Sequence[Mapping[str, Any]]) -> List[float]:
-        if len(path) < 2:
-            return []
-        frame = pd.DataFrame(path)
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
-        frame["mtm_equity"] = pd.to_numeric(frame["mtm_equity"], errors="coerce")
-        frame = (
-            frame.dropna(subset=["timestamp", "mtm_equity"])
-            .set_index("timestamp")
-            .sort_index()
-        )
-        if len(frame) < 2:
-            return []
-        daily = frame["mtm_equity"].resample("1D").last().ffill().pct_change().dropna()
-        return [float(value) for value in daily if math.isfinite(float(value))]
+    def _equity_growth(self, path: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+        """Chain the observed path without claiming a complete evaluation window."""
+        unavailable = {
+            "evaluation_window_role": "EVENT_BOUNDED",
+            "coverage_status": "EVENT_BOUNDED",
+            "coverage_reason": "EVALUATION_WINDOW_AND_VALUATION_CONTEXT_UNPROVEN",
+            "inference_daily_log_returns": [],
+            "cumulative_log_growth": None,
+            "time_weighted_return": None,
+        }
+        if len(path) < 2 or path[0]["timestamp"] == path[-1]["timestamp"]:
+            return {**unavailable, "failure_code": "EVALUATION_WINDOW_NOT_POSITIVE"}
+        # Replay's existing timestamp codec represents UTC without a zone tag.
+        marks = [
+            (_timestamp(row["timestamp"]).tz_localize("UTC"), row["mtm_equity"])
+            for row in path
+        ]
+        try:
+            reduction = reduce_equity_path(
+                initial_equity=self.policy.starting_balance,
+                marks=marks[:-1],
+                evaluation_start=marks[0][0],
+                evaluation_end=marks[-1][0],
+                terminal_mark=marks[-1],
+                complete_valuation_context=False,
+            )
+        except EquityReductionError as exc:
+            if exc.code != "EQUITY_DEPLETED":
+                raise
+            # Depletion remains visible to the existing observed-ruin controls.
+            return {**unavailable, "failure_code": exc.code, "coverage_reason": exc.code}
+        return {
+            **json.loads(json.dumps(asdict(reduction), allow_nan=False)),
+            "evaluation_window_role": "EVENT_BOUNDED",
+            "coverage_reason": unavailable["coverage_reason"],
+        }
 
 
 def bootstrap_ruin_probability(

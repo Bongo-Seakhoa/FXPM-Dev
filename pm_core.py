@@ -26,6 +26,7 @@ import math
 import hashlib
 import hmac
 import logging
+from functools import wraps
 from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -38,16 +39,23 @@ import numpy as np
 import pandas as pd
 from pm_order_governance import candidate_policy_names, evaluate_policy, make_policy, GovernanceContext
 from pm_metrics import (
+    EquityMark,
+    EquityReductionError,
     METRIC_CONTRACT_VERSION,
     profit_factor_from_gross,
     return_drawdown_metrics,
     round_metric,
+    reduce_equity_path,
     sharpe_sortino_from_returns,
 )
 from pm_symbol import infer_asset_class
+from pm_spread_profile import (
+    ADMISSION_POLICY, ADMISSION_SCHEMA, FrozenSpreadTier, RETIRED_COST_POLICY, spread_admission,
+)
 from pm_native_activation import resolve_active_native_artifact
 from pm_broker_terms import (
     BrokerTermsError,
+    ResearchSwapContext,
     project_session_events,
     resolve_active_swap_contract,
     sha256_file as broker_terms_sha256_file,
@@ -65,10 +73,93 @@ from pm_evidence import (
 from pm_trade_power import (
     REQUIRED_TRADE_RECORD_SCHEMA,
     build_numerical_execution_cost_attestation,
+    build_numerical_execution_cost_policy,
 )
 
 # Configure module logger
 logger = logging.getLogger(__name__)
+
+
+class ContinuousAccountExecutionError(ValueError):
+    def __init__(self, code: str, message: str = ""):
+        self.code = code
+        super().__init__(code + (": " + message if message else ""))
+
+
+@dataclass(frozen=True)
+class ContinuousEntryOwner:
+    owner_id: str
+    strategy: Any
+    features: pd.DataFrame
+    signals: pd.Series
+    spread_tier: FrozenSpreadTier
+
+
+@dataclass(frozen=True)
+class ContinuousEntrySlot:
+    slot_id: str
+    start_utc: Union[datetime, pd.Timestamp, np.datetime64]
+    end_utc: Union[datetime, pd.Timestamp, np.datetime64]
+    owner_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ContinuousEntrySchedule:
+    owners: Tuple[ContinuousEntryOwner, ...]
+    slots: Tuple[ContinuousEntrySlot, ...]
+
+
+def _require_liquidated_terminal(terminal_policy):
+    if terminal_policy != "LIQUIDATE":
+        raise ContinuousAccountExecutionError(
+            "CONTINUOUS_ACCOUNT_TERMINAL_SCHEMA_UNSUPPORTED")
+
+
+def _validate_continuous_buffers(mark_open, floats, integers):
+    if mark_open and not (
+        isinstance(floats, np.ndarray) and floats.dtype == np.dtype("float64")
+        and floats.shape == (CONTINUOUS_TERMINAL_FLOAT_COUNT,) and floats.flags.c_contiguous and floats.flags.writeable
+        and isinstance(integers, np.ndarray) and integers.dtype == np.dtype("int64")
+        and integers.shape == (CONTINUOUS_TERMINAL_INT_COUNT,) and integers.flags.c_contiguous and integers.flags.writeable
+    ):
+        raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_INPUT_INVALID", "terminal buffers")
+
+
+# Cash, mark, fill, SL, TP, lots, requested/executed risk, swap, bid/ask,
+# unrealized gross, latched swap rate, MAE and MFE; integers hold position lineage.
+CONTINUOUS_TERMINAL_FLOAT_COUNT = 15
+CONTINUOUS_TERMINAL_INT_COUNT = 7
+
+
+def _checked_continuous_kernel(function):
+    @wraps(function)
+    def checked(*args, **kwargs):
+        mark_open = kwargs.get("mark_open", args[27] if len(args) > 27 else False)
+        floats = kwargs.get("terminal_float_out", args[28] if len(args) > 28 else None)
+        integers = kwargs.get("terminal_int_out", args[29] if len(args) > 29 else None)
+        _validate_continuous_buffers(mark_open, floats, integers)
+        if mark_open:
+            opens = args[0] if args else kwargs["open_arr"]
+            codes = kwargs.get("entry_owner_codes", args[25] if len(args) > 25 else None)
+            spreads = kwargs.get("owner_half_spreads", args[26] if len(args) > 26 else None)
+            entries = args[7] if len(args) > 7 else kwargs["entry_prices"]
+            _validate_continuous_arrays(len(opens), codes, spreads, entries)
+        return function(*args, **kwargs)
+    return checked
+
+
+def _validate_continuous_arrays(count, codes, spreads, entries):
+    if not (
+        count > 0 and isinstance(codes, np.ndarray) and codes.dtype == np.dtype("int32")
+        and codes.shape == (count,) and isinstance(spreads, np.ndarray)
+        and spreads.dtype == np.dtype("float64") and spreads.ndim == 2
+        and spreads.shape[1] == count and np.isfinite(spreads).all()
+        and (codes >= -1).all() and (codes < spreads.shape[0]).all()
+        and isinstance(entries, np.ndarray) and entries.shape == (count,)
+    ):
+        raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_INPUT_INVALID", "owner arrays")
+    if np.any((codes == -1) & np.isfinite(entries)):
+        raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_INPUT_INVALID", "finite entry under NO_TRADE")
 
 
 _WEEKDAY_NAME_TO_INDEX = {
@@ -80,6 +171,18 @@ _WEEKDAY_NAME_TO_INDEX = {
     "saturday": 5,
     "sunday": 6,
 }
+
+_ALLOWED_BACKTEST_SPREAD_MODES = frozenset({
+    "fixed_spec",
+    "historical_bar",
+    "historical_max",
+    "conservative_max",
+})
+_RETIRED_BACKTEST_SPREAD_MODES = frozenset({
+    "stress_p90",
+    "stress_p95",
+    "stress_max",
+})
 
 
 # =============================================================================
@@ -122,19 +225,60 @@ BACKTEST_WINNER_DAILY_R_MAX_DAYS = 20_000
 BACKTEST_WINNER_DAILY_R_MAX_LEGS = 500_000
 BACKTEST_WINNER_DAILY_R_MAX_MARKS = 5_000_000
 BACKTEST_WINNER_R_DECIMAL_PLACES = 12
-_BACKTEST_WINNER_R_QUANTUM = Decimal("0.000000000001")
-BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION = (
-    "fxpm.backtester-frozen-path-cost-stress.v3"
+_BACKTEST_WINNER_R_QUANTUM = Decimal(1).scaleb(
+    -BACKTEST_WINNER_R_DECIMAL_PLACES
 )
-BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT = (
-    "ADVERSE"
+BACKTEST_FROZEN_PATH_COST_LADDER_SCHEMA_VERSION = (
+    "fxpm.backtester-frozen-path-cost-ladder.v2"
 )
-BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT = (
-    "NO_NUMERICAL_SHOCK"
+BACKTEST_COST_LADDER_CONTRACT_SCHEMA_VERSION = (
+    "fxpm.backtester-cost-ladder-contract.v1"
 )
-BACKTEST_CLOSED_PARTITION_SPREAD_STRESS_SCHEMA_VERSION = (
-    "fxpm.closed-partition-observed-spread-stress.v1"
+BACKTEST_FROZEN_PATH_COST_LADDER_ADVERSITY_STRICT = "ADVERSE"
+BACKTEST_FROZEN_PATH_COST_LADDER_ADVERSITY_INSUFFICIENT = "NO_NUMERICAL_SHOCK"
+BACKTEST_TRADE_IDENTITY_PNL_FIELDS = (
+    "entry_bar",
+    "exit_bar",
+    "signal_bar",
+    "entry_time",
+    "exit_time",
+    "direction",
+    "position_size",
+    "risk_amount",
+    "exit_reason",
+    "pnl_dollars",
 )
+# Retained only to verify archived evidence; multiplier execution is retired.
+_BACKTEST_COST_LADDER_LEVELS = (
+    (
+        "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+        75,
+        "0x1.a000000000000p+2",
+    ),
+    (
+        "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P95",
+        95,
+        "0x1.7000000000000p+4",
+    ),
+)
+_BACKTEST_COST_LADDER_BASE_LEVEL = (
+    "BASE",
+    0,
+    "0x1.0000000000000p+0",
+)
+
+
+def build_backtest_validated_cost_ladder_tolerance() -> Dict[str, Any]:
+    """Return the exact P75 tolerance carried by an admitted Winner."""
+
+    level_id, percentile, multiplier_hex = _BACKTEST_COST_LADDER_LEVELS[0]
+    return {
+        "level_id": level_id,
+        "single_fill_uplift_percentile": percentile,
+        "uniform_entry_half_spread_multiplier_float64_hex": multiplier_hex,
+    }
+
+
 _BACKTEST_TIMEFRAME_SECONDS = {
     "M1": 60,
     "M5": 300,
@@ -146,14 +290,278 @@ _BACKTEST_TIMEFRAME_SECONDS = {
 }
 
 
-class FrozenPathCostStressError(ValueError):
-    """Typed fail-closed error for frozen-path cost-stress evidence."""
+class FrozenPathCostLadderError(ValueError):
+    """Typed fail-closed error for frozen-path cost-ladder evidence."""
 
     def __init__(self, code: str, details: Sequence[Any] = ()) -> None:
         self.code = str(code)
         self.details = tuple(str(value) for value in details)
         suffix = ":" + ",".join(self.details[:8]) if self.details else ""
         super().__init__(self.code + suffix)
+
+
+def build_backtest_spread_mode(spread_meta: Mapping[str, Any]) -> str:
+    """Serialize the exact numerical spread policy consumed by attestation v3."""
+
+    if not isinstance(spread_meta, Mapping):
+        raise ValueError("spread metadata is invalid")
+    try:
+        broker_fixed_spread_price = float(
+            spread_meta.get("broker_fixed_spread_price", 0.0)
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("broker fixed spread price is invalid") from exc
+    if (
+        not math.isfinite(broker_fixed_spread_price)
+        or broker_fixed_spread_price < 0.0
+    ):
+        raise ValueError("broker fixed spread price is invalid")
+    spread_policy = {
+        "mode": str(spread_meta.get("mode") or ""),
+        "source": str(spread_meta.get("source") or ""),
+        "entry_column": str(spread_meta.get("entry_column") or ""),
+        "bar_column": str(spread_meta.get("bar_column") or ""),
+        "entry_model": str(spread_meta.get("entry_model") or ""),
+        "asset_class": str(spread_meta.get("asset_class") or ""),
+        "broker_fixed_spread_price": broker_fixed_spread_price,
+        "cost_ladder_level_id": str(
+            spread_meta.get("cost_ladder_level_id") or ""
+        ),
+        "single_fill_uplift_percentile": int(
+            spread_meta.get("single_fill_uplift_percentile", 0) or 0
+        ),
+        "uniform_entry_half_spread_multiplier_float64_hex": str(
+            spread_meta.get(
+                "uniform_entry_half_spread_multiplier_float64_hex"
+            )
+            or ""
+        ),
+        "entry_cost_application": str(
+            spread_meta.get("entry_cost_application") or ""
+        ),
+        "uniform_application": str(spread_meta.get("uniform_application") or ""),
+        "uplift_distribution_basis": str(
+            spread_meta.get("uplift_distribution_basis") or ""
+        ),
+        "stochastic_scenario": bool(
+            spread_meta.get("stochastic_scenario", False)
+        ),
+        "intrabar_policy": str(spread_meta.get("intrabar_policy") or ""),
+        "units": str(spread_meta.get("units") or ""),
+    }
+    if spread_meta.get("frozen_spread_tier") is not None:
+        spread_policy.update({
+            "frozen_spread_tier": spread_meta["frozen_spread_tier"],
+            "entry_admission_policy": spread_meta.get("entry_admission_policy"),
+        })
+        if "entry_admission_schema" in spread_meta:
+            spread_policy["entry_admission_schema"] = spread_meta["entry_admission_schema"]
+    return json.dumps(
+        spread_policy,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def validate_authenticated_backtest_base_spread(
+    spread_meta: Mapping[str, Any],
+) -> None:
+    """Reject an authenticated BASE that silently substituted fixed spread."""
+
+    if (
+        not isinstance(spread_meta, Mapping)
+        or spread_meta.get("fallback_to_fixed") is not False
+    ):
+        raise ValueError("authenticated BASE spread fallback is forbidden")
+
+
+def _backtest_cost_ladder_spread_meta(
+    base_spread_meta: Mapping[str, Any],
+    *,
+    level_id: str,
+    percentile: int,
+    multiplier_hex: str,
+) -> Dict[str, Any]:
+    if not isinstance(base_spread_meta, Mapping):
+        raise ValueError("BASE spread metadata is invalid")
+    spread_meta = dict(base_spread_meta)
+    if level_id == "BASE":
+        return spread_meta
+    spread_meta.update(
+        {
+            "mode": level_id,
+            "source": "authenticated_base_entry_half_spread_vector",
+            "entry_model": "uniform_all_fills_single_fill_uplift",
+            "cost_ladder_level_id": level_id,
+            "single_fill_uplift_percentile": int(percentile),
+            "uniform_entry_half_spread_multiplier_float64_hex": multiplier_hex,
+            "entry_cost_application": "ENTRY_SIDE_ONLY",
+            "uniform_application": "EVERY_FILL",
+            "uplift_distribution_basis": (
+                "UNCONDITIONAL_MEASURED_SINGLE_FILL_UPLIFT_DISTRIBUTION"
+            ),
+            "stochastic_scenario": False,
+            "intrabar_policy": "UNCHANGED_AUTHENTICATED_BASE",
+        }
+    )
+    return spread_meta
+
+
+def build_backtest_cost_ladder_contract(
+    base_spread_meta: Mapping[str, Any],
+    *,
+    use_spread: bool,
+    instrument_spec_sha256: str,
+) -> Dict[str, Any]:
+    """Freeze ordered BASE/P75/P95 array-independent cost-policy identities."""
+
+    levels: List[Dict[str, Any]] = []
+    for level_id, percentile, multiplier_hex in (
+        _BACKTEST_COST_LADDER_BASE_LEVEL,
+        *_BACKTEST_COST_LADDER_LEVELS,
+    ):
+        spread_meta = _backtest_cost_ladder_spread_meta(
+            base_spread_meta,
+            level_id=level_id,
+            percentile=percentile,
+            multiplier_hex=multiplier_hex,
+        )
+        spread_mode = build_backtest_spread_mode(spread_meta)
+        canonical_spread_model = json.loads(spread_mode)
+        levels.append(
+            {
+                "level_id": level_id,
+                "single_fill_uplift_percentile": percentile,
+                "uniform_entry_half_spread_multiplier_float64_hex": multiplier_hex,
+                "spread_model": canonical_spread_model,
+                "numerical_execution_cost_policy": (
+                    build_numerical_execution_cost_policy(
+                        use_spread=use_spread,
+                        spread_mode=spread_mode,
+                        instrument_spec_sha256=instrument_spec_sha256,
+                    )
+                ),
+            }
+        )
+    return {
+        "schema_version": BACKTEST_COST_LADDER_CONTRACT_SCHEMA_VERSION,
+        "percentile_choice_kind": (
+            "PREDECLARED_CONSERVATIVE_JUDGMENT_NOT_DATA_SELECTED_ELBOW"
+        ),
+        "p95_over_max_rationale": (
+            "LONG_TAIL_MAXIMUM_NOT_SENSIBLE_ACTIVE_TARGET"
+        ),
+        "levels": levels,
+    }
+
+
+BACKTEST_FROZEN_TIER_PAIR_CONTRACT_SCHEMA_VERSION = (
+    "fxpm.backtester-frozen-tier-pair-contract.v1"
+)
+
+
+def validate_backtest_frozen_tier_pair_contract(value: Any) -> Dict[str, Any]:
+    """Validate cost identities only; this does not authenticate their source."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "schema_version", "admission_schema", "admission_policy", "tiers",
+        "qualification_authority",
+    }:
+        raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID")
+    body = json.loads(json.dumps(value, sort_keys=True, allow_nan=False))
+    if (body["schema_version"] != BACKTEST_FROZEN_TIER_PAIR_CONTRACT_SCHEMA_VERSION
+            or body["admission_schema"] != ADMISSION_SCHEMA
+            or body["admission_policy"] != ADMISSION_POLICY
+            or body["qualification_authority"] is not False
+            or not isinstance(body["tiers"], list) or len(body["tiers"]) != 2):
+        raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID")
+    descriptors = []
+    spec_hashes = []
+    for expected, item in zip(("P75", "P95"), body["tiers"]):
+        if (not isinstance(item, dict) or set(item) != {
+                "tier", "frozen_spread_tier", "numerical_execution_cost_policy"}
+                or item["tier"] != expected):
+            raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID")
+        descriptor = item["frozen_spread_tier"]
+        if not isinstance(descriptor, dict) or descriptor.get("tier") != expected:
+            raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID")
+        try:
+            tier = FrozenSpreadTier(json.dumps(descriptor, sort_keys=True, allow_nan=False))
+            tier.validate_execution(tier.symbol, tier.timeframe, tier.point)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID") from exc
+        policy = item["numerical_execution_cost_policy"]
+        if not isinstance(policy, dict):
+            raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID")
+        try:
+            model = json.loads(policy["spread_mode"])
+            spec_hash = policy["instrument_spec_sha256"]
+            rebuilt = build_numerical_execution_cost_policy(
+                use_spread=True, spread_mode=build_backtest_spread_mode(model),
+                instrument_spec_sha256=spec_hash,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID") from exc
+        if (policy != rebuilt or model.get("mode") != "conservative_max"
+                or model.get("frozen_spread_tier") != descriptor
+                or model.get("entry_admission_policy") != ADMISSION_POLICY
+                or model.get("entry_admission_schema") != ADMISSION_SCHEMA):
+            raise ValueError("FROZEN_TIER_PAIR_CONTRACT_INVALID")
+        descriptors.append(descriptor)
+        spec_hashes.append(spec_hash)
+    left, right = (dict(item) for item in descriptors)
+    for key in ("tier", "spread_points", "full_spread_price"):
+        left.pop(key)
+        right.pop(key)
+    if (left != right or spec_hashes[0] != spec_hashes[1]
+            or descriptors[1]["spread_points"] < descriptors[0]["spread_points"]):
+        raise ValueError("FROZEN_TIER_PAIR_BINDING_MISMATCH")
+    return body
+
+
+def build_backtest_frozen_tier_pair_contract(
+    tier_results: Mapping[str, Any], *, spec: "InstrumentSpec", use_spread: bool,
+) -> Dict[str, Any]:
+    """Derive the same outcome-independent policy from probes or real runs."""
+    if (not isinstance(tier_results, Mapping) or set(tier_results) != {"P75", "P95"}
+            or not isinstance(spec, InstrumentSpec) or use_spread is not True):
+        raise ValueError("FROZEN_TIER_PAIR_RESULTS_REQUIRED")
+    spec_sha = Backtester._cost_attestation_json_sha256({
+        "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
+        "instrument_spec": asdict(spec),
+    })
+    tiers = []
+    for name in ("P75", "P95"):
+        result = tier_results[name]
+        if not isinstance(result, Mapping):
+            raise ValueError("FROZEN_TIER_PAIR_RESULTS_REQUIRED")
+        model = result.get("spread_model")
+        policy = build_numerical_execution_cost_policy(
+            use_spread=True, spread_mode=build_backtest_spread_mode(model),
+            instrument_spec_sha256=spec_sha,
+        )
+        attestation = result.get("numerical_execution_cost_attestation")
+        if not isinstance(attestation, Mapping):
+            raise ValueError("FROZEN_TIER_PAIR_ATTESTATION_MISSING")
+        try:
+            rebuilt = build_numerical_execution_cost_attestation(
+                use_spread=True, spread_mode=policy["spread_mode"],
+                instrument_spec_sha256=spec_sha,
+                entry_half_spread_values_sha256=attestation["entry_half_spread_values_sha256"],
+                intrabar_half_spread_values_sha256=attestation["intrabar_half_spread_values_sha256"],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("FROZEN_TIER_PAIR_ATTESTATION_INVALID") from exc
+        if dict(attestation) != rebuilt:
+            raise ValueError("FROZEN_TIER_PAIR_ATTESTATION_INVALID")
+        tiers.append({"tier": name, "frozen_spread_tier": model.get("frozen_spread_tier"),
+                      "numerical_execution_cost_policy": policy})
+    return validate_backtest_frozen_tier_pair_contract({
+        "schema_version": BACKTEST_FROZEN_TIER_PAIR_CONTRACT_SCHEMA_VERSION,
+        "admission_schema": ADMISSION_SCHEMA, "admission_policy": ADMISSION_POLICY,
+        "tiers": tiers, "qualification_authority": False,
+    })
 
 
 def _position_event_utc(value: Any, field_name: str) -> str:
@@ -225,6 +633,8 @@ def canonical_backtest_winner_r(pnl_dollars: Any, risk_amount: Any) -> float:
             _BACKTEST_WINNER_R_QUANTUM,
             rounding=ROUND_HALF_EVEN,
         )
+        if value.is_zero():
+            value = value.copy_abs()
         result = float(value)
     except (InvalidOperation, TypeError, ValueError, OverflowError) as exc:
         raise ValueError("winner R inputs are invalid") from exc
@@ -237,8 +647,10 @@ def build_backtest_position_events(
     trades: Sequence[Mapping[str, Any]],
     *,
     namespace: str,
+    terminal_policy: str = "LIQUIDATE",
 ) -> List[Dict[str, Any]]:
     """Aggregate execution legs into canonical flat-to-flat positions."""
+    _require_liquidated_terminal(terminal_policy)
     if not isinstance(trades, (list, tuple)):
         raise ValueError("backtest trades must be a list or tuple")
     if not trades:
@@ -374,34 +786,153 @@ def _exact_decimal_float(value: Decimal) -> float:
     return result
 
 
-def build_backtest_winner_daily_r_surface(
-    features: pd.DataFrame,
+def build_backtest_trade_identity_pnl_evidence(
     trades: Sequence[Mapping[str, Any]],
-    position_events: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Project the exact ordered trade identity and PnL used by ladder proof."""
+
+    if not isinstance(trades, (list, tuple)):
+        raise ValueError("backtest trades must be a list or tuple")
+    projected: List[Dict[str, Any]] = []
+    for ordinal, raw in enumerate(trades):
+        if not isinstance(raw, Mapping) or any(
+            field not in raw for field in BACKTEST_TRADE_IDENTITY_PNL_FIELDS
+        ):
+            raise ValueError(f"backtest trade {ordinal} lacks ladder evidence")
+        try:
+            if any(
+                type(raw[field]) is not str
+                for field in ("direction", "exit_reason")
+            ):
+                raise ValueError("trade text identity must be exact")
+            if any(
+                isinstance(raw[field], (bool, np.bool_))
+                or not isinstance(
+                    raw[field], (int, float, np.integer, np.floating)
+                )
+                for field in ("position_size", "risk_amount", "pnl_dollars")
+            ):
+                raise ValueError("trade PnL evidence must be numeric")
+            raw_entry_bar = raw["entry_bar"]
+            raw_exit_bar = raw["exit_bar"]
+            raw_signal_bar = raw["signal_bar"]
+            if any(
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                for value in (raw_entry_bar, raw_exit_bar, raw_signal_bar)
+            ):
+                raise ValueError("trade bar identity must be integral")
+            entry_bar = int(raw_entry_bar)
+            exit_bar = int(raw_exit_bar)
+            signal_bar = int(raw_signal_bar)
+            entry_timestamp = pd.Timestamp(
+                _position_event_utc(raw["entry_time"], "entry_time")
+            )
+            exit_timestamp = pd.Timestamp(
+                _position_event_utc(raw["exit_time"], "exit_time")
+            )
+            if (
+                entry_timestamp.value % 1_000_000_000
+                or exit_timestamp.value % 1_000_000_000
+            ):
+                raise ValueError("trade event time must have whole-second precision")
+            entry_time = entry_timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+            exit_time = exit_timestamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+            direction = raw["direction"].upper()
+            position_size = float(raw["position_size"])
+            risk_amount = float(raw["risk_amount"])
+            exit_reason = raw["exit_reason"]
+            pnl_dollars = float(raw["pnl_dollars"])
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                f"backtest trade {ordinal} has invalid ladder evidence"
+            ) from exc
+        if (
+            entry_bar < 0
+            or exit_bar < entry_bar
+            or signal_bar < 0
+            or exit_timestamp < entry_timestamp
+            or direction not in {"LONG", "SHORT"}
+            or not math.isfinite(position_size)
+            or position_size <= 0.0
+            or not math.isfinite(risk_amount)
+            or risk_amount <= 0.0
+            or not exit_reason
+            or len(exit_reason.encode("utf-8")) > 256
+            or not math.isfinite(pnl_dollars)
+        ):
+            raise ValueError(f"backtest trade {ordinal} violates ladder evidence")
+        projected.append(
+            {
+                "entry_bar": entry_bar,
+                "exit_bar": exit_bar,
+                "signal_bar": signal_bar,
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "direction": direction,
+                "position_size": position_size,
+                "risk_amount": risk_amount,
+                "exit_reason": exit_reason,
+                "pnl_dollars": pnl_dollars,
+            }
+        )
+    return projected
+
+
+@dataclass(frozen=True)
+class _BacktestWinnerDailyRLane:
+    name: str
+    trades: Sequence[Mapping[str, Any]]
+    position_events: Sequence[Mapping[str, Any]]
+    half_spread_arr: Sequence[float]
+    use_spread: bool
+    swap_model_enabled: bool
+    causal_swap_enabled: bool
+    pre_open_rollover_units_arr: Sequence[int]
+    rollover_units_arr: Sequence[int]
+    swap_long_per_lot_arr: Sequence[float]
+    swap_short_per_lot_arr: Sequence[float]
+
+
+def _build_backtest_winner_daily_r_lanes(
+    features: pd.DataFrame,
+    lanes: Sequence[_BacktestWinnerDailyRLane],
     *,
     namespace: str,
     spec: "InstrumentSpec",
-    half_spread_arr: Sequence[float],
-    use_spread: bool,
-    swap_model_enabled: bool,
-    causal_swap_enabled: bool,
-    pre_open_rollover_units_arr: Sequence[int],
-    rollover_units_arr: Sequence[int],
-    swap_long_per_lot_arr: Sequence[float],
-    swap_short_per_lot_arr: Sequence[float],
     warmup_bars: int = 0,
-) -> Dict[str, Any]:
-    """Emit bounded full-path daily MTM in entry-risk-normalized R."""
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, int]]]:
+    """Build one to three aligned daily-MTM lanes in one sparse traversal.
+
+    Only lane-by-day aggregate vectors are retained. Position paths are marked,
+    compared with their adjacent predecessor, and discarded one position at a
+    time, avoiding a position-by-day matrix.
+    """
+
+    if not lanes or len(lanes) > 3:
+        raise ValueError("winner daily R lane count is invalid")
+    diagnostics = [
+        {
+            "position_final_comparison_count": 0,
+            "strictly_worse_position_final_count": 0,
+            "aggregate_prefix_comparison_count": 0,
+            "strictly_worse_aggregate_prefix_count": 0,
+            "daily_increment_improvement_observation_count": 0,
+        }
+        for _ in lanes
+    ]
     if not isinstance(features, pd.DataFrame) or not len(features):
-        return _backtest_winner_daily_surface("UNAVAILABLE")
-    if "_BAR_CLOSE_TS" not in features.columns:
-        return _backtest_winner_daily_surface("UNAVAILABLE")
-    if swap_model_enabled and not causal_swap_enabled:
-        return _backtest_winner_daily_surface("UNAVAILABLE")
-    if not isinstance(trades, (list, tuple)) or len(trades) > BACKTEST_WINNER_DAILY_R_MAX_LEGS:
-        raise ValueError("winner daily R trade-leg bound exceeded")
-    if not isinstance(position_events, (list, tuple)):
-        raise ValueError("winner daily R position events are invalid")
+        return (
+            [_backtest_winner_daily_surface("UNAVAILABLE") for _ in lanes],
+            diagnostics,
+        )
+    if "_BAR_CLOSE_TS" not in features.columns or any(
+        lane.swap_model_enabled and not lane.causal_swap_enabled for lane in lanes
+    ):
+        return (
+            [_backtest_winner_daily_surface("UNAVAILABLE") for _ in lanes],
+            diagnostics,
+        )
 
     count = len(features)
     scored_start = max(0, int(warmup_bars or 0))
@@ -431,14 +962,16 @@ def build_backtest_winner_daily_r_surface(
         raise ValueError("winner daily R calendar-day bound exceeded")
     days = [start_day + timedelta(days=offset) for offset in range(day_count)]
     boundaries = pd.DatetimeIndex(
-        [
-            pd.Timestamp(day + timedelta(days=1), tz="UTC")
-            for day in days
-        ]
+        [pd.Timestamp(day + timedelta(days=1), tz="UTC") for day in days]
     )
     mark_indices = closes.searchsorted(boundaries, side="right") - 1
 
-    def _float_vector(raw: Sequence[float], name: str, *, nonnegative: bool = False) -> np.ndarray:
+    def _float_vector(
+        raw: Sequence[float],
+        name: str,
+        *,
+        nonnegative: bool = False,
+    ) -> np.ndarray:
         try:
             values = np.asarray(raw, dtype=np.float64)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -449,183 +982,462 @@ def build_backtest_winner_daily_r_surface(
             raise ValueError(f"winner daily R {name} is invalid")
         return values
 
-    spreads = _float_vector(half_spread_arr, "spread vector", nonnegative=True)
-    long_rates = _float_vector(swap_long_per_lot_arr, "long swap vector")
-    short_rates = _float_vector(swap_short_per_lot_arr, "short swap vector")
-
     def _unit_vector(raw: Sequence[int], name: str) -> np.ndarray:
         values = _float_vector(raw, name, nonnegative=True)
-        if bool((values != np.floor(values)).any()) or bool((values > 1_000_000).any()):
+        if bool((values != np.floor(values)).any()) or bool(
+            (values > 1_000_000).any()
+        ):
             raise ValueError(f"winner daily R {name} is invalid")
         return values.astype(np.int64)
 
-    pre_open_units = _unit_vector(
-        pre_open_rollover_units_arr,
-        "pre-open rollover vector",
-    )
-    close_units = _unit_vector(rollover_units_arr, "close rollover vector")
-    if not swap_model_enabled:
-        pre_open_units = np.zeros(count, dtype=np.int64)
-        close_units = np.zeros(count, dtype=np.int64)
-        long_rates = np.zeros(count, dtype=np.float64)
-        short_rates = np.zeros(count, dtype=np.float64)
-    pre_open_prefix = np.concatenate(
-        (np.zeros(1, dtype=np.int64), np.cumsum(pre_open_units, dtype=np.int64))
-    )
-    close_prefix = np.concatenate(
-        (np.zeros(1, dtype=np.int64), np.cumsum(close_units, dtype=np.int64))
-    )
-
-    rebuilt_events = build_backtest_position_events(trades, namespace=namespace)
-    if rebuilt_events != list(position_events):
-        raise ValueError("winner daily R position-event reconciliation failed")
-    event_by_id = {event["position_id"]: event for event in rebuilt_events}
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for ordinal, raw in enumerate(trades):
-        try:
-            entry_bar = int(raw["entry_bar"])
-            exit_bar = int(raw["exit_bar"])
-            signal_bar = int(raw["signal_bar"])
-            entry_price = float(raw["entry_price"])
-            size = float(raw["position_size"])
-            pnl = float(raw["pnl_dollars"])
-        except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"winner daily R trade {ordinal} is invalid") from exc
-        direction_name = str(raw.get("direction") or "").upper()
-        direction = 1 if direction_name == "LONG" else -1 if direction_name == "SHORT" else 0
+    prepared: List[Dict[str, Any]] = []
+    for lane in lanes:
         if (
-            direction == 0
-            or not scored_start <= entry_bar <= exit_bar < count
-            or signal_bar != entry_bar - 1
-            or not math.isfinite(entry_price)
-            or not math.isfinite(size)
-            or size <= 0.0
-            or not math.isfinite(pnl)
+            not isinstance(lane.trades, (list, tuple))
+            or len(lane.trades) > BACKTEST_WINNER_DAILY_R_MAX_LEGS
         ):
-            raise ValueError(f"winner daily R trade {ordinal} is invalid")
-        entry_time = _position_event_utc(raw.get("entry_time"), "entry_time")
-        exit_time = _position_event_utc(raw.get("exit_time"), "exit_time")
-        entry_ts = pd.Timestamp(entry_time)
-        exit_ts = pd.Timestamp(exit_time)
-        if entry_ts != opens[entry_bar] or exit_ts != opens[exit_bar]:
-            raise ValueError(f"winner daily R trade {ordinal} axis drift")
-        position_id = _backtest_position_id(
-            namespace,
-            entry_bar=entry_bar,
-            entry_time=entry_time,
-            signal_bar=signal_bar,
-            direction=direction_name,
+            raise ValueError("winner daily R trade-leg bound exceeded")
+        if not isinstance(lane.position_events, (list, tuple)):
+            raise ValueError("winner daily R position events are invalid")
+        spreads = _float_vector(
+            lane.half_spread_arr,
+            f"{lane.name} spread vector",
+            nonnegative=True,
         )
-        if position_id not in event_by_id:
-            raise ValueError(f"winner daily R trade {ordinal} position is missing")
-        groups.setdefault(position_id, []).append(
+        long_rates = _float_vector(
+            lane.swap_long_per_lot_arr,
+            f"{lane.name} long swap vector",
+        )
+        short_rates = _float_vector(
+            lane.swap_short_per_lot_arr,
+            f"{lane.name} short swap vector",
+        )
+        pre_open_units = _unit_vector(
+            lane.pre_open_rollover_units_arr,
+            f"{lane.name} pre-open rollover vector",
+        )
+        close_units = _unit_vector(
+            lane.rollover_units_arr,
+            f"{lane.name} close rollover vector",
+        )
+        if not lane.swap_model_enabled:
+            pre_open_units = np.zeros(count, dtype=np.int64)
+            close_units = np.zeros(count, dtype=np.int64)
+            long_rates = np.zeros(count, dtype=np.float64)
+            short_rates = np.zeros(count, dtype=np.float64)
+        pre_open_prefix = np.concatenate(
+            (np.zeros(1, dtype=np.int64), np.cumsum(pre_open_units, dtype=np.int64))
+        )
+        close_prefix = np.concatenate(
+            (np.zeros(1, dtype=np.int64), np.cumsum(close_units, dtype=np.int64))
+        )
+
+        rebuilt_events = build_backtest_position_events(
+            lane.trades,
+            namespace=namespace,
+        )
+        if rebuilt_events != list(lane.position_events):
+            raise ValueError("winner daily R position-event reconciliation failed")
+        event_by_id = {event["position_id"]: event for event in rebuilt_events}
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for ordinal, raw in enumerate(lane.trades):
+            try:
+                entry_bar = int(raw["entry_bar"])
+                exit_bar = int(raw["exit_bar"])
+                signal_bar = int(raw["signal_bar"])
+                entry_price = float(raw["entry_price"])
+                size = float(raw["position_size"])
+                pnl = float(raw["pnl_dollars"])
+                risk_amount = float(raw["risk_amount"])
+            except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"winner daily R {lane.name} trade {ordinal} is invalid"
+                ) from exc
+            direction_name = str(raw.get("direction") or "").upper()
+            direction = (
+                1 if direction_name == "LONG" else -1 if direction_name == "SHORT" else 0
+            )
+            if (
+                direction == 0
+                or not scored_start <= entry_bar <= exit_bar < count
+                or signal_bar != entry_bar - 1
+                or not all(
+                    math.isfinite(value)
+                    for value in (entry_price, size, pnl, risk_amount)
+                )
+                or size <= 0.0
+                or risk_amount <= 0.0
+            ):
+                raise ValueError(
+                    f"winner daily R {lane.name} trade {ordinal} is invalid"
+                )
+            entry_time = _position_event_utc(raw.get("entry_time"), "entry_time")
+            exit_time = _position_event_utc(raw.get("exit_time"), "exit_time")
+            entry_ts = pd.Timestamp(entry_time)
+            exit_ts = pd.Timestamp(exit_time)
+            if entry_ts != opens[entry_bar] or exit_ts != opens[exit_bar]:
+                raise ValueError(
+                    f"winner daily R {lane.name} trade {ordinal} axis drift"
+                )
+            position_id = _backtest_position_id(
+                namespace,
+                entry_bar=entry_bar,
+                entry_time=entry_time,
+                signal_bar=signal_bar,
+                direction=direction_name,
+            )
+            if position_id not in event_by_id:
+                raise ValueError(
+                    f"winner daily R {lane.name} trade {ordinal} position is missing"
+                )
+            groups.setdefault(position_id, []).append(
+                {
+                    "entry_bar": entry_bar,
+                    "exit_bar": exit_bar,
+                    "signal_bar": signal_bar,
+                    "entry_ts": entry_ts,
+                    "exit_ts": exit_ts,
+                    "entry_price": entry_price,
+                    "size": size,
+                    "pnl": pnl,
+                    "risk_amount": risk_amount,
+                    "direction": direction,
+                    "direction_name": direction_name,
+                    "exit_reason": str(raw.get("exit_reason") or ""),
+                }
+            )
+        if set(groups) != set(event_by_id):
+            raise ValueError("winner daily R position roster drift")
+        prepared.append(
             {
-                "entry_bar": entry_bar,
-                "exit_bar": exit_bar,
-                "entry_ts": entry_ts,
-                "exit_ts": exit_ts,
-                "entry_price": entry_price,
-                "size": size,
-                "pnl": pnl,
-                "direction": direction,
+                "lane": lane,
+                "spreads": spreads,
+                "long_rates": long_rates,
+                "short_rates": short_rates,
+                "pre_open_prefix": pre_open_prefix,
+                "close_prefix": close_prefix,
+                "events": rebuilt_events,
+                "event_by_id": event_by_id,
+                "groups": groups,
             }
         )
-    if set(groups) != set(event_by_id):
-        raise ValueError("winner daily R position roster drift")
 
-    active_marks = [Decimal(0) for _ in range(day_count)]
-    realized_deltas = [Decimal(0) for _ in range(day_count)]
+    base_position_ids = list(prepared[0]["event_by_id"])
+    event_identity_fields = (
+        "trade_record_schema_version",
+        "position_id",
+        "entry_time",
+        "exit_time",
+        "entry_event_order",
+        "exit_event_order",
+        "risk_amount",
+    )
+    leg_identity_fields = (
+        "entry_bar",
+        "exit_bar",
+        "signal_bar",
+        "entry_ts",
+        "exit_ts",
+        "size",
+        "risk_amount",
+        "direction",
+        "direction_name",
+        "exit_reason",
+    )
+    for other in prepared[1:]:
+        if list(other["event_by_id"]) != base_position_ids:
+            raise FrozenPathCostLadderError("LADDER_POSITION_ROSTER_CHANGED")
+        for position_id in base_position_ids:
+            base_event = prepared[0]["event_by_id"][position_id]
+            other_event = other["event_by_id"][position_id]
+            if any(
+                base_event.get(field) != other_event.get(field)
+                for field in event_identity_fields
+            ):
+                raise FrozenPathCostLadderError(
+                    "LADDER_POSITION_IDENTITY_CHANGED",
+                    (other["lane"].name, position_id),
+                )
+            base_legs = prepared[0]["groups"][position_id]
+            other_legs = other["groups"][position_id]
+            if len(base_legs) != len(other_legs) or any(
+                any(base.get(field) != changed.get(field) for field in leg_identity_fields)
+                for base, changed in zip(base_legs, other_legs, strict=True)
+            ):
+                raise FrozenPathCostLadderError(
+                    "LADDER_TRADE_PATH_IDENTITY_CHANGED",
+                    (other["lane"].name, position_id),
+                )
+
+    active_marks = [
+        [Decimal(0) for _ in range(day_count)] for _ in prepared
+    ]
+    realized_deltas = [
+        [Decimal(0) for _ in range(day_count)] for _ in prepared
+    ]
+    total_trade_r = [Decimal(0) for _ in prepared]
     mark_operations = 0
-    total_trade_r = Decimal(0)
-    for position_id, event in event_by_id.items():
-        legs = groups[position_id]
-        event_entry = pd.Timestamp(event["entry_time"])
-        event_exit = pd.Timestamp(event["exit_time"])
-        event_r = canonical_backtest_winner_r(
-            event["pnl_dollars"],
-            event["risk_amount"],
-        )
-        event_r_decimal = Decimal(str(event_r))
-        total_trade_r += event_r_decimal
+    tolerance = _BACKTEST_WINNER_R_QUANTUM
+
+    for position_id in base_position_ids:
+        base_event = prepared[0]["event_by_id"][position_id]
+        event_entry = pd.Timestamp(base_event["entry_time"])
+        event_exit = pd.Timestamp(base_event["exit_time"])
         entry_day_index = (event_entry.date() - start_day).days
         exit_day_index = (event_exit.date() - start_day).days
         if not 0 <= entry_day_index <= exit_day_index < day_count:
             raise ValueError("winner daily R position lies outside the scored axis")
-        realized_deltas[exit_day_index] += event_r_decimal
         active_days = exit_day_index - entry_day_index
         mark_operations += active_days
         if mark_operations > BACKTEST_WINNER_DAILY_R_MAX_MARKS:
             raise ValueError("winner daily R mark-operation bound exceeded")
+
+        final_values: List[Decimal] = []
+        for lane_index, item in enumerate(prepared):
+            event = item["event_by_id"][position_id]
+            final_value = Decimal(
+                str(
+                    canonical_backtest_winner_r(
+                        event["pnl_dollars"],
+                        event["risk_amount"],
+                    )
+                )
+            )
+            final_values.append(final_value)
+            total_trade_r[lane_index] += final_value
+            realized_deltas[lane_index][exit_day_index] += final_value
+        for lane_index in range(1, len(prepared)):
+            diagnostics[lane_index]["position_final_comparison_count"] += 1
+            if final_values[lane_index] > final_values[lane_index - 1] + tolerance:
+                raise FrozenPathCostLadderError(
+                    "LADDER_POSITION_FINAL_PNL_IMPROVEMENT",
+                    (prepared[lane_index]["lane"].name, position_id),
+                )
+            if final_values[lane_index] < final_values[lane_index - 1]:
+                diagnostics[lane_index]["strictly_worse_position_final_count"] += 1
+
         for day_index in range(entry_day_index, exit_day_index):
             boundary = boundaries[day_index]
             mark_index = int(mark_indices[day_index])
             if mark_index < scored_start:
                 raise ValueError("winner daily R observable daily mark is unavailable")
-            marked_pnl_parts: List[float] = []
-            for leg in legs:
-                if leg["exit_ts"] < boundary:
-                    marked_pnl_parts.append(leg["pnl"])
-                    continue
-                if leg["entry_ts"] >= boundary:
-                    continue
-                entry_bar = int(leg["entry_bar"])
-                if not entry_bar <= mark_index < int(leg["exit_bar"]):
-                    raise ValueError("winner daily R mark/event order is invalid")
-                mark_price = float(features["Close"].iat[mark_index])
-                if use_spread:
-                    mark_price += (
-                        -float(spreads[mark_index])
-                        if leg["direction"] == 1
-                        else float(spreads[mark_index])
+            position_marks: List[Decimal] = []
+            for lane_index, item in enumerate(prepared):
+                marked_pnl_parts: List[float] = []
+                for leg in item["groups"][position_id]:
+                    if leg["exit_ts"] < boundary:
+                        marked_pnl_parts.append(leg["pnl"])
+                        continue
+                    if leg["entry_ts"] >= boundary:
+                        continue
+                    entry_bar = int(leg["entry_bar"])
+                    if not entry_bar <= mark_index < int(leg["exit_bar"]):
+                        raise ValueError("winner daily R mark/event order is invalid")
+                    mark_price = float(features["Close"].iat[mark_index])
+                    if item["lane"].use_spread:
+                        mark_price += (
+                            -float(item["spreads"][mark_index])
+                            if leg["direction"] == 1
+                            else float(item["spreads"][mark_index])
+                        )
+                    marked_pnl = spec.calculate_tick_profit(
+                        leg["entry_price"],
+                        mark_price,
+                        leg["size"],
+                        leg["direction"],
                     )
-                marked_pnl = spec.calculate_tick_profit(
-                    leg["entry_price"],
-                    mark_price,
-                    leg["size"],
-                    leg["direction"],
+                    pre_units = int(
+                        item["pre_open_prefix"][mark_index + 1]
+                        - item["pre_open_prefix"][entry_bar + 1]
+                    )
+                    at_close_units = int(
+                        item["close_prefix"][mark_index + 1]
+                        - item["close_prefix"][entry_bar]
+                    )
+                    swap_rate = (
+                        float(item["long_rates"][entry_bar])
+                        if leg["direction"] == 1
+                        else float(item["short_rates"][entry_bar])
+                    )
+                    marked_pnl += swap_rate * leg["size"] * (
+                        pre_units + at_close_units
+                    )
+                    if not math.isfinite(marked_pnl):
+                        raise ValueError("winner daily R marked PnL is invalid")
+                    marked_pnl_parts.append(marked_pnl)
+                marked_r = Decimal(
+                    str(
+                        canonical_backtest_winner_r(
+                            math.fsum(marked_pnl_parts),
+                            item["event_by_id"][position_id]["risk_amount"],
+                        )
+                    )
                 )
-                pre_units = int(
-                    pre_open_prefix[mark_index + 1]
-                    - pre_open_prefix[entry_bar + 1]
-                )
-                at_close_units = int(
-                    close_prefix[mark_index + 1] - close_prefix[entry_bar]
-                )
-                swap_rate = (
-                    float(long_rates[entry_bar])
-                    if leg["direction"] == 1
-                    else float(short_rates[entry_bar])
-                )
-                marked_pnl += swap_rate * leg["size"] * (
-                    pre_units + at_close_units
-                )
-                if not math.isfinite(marked_pnl):
-                    raise ValueError("winner daily R marked PnL is invalid")
-                marked_pnl_parts.append(marked_pnl)
-            marked_r = canonical_backtest_winner_r(
-                math.fsum(marked_pnl_parts),
-                event["risk_amount"],
-            )
-            active_marks[day_index] += Decimal(str(marked_r))
+                position_marks.append(marked_r)
+                active_marks[lane_index][day_index] += marked_r
+            for lane_index in range(1, len(prepared)):
+                if position_marks[lane_index] > position_marks[lane_index - 1] + tolerance:
+                    raise FrozenPathCostLadderError(
+                        "LADDER_POSITION_CUMULATIVE_PREFIX_IMPROVEMENT",
+                        (
+                            prepared[lane_index]["lane"].name,
+                            position_id,
+                            str(days[day_index]),
+                        ),
+                    )
 
-    running_realized = Decimal(0)
-    prior_cumulative = Decimal(0)
-    daily_values: List[float] = []
+    running_realized = [Decimal(0) for _ in prepared]
+    prior_cumulative = [Decimal(0) for _ in prepared]
+    daily_values: List[List[float]] = [[] for _ in prepared]
     for day_index in range(day_count):
-        running_realized += realized_deltas[day_index]
-        cumulative = running_realized + active_marks[day_index]
-        daily_values.append(_exact_decimal_float(cumulative - prior_cumulative))
-        prior_cumulative = cumulative
-    if prior_cumulative != total_trade_r or sum(
-        (Decimal(str(value)) for value in daily_values),
-        Decimal(0),
-    ) != total_trade_r:
-        raise ValueError("winner daily R accounting identity failed")
-    return _backtest_winner_daily_surface(
-        "AVAILABLE",
-        dates=[day.isoformat() for day in days],
-        values=daily_values,
+        cumulative_values: List[Decimal] = []
+        for lane_index in range(len(prepared)):
+            running_realized[lane_index] += realized_deltas[lane_index][day_index]
+            cumulative = (
+                running_realized[lane_index] + active_marks[lane_index][day_index]
+            )
+            cumulative_values.append(cumulative)
+            daily_values[lane_index].append(
+                _exact_decimal_float(cumulative - prior_cumulative[lane_index])
+            )
+            prior_cumulative[lane_index] = cumulative
+        for lane_index in range(1, len(prepared)):
+            diagnostics[lane_index]["aggregate_prefix_comparison_count"] += 1
+            if cumulative_values[lane_index] > cumulative_values[lane_index - 1] + tolerance:
+                raise FrozenPathCostLadderError(
+                    "LADDER_AGGREGATE_CUMULATIVE_PREFIX_IMPROVEMENT",
+                    (prepared[lane_index]["lane"].name, str(days[day_index])),
+                )
+            if cumulative_values[lane_index] < cumulative_values[lane_index - 1]:
+                diagnostics[lane_index][
+                    "strictly_worse_aggregate_prefix_count"
+                ] += 1
+
+    surfaces: List[Dict[str, Any]] = []
+    for lane_index in range(len(prepared)):
+        if prior_cumulative[lane_index] != total_trade_r[lane_index] or sum(
+            (Decimal(str(value)) for value in daily_values[lane_index]),
+            Decimal(0),
+        ) != total_trade_r[lane_index]:
+            raise ValueError("winner daily R accounting identity failed")
+        if lane_index:
+            diagnostics[lane_index][
+                "daily_increment_improvement_observation_count"
+            ] = sum(
+                Decimal(str(current)) > Decimal(str(previous))
+                for previous, current in zip(
+                    daily_values[lane_index - 1],
+                    daily_values[lane_index],
+                    strict=True,
+                )
+            )
+        surfaces.append(
+            _backtest_winner_daily_surface(
+                "AVAILABLE",
+                dates=[day.isoformat() for day in days],
+                values=daily_values[lane_index],
+            )
+        )
+    return surfaces, diagnostics
+
+
+def build_backtest_winner_daily_r_surface(
+    features: pd.DataFrame,
+    trades: Sequence[Mapping[str, Any]],
+    position_events: Sequence[Mapping[str, Any]],
+    *,
+    namespace: str,
+    spec: "InstrumentSpec",
+    half_spread_arr: Sequence[float],
+    use_spread: bool,
+    swap_model_enabled: bool,
+    causal_swap_enabled: bool,
+    pre_open_rollover_units_arr: Sequence[int],
+    rollover_units_arr: Sequence[int],
+    swap_long_per_lot_arr: Sequence[float],
+    swap_short_per_lot_arr: Sequence[float],
+    warmup_bars: int = 0,
+    terminal_policy: str = "LIQUIDATE",
+) -> Dict[str, Any]:
+    """Emit bounded full-path daily MTM in entry-risk-normalized R."""
+    _require_liquidated_terminal(terminal_policy)
+
+    surfaces, _diagnostics = _build_backtest_winner_daily_r_lanes(
+        features,
+        (
+            _BacktestWinnerDailyRLane(
+                name="BASE",
+                trades=trades,
+                position_events=position_events,
+                half_spread_arr=half_spread_arr,
+                use_spread=use_spread,
+                swap_model_enabled=swap_model_enabled,
+                causal_swap_enabled=causal_swap_enabled,
+                pre_open_rollover_units_arr=pre_open_rollover_units_arr,
+                rollover_units_arr=rollover_units_arr,
+                swap_long_per_lot_arr=swap_long_per_lot_arr,
+                swap_short_per_lot_arr=swap_short_per_lot_arr,
+            ),
+        ),
+        namespace=namespace,
+        spec=spec,
+        warmup_bars=warmup_bars,
     )
+    return surfaces[0]
+
+
+def build_backtest_equity_growth(
+    features: pd.DataFrame,
+    equity_curve: Sequence[float],
+    *,
+    initial_equity: float,
+    warmup_bars: int = 0,
+    terminal_policy: str = "LIQUIDATE",
+) -> Dict[str, Any]:
+    """Reduce actual engine equity at observable closes, without daily inference."""
+    _require_liquidated_terminal(terminal_policy)
+    provenance = {
+        "schema_version": "fxpm.backtest-equity-growth.v1",
+        "origin": "authoritative_execution_unrounded_equity",
+        "timestamp_source": "_BAR_CLOSE_TS",
+        "complete_valuation_context": False,
+        "external_flow_count": 0,
+        "terminal_inventory": "END_OF_DATA_LIQUIDATED",
+    }
+    if not len(features):
+        return {**provenance, "status": "UNAVAILABLE", "reason": "EMPTY_EVALUATION_WINDOW"}
+    if "_BAR_CLOSE_TS" not in features:
+        return {**provenance, "status": "UNAVAILABLE", "reason": "BAR_CLOSE_AXIS_UNAVAILABLE"}
+    opens = pd.DatetimeIndex(pd.to_datetime(features.index, utc=True, errors="coerce"))
+    closes = pd.DatetimeIndex(pd.to_datetime(features["_BAR_CLOSE_TS"], utc=True, errors="coerce"))
+    if (
+        opens.isna().any() or closes.isna().any()
+        or opens.has_duplicates or closes.has_duplicates
+        or not opens.is_monotonic_increasing or not closes.is_monotonic_increasing
+        or bool((closes <= opens).any())
+        or bool((closes[:-1] > opens[1:]).any())
+    ):
+        raise EquityReductionError("INVALID_BACKTEST_CLOSE_AXIS", "close-time observations must be ordered and nonoverlapping")
+    scored_start = max(0, int(warmup_bars or 0))
+    if scored_start >= len(features):
+        raise EquityReductionError("INVALID_EVALUATION_WINDOW", "warmup consumes the scored path")
+    if len(equity_curve) != len(features):
+        raise EquityReductionError("BACKTEST_EQUITY_AXIS_MISMATCH", "one engine equity value is required per bar")
+    try:
+        reduction = reduce_equity_path(
+            initial_equity=initial_equity,
+            marks=(EquityMark(timestamp, value) for timestamp, value in zip(closes[scored_start:-1], equity_curve[scored_start:-1])),
+            evaluation_start=opens[scored_start],
+            evaluation_end=closes[-1],
+            terminal_mark=EquityMark(closes[-1], equity_curve[-1]),
+            complete_valuation_context=False,
+        )
+    except EquityReductionError as exc:
+        if exc.code != "EQUITY_DEPLETED":
+            raise
+        return {**provenance, "status": "DEPLETED", "reason": exc.code}
+    result = {key: list(value) if isinstance(value, tuple) else value for key, value in asdict(reduction).items()}
+    return {**provenance, **result, "status": "AVAILABLE", "raw_mark_count": len(features) - scored_start}
 
 
 def build_backtest_partition_axis(
@@ -764,6 +1576,7 @@ def _calc_trade_pnl_numba(entry_px: float,
     return pnl_dollars_local, pnl_pips_local
 
 
+@_checked_continuous_kernel
 @jit(nopython=True, cache=True)
 def _backtest_loop_numba(
     # OHLC arrays (float64 for precision)
@@ -799,6 +1612,11 @@ def _backtest_loop_numba(
     swap_short_per_lot_arr=None,
     causal_swap_enabled: bool = False,
     pre_open_rollover_units_arr=None,
+    entry_owner_codes=None,
+    owner_half_spreads=None,
+    mark_open: bool = False,
+    terminal_float_out=None,
+    terminal_int_out=None,
 ) -> Tuple:
     """
     Numba JIT-compiled backtest loop for 3-10x speedup.
@@ -872,6 +1690,7 @@ def _backtest_loop_numba(
     max_drawdown = 0.0
     
     in_position = False
+    held_owner_code = -1
     position_direction = 0
     entry_price = 0.0
     entry_bar = 0
@@ -895,12 +1714,16 @@ def _backtest_loop_numba(
     
     # Main loop
     for i in range(1, n_bars):
+        entry_allowed_at_open = not in_position
         open_price = open_arr[i]
         high_price = high_arr[i]
         low_price = low_arr[i]
         close_price = close_arr[i]
 
         half_spread = half_spread_arr[i] if i < len(half_spread_arr) else 0.0
+        if mark_open and entry_owner_codes is not None and owner_half_spreads is not None:
+            quote_owner = held_owner_code if in_position else entry_owner_codes[i]
+            half_spread = owner_half_spreads[quote_owner, i] if quote_owner >= 0 else 0.0
         if use_spread:
             bid_open = open_price - half_spread
             ask_open = open_price + half_spread
@@ -966,6 +1789,7 @@ def _backtest_loop_numba(
                 if bid_open <= stop_loss:
                     exit_price = bid_open
                     exit_reason = EXIT_SL
+                    entry_allowed_at_open = True
                 elif bid_low <= stop_loss:
                     exit_price = stop_loss
                     exit_reason = EXIT_SL
@@ -976,6 +1800,7 @@ def _backtest_loop_numba(
                 if ask_open >= stop_loss:
                     exit_price = ask_open
                     exit_reason = EXIT_SL
+                    entry_allowed_at_open = True
                 elif ask_high >= stop_loss:
                     exit_price = stop_loss
                     exit_reason = EXIT_SL
@@ -1018,7 +1843,7 @@ def _backtest_loop_numba(
                 trade_count += 1
                 in_position = False
 
-        if (not in_position) and i >= warmup_bars:
+        if entry_allowed_at_open and (not in_position) and i >= warmup_bars:
             signal = sig_arr[i - 1]
             if signal != 0:
                 direction = signal
@@ -1071,6 +1896,17 @@ def _backtest_loop_numba(
                             max_drawdown = dd
                     continue
 
+                if mark_open and entry_owner_codes is not None and owner_half_spreads is not None:
+                    held_owner_code = entry_owner_codes[i]
+                    half_spread = owner_half_spreads[held_owner_code, i]
+                    bid_open = open_price - half_spread
+                    ask_open = open_price + half_spread
+                    bid_high = high_price - half_spread
+                    bid_low = low_price - half_spread
+                    ask_high = high_price + half_spread
+                    ask_low = low_price + half_spread
+                    bid_close = close_price - half_spread
+                    ask_close = close_price + half_spread
                 entry_price = entry_price_candidate
                 stop_loss = stop_loss_candidate
                 take_profit = take_profit_candidate
@@ -1210,7 +2046,7 @@ def _backtest_loop_numba(
             if dd > max_drawdown:
                 max_drawdown = dd
 
-    if in_position:
+    if in_position and not mark_open:
         half_spread = half_spread_arr[n_bars - 1] if n_bars - 1 < len(half_spread_arr) else 0.0
         if use_spread:
             exit_price = close_arr[n_bars - 1] - half_spread if position_direction == 1 else close_arr[n_bars - 1] + half_spread
@@ -1256,6 +2092,32 @@ def _backtest_loop_numba(
             if dd > max_drawdown:
                 max_drawdown = dd
     
+    if (mark_open and entry_owner_codes is not None and owner_half_spreads is not None
+            and terminal_float_out is not None and terminal_int_out is not None):
+        actual_risk = 0.0
+        unrealized = 0.0
+        terminal_bid = np.nan
+        terminal_ask = np.nan
+        if in_position:
+            hs = owner_half_spreads[held_owner_code, n_bars - 1]
+            terminal_bid = close_arr[n_bars - 1] - hs
+            terminal_ask = close_arr[n_bars - 1] + hs
+            actual_risk, _ = _calc_trade_pnl_numba(entry_price, stop_loss, position_direction,
+                position_size, tick_size, tick_value, pip_size, pip_value)
+            unrealized, _ = _calc_trade_pnl_numba(entry_price,
+                terminal_bid if position_direction == 1 else terminal_ask, position_direction,
+                position_size, tick_size, tick_value, pip_size, pip_value)
+        terminal_float_out[:] = (equity, equity_curve[n_bars - 1], entry_price, stop_loss,
+            take_profit, position_size, risk_amount_at_entry, abs(actual_risk),
+            accrued_swap_dollars_current, terminal_bid, terminal_ask, unrealized,
+            daily_swap_per_lot_current, mae_pips_current, mfe_pips_current)
+        depleted = -1
+        for j in range(n_bars):
+            if equity_curve[j] <= 0.0:
+                depleted = j
+                break
+        terminal_int_out[:] = (int(in_position), position_direction, entry_bar, signal_bar,
+            held_owner_code, accrued_swap_units_current, depleted)
     # Return only filled portion of arrays
     return (
         trade_signal_bars[:trade_count],
@@ -1295,10 +2157,9 @@ def _backtest_loop_numba(
 # CONFIGURATION
 # =============================================================================
 
-# These controls belonged to scoring regimes that have been retired from the
-# executable system.  Keep one short deny-list at the configuration boundary so
-# an old experiment file cannot be accepted while its settings are silently
-# ignored by the canonical scorer.
+# These controls have been retired from the executable system. Keep one short
+# deny-list at the pipeline boundary so an old config cannot be accepted while
+# its settings are silently ignored.
 RETIRED_SCORING_CONFIG_KEYS = frozenset(
     {
         "legacy_confidence_bonus_cap",
@@ -1311,9 +2172,17 @@ RETIRED_SCORING_CONFIG_KEYS = frozenset(
         "threadspark_historical_cost_scope",
         "threadspark_selection_surface",
         "threadspark_use_historical_cost_evidence",
+        "oos_evidence_execution_cost_max_candidates_per_tf",
+        "oos_evidence_execution_stress_mode",
+        "oos_evidence_include_execution_cost_survival",
         "use_commission",
         "use_slippage",
         "slippage_pips",
+        "execution_spread_spike_mult",
+        "production_promotion_review_path",
+        "production_promotion_cell_safety_path",
+        "production_completion_marker_path",
+        "production_expected_promote_cells",
     }
 )
 RETIRED_INSTRUMENT_SPEC_CONFIG_KEYS = frozenset({"commission_per_lot"})
@@ -1427,7 +2296,7 @@ class PipelineConfig:
     #   swap_model_enabled=True. Triple rollover is applied on the configured
     #   broker rollover weekday.
     use_spread: bool = True
-    backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max|stress_p90|stress_p95|stress_max
+    backtest_spread_mode: str = "fixed_spec"  # fixed_spec|historical_bar|historical_max|conservative_max
     swap_model_enabled: bool = True
     swap_model_triple_rollover_day: str = "wednesday"
     swap_model_min_holding_hours: float = 20.0
@@ -1524,9 +2393,6 @@ class PipelineConfig:
     oos_evidence_min_periods: int = 8
     oos_evidence_dirname: str = "oos_evidence"
     oos_evidence_trade_path_max_points: int = 256
-    oos_evidence_include_execution_cost_survival: bool = True
-    oos_evidence_execution_stress_mode: str = "stress_p95"
-    oos_evidence_execution_cost_max_candidates_per_tf: int = 0  # 0 = no cap when enabled
     # Timeframes to evaluate
     timeframes: List[str] = field(default_factory=lambda: ['M5', 'M15', 'M30', 'H1', 'H4', 'D1'])
     
@@ -1544,17 +2410,10 @@ class PipelineConfig:
     manual_new_entries_enabled: bool = True
     manual_kill_switch_path: str = ""
     production_require_promotion_gate: bool = True
-    # ``ledger_status`` and the old multi-file review mode remain readable for
-    # historical/research runs.  The shipped funded profile uses
-    # ``immutable_exact`` and live readiness refuses every weaker mode.
-    production_promotion_gate_mode: str = "ledger_status"  # immutable_exact|external_review_exact|ledger_status
+    production_promotion_gate_mode: str = "immutable_exact"
     production_promotion_authorization_path: str = ""
     production_promotion_authorization_sha256: str = ""
     production_promotion_authorization_max_age_days: int = 31
-    production_promotion_review_path: str = ""
-    production_promotion_cell_safety_path: str = ""
-    production_completion_marker_path: str = ""
-    production_expected_promote_cells: List[str] = field(default_factory=list)
     live_allowed_promotion_statuses: List[str] = field(default_factory=lambda: ["PROMOTED"])
     production_replay_audit_enabled: bool = True
     production_replay_audit_mode: str = "apply"  # report_only|apply
@@ -1686,7 +2545,6 @@ class PipelineConfig:
     target_annual_vol: float = 0.10
     execution_spread_filter_enabled: bool = True
     execution_spread_min_edge_mult: float = 1.5
-    execution_spread_spike_mult: float = 2.0
     execution_spread_penalty_start_mult: float = 0.5
     regime_profitability_audit_enabled: bool = True
     regime_boundary_audit_enabled: bool = True
@@ -2386,24 +3244,6 @@ class PipelineConfig:
         except (TypeError, ValueError, OverflowError):
             trade_path_points = 256
         self.oos_evidence_trade_path_max_points = max(0, min(5000, trade_path_points))
-        self.oos_evidence_include_execution_cost_survival = bool(
-            getattr(self, "oos_evidence_include_execution_cost_survival", False)
-        )
-        stress_mode = str(
-            getattr(self, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95"
-        ).strip().lower()
-        if stress_mode not in {"stress_p90", "stress_p95", "stress_max"}:
-            logger.warning(
-                "Invalid oos_evidence_execution_stress_mode=%r; falling back to stress_p95.",
-                stress_mode,
-            )
-            stress_mode = "stress_p95"
-        self.oos_evidence_execution_stress_mode = stress_mode
-        try:
-            stress_cap = int(getattr(self, "oos_evidence_execution_cost_max_candidates_per_tf", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            stress_cap = 0
-        self.oos_evidence_execution_cost_max_candidates_per_tf = max(0, stress_cap)
         try:
             mult = float(getattr(self, "promote_small_risk_multiplier", 0.5) or 0.0)
         except (TypeError, ValueError, OverflowError):
@@ -2439,15 +3279,12 @@ class PipelineConfig:
         )
         self.swap_model_enabled = bool(self.swap_model_enabled)
         _spread_mode = str(getattr(self, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
-        if _spread_mode not in {
-            "fixed_spec",
-            "historical_bar",
-            "historical_max",
-            "conservative_max",
-            "stress_p90",
-            "stress_p95",
-            "stress_max",
-        }:
+        if _spread_mode in _RETIRED_BACKTEST_SPREAD_MODES:
+            raise ValueError(
+                "old stress spread modes are retired; use a bound frozen spread "
+                "profile with separate endogenous P75/P95 accounts"
+            )
+        if _spread_mode not in _ALLOWED_BACKTEST_SPREAD_MODES:
             logger.warning("Invalid backtest_spread_mode=%r; falling back to fixed_spec.", _spread_mode)
             _spread_mode = "fixed_spec"
         self.backtest_spread_mode = _spread_mode
@@ -2723,10 +3560,6 @@ class PipelineConfig:
         except Exception:
             self.execution_spread_min_edge_mult = 1.5
         try:
-            self.execution_spread_spike_mult = max(1.0, float(self.execution_spread_spike_mult))
-        except Exception:
-            self.execution_spread_spike_mult = 2.0
-        try:
             self.execution_spread_penalty_start_mult = max(0.0, float(self.execution_spread_penalty_start_mult))
         except Exception:
             self.execution_spread_penalty_start_mult = 0.5
@@ -2743,27 +3576,10 @@ class PipelineConfig:
         self.production_require_promotion_gate = bool(
             getattr(self, "production_require_promotion_gate", False)
         )
-        gate_mode = str(getattr(self, "production_promotion_gate_mode", "external_review_exact") or "").strip().lower()
-        gate_mode_aliases = {
-            "immutable": "immutable_exact",
-            "authorization": "immutable_exact",
-            "authorization_exact": "immutable_exact",
-            "external": "external_review_exact",
-            "exact": "external_review_exact",
-            "review_exact": "external_review_exact",
-            "review": "external_review_exact",
-            "ledger": "ledger_status",
-            "current_ledger": "ledger_status",
-            "ledger_authoritative": "ledger_status",
-        }
-        gate_mode = gate_mode_aliases.get(gate_mode, gate_mode)
-        if gate_mode not in {"immutable_exact", "external_review_exact", "ledger_status"}:
-            logger.warning(
-                "Invalid production_promotion_gate_mode=%r; falling back to 'external_review_exact'.",
-                getattr(self, "production_promotion_gate_mode", None),
+        if self.production_promotion_gate_mode != "immutable_exact":
+            raise ValueError(
+                "production_promotion_gate_mode must be literal 'immutable_exact'"
             )
-            gate_mode = "external_review_exact"
-        self.production_promotion_gate_mode = gate_mode
         self.production_promotion_authorization_path = str(
             getattr(self, "production_promotion_authorization_path", "") or ""
         ).strip()
@@ -2777,23 +3593,6 @@ class PipelineConfig:
             )
         except (TypeError, ValueError, OverflowError):
             self.production_promotion_authorization_max_age_days = 31
-        self.production_promotion_review_path = str(
-            getattr(self, "production_promotion_review_path", "") or ""
-        ).strip()
-        self.production_promotion_cell_safety_path = str(
-            getattr(self, "production_promotion_cell_safety_path", "") or ""
-        ).strip()
-        self.production_completion_marker_path = str(
-            getattr(self, "production_completion_marker_path", "") or ""
-        ).strip()
-        raw_cells = getattr(self, "production_expected_promote_cells", []) or []
-        if isinstance(raw_cells, str):
-            raw_cells = [raw_cells]
-        self.production_expected_promote_cells = [
-            str(cell or "").strip().upper()
-            for cell in raw_cells
-            if str(cell or "").strip()
-        ]
         raw_live_statuses = getattr(self, "live_allowed_promotion_statuses", ["PROMOTED"])
         if isinstance(raw_live_statuses, str):
             raw_live_statuses = [
@@ -3032,18 +3831,18 @@ class PipelineConfig:
 
 
 class RetiredScoringConfigError(ValueError):
-    """Raised when an executable config still names a retired scorer control."""
+    """Raised when an executable config still names a retired pipeline control."""
 
     def __init__(self, keys: Sequence[str]):
         self.keys = tuple(sorted({str(key) for key in keys}))
         super().__init__(
-            "retired scoring config keys are no longer executable: "
+            "retired pipeline config keys are no longer executable: "
             f"{list(self.keys)}"
         )
 
 
 def reject_retired_scoring_config_keys(data: Mapping[str, Any]) -> None:
-    """Fail before a retired scorer setting can be silently filtered away."""
+    """Fail before a retired pipeline setting can be silently filtered away."""
 
     if not isinstance(data, Mapping):
         raise TypeError("pipeline config payload must be a mapping")
@@ -4157,7 +4956,7 @@ class DataLoader:
         'H4': 2000,    # ~6 months of H4 data minimum  
         'D1': 500,     # ~2 years of D1 data minimum
     }
-    RESAMPLE_CACHE_SCHEMA_VERSION = 3
+    RESAMPLE_CACHE_SCHEMA_VERSION = 4
     SOURCE_FRAME_CACHE_MAX_ENTRIES = 4
     SOURCE_FRAME_CACHE_MAX_BYTES = 128 * 1024 * 1024
     RESAMPLE_MEMORY_CACHE_MAX_ENTRIES = 8
@@ -4745,8 +5544,6 @@ class DataLoader:
             resampled['Spread'] = grouped_spread.mean()
             resampled['SpreadOpen'] = grouped_spread.first()
             resampled['SpreadMax'] = grouped_spread.max()
-            resampled['SpreadP90'] = grouped_spread.quantile(0.90)
-            resampled['SpreadP95'] = grouped_spread.quantile(0.95)
         
         return resampled
 
@@ -5449,7 +6246,7 @@ class FeatureComputer:
         expected_sha256: Any,
     ) -> Tuple[Any, str]:
         """Return an isolated, hash-bound canonical detector row."""
-        from pm_regime import RegimeParams, regime_params_sha256
+        from pm_regime import RegimeParams, regime_params_sha256, validated_regime_params
 
         if isinstance(value, RegimeParams):
             payload = value.to_dict()
@@ -5468,61 +6265,10 @@ class FeatureComputer:
                 f"(missing={missing}, unknown={unknown})"
             )
 
-        params = RegimeParams.from_dict(payload)
-        integer_fields = {
-            item.name for item in fields(RegimeParams) if item.type is int
-        }
-        integer_max = {
-            "k_confirm": 64,
-            "k_hold": 256,
-            "adx_period": 512,
-            "atr_period": 512,
-            "bb_period": 512,
-            "efficiency_period": 512,
-            "bb_squeeze_lookback": 10_000,
-            "atr_lookback": 10_000,
-            "structure_period": 512,
-        }
-        for name, raw in payload.items():
-            if isinstance(raw, bool):
-                raise ValueError(f"regime parameter {name} must be numeric")
-            if name in integer_fields:
-                if (
-                    not isinstance(raw, (int, np.integer))
-                    or int(raw) < 1
-                    or int(raw) > integer_max[name]
-                ):
-                    raise ValueError(f"regime parameter {name} must be a positive integer")
-            elif not isinstance(raw, (int, float, np.integer, np.floating)):
-                raise ValueError(f"regime parameter {name} must be numeric")
-            if not math.isfinite(float(raw)):
-                raise ValueError(f"regime parameter {name} must be finite")
-
-        bounded_unit = {"gap_min"}
-        bounded_percent = {"bb_squeeze_percentile", "adx_trend_threshold"}
-        positive = {"bb_std"}
-        nonnegative = {"structure_atr_mult"}
-        weight_fields = {name for name in payload if name.endswith("_weight")}
-        for name in bounded_unit | weight_fields:
-            if not 0.0 <= float(payload[name]) <= 1.0:
-                raise ValueError(f"regime parameter {name} must be within [0, 1]")
-        for name in bounded_percent:
-            if not 0.0 <= float(payload[name]) <= 100.0:
-                raise ValueError(f"regime parameter {name} must be within [0, 100]")
-        for name in positive:
-            if not 0.0 < float(payload[name]) <= 10.0:
-                raise ValueError(f"regime parameter {name} must be positive")
-        for name in nonnegative:
-            if not 0.0 <= float(payload[name]) <= 10.0:
-                raise ValueError(f"regime parameter {name} must be nonnegative")
-
-        for prefix in ("trend", "range", "breakout", "chop"):
-            group = [float(payload[name]) for name in weight_fields if name.startswith(prefix)]
-            if not math.isclose(sum(group), 1.0, rel_tol=0.0, abs_tol=1e-9):
-                raise ValueError(f"regime {prefix} weights must sum to 1")
+        params = validated_regime_params(payload)
 
         supplied_sha = expected_sha256 if type(expected_sha256) is str else ""
-        actual_sha = regime_params_sha256(payload)
+        actual_sha = regime_params_sha256(params.to_dict())
         if (
             len(supplied_sha) != 64
             or any(char not in "0123456789abcdef" for char in supplied_sha)
@@ -5552,7 +6298,7 @@ class FeatureComputer:
             raw_cols = [
                 c for c in [
                     'Open', 'High', 'Low', 'Close', 'Volume', 'RealVolume',
-                    'Spread', 'SpreadOpen', 'SpreadMax', 'SpreadP90', 'SpreadP95',
+                    'Spread', 'SpreadOpen', 'SpreadMax',
                 ] if c in df.columns
             ]
             source = df.loc[:, raw_cols].copy() if raw_cols else df.copy()
@@ -5949,6 +6695,8 @@ class FeatureComputer:
         'TREND_SCORE', 'RANGE_SCORE', 'BREAKOUT_SCORE', 'CHOP_SCORE',
         'REGIME_RAW', 'REGIME', 'REGIME_STRENGTH', 'REGIME_GAP',
         'REGIME_LIVE', 'REGIME_STRENGTH_LIVE',
+        'REGIME_WARMUP', 'REGIME_RAW_STRENGTH', 'REGIME_RAW_STRENGTH_LIVE',
+        'REGIME_ADX', 'REGIME_ATR', 'REGIME_BB_WIDTH', 'REGIME_CONFIRM_EVIDENCE',
     }
     
     @staticmethod
@@ -6453,42 +7201,24 @@ class FeatureComputer:
                                 regime_params_file: str,
                                 regime_params_override: Any = None) -> None:
         """Append regime features through the single canonical detector path."""
-        regime_columns = [
-            'TREND_SCORE', 'RANGE_SCORE', 'BREAKOUT_SCORE', 'CHOP_SCORE',
-            'REGIME_RAW', 'REGIME', 'REGIME_STRENGTH', 'REGIME_GAP',
-            'REGIME_LIVE', 'REGIME_STRENGTH_LIVE'
-        ]
+        from pm_regime import (
+            MarketRegimeDetector, REGIME_OUTPUT_COLUMNS, load_regime_params,
+        )
+
         detector_columns = [
             name for name in ('Open', 'High', 'Low', 'Close', 'Volume')
             if name in features.columns
         ]
         detector_input = features.loc[:, detector_columns].copy()
 
-        if regime_params_override is not None:
-            from pm_regime import MarketRegimeDetector
-
-            detector = MarketRegimeDetector(regime_params_override)
-            regime_df = detector.compute_regime_scores(detector_input)
-            for col in regime_columns:
-                if col in regime_df.columns:
-                    features.loc[:, col] = regime_df[col]
-            logger.debug(f"Added authority-bound regime features for {symbol} {timeframe}")
-            return
-
-        try:
-            from pm_regime import MarketRegimeDetector, load_regime_params
-
-            params = load_regime_params(symbol, timeframe, regime_params_file)
-            detector = MarketRegimeDetector(params)
-            regime_df = detector.compute_regime_scores(detector_input)
-            for col in regime_columns:
-                if col in regime_df.columns:
-                    features.loc[:, col] = regime_df[col]
-            logger.debug(f"Added regime features for {symbol} {timeframe}")
-        except ImportError:
-            logger.warning("pm_regime module not available, skipping regime features")
-        except Exception as e:
-            logger.warning(f"Failed to compute regime features for {symbol} {timeframe}: {e}")
+        params = (
+            regime_params_override if regime_params_override is not None
+            else load_regime_params(symbol, timeframe, regime_params_file)
+        )
+        regime_df = MarketRegimeDetector(params).compute_regime_scores(detector_input)
+        for col in REGIME_OUTPUT_COLUMNS:
+            features.loc[:, col] = regime_df[col]
+        logger.debug(f"Added regime features for {symbol} {timeframe}")
     
     @staticmethod
     def hull_ma(series: pd.Series, period: int = 20) -> pd.Series:
@@ -6779,14 +7509,25 @@ class Backtester:
     - Same exit pricing rules (bid for long, ask for short)
     """
     
-    def __init__(self, config: PipelineConfig):
+    def __init__(
+        self,
+        config: PipelineConfig,
+        *,
+        research_swap_context: Optional[ResearchSwapContext] = None,
+    ):
         """
         Initialize Backtester.
         
         Args:
             config: Pipeline configuration
         """
+        if research_swap_context is not None:
+            if not bool(getattr(config, "research_mode", False)):
+                raise BrokerTermsError("RESEARCH_SWAP_CONTEXT_REQUIRES_RESEARCH_MODE")
+            if not isinstance(research_swap_context, ResearchSwapContext):
+                raise BrokerTermsError("RESEARCH_SWAP_CONTEXT_INVALID")
         self.config = config
+        self._research_swap_context = research_swap_context
         # Resolved broker-terms artifacts are immutable and shared by every
         # trial in one optimizer lifetime.  Keep a small, hard-bounded cell
         # cache and pin the terms pointer on first use; a mid-run activation
@@ -6809,8 +7550,8 @@ class Backtester:
 
         Backtester has no mutable market-path state.  Its sole runtime cache is
         a bounded map of verified immutable broker contracts plus the active
-        pointer pin.  Stress replay creates sibling helpers under a different
-        spread policy; sharing this cache avoids reopening the same contract
+        pointer pin.  Ladder replay creates a sibling helper for BASE
+        authentication; sharing this cache avoids reopening the same contract
         while each use still hashes and checks ``terms/ACTIVE.json``.
         """
 
@@ -6946,28 +7687,22 @@ class Backtester:
         return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
-    def _spread_arrays_sha256(
-        entry_half_spread: np.ndarray,
-        intrabar_half_spread: np.ndarray,
-    ) -> str:
-        """Hash the exact two float64 spread arrays consumed by the engine."""
+    def _spread_array_sha256(role: str, raw: np.ndarray) -> str:
+        """Hash one exact float64 spread vector with a domain-separated role."""
 
+        normalized_role = str(role or "")
+        if normalized_role not in {"entry_half_spread", "intrabar_half_spread"}:
+            raise ValueError("spread-array role is invalid")
+        array = np.asarray(raw, dtype=np.float64)
+        if array.ndim != 1:
+            raise ValueError(f"{normalized_role} must be a one-dimensional array")
+        exact = np.ascontiguousarray(array.astype("<f8", copy=False))
         digest = hashlib.sha256()
-        digest.update(b"fxpm-backtester-spread-arrays-v1\x00")
-        for label, raw in (
-            ("entry_half_spread", entry_half_spread),
-            ("intrabar_half_spread", intrabar_half_spread),
-        ):
-            array = np.asarray(raw, dtype=np.float64)
-            if array.ndim != 1:
-                raise ValueError(f"{label} must be a one-dimensional array")
-            # Normalize byte order only; do not round, fill, or otherwise
-            # transform values after the Backtester selected them.
-            exact = np.ascontiguousarray(array.astype("<f8", copy=False))
-            digest.update(label.encode("ascii"))
-            digest.update(b"\x00<f8\x00")
-            digest.update(int(exact.size).to_bytes(8, "big", signed=False))
-            digest.update(exact.tobytes(order="C"))
+        digest.update(b"fxpm-backtester-spread-array-v2\x00")
+        digest.update(normalized_role.encode("ascii"))
+        digest.update(b"\x00<f8\x00")
+        digest.update(int(exact.size).to_bytes(8, "big", signed=False))
+        digest.update(exact.tobytes(order="C"))
         return digest.hexdigest()
 
     def _numerical_execution_cost_attestation(
@@ -6977,38 +7712,12 @@ class Backtester:
         intrabar_half_spread: np.ndarray,
         spread_meta: Dict[str, Any],
         spec: InstrumentSpec,
+        terminal_policy: str = "LIQUIDATE",
     ) -> Dict[str, Any]:
         """Seal the exact spread arrays, policy, and instrument inputs."""
+        _require_liquidated_terminal(terminal_policy)
 
-        spread_policy = {
-            "mode": str(spread_meta.get("mode") or ""),
-            "source": str(spread_meta.get("source") or ""),
-            "fallback_to_fixed": bool(
-                spread_meta.get("fallback_to_fixed", False)
-            ),
-            "entry_column": str(spread_meta.get("entry_column") or ""),
-            "bar_column": str(spread_meta.get("bar_column") or ""),
-            "entry_model": str(spread_meta.get("entry_model") or ""),
-            "stress_entry_fallback": bool(
-                spread_meta.get("stress_entry_fallback", False)
-            ),
-            "stress_derivation_schema": str(
-                spread_meta.get("stress_derivation_schema") or ""
-            ),
-            "stress_distribution_scope": str(
-                spread_meta.get("stress_distribution_scope") or ""
-            ),
-            "stress_distribution_statistic": str(
-                spread_meta.get("stress_distribution_statistic") or ""
-            ),
-            "units": str(spread_meta.get("units") or ""),
-        }
-        spread_mode = json.dumps(
-            spread_policy,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
+        spread_mode = build_backtest_spread_mode(spread_meta)
         instrument_spec_sha256 = self._cost_attestation_json_sha256({
             "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
             "instrument_spec": asdict(spec),
@@ -7016,8 +7725,12 @@ class Backtester:
         return build_numerical_execution_cost_attestation(
             use_spread=bool(getattr(self.config, "use_spread", True)),
             spread_mode=spread_mode,
-            spread_values_sha256=self._spread_arrays_sha256(
+            entry_half_spread_values_sha256=self._spread_array_sha256(
+                "entry_half_spread",
                 entry_half_spread,
+            ),
+            intrabar_half_spread_values_sha256=self._spread_array_sha256(
+                "intrabar_half_spread",
                 intrabar_half_spread,
             ),
             instrument_spec_sha256=instrument_spec_sha256,
@@ -7036,96 +7749,64 @@ class Backtester:
         values = np.where(np.isfinite(values) & (values >= 0.0), values, np.nan)
         return values * point * 0.5
 
-    @staticmethod
-    def _closed_partition_spread_stress_points(
-        raw: Any,
-        *,
-        mode: str,
-    ) -> Tuple[Optional[pd.Series], Dict[str, Any]]:
-        """Derive a preregistered stress statistic from genuine closed bars.
-
-        Independently acquired native timeframes expose one MT5 ``Spread``
-        observation per closed bar, not synthetic within-bar P90/P95/Max
-        columns.  For cost-stress evaluation only, use the exact closed
-        partition's empirical order statistic and apply it as a pointwise
-        floor to the observed spread.  Signals, positions, and base fills are
-        already frozen before this counterfactual lane is evaluated.
-
-        The linear order statistic is implemented explicitly so its numerical
-        definition is code-pinned and does not depend on a library default.
-        No uplift is invented: a constant or already-worse observed spread
-        remains unchanged and the trade-bearing stress lane then fails closed.
-        """
-
-        normalized_mode = str(mode or "").strip().lower()
-        statistics = {
-            "stress_p90": (0.90, "EMPIRICAL_P90_LINEAR_ORDER_STATISTIC"),
-            "stress_p95": (0.95, "EMPIRICAL_P95_LINEAR_ORDER_STATISTIC"),
-            "stress_max": (None, "EMPIRICAL_MAXIMUM"),
-        }
-        if normalized_mode not in statistics:
-            raise ValueError("closed-partition spread stress mode is invalid")
-        try:
-            series = pd.to_numeric(raw, errors="coerce")
-            values = series.to_numpy(dtype=np.float64)
-        except (AttributeError, TypeError, ValueError, OverflowError):
-            return None, {}
-        if values.ndim != 1 or not len(values):
-            return None, {}
-        finite_mask = np.isfinite(values) & (values >= 0.0)
-        observed = np.sort(values[finite_mask].astype(np.float64, copy=True))
-        if not len(observed):
-            return None, {}
-        quantile, statistic_name = statistics[normalized_mode]
-        if quantile is None:
-            statistic = float(observed[-1])
-        else:
-            rank = float(quantile) * float(len(observed) - 1)
-            lower = int(math.floor(rank))
-            upper = int(math.ceil(rank))
-            weight = rank - float(lower)
-            statistic = float(
-                observed[lower]
-                + (observed[upper] - observed[lower]) * weight
-            )
-        if not math.isfinite(statistic) or statistic < 0.0:
-            return None, {}
-        stressed = np.fmax(
-            np.where(finite_mask, values, np.nan),
-            np.full(len(values), statistic, dtype=np.float64),
-        )
-        if not np.isfinite(stressed).all() or bool((stressed < 0.0).any()):
-            return None, {}
-        return pd.Series(stressed, index=series.index, dtype=np.float64), {
-            "stress_derivation_schema": (
-                BACKTEST_CLOSED_PARTITION_SPREAD_STRESS_SCHEMA_VERSION
-            ),
-            "stress_distribution_scope": "EXACT_CLOSED_BACKTEST_PARTITION",
-            "stress_distribution_statistic": statistic_name,
-            "stress_distribution_column": "Spread",
-            "stress_distribution_observation_count": int(len(observed)),
-            "stress_distribution_value_points": statistic,
-        }
-
     def _build_half_spread_arrays(
         self,
         features: pd.DataFrame,
         spec: InstrumentSpec,
+        *,
+        spread_tier: Optional[FrozenSpreadTier] = None,
+        timeframe: str = "",
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
         """
         Build entry and intrabar half-spread arrays.
 
-        Default `fixed_spec` preserves the historical behavior. Evidence modes use
-        MT5 bar Spread columns, which are stored in points and converted via the
-        instrument spec's broker point. `conservative_max` keeps entry at bar-open
-        spread and uses max spread intrabar. Stress modes keep the same intrabar
-        max-spread protection while changing only the entry-fill assumption:
-        p90, p95, or max spread inside the entry bar.
+        `conservative_max` requires a bound frozen tier and charges the greater
+        of that tier and the recorded side's spread. The other modes remain
+        non-authorising diagnostics. Bar minima are not observed entry quotes.
         """
         n_bars = len(features)
         fixed_half = spec.get_half_spread_price() if bool(getattr(self.config, "use_spread", True)) else 0.0
         fixed_arr = np.full(n_bars, float(fixed_half), dtype=np.float64)
         mode = str(getattr(self.config, "backtest_spread_mode", "fixed_spec") or "fixed_spec").strip().lower()
+        if mode not in _ALLOWED_BACKTEST_SPREAD_MODES:
+            raise ValueError(
+                f"invalid backtest_spread_mode at execution: {mode!r}; "
+                "configuration must be normalized before backtesting"
+            )
+        if mode == "conservative_max":
+            if not isinstance(spread_tier, FrozenSpreadTier):
+                raise ValueError("FROZEN_SPREAD_TIER_REQUIRED:" + RETIRED_COST_POLICY)
+            if not bool(self.config.use_spread):
+                raise ValueError("FROZEN_SPREAD_REQUIRES_COSTS_ENABLED")
+            spread_tier.validate_execution(spec.symbol, timeframe, spec.point)
+            floor = spread_tier.full_spread_price / 2.0
+            arrays = []
+            columns = ("SpreadOpen" if "SpreadOpen" in features else "Spread",
+                       "SpreadMax" if "SpreadMax" in features else "Spread")
+            missing = {}
+            for column in columns:
+                raw = (pd.to_numeric(features[column], errors="raise").to_numpy(dtype=float)
+                       if column in features else np.full(n_bars, np.nan))
+                invalid = ~np.isnan(raw) & (~np.isfinite(raw) | (raw < 0) | (raw != np.floor(raw)))
+                if invalid.any():
+                    raise ValueError("RECORDED_SPREAD_POINTS_INVALID")
+                missing[column] = int(np.isnan(raw).sum())
+                arrays.append(np.maximum(floor, np.where(np.isnan(raw), floor, raw * spec.point / 2)))
+            return arrays[0], arrays[1], {
+                "mode": mode, "source": "frozen_profile_and_recorded_spread_points",
+                "units": "price", "fallback_to_fixed": False,
+                "asset_class": str(spec.asset_class),
+                "broker_fixed_spread_price": 0.0,
+                "entry_column": columns[0], "bar_column": columns[1],
+                "entry_model": "max_frozen_tier_and_recorded_bar_scenario",
+                "intrabar_policy": "MAX_TIER_AND_RECORDED_EXIT_SPREAD_PROTECTIVE_EXITS_UNCAPPED",
+                "spread_provenance_status": "RETROSPECTIVE_FIXED_SCENARIO_NOT_EXECUTION_QUOTES",
+                "frozen_spread_tier": spread_tier.descriptor(),
+                "entry_admission_policy": ADMISSION_POLICY,
+                "entry_admission_schema": ADMISSION_SCHEMA,
+                "recorded_spread_missing_rows": missing,
+                "qualification_authority": False,
+            }
         asset_class = str(getattr(spec, "asset_class", "unknown") or "unknown").strip().lower()
         broker_fixed_spread_price = float(fixed_half) * 2.0
         meta: Dict[str, Any] = {
@@ -7140,31 +7821,8 @@ class Backtester:
         if not bool(getattr(self.config, "use_spread", True)) or mode == "fixed_spec" or n_bars <= 0:
             return fixed_arr, fixed_arr, meta
 
-        stress_entry_preferences = {
-            "stress_p90": ("SpreadP90", "SpreadMax"),
-            "stress_p95": ("SpreadP95", "SpreadMax", "SpreadP90"),
-            "stress_max": ("SpreadMax",),
-        }
-        requested_stress_cols = stress_entry_preferences.get(mode, ())
-        entry_col = ""
-        derived_stress_entry: Optional[pd.Series] = None
-        derived_stress_meta: Dict[str, Any] = {}
-        for candidate_col in requested_stress_cols:
-            if candidate_col in features.columns:
-                entry_col = candidate_col
-                break
-        if not entry_col and requested_stress_cols and "Spread" in features.columns:
-            derived_stress_entry, derived_stress_meta = (
-                self._closed_partition_spread_stress_points(
-                    features["Spread"],
-                    mode=mode,
-                )
-            )
-            if derived_stress_entry is not None:
-                entry_col = "Spread"
-        if not entry_col:
-            entry_col = "SpreadOpen" if "SpreadOpen" in features.columns else "Spread"
-        if mode in {"historical_max", "conservative_max", "stress_p90", "stress_p95", "stress_max"} and "SpreadMax" in features.columns:
+        entry_col = "SpreadOpen" if "SpreadOpen" in features.columns else "Spread"
+        if mode in {"historical_max", "conservative_max"} and "SpreadMax" in features.columns:
             bar_col = "SpreadMax"
         else:
             bar_col = "Spread"
@@ -7174,12 +7832,7 @@ class Backtester:
             meta["missing_columns"] = [col for col in {entry_col, bar_col} if col not in features.columns]
             return fixed_arr, fixed_arr, meta
 
-        entry_hist = self._spread_points_to_half_price(
-            derived_stress_entry
-            if derived_stress_entry is not None
-            else features[entry_col],
-            spec,
-        )
+        entry_hist = self._spread_points_to_half_price(features[entry_col], spec)
         bar_hist = self._spread_points_to_half_price(features[bar_col], spec)
         if entry_hist is None or bar_hist is None:
             meta["fallback_to_fixed"] = True
@@ -7188,36 +7841,15 @@ class Backtester:
 
         entry_hist = np.where(np.isfinite(entry_hist), entry_hist, fixed_arr)
         bar_hist = np.where(np.isfinite(bar_hist), bar_hist, fixed_arr)
-        if mode in {"conservative_max", "stress_p90", "stress_p95", "stress_max"}:
-            entry_arr = np.maximum(fixed_arr, entry_hist)
-            bar_arr = np.maximum(fixed_arr, bar_hist)
-        else:
-            entry_arr = entry_hist
-            bar_arr = bar_hist
+        entry_arr = entry_hist
+        bar_arr = bar_hist
 
-        entry_model = {
-            "SpreadP90": "p90_spread_stress",
-            "SpreadP95": "p95_spread_stress",
-            "SpreadMax": "max_spread_stress",
-        }.get(entry_col, "bar_open_or_mean")
-        if derived_stress_entry is not None:
-            entry_model = {
-                "stress_p90": "closed_partition_empirical_p90_spread_stress",
-                "stress_p95": "closed_partition_empirical_p95_spread_stress",
-                "stress_max": "closed_partition_empirical_max_spread_stress",
-            }[mode]
+        entry_model = "bar_open_or_mean"
         meta.update({
-            "source": (
-                "closed_partition_historical_spread_points"
-                if derived_stress_entry is not None
-                else "historical_spread_points"
-            ),
-            "requested_entry_columns": list(requested_stress_cols),
+            "source": "historical_spread_points",
             "entry_column": entry_col,
             "bar_column": bar_col,
             "entry_model": entry_model,
-            "stress_entry_fallback": bool(requested_stress_cols and entry_col != requested_stress_cols[0]),
-            **derived_stress_meta,
         })
         try:
             effective_spread_price = bar_arr * 2.0
@@ -7286,6 +7918,15 @@ class Backtester:
         happen to match.
         """
         binding = dict(features.attrs.get(NATIVE_SOURCE_BINDING_ATTR) or {})
+        if self._research_swap_context is not None:
+            if not bool(getattr(self.config, "research_mode", False)):
+                raise BrokerTermsError("RESEARCH_SWAP_CONTEXT_REQUIRES_RESEARCH_MODE")
+            if binding:
+                raise BrokerTermsError("RESEARCH_SWAP_CONTEXT_NATIVE_AUTHORITY_CONFLICT")
+            projection = self._research_swap_context.project(
+                features, symbol=str(spec.symbol or "").upper()
+            )
+            return projection, self._research_swap_context.resolved_terms()
         if not binding:
             return None
         native_root = Path(getattr(self.config, "data_dir", Path("./data"))) / "native"
@@ -7366,6 +8007,10 @@ class Backtester:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, Dict[str, Any]]:
         """Build observable per-close rollover and per-entry swap arrays."""
         count = int(len(features))
+        research_overlay = (
+            self._resolve_broker_swap_projection(features, spec, timeframe)
+            if self._research_swap_context is not None else None
+        )
         pre_open_rollover_units = np.zeros(count, dtype=np.int32)
         rollover_units = np.zeros(count, dtype=np.int32)
         long_per_lot = np.zeros(count, dtype=np.float64)
@@ -7419,7 +8064,7 @@ class Backtester:
             contract["reason"] = f"bar-open validation failed: {type(exc).__name__}"
             return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
 
-        overlay = self._resolve_broker_swap_projection(
+        overlay = research_overlay or self._resolve_broker_swap_projection(
             features,
             spec,
             timeframe,
@@ -7507,6 +8152,20 @@ class Backtester:
                     pre_open_rollover_units.sum() + rollover_units.sum()
                 ),
             })
+            if resolved.get("research_context"):
+                contract.update({
+                    "status": "UNAVAILABLE",
+                    "mode": "research_d1_session_projection",
+                    "rollover_event_source": "delivered_pre_cutoff_d1_intervals",
+                    "timestamp_evidence_level": "declared_research_d1_session_proxy",
+                    "source_provenance_authenticated": False,
+                    "historical_rate_provenance": "static_current_terms_stress",
+                    "research_cutoff_utc": resolved.get("research_cutoff_utc"),
+                    "terms_snapshot_captured_at_utc": resolved.get(
+                        "terms_snapshot_captured_at_utc"
+                    ),
+                    "reason": "unauthenticated research costs using static current-terms stress",
+                })
             return (
                 pre_open_rollover_units,
                 rollover_units,
@@ -7584,6 +8243,237 @@ class Backtester:
         })
         return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, True, contract
      
+    def _validate_research_cost_level(self, level_id: Optional[str]) -> None:
+        if level_id is None:
+            return
+        raise ValueError(RETIRED_COST_POLICY)
+
+    def _research_execution_spread_arrays(
+        self, features: pd.DataFrame, spec: InstrumentSpec, level_id: Optional[str],
+        *, spread_tier: Optional[FrozenSpreadTier] = None, timeframe: str = "",
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        self._validate_research_cost_level(level_id)
+        return self._build_half_spread_arrays(features, spec, spread_tier=spread_tier,
+                                            timeframe=timeframe)
+
+
+    @staticmethod
+    def _continuous_utc_axis(values):
+        error = ContinuousAccountExecutionError
+        if isinstance(values, pd.DatetimeIndex):
+            axis = values
+        elif (isinstance(values, pd.Series) and pd.api.types.is_datetime64_any_dtype(values.dtype)) or (
+                isinstance(values, np.ndarray) and values.ndim == 1 and np.issubdtype(values.dtype, np.datetime64)):
+            axis = pd.DatetimeIndex(values)
+        else:
+            try:
+                source = iter(values)
+            except TypeError as exc:
+                raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "datetime axis required") from exc
+            stamps = []
+            for value in source:
+                if not isinstance(value, (datetime, pd.Timestamp, np.datetime64)) or pd.isna(value):
+                    raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "datetime objects required")
+                stamp = pd.Timestamp(value)
+                if stamp.tzinfo is None:
+                    stamp = stamp.tz_localize("UTC")
+                elif str(stamp.tzinfo) != "UTC":
+                    raise error("CONTINUOUS_ACCOUNT_UTC_REQUIRED")
+                stamps.append(stamp)
+            return pd.DatetimeIndex(stamps, tz="UTC")
+        if axis.hasnans:
+            raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "missing timestamp")
+        if axis.tz is None:
+            return axis.tz_localize("UTC")
+        if str(axis.tz) != "UTC":
+            raise error("CONTINUOUS_ACCOUNT_UTC_REQUIRED")
+        return axis
+
+    def _prepare_continuous_account(self, features, schedule, symbol, spec, timeframe,
+                                    warmup_bars, observations, governance_policy):
+        error = ContinuousAccountExecutionError
+        if self.config.backtest_spread_mode != "conservative_max" or self.config.use_spread is not True:
+            raise error("CONTINUOUS_ACCOUNT_SPREAD_POLICY_INVALID")
+        if governance_policy is not None:
+            raise error("CONTINUOUS_ACCOUNT_GOVERNANCE_UNSUPPORTED")
+        if not isinstance(schedule, ContinuousEntrySchedule) or not isinstance(features, pd.DataFrame):
+            raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "schedule/frame")
+        if not isinstance(schedule.owners, tuple) or not isinstance(schedule.slots, tuple):
+            raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "owner/slot rosters")
+        if isinstance(warmup_bars, bool) or not isinstance(warmup_bars, (int, np.integer)) or warmup_bars < 0:
+            raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "warmup")
+        frame = features.copy()
+        frame.index = self._continuous_utc_axis(features.index)
+        n = len(frame)
+        if frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
+            raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "native open axis")
+        if "_BAR_CLOSE_TS" not in frame:
+            code = "CAUSAL_SWAP_REQUIRED" if self.config.swap_model_enabled else "INPUT_INVALID"
+            raise error("CONTINUOUS_ACCOUNT_" + code, "actual close axis required")
+        closes = self._continuous_utc_axis(frame["_BAR_CLOSE_TS"])
+        if closes.has_duplicates or not closes.is_monotonic_increasing or not (closes > frame.index).all():
+            raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "native close axis")
+        if n > 1 and (closes[:-1] > frame.index[1:]).any():
+            raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "overlapping native bars")
+        frame["_BAR_CLOSE_TS"] = closes
+        for column in ("Open", "High", "Low", "Close"):
+            if column not in frame or not np.isfinite(pd.to_numeric(frame[column], errors="coerce")).all():
+                raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", column)
+        if observations is None:
+            observations = pd.Series(np.nan, index=frame.index)
+        elif not isinstance(observations, pd.Series) or len(observations) != n:
+            raise error("CONTINUOUS_ACCOUNT_AXIS_MISMATCH", "entry observations")
+        else:
+            observations = observations.copy()
+            observations.index = self._continuous_utc_axis(observations.index)
+            if not observations.index.equals(frame.index):
+                raise error("CONTINUOUS_ACCOUNT_AXIS_MISMATCH", "entry observations")
+        owners, owner_ids, profiles = [], {}, set()
+        native_columns = ("Open", "High", "Low", "Close", "Spread", "SpreadOpen", "SpreadMax", "_BAR_CLOSE_TS")
+        for owner in schedule.owners:
+            if not isinstance(owner, ContinuousEntryOwner) or not isinstance(owner.owner_id, str) or not owner.owner_id or owner.owner_id in owner_ids:
+                raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "owner identity")
+            if not isinstance(owner.features, pd.DataFrame) or not isinstance(owner.signals, pd.Series) or len(owner.features) != n or len(owner.signals) != n:
+                raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "owner arrays")
+            own_frame, signals = owner.features.copy(), owner.signals.copy()
+            own_frame.index = self._continuous_utc_axis(own_frame.index)
+            signals.index = self._continuous_utc_axis(signals.index)
+            if not own_frame.index.equals(frame.index) or not signals.index.equals(frame.index):
+                raise error("CONTINUOUS_ACCOUNT_AXIS_MISMATCH", owner.owner_id)
+            if "_BAR_CLOSE_TS" in own_frame:
+                own_frame["_BAR_CLOSE_TS"] = self._continuous_utc_axis(own_frame["_BAR_CLOSE_TS"])
+            for column in native_columns:
+                if (column in own_frame) != (column in frame) or (column in frame and not own_frame[column].equals(frame[column])):
+                    raise error("CONTINUOUS_ACCOUNT_AXIS_MISMATCH", column)
+            numeric = pd.to_numeric(signals, errors="coerce")
+            if numeric.isna().any() or not numeric.isin([-1, 0, 1]).all():
+                raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "owner signals")
+            try:
+                if not isinstance(owner.spread_tier, FrozenSpreadTier):
+                    raise ValueError("missing tier")
+                owner.spread_tier.validate_execution(symbol, timeframe, spec.point)
+                descriptor = owner.spread_tier.descriptor()
+                profiles.add((descriptor["profile_sha256"], descriptor["source_identity_sha256"],
+                              descriptor["symbol"], descriptor["timeframe"], descriptor["point_price"],
+                              descriptor["source_timeframe"], json.dumps(descriptor["source_binding"], sort_keys=True)))
+            except Exception as exc:
+                raise error("CONTINUOUS_ACCOUNT_TIER_BINDING_INVALID", str(exc)) from exc
+            try:
+                entry_spreads, bar_spreads, _ = self._research_execution_spread_arrays(
+                    frame, spec, None, spread_tier=owner.spread_tier, timeframe=timeframe)
+                states, _ = self._entry_spread_admission_inputs(frame, owner.spread_tier, observations)
+            except Exception as exc:
+                raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "spread data: " + str(exc)) from exc
+            owner_ids[owner.owner_id] = len(owners)
+            owners.append((owner, own_frame, numeric.astype(np.int32), entry_spreads, bar_spreads, states))
+        if len(profiles) > 1:
+            raise error("CONTINUOUS_ACCOUNT_TIER_BINDING_INVALID", "profile identities differ")
+        codes = np.full(n, -1, dtype=np.int32)
+        slot_codes = np.full(n, -1, dtype=np.int32)
+        previous_end, seen = None, set()
+        for ordinal, slot in enumerate(schedule.slots):
+            if not isinstance(slot, ContinuousEntrySlot) or not isinstance(slot.slot_id, str) or not slot.slot_id or slot.slot_id in seen:
+                raise error("CONTINUOUS_ACCOUNT_INPUT_INVALID", "slot identity")
+            seen.add(slot.slot_id)
+            start, end = self._continuous_utc_axis([slot.start_utc, slot.end_utc])
+            if start >= end:
+                raise error("CONTINUOUS_ACCOUNT_SLOT_COVERAGE_INVALID", slot.slot_id)
+            if previous_end is not None and start != previous_end:
+                raise error("CONTINUOUS_ACCOUNT_SLOT_GAP" if start > previous_end else "CONTINUOUS_ACCOUNT_SLOT_OVERLAP")
+            previous_end = end
+            if slot.owner_id is not None and slot.owner_id not in owner_ids:
+                raise error("CONTINUOUS_ACCOUNT_OWNER_UNKNOWN", str(slot.owner_id))
+            mask = (frame.index >= start) & (frame.index < end)
+            slot_codes[mask] = ordinal
+            if slot.owner_id is not None:
+                codes[mask] = owner_ids[slot.owner_id]
+        if n > warmup_bars and ((slot_codes[warmup_bars:] < 0).any() or not schedule.slots or closes[-1] > previous_end):
+            raise error("CONTINUOUS_ACCOUNT_SLOT_COVERAGE_INVALID")
+        codes[:warmup_bars] = -1
+        routed = np.zeros(n, dtype=np.int32)
+        entry_spreads = np.zeros(n, dtype=np.float64)
+        states = np.full(n, "NO_TRADE", dtype="<U8")
+        half_spreads = np.empty((len(owners), n), dtype=np.float64)
+        for code, (_, _, signals, entry, bars, admission) in enumerate(owners):
+            half_spreads[code] = bars
+            mask = codes == code
+            entry_spreads[mask], states[mask] = entry[mask], admission[mask]
+            for i in np.flatnonzero(mask & (np.arange(n) >= max(1, warmup_bars))):
+                routed[i - 1] = signals.iat[i - 1]
+        return frame, pd.Series(routed, index=frame.index), {
+            "schedule": schedule, "owners": owners, "codes": codes, "slots": slot_codes,
+            "entry_spreads": entry_spreads, "half_spreads": half_spreads, "admission": states, "warmup": warmup_bars,
+        }
+
+    def _continuous_account_result(self, context, features, spec, trades, curve, max_dd,
+                                   floats, integers, swap_contract):
+        cash, marked = float(floats[0]), float(floats[1])
+        asof = len(features) - 1 if len(features) else None
+        position = None
+        if integers[0]:
+            code, entry_bar = int(integers[4]), int(integers[2])
+            owner = context["owners"][code][0]
+            position = {
+                "owner_id": owner.owner_id,
+                "slot_id": context["schedule"].slots[int(context["slots"][entry_bar])].slot_id,
+                "tier": owner.spread_tier.descriptor(), "direction": int(integers[1]),
+                "entry_bar": entry_bar, "signal_bar": int(integers[3]),
+                "entry_utc_open": features.index[entry_bar],
+                "entry_price": float(floats[2]), "stop_loss": float(floats[3]),
+                "take_profit": float(floats[4]), "lots": float(floats[5]),
+                "requested_risk_amount": float(floats[6]), "executed_stop_risk": float(floats[7]),
+                "posted_swap_cash": float(floats[8]), "posted_swap_units": int(integers[5]),
+                "latched_rate_per_lot": float(floats[12]),
+                "mae_pips": float(floats[13]), "mfe_pips": float(floats[14]),
+            }
+        for trade in trades:
+            entry_bar = trade["entry_bar"]
+            owner = context["owners"][int(context["codes"][entry_bar])][0]
+            trade.update(owner_id=owner.owner_id, slot_id=context["schedule"].slots[int(context["slots"][entry_bar])].slot_id,
+                         frozen_spread_tier=owner.spread_tier.descriptor())
+        depleted = int(integers[6]) if integers[6] >= 0 else None
+        terminal = {
+            "schema_version": "fxpm.continuous-account-terminal.v1", "policy": "MARK_OPEN",
+            "valuation_status": "UNAVAILABLE_NO_OBSERVATION" if asof is None else "MARKED_OPEN" if position else "FLAT_CASH_ONLY",
+            "cash": cash, "marked_equity": marked if asof is not None else None,
+            "asof_bar": asof, "asof_open": features.index[asof] if asof is not None else None,
+            "asof_close": features["_BAR_CLOSE_TS"].iat[asof] if asof is not None else None,
+            "bid": float(floats[9]) if position else None,
+            "ask": float(floats[10]) if position else None,
+            "unrealized_gross": float(floats[11]) if position else 0.0,
+            "open_position": position, "first_depletion_bar": depleted,
+        }
+        opportunities = np.zeros(len(features), dtype=bool)
+        for i in range(1, len(features)):
+            code = context["codes"][i]
+            opportunities[i] = code >= 0 and context["owners"][code][2].iat[i - 1] != 0
+        admission = context["admission"]
+        tier_counts = {}
+        for code, row in enumerate(context["owners"]):
+            level = row[0].spread_tier.tier
+            counts = tier_counts.setdefault(level, {"admitted": 0, "refused": 0, "missing": 0})
+            mask = opportunities & (context["codes"] == code)
+            for key, state in (("admitted", "ADMIT"), ("refused", "REFUSE"), ("missing", "MISSING")):
+                counts[key] += int((mask & (admission == state)).sum())
+        return {
+            "schema_version": "fxpm.continuous-account-result.v1", "terminal_policy": "MARK_OPEN",
+            "cash": cash, "final_equity": marked if asof is not None else None,
+            "net_account_profit": marked - self.config.initial_capital if asof is not None else None,
+            "equity_curve": curve, "max_drawdown_pct": max_dd,
+            "total_trades": len(trades), "trades": trades,
+            "closed_trade_statistics_basis": "CLOSED_TRADES_ONLY_EXCLUDES_OPEN_INVENTORY",
+            "closed_trade_gross_profit": sum(t["gross_pnl_dollars"] for t in trades),
+            "terminal": terminal, "first_depletion_bar": depleted,
+            "swap_accrual_contract": swap_contract, "qualification_authority": False,
+            "tier_entry_counts": tier_counts,
+            "spread_admission": {
+                "known_cap_refused_opportunities": int((opportunities & (admission == "REFUSE")).sum()),
+                "known_cap_pass_opportunities": int((opportunities & (admission == "ADMIT")).sum()),
+                "missing_refused_opportunities": int((opportunities & (admission == "MISSING")).sum()),
+                "no_trade_scored_bar_count": int((admission[context["warmup"]:] == "NO_TRADE").sum()),
+            },
+        }
+
     def run(self,
             features: pd.DataFrame,
             signals: pd.Series,
@@ -7592,7 +8482,12 @@ class Backtester:
             spec: Optional[InstrumentSpec] = None,
             timeframe: str = "",
             warmup_bars: int = 0,
-            governance_policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            governance_policy: Optional[Dict[str, Any]] = None,
+            *, research_cost_level_id: Optional[str] = None,
+            spread_tier: Optional[FrozenSpreadTier] = None,
+            entry_spread_observations: Optional[pd.Series] = None,
+            entry_schedule: Optional[ContinuousEntrySchedule] = None,
+            terminal_policy: str = "LIQUIDATE") -> Dict[str, Any]:
         """
         Run backtest on a dataset with signals.
         
@@ -7606,12 +8501,34 @@ class Backtester:
             symbol: Symbol being traded
             strategy: Strategy instance (for stop calculation)
             spec: Optional InstrumentSpec (uses default if None)
+            spread_tier: bound one-time SymbolTF P75 or P95 cost identity.
+            entry_spread_observations: exact prior-fine-close points aligned to
+                entry bars; missing observations refuse new entries.
+            research_cost_level_id: retired multiplier interface; rejected.
             
         Returns:
             Dict with complete backtest results and metrics
         """
+        self._validate_research_cost_level(research_cost_level_id)
         if spec is None:
             spec = get_instrument_spec(symbol)
+        if spread_tier is not None:
+            if self.config.backtest_spread_mode != "conservative_max":
+                raise ValueError("FROZEN_SPREAD_REQUIRES_CONSERVATIVE_MAX")
+            spread_tier.validate_execution(symbol, timeframe, spec.point)
+        continuous = None
+        if terminal_policy not in {"LIQUIDATE", "MARK_OPEN"}:
+            raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_TERMINAL_POLICY_INVALID")
+        if entry_schedule is not None:
+            if terminal_policy != "MARK_OPEN":
+                raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_TERMINAL_POLICY_INVALID")
+            if signals is not None or strategy is not None or spread_tier is not None:
+                raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_ARGUMENT_CONFLICT")
+            features, signals, continuous = self._prepare_continuous_account(
+                features, entry_schedule, symbol, spec, timeframe, warmup_bars,
+                entry_spread_observations, governance_policy)
+        elif terminal_policy != "LIQUIDATE":
+            raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_ARGUMENT_CONFLICT")
         strategy_name = getattr(strategy, "name", strategy.__class__.__name__)
 
         # ----------------------------------------------------------------
@@ -7643,6 +8560,13 @@ class Backtester:
         signal_numeric = signal_numeric.astype(np.int32)
 
         n_bars = len(features)
+        if n_bars == 0 and continuous is not None:
+            floats = np.zeros(CONTINUOUS_TERMINAL_FLOAT_COUNT, dtype=np.float64)
+            floats[:2] = self.config.initial_capital
+            integers = np.full(CONTINUOUS_TERMINAL_INT_COUNT, -1, dtype=np.int64)
+            integers[0] = 0
+            return self._continuous_account_result(continuous, features, spec, [], [], 0.0,
+                floats, integers, {"status": "UNAVAILABLE_NO_OBSERVATION"})
         if n_bars == 0:
             # Never enter the Numba kernel with zero rows: its preallocated
             # equity curve writes index zero and bounds checks are disabled.
@@ -7661,9 +8585,13 @@ class Backtester:
                 timeframe=timeframe,
             )
             entry_half_spread_arr, half_spread_arr, spread_meta = (
-                self._build_half_spread_arrays(features, spec)
+                self._research_execution_spread_arrays(features, spec, research_cost_level_id,
+                                                       spread_tier=spread_tier, timeframe=timeframe)
             )
             metrics = self._empty_result()
+            metrics["equity_growth"] = build_backtest_equity_growth(
+                features, (), initial_equity=self.config.initial_capital,
+            )
             metrics["winner_daily_r_surface"] = _backtest_winner_daily_surface(
                 "UNAVAILABLE"
             )
@@ -7694,7 +8622,21 @@ class Backtester:
         # Cache spread-related arrays. The default mode is a fixed per-symbol
         # spread to preserve benchmark behavior; evidence modes can consume
         # historical bar-level spread columns.
-        entry_half_spread_arr, half_spread_arr, spread_meta = self._build_half_spread_arrays(features, spec)
+        if continuous is not None:
+            entry_half_spread_arr = continuous["entry_spreads"]
+            half_spread_arr = np.zeros(n_bars, dtype=np.float64)
+            spread_meta = {}
+            admission_states = continuous["admission"]
+        else:
+            entry_half_spread_arr, half_spread_arr, spread_meta = self._research_execution_spread_arrays(
+                features, spec, research_cost_level_id, spread_tier=spread_tier, timeframe=timeframe,
+            )
+            admission_states = None
+        if spread_tier is not None:
+            admission_states, admission_binding = self._entry_spread_admission_inputs(
+                features, spread_tier, entry_spread_observations,
+            )
+            spread_meta.update(admission_binding)
         
         if 'ATR_14' in features.columns:
             atr_arr = pd.to_numeric(features['ATR_14'], errors='coerce').to_numpy().astype(np.float64)
@@ -7713,7 +8655,8 @@ class Backtester:
         strategy_cls_dict = getattr(getattr(strategy, "__class__", object), "__dict__", {})
         strategy_params = getattr(strategy, "params", {}) or {}
         default_atr_stop_fast_path = (
-            strategy_cls_dict.get("calculate_stops") is None
+            continuous is None
+            and strategy_cls_dict.get("calculate_stops") is None
             and strategy_cls_dict.get("build_trade_intent") is None
             and not bool(strategy_params.get("use_structural_sl", False))
             and "ATR_14" in features.columns
@@ -7769,6 +8712,13 @@ class Backtester:
                 signal = sig_arr[i - 1]  # Signal from previous bar
 
                 if signal != 0:
+                    if continuous is not None:
+                        owner, stop_features = continuous["owners"][int(continuous["codes"][i])][:2]
+                        strategy = owner.strategy
+                        stop_label = f"owner {owner.owner_id}/{getattr(strategy, 'name', type(strategy).__name__)}"
+                    else:
+                        stop_features = features
+                        stop_label = strategy_name
                     direction = int(signal)
                     is_long = direction == 1
                     signal_bar_index = i - 1
@@ -7780,17 +8730,17 @@ class Backtester:
                         if callable(getattr(strategy, "build_trade_intent", None)):
                             regime_label = ""
                             regime_col = (
-                                "REGIME_LIVE" if "REGIME_LIVE" in features.columns
-                                else "REGIME" if "REGIME" in features.columns
+                                "REGIME_LIVE" if "REGIME_LIVE" in stop_features.columns
+                                else "REGIME" if "REGIME" in stop_features.columns
                                 else None
                             )
                             if regime_col is not None:
                                 try:
-                                    regime_label = str(features[regime_col].iat[signal_bar_index])
+                                    regime_label = str(stop_features[regime_col].iat[signal_bar_index])
                                 except Exception:
                                     regime_label = ""
                             intent = strategy.build_trade_intent(
-                                features,
+                                stop_features,
                                 symbol=symbol,
                                 timeframe=timeframe,
                                 regime=regime_label,
@@ -7803,27 +8753,29 @@ class Backtester:
                             tp_pips = float(intent.take_profit_pips)
                         else:
                             sl_pips, tp_pips = strategy.calculate_stops(
-                                features, direction, symbol, spec=spec, bar_index=signal_bar_index
+                                stop_features, direction, symbol, spec=spec, bar_index=signal_bar_index
                             )
                     except TypeError:
                         # Fallback for legacy strategies/test doubles without the
                         # trade-intent or bar_index-aware stop signature.
                         try:
                             sl_pips, tp_pips = strategy.calculate_stops(
-                                features.iloc[:signal_bar_index + 1].copy(), direction, symbol
+                                stop_features.iloc[:signal_bar_index + 1].copy(), direction, symbol
                             )
                         except Exception as exc:
                             raise RuntimeError(
-                                f"{strategy_name} stop calculation failed at bar {signal_bar_index} on {symbol}"
+                                f"{stop_label} stop calculation failed at bar {signal_bar_index} on {symbol}"
                             ) from exc
                     except Exception as exc:
                         raise RuntimeError(
-                            f"{strategy_name} stop calculation failed at bar {signal_bar_index} on {symbol}"
+                            f"{stop_label} stop calculation failed at bar {signal_bar_index} on {symbol}"
                         ) from exc
 
+                    if continuous is not None and (not math.isfinite(sl_pips) or not math.isfinite(tp_pips) or sl_pips <= 0 or tp_pips <= 0):
+                        raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_STOP_SIDE_INVALID", f"{stop_label} at signal bar {signal_bar_index}")
                     if np.isnan(sl_pips) or np.isnan(tp_pips) or sl_pips <= 0 or tp_pips <= 0:
                         raise ValueError(
-                            f"{strategy_name} produced invalid stops at bar {signal_bar_index} on {symbol}: "
+                            f"{stop_label} produced invalid stops at bar {signal_bar_index} on {symbol}: "
                             f"sl={sl_pips}, tp={tp_pips}"
                         )
 
@@ -7849,6 +8801,13 @@ class Backtester:
                     tp_prices[i] = take_profit
         
         # ----------------------------------------------------------------
+        # Refusal suppresses only new entry prices, preserving position management.
+        if admission_states is not None:
+            refused = admission_states != "ADMIT"
+            entry_prices[refused] = np.nan
+            sl_prices[refused] = np.nan
+            tp_prices[refused] = np.nan
+
         # RUN BACKTEST LOOP (Numba JIT or Pure Python)
         # ----------------------------------------------------------------
         discovery_risk_per_trade_pct = self._discovery_risk_per_trade_pct()
@@ -7865,6 +8824,23 @@ class Backtester:
             entry_prices,
             timeframe=timeframe,
         )
+        kernel_extra = {}
+        if continuous is not None:
+            if self.config.swap_model_enabled and not causal_swap_enabled:
+                raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_CAUSAL_SWAP_REQUIRED")
+            floats = np.full(CONTINUOUS_TERMINAL_FLOAT_COUNT, np.nan, dtype=np.float64)
+            integers = np.full(CONTINUOUS_TERMINAL_INT_COUNT, -1, dtype=np.int64)
+            kernel_extra = dict(entry_owner_codes=continuous["codes"], owner_half_spreads=continuous["half_spreads"],
+                mark_open=True, terminal_float_out=floats, terminal_int_out=integers)
+            finite = np.isfinite(entry_prices)
+            side = np.zeros(n_bars, dtype=np.int32)
+            side[1:] = sig_arr[:-1]
+            invalid = finite & (((entry_prices - sl_prices) * side <= 0) | ((tp_prices - entry_prices) * side <= 0)
+                                | ~np.isfinite(sl_prices) | ~np.isfinite(tp_prices))
+            if np.any(invalid):
+                invalid_bar = int(np.flatnonzero(invalid)[0])
+                invalid_owner = continuous["owners"][int(continuous["codes"][invalid_bar])][0].owner_id
+                raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_STOP_SIDE_INVALID", f"owner {invalid_owner} at entry bar {invalid_bar}")
         if NUMBA_AVAILABLE and normalized_governance is None:
             # Use Numba JIT-compiled kernel with live-equity sizing
             (
@@ -7895,6 +8871,7 @@ class Backtester:
                 swap_short_per_lot_arr,
                 causal_swap_enabled,
                 pre_open_rollover_units_arr,
+                **kernel_extra,
             )
             
             # Convert JIT results to trade dicts
@@ -7959,8 +8936,12 @@ class Backtester:
                 swap_short_per_lot_arr=swap_short_per_lot_arr,
                 causal_swap_enabled=causal_swap_enabled,
                 pre_open_rollover_units_arr=pre_open_rollover_units_arr,
+                **kernel_extra,
             )
         
+        if continuous is not None:
+            return self._continuous_account_result(continuous, features, spec, trades, equity_curve,
+                max_drawdown, floats, integers, swap_accrual_contract)
         if bool(getattr(self.config, "swap_model_enabled", True)) and not causal_swap_enabled:
             trades, final_equity, max_drawdown, equity_curve = self._apply_swap_model(
                 trades,
@@ -7979,6 +8960,10 @@ class Backtester:
             max_drawdown,
             features,
             timeframe,
+            warmup_bars=warmup_bars,
+        )
+        metrics["equity_growth"] = build_backtest_equity_growth(
+            features, equity_curve, initial_equity=self.config.initial_capital,
             warmup_bars=warmup_bars,
         )
         position_namespace = "|".join(
@@ -8020,6 +9005,26 @@ class Backtester:
                 timeframe=timeframe,
                 warmup_bars=warmup_bars,
             )
+        if admission_states is not None:
+            opportunities = np.zeros(n_bars, dtype=bool)
+            opportunities[max(1, warmup_bars):] = sig_arr[max(1, warmup_bars) - 1:-1] != 0
+            for trade in trades:
+                trade["entry_spread_admission"] = str(admission_states[int(trade["entry_bar"])])
+            metrics["spread_admission"] = {
+                "schema_version": ADMISSION_SCHEMA,
+                "entry_admission_policy": ADMISSION_POLICY,
+                "signal_opportunities": int(opportunities.sum()),
+                "known_cap_pass_opportunities": int((opportunities & (admission_states == "ADMIT")).sum()),
+                "known_cap_refused_opportunities": int((opportunities & (admission_states == "REFUSE")).sum()),
+                "missing_refused_opportunities": int((opportunities & (admission_states == "MISSING")).sum()),
+                "missing_executed_legs": sum(t["entry_spread_admission"] == "MISSING" for t in trades),
+                "entry_observations_sha256": spread_meta["entry_observations_sha256"],
+                "entry_admission_mask_sha256": hashlib.sha256(
+                    (admission_states == "ADMIT").astype(np.uint8).tobytes()
+                ).hexdigest(),
+                "input_provenance_authenticated": False,
+                "qualification_authority": False,
+            }
         metrics["spread_model"] = spread_meta
         metrics["swap_accrual_contract"] = swap_accrual_contract
         metrics["execution_cost_timing_contract"] = {
@@ -8035,6 +9040,33 @@ class Backtester:
         )
         return metrics
 
+    def run_frozen_spread_tiers(
+        self, features, signals, symbol, strategy, *, spec, timeframe,
+        p75: FrozenSpreadTier, p95: Optional[FrozenSpreadTier] = None,
+        entry_spread_observations=None, warmup_bars=0, governance_policy=None,
+    ):
+        """Execute at most two independent accounts; this does not qualify either."""
+        if p75.tier != "P75" or (p95 is not None and p95.tier != "P95"):
+            raise ValueError("FROZEN_SPREAD_TIERS_INVALID")
+        if p95 is not None:
+            left, right = p75.descriptor(), p95.descriptor()
+            for key in ("tier", "spread_points", "full_spread_price"):
+                left.pop(key)
+                right.pop(key)
+            if left != right or p95.spread_points < p75.spread_points:
+                raise ValueError("FROZEN_SPREAD_TIERS_BINDING_MISMATCH")
+        results = {}
+        for tier in (p75, p95):
+            if tier is None:
+                continue
+            results[tier.tier] = self.run(
+                features, signals, symbol, strategy, spec=spec, timeframe=timeframe,
+                warmup_bars=warmup_bars, governance_policy=governance_policy,
+                spread_tier=tier, entry_spread_observations=entry_spread_observations,
+            )
+        return {"accounts": results, "qualification_authority": False,
+                "selection_policy": "P75_REQUIRED_P95_PREFERRED_AMONG_P75_PASSES"}
+
     def build_evidence_source_seed_result(
         self,
         features: pd.DataFrame,
@@ -8042,6 +9074,8 @@ class Backtester:
         *,
         spec: Optional[InstrumentSpec] = None,
         timeframe: str = "",
+        spread_tier: Optional[FrozenSpreadTier] = None,
+        entry_spread_observations: Optional[pd.Series] = None,
     ) -> Dict[str, Any]:
         """Build a non-trading, partition-local source/cost provenance probe.
 
@@ -8058,8 +9092,16 @@ class Backtester:
         if not isinstance(spec, InstrumentSpec):
             raise ValueError("evidence source seed instrument is invalid")
         entry_half_spread, intrabar_half_spread, spread_meta = (
-            self._build_half_spread_arrays(features, spec)
+            self._build_half_spread_arrays(
+                features, spec, spread_tier=spread_tier, timeframe=timeframe,
+            )
         )
+        admission_binding = None
+        if spread_tier is not None:
+            _states, admission_binding = self._entry_spread_admission_inputs(
+                features, spread_tier, entry_spread_observations,
+            )
+            spread_meta.update(admission_binding)
         (
             _pre_open_units,
             _close_units,
@@ -8073,7 +9115,7 @@ class Backtester:
             np.full(len(features), np.nan, dtype=np.float64),
             timeframe=timeframe,
         )
-        return {
+        result = {
             "position_events": [],
             "spread_model": spread_meta,
             "execution_cost_timing_contract": {
@@ -8090,8 +9132,42 @@ class Backtester:
             "swap_accrual_contract": swap_contract,
             "source_seed_has_strategy_or_position_evidence": False,
         }
+        if admission_binding is not None:
+            result["spread_admission"] = {
+                "schema_version": ADMISSION_SCHEMA,
+                "entry_admission_policy": ADMISSION_POLICY,
+                "entry_observations_sha256": admission_binding["entry_observations_sha256"],
+                "entry_admission_mask_sha256": admission_binding["entry_admission_mask_sha256"],
+                "input_provenance_authenticated": False,
+                "qualification_authority": False,
+            }
+        return result
 
-    def replay_frozen_path_cost_stress(
+    @staticmethod
+    def _entry_spread_admission_inputs(features, spread_tier, observations):
+        if observations is None:
+            observations = pd.Series(np.nan, index=features.index)
+        elif (not isinstance(observations, pd.Series)
+              or not observations.index.equals(features.index)):
+            raise ValueError("ENTRY_SPREAD_OBSERVATIONS_AXIS_MISMATCH")
+        numeric = pd.to_numeric(observations, errors="raise").to_numpy(dtype=float)
+        if np.any(np.isfinite(numeric) & (numeric != np.floor(numeric))):
+            raise ValueError("ENTRY_SPREAD_OBSERVATION_INVALID")
+        states = np.array([spread_admission(spread_tier, x) for x in observations])
+        if (states == "INVALID").any():
+            raise ValueError("ENTRY_SPREAD_OBSERVATION_INVALID")
+        return states, {
+            "entry_admission_policy": ADMISSION_POLICY,
+            "entry_admission_schema": ADMISSION_SCHEMA,
+            "entry_observations_sha256": hashlib.sha256(
+                pd.util.hash_pandas_object(observations, index=True).values.tobytes()
+            ).hexdigest(),
+            "entry_admission_mask_sha256": hashlib.sha256(
+                (states == "ADMIT").astype(np.uint8).tobytes()
+            ).hexdigest(),
+        }
+
+    def replay_frozen_path_cost_ladder(
         self,
         features: pd.DataFrame,
         signals: pd.Series,
@@ -8099,568 +9175,13 @@ class Backtester:
         strategy: Any,
         base_result: Mapping[str, Any],
         *,
-        stress_mode: str,
         spec: Optional[InstrumentSpec] = None,
         timeframe: str = "",
         warmup_bars: int = 0,
+        maximum_level_id: str = _BACKTEST_COST_LADDER_LEVELS[-1][0],
     ) -> Dict[str, Any]:
-        """Reprice genuine base positions under a stricter execution policy.
-
-        A second strategy backtest is not a paired cost shock: wider entry
-        spreads can move stop/target levels and therefore change the selected
-        position path.  Winner evidence instead needs the *same* positions and
-        event times under a preregistered, adverse cost policy.  This method
-        authenticates the complete base result against this Backtester, keeps
-        that path frozen, and recomputes entry costs, financing, position
-        events, full-path daily MTM, and the numerical cost attestation using a
-        dedicated stress Backtester.
-
-        The returned object is a normal decision-relevant Backtester lane plus
-        a method receipt.  It fails closed if the stress arrays are not
-        pointwise adverse, the base lane cannot be reproduced, position
-        identities change, any stressed trade R improves, or any stressed
-        cumulative daily-MTM prefix improves.  A fully
-        evaluated lane with no strict realized degradation is returned with an
-        authenticated insufficiency status so the evidence consumer can keep
-        its genuine PBO fold while excluding the attempt from Winner.
-        """
-
-        normalized_stress_mode = str(stress_mode or "").strip().lower()
-        if normalized_stress_mode not in {"stress_p90", "stress_p95", "stress_max"}:
-            raise ValueError("frozen-path cost stress mode is invalid")
-        if not isinstance(features, pd.DataFrame) or not len(features):
-            raise ValueError("frozen-path cost stress features are empty")
-        if not isinstance(base_result, Mapping):
-            raise ValueError("frozen-path base result is invalid")
-        if spec is None:
-            spec = get_instrument_spec(symbol)
-        if not isinstance(spec, InstrumentSpec):
-            raise ValueError("frozen-path instrument specification is invalid")
-
-        if isinstance(signals, pd.Series):
-            signal_series = signals.copy()
-        else:
-            if len(signals) != len(features):
-                raise ValueError("frozen-path signal length mismatch")
-            signal_series = pd.Series(signals, index=features.index)
-        if not signal_series.index.equals(features.index):
-            raise ValueError("frozen-path signal index mismatch")
-        signal_numeric = pd.to_numeric(signal_series, errors="coerce")
-        if signal_numeric.isna().any() or bool((~signal_numeric.isin([-1, 0, 1])).any()):
-            raise ValueError("frozen-path signals are invalid")
-        signal_numeric = signal_numeric.astype(np.int32)
-
-        base_trades_raw = base_result.get("trades")
-        base_events_raw = base_result.get("position_events")
-        if type(base_trades_raw) is not list or type(base_events_raw) is not list:
-            raise ValueError("frozen-path base trades or positions are missing")
-        base_trades = [dict(value) for value in base_trades_raw]
-        if any(not isinstance(value, Mapping) for value in base_trades_raw):
-            raise ValueError("frozen-path base trade is invalid")
-        position_namespace = "|".join(
-            (
-                str(symbol).upper(),
-                str(timeframe).upper(),
-                str(getattr(strategy, "name", type(strategy).__name__)),
-            )
-        )
-        rebuilt_base_events = build_backtest_position_events(
-            base_trades,
-            namespace=position_namespace,
-        )
-        if rebuilt_base_events != list(base_events_raw):
-            raise ValueError("frozen-path base position reconciliation failed")
-
-        base_entry_spread, base_intrabar_spread, base_spread_meta = (
-            self._build_half_spread_arrays(features, spec)
-        )
-        rebuilt_base_attestation = self._numerical_execution_cost_attestation(
-            entry_half_spread=base_entry_spread,
-            intrabar_half_spread=base_intrabar_spread,
-            spread_meta=base_spread_meta,
-            spec=spec,
-        )
-        if (
-            base_result.get("numerical_execution_cost_attestation")
-            != rebuilt_base_attestation
-            or base_result.get("spread_model") != base_spread_meta
-        ):
-            raise ValueError("frozen-path base numerical cost attestation drift")
-        rebuilt_axis = build_backtest_partition_axis(
-            features,
-            timeframe=timeframe,
-            warmup_bars=warmup_bars,
-        )
-        if base_result.get("trade_power_partition_axis") != rebuilt_axis:
-            raise ValueError("frozen-path base partition axis drift")
-
-        # Internal consistency is not authenticity: a caller could previously
-        # submit a perfectly reconciled Backtester result produced from a
-        # different signal vector (or a fabricated-but-self-consistent path).
-        # Re-execute the exact supplied inputs before touching the stress lane
-        # and bind every result field, not just the position-event projection.
-        try:
-            fresh_base_backtester = Backtester(self.config)
-            self._share_immutable_swap_cache_with(fresh_base_backtester)
-            fresh_base_result = fresh_base_backtester.run(
-                features,
-                signal_numeric,
-                symbol,
-                strategy,
-                spec=spec,
-                timeframe=timeframe,
-                warmup_bars=warmup_bars,
-            )
-        except Exception as exc:
-            raise FrozenPathCostStressError(
-                "BASE_REPLAY_EXECUTION_FAILED",
-                (type(exc).__name__, str(exc)),
-            ) from exc
-        base_keys = set(base_result.keys())
-        fresh_keys = set(fresh_base_result.keys())
-        if base_keys != fresh_keys or any(
-            not isinstance(key, str) for key in base_keys | fresh_keys
-        ):
-            raise FrozenPathCostStressError(
-                "BASE_REPLAY_KEYSET_MISMATCH",
-                (
-                    self._cost_attestation_json_sha256(
-                        {"keys": sorted(str(key) for key in base_keys)}
-                    ),
-                    self._cost_attestation_json_sha256(
-                        {"keys": sorted(str(key) for key in fresh_keys)}
-                    ),
-                ),
-            )
-        for field_name in sorted(fresh_keys):
-            try:
-                supplied_sha256 = self._frozen_path_exact_sha256(
-                    base_result[field_name]
-                )
-                replayed_sha256 = self._frozen_path_exact_sha256(
-                    fresh_base_result[field_name]
-                )
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise FrozenPathCostStressError(
-                    "BASE_REPLAY_CANONICALIZATION_FAILED",
-                    (field_name, type(exc).__name__, str(exc)),
-                ) from exc
-            if supplied_sha256 != replayed_sha256:
-                raise FrozenPathCostStressError(
-                    "BASE_REPLAY_MISMATCH",
-                    (field_name, supplied_sha256, replayed_sha256),
-                )
-
-        stress_config = replace(
-            self.config,
-            backtest_spread_mode=normalized_stress_mode,
-        )
-        stress_backtester = Backtester(stress_config)
-        self._share_immutable_swap_cache_with(stress_backtester)
-        stress_entry_spread, stress_intrabar_spread, stress_spread_meta = (
-            stress_backtester._build_half_spread_arrays(features, spec)
-        )
-        if (
-            len(stress_entry_spread) != len(base_entry_spread)
-            or len(stress_intrabar_spread) != len(base_intrabar_spread)
-            or bool((stress_entry_spread + 1e-15 < base_entry_spread).any())
-            or bool((stress_intrabar_spread + 1e-15 < base_intrabar_spread).any())
-        ):
-            raise ValueError("frozen-path stress spread arrays are not adverse")
-        stress_attestation = stress_backtester._numerical_execution_cost_attestation(
-            entry_half_spread=stress_entry_spread,
-            intrabar_half_spread=stress_intrabar_spread,
-            spread_meta=stress_spread_meta,
-            spec=spec,
-        )
-        if (
-            rebuilt_base_attestation.get("policy_sha256")
-            == stress_attestation.get("policy_sha256")
-        ):
-            raise ValueError("frozen-path base and stress policies are not distinct")
-
-        count = len(features)
-        base_entry_prices = np.full(count, np.nan, dtype=np.float64)
-        stress_entry_prices = np.full(count, np.nan, dtype=np.float64)
-        stressed_trades: List[Dict[str, Any]] = []
-        for ordinal, trade in enumerate(base_trades):
-            try:
-                entry_bar = int(trade["entry_bar"])
-                direction = str(trade["direction"]).upper()
-                base_entry_price = float(trade["entry_price"])
-                position_size = float(trade["position_size"])
-                base_pnl = float(trade["pnl_dollars"])
-                base_gross = float(trade["gross_pnl_dollars"])
-                base_swap = float(trade["swap_dollars"])
-                rollover_units = int(trade["swap_rollover_units"])
-                base_pnl_pips = float(trade["pnl_pips"])
-                risk_amount = float(trade["risk_amount"])
-            except (KeyError, TypeError, ValueError, OverflowError) as exc:
-                raise ValueError(
-                    f"frozen-path base trade {ordinal} is invalid"
-                ) from exc
-            if (
-                not 0 <= entry_bar < count
-                or direction not in {"LONG", "SHORT"}
-                or not all(
-                    math.isfinite(value)
-                    for value in (
-                        base_entry_price,
-                        position_size,
-                        base_pnl,
-                        base_gross,
-                        base_swap,
-                        base_pnl_pips,
-                        risk_amount,
-                    )
-                )
-                or position_size <= 0.0
-                or risk_amount <= 0.0
-                or rollover_units < 0
-            ):
-                raise ValueError(f"frozen-path base trade {ordinal} is invalid")
-            entry_spread_delta = float(
-                stress_entry_spread[entry_bar] - base_entry_spread[entry_bar]
-            )
-            if not math.isfinite(entry_spread_delta) or entry_spread_delta < -1e-15:
-                raise ValueError("frozen-path entry spread delta is invalid")
-            entry_spread_delta = max(0.0, entry_spread_delta)
-            direction_sign = 1.0 if direction == "LONG" else -1.0
-            stressed_entry_price = (
-                base_entry_price + direction_sign * entry_spread_delta
-            )
-            existing_base = base_entry_prices[entry_bar]
-            existing_stress = stress_entry_prices[entry_bar]
-            if (
-                (math.isfinite(existing_base) and existing_base != base_entry_price)
-                or (
-                    math.isfinite(existing_stress)
-                    and existing_stress != stressed_entry_price
-                )
-            ):
-                raise ValueError("frozen-path entry price identity is ambiguous")
-            base_entry_prices[entry_bar] = base_entry_price
-            stress_entry_prices[entry_bar] = stressed_entry_price
-            if spec.tick_size <= 0.0 or spec.tick_value <= 0.0:
-                raise ValueError("frozen-path tick value contract is invalid")
-            entry_cost_dollars = (
-                entry_spread_delta / float(spec.tick_size)
-            ) * float(spec.tick_value) * position_size
-            if not math.isfinite(entry_cost_dollars) or entry_cost_dollars < -1e-12:
-                raise ValueError("frozen-path entry cost is invalid")
-            stressed = dict(trade)
-            stressed["entry_price"] = stressed_entry_price
-            stressed["gross_pnl_dollars"] = round(
-                base_gross - entry_cost_dollars,
-                2,
-            )
-            stressed["pnl_pips"] = round(
-                base_pnl_pips
-                - (
-                    entry_spread_delta / float(spec.pip_size)
-                    if spec.pip_size > 0.0
-                    else 0.0
-                ),
-                2,
-            )
-            stressed["_frozen_path_base_pnl_dollars"] = base_pnl
-            stressed["_frozen_path_base_swap_dollars"] = base_swap
-            stressed["_frozen_path_entry_cost_dollars"] = entry_cost_dollars
-            stressed_trades.append(stressed)
-
-        (
-            base_pre_open_units,
-            base_close_units,
-            base_swap_long,
-            base_swap_short,
-            base_causal_swap,
-            base_swap_contract,
-        ) = self._build_causal_swap_inputs(
-            features,
-            spec,
-            base_entry_prices,
-            timeframe=timeframe,
-        )
-        (
-            stress_pre_open_units,
-            stress_close_units,
-            stress_swap_long,
-            stress_swap_short,
-            stress_causal_swap,
-            stress_swap_contract,
-        ) = stress_backtester._build_causal_swap_inputs(
-            features,
-            spec,
-            stress_entry_prices,
-            timeframe=timeframe,
-        )
-        if (
-            base_result.get("swap_accrual_contract") != base_swap_contract
-            or base_causal_swap != stress_causal_swap
-            or not np.array_equal(base_pre_open_units, stress_pre_open_units)
-            or not np.array_equal(base_close_units, stress_close_units)
-        ):
-            raise ValueError("frozen-path swap projection drift")
-
-        for ordinal, stressed in enumerate(stressed_trades):
-            entry_bar = int(stressed["entry_bar"])
-            direction = str(stressed["direction"]).upper()
-            position_size = float(stressed["position_size"])
-            units = int(stressed["swap_rollover_units"])
-            base_rate = (
-                float(base_swap_long[entry_bar])
-                if direction == "LONG"
-                else float(base_swap_short[entry_bar])
-            )
-            stress_rate = (
-                float(stress_swap_long[entry_bar])
-                if direction == "LONG"
-                else float(stress_swap_short[entry_bar])
-            )
-            base_swap = float(stressed.pop("_frozen_path_base_swap_dollars"))
-            stress_swap = self._settle_frozen_path_stress_swap(
-                base_swap=base_swap,
-                rollover_units=units,
-                position_size=position_size,
-                base_rate=base_rate,
-                stress_rate=stress_rate,
-            )
-            base_pnl = float(stressed.pop("_frozen_path_base_pnl_dollars"))
-            entry_cost = float(stressed.pop("_frozen_path_entry_cost_dollars"))
-            stress_pnl = round(base_pnl - entry_cost + stress_swap - base_swap, 2)
-            if stress_pnl > base_pnl + 1e-12:
-                raise ValueError(
-                    f"frozen-path trade {ordinal} improves under stress"
-                )
-            stressed["swap_dollars"] = stress_swap
-            stressed["pnl_dollars"] = stress_pnl
-            stressed["r_multiple"] = round(
-                stress_pnl / float(stressed["risk_amount"]),
-                3,
-            )
-
-        stress_events = build_backtest_position_events(
-            stressed_trades,
-            namespace=position_namespace,
-        )
-        if len(stress_events) != len(rebuilt_base_events):
-            raise ValueError("frozen-path stress position roster changed")
-        for ordinal, (base_event, stress_event) in enumerate(
-            zip(rebuilt_base_events, stress_events, strict=True)
-        ):
-            identity_fields = (
-                "trade_record_schema_version",
-                "position_id",
-                "entry_time",
-                "exit_time",
-                "entry_event_order",
-                "exit_event_order",
-                "risk_amount",
-            )
-            if any(
-                base_event.get(name) != stress_event.get(name)
-                for name in identity_fields
-            ):
-                raise ValueError(
-                    f"frozen-path stress position {ordinal} identity changed"
-                )
-            if float(stress_event["pnl_dollars"]) > float(
-                base_event["pnl_dollars"]
-            ) + 1e-12:
-                raise ValueError(
-                    f"frozen-path stress position {ordinal} improves"
-                )
-
-        rebuilt_base_surface = build_backtest_winner_daily_r_surface(
-            features,
-            base_trades,
-            rebuilt_base_events,
-            namespace=position_namespace,
-            spec=spec,
-            half_spread_arr=base_intrabar_spread,
-            use_spread=bool(self.config.use_spread),
-            swap_model_enabled=bool(getattr(self.config, "swap_model_enabled", True)),
-            causal_swap_enabled=base_causal_swap,
-            pre_open_rollover_units_arr=base_pre_open_units,
-            rollover_units_arr=base_close_units,
-            swap_long_per_lot_arr=base_swap_long,
-            swap_short_per_lot_arr=base_swap_short,
-            warmup_bars=warmup_bars,
-        )
-        if base_result.get("winner_daily_r_surface") != rebuilt_base_surface:
-            raise ValueError("frozen-path base daily MTM replay drift")
-        stress_surface = build_backtest_winner_daily_r_surface(
-            features,
-            stressed_trades,
-            stress_events,
-            namespace=position_namespace,
-            spec=spec,
-            half_spread_arr=stress_intrabar_spread,
-            use_spread=bool(stress_config.use_spread),
-            swap_model_enabled=bool(
-                getattr(stress_config, "swap_model_enabled", True)
-            ),
-            causal_swap_enabled=stress_causal_swap,
-            pre_open_rollover_units_arr=stress_pre_open_units,
-            rollover_units_arr=stress_close_units,
-            swap_long_per_lot_arr=stress_swap_long,
-            swap_short_per_lot_arr=stress_swap_short,
-            warmup_bars=warmup_bars,
-        )
-        base_dates = rebuilt_base_surface.get("daily_dates_utc")
-        stress_dates = stress_surface.get("daily_dates_utc")
-        base_daily = rebuilt_base_surface.get("daily_net_mtm_r")
-        stress_daily = stress_surface.get("daily_net_mtm_r")
-        cumulative_mtm_improves = False
-        if (
-            type(base_daily) is list
-            and type(stress_daily) is list
-            and len(base_daily) == len(stress_daily)
-        ):
-            base_cumulative = Decimal(0)
-            stress_cumulative = Decimal(0)
-            tolerance = Decimal("1e-12")
-            for base_value, stress_value in zip(base_daily, stress_daily, strict=True):
-                base_cumulative += Decimal(str(base_value))
-                stress_cumulative += Decimal(str(stress_value))
-                if stress_cumulative > base_cumulative + tolerance:
-                    cumulative_mtm_improves = True
-                    break
-        if (
-            rebuilt_base_surface.get("status") != "AVAILABLE"
-            or stress_surface.get("status") != "AVAILABLE"
-            or base_dates != stress_dates
-            or type(base_daily) is not list
-            or type(stress_daily) is not list
-            or len(base_daily) != len(stress_daily)
-            # Daily values are first differences of cumulative MTM.  In MT5
-            # swap mode 6 the rate depends on opening notional: a wider SHORT
-            # entry is lower, so negative carry becomes less negative on each
-            # rollover day even while the entry shock leaves the trade adverse.
-            # The unchanged per-trade P&L check above protects closed positions;
-            # this cumulative-prefix check also protects positions still open at
-            # the partition boundary.
-            or cumulative_mtm_improves
-        ):
-            raise ValueError("frozen-path stress cumulative MTM improves or is unavailable")
-
-        # A different policy label or spread-column preference is not proof of
-        # realized cost-stress survival.  Record whether at least one exact net
-        # trade or exact daily MTM observation is strictly worse.  A completely
-        # replayed path with no strict degradation is valid evaluated evidence,
-        # but it is an insufficiency rather than winner-eligible stress
-        # evidence.  The consumer independently recomputes this status from the
-        # paired lanes.
-        strictly_worse_trade_count = sum(
-            Decimal(str(stressed["pnl_dollars"]))
-            < Decimal(str(baseline["pnl_dollars"]))
-            for baseline, stressed in zip(
-                base_trades,
-                stressed_trades,
-                strict=True,
-            )
-        )
-        strictly_worse_daily_observation_count = sum(
-            Decimal(str(stress_value)) < Decimal(str(base_value))
-            for base_value, stress_value in zip(
-                base_daily,
-                stress_daily,
-                strict=True,
-            )
-        )
-        stress_daily_improvement_observation_count = sum(
-            Decimal(str(stress_value)) > Decimal(str(base_value))
-            for base_value, stress_value in zip(
-                base_daily,
-                stress_daily,
-                strict=True,
-            )
-        )
-        base_spread_values_sha256 = str(
-            rebuilt_base_attestation.get("spread_values_sha256") or ""
-        )
-        stress_spread_values_sha256 = str(
-            stress_attestation.get("spread_values_sha256") or ""
-        )
-        vector_changed = (
-            base_spread_values_sha256 != stress_spread_values_sha256
-        )
-        strict_realized_degradation = bool(
-            strictly_worse_trade_count
-            or strictly_worse_daily_observation_count
-        )
-        if strict_realized_degradation and not vector_changed:
-            raise FrozenPathCostStressError(
-                "STRESS_REALIZED_DEGRADATION_WITHOUT_VECTOR_CHANGE",
-                (
-                    normalized_stress_mode,
-                    str(strictly_worse_trade_count),
-                    str(strictly_worse_daily_observation_count),
-                ),
-            )
-        realized_adversity_status = (
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
-            if strict_realized_degradation
-            else BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-        )
-
-        signal_bytes = np.asarray(signal_numeric, dtype="<i4").tobytes(order="C")
-        receipt_body = {
-            "schema_version": BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
-            "symbol": str(symbol).upper(),
-            "timeframe": str(timeframe).upper(),
-            "strategy_name": str(
-                getattr(strategy, "name", type(strategy).__name__)
-            ),
-            "stress_mode": normalized_stress_mode,
-            "warmup_bars": int(warmup_bars or 0),
-            "partition_axis_sha256": rebuilt_axis["horizon_receipt_sha256"],
-            "signal_vector_sha256": hashlib.sha256(signal_bytes).hexdigest(),
-            "base_cost_attestation_sha256": rebuilt_base_attestation[
-                "attestation_sha256"
-            ],
-            "stress_cost_attestation_sha256": stress_attestation[
-                "attestation_sha256"
-            ],
-            "base_spread_values_sha256": base_spread_values_sha256,
-            "stress_spread_values_sha256": stress_spread_values_sha256,
-            "base_position_roster_sha256": self._cost_attestation_json_sha256(
-                {"position_events": rebuilt_base_events}
-            ),
-            "stress_position_roster_sha256": self._cost_attestation_json_sha256(
-                {"position_events": stress_events}
-            ),
-            "position_count": len(stress_events),
-            "daily_observation_count": len(stress_daily),
-            "path_identity_preserved": True,
-            "stress_never_improves": True,
-            "strictly_worse_trade_count": strictly_worse_trade_count,
-            "strictly_worse_daily_observation_count": (
-                strictly_worse_daily_observation_count
-            ),
-            "stress_daily_improvement_observation_count": (
-                stress_daily_improvement_observation_count
-            ),
-            "realized_adversity_status": realized_adversity_status,
-        }
-        receipt = {
-            **receipt_body,
-            "receipt_sha256": self._cost_attestation_json_sha256(receipt_body),
-        }
-        return {
-            "trades": stressed_trades,
-            "position_events": stress_events,
-            "position_event_count": len(stress_events),
-            "winner_daily_r_surface": stress_surface,
-            "trade_power_partition_axis": rebuilt_axis,
-            "spread_model": stress_spread_meta,
-            "execution_cost_timing_contract": {
-                "swap_accrual": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
-            },
-            "numerical_execution_cost_attestation": stress_attestation,
-            "swap_accrual_contract": stress_swap_contract,
-            "cost_stress_frozen_path_receipt": receipt,
-        }
+        """Retired: endogenous tier admissions cannot use frozen-path repricing."""
+        raise ValueError(RETIRED_COST_POLICY)
 
     @staticmethod
     def _max_drawdown_from_equity_curve(equity_curve: List[float]) -> float:
@@ -8843,15 +9364,15 @@ class Backtester:
         return 0.0
 
     @staticmethod
-    def _settle_frozen_path_stress_swap(
+    def _settle_frozen_path_ladder_swap(
         *,
         base_swap: float,
         rollover_units: int,
         position_size: float,
         base_rate: float,
-        stress_rate: float,
+        ladder_rate: float,
     ) -> float:
-        """Settle stress financing relative to the already-settled base cents.
+        """Settle ladder financing relative to the already-settled base cents.
 
         The base sub-cent amount is no longer available here. Equal financing
         inputs therefore preserve the base settlement exactly; changed inputs
@@ -8860,20 +9381,20 @@ class Backtester:
         if (
             not all(
                 math.isfinite(value)
-                for value in (base_swap, position_size, base_rate, stress_rate)
+                for value in (base_swap, position_size, base_rate, ladder_rate)
             )
             or rollover_units < 0
             or position_size <= 0.0
         ):
             raise ValueError("frozen-path swap counterfactual is invalid")
-        if base_rate == stress_rate:
+        if base_rate == ladder_rate:
             return base_swap
         try:
             settled = (
                 Decimal(str(base_swap))
                 + Decimal(rollover_units)
                 * Decimal(str(position_size))
-                * (Decimal(str(stress_rate)) - Decimal(str(base_rate)))
+                * (Decimal(str(ladder_rate)) - Decimal(str(base_rate)))
             ).quantize(Decimal("0.01"), rounding=ROUND_HALF_EVEN)
             result = float(settled)
         except (InvalidOperation, TypeError, ValueError, OverflowError) as exc:
@@ -9055,12 +9576,17 @@ class Backtester:
                          swap_long_per_lot_arr: Optional[np.ndarray] = None,
                          swap_short_per_lot_arr: Optional[np.ndarray] = None,
                          causal_swap_enabled: bool = False,
-                         pre_open_rollover_units_arr: Optional[np.ndarray] = None) -> Tuple[List[Dict], float, float, List[float]]:
+                         pre_open_rollover_units_arr: Optional[np.ndarray] = None,
+                         entry_owner_codes=None, owner_half_spreads=None, mark_open=False,
+                         terminal_float_out=None, terminal_int_out=None) -> Tuple[List[Dict], float, float, List[float]]:
         """
         Pure Python backtest loop (fallback when Numba not available).
         
         Uses LIVE EQUITY for position sizing (compounding preserved).
         """
+        _validate_continuous_buffers(mark_open, terminal_float_out, terminal_int_out)
+        if mark_open:
+            _validate_continuous_arrays(len(open_arr), entry_owner_codes, owner_half_spreads, entry_prices)
         equity = self.config.initial_capital
         peak_equity = equity
         max_drawdown = 0.0
@@ -9070,6 +9596,7 @@ class Backtester:
         
         # Position state
         in_position = False
+        held_owner_code = -1
         position_direction = 0
         entry_price = 0.0
         entry_bar = 0
@@ -9174,11 +9701,15 @@ class Backtester:
         n_bars = len(features)
         
         for i in range(1, n_bars):
+            entry_allowed_at_open = not in_position
             open_price = open_arr[i]
             high_price = high_arr[i]
             low_price = low_arr[i]
             close_price = close_arr[i]
             half_spread = half_spread_arr[i] if i < len(half_spread_arr) else 0.0
+            if mark_open:
+                quote_owner = held_owner_code if in_position else entry_owner_codes[i]
+                half_spread = owner_half_spreads[quote_owner, i] if quote_owner >= 0 else 0.0
 
             if self.config.use_spread:
                 bid_open = open_price - half_spread
@@ -9410,6 +9941,7 @@ class Backtester:
                                 else ask_open
                             )
                             governance_exit_reason = 'governance_exit'
+                            entry_allowed_at_open = True
                 exit_price = governance_exit_price
                 exit_reason = governance_exit_reason
 
@@ -9435,6 +9967,7 @@ class Backtester:
                     if bid_open <= stop_loss:
                         exit_price = bid_open
                         exit_reason = TradeStatus.CLOSED_SL.value
+                        entry_allowed_at_open = True
                     elif bid_low <= stop_loss:
                         exit_price = stop_loss
                         exit_reason = TradeStatus.CLOSED_SL.value
@@ -9446,6 +9979,7 @@ class Backtester:
                     if ask_open >= stop_loss:
                         exit_price = ask_open
                         exit_reason = TradeStatus.CLOSED_SL.value
+                        entry_allowed_at_open = True
                     elif ask_high >= stop_loss:
                         exit_price = stop_loss
                         exit_reason = TradeStatus.CLOSED_SL.value
@@ -9502,12 +10036,12 @@ class Backtester:
                     in_position = False
             
             # CHECK ENTRIES
-            if not in_position and i >= warmup_bars:
+            if entry_allowed_at_open and not in_position and i >= warmup_bars:
                 signal = sig_arr[i - 1]
                 
                 if signal != 0:
                     # Use pre-computed entry/stop prices
-                    if not np.isnan(entry_prices[i]) and not np.isnan(sl_prices[i]):
+                    if not np.isnan(entry_prices[i]) and not np.isnan(sl_prices[i]) and (not mark_open or not np.isnan(tp_prices[i])):
                         direction = int(signal)
                         
                         entry_price_candidate = entry_prices[i]
@@ -9530,6 +10064,17 @@ class Backtester:
                             position_size = 0.0
                         
                         if position_size > 0:
+                            if mark_open:
+                                held_owner_code = int(entry_owner_codes[i])
+                                half_spread = owner_half_spreads[held_owner_code, i]
+                                bid_open = open_price - half_spread
+                                ask_open = open_price + half_spread
+                                bid_high = high_price - half_spread
+                                bid_low = low_price - half_spread
+                                ask_high = high_price + half_spread
+                                ask_low = low_price + half_spread
+                                bid_close = close_price - half_spread
+                                ask_close = close_price + half_spread
                             entry_price = entry_price_candidate
                             stop_loss = stop_loss_candidate
                             take_profit = take_profit_candidate
@@ -9693,7 +10238,7 @@ class Backtester:
             max_drawdown = max(max_drawdown, dd)
         
         # CLOSE ANY REMAINING POSITION AT END
-        if in_position:
+        if in_position and not mark_open:
             is_long = position_direction == 1
             half_spread = half_spread_arr[-1] if len(half_spread_arr) else 0.0
             if self.config.use_spread:
@@ -9747,6 +10292,22 @@ class Backtester:
             dd = (peak_equity - equity) / peak_equity * 100 if peak_equity > 0 else 0
             max_drawdown = max(max_drawdown, dd)
         
+        if mark_open:
+            actual_risk = unrealized = 0.0
+            terminal_bid = terminal_ask = float("nan")
+            if in_position:
+                hs = owner_half_spreads[held_owner_code, n_bars - 1]
+                terminal_bid, terminal_ask = close_arr[-1] - hs, close_arr[-1] + hs
+                actual_risk = spec.calculate_tick_profit(entry_price, stop_loss, position_size, position_direction)
+                unrealized = spec.calculate_tick_profit(entry_price,
+                    terminal_bid if position_direction == 1 else terminal_ask, position_size, position_direction)
+            terminal_float_out[:] = (equity, equity_curve[-1], entry_price, stop_loss,
+                take_profit, position_size, risk_amount_at_entry, abs(actual_risk),
+                accrued_swap_dollars_current, terminal_bid, terminal_ask, unrealized,
+                daily_swap_per_lot_current, mae_pips_current, mfe_pips_current)
+            depleted = next((j for j, value in enumerate(equity_curve) if value <= 0.0), -1)
+            terminal_int_out[:] = (int(in_position), position_direction, entry_bar, signal_bar,
+                held_owner_code, accrued_swap_units_current, depleted)
         return trades, equity, max_drawdown, equity_curve
     
     # Bars-per-year lookup for known timeframes (252 trading days assumed)
@@ -9784,7 +10345,11 @@ class Backtester:
             Dict with all performance metrics including R-multiple stats
         """
         if not trades:
-            return self._empty_result()
+            metrics = self._empty_result()
+            # No fills still have an actual engine path to export.
+            if equity_curve is not None and len(equity_curve) > 0:
+                metrics['equity_curve'] = equity_curve
+            return metrics
 
         # Basic counts
         total_trades = len(trades)

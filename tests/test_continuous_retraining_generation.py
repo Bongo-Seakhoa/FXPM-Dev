@@ -35,6 +35,7 @@ def _config(tmp_path: Path) -> PipelineConfig:
         optimization_max_workers=1,
         feature_disk_cache_enabled=False,
         oos_evidence_export_enabled=False,
+        production_require_promotion_gate=False,
     )
 
 

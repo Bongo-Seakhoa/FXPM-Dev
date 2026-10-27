@@ -410,6 +410,19 @@ def _digest(value: Any, code: str) -> str:
     return str(value)
 
 
+def _validated_pinned_activation_manifest_sha256(
+    value: str | None,
+    *,
+    require_current_activation: bool,
+) -> str | None:
+    if value is None:
+        return None
+    pinned = _digest(value, "PREFIX_PINNED_ACTIVATION_SHA_INVALID")
+    if require_current_activation:
+        _fail("PREFIX_PINNED_ACTIVATION_CURRENT_REQUIRED")
+    return pinned
+
+
 def _symbol(value: Any) -> str:
     if type(value) is not str or _SYMBOL_RE.fullmatch(value) is None:
         _fail("PREFIX_SYMBOL_INVALID")
@@ -3259,6 +3272,7 @@ def _verify_activated_native_prefix_single(
     expected_activation_manifest_sha256: str,
     production_contract_required: bool = True,
     require_current_activation: bool = False,
+    pinned_activation_manifest_sha256: str | None = None,
     _batch_available_evidence: _BatchAvailableEvidence | None = None,
     _batch_terminal_resolution: ActiveNativeResolution | None = None,
     _batch_cutoff_terminal_resolution: ActiveNativeResolution | None = None,
@@ -3273,6 +3287,12 @@ def _verify_activated_native_prefix_single(
         expected_activation_manifest_sha256,
         "PREFIX_EXPECTED_ACTIVATION_SHA_INVALID",
     )
+    pinned_activation = _validated_pinned_activation_manifest_sha256(
+        pinned_activation_manifest_sha256,
+        require_current_activation=require_current_activation,
+    )
+    if pinned_activation is not None and expected_activation != pinned_activation:
+        _fail("PREFIX_PINNED_ACTIVATION_CANDIDATE_MISMATCH")
     normalized_index, index_raw = _read_spool_descriptor(
         context,
         dict(index_descriptor),
@@ -3310,15 +3330,19 @@ def _verify_activated_native_prefix_single(
         ):
             _fail("PREFIX_AVAILABLE_TERMINAL_FIELDS_INVALID")
         if _batch_available_evidence is None:
-            resolution = resolve_active_native_artifact(
-                Path(data_dir),
-                symbol,
-                timeframe,
-                production_contract_required=production_contract_required,
-            )
-            if require_current_activation and not resolution.valid:
+            resolution = None
+            if pinned_activation is None:
+                resolution = resolve_active_native_artifact(
+                    Path(data_dir),
+                    symbol,
+                    timeframe,
+                    production_contract_required=production_contract_required,
+                )
+            if require_current_activation and (
+                resolution is None or not resolution.valid
+            ):
                 _fail("PREFIX_CURRENT_ACTIVATION_INVALID")
-            if not resolution.valid:
+            if resolution is None or not resolution.valid:
                 # Pinned historical activations remain verifiable after ACTIVE.json
                 # advances only when their exact manifest and leaf bytes remain.
                 resolution = ActiveNativeResolution(
@@ -3567,23 +3591,30 @@ def _verify_activated_native_prefix_single(
             if _batch_terminal_resolution is not None:
                 _fail("PREFIX_BATCH_TERMINAL_EVIDENCE_KIND_MISMATCH")
             if _batch_cutoff_terminal_resolution is None:
-                try:
-                    observed_resolution = resolve_active_native_artifact(
-                        Path(data_dir),
-                        symbol,
-                        timeframe,
-                        production_contract_required=production_contract_required,
-                    )
-                except Exception as exc:
-                    if require_current_activation:
-                        raise NativePrefixError(
-                            "PREFIX_CUTOFF_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
-                        ) from exc
+                if pinned_activation is not None:
                     observed_resolution = ActiveNativeResolution(
                         symbol=symbol,
                         timeframe=timeframe,
                         errors=["PINNED_ACTIVATION_REOPEN_REQUIRED"],
                     )
+                else:
+                    try:
+                        observed_resolution = resolve_active_native_artifact(
+                            Path(data_dir),
+                            symbol,
+                            timeframe,
+                            production_contract_required=production_contract_required,
+                        )
+                    except Exception as exc:
+                        if require_current_activation:
+                            raise NativePrefixError(
+                                "PREFIX_CUTOFF_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
+                            ) from exc
+                        observed_resolution = ActiveNativeResolution(
+                            symbol=symbol,
+                            timeframe=timeframe,
+                            errors=["PINNED_ACTIVATION_REOPEN_REQUIRED"],
+                        )
             else:
                 observed_resolution = _batch_cutoff_terminal_resolution
             if require_current_activation and not observed_resolution.valid:
@@ -3972,12 +4003,17 @@ def verify_activated_native_prefix_candidates(
     candidates: Sequence[Mapping[str, Any]],
     production_contract_required: bool = True,
     require_current_activation: bool = False,
+    pinned_activation_manifest_sha256: str | None = None,
     cancellation_event: threading.Event | None = None,
 ) -> tuple[NativePrefixProduct, ...]:
     """Independently replay all AVAILABLE candidates in one source pass."""
 
     canonical_symbol = _symbol(symbol)
     canonical_timeframe = _timeframe(timeframe)
+    pinned_activation = _validated_pinned_activation_manifest_sha256(
+        pinned_activation_manifest_sha256,
+        require_current_activation=require_current_activation,
+    )
     if type(candidates) not in {list, tuple} or not 1 <= len(candidates) <= 16:
         _fail("PREFIX_CANDIDATE_BATCH_INVALID")
     owned = tuple(_normalized_candidate(value) for value in candidates)
@@ -3987,6 +4023,10 @@ def verify_activated_native_prefix_candidates(
         for value in owned
     ):
         _fail("PREFIX_CANDIDATE_BATCH_CELL_MISMATCH")
+    if pinned_activation is not None and any(
+        value["activation_manifest_sha256"] != pinned_activation for value in owned
+    ):
+        _fail("PREFIX_PINNED_ACTIVATION_CANDIDATE_MISMATCH")
     _batch_checkpoint(cancellation_event)
 
     indexes: list[dict[str, Any]] = []
@@ -4055,16 +4095,20 @@ def verify_activated_native_prefix_candidates(
         first_index = indexes[available_ordinals[0]]
         activation = first_index["activation"]
         _batch_checkpoint(cancellation_event)
-        resolution = resolve_active_native_artifact(
-            Path(data_dir),
-            canonical_symbol,
-            canonical_timeframe,
-            production_contract_required=production_contract_required,
-        )
+        resolution = None
+        if pinned_activation is None:
+            resolution = resolve_active_native_artifact(
+                Path(data_dir),
+                canonical_symbol,
+                canonical_timeframe,
+                production_contract_required=production_contract_required,
+            )
         _batch_checkpoint(cancellation_event)
-        if require_current_activation and not resolution.valid:
+        if require_current_activation and (
+            resolution is None or not resolution.valid
+        ):
             _fail("PREFIX_CURRENT_ACTIVATION_INVALID")
-        if not resolution.valid:
+        if resolution is None or not resolution.valid:
             resolution = ActiveNativeResolution(
                 symbol=canonical_symbol,
                 timeframe=canonical_timeframe,
@@ -4184,23 +4228,30 @@ def verify_activated_native_prefix_candidates(
             )
     if cutoff_terminal_ordinals and cutoff_terminal_resolution is None:
         _batch_checkpoint(cancellation_event)
-        try:
-            cutoff_terminal_resolution = resolve_active_native_artifact(
-                Path(data_dir),
-                canonical_symbol,
-                canonical_timeframe,
-                production_contract_required=production_contract_required,
-            )
-        except Exception as exc:
-            if require_current_activation:
-                raise NativePrefixError(
-                    "PREFIX_CUTOFF_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
-                ) from exc
+        if pinned_activation is not None:
             cutoff_terminal_resolution = ActiveNativeResolution(
                 symbol=canonical_symbol,
                 timeframe=canonical_timeframe,
                 errors=["PINNED_ACTIVATION_REOPEN_REQUIRED"],
             )
+        else:
+            try:
+                cutoff_terminal_resolution = resolve_active_native_artifact(
+                    Path(data_dir),
+                    canonical_symbol,
+                    canonical_timeframe,
+                    production_contract_required=production_contract_required,
+                )
+            except Exception as exc:
+                if require_current_activation:
+                    raise NativePrefixError(
+                        "PREFIX_CUTOFF_TERMINAL_ACTIVATION_RESOLUTION_EXCEPTION"
+                    ) from exc
+                cutoff_terminal_resolution = ActiveNativeResolution(
+                    symbol=canonical_symbol,
+                    timeframe=canonical_timeframe,
+                    errors=["PINNED_ACTIVATION_REOPEN_REQUIRED"],
+                )
         _batch_checkpoint(cancellation_event)
 
     products: list[NativePrefixProduct] = []
@@ -4220,6 +4271,7 @@ def verify_activated_native_prefix_candidates(
                 ],
                 production_contract_required=production_contract_required,
                 require_current_activation=require_current_activation,
+                pinned_activation_manifest_sha256=pinned_activation,
                 _batch_available_evidence=evidence.get(ordinal),
                 _batch_terminal_resolution=(
                     terminal_resolution
@@ -4311,6 +4363,7 @@ def verify_activated_native_prefix(
     expected_activation_manifest_sha256: str,
     production_contract_required: bool = True,
     require_current_activation: bool = False,
+    pinned_activation_manifest_sha256: str | None = None,
     cancellation_event: threading.Event | None = None,
 ) -> NativePrefixProduct:
     """Compatibility adapter over the canonical one-candidate verifier."""
@@ -4338,6 +4391,7 @@ def verify_activated_native_prefix(
         ),
         production_contract_required=production_contract_required,
         require_current_activation=require_current_activation,
+        pinned_activation_manifest_sha256=pinned_activation_manifest_sha256,
         cancellation_event=cancellation_event,
     )[0]
 

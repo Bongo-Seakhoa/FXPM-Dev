@@ -5,6 +5,9 @@ activation, independently revalidates the exact v5 run calendar, and derives
 the repeated historical anchors without accepting dates, rosters, or market
 verdicts from a caller.  The resulting receipt grants no search, deployment,
 publication, or trading authority.
+
+The separate declared owner-slot roster accepts explicit simulation geometry;
+it neither resolves native authority nor changes the production anchor plan.
 """
 
 from __future__ import annotations
@@ -1080,11 +1083,261 @@ def derive_production_anchor_plan(data_dir: Path, /) -> ProductionAnchorPlanRece
     return receipt
 
 
+DECLARED_OWNER_SLOT_ROSTER_SCHEMA: Final = "fxpm.declared-owner-slot-roster.v1"
+DECLARED_OWNER_SLOT_COUNT: Final = 13
+DECLARED_OWNER_SLOT_CALENDAR_DAYS: Final = 28
+_DECLARED_REFIT_CLOCK_ANCHOR_UTC: Final = "2026-03-29T00:01:00Z"
+
+
+def derive_declared_owner_slot_roster(
+    *,
+    launch_activation_utc: str,
+    frozen_refit_clock: Mapping[str, Any],
+    config_identity_refs: Mapping[str, str],
+    extend_frozen_clock_backward: bool,
+    protected_end_exclusive_utc: str,
+) -> dict[str, Any]:
+    """Declare nominal H364 geometry without materializing an owner or data."""
+    launch = _utc(launch_activation_utc, "DECLARED_SLOT_LAUNCH_INVALID")
+    protected_end = _utc(
+        protected_end_exclusive_utc, "DECLARED_SLOT_PROTECTED_END_INVALID"
+    )
+    if type(frozen_refit_clock) is not dict or set(frozen_refit_clock) != {
+        "anchor_activation_utc", "interval_calendar_days"
+    }:
+        _fail("DECLARED_SLOT_REFIT_CLOCK_INVALID")
+    clock = dict(frozen_refit_clock)
+    anchor = _utc(clock["anchor_activation_utc"], "DECLARED_SLOT_REFIT_CLOCK_INVALID")
+    if (
+        clock["anchor_activation_utc"] != _DECLARED_REFIT_CLOCK_ANCHOR_UTC
+        or type(clock["interval_calendar_days"]) is not int
+        or clock["interval_calendar_days"] != DECLARED_OWNER_SLOT_CALENDAR_DAYS
+    ):
+        _fail("DECLARED_SLOT_REFIT_CLOCK_INVALID")
+    interval = timedelta(days=DECLARED_OWNER_SLOT_CALENDAR_DAYS)
+    if (launch - anchor) % interval != timedelta(0):
+        _fail("DECLARED_SLOT_LAUNCH_OFF_CLOCK")
+    if (
+        type(extend_frozen_clock_backward) is not bool
+        or extend_frozen_clock_backward is not (launch < anchor)
+    ):
+        _fail("DECLARED_SLOT_CLOCK_EXTENSION_MISMATCH")
+    if type(config_identity_refs) is not dict or set(config_identity_refs) != {
+        "config_sha256", "effective_config_sha256"
+    }:
+        _fail("DECLARED_SLOT_CONFIG_IDENTITY_INVALID")
+    refs = {
+        name: _require_sha256(value, "DECLARED_SLOT_CONFIG_IDENTITY_INVALID")
+        for name, value in config_identity_refs.items()
+    }
+    try:
+        run_end = launch + interval * DECLARED_OWNER_SLOT_COUNT
+    except OverflowError as exc:
+        raise ProductionAnchorPlanError("DECLARED_SLOT_DATE_OVERFLOW") from exc
+    if run_end > protected_end:
+        _fail("DECLARED_SLOT_PROTECTED_END_EXCEEDED")
+    slots = []
+    for index in range(DECLARED_OWNER_SLOT_COUNT):
+        activation = launch + interval * index
+        native_cutoff = datetime(
+            activation.year, activation.month, activation.day, tzinfo=_UTC
+        )
+        slots.append({
+            "slot_id": f"owner-slot-{index + 1:02d}-{activation:%Y%m%dT%H%M%SZ}",
+            "ordinal": index + 1,
+            "activation_utc": _iso(activation),
+            "end_exclusive_utc": _iso(activation + interval),
+            "native_cutoff_utc": _iso(native_cutoff),
+            "owner_status": "UNMATERIALIZED",
+            "owner": None,
+        })
+    body = {
+        "schema_version": DECLARED_OWNER_SLOT_ROSTER_SCHEMA,
+        "scope": "DECLARED_UNMATERIALIZED_OWNER_GEOMETRY_ONLY",
+        "frozen_refit_clock": clock,
+        "config_identity_refs": refs,
+        "clock_extended_backward": extend_frozen_clock_backward,
+        "clock_extension_scope": (
+            "EXPLICIT_DECLARED_GEOMETRY_NOT_LIVE_CLOCK_REANCHORING"
+        ),
+        "protected_end_exclusive_utc": _iso(protected_end),
+        "start_utc": _iso(launch),
+        "end_exclusive_utc": _iso(run_end),
+        "slot_count": DECLARED_OWNER_SLOT_COUNT,
+        "slot_calendar_days": DECLARED_OWNER_SLOT_CALENDAR_DAYS,
+        "total_calendar_days": (
+            DECLARED_OWNER_SLOT_COUNT * DECLARED_OWNER_SLOT_CALENDAR_DAYS
+        ),
+        "handover_latency_seconds": 0,
+        "handover_scope": (
+            "NOMINAL_PLAN_ONLY_NOT_COMPUTED_OWNER_AVAILABILITY_OR_BACKDATED_PERMISSION"
+        ),
+        "native_cutoff_scope": (
+            "DECLARED_CLOSED_SOURCE_UPPER_BOUND_NOT_VERIFIED_AVAILABILITY"
+        ),
+        "state_carry_scope": (
+            "NO_CASH_INVENTORY_OR_OWNER_POSITION_RESET_DECLARED_BY_ROSTER"
+        ),
+        "slots": slots,
+        "qualification_authority": False,
+        "capital_authority": False,
+        "live_authority": False,
+        "order_authority": False,
+        "profitability_claimed": False,
+        _AUTHORITY_FLAG: False,
+    }
+    return json.loads(_canonical_bytes(body).decode("ascii"))
+
+
+DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA: Final = "fxpm.declared-owner-slot-roster.v2"
+_DECLARED_V2_NOMINAL_ACTIVATION_PHASE_UTC: Final = "2026-03-28T00:00:00Z"
+_DECLARED_V2_NOMINAL_HANDOVER_SECONDS: Final = 86400
+
+
+def derive_declared_owner_slot_roster_v2(
+    *,
+    launch_activation_utc: str,
+    frozen_refit_clock: Mapping[str, Any],
+    config_identity_refs: Mapping[str, str],
+    extend_frozen_clock_backward: bool,
+    protected_end_exclusive_utc: str,
+) -> dict[str, Any]:
+    """Declare Saturday H364 geometry with a nominal one-day source lead."""
+    launch = _utc(launch_activation_utc, "DECLARED_SLOT_LAUNCH_INVALID")
+    protected_end = _utc(
+        protected_end_exclusive_utc, "DECLARED_SLOT_PROTECTED_END_INVALID"
+    )
+    if type(frozen_refit_clock) is not dict or set(frozen_refit_clock) != {
+        "anchor_activation_utc", "interval_calendar_days"
+    }:
+        _fail("DECLARED_SLOT_REFIT_CLOCK_INVALID")
+    clock = dict(frozen_refit_clock)
+    anchor = _utc(clock["anchor_activation_utc"], "DECLARED_SLOT_REFIT_CLOCK_INVALID")
+    if (
+        clock["anchor_activation_utc"] != _DECLARED_REFIT_CLOCK_ANCHOR_UTC
+        or type(clock["interval_calendar_days"]) is not int
+        or clock["interval_calendar_days"] != DECLARED_OWNER_SLOT_CALENDAR_DAYS
+    ):
+        _fail("DECLARED_SLOT_REFIT_CLOCK_INVALID")
+    interval = timedelta(days=DECLARED_OWNER_SLOT_CALENDAR_DAYS)
+    phase = _utc(
+        _DECLARED_V2_NOMINAL_ACTIVATION_PHASE_UTC,
+        "DECLARED_SLOT_REFIT_CLOCK_INVALID",
+    )
+    if (launch - phase) % interval != timedelta(0):
+        _fail("DECLARED_SLOT_LAUNCH_OFF_CLOCK")
+    if (
+        type(extend_frozen_clock_backward) is not bool
+        or extend_frozen_clock_backward is not (launch < anchor)
+    ):
+        _fail("DECLARED_SLOT_CLOCK_EXTENSION_MISMATCH")
+    if type(config_identity_refs) is not dict or set(config_identity_refs) != {
+        "config_sha256", "effective_config_sha256"
+    }:
+        _fail("DECLARED_SLOT_CONFIG_IDENTITY_INVALID")
+    refs = {
+        name: _require_sha256(value, "DECLARED_SLOT_CONFIG_IDENTITY_INVALID")
+        for name, value in config_identity_refs.items()
+    }
+    try:
+        run_end = launch + interval * DECLARED_OWNER_SLOT_COUNT
+    except OverflowError as exc:
+        raise ProductionAnchorPlanError("DECLARED_SLOT_DATE_OVERFLOW") from exc
+    if run_end > protected_end:
+        _fail("DECLARED_SLOT_PROTECTED_END_EXCEEDED")
+    lead = timedelta(seconds=_DECLARED_V2_NOMINAL_HANDOVER_SECONDS)
+    slots = []
+    for index in range(DECLARED_OWNER_SLOT_COUNT):
+        activation = launch + interval * index
+        slots.append({
+            "slot_id": f"owner-slot-{index + 1:02d}-{activation:%Y%m%dT%H%M%SZ}",
+            "ordinal": index + 1,
+            "activation_utc": _iso(activation),
+            "end_exclusive_utc": _iso(activation + interval),
+            "native_cutoff_utc": _iso(activation - lead),
+            "owner_status": "UNMATERIALIZED",
+            "owner": None,
+        })
+    body = {
+        "schema_version": DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA,
+        "scope": "DECLARED_UNMATERIALIZED_OWNER_GEOMETRY_ONLY",
+        "frozen_refit_clock": clock,
+        "config_identity_refs": refs,
+        "clock_extended_backward": extend_frozen_clock_backward,
+        "clock_extension_scope": (
+            "EXPLICIT_DECLARED_GEOMETRY_NOT_LIVE_CLOCK_REANCHORING"
+        ),
+        "protected_end_exclusive_utc": _iso(protected_end),
+        "start_utc": _iso(launch),
+        "end_exclusive_utc": _iso(run_end),
+        "slot_count": DECLARED_OWNER_SLOT_COUNT,
+        "slot_calendar_days": DECLARED_OWNER_SLOT_CALENDAR_DAYS,
+        "total_calendar_days": (
+            DECLARED_OWNER_SLOT_COUNT * DECLARED_OWNER_SLOT_CALENDAR_DAYS
+        ),
+        "nominal_activation_phase_utc": _iso(phase),
+        "nominal_handover_seconds": _DECLARED_V2_NOMINAL_HANDOVER_SECONDS,
+        "handover_scope": (
+            "NOMINAL_PLAN_ONLY_NOT_COMPUTED_OWNER_AVAILABILITY_OR_BACKDATED_PERMISSION"
+        ),
+        "native_cutoff_scope": (
+            "DECLARED_CLOSED_SOURCE_UPPER_BOUND_NOT_VERIFIED_AVAILABILITY"
+        ),
+        "state_carry_scope": (
+            "NO_CASH_INVENTORY_OR_OWNER_POSITION_RESET_DECLARED_BY_ROSTER"
+        ),
+        "slots": slots,
+        "qualification_authority": False,
+        "capital_authority": False,
+        "live_authority": False,
+        "order_authority": False,
+        "profitability_claimed": False,
+        _AUTHORITY_FLAG: False,
+    }
+    return json.loads(_canonical_bytes(body).decode("ascii"))
+
+
+def verify_declared_owner_slot_roster(
+    roster: Mapping[str, Any],
+    *,
+    launch_activation_utc: str,
+    frozen_refit_clock: Mapping[str, Any],
+    config_identity_refs: Mapping[str, str],
+    extend_frozen_clock_backward: bool,
+    protected_end_exclusive_utc: str,
+) -> dict[str, Any]:
+    """Recompute the complete declared roster against explicit caller bindings."""
+    if type(roster) is not dict:
+        _fail("DECLARED_SLOT_ROSTER_INVALID")
+    schema = roster.get("schema_version")
+    if schema == DECLARED_OWNER_SLOT_ROSTER_SCHEMA:
+        derive = derive_declared_owner_slot_roster
+    elif schema == DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA:
+        derive = derive_declared_owner_slot_roster_v2
+    else:
+        _fail("DECLARED_SLOT_ROSTER_MISMATCH")
+    observed = _canonical_bytes(roster)
+    expected = derive(
+        launch_activation_utc=launch_activation_utc,
+        frozen_refit_clock=frozen_refit_clock,
+        config_identity_refs=config_identity_refs,
+        extend_frozen_clock_backward=extend_frozen_clock_backward,
+        protected_end_exclusive_utc=protected_end_exclusive_utc,
+    )
+    if observed != _canonical_bytes(expected):
+        _fail("DECLARED_SLOT_ROSTER_MISMATCH")
+    return json.loads(observed.decode("ascii"))
+
+
 __all__ = [
     "CAPITAL_CURRENT_SELECTION_CALENDAR_DAYS",
     "CAPITAL_INNER_SELECTION_CALENDAR_DAYS",
     "DEFAULT_ANCHOR_COUNT",
     "DEFAULT_FORWARD_OOS_CALENDAR_DAYS",
+    "DECLARED_OWNER_SLOT_CALENDAR_DAYS",
+    "DECLARED_OWNER_SLOT_COUNT",
+    "DECLARED_OWNER_SLOT_ROSTER_SCHEMA",
+    "DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA",
     "INTER_ANCHOR_OOS_GAP_CALENDAR_DAYS",
     "PINNED_MINIMUM_PURGE_CALENDAR_DAYS",
     "PLAN_SCHEMA",
@@ -1093,5 +1346,8 @@ __all__ = [
     "ProductionAnchorPlanInsufficientHistory",
     "ProductionAnchorPlanReceipt",
     "derive_production_anchor_plan",
+    "derive_declared_owner_slot_roster",
+    "derive_declared_owner_slot_roster_v2",
+    "verify_declared_owner_slot_roster",
     "verify_production_anchor_plan_receipt",
 ]

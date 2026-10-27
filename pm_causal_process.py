@@ -5,7 +5,7 @@ authorize a current refit, promote a model, allocate capital, assert profitabili
 or enable funded/live trading.  It consumes three exact bounded canonical payloads:
 the precommitment, executed historical evidence, and ledger reconciliation.
 
-Decision-v9 retains its historical ``*_receipt_sha256`` output field names for
+Decision-v10 retains its historical ``*_receipt_sha256`` output field names for
 downstream compatibility.  Each value is the deterministic canonical payload
 receipt (the SHA-256 identity of the exact payload), not a signature receipt.
 
@@ -33,24 +33,26 @@ from decimal import (
 )
 from typing import Any, Final, Mapping, Sequence
 
-PROCESS_AUTHORITY_VERSION: Final = "fxpm-offline-process-validation-v9"
-PRECOMMIT_SCHEMA: Final = "fxpm-historical-process-precommit-v9"
-EVIDENCE_SCHEMA: Final = "fxpm-historical-process-evidence-v9"
-RECONCILIATION_SCHEMA: Final = "fxpm-historical-process-reconciliation-v9"
-DECISION_SCHEMA: Final = "fxpm-offline-process-validation-decision-v9"
+PROCESS_AUTHORITY_VERSION: Final = "fxpm-offline-process-validation-v10"
+PRECOMMIT_SCHEMA: Final = "fxpm-historical-process-precommit-v10"
+EVIDENCE_SCHEMA: Final = "fxpm-historical-process-evidence-v10"
+RECONCILIATION_SCHEMA: Final = "fxpm-historical-process-reconciliation-v10"
+DECISION_SCHEMA: Final = "fxpm-offline-process-validation-decision-v10"
 FORWARD_OOS_REPLAY_LINEAGE_SCHEMA: Final = "fxpm.causal-forward-oos-replay-lineage.v1"
 FORWARD_OOS_ANCHOR_LINEAGE_SCHEMA: Final = "fxpm.causal-forward-oos-anchor-lineage.v1"
 PINNED_FORWARD_OOS_PRODUCTION_CONTRACT_VERSION: Final = (
-    "fxpm.forward-oos-replay-producer.v4"
+    "fxpm.forward-oos-replay-producer.v5"
 )
-PINNED_FORWARD_OOS_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v4"
+PINNED_FORWARD_OOS_PRECOMMIT_SCHEMA: Final = "fxpm.forward-oos-replay-precommit.v5"
 PINNED_FORWARD_OOS_PRODUCER_RECEIPT_SCHEMA: Final = (
-    "fxpm.forward-oos-replay-producer-receipt.v4"
+    "fxpm.forward-oos-replay-producer-receipt.v5"
 )
 PINNED_AUTHORITY_ARTIFACT_DESCRIPTOR_SCHEMA: Final = (
     "fxpm.authority-spool-artifact-descriptor.v1"
 )
 PINNED_AUTHORITY_CANONICAL_JSON_FORMAT: Final = "canonical-json"
+_ACTIVITY_FILL_LEDGER_SCHEMA: Final = "fxpm-anchor-entry-exit-fill-ledger-v3"
+_ACTIVITY_COST_LEDGER_SCHEMA: Final = "fxpm-anchor-economic-cost-ledger-v3"
 
 SYMBOLS: Final = (
     "AUDUSD",
@@ -163,9 +165,9 @@ NO_LOCAL_WINNER: Final = "NO_LOCAL_WINNER"
 TERMINAL_TECHNICAL: Final = "TERMINAL_TECHNICAL"
 TERMINAL_TECHNICAL_SOURCE_STATE: Final = "AUTHENTIC_TERMINAL_TECHNICAL"
 TERMINAL_TECHNICAL_REASON: Final = "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
-PINNED_BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v13"
-PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = "fxpm.winner-selection.v13"
-PINNED_WINNER_EVIDENCE_LEDGER_VERSION: Final = "fxpm.winner-evidence-ledger.v4"
+PINNED_BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v14"
+PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = "fxpm.winner-selection.v14"
+PINNED_WINNER_EVIDENCE_LEDGER_VERSION: Final = "fxpm.winner-evidence-ledger.v6"
 PINNED_REGIME_FIT_CONTRACT_VERSION: Final = "fxpm.historical-regime-fit.v4"
 REGIME_DETECTOR_RECORD_SCHEMA_VERSION: Final = "fxpm.regime-detector-record/v1"
 REGIME_DETECTOR_LEDGER_RECORD_SCHEMA_VERSION: Final = (
@@ -178,10 +180,10 @@ INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION: Final = (
     "fxpm.historical-insufficient-evidence-binding.v2"
 )
 HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION: Final = (
-    "fxpm.historical-horizon-winner-cross-binding.v1"
+    "fxpm.historical-horizon-winner-cross-binding.v2"
 )
 WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION: Final = (
-    "fxpm.winner-raw-evidence-production.v1"
+    "fxpm.winner-raw-evidence-production.v4"
 )
 INSUFFICIENT_PRESEARCH_BOUNDARY_REASON: Final = "SOURCE_BOUNDARY_SHORTFALL"
 INSUFFICIENT_ALL_ATTEMPTS_REJECTED_REASON: Final = (
@@ -348,9 +350,9 @@ _FROZEN_RISK_POLICY: Final = {
     "minimum_purge_calendar_days": _DERIVED_MINIMUM_PURGE_DAYS,
 }
 _FROZEN_COST_POLICY: Final = {
-    "schema": "fxpm-historical-process-cost-policy-v3",
+    "schema": "fxpm-historical-process-cost-policy-v4",
     "base_lane": "GROSS_MTM_PLUS_OBSERVED_EXECUTION_COST_DEBITS",
-    "stress_lane": (
+    "p75_lane": (
         "SAME_EVENTS_WITH_PER_POSITION_AND_AGGREGATE_CUMULATIVE_COST_PREFIX_"
         "NON_IMPROVEMENT_AND_COMPONENT_DAY_REBOUND_ALLOWED"
     ),
@@ -430,7 +432,7 @@ _ECONOMIC_VALUE_BOUND: Final = Decimal("1000000000000000")
 _RETURN_QUANTUM: Final = Decimal("0.000000000001")
 
 _PINNED_POLICY: Final = {
-    "schema": "fxpm-historical-process-policy-v9",
+    "schema": "fxpm-historical-process-policy-v10",
     "authority_scope": "OFFLINE_PROCESS_VALIDATION_ONLY",
     "book_multiplicity_contract_version": (PINNED_BOOK_MULTIPLICITY_CONTRACT_VERSION),
     "winner_selection_contract_version": PINNED_WINNER_SELECTION_CONTRACT_VERSION,
@@ -468,18 +470,18 @@ _PINNED_POLICY: Final = {
     "primary_hac_bandwidth_rule": "MAX_HOLDING_OVERLAP_FLOOR_AND_SAMPLE_SIZE_FLOOR",
     "sensitivity_hac_bandwidth_multiplier": 2,
     "sensitivity_hac_bandwidth_rule": "MIN_TWO_TIMES_PRIMARY_AND_SHORTEST_ANCHOR_MINUS_ONE",
-    "primary_estimand": "SYNCHRONIZED_DAILY_STRESS_NET_EQUITY_LOG_GROWTH",
+    "primary_estimand": "SYNCHRONIZED_DAILY_P75_NET_EQUITY_LOG_GROWTH",
     "arithmetic_return_role": "DIAGNOSTIC_AND_RISK_ONLY_NEVER_PASS_AUTHORITY",
     "confirmatory_variance_rule": (
         "MAX_PRIMARY_HAC_SENSITIVITY_HAC_ANCHOR_CLUSTER_AND_DAILY_IPS_NEVER_SUM"
     ),
-    "confirmatory_gate": "ONE_SIDED_STUDENT_T_STRESS_LOG_GROWTH_LCB_ABOVE_ZERO",
-    "confirmatory_null_daily_stress_log_growth": "0",
+    "confirmatory_gate": "ONE_SIDED_STUDENT_T_P75_LOG_GROWTH_LCB_ABOVE_ZERO",
+    "confirmatory_null_daily_p75_log_growth": "0",
     "confirmatory_null_units": "LOG_EQUITY_GROWTH_PER_SYNCHRONIZED_UTC_DAY",
     "confirmatory_null_rationale": (
         "POST_TRADING_COST_COMPOUNDING_BREAK_EVEN_NOT_PROFITABILITY_OR_FIXED_OPERATING_COST_SUFFICIENCY"
     ),
-    "newest_anchor_gate": "STRESS_LOG_GROWTH_MEAN_ABOVE_ZERO",
+    "newest_anchor_gate": "P75_LOG_GROWTH_MEAN_ABOVE_ZERO",
     "fixed_hac_role": "VARIANCE_CANDIDATES_AND_DIAGNOSTICS_NOT_SEPARATE_TESTS",
     "daily_ips_rule": "GEYER_INITIAL_POSITIVE_MONOTONE_SEQUENCE_ANCHOR_CENTERED",
     "daily_ips_max_lag": 67,
@@ -498,9 +500,9 @@ _PINNED_POLICY: Final = {
     "minimum_distinct_anchor_means": 2,
     "require_positive_within_anchor_variance": True,
     "maximum_base_expected_shortfall_5pct": "0.20",
-    "maximum_stress_expected_shortfall_5pct": "0.25",
+    "maximum_p75_expected_shortfall_5pct": "0.25",
     "maximum_base_drawdown": "0.50",
-    "maximum_stress_drawdown": "0.60",
+    "maximum_p75_drawdown": "0.60",
     "daily_return_absolute_bound": "1",
     "daily_return_maximum_decimal_places": 12,
     "economic_primitive_absolute_bound": "1000000000000000",
@@ -883,7 +885,7 @@ def _validate_forward_oos_replay_lineage(
     plans: Sequence[Mapping[str, Any]],
     precommit_payload_sha256: str,
 ) -> dict[str, Any]:
-    """Validate the sealed forward producer/precommit identity carried by v9.
+    """Validate the sealed forward producer/precommit identity carried by v10.
 
     The raw six-ledger objects are reopened by the production adapter before
     this standalone evaluator is called.  The evaluator nevertheless owns the
@@ -1255,7 +1257,7 @@ def _validate_process_definition(
         ),
         "process_definition",
     )
-    if value["schema"] != "fxpm-frozen-historical-institution-process-v9":
+    if value["schema"] != "fxpm-frozen-historical-institution-process-v10":
         raise ProcessVerificationError("process definition schema mismatch")
     if type(value["symbols"]) is not list or tuple(value["symbols"]) != SYMBOLS:
         raise ProcessVerificationError(
@@ -2664,7 +2666,7 @@ def _validate_activity_ledger(
     dates: Sequence[str],
     gross: Sequence[Decimal],
     base_cost: Sequence[Decimal],
-    stress_cost: Sequence[Decimal],
+    p75_cost: Sequence[Decimal],
     identity_registry: _EvidenceIdentityRegistry | None = None,
     used_broker_fill_ids: set[str] | None = None,
 ) -> tuple[
@@ -2684,7 +2686,7 @@ def _validate_activity_ledger(
                 dates,
                 gross,
                 base_cost,
-                stress_cost,
+                p75_cost,
                 registry,
                 used_broker_fill_ids,
             )
@@ -2699,7 +2701,7 @@ def _validate_activity_ledger_in_context(
     dates: Sequence[str],
     gross: Sequence[Decimal],
     base_cost: Sequence[Decimal],
-    stress_cost: Sequence[Decimal],
+    p75_cost: Sequence[Decimal],
     identity_registry: _EvidenceIdentityRegistry,
     used_broker_fill_ids: set[str] | None = None,
 ) -> tuple[
@@ -2747,7 +2749,7 @@ def _validate_activity_ledger_in_context(
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     )
     opening_identity_keys = (
         "opening_fill_payload_sha256",
@@ -2766,7 +2768,7 @@ def _validate_activity_ledger_in_context(
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     )
     closing_identity_keys = (
         "closing_fill_payload_sha256",
@@ -2781,11 +2783,11 @@ def _validate_activity_ledger_in_context(
 
     def require_position_cost_prefix(state: Mapping[str, Any], label: str) -> None:
         if (
-            state["stress_cost_prefix_cash"] + _RETURN_QUANTUM
+            state["p75_cost_prefix_cash"] + _RETURN_QUANTUM
             < state["base_cost_prefix_cash"]
         ):
             raise ProcessVerificationError(
-                f"{label} stress cumulative cost prefix improves on base"
+                f"{label} p75 cumulative cost prefix improves on base"
             )
 
     def validate_opening_fill(
@@ -2859,9 +2861,9 @@ def _validate_activity_ledger_in_context(
             f"{label} base fill price",
             strictly_positive=True,
         )
-        stress_fill = _economic_decimal(
-            value["stress_fill_price"],
-            f"{label} stress fill price",
+        p75_fill = _economic_decimal(
+            value["p75_fill_price"],
+            f"{label} p75 fill price",
             strictly_positive=True,
         )
         if (side == "LONG" and stop_price >= reference_mid) or (
@@ -2915,10 +2917,10 @@ def _validate_activity_ledger_in_context(
             base_fill - executable_quote,
             unit_scale,
         )
-        stress_fill_degradation_cash = _bounded_economic_product(
-            f"{label} stress fill-degradation cash",
+        p75_fill_degradation_cash = _bounded_economic_product(
+            f"{label} p75 fill-degradation cash",
             side_sign,
-            stress_fill - executable_quote,
+            p75_fill - executable_quote,
             unit_scale,
         )
         base_execution_cost = max(
@@ -2929,19 +2931,19 @@ def _validate_activity_ledger_in_context(
                 base_fill_degradation_cash,
             ),
         )
-        stress_execution_cost = max(
+        p75_execution_cost = max(
             Decimal(0),
             _bounded_economic_sum(
-                f"{label} stress spread and fill-degradation cash",
+                f"{label} p75 spread and fill-degradation cash",
                 base_spread_cash,
-                stress_fill_degradation_cash,
+                p75_fill_degradation_cash,
             ),
         )
         base_cost_cash = base_execution_cost
-        stress_cost_cash = stress_execution_cost
-        if stress_cost_cash < base_cost_cash:
+        p75_cost_cash = p75_execution_cost
+        if p75_cost_cash < base_cost_cash:
             raise ProcessVerificationError(
-                f"{label} stress execution cost is less severe than base"
+                f"{label} p75 execution cost is less severe than base"
             )
         last_mark = reference_mid
         if carried:
@@ -2993,9 +2995,9 @@ def _validate_activity_ledger_in_context(
             "stop_price": stop_price,
             "last_mark": last_mark,
             "pending_base_cost_cash": Decimal(0) if carried else base_cost_cash,
-            "pending_stress_cost_cash": (Decimal(0) if carried else stress_cost_cash),
+            "pending_p75_cost_cash": (Decimal(0) if carried else p75_cost_cash),
             "base_cost_prefix_cash": base_cost_cash,
-            "stress_cost_prefix_cash": stress_cost_cash,
+            "p75_cost_prefix_cash": p75_cost_cash,
             "base_contribution": Decimal(0),
         }
         require_position_cost_prefix(state, label)
@@ -3031,7 +3033,7 @@ def _validate_activity_ledger_in_context(
     maximum_gross_exposure = Decimal(0)
     maximum_concurrent_positions = 0
     cumulative_base_cost_return = Decimal(0)
-    cumulative_stress_cost_return = Decimal(0)
+    cumulative_p75_cost_return = Decimal(0)
     for index, (record, date_text) in enumerate(zip(day_records, dates, strict=True)):
         if type(record) is not dict:
             raise ProcessVerificationError("activity day must be an exact mapping")
@@ -3082,7 +3084,7 @@ def _validate_activity_ledger_in_context(
         mark_ids: list[str] = []
         gross_cash_sum = Decimal(0)
         base_cost_cash_sum = Decimal(0)
-        stress_cost_cash_sum = Decimal(0)
+        p75_cost_cash_sum = Decimal(0)
         total_open_risk = Decimal(0)
         total_gross_exposure = Decimal(0)
         position_exposures: list[dict[str, Any]] = []
@@ -3101,7 +3103,7 @@ def _validate_activity_ledger_in_context(
                     "market_mark_payload_sha256",
                     "market_mark_receipt_sha256",
                     "base_financing_cash",
-                    "stress_financing_cash",
+                    "p75_financing_cash",
                 ),
                 "position mark",
             )
@@ -3168,9 +3170,9 @@ def _validate_activity_ledger_in_context(
                 "position base financing",
                 strictly_positive=False,
             )
-            stress_financing = _economic_decimal(
-                mark["stress_financing_cash"],
-                "position stress financing",
+            p75_financing = _economic_decimal(
+                mark["p75_financing_cash"],
+                "position p75 financing",
                 strictly_positive=False,
             )
             if (state["side"] == "LONG" and state["stop_price"] >= mark_price) or (
@@ -3190,20 +3192,20 @@ def _validate_activity_ledger_in_context(
                 state["pending_base_cost_cash"],
                 base_financing,
             )
-            position_stress_cost = _bounded_economic_sum(
-                "position stress cost cash",
-                state["pending_stress_cost_cash"],
-                stress_financing,
+            position_p75_cost = _bounded_economic_sum(
+                "position p75 cost cash",
+                state["pending_p75_cost_cash"],
+                p75_financing,
             )
             state["base_cost_prefix_cash"] = _bounded_economic_sum(
                 "position cumulative base cost cash",
                 state["base_cost_prefix_cash"],
                 base_financing,
             )
-            state["stress_cost_prefix_cash"] = _bounded_economic_sum(
-                "position cumulative stress cost cash",
-                state["stress_cost_prefix_cash"],
-                stress_financing,
+            state["p75_cost_prefix_cash"] = _bounded_economic_sum(
+                "position cumulative p75 cost cash",
+                state["p75_cost_prefix_cash"],
+                p75_financing,
             )
             require_position_cost_prefix(state, "position mark")
             gross_cash_sum = _bounded_economic_sum(
@@ -3214,10 +3216,10 @@ def _validate_activity_ledger_in_context(
                 base_cost_cash_sum,
                 position_base_cost,
             )
-            stress_cost_cash_sum = _bounded_economic_sum(
-                "aggregate daily stress cost cash",
-                stress_cost_cash_sum,
-                position_stress_cost,
+            p75_cost_cash_sum = _bounded_economic_sum(
+                "aggregate daily p75 cost cash",
+                p75_cost_cash_sum,
+                position_p75_cost,
             )
             net_base_cash = _bounded_economic_sum(
                 "position net base cash", gross_cash, -position_base_cost
@@ -3228,7 +3230,7 @@ def _validate_activity_ledger_in_context(
                 "position base contribution",
             )
             state["pending_base_cost_cash"] = Decimal(0)
-            state["pending_stress_cost_cash"] = Decimal(0)
+            state["pending_p75_cost_cash"] = Decimal(0)
             state["last_mark"] = mark_price
             mark_by_position[position_id] = (
                 mark_price,
@@ -3365,9 +3367,9 @@ def _validate_activity_ledger_in_context(
                 "closing base fill price",
                 strictly_positive=True,
             )
-            stress_fill = _economic_decimal(
-                exit_fill["stress_fill_price"],
-                "closing stress fill price",
+            p75_fill = _economic_decimal(
+                exit_fill["p75_fill_price"],
+                "closing p75 fill price",
                 strictly_positive=True,
             )
             executable_quote = (
@@ -3385,10 +3387,10 @@ def _validate_activity_ledger_in_context(
                 executable_quote - base_fill,
                 state["unit_scale"],
             )
-            stress_fill_degradation_cash = _bounded_economic_product(
-                "closing stress fill-degradation cash",
+            p75_fill_degradation_cash = _bounded_economic_product(
+                "closing p75 fill-degradation cash",
                 state["side_sign"],
-                executable_quote - stress_fill,
+                executable_quote - p75_fill,
                 state["unit_scale"],
             )
             base_execution_cost = max(
@@ -3399,29 +3401,29 @@ def _validate_activity_ledger_in_context(
                     base_fill_degradation_cash,
                 ),
             )
-            stress_execution_cost = max(
+            p75_execution_cost = max(
                 Decimal(0),
                 _bounded_economic_sum(
-                    "closing stress spread and fill-degradation cash",
+                    "closing p75 spread and fill-degradation cash",
                     exit_spread_cash,
-                    stress_fill_degradation_cash,
+                    p75_fill_degradation_cash,
                 ),
             )
             base_exit_cost = base_execution_cost
-            stress_exit_cost = stress_execution_cost
-            if stress_exit_cost < base_exit_cost:
+            p75_exit_cost = p75_execution_cost
+            if p75_exit_cost < base_exit_cost:
                 raise ProcessVerificationError(
-                    "closing stress execution cost is less severe than base"
+                    "closing p75 execution cost is less severe than base"
                 )
             state["base_cost_prefix_cash"] = _bounded_economic_sum(
                 "position cumulative base cost cash",
                 state["base_cost_prefix_cash"],
                 base_exit_cost,
             )
-            state["stress_cost_prefix_cash"] = _bounded_economic_sum(
-                "position cumulative stress cost cash",
-                state["stress_cost_prefix_cash"],
-                stress_exit_cost,
+            state["p75_cost_prefix_cash"] = _bounded_economic_sum(
+                "position cumulative p75 cost cash",
+                state["p75_cost_prefix_cash"],
+                p75_exit_cost,
             )
             require_position_cost_prefix(state, "position close")
             expected_close_payload = _sha256(
@@ -3447,10 +3449,10 @@ def _validate_activity_ledger_in_context(
                 base_cost_cash_sum,
                 base_exit_cost,
             )
-            stress_cost_cash_sum = _bounded_economic_sum(
-                "aggregate daily stress cost cash",
-                stress_cost_cash_sum,
-                stress_exit_cost,
+            p75_cost_cash_sum = _bounded_economic_sum(
+                "aggregate daily p75 cost cash",
+                p75_cost_cash_sum,
+                p75_exit_cost,
             )
             state["base_contribution"] -= _economic_ratio(
                 base_exit_cost,
@@ -3470,25 +3472,25 @@ def _validate_activity_ledger_in_context(
         derived_base_cost = _cash_return(
             -base_cost_cash_sum, equity, "event-derived daily base cost"
         )
-        derived_stress_cost = _cash_return(
-            -stress_cost_cash_sum, equity, "event-derived daily stress cost"
+        derived_p75_cost = _cash_return(
+            -p75_cost_cash_sum, equity, "event-derived daily p75 cost"
         )
         if (
             derived_gross != gross[index]
             or derived_base_cost != base_cost[index]
-            or derived_stress_cost != stress_cost[index]
+            or derived_p75_cost != p75_cost[index]
         ):
             raise ProcessVerificationError(
                 "economic fill and mark replay does not reconcile daily gross and cost vectors"
             )
         cumulative_base_cost_return += derived_base_cost
-        cumulative_stress_cost_return += derived_stress_cost
+        cumulative_p75_cost_return += derived_p75_cost
         if (
-            cumulative_stress_cost_return
+            cumulative_p75_cost_return
             > cumulative_base_cost_return + _RETURN_QUANTUM
         ):
             raise ProcessVerificationError(
-                "stress cumulative cost-return prefix improves on base"
+                "p75 cumulative cost-return prefix improves on base"
             )
         for position_id, state in open_positions.items():
             require_position_cost_prefix(state, f"position {position_id} day boundary")
@@ -3514,7 +3516,7 @@ def _validate_activity_ledger_in_context(
                 "position_marks": mark_records,
                 "closing_fills": exits,
                 "derived_base_cost_return": _decimal_text(derived_base_cost),
-                "derived_stress_cost_return": _decimal_text(derived_stress_cost),
+                "derived_p75_cost_return": _decimal_text(derived_p75_cost),
             }
         )
         exposure_days.append(
@@ -3561,7 +3563,7 @@ def _validate_activity_ledger_in_context(
         "event_ledger_sha256": activity_sha,
         "fill_ledger_sha256": _sha256(
             {
-                "schema": "fxpm-anchor-entry-exit-fill-ledger-v2",
+                "schema": _ACTIVITY_FILL_LEDGER_SCHEMA,
                 "anchor_id": anchor["anchor_id"],
                 "initial_positions": initial_positions,
                 "days": fill_days,
@@ -3569,7 +3571,7 @@ def _validate_activity_ledger_in_context(
         ),
         "cost_ledger_sha256": _sha256(
             {
-                "schema": "fxpm-anchor-economic-cost-ledger-v2",
+                "schema": _ACTIVITY_COST_LEDGER_SCHEMA,
                 "anchor_id": anchor["anchor_id"],
                 "days": cost_days,
             }
@@ -3641,12 +3643,12 @@ def _validate_anchor_evidence(
             "gross_vector_sha256",
             "daily_base_cost_returns",
             "base_cost_vector_sha256",
-            "daily_stress_cost_returns",
-            "stress_cost_vector_sha256",
+            "daily_p75_cost_returns",
+            "p75_cost_vector_sha256",
             "daily_base_net_mtm_returns",
             "base_vector_sha256",
-            "daily_stress_net_mtm_returns",
-            "stress_vector_sha256",
+            "daily_p75_net_mtm_returns",
+            "p75_vector_sha256",
             "activity_ledger",
             "activity_ledger_sha256",
             "completed_trade_count",
@@ -3724,15 +3726,15 @@ def _validate_anchor_evidence(
         raise ProcessVerificationError("anchor calendar identity mismatch")
     gross_values = anchor["daily_gross_mtm_returns"]
     base_cost_values = anchor["daily_base_cost_returns"]
-    stress_cost_values = anchor["daily_stress_cost_returns"]
+    p75_cost_values = anchor["daily_p75_cost_returns"]
     base_values = anchor["daily_base_net_mtm_returns"]
-    stress_values = anchor["daily_stress_net_mtm_returns"]
+    p75_values = anchor["daily_p75_net_mtm_returns"]
     daily_vectors = (
         gross_values,
         base_cost_values,
-        stress_cost_values,
+        p75_cost_values,
         base_values,
-        stress_values,
+        p75_values,
     )
     if any(type(values) is not list for values in daily_vectors):
         raise ProcessVerificationError("daily MTM evidence must be vectors")
@@ -3749,28 +3751,28 @@ def _validate_anchor_evidence(
         _decimal(value, "base daily cost debit", absolute_bound=bound)
         for value in base_cost_values
     ]
-    stress_cost = [
-        _decimal(value, "stress daily cost debit", absolute_bound=bound)
-        for value in stress_cost_values
+    p75_cost = [
+        _decimal(value, "p75 daily cost debit", absolute_bound=bound)
+        for value in p75_cost_values
     ]
     base = [
         _decimal(value, "base daily return", absolute_bound=bound)
         for value in base_values
     ]
-    stress = [
-        _decimal(value, "stress daily return", absolute_bound=bound)
-        for value in stress_values
+    p75 = [
+        _decimal(value, "p75 daily return", absolute_bound=bound)
+        for value in p75_values
     ]
     cumulative_base_cost_return = Decimal(0)
-    cumulative_stress_cost_return = Decimal(0)
+    cumulative_p75_cost_return = Decimal(0)
     for index, (
         gross_return,
         base_debit,
-        stress_debit,
+        p75_debit,
         base_net,
-        stress_net,
-    ) in enumerate(zip(gross, base_cost, stress_cost, base, stress, strict=True)):
-        if base_debit > 0 or stress_debit > 0:
+        p75_net,
+    ) in enumerate(zip(gross, base_cost, p75_cost, base, p75, strict=True)):
+        if base_debit > 0 or p75_debit > 0:
             raise ProcessVerificationError(
                 f"cost evidence is not a debit on day {index}"
             )
@@ -3778,18 +3780,18 @@ def _validate_anchor_evidence(
             raise ProcessVerificationError(
                 f"base return does not reconcile gross MTM and costs on day {index}"
             )
-        if gross_return + stress_debit != stress_net:
+        if gross_return + p75_debit != p75_net:
             raise ProcessVerificationError(
-                f"stress return does not reconcile the same gross MTM stream on day {index}"
+                f"p75 return does not reconcile the same gross MTM stream on day {index}"
             )
         cumulative_base_cost_return += base_debit
-        cumulative_stress_cost_return += stress_debit
+        cumulative_p75_cost_return += p75_debit
         if (
-            cumulative_stress_cost_return
+            cumulative_p75_cost_return
             > cumulative_base_cost_return + _RETURN_QUANTUM
         ):
             raise ProcessVerificationError(
-                f"stress cumulative cost prefix improves on base on day {index}"
+                f"p75 cumulative cost prefix improves on base on day {index}"
             )
     if anchor["gross_vector_sha256"] != _vector_hash(dates, gross_values, "GROSS_MTM"):
         raise ProcessVerificationError("gross daily vector identity mismatch")
@@ -3797,14 +3799,14 @@ def _validate_anchor_evidence(
         dates, base_cost_values, "BASE_COST_DEBIT"
     ):
         raise ProcessVerificationError("base cost vector identity mismatch")
-    if anchor["stress_cost_vector_sha256"] != _vector_hash(
-        dates, stress_cost_values, "STRESS_COST_DEBIT"
+    if anchor["p75_cost_vector_sha256"] != _vector_hash(
+        dates, p75_cost_values, "P75_COST_DEBIT"
     ):
-        raise ProcessVerificationError("stress cost vector identity mismatch")
+        raise ProcessVerificationError("p75 cost vector identity mismatch")
     if anchor["base_vector_sha256"] != _vector_hash(dates, base_values, "BASE"):
         raise ProcessVerificationError("base daily vector identity mismatch")
-    if anchor["stress_vector_sha256"] != _vector_hash(dates, stress_values, "STRESS"):
-        raise ProcessVerificationError("stress daily vector identity mismatch")
+    if anchor["p75_vector_sha256"] != _vector_hash(dates, p75_values, "P75"):
+        raise ProcessVerificationError("p75 daily vector identity mismatch")
     (
         event_completed_outcomes,
         event_observed_holding_by_timeframe,
@@ -3816,7 +3818,7 @@ def _validate_anchor_evidence(
         dates,
         gross,
         base_cost,
-        stress_cost,
+        p75_cost,
         identity_registry,
         used_broker_fill_ids,
     )
@@ -3855,7 +3857,7 @@ def _validate_anchor_evidence(
             "completed-trade outcome vector identity mismatch"
         )
     if trades == 0 and any(
-        value != 0 for vector in (gross, base, stress) for value in vector
+        value != 0 for vector in (gross, base, p75) for value in vector
     ):
         raise ProcessVerificationError(
             "nonzero MTM evidence requires at least one completed position"
@@ -3865,7 +3867,7 @@ def _validate_anchor_evidence(
         trades != 0
         or any(value != 0 for value in gross)
         or any(value != 0 for value in base)
-        or any(value != 0 for value in stress)
+        or any(value != 0 for value in p75)
     ):
         raise ProcessVerificationError(
             "an anchor with no selected specialist cannot manufacture returns or trades"
@@ -4011,9 +4013,9 @@ def _validate_anchor_evidence(
             "cost_ledger_sha256": ledgers["cost_ledger_sha256"],
             "gross_vector_sha256": anchor["gross_vector_sha256"],
             "base_cost_vector_sha256": anchor["base_cost_vector_sha256"],
-            "stress_cost_vector_sha256": anchor["stress_cost_vector_sha256"],
+            "p75_cost_vector_sha256": anchor["p75_cost_vector_sha256"],
             "base_vector_sha256": anchor["base_vector_sha256"],
-            "stress_vector_sha256": anchor["stress_vector_sha256"],
+            "p75_vector_sha256": anchor["p75_vector_sha256"],
         }
     )
     expected_replay_output = _sha256(
@@ -4027,7 +4029,7 @@ def _validate_anchor_evidence(
             "fill_ledger_sha256": ledgers["fill_ledger_sha256"],
             "gross_vector_sha256": anchor["gross_vector_sha256"],
             "base_vector_sha256": anchor["base_vector_sha256"],
-            "stress_vector_sha256": anchor["stress_vector_sha256"],
+            "p75_vector_sha256": anchor["p75_vector_sha256"],
         }
     )
     lineage_outputs = _expected_lineage_outputs(anchor)
@@ -4059,9 +4061,9 @@ def _validate_anchor_evidence(
         "calendar_sha256",
         "gross_vector_sha256",
         "base_cost_vector_sha256",
-        "stress_cost_vector_sha256",
+        "p75_cost_vector_sha256",
         "base_vector_sha256",
-        "stress_vector_sha256",
+        "p75_vector_sha256",
         "trade_vector_sha256",
     ):
         identity_registry.register(
@@ -4076,7 +4078,7 @@ def _validate_anchor_evidence(
     for key, identity in ledgers.items():
         if key not in ("event_ledger_sha256", "calendar_completeness_sha256"):
             identity_registry.register(identity, f"{anchor_id} ledger {key}")
-    return anchor, base, stress
+    return anchor, base, p75
 
 
 def _validate_reconciliation_anchor(
@@ -4097,17 +4099,17 @@ def _validate_reconciliation_anchor(
             "calendar_dates",
             "daily_gross_mtm_returns",
             "daily_base_cost_returns",
-            "daily_stress_cost_returns",
+            "daily_p75_cost_returns",
             "daily_base_net_mtm_returns",
-            "daily_stress_net_mtm_returns",
+            "daily_p75_net_mtm_returns",
             "activity_ledger",
             "activity_ledger_sha256",
             "calendar_sha256",
             "gross_vector_sha256",
             "base_cost_vector_sha256",
-            "stress_cost_vector_sha256",
+            "p75_cost_vector_sha256",
             "base_vector_sha256",
-            "stress_vector_sha256",
+            "p75_vector_sha256",
             "completed_trade_count",
             "completed_trade_outcomes",
             "trade_vector_sha256",
@@ -4136,17 +4138,17 @@ def _validate_reconciliation_anchor(
         "calendar_dates",
         "daily_gross_mtm_returns",
         "daily_base_cost_returns",
-        "daily_stress_cost_returns",
+        "daily_p75_cost_returns",
         "daily_base_net_mtm_returns",
-        "daily_stress_net_mtm_returns",
+        "daily_p75_net_mtm_returns",
         "activity_ledger",
         "activity_ledger_sha256",
         "calendar_sha256",
         "gross_vector_sha256",
         "base_cost_vector_sha256",
-        "stress_cost_vector_sha256",
+        "p75_cost_vector_sha256",
         "base_vector_sha256",
-        "stress_vector_sha256",
+        "p75_vector_sha256",
         "completed_trade_count",
         "completed_trade_outcomes",
         "trade_vector_sha256",
@@ -4400,16 +4402,16 @@ def _compute_decision_body(
     reconciliation_time: datetime,
     anchors: Sequence[Mapping[str, Any]],
     base_vectors: Sequence[Sequence[Decimal]],
-    stress_vectors: Sequence[Sequence[Decimal]],
+    p75_vectors: Sequence[Sequence[Decimal]],
 ) -> dict[str, Any]:
     base_log_vectors = _log_growth_vectors(base_vectors)
-    stress_log_vectors = _log_growth_vectors(stress_vectors)
+    p75_log_vectors = _log_growth_vectors(p75_vectors)
     base_arithmetic_means = [_mean(vector) for vector in base_vectors]
-    stress_arithmetic_means = [_mean(vector) for vector in stress_vectors]
+    p75_arithmetic_means = [_mean(vector) for vector in p75_vectors]
     base_log_means = [_mean(vector) for vector in base_log_vectors]
-    stress_log_means = [_mean(vector) for vector in stress_log_vectors]
+    p75_log_means = [_mean(vector) for vector in p75_log_vectors]
     sample_floor, primary_bandwidth, sensitivity_bandwidth = _pinned_hac_bandwidths(
-        stress_log_vectors
+        p75_log_vectors
     )
 
     pooled_base_log_mean, base_primary_variance = _pooled_hac_variance(
@@ -4430,40 +4432,40 @@ def _compute_decision_body(
         pooled_base_log_mean, base_diagnostic_variance, len(base_log_vectors)
     )
 
-    pooled_stress_log_mean, stress_primary_variance = _pooled_hac_variance(
-        stress_log_vectors, primary_bandwidth
+    pooled_p75_log_mean, p75_primary_variance = _pooled_hac_variance(
+        p75_log_vectors, primary_bandwidth
     )
-    _, stress_sensitivity_variance = _pooled_hac_variance(
-        stress_log_vectors, sensitivity_bandwidth
+    _, p75_sensitivity_variance = _pooled_hac_variance(
+        p75_log_vectors, sensitivity_bandwidth
     )
-    stress_cluster_variance = _anchor_cluster_variance(
-        stress_log_vectors, pooled_stress_log_mean
+    p75_cluster_variance = _anchor_cluster_variance(
+        p75_log_vectors, pooled_p75_log_mean
     )
     ips_lrv, ips_variance, ips_unresolved, ips_valid_pair_count = _daily_ips_variance(
-        stress_log_vectors,
+        p75_log_vectors,
         _PINNED_POLICY["daily_ips_max_lag"],
     )
-    stress_variance_candidates = {
-        "PRIMARY_HAC": stress_primary_variance,
-        "SENSITIVITY_HAC": stress_sensitivity_variance,
-        "ANCHOR_CLUSTER": stress_cluster_variance,
+    p75_variance_candidates = {
+        "PRIMARY_HAC": p75_primary_variance,
+        "SENSITIVITY_HAC": p75_sensitivity_variance,
+        "ANCHOR_CLUSTER": p75_cluster_variance,
     }
     if ips_variance is not None:
-        stress_variance_candidates["DAILY_IPS"] = ips_variance
-    selected_stress_variance = max(stress_variance_candidates.values())
-    selected_stress_variance_sources = sorted(
+        p75_variance_candidates["DAILY_IPS"] = ips_variance
+    selected_p75_variance = max(p75_variance_candidates.values())
+    selected_p75_variance_sources = sorted(
         key
-        for key, value in stress_variance_candidates.items()
-        if value == selected_stress_variance
+        for key, value in p75_variance_candidates.items()
+        if value == selected_p75_variance
     )
     if ips_unresolved:
         confirmatory_lcb = None
         confirmatory_status = "DEPENDENCE_INSUFFICIENT"
     else:
         confirmatory_lcb = _student_t_lcb(
-            pooled_stress_log_mean,
-            selected_stress_variance,
-            len(stress_log_vectors),
+            pooled_p75_log_mean,
+            selected_p75_variance,
+            len(p75_log_vectors),
         )
         confirmatory_status = "PASS" if confirmatory_lcb > 0 else "FAIL"
 
@@ -4472,71 +4474,71 @@ def _compute_decision_body(
         _leave_most_influential_block(vector, influence_block_size)
         for vector in base_log_vectors
     ]
-    stress_influence_results = [
+    p75_influence_results = [
         _leave_most_influential_block(vector, influence_block_size)
-        for vector in stress_log_vectors
+        for vector in p75_log_vectors
     ]
     base_without_influence = [result[0] for result in base_influence_results]
-    stress_without_influence = [result[0] for result in stress_influence_results]
+    p75_without_influence = [result[0] for result in p75_influence_results]
     pooled_base_without_influence_mean = sum(
         (sum(vector, Decimal(0)) for vector in base_without_influence), Decimal(0)
     ) / Decimal(sum(len(vector) for vector in base_without_influence))
-    pooled_stress_without_influence_mean = sum(
-        (sum(vector, Decimal(0)) for vector in stress_without_influence), Decimal(0)
-    ) / Decimal(sum(len(vector) for vector in stress_without_influence))
+    pooled_p75_without_influence_mean = sum(
+        (sum(vector, Decimal(0)) for vector in p75_without_influence), Decimal(0)
+    ) / Decimal(sum(len(vector) for vector in p75_without_influence))
 
     anchor_group_base_log_mean, anchor_group_base_log_lcb, _ = _anchor_group_t_lcb(
         base_log_vectors
     )
-    anchor_group_stress_log_mean, anchor_group_stress_log_lcb, _ = _anchor_group_t_lcb(
-        stress_log_vectors
+    anchor_group_p75_log_mean, anchor_group_p75_log_lcb, _ = _anchor_group_t_lcb(
+        p75_log_vectors
     )
     base_between_log_variance = _sample_variance(base_log_means)
-    stress_between_log_variance = _sample_variance(stress_log_means)
+    p75_between_log_variance = _sample_variance(p75_log_means)
     base_within_log_variances = [
         _sample_variance(vector) for vector in base_log_vectors
     ]
-    stress_within_log_variances = [
-        _sample_variance(vector) for vector in stress_log_vectors
+    p75_within_log_variances = [
+        _sample_variance(vector) for vector in p75_log_vectors
     ]
     anchor_blocks = [
         _effective_dependence_blocks(vector, sensitivity_bandwidth)
-        for vector in stress_log_vectors
+        for vector in p75_log_vectors
     ]
     trades = [anchor["completed_trade_count"] for anchor in anchors]
     base_es = _expected_shortfall_5pct(base_vectors)
-    stress_es = _expected_shortfall_5pct(stress_vectors)
+    p75_es = _expected_shortfall_5pct(p75_vectors)
     base_dd = _maximum_drawdown(base_vectors)
-    stress_dd = _maximum_drawdown(stress_vectors)
+    p75_dd = _maximum_drawdown(p75_vectors)
 
     gates = {
-        "newest_anchor_stress_log_growth_mean_above_zero": stress_log_means[-1] > 0,
+        "newest_anchor_p75_log_growth_mean_above_zero": p75_log_means[-1] > 0,
         "base_between_anchor_log_growth_variation": base_between_log_variance > 0,
-        "stress_between_anchor_log_growth_variation": stress_between_log_variance > 0,
+        "p75_between_anchor_log_growth_variation": p75_between_log_variance > 0,
         "base_distinct_anchor_log_growth_means": len(set(base_log_means))
         >= _PINNED_POLICY["minimum_distinct_anchor_means"],
-        "stress_distinct_anchor_log_growth_means": len(set(stress_log_means))
+        "p75_distinct_anchor_log_growth_means": len(set(p75_log_means))
         >= _PINNED_POLICY["minimum_distinct_anchor_means"],
         "base_positive_within_anchor_log_growth_variance": min(
             base_within_log_variances
         )
         > 0,
-        "stress_positive_within_anchor_log_growth_variance": min(
-            stress_within_log_variances
+        "p75_positive_within_anchor_log_growth_variance": min(
+            p75_within_log_variances
         )
         > 0,
         "base_arithmetic_expected_shortfall_risk_limit": base_es
         <= Decimal(_PINNED_POLICY["maximum_base_expected_shortfall_5pct"]),
-        "stress_arithmetic_expected_shortfall_risk_limit": stress_es
-        <= Decimal(_PINNED_POLICY["maximum_stress_expected_shortfall_5pct"]),
+        "p75_arithmetic_expected_shortfall_risk_limit": p75_es
+        <= Decimal(_PINNED_POLICY["maximum_p75_expected_shortfall_5pct"]),
         "base_arithmetic_drawdown_risk_limit": base_dd
         <= Decimal(_PINNED_POLICY["maximum_base_drawdown"]),
-        "stress_arithmetic_drawdown_risk_limit": stress_dd
-        <= Decimal(_PINNED_POLICY["maximum_stress_drawdown"]),
+        "p75_arithmetic_drawdown_risk_limit": p75_dd
+        <= Decimal(_PINNED_POLICY["maximum_p75_drawdown"]),
     }
     failure_reasons = sorted(key for key, value in gates.items() if not value)
     if confirmatory_status == "FAIL":
-        failure_reasons.append("stress_log_growth_confirmatory_lcb_above_zero")
+        failure_reasons.append("p75_log_growth_confirmatory_lcb_above_zero")
         failure_reasons.sort()
     if failure_reasons:
         decision = "OFFLINE_PROCESS_VALIDATION_FAIL"
@@ -4544,7 +4546,7 @@ def _compute_decision_body(
     elif confirmatory_status == "DEPENDENCE_INSUFFICIENT":
         decision = "OFFLINE_PROCESS_VALIDATION_DEPENDENCE_INSUFFICIENT"
         insufficiency_reasons = [
-            "stress_log_growth_ips_positive_sequence_unresolved_through_lag_67"
+            "p75_log_growth_ips_positive_sequence_unresolved_through_lag_67"
         ]
     else:
         decision = "OFFLINE_PROCESS_VALIDATION_PASS"
@@ -4553,11 +4555,11 @@ def _compute_decision_body(
     metrics = {
         "primary_estimand": _PINNED_POLICY["primary_estimand"],
         "arithmetic_return_role": _PINNED_POLICY["arithmetic_return_role"],
-        "confirmatory_null_daily_stress_log_growth": "0",
+        "confirmatory_null_daily_p75_log_growth": "0",
         "confirmatory_null_units": _PINNED_POLICY["confirmatory_null_units"],
         "confirmatory_null_rationale": _PINNED_POLICY["confirmatory_null_rationale"],
         "anchor_count": len(anchors),
-        "total_calendar_days": sum(len(vector) for vector in stress_log_vectors),
+        "total_calendar_days": sum(len(vector) for vector in p75_log_vectors),
         "completed_trade_count": sum(trades),
         "completed_trade_counts_by_anchor_diagnostic_only": trades,
         "effective_dependence_blocks": _decimal_text(sum(anchor_blocks, Decimal(0))),
@@ -4569,31 +4571,31 @@ def _compute_decision_body(
         "small_cluster_one_sided_critical_value": _ONE_SIDED_T_95_BY_DF[
             len(anchors) - 1
         ],
-        "pooled_stress_log_growth_mean": _decimal_text(pooled_stress_log_mean),
-        "stress_log_growth_confirmatory_lcb": (
+        "pooled_p75_log_growth_mean": _decimal_text(pooled_p75_log_mean),
+        "p75_log_growth_confirmatory_lcb": (
             None if confirmatory_lcb is None else _decimal_text(confirmatory_lcb)
         ),
-        "stress_log_growth_selected_variance": _decimal_text(selected_stress_variance),
-        "stress_log_growth_selected_variance_sources": (
-            selected_stress_variance_sources
+        "p75_log_growth_selected_variance": _decimal_text(selected_p75_variance),
+        "p75_log_growth_selected_variance_sources": (
+            selected_p75_variance_sources
         ),
-        "stress_log_growth_primary_hac_variance": _decimal_text(
-            stress_primary_variance
+        "p75_log_growth_primary_hac_variance": _decimal_text(
+            p75_primary_variance
         ),
-        "stress_log_growth_sensitivity_hac_variance": _decimal_text(
-            stress_sensitivity_variance
+        "p75_log_growth_sensitivity_hac_variance": _decimal_text(
+            p75_sensitivity_variance
         ),
-        "stress_log_growth_anchor_cluster_variance": _decimal_text(
-            stress_cluster_variance
+        "p75_log_growth_anchor_cluster_variance": _decimal_text(
+            p75_cluster_variance
         ),
-        "stress_log_growth_daily_ips_lrv": (
+        "p75_log_growth_daily_ips_lrv": (
             None if ips_lrv is None else _decimal_text(ips_lrv)
         ),
-        "stress_log_growth_daily_ips_variance": (
+        "p75_log_growth_daily_ips_variance": (
             None if ips_variance is None else _decimal_text(ips_variance)
         ),
-        "stress_log_growth_daily_ips_valid_pair_count": ips_valid_pair_count,
-        "stress_log_growth_daily_ips_unresolved_through_lag_67": ips_unresolved,
+        "p75_log_growth_daily_ips_valid_pair_count": ips_valid_pair_count,
+        "p75_log_growth_daily_ips_unresolved_through_lag_67": ips_unresolved,
         "pooled_base_log_growth_mean_diagnostic": _decimal_text(pooled_base_log_mean),
         "base_log_growth_max_variance_lcb_diagnostic": _decimal_text(
             base_diagnostic_lcb
@@ -4613,72 +4615,72 @@ def _compute_decision_body(
         "anchor_group_base_log_growth_t_lcb_diagnostic": _decimal_text(
             anchor_group_base_log_lcb
         ),
-        "anchor_group_stress_log_growth_mean_diagnostic": _decimal_text(
-            anchor_group_stress_log_mean
+        "anchor_group_p75_log_growth_mean_diagnostic": _decimal_text(
+            anchor_group_p75_log_mean
         ),
-        "anchor_group_stress_log_growth_t_lcb_diagnostic": _decimal_text(
-            anchor_group_stress_log_lcb
+        "anchor_group_p75_log_growth_t_lcb_diagnostic": _decimal_text(
+            anchor_group_p75_log_lcb
         ),
         "anchor_base_log_growth_means_diagnostic": [
             _decimal_text(value) for value in base_log_means
         ],
-        "anchor_stress_log_growth_means": [
-            _decimal_text(value) for value in stress_log_means
+        "anchor_p75_log_growth_means": [
+            _decimal_text(value) for value in p75_log_means
         ],
         "worst_anchor_base_log_growth_mean_diagnostic": _decimal_text(
             min(base_log_means)
         ),
-        "worst_anchor_stress_log_growth_mean_diagnostic": _decimal_text(
-            min(stress_log_means)
+        "worst_anchor_p75_log_growth_mean_diagnostic": _decimal_text(
+            min(p75_log_means)
         ),
         "newest_anchor_base_log_growth_mean_diagnostic": _decimal_text(
             base_log_means[-1]
         ),
-        "newest_anchor_stress_log_growth_mean": _decimal_text(stress_log_means[-1]),
+        "newest_anchor_p75_log_growth_mean": _decimal_text(p75_log_means[-1]),
         "base_between_anchor_log_growth_variance": _decimal_text(
             base_between_log_variance
         ),
-        "stress_between_anchor_log_growth_variance": _decimal_text(
-            stress_between_log_variance
+        "p75_between_anchor_log_growth_variance": _decimal_text(
+            p75_between_log_variance
         ),
         "most_influential_block_calendar_days": influence_block_size,
         "most_influential_block_role": _PINNED_POLICY["most_influential_block_role"],
         "base_log_growth_most_influential_block_start_by_anchor_diagnostic": [
             result[1] for result in base_influence_results
         ],
-        "stress_log_growth_most_influential_block_start_by_anchor_diagnostic": [
-            result[1] for result in stress_influence_results
+        "p75_log_growth_most_influential_block_start_by_anchor_diagnostic": [
+            result[1] for result in p75_influence_results
         ],
         "base_log_growth_most_influential_block_sum_by_anchor_diagnostic": [
             _decimal_text(result[2]) for result in base_influence_results
         ],
-        "stress_log_growth_most_influential_block_sum_by_anchor_diagnostic": [
-            _decimal_text(result[2]) for result in stress_influence_results
+        "p75_log_growth_most_influential_block_sum_by_anchor_diagnostic": [
+            _decimal_text(result[2]) for result in p75_influence_results
         ],
         "pooled_base_log_growth_mean_after_top_block_removal_diagnostic": (
             _decimal_text(pooled_base_without_influence_mean)
         ),
-        "pooled_stress_log_growth_mean_after_top_block_removal_diagnostic": (
-            _decimal_text(pooled_stress_without_influence_mean)
+        "pooled_p75_log_growth_mean_after_top_block_removal_diagnostic": (
+            _decimal_text(pooled_p75_without_influence_mean)
         ),
         "pooled_base_arithmetic_return_mean_diagnostic": _decimal_text(
             sum((sum(vector, Decimal(0)) for vector in base_vectors), Decimal(0))
             / Decimal(sum(len(vector) for vector in base_vectors))
         ),
-        "pooled_stress_arithmetic_return_mean_diagnostic": _decimal_text(
-            sum((sum(vector, Decimal(0)) for vector in stress_vectors), Decimal(0))
-            / Decimal(sum(len(vector) for vector in stress_vectors))
+        "pooled_p75_arithmetic_return_mean_diagnostic": _decimal_text(
+            sum((sum(vector, Decimal(0)) for vector in p75_vectors), Decimal(0))
+            / Decimal(sum(len(vector) for vector in p75_vectors))
         ),
         "anchor_base_arithmetic_return_means_diagnostic": [
             _decimal_text(value) for value in base_arithmetic_means
         ],
-        "anchor_stress_arithmetic_return_means_diagnostic": [
-            _decimal_text(value) for value in stress_arithmetic_means
+        "anchor_p75_arithmetic_return_means_diagnostic": [
+            _decimal_text(value) for value in p75_arithmetic_means
         ],
         "base_arithmetic_expected_shortfall_5pct": _decimal_text(base_es),
-        "stress_arithmetic_expected_shortfall_5pct": _decimal_text(stress_es),
+        "p75_arithmetic_expected_shortfall_5pct": _decimal_text(p75_es),
         "base_arithmetic_maximum_drawdown": _decimal_text(base_dd),
-        "stress_arithmetic_maximum_drawdown": _decimal_text(stress_dd),
+        "p75_arithmetic_maximum_drawdown": _decimal_text(p75_dd),
     }
     return {
         "schema": DECISION_SCHEMA,
@@ -4793,7 +4795,7 @@ class HistoricalProcessDecision:
             key for key, value in body["gates"].items() if not value
         )
         if confirmatory_status == "FAIL":
-            expected_failures.append("stress_log_growth_confirmatory_lcb_above_zero")
+            expected_failures.append("p75_log_growth_confirmatory_lcb_above_zero")
             expected_failures.sort()
         if expected_failures:
             expected_decision = "OFFLINE_PROCESS_VALIDATION_FAIL"
@@ -4801,7 +4803,7 @@ class HistoricalProcessDecision:
         elif confirmatory_status == "DEPENDENCE_INSUFFICIENT":
             expected_decision = "OFFLINE_PROCESS_VALIDATION_DEPENDENCE_INSUFFICIENT"
             expected_insufficiency = [
-                "stress_log_growth_ips_positive_sequence_unresolved_through_lag_67"
+                "p75_log_growth_ips_positive_sequence_unresolved_through_lag_67"
             ]
         else:
             expected_decision = "OFFLINE_PROCESS_VALIDATION_PASS"
@@ -5007,11 +5009,11 @@ def _evaluate_impl(
         raise ProcessVerificationError("evidence anchor count exceeds hard bound")
     validated_anchors: list[dict[str, Any]] = []
     base_vectors: list[list[Decimal]] = []
-    stress_vectors: list[list[Decimal]] = []
+    p75_vectors: list[list[Decimal]] = []
     used_broker_fill_ids: set[str] = set()
     total_days = 0
     for anchor, plan in zip(anchors_value, plans, strict=True):
-        validated, base, stress = _validate_anchor_evidence(
+        validated, base, p75 = _validate_anchor_evidence(
             anchor,
             plan,
             forward_oos_replay_lineage,
@@ -5022,7 +5024,7 @@ def _evaluate_impl(
         )
         validated_anchors.append(validated)
         base_vectors.append(base)
-        stress_vectors.append(stress)
+        p75_vectors.append(p75)
         total_days += len(base)
         if total_days > _MAX_TOTAL_DAYS:
             raise ProcessVerificationError("total evidence calendar exceeds hard bound")
@@ -5103,7 +5105,7 @@ def _evaluate_impl(
         reconciliation_time=reconciled_at,
         anchors=validated_anchors,
         base_vectors=base_vectors,
-        stress_vectors=stress_vectors,
+        p75_vectors=p75_vectors,
     )
     return HistoricalProcessDecision(_canonical_bytes(body))
 
@@ -5115,7 +5117,7 @@ def evaluate_historical_process(
 ) -> HistoricalProcessDecision:
     """Evaluate three exact canonical payloads for offline validation only.
 
-    Decision-v6 fields ending in ``*_receipt_sha256`` identify the canonical
+    Decision-v10 fields ending in ``*_receipt_sha256`` identify the canonical
     input payload bytes; they are deterministic content receipts, not signatures.
     """
 

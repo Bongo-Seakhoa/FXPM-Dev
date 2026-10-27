@@ -31,6 +31,10 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from pm_current_refit_parameters import (
+    build_parameter_domain, validate_parameter_domain_member, parameter_domain_point,
+    decode_parameter_mapping,
+)
 
 from pm_search_outcomes import (
     SearchInfrastructureError,
@@ -137,6 +141,20 @@ def _bounded_cartesian_combinations(
         return tuple(result)
 
     return [decode((start + offset * step) % total) for offset in range(count)], total
+
+
+def _bounded_parameter_points(domain, *, limit, seed):
+    if not domain["axes"]:
+        return ([dict(domain["defaults"])] if limit > 0 else []), 1
+    combinations, total = _bounded_cartesian_combinations(
+        [axis["choices"] for axis in domain["axes"]], limit=limit, seed=seed)
+    result = []
+    for combination in combinations:
+        parameters = dict(domain["defaults"])
+        for axis, row in zip(domain["axes"], combination):
+            parameters.update(zip(axis["names"], row))
+        result.append(validate_parameter_domain_member(domain, parameters))
+    return result, total
 
 
 def _classify_staged_search_exception(
@@ -304,7 +322,7 @@ class ParameterSpace:
         ('signal_period', 'slow_period', 'lt'),  # signal < slow (MACD)
     }
     
-    def __init__(self, param_grid: Dict[str, List], default_params: Dict[str, Any]):
+    def __init__(self, param_grid: Dict[str, List], default_params: Dict[str, Any], *, coupled_groups=()):
         """
         Initialize parameter space from strategy param grid.
         
@@ -314,6 +332,8 @@ class ParameterSpace:
         """
         self.param_grid = param_grid
         self.default_params = default_params
+        self.domain = build_parameter_domain(default_params, param_grid, coupled_groups=coupled_groups)
+        self.grouped_keys = {name for axis in self.domain["axes"] if len(axis["names"]) > 1 for name in axis["names"]}
         self.param_info = self._analyze_params()
     
     def _analyze_params(self) -> Dict[str, Dict[str, Any]]:
@@ -399,18 +419,26 @@ class ParameterSpace:
         # int/float grids and categoricals all sample the discrete grid; tuple/list
         # choices are index-encoded inside the helper so Optuna only sees scalars.
         for name, info in self.param_info.items():
+            if name in self.grouped_keys:
+                continue
             if info['type'] in ('categorical', 'int', 'float'):
                 params[name] = self._suggest_categorical(trial, name, info['choices'])
+
+        for axis in self.domain["axes"]:
+            if len(axis["names"]) > 1:
+                key = "__coupled__" + "__".join(axis["names"])
+                index = trial.suggest_categorical(key, list(range(len(axis["choices"]))))
+                params.update(zip(axis["names"], axis["choices"][index]))
 
         # Apply constraints
         params = self._apply_constraints(params)
 
-        return params
+        return decode_parameter_mapping(validate_parameter_domain_member(self.domain, params), self.default_params)
     
     def _apply_constraints(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Apply parameter constraints to ensure valid configurations."""
         # EMA/MA crossover: slow > fast
-        if 'fast_period' in params and 'slow_period' in params:
+        if not self.grouped_keys.intersection(('fast_period', 'slow_period')) and 'fast_period' in params and 'slow_period' in params:
             if params['slow_period'] <= params['fast_period']:
                 # Adjust slow_period to be greater
                 fast = params['fast_period']
@@ -422,7 +450,7 @@ class ParameterSpace:
                     params['slow_period'] = fast + 5
         
         # Ichimoku: kijun > tenkan
-        if 'tenkan_period' in params and 'kijun_period' in params:
+        if not self.grouped_keys.intersection(('tenkan_period', 'kijun_period')) and 'tenkan_period' in params and 'kijun_period' in params:
             if params['kijun_period'] <= params['tenkan_period']:
                 tenkan = params['tenkan_period']
                 kijun_choices = self.param_info.get('kijun_period', {}).get('choices', [])
@@ -433,7 +461,7 @@ class ParameterSpace:
                     params['kijun_period'] = tenkan + 5
         
         # MACD: signal < slow
-        if 'signal_period' in params and 'slow_period' in params:
+        if not self.grouped_keys.intersection(('signal_period', 'slow_period')) and 'signal_period' in params and 'slow_period' in params:
             if params['signal_period'] >= params['slow_period']:
                 slow = params['slow_period']
                 signal_choices = self.param_info.get('signal_period', {}).get('choices', [])
@@ -444,7 +472,7 @@ class ParameterSpace:
                     params['signal_period'] = max(1, slow - 1)
         
         # Stochastic: d <= k
-        if 'k_period' in params and 'd_period' in params:
+        if not self.grouped_keys.intersection(('k_period', 'd_period')) and 'k_period' in params and 'd_period' in params:
             if params['d_period'] > params['k_period']:
                 params['d_period'] = params['k_period']
         
@@ -452,11 +480,7 @@ class ParameterSpace:
     
     def get_search_space_size(self) -> int:
         """Calculate total size of parameter search space."""
-        size = 1
-        for info in self.param_info.values():
-            if 'choices' in info:
-                size *= len(info['choices'])
-        return size
+        return self.domain["point_count"]
 
 
 # =============================================================================
@@ -811,7 +835,7 @@ class OptunaTPEOptimizer:
         
         # Create parameter space
         try:
-            param_space = ParameterSpace(param_grid, default_params)
+            param_space = ParameterSpace(param_grid, default_params, coupled_groups=base_strategy.get_param_couplings())
             search_space_size = param_space.get_search_space_size()
         except Exception as exc:
             outcome = _classify_staged_search_exception(
@@ -1100,7 +1124,7 @@ class OptunaTPEOptimizer:
         
         # Create parameter space
         try:
-            param_space = ParameterSpace(param_grid, default_params)
+            param_space = ParameterSpace(param_grid, default_params, coupled_groups=base_strategy.get_param_couplings())
             search_space_size = param_space.get_search_space_size()
         except Exception as exc:
             outcome = _classify_staged_search_exception(
@@ -1682,16 +1706,16 @@ class OptunaTPEOptimizer:
             )
         
         # Decode only the configured number of deterministic Cartesian points.
-        param_names = list(param_grid.keys())
-        param_values = [list(param_grid[name] or []) for name in param_names]
+        domain = build_parameter_domain(default_params, param_grid,
+            coupled_groups=base_strategy.get_param_couplings())
         _seed = _stable_seed(
             symbol,
             strategy_name,
             "grid_fallback_train_only",
             len(train_features),
         )
-        combos, _total_space = _bounded_cartesian_combinations(
-            param_values,
+        combos, _total_space = _bounded_parameter_points(
+            domain,
             limit=self.config.n_trials,
             seed=_seed,
         )
@@ -1704,8 +1728,7 @@ class OptunaTPEOptimizer:
         completed = 0
         early_rejections = 0
         
-        for idx, combo in enumerate(combos):
-            params = {**default_params, **dict(zip(param_names, combo))}
+        for idx, params in enumerate(combos):
 
             # Progressive rejection for random fallback
             progress = (idx + 1) / max(len(combos), 1)
@@ -1850,9 +1873,9 @@ class OptunaTPEOptimizer:
             ))
         
         try:
-            param_names = list(param_grid.keys())
-            param_values = [list(param_grid[name] or []) for name in param_names]
-            total_space = int(math.prod(len(values) for values in param_values))
+            domain = build_parameter_domain(default_params, param_grid,
+                coupled_groups=base_strategy.get_param_couplings())
+            total_space = domain["point_count"]
         except Exception as exc:
             outcome = _classify_staged_search_exception(
                 exc,
@@ -1878,8 +1901,8 @@ class OptunaTPEOptimizer:
                 "regime_grid_train_only",
                 len(train_features),
             )
-            combos, _ = _bounded_cartesian_combinations(
-                param_values,
+            combos, _ = _bounded_parameter_points(
+                domain,
                 limit=n_trials,
                 seed=seed,
             )
@@ -1891,13 +1914,13 @@ class OptunaTPEOptimizer:
             eligible_train_trials = 0
             early_rejections = 0
             trial_outcomes: List[TrialOutcome] = []
-            for idx, combo in enumerate(combos):
+            for idx, candidate_params in enumerate(combos):
                 params: Dict[str, Any] = {}
                 clean_params: Dict[str, Any] = {}
                 parameter_hash = ""
                 current_stage = SearchStage.PARAMETER_VALIDATION
                 try:
-                    params = {**default_params, **dict(zip(param_names, combo))}
+                    params = candidate_params
                     clean_params = self._clean_params(params)
                     parameter_hash = _parameter_hash(clean_params)
                     current_stage = SearchStage.STRATEGY_CONSTRUCTION

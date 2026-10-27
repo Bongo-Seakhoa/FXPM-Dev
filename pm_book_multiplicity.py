@@ -1,8 +1,9 @@
 """Lean historical Book construction for the complete FXPM specialist family.
 
 The family is fixed at 100 symbols x six native timeframes x four regimes.
-Winner V11 decides local process admissibility inside each cell.  This module
-replays those exact Winner requests, represents non-economic process outcomes
+Original Winner-v14 evidence and current independent-tier Winner-v15 evidence
+retain separate immutable contracts.  This module replays exact Winner requests,
+represents non-economic process outcomes
 with canonical typed decisions, and reports a flat Benjamini-Yekutieli
 diagnostic across all 2,400 hypotheses.  BY is diagnostic only: a local Winner
 is a historical candidate pending a separate repeated whole-process Causal
@@ -42,15 +43,20 @@ from typing import Any, Final
 import pm_current_refit_artifacts as current_refit
 import pm_winner_selection as winner
 import pm_training_horizon as horizon
+from pm_core import validate_backtest_frozen_tier_pair_contract
 
 
-BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v13"
+BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v14"
+CURRENT_BOOK_MULTIPLICITY_CONTRACT_VERSION: Final = "fxpm.book-multiplicity.v15"
 BOOK_MULTIPLICITY_SCOPE: Final = "OFFLINE_HISTORICAL_BOOK_ONLY"
-PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = "fxpm.winner-selection.v13"
-PINNED_WINNER_SELECTION_REQUEST_VERSION: Final = "fxpm.winner-selection-request.v1"
-PINNED_WINNER_ATTEMPT_LEDGER_VERSION: Final = "fxpm.winner-attempt-ledger.v2"
-PINNED_WINNER_EVIDENCE_LEDGER_VERSION: Final = "fxpm.winner-evidence-ledger.v4"
-PINNED_WINNER_TRADE_POWER_BINDING_VERSION: Final = "fxpm.winner-trade-power-binding.v1"
+PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = "fxpm.winner-selection.v14"
+PINNED_WINNER_SELECTION_REQUEST_VERSION: Final = "fxpm.winner-selection-request.v2"
+PINNED_WINNER_BOOK_MARGINAL_CONTRACT_VERSION: Final = (
+    "fxpm.winner-book-marginal.v1"
+)
+PINNED_WINNER_ATTEMPT_LEDGER_VERSION: Final = "fxpm.winner-attempt-ledger.v3"
+PINNED_WINNER_EVIDENCE_LEDGER_VERSION: Final = "fxpm.winner-evidence-ledger.v6"
+PINNED_WINNER_TRADE_POWER_BINDING_VERSION: Final = "fxpm.winner-trade-power-binding.v2"
 SOURCE_GROUP_CONTRACT_VERSION: Final = "fxpm.historical-source-group.v3"
 REGIME_FIT_CONTRACT_VERSION: Final = "fxpm.historical-regime-fit.v4"
 REGIME_DETECTOR_RECORD_SCHEMA_VERSION: Final = "fxpm.regime-detector-record/v1"
@@ -59,10 +65,10 @@ INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION: Final = (
     "fxpm.historical-insufficient-evidence-binding.v2"
 )
 HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION: Final = (
-    "fxpm.historical-horizon-winner-cross-binding.v1"
+    "fxpm.historical-horizon-winner-cross-binding.v2"
 )
 WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION: Final = (
-    "fxpm.winner-raw-evidence-production.v1"
+    "fxpm.winner-raw-evidence-production.v4"
 )
 
 TIMEFRAME_ORDER: Final = ("M5", "M15", "M30", "H1", "H4", "D1")
@@ -175,7 +181,7 @@ FAMILY_SIZE: Final = SOURCE_GROUP_SIZE * 4
 MULTIPLICITY_METHOD: Final = "BY"
 TARGET_FDR: Final = 0.10
 SELECTION_RULE: Final = (
-    "WINNER_V11_LOCAL_ADMISSIBILITY_PENDING_WHOLE_PROCESS_CAUSAL_VALIDATION"
+    "WINNER_V14_LOCAL_ADMISSIBILITY_PENDING_WHOLE_PROCESS_CAUSAL_VALIDATION"
 )
 PINNED_P_VALUE_CONTRACT_SHA256: Final = winner.PINNED_BOOK_P_VALUE_CONTRACT_SHA256
 
@@ -487,24 +493,76 @@ def compute_source_group_id(symbol: Any, timeframe: Any) -> str | None:
         or timeframe not in TIMEFRAME_ORDER
     ):
         return None
-    return _sha256_json(
-        {
-            "identity_contract": "FXPM_SYMBOL_TIMEFRAME_SOURCE_GROUP_V1",
-            "symbol": symbol,
-            "timeframe": timeframe,
-        }
-    )
+    return _sha256_json({
+        "identity_contract": "FXPM_SYMBOL_TIMEFRAME_SOURCE_GROUP_V1",
+        "symbol": symbol, "timeframe": timeframe,
+    })
 
 
-def _family_precommitment() -> dict[str, Any]:
+@dataclass(frozen=True, slots=True)
+class _BookGeneration:
+    version: str
+    winner_generation: Any
+    raw_schema: str
+    cross_binding_schema: str
+    insufficient_schema: str
+
+    @property
+    def p_value_contract_sha256(self) -> str:
+        return winner.PINNED_BOOK_P_VALUE_CONTRACT_SHA256 if self.winner_generation.archived else winner.CURRENT_BOOK_P_VALUE_CONTRACT_SHA256
+
+    @property
+    def selection_rule(self) -> str:
+        return SELECTION_RULE if self.winner_generation.archived else "WINNER_V15_LOCAL_ADMISSIBILITY_PENDING_CELL_CAMPAIGN_VALIDATION"
+
+    @property
+    def family_sha256(self) -> str:
+        return _sha256_json(_family_precommitment(_generation=self))
+
+
+ARCHIVED_GENERATION: Final = _BookGeneration(
+    "fxpm.book-multiplicity.v14", winner.ARCHIVED_GENERATION,
+    "fxpm.winner-raw-evidence-production.v4", "fxpm.historical-horizon-winner-cross-binding.v2",
+    "fxpm.historical-insufficient-evidence-binding.v2",
+)
+CURRENT_GENERATION: Final = _BookGeneration(
+    "fxpm.book-multiplicity.v15", winner.CURRENT_GENERATION,
+    "fxpm.winner-raw-evidence-production.v5", "fxpm.historical-horizon-winner-cross-binding.v3",
+    "fxpm.historical-insufficient-evidence-binding.v3",
+)
+V16_GENERATION: Final = _BookGeneration(
+    "fxpm.book-multiplicity.v16", winner.V16_GENERATION,
+    "fxpm.winner-raw-evidence-production.v6", "fxpm.historical-horizon-winner-cross-binding.v4",
+    "fxpm.historical-insufficient-evidence-binding.v4",
+)
+CURRENT_PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = CURRENT_GENERATION.winner_generation.selection_version
+CURRENT_PINNED_WINNER_SELECTION_REQUEST_VERSION: Final = CURRENT_GENERATION.winner_generation.request_version
+CURRENT_PINNED_WINNER_BOOK_MARGINAL_CONTRACT_VERSION: Final = CURRENT_GENERATION.winner_generation.marginal_version
+CURRENT_PINNED_WINNER_EVIDENCE_LEDGER_VERSION: Final = CURRENT_GENERATION.winner_generation.evidence_version
+CURRENT_INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION: Final = CURRENT_GENERATION.insufficient_schema
+CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION: Final = CURRENT_GENERATION.cross_binding_schema
+CURRENT_WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION: Final = CURRENT_GENERATION.raw_schema
+
+
+def _book_generation(version: Any) -> _BookGeneration:
+    if version == V16_GENERATION.version:
+        return V16_GENERATION
+    if version == CURRENT_GENERATION.version:
+        return CURRENT_GENERATION
+    if version == ARCHIVED_GENERATION.version:
+        return ARCHIVED_GENERATION
+    raise _BookError("BOOK_VERSION_INVALID")
+
+
+def _family_precommitment( *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> dict[str, Any]:
     return {
-        "contract_version": BOOK_MULTIPLICITY_CONTRACT_VERSION,
+        "contract_version": _generation.version,
         "family_size": FAMILY_SIZE,
         "source_group_size": SOURCE_GROUP_SIZE,
         "method": MULTIPLICITY_METHOD,
-        "p_value_contract_sha256": PINNED_P_VALUE_CONTRACT_SHA256,
+        "p_value_contract_sha256": _generation.p_value_contract_sha256,
         "regimes": list(REGIME_ORDER),
-        "selection_rule": SELECTION_RULE,
+        "selection_rule": _generation.selection_rule,
         "multiplicity_tested_state_rule": (
             "ALL_PHYSICAL_BOOK_CELLS_EXCEPT_AUTHENTICATED_TERMINAL_TECHNICAL"
         ),
@@ -512,10 +570,13 @@ def _family_precommitment() -> dict[str, Any]:
         "target_fdr": TARGET_FDR,
         "timeframes": list(TIMEFRAME_ORDER),
         "by_role": "DIAGNOSTIC_ONLY",
-        "winner_selection_contract_version": (PINNED_WINNER_SELECTION_CONTRACT_VERSION),
-        "winner_selection_request_version": PINNED_WINNER_SELECTION_REQUEST_VERSION,
+        "winner_selection_contract_version": (_generation.winner_generation.selection_version),
+        "winner_selection_request_version": _generation.winner_generation.request_version,
+        "winner_book_marginal_contract_version": (
+            _generation.winner_generation.marginal_version
+        ),
         "winner_attempt_ledger_version": PINNED_WINNER_ATTEMPT_LEDGER_VERSION,
-        "winner_evidence_ledger_version": PINNED_WINNER_EVIDENCE_LEDGER_VERSION,
+        "winner_evidence_ledger_version": _generation.winner_generation.evidence_version,
         "winner_trade_power_binding_version": (
             PINNED_WINNER_TRADE_POWER_BINDING_VERSION
         ),
@@ -523,6 +584,7 @@ def _family_precommitment() -> dict[str, Any]:
 
 
 PINNED_FAMILY_PRECOMMITMENT_SHA256: Final = _sha256_json(_family_precommitment())
+CURRENT_FAMILY_PRECOMMITMENT_SHA256: Final = CURRENT_GENERATION.family_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -791,13 +853,13 @@ def _winner_fold_axes(value: Any) -> tuple[tuple[str, str], ...]:
     return tuple(axes)
 
 
-def _insufficient_binding_body(value: Any) -> dict[str, Any]:
+def _insufficient_binding_body(value: Any, *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> dict[str, Any]:
     body = _exact_dict(
         value,
         _INSUFFICIENT_BINDING_KEYS,
         "INSUFFICIENT_BINDING_SCHEMA_INVALID",
     )
-    if body["schema_version"] != INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION:
+    if body["schema_version"] != _generation.insufficient_schema:
         raise _BookError("INSUFFICIENT_BINDING_VERSION_INVALID")
     if body["terminal_stage"] not in {
         INSUFFICIENT_PRESEARCH_STAGE,
@@ -881,12 +943,12 @@ def _insufficient_binding_body(value: Any) -> dict[str, Any]:
     else:
         if (
             body["reason_code"] != INSUFFICIENT_ALL_ATTEMPTS_REJECTED_REASON
-            or fold_count < int(winner.PINNED_SELECTION_POLICY["min_causal_folds"])
+            or fold_count < int(_generation.winner_generation.policy["min_causal_folds"])
             or rejected != planned
             or body["horizon_winner_cross_binding_schema_version"]
-            != HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION
+            != _generation.cross_binding_schema
             or body["winner_raw_production_schema_version"]
-            != WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION
+            != _generation.raw_schema
         ):
             raise _BookError("INSUFFICIENT_POSTSEARCH_SEMANTICS_INVALID")
         for key in process_keys:
@@ -909,7 +971,7 @@ def _horizon_winner_cross_binding_identity(
     process_rejection_request: winner.WinnerSelectionRequest,
     process_rejection_decision: winner.WinnerSelectionDecision,
     winner_raw_production_receipt_bytes: Any,
-) -> tuple[str, str, str, str, str]:
+ _generation: _BookGeneration = ARCHIVED_GENERATION) -> tuple[str, str, str, str, str]:
     """Reopen the pre-evidence bijection between distinct Horizon/Winner schemas."""
 
     if (
@@ -953,7 +1015,7 @@ def _horizon_winner_cross_binding_identity(
     plan_anchor = plan_body["anchor"]
     prefix = plan_body["native_prefix"]
     if (
-        binding["schema_version"] != HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION
+        binding["schema_version"] != _generation.cross_binding_schema
         or binding["anchor_id"] != plan_anchor["anchor_id"]
         or binding["selection_cutoff_utc"] != plan_anchor["selection_cutoff_utc"]
         or binding["process_precommit_receipt_sha256"]
@@ -1011,6 +1073,9 @@ def _horizon_winner_cross_binding_identity(
 
     precommitment = process_rejection_request.precommitment.to_dict()
     attempt_ledger = process_rejection_request.attempt_ledger.to_dict()
+    pair_key = _generation.winner_generation.pair_field
+    current_keys = (() if _generation.winner_generation.archived
+                    else ("partition_cost_precommitments_sha256",))
     winner_roster = _exact_dict(
         binding["winner_roster"],
         frozenset(
@@ -1025,7 +1090,8 @@ def _horizon_winner_cross_binding_identity(
                 "causal_fold_plan_sha256",
                 "source_contract_sha256",
                 "cost_contract_sha256",
-                "cost_stress_contract_sha256",
+                pair_key,
+                *current_keys,
             }
         ),
         "INSUFFICIENT_CROSS_BINDING_WINNER_ROSTER_INVALID",
@@ -1040,7 +1106,8 @@ def _horizon_winner_cross_binding_identity(
         "causal_fold_plan_sha256": precommitment["causal_fold_plan_sha256"],
         "source_contract_sha256": precommitment["source_contract_sha256"],
         "cost_contract_sha256": precommitment["cost_contract_sha256"],
-        "cost_stress_contract_sha256": precommitment["cost_stress_contract_sha256"],
+        pair_key: precommitment[pair_key],
+        **{key: precommitment[key] for key in current_keys},
     }
     _hex64(
         winner_roster["frozen_receipt_sha256"],
@@ -1305,7 +1372,7 @@ def _horizon_winner_cross_binding_identity(
     cross_binding_sha256 = _sha256_bytes(encoded)
     evidence_ledger = process_rejection_request.evidence_ledger.to_dict()
     if (
-        production["schema_version"] != WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION
+        production["schema_version"] != _generation.raw_schema
         or production["run_id"] != precommitment["run_id"]
         or production["artifact_namespace"] != binding["artifact_namespace"]
         or {
@@ -1356,10 +1423,10 @@ def _horizon_winner_cross_binding_identity(
         ):
             raise _BookError("INSUFFICIENT_RAW_PRODUCTION_DESCRIPTOR_SPLICE")
     return (
-        HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION,
+        _generation.cross_binding_schema,
         cross_binding_sha256,
         binding["mapping_sha256"],
-        WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION,
+        _generation.raw_schema,
         _sha256_bytes(winner_raw_production_receipt_bytes),
     )
 
@@ -1378,8 +1445,13 @@ def _build_insufficient_binding(
     process_rejection_decision: Any,
     horizon_winner_cross_binding_bytes: Any = None,
     winner_raw_production_receipt_bytes: Any = None,
-) -> dict[str, Any]:
+ _generation: _BookGeneration = ARCHIVED_GENERATION) -> dict[str, Any]:
     plan_body = _horizon_plan_body(horizon_plan)
+    expected_plan_schema = ("fxpm.historical-horizon-plan.v2"
+                            if _generation.winner_generation.archived
+                            else "fxpm.historical-horizon-plan.v3")
+    if plan_body.get("schema_version") != expected_plan_schema:
+        raise _BookError("BOOK_MIXED_GENERATIONS")
     cell_id = compute_cell_id(symbol, timeframe, regime)
     if (
         plan_body.get("cell")
@@ -1457,33 +1529,25 @@ def _build_insufficient_binding(
         evidence_ledger = process_rejection_request.evidence_ledger.to_dict()
         attempt_rows = attempt_ledger["attempts"]
         entries = evidence_ledger["entries"]
-        pbo_fold_count = len(precommitment["causal_fold_plan"])
+        required_fold_count = len(precommitment["causal_fold_plan"])
 
         def _matches_rejected_role(
             attempt: dict[str, Any], entry: dict[str, Any]
         ) -> bool:
-            if (
-                entry["evidence_status"] != "PROCESS_REJECTED"
-                or entry["fold_count"] != 0
-                or entry["folds"] != []
-            ):
+            if entry["evidence_status"] != "PROCESS_REJECTED":
                 return False
             role = attempt["precommitted_evidence_role"]
             if role == "EVALUATION_REQUIRED":
                 return (
                     entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
-                    and entry["pbo_evidence_source"]
-                    == "COMPLETE_EVALUATION_REQUIRED_FOLDS"
-                    and entry["pbo_fold_count"] == pbo_fold_count
-                    and len(entry["pbo_folds"]) == pbo_fold_count
+                    and entry["fold_count"] == required_fold_count
+                    and len(entry["folds"]) == required_fold_count
                 )
             if role == "PRESEARCH_PROCESS_REJECTED":
                 return (
                     entry["status_reason"] == "PRESEARCH_PROCESS_REJECTED"
-                    and entry["pbo_evidence_source"]
-                    == "NOT_APPLICABLE_PRESEARCH_REJECTION"
-                    and entry["pbo_fold_count"] == 0
-                    and entry["pbo_folds"] == []
+                    and entry["fold_count"] == 0
+                    and entry["folds"] == []
                 )
             return False
 
@@ -1522,7 +1586,7 @@ def _build_insufficient_binding(
             process_rejection_request=process_rejection_request,
             process_rejection_decision=process_rejection_decision,
             winner_raw_production_receipt_bytes=(winner_raw_production_receipt_bytes),
-        )
+        _generation=_generation)
         planned_axes: tuple[tuple[str, str], ...] | None = None
         for candidate, registry in zip(
             plan_body["candidates"], plan_body["candidate_registry"], strict=True
@@ -1554,7 +1618,7 @@ def _build_insufficient_binding(
     else:
         raise _BookError("INSUFFICIENT_REASON_INVALID")
     body = {
-        "schema_version": INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION,
+        "schema_version": _generation.insufficient_schema,
         "terminal_stage": stage,
         "reason_code": reason_code,
         "selection_cutoff_utc": plan_body["anchor"]["selection_cutoff_utc"],
@@ -1589,7 +1653,7 @@ def _build_insufficient_binding(
         "winner_raw_production_schema_version": raw_production_schema,
         "winner_raw_production_receipt_sha256": raw_production_receipt_sha,
     }
-    return _insufficient_binding_body(body)
+    return _insufficient_binding_body(body, _generation=_generation)
 
 
 def _owned_decision(decision_type: type[Any], body: dict[str, Any]) -> Any:
@@ -2180,7 +2244,7 @@ def _process_state_body(
     decision: Any,
     source_decision: Any | None = None,
     regime_fit_decision: Any | None = None,
-) -> dict[str, Any]:
+ *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> dict[str, Any]:
     if type(decision) is not HistoricalProcessStateDecision:
         raise _BookError("PROCESS_STATE_DECISION_TYPE_INVALID")
     if (
@@ -2214,7 +2278,7 @@ def _process_state_body(
     )
     _reason(body["reason_code"], "PROCESS_REASON_INVALID")
     insufficient_binding = (
-        _insufficient_binding_body(body["insufficient_evidence_binding"])
+        _insufficient_binding_body(body["insufficient_evidence_binding"], _generation=_generation)
         if body["state_kind"] == INSUFFICIENT_EVIDENCE
         else None
     )
@@ -2316,7 +2380,88 @@ def _process_state_body(
     return body
 
 
+def _infer_input_generation(
+    *, horizon_plan: Any = None, request: Any = None, decision: Any = None,
+    process_state: Any = None, preferred: _BookGeneration | None = None,
+) -> _BookGeneration | None:
+    versions = []
+    plan_version = None
+    if horizon_plan is not None:
+        plan_version = _horizon_plan_body(horizon_plan).get("schema_version")
+        if plan_version == "fxpm.historical-horizon-plan.v2":
+            versions.append(ARCHIVED_GENERATION)
+        elif plan_version == "fxpm.historical-horizon-plan.v3":
+            pass  # The cost-lineage plan is shared by the v15/v16 transport editions.
+        else:
+            raise _BookError("HORIZON_GENERATION_INVALID")
+    if request is not None:
+        if type(request) is not winner.WinnerSelectionRequest:
+            raise _BookError("WINNER_REQUEST_TYPE_INVALID")
+        version = request.to_dict().get("contract_version")
+        if version == ARCHIVED_GENERATION.winner_generation.request_version:
+            versions.append(ARCHIVED_GENERATION)
+        elif version == CURRENT_GENERATION.winner_generation.request_version:
+            versions.append(CURRENT_GENERATION)
+        elif version == V16_GENERATION.winner_generation.request_version:
+            versions.append(V16_GENERATION)
+        else:
+            raise _BookError("WINNER_REQUEST_GENERATION_INVALID")
+    if decision is not None:
+        if type(decision) is not winner.WinnerSelectionDecision:
+            raise _BookError("WINNER_DECISION_TYPE_INVALID")
+        versions.append(_book_generation(
+            BOOK_MULTIPLICITY_CONTRACT_VERSION
+            if decision.to_dict().get("contract_version") == ARCHIVED_GENERATION.winner_generation.selection_version
+            else CURRENT_BOOK_MULTIPLICITY_CONTRACT_VERSION
+            if decision.to_dict().get("contract_version") == CURRENT_GENERATION.winner_generation.selection_version
+            else V16_GENERATION.version
+            if decision.to_dict().get("contract_version") == V16_GENERATION.winner_generation.selection_version
+            else None))
+    if process_state is not None:
+        if type(process_state) is not HistoricalProcessStateDecision:
+            raise _BookError("PROCESS_STATE_DECISION_TYPE_INVALID")
+        state = json.loads(process_state._body_json.decode("ascii"))
+        binding = state.get("insufficient_evidence_binding")
+        if binding is not None:
+            if type(binding) is not dict:
+                raise _BookError("INSUFFICIENT_BINDING_SCHEMA_INVALID")
+            schema = binding.get("schema_version")
+            if schema == ARCHIVED_GENERATION.insufficient_schema:
+                versions.append(ARCHIVED_GENERATION)
+            elif schema == CURRENT_GENERATION.insufficient_schema:
+                versions.append(CURRENT_GENERATION)
+            elif schema == V16_GENERATION.insufficient_schema:
+                versions.append(V16_GENERATION)
+            else:
+                raise _BookError("INSUFFICIENT_BINDING_VERSION_INVALID")
+    if versions and any(item is not versions[0] for item in versions):
+        raise _BookError("BOOK_MIXED_GENERATIONS")
+    if plan_version == "fxpm.historical-horizon-plan.v3":
+        if versions and versions[0] is ARCHIVED_GENERATION:
+            raise _BookError("BOOK_MIXED_GENERATIONS")
+        if not versions:
+            versions.append(preferred if preferred is CURRENT_GENERATION or preferred is V16_GENERATION else CURRENT_GENERATION)
+    return versions[0] if versions else None
+
+
 def create_historical_process_state_decision(
+    *, symbol: Any, timeframe: Any, regime: Any, state_kind: Any, reason_code: Any,
+    source_group_decision: Any, regime_fit_decision: Any, attempted_trials_exact: Any,
+    horizon_plan: Any = None, process_rejection_request: Any = None,
+    process_rejection_decision: Any = None, horizon_winner_cross_binding_bytes: Any = None,
+    winner_raw_production_receipt_bytes: Any = None,
+) -> HistoricalProcessStateDecision | None:
+    """Create a canonical cell state with the preserved generation inference."""
+    return _create_historical_process_state_decision(symbol=symbol, timeframe=timeframe,
+        regime=regime, state_kind=state_kind, reason_code=reason_code,
+        source_group_decision=source_group_decision, regime_fit_decision=regime_fit_decision,
+        attempted_trials_exact=attempted_trials_exact, horizon_plan=horizon_plan,
+        process_rejection_request=process_rejection_request, process_rejection_decision=process_rejection_decision,
+        horizon_winner_cross_binding_bytes=horizon_winner_cross_binding_bytes,
+        winner_raw_production_receipt_bytes=winner_raw_production_receipt_bytes)
+
+
+def _create_historical_process_state_decision(
     *,
     symbol: Any,
     timeframe: Any,
@@ -2331,10 +2476,19 @@ def create_historical_process_state_decision(
     process_rejection_decision: Any = None,
     horizon_winner_cross_binding_bytes: Any = None,
     winner_raw_production_receipt_bytes: Any = None,
+    _generation: _BookGeneration | None = None,
 ) -> HistoricalProcessStateDecision | None:
     """Create a canonical cell state bound to source and shared regime facts."""
 
     try:
+        inferred = _infer_input_generation(
+            horizon_plan=horizon_plan, request=process_rejection_request,
+            decision=process_rejection_decision, preferred=_generation,
+        )
+        if _generation is not None and (_generation is not V16_GENERATION
+                or inferred is not None and inferred is not _generation):
+            raise _BookError("BOOK_MIXED_GENERATIONS")
+        _generation = inferred or _generation or ARCHIVED_GENERATION
         cell_id = compute_cell_id(symbol, timeframe, regime)
         source_body = _source_body(source_group_decision)
         fit_body = _regime_fit_body(regime_fit_decision, source_group_decision)
@@ -2370,7 +2524,7 @@ def create_historical_process_state_decision(
                 winner_raw_production_receipt_bytes=(
                     winner_raw_production_receipt_bytes
                 ),
-            )
+            _generation=_generation)
         elif any(
             value is not None
             for value in (
@@ -2419,10 +2573,17 @@ def create_historical_process_state_decision(
             },
         }
         decision = _owned_decision(HistoricalProcessStateDecision, body)
-        _process_state_body(decision, source_group_decision, regime_fit_decision)
+        _process_state_body(decision, source_group_decision, regime_fit_decision, _generation=_generation)
         return decision
     except Exception:
         return None
+
+
+def create_transport_historical_process_state_decision(**kwargs: Any) -> HistoricalProcessStateDecision | None:
+    """Create an explicitly v16 state, including a pre-search terminal state."""
+    if "_generation" in kwargs:
+        return None
+    return _create_historical_process_state_decision(**kwargs, _generation=V16_GENERATION)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2452,7 +2613,7 @@ def winner_cell_evidence(
     source_group_decision: Any,
     regime_fit_decision: Any,
 ) -> HistoricalBookCellEvidence | None:
-    """Build one Winner-backed input after exact Winner V11 request replay."""
+    """Build one Winner-backed input after exact Winner-v14 request replay."""
 
     try:
         if (
@@ -2508,11 +2669,15 @@ def process_state_cell_evidence(
     """Build one process-state input from its exact typed canonical decision."""
 
     try:
+        _generation = _infer_input_generation(
+            horizon_plan=horizon_plan, request=process_rejection_request,
+            decision=process_rejection_decision, process_state=process_state_decision,
+        ) or ARCHIVED_GENERATION
         body = _process_state_body(
             process_state_decision,
             source_group_decision,
             regime_fit_decision,
-        )
+        _generation=_generation)
         if body["state_kind"] == INSUFFICIENT_EVIDENCE:
             expected_binding = _build_insufficient_binding(
                 symbol=body["cell"]["symbol"],
@@ -2529,7 +2694,7 @@ def process_state_cell_evidence(
                 winner_raw_production_receipt_bytes=(
                     winner_raw_production_receipt_bytes
                 ),
-            )
+            _generation=_generation)
             if body["insufficient_evidence_binding"] != expected_binding:
                 raise _BookError("INSUFFICIENT_BINDING_REPLAY_MISMATCH")
         elif any(
@@ -2600,6 +2765,7 @@ def adjust_p_values_by(p_values: Any) -> tuple[float, ...] | None:
 
 _MARGINAL_KEYS: Final = frozenset(
     {
+        "contract_version",
         "cell_id",
         "effective_trials",
         "evidence_candidate_id",
@@ -2610,12 +2776,53 @@ _MARGINAL_KEYS: Final = frozenset(
         "p_value_kind",
         "parameter_evidence_inherited",
         "process_sha256",
+        "selected_cost_ladder_tier",
+        "validated_cost_ladder_tolerance",
         "source_evidence_sha256",
         "upstream_evidence_receipt_sha256",
         "within_cell_attempted_trials_exact",
         "within_cell_multiplicity_adjusted",
     }
 )
+_VALIDATED_COST_LADDER_TOLERANCE_KEYS: Final = frozenset(
+    {
+        "level_id",
+        "single_fill_uplift_percentile",
+        "uniform_entry_half_spread_multiplier_float64_hex",
+    }
+)
+
+
+def _is_exact_validated_cost_ladder_tolerance(
+    value: Any, *, _generation: _BookGeneration = ARCHIVED_GENERATION,
+) -> bool:
+    if not _generation.winner_generation.archived:
+        if (type(value) is not dict or set(value) != {
+                "schema_version", "tier", "frozen_tier_pair_contract",
+                "frozen_tier_pair_contract_sha256"}
+                or value.get("schema_version") != "fxpm.winner-frozen-spread-qualification-cost.v1"
+                or value.get("tier") not in {"P75", "P95"}):
+            return False
+        try:
+            pair = validate_backtest_frozen_tier_pair_contract(value["frozen_tier_pair_contract"])
+            return (pair == value["frozen_tier_pair_contract"]
+                    and value["frozen_tier_pair_contract_sha256"] == _sha256_json(pair))
+        except (TypeError, ValueError, KeyError):
+            return False
+    expected = winner.PINNED_VALIDATED_COST_LADDER_TOLERANCE
+    return bool(
+        type(value) is dict
+        and frozenset(value) == _VALIDATED_COST_LADDER_TOLERANCE_KEYS
+        and type(value["level_id"]) is str
+        and value["level_id"] == expected["level_id"]
+        and type(value["single_fill_uplift_percentile"]) is int
+        and value["single_fill_uplift_percentile"]
+        == expected["single_fill_uplift_percentile"]
+        and type(value["uniform_entry_half_spread_multiplier_float64_hex"])
+        is str
+        and value["uniform_entry_half_spread_multiplier_float64_hex"]
+        == expected["uniform_entry_half_spread_multiplier_float64_hex"]
+    )
 
 
 def _winner_record(
@@ -2623,7 +2830,7 @@ def _winner_record(
     ordinal: int,
     expected_cell_id: str,
     source_body: dict[str, Any],
-) -> dict[str, Any]:
+ *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> dict[str, Any]:
     if (
         type(evidence.winner_decision) is not winner.WinnerSelectionDecision
         or type(evidence.winner_request) is not winner.WinnerSelectionRequest
@@ -2635,12 +2842,16 @@ def _winner_record(
         or evidence.insufficient_winner_raw_production_receipt_bytes is not None
     ):
         raise _BookError(f"CELL_{ordinal:04d}_WINNER_INPUT_INVALID")
+    current = not _generation.winner_generation.archived
+    released = winner.V16_GENERATION if _generation is V16_GENERATION else None
     if (
-        winner.WINNER_SELECTION_CONTRACT_VERSION
-        != PINNED_WINNER_SELECTION_CONTRACT_VERSION
-        or winner.WINNER_SELECTION_REQUEST_VERSION
-        != PINNED_WINNER_SELECTION_REQUEST_VERSION
-        or winner.EVIDENCE_LEDGER_VERSION != PINNED_WINNER_EVIDENCE_LEDGER_VERSION
+        (released.selection_version if released else winner.CURRENT_WINNER_SELECTION_CONTRACT_VERSION if current else winner.WINNER_SELECTION_CONTRACT_VERSION)
+        != _generation.winner_generation.selection_version
+        or (released.request_version if released else winner.CURRENT_WINNER_SELECTION_REQUEST_VERSION if current else winner.WINNER_SELECTION_REQUEST_VERSION)
+        != _generation.winner_generation.request_version
+        or (released.marginal_version if released else winner.CURRENT_WINNER_BOOK_MARGINAL_CONTRACT_VERSION if current else winner.WINNER_BOOK_MARGINAL_CONTRACT_VERSION)
+        != _generation.winner_generation.marginal_version
+        or (released.evidence_version if released else winner.CURRENT_EVIDENCE_LEDGER_VERSION if current else winner.EVIDENCE_LEDGER_VERSION) != _generation.winner_generation.evidence_version
         or winner.ATTEMPT_LEDGER_VERSION != PINNED_WINNER_ATTEMPT_LEDGER_VERSION
         or winner.TRADE_POWER_BINDING_VERSION
         != PINNED_WINNER_TRADE_POWER_BINDING_VERSION
@@ -2671,7 +2882,7 @@ def _winner_record(
     if (
         attempt_body.get("contract_version") != PINNED_WINNER_ATTEMPT_LEDGER_VERSION
         or evidence_body.get("contract_version")
-        != PINNED_WINNER_EVIDENCE_LEDGER_VERSION
+        != _generation.winner_generation.evidence_version
     ):
         raise _BookError(f"CELL_{ordinal:04d}_WINNER_LEDGER_VERSION_INVALID")
     attempt_sha = _hex64(
@@ -2694,15 +2905,44 @@ def _winner_record(
     if marginal["upstream_evidence_receipt_sha256"] != decision_receipt:
         raise _BookError(f"CELL_{ordinal:04d}_MARGINAL_RECEIPT_MISMATCH")
     if (
-        marginal["cell_id"] != expected_cell_id
-        or marginal["p_value_contract_sha256"] != PINNED_P_VALUE_CONTRACT_SHA256
+        marginal["contract_version"]
+        != _generation.winner_generation.marginal_version
+        or marginal["cell_id"] != expected_cell_id
+        or marginal["p_value_contract_sha256"] != _generation.p_value_contract_sha256
         or marginal["p_value_kind"] != "ONE_SIDED_SUPERIORITY"
         or marginal["within_cell_multiplicity_adjusted"] is not True
         or marginal["evidence_scope"] != "PROCESS_LEVEL_ONLY"
         or marginal["parameter_evidence_inherited"] is not False
         or type(marginal["local_admissibility_passed"]) is not bool
+        or (
+            marginal["local_admissibility_passed"]
+            and marginal["selected_cost_ladder_tier"]
+            not in {"P75_REQUIRED", "P95_PREFERENCE"}
+        )
+        or (
+            not marginal["local_admissibility_passed"]
+            and marginal["selected_cost_ladder_tier"] is not None
+        )
+        or (
+            marginal["local_admissibility_passed"]
+            and not _is_exact_validated_cost_ladder_tolerance(
+                marginal["validated_cost_ladder_tolerance"], _generation=_generation,
+            )
+        )
+        or (
+            not marginal["local_admissibility_passed"]
+            and marginal["validated_cost_ladder_tolerance"] is not None
+        )
     ):
         raise _BookError(f"CELL_{ordinal:04d}_MARGINAL_SEMANTICS_INVALID")
+    if current and marginal["local_admissibility_passed"]:
+        tolerance = marginal["validated_cost_ladder_tolerance"]
+        policy = evidence.winner_request.precommitment.to_dict()
+        expected_tier = "P75" if marginal["selected_cost_ladder_tier"] == "P75_REQUIRED" else "P95"
+        if (tolerance["tier"] != expected_tier
+                or tolerance["frozen_tier_pair_contract"] != policy["frozen_tier_pair_contract"]
+                or tolerance["frozen_tier_pair_contract_sha256"] != policy["frozen_tier_pair_contract_sha256"]):
+            raise _BookError(f"CELL_{ordinal:04d}_MARGINAL_COST_SPLICE")
     attempts = _exact_int(
         marginal["within_cell_attempted_trials_exact"],
         1,
@@ -2754,6 +2994,9 @@ def _winner_record(
         "winner_evidence_ledger_payload_sha256": evidence_sha,
         "local_process_candidate_id": candidate_id,
         "local_process_sha256": process_sha,
+        "validated_cost_ladder_tolerance": marginal[
+            "validated_cost_ladder_tolerance"
+        ],
         "process_state_payload": None,
         "process_state_receipt_sha256": None,
         "within_cell_attempted_trials_exact": attempts,
@@ -2767,7 +3010,7 @@ def _state_record(
     ordinal: int,
     source_decision: HistoricalSourceGroupDecision,
     regime_fit_decision: RegimeFitDecision,
-) -> dict[str, Any]:
+ *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> dict[str, Any]:
     if (
         evidence.winner_decision is not None
         or evidence.winner_request is not None
@@ -2776,7 +3019,7 @@ def _state_record(
         raise _BookError(f"CELL_{ordinal:04d}_PROCESS_STATE_INPUT_INVALID")
     body = _process_state_body(
         evidence.process_state_decision, source_decision, regime_fit_decision
-    )
+    , _generation=_generation)
     raw_insufficient = (
         evidence.insufficient_horizon_plan,
         evidence.insufficient_process_rejection_request,
@@ -2804,7 +3047,7 @@ def _state_record(
             winner_raw_production_receipt_bytes=(
                 evidence.insufficient_winner_raw_production_receipt_bytes
             ),
-        )
+        _generation=_generation)
         if replayed != body["insufficient_evidence_binding"]:
             raise _BookError(f"CELL_{ordinal:04d}_INSUFFICIENT_BINDING_MISMATCH")
     elif any(value is not None for value in raw_insufficient):
@@ -2839,6 +3082,7 @@ def _state_record(
         "winner_evidence_ledger_payload_sha256": None,
         "local_process_candidate_id": None,
         "local_process_sha256": None,
+        "validated_cost_ladder_tolerance": None,
         "process_state_payload": body,
         "process_state_receipt_sha256": (
             evidence.process_state_decision.receipt_sha256
@@ -2849,10 +3093,10 @@ def _state_record(
     }
 
 
-def _entry_identity(record: dict[str, Any]) -> str:
+def _entry_identity(record: dict[str, Any], *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> str:
     return _sha256_json(
         {
-            "book_contract_version": BOOK_MULTIPLICITY_CONTRACT_VERSION,
+            "book_contract_version": _generation.version,
             **record,
         }
     )
@@ -2879,6 +3123,7 @@ _CELL_KEYS: Final = frozenset(
         "winner_evidence_ledger_payload_sha256",
         "local_process_candidate_id",
         "local_process_sha256",
+        "validated_cost_ladder_tolerance",
         "process_state_payload",
         "process_state_receipt_sha256",
         "within_cell_attempted_trials_exact",
@@ -3002,13 +3247,13 @@ def _make_decision(body: dict[str, Any]) -> BookMultiplicityDecision:
     return BookMultiplicityDecision(encoded, _sha256_bytes(encoded))
 
 
-def _rejected(reason: str) -> BookMultiplicityDecision:
+def _rejected(reason: str, *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> BookMultiplicityDecision:
     safe = (
         reason if type(reason) is str and _SAFE_REASON.fullmatch(reason) else "REJECTED"
     )
     return _make_decision(
         {
-            "contract_version": BOOK_MULTIPLICITY_CONTRACT_VERSION,
+            "contract_version": _generation.version,
             "selection_scope": BOOK_MULTIPLICITY_SCOPE,
             "status": "REJECTED",
             "valid": False,
@@ -3037,6 +3282,9 @@ def _iter_exact_family(value: Any) -> Iterable[HistoricalBookCellEvidence]:
             raise _BookError("FAMILY_INCOMPLETE") from exc
         if type(evidence) is not HistoricalBookCellEvidence:
             raise _BookError(f"CELL_{ordinal:04d}_INPUT_TYPE_INVALID")
+        # Preserve the first roster error before generation dispatch exhausts the family.
+        if (evidence.symbol, evidence.timeframe, evidence.regime) != _cell_tuple(ordinal):
+            raise _BookError(f"CELL_{ordinal:04d}_ROSTER_MISMATCH")
         yield evidence
     try:
         next(iterator)
@@ -3050,9 +3298,79 @@ def _serialized_owned(decision: Any) -> dict[str, Any]:
     return {"payload": body, "receipt_sha256": decision.receipt_sha256}
 
 
-def evaluate_historical_book_multiplicity(
+def _family_input_generation(
+    family: tuple[HistoricalBookCellEvidence, ...],
+    expected: _BookGeneration | None,
+) -> _BookGeneration:
+    found = None
+    for evidence in family:
+        carriers = (
+            {"request": evidence.winner_request, "decision": evidence.winner_decision},
+            dict(
+                horizon_plan=evidence.insufficient_horizon_plan,
+                request=evidence.insufficient_process_rejection_request,
+                decision=evidence.insufficient_process_rejection_decision,
+                process_state=evidence.process_state_decision,
+            ),
+        )
+        for carrier in carriers:
+            try:
+                generation = _infer_input_generation(**carrier, preferred=expected)
+            except _BookError as exc:
+                if str(exc) == "BOOK_MIXED_GENERATIONS":
+                    raise
+                # The existing cell verifier owns malformed-carrier rejection.
+                continue
+            except Exception:
+                continue
+            if generation is None:
+                continue
+            if (expected is not None and generation is not expected
+                    or found is not None and generation is not found):
+                raise _BookError("BOOK_MIXED_GENERATIONS")
+            found = generation
+    return found or expected or ARCHIVED_GENERATION
+
+
+def evaluate_historical_book_multiplicity(evidence_family: Any) -> BookMultiplicityDecision:
+    """Infer a single immutable generation; neutral terminal families retain v14."""
+    try:
+        family = tuple(_iter_exact_family(evidence_family))
+        generation = _family_input_generation(family, None)
+        return _evaluate_historical_book_multiplicity(family, _generation=generation)
+    except _BookError as exc:
+        return _rejected(str(exc))
+    except Exception:
+        return _rejected("EVALUATION_FAILED_CLOSED")
+
+
+def evaluate_frozen_tier_historical_book_multiplicity(evidence_family: Any) -> BookMultiplicityDecision:
+    """Evaluate current candidate evidence, including an entirely terminal family."""
+    try:
+        family = tuple(_iter_exact_family(evidence_family))
+        _family_input_generation(family, CURRENT_GENERATION)
+        return _evaluate_historical_book_multiplicity(family, _generation=CURRENT_GENERATION)
+    except _BookError as exc:
+        return _rejected(str(exc), _generation=CURRENT_GENERATION)
+    except Exception:
+        return _rejected("EVALUATION_FAILED_CLOSED", _generation=CURRENT_GENERATION)
+
+
+def evaluate_transport_historical_book_multiplicity(evidence_family: Any) -> BookMultiplicityDecision:
+    """Evaluate the explicit v16 transport edition without changing v15 defaults."""
+    try:
+        family = tuple(_iter_exact_family(evidence_family))
+        _family_input_generation(family, V16_GENERATION)
+        return _evaluate_historical_book_multiplicity(family, _generation=V16_GENERATION)
+    except _BookError as exc:
+        return _rejected(str(exc), _generation=V16_GENERATION)
+    except Exception:
+        return _rejected("EVALUATION_FAILED_CLOSED", _generation=V16_GENERATION)
+
+
+def _evaluate_historical_book_multiplicity(
     evidence_family: Any,
-) -> BookMultiplicityDecision:
+ *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> BookMultiplicityDecision:
     """Evaluate the exact historical 2,400-cell family and nothing else."""
 
     try:
@@ -3066,12 +3384,6 @@ def evaluate_historical_book_multiplicity(
         active_fit_body: dict[str, Any] | None = None
         for ordinal, evidence in enumerate(_iter_exact_family(evidence_family)):
             symbol, timeframe, regime = _cell_tuple(ordinal)
-            if (evidence.symbol, evidence.timeframe, evidence.regime) != (
-                symbol,
-                timeframe,
-                regime,
-            ):
-                raise _BookError(f"CELL_{ordinal:04d}_ROSTER_MISMATCH")
             source_body = _source_body(evidence.source_group_decision)
             fit_body = _regime_fit_body(
                 evidence.regime_fit_decision, evidence.source_group_decision
@@ -3109,14 +3421,14 @@ def evaluate_historical_book_multiplicity(
                 evidence.winner_decision is not None
                 or evidence.winner_request is not None
             ):
-                specific = _winner_record(evidence, ordinal, cell_id, source_body)
+                specific = _winner_record(evidence, ordinal, cell_id, source_body, _generation=_generation)
             else:
                 specific = _state_record(
                     evidence,
                     ordinal,
                     evidence.source_group_decision,
                     evidence.regime_fit_decision,
-                )
+                _generation=_generation)
             outcome = specific["historical_outcome_receipt_sha256"]
             if outcome in outcome_receipts:
                 raise _BookError(f"CELL_{ordinal:04d}_OUTCOME_RECEIPT_REUSED")
@@ -3217,7 +3529,7 @@ def evaluate_historical_book_multiplicity(
             diagnostic_count += int(qualified)
             if candidate:
                 candidate_ids.append(record["cell_id"])
-            entry_sha = _entry_identity(record)
+            entry_sha = _entry_identity(record, _generation=_generation)
             cells.append(
                 {
                     **record,
@@ -3257,9 +3569,9 @@ def evaluate_historical_book_multiplicity(
             reasons = ["COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS"]
         generation_sha = _sha256_json(
             {
-                "family_precommitment_sha256": PINNED_FAMILY_PRECOMMITMENT_SHA256,
+                "family_precommitment_sha256": _generation.family_sha256,
                 "method": MULTIPLICITY_METHOD,
-                "selection_rule": SELECTION_RULE,
+                "selection_rule": _generation.selection_rule,
                 "target_fdr": TARGET_FDR,
                 "source_group_receipts": [
                     item["receipt_sha256"] for item in source_groups
@@ -3272,7 +3584,7 @@ def evaluate_historical_book_multiplicity(
         )
         return _make_decision(
             {
-                "contract_version": BOOK_MULTIPLICITY_CONTRACT_VERSION,
+                "contract_version": _generation.version,
                 "selection_scope": BOOK_MULTIPLICITY_SCOPE,
                 "status": status,
                 "valid": not incomplete,
@@ -3282,11 +3594,11 @@ def evaluate_historical_book_multiplicity(
                 "symbols": list(PINNED_SYMBOL_ORDER),
                 "timeframes": list(TIMEFRAME_ORDER),
                 "regimes": list(REGIME_ORDER),
-                "family_precommitment_sha256": PINNED_FAMILY_PRECOMMITMENT_SHA256,
-                "p_value_contract_sha256": PINNED_P_VALUE_CONTRACT_SHA256,
+                "family_precommitment_sha256": _generation.family_sha256,
+                "p_value_contract_sha256": _generation.p_value_contract_sha256,
                 "method": MULTIPLICITY_METHOD,
                 "target_fdr": TARGET_FDR,
-                "selection_rule": SELECTION_RULE,
+                "selection_rule": _generation.selection_rule,
                 "by_is_diagnostic_only": True,
                 "individual_family_wide_fdr_claimed": False,
                 "causal_process_validation_required": True,
@@ -3316,9 +3628,9 @@ def evaluate_historical_book_multiplicity(
             }
         )
     except _BookError as exc:
-        return _rejected(str(exc))
+        return _rejected(str(exc), _generation=_generation)
     except Exception:
-        return _rejected("EVALUATION_FAILED_CLOSED")
+        return _rejected("EVALUATION_FAILED_CLOSED", _generation=_generation)
 
 
 def _owned_from_serialized(
@@ -3336,11 +3648,11 @@ def _owned_from_serialized(
     return decision_type(encoded, receipt)
 
 
-def _verify_complete_body(body: dict[str, Any]) -> bool:
+def _verify_complete_body(body: dict[str, Any], *, _generation: _BookGeneration = ARCHIVED_GENERATION) -> bool:
     try:
         _exact_dict(body, _DECISION_KEYS, "DECISION_SCHEMA_INVALID")
         if (
-            body["contract_version"] != BOOK_MULTIPLICITY_CONTRACT_VERSION
+            body["contract_version"] != _generation.version
             or body["selection_scope"] != BOOK_MULTIPLICITY_SCOPE
             or type(body["status"]) is not str
             or body["status"]
@@ -3362,12 +3674,12 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
             or body["symbols"] != list(PINNED_SYMBOL_ORDER)
             or body["timeframes"] != list(TIMEFRAME_ORDER)
             or body["regimes"] != list(REGIME_ORDER)
-            or body["family_precommitment_sha256"] != PINNED_FAMILY_PRECOMMITMENT_SHA256
-            or body["p_value_contract_sha256"] != PINNED_P_VALUE_CONTRACT_SHA256
+            or body["family_precommitment_sha256"] != _generation.family_sha256
+            or body["p_value_contract_sha256"] != _generation.p_value_contract_sha256
             or body["method"] != MULTIPLICITY_METHOD
             or type(body["target_fdr"]) is not float
             or body["target_fdr"] != TARGET_FDR
-            or body["selection_rule"] != SELECTION_RULE
+            or body["selection_rule"] != _generation.selection_rule
             or body["by_is_diagnostic_only"] is not True
             or body["individual_family_wide_fdr_claimed"] is not False
             or body["causal_process_validation_required"] is not True
@@ -3487,6 +3799,16 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
                     or _HEX64.fullmatch(cell["local_process_sha256"] or "") is None
                     or type(cell["local_process_candidate_id"]) is not str
                     or not 1 <= len(cell["local_process_candidate_id"]) <= 256
+                    or (
+                        state == "WINNER"
+                        and not _is_exact_validated_cost_ladder_tolerance(
+                            cell["validated_cost_ladder_tolerance"], _generation=_generation,
+                        )
+                    )
+                    or (
+                        state == "NO_WINNER"
+                        and cell["validated_cost_ladder_tolerance"] is not None
+                    )
                     or cell["process_state_payload"] is not None
                     or cell["process_state_receipt_sha256"] is not None
                     or attempts < 1
@@ -3503,6 +3825,7 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
                     or cell["winner_evidence_ledger_payload_sha256"] is not None
                     or cell["local_process_candidate_id"] is not None
                     or cell["local_process_sha256"] is not None
+                    or cell["validated_cost_ladder_tolerance"] is not None
                     or type(cell["process_state_payload"]) is not dict
                     or cell["process_state_receipt_sha256"] != outcome
                     or type(cell["effective_trials"]) is not float
@@ -3513,7 +3836,7 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
                 process = HistoricalProcessStateDecision(
                     _canonical_bytes(cell["process_state_payload"]), outcome
                 )
-                process_body = _process_state_body(process, source, fit)
+                process_body = _process_state_body(process, source, fit, _generation=_generation)
                 expected_state = {
                     TERMINAL_SOURCE_ABSENCE: "SOURCE_UNAVAILABLE",
                     TERMINAL_TECHNICAL: TERMINAL_TECHNICAL,
@@ -3539,7 +3862,7 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
                     "historical_book_entry_sha256",
                 }
             }
-            entry_sha = _entry_identity(identity_record)
+            entry_sha = _entry_identity(identity_record, _generation=_generation)
             if cell["historical_book_entry_sha256"] != entry_sha:
                 return False
             p_values.append(p_value)
@@ -3668,9 +3991,9 @@ def _verify_complete_body(body: dict[str, Any]) -> bool:
             expected_reasons = ["COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS"]
         generation_sha = _sha256_json(
             {
-                "family_precommitment_sha256": PINNED_FAMILY_PRECOMMITMENT_SHA256,
+                "family_precommitment_sha256": _generation.family_sha256,
                 "method": MULTIPLICITY_METHOD,
-                "selection_rule": SELECTION_RULE,
+                "selection_rule": _generation.selection_rule,
                 "target_fdr": TARGET_FDR,
                 "source_group_receipts": [source.receipt_sha256 for source in sources],
                 "regime_fit_receipts": [fit.receipt_sha256 for fit in fits],
@@ -3723,25 +4046,28 @@ def verify_historical_book_multiplicity_decision(
         body = json.loads(decision._body_json.decode("ascii"))
         if type(body) is not dict or _canonical_bytes(body) != decision._body_json:
             return False
-        if body.get("status") == "REJECTED" or not _verify_complete_body(body):
+        _generation = _book_generation(body.get("contract_version"))
+        if body.get("status") == "REJECTED" or not _verify_complete_body(body, _generation=_generation):
             return False
         if evidence_family is not None:
-            replay = evaluate_historical_book_multiplicity(evidence_family)
+            family = tuple(_iter_exact_family(evidence_family))
+            _family_input_generation(family, _generation)
+            replay = _evaluate_historical_book_multiplicity(family, _generation=_generation)
             return replay._body_json == decision._body_json
         return True
     except Exception:
         return False
 
 
-def pinned_policy_snapshot() -> dict[str, Any]:
+def _policy_snapshot(*, _generation: _BookGeneration) -> dict[str, Any]:
     return {
-        **_family_precommitment(),
+        **_family_precommitment(_generation=_generation),
         "book_scope": BOOK_MULTIPLICITY_SCOPE,
-        "family_precommitment_sha256": PINNED_FAMILY_PRECOMMITMENT_SHA256,
-        "winner_selection_contract_version": PINNED_WINNER_SELECTION_CONTRACT_VERSION,
-        "winner_selection_request_version": PINNED_WINNER_SELECTION_REQUEST_VERSION,
+        "family_precommitment_sha256": _generation.family_sha256,
+        "winner_selection_contract_version": _generation.winner_generation.selection_version,
+        "winner_selection_request_version": _generation.winner_generation.request_version,
         "winner_attempt_ledger_version": PINNED_WINNER_ATTEMPT_LEDGER_VERSION,
-        "winner_evidence_ledger_version": PINNED_WINNER_EVIDENCE_LEDGER_VERSION,
+        "winner_evidence_ledger_version": _generation.winner_generation.evidence_version,
         "winner_trade_power_binding_version": (
             PINNED_WINNER_TRADE_POWER_BINDING_VERSION
         ),
@@ -3759,10 +4085,10 @@ def pinned_policy_snapshot() -> dict[str, Any]:
         "regime_unobserved_is_complete_p_one_zero_attempts": True,
         "regime_unobserved_requires_train_support_receipt": True,
         "insufficient_evidence_binding_schema_version": (
-            INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION
+            _generation.insufficient_schema
         ),
         "horizon_winner_cross_binding_schema_version": (
-            HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION
+            _generation.cross_binding_schema
         ),
         "postsearch_insufficiency_requires_pre_evidence_bijective_cross_binding": True,
         "postsearch_insufficiency_requires_raw_winner_production_receipt": True,
@@ -3792,10 +4118,35 @@ def pinned_policy_snapshot() -> dict[str, Any]:
     }
 
 
+def pinned_policy_snapshot() -> dict[str, Any]:
+    return _policy_snapshot(_generation=ARCHIVED_GENERATION)
+
+
+def current_policy_snapshot() -> dict[str, Any]:
+    return _policy_snapshot(_generation=CURRENT_GENERATION)
+
+
+def transport_policy_snapshot() -> dict[str, Any]:
+    return _policy_snapshot(_generation=V16_GENERATION)
+
+
 __all__ = [
+    "V16_GENERATION",
+    "create_transport_historical_process_state_decision",
+    "evaluate_transport_historical_book_multiplicity",
+    "transport_policy_snapshot",
     "AVAILABLE",
     "BOOK_MULTIPLICITY_CONTRACT_VERSION",
     "BOOK_MULTIPLICITY_SCOPE",
+    "CURRENT_BOOK_MULTIPLICITY_CONTRACT_VERSION",
+    "CURRENT_FAMILY_PRECOMMITMENT_SHA256",
+    "CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION",
+    "CURRENT_INSUFFICIENT_EVIDENCE_BINDING_SCHEMA_VERSION",
+    "CURRENT_PINNED_WINNER_SELECTION_CONTRACT_VERSION",
+    "CURRENT_PINNED_WINNER_SELECTION_REQUEST_VERSION",
+    "CURRENT_PINNED_WINNER_BOOK_MARGINAL_CONTRACT_VERSION",
+    "CURRENT_PINNED_WINNER_EVIDENCE_LEDGER_VERSION",
+    "CURRENT_WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION",
     "BookMultiplicityDecision",
     "FAMILY_SIZE",
     "HistoricalBookCellEvidence",
@@ -3815,6 +4166,7 @@ __all__ = [
     "PINNED_SYMBOL_ORDER",
     "PINNED_WINNER_ATTEMPT_LEDGER_VERSION",
     "PINNED_WINNER_EVIDENCE_LEDGER_VERSION",
+    "PINNED_WINNER_BOOK_MARGINAL_CONTRACT_VERSION",
     "PINNED_WINNER_SELECTION_CONTRACT_VERSION",
     "PINNED_WINNER_SELECTION_REQUEST_VERSION",
     "PINNED_WINNER_TRADE_POWER_BINDING_VERSION",
@@ -3854,6 +4206,8 @@ __all__ = [
     "create_regime_detector_record",
     "create_regime_fit_decision",
     "evaluate_historical_book_multiplicity",
+    "evaluate_frozen_tier_historical_book_multiplicity",
+    "current_policy_snapshot",
     "pinned_policy_snapshot",
     "process_state_cell_evidence",
     "verify_historical_book_multiplicity_decision",

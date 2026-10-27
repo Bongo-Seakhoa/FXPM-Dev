@@ -169,6 +169,150 @@ class SwapProjection:
     event_count: int
 
 
+@dataclass(frozen=True)
+class ResearchSwapContext:
+    """Declared stress cashflows from one D1 prefix, without trading authority."""
+
+    symbol: str
+    cutoff_utc: str
+    events: Tuple[Tuple[str, int], ...]
+    d1_intervals: Tuple[Tuple[str, str], ...]
+    terms_snapshot_sha256: str
+    terms_snapshot_content_sha256: str
+    captured_at_utc: str
+    capture_started_at_utc: str
+    stress_policy_sha256: str
+    d1_axis_sha256: str
+    schedule_sha256: str
+    _snapshot_json: str
+
+    def __post_init__(self) -> None:
+        """Keep directly constructed contexts as exact as factory products."""
+
+        try:
+            snapshot = json.loads(self._snapshot_json)
+        except (TypeError, ValueError) as exc:
+            raise BrokerTermsError("research swap context snapshot is invalid") from exc
+        if not isinstance(snapshot, Mapping):
+            raise BrokerTermsError("research swap context snapshot is invalid")
+        content_sha = _validate_terms_snapshot(snapshot)
+        if (
+            snapshot.get("provenance_status") != STRESS_APPROVED
+            or type(self.symbol) is not str
+            or not self.symbol
+            or self.symbol != self.symbol.strip().upper()
+            or self.symbol not in snapshot["symbols"]
+        ):
+            raise BrokerTermsError("research swap context requires an exact approved symbol snapshot")
+        record = snapshot["symbols"][self.symbol]
+        if record.get("weekday_factors") != {weekday: 3 for weekday in WEEKDAYS}:
+            raise BrokerTermsError("research swap context requires uniform approved factor 3")
+        if (
+            self.terms_snapshot_sha256 != hashlib.sha256(self._snapshot_json.encode("utf-8")).hexdigest()
+            or self.terms_snapshot_content_sha256 != content_sha
+            or self.captured_at_utc != snapshot["captured_at_utc"]
+            or self.capture_started_at_utc != snapshot["capture_started_at_utc"]
+            or self.stress_policy_sha256 != canonical_sha256(snapshot["stress_policy"])
+        ):
+            raise BrokerTermsError("research swap context snapshot provenance mismatch")
+        cutoff = _aware_utc(self.cutoff_utc, "research cutoff")
+        if self.cutoff_utc != _iso(cutoff):
+            raise BrokerTermsError("research swap context cutoff must be canonical UTC")
+        if (
+            type(self.d1_intervals) is not tuple
+            or not self.d1_intervals
+            or len(self.d1_intervals) > 100_000
+            or any(type(row) is not tuple or len(row) != 2
+                   or any(type(value) is not str for value in row) for row in self.d1_intervals)
+        ):
+            raise BrokerTermsError("research swap context D1 intervals are invalid")
+        try:
+            source = pd.DataFrame(
+                {"_BAR_CLOSE_TS": [row[1] for row in self.d1_intervals]},
+                index=pd.DatetimeIndex([row[0] for row in self.d1_intervals]),
+            )
+        except (TypeError, ValueError) as exc:
+            raise BrokerTermsError("research swap context D1 intervals are invalid") from exc
+        _research_d1_source_axis(source, cutoff=cutoff)
+        if (
+            type(self.events) is not tuple
+            or any(type(row) is not tuple or len(row) != 2
+                   or type(row[0]) is not str or type(row[1]) is not int for row in self.events)
+            or self.events != tuple((row[1], 3) for row in self.d1_intervals)
+            or self.d1_axis_sha256 != canonical_sha256(self.d1_intervals)
+            or self.schedule_sha256 != canonical_sha256(self.events)
+        ):
+            raise BrokerTermsError("research swap context event or source-axis mismatch")
+
+    def _symbol_terms(self) -> Dict[str, Any]:
+        return dict(json.loads(self._snapshot_json)["symbols"][self.symbol])
+
+    @property
+    def swap_mode(self) -> int:
+        return int(self._symbol_terms()["swap_mode"])
+
+    @property
+    def swap_long(self) -> float:
+        return float(self._symbol_terms()["swap_long"])
+
+    @property
+    def swap_short(self) -> float:
+        return float(self._symbol_terms()["swap_short"])
+
+    @property
+    def source_first_open_utc(self) -> str:
+        return self.d1_intervals[0][0]
+
+    @property
+    def source_last_close_utc(self) -> str:
+        return self.d1_intervals[-1][1]
+
+    def project(self, target_frame: pd.DataFrame, *, symbol: str) -> SwapProjection:
+        if str(symbol or "").strip().upper() != self.symbol:
+            raise BrokerTermsError("research swap context symbol mismatch")
+        opens, closes = _research_interval_axis(
+            target_frame,
+            label="research target",
+            cutoff=_aware_utc(self.cutoff_utc, "research cutoff"),
+            allow_empty=True,
+        )
+        if len(opens) and (
+            opens[0] < pd.Timestamp(self.source_first_open_utc)
+            or closes[-1] > pd.Timestamp(self.source_last_close_utc)
+        ):
+            raise BrokerTermsError("research target interval is outside the supplied D1 coverage")
+        return project_session_events(self.events, target_frame)
+
+    def resolved_terms(self) -> Dict[str, Any]:
+        """Return an isolated resolver-shaped view with no activation binding."""
+
+        return {
+            "status": "UNAVAILABLE",
+            "research_context": True,
+            "research_cutoff_utc": self.cutoff_utc,
+            "schedule_provenance_status": STRESS_APPROVED,
+            "source_provenance_authenticated": False,
+            "historical_rate_provenance": "declared_snapshot_stress_only",
+            "historical_rates_authenticated": False,
+            "stress_approved": True,
+            "stress_policy_immutable": True,
+            "stress_policy_sha256": self.stress_policy_sha256,
+            "terms_snapshot_sha256": self.terms_snapshot_sha256,
+            "terms_snapshot_content_sha256": self.terms_snapshot_content_sha256,
+            "terms_snapshot_captured_at_utc": self.captured_at_utc,
+            "terms_snapshot_capture_started_at_utc": self.capture_started_at_utc,
+            "schedule_source_timeframe": "D1",
+            "schedule_derivation_contract": D1_SESSION_DERIVATION_CONTRACT,
+            "source_axis_sha256": self.d1_axis_sha256,
+            "source_first_open_utc": self.source_first_open_utc,
+            "source_last_close_utc": self.source_last_close_utc,
+            "schedule_sha256": self.schedule_sha256,
+            "projection_contract": SWAP_PROJECTION_CONTRACT,
+            "terms": self._symbol_terms(),
+            "events": [list(event) for event in self.events],
+        }
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -1239,6 +1383,37 @@ def _completed_or_represented_session_epochs(
     return sessions[sessions + 86_400 <= last_verified_close_epoch]
 
 
+def _d1_session_events_from_axes(
+    opens: pd.DatetimeIndex,
+    closes: pd.DatetimeIndex,
+    *,
+    symbol_terms: Mapping[str, Any],
+    weekday_offset: int,
+) -> list[Dict[str, Any]]:
+    """Emit the shared D1 cashflow schedule after caller-owned axis binding."""
+
+    factors = dict(symbol_terms.get("weekday_factors") or {})
+    if set(factors) != set(WEEKDAYS):
+        raise BrokerTermsError("seven weekday factors are required")
+    events: list[Dict[str, Any]] = []
+    for index, (opened, closed) in enumerate(zip(opens, closes)):
+        utc_mql5_weekday = (opened.weekday() + 1) % 7
+        from_weekday = (utc_mql5_weekday + weekday_offset) % 7
+        weekday_name = WEEKDAYS[from_weekday]
+        factor = _strict_int(factors[weekday_name], f"weekday_factors.{weekday_name}")
+        if factor not in {0, 1, 3}:
+            raise BrokerTermsError("session factor is outside the official factor set")
+        events.append({
+            "d1_bar_index": index,
+            "d1_open_utc": opened.isoformat(),
+            "event_utc": closed.isoformat(),
+            "from_weekday": from_weekday,
+            "from_weekday_name": weekday_name,
+            "factor": factor,
+        })
+    return events
+
+
 def _derive_d1_session_events_hashed(
     d1_csv_path: Path,
     *,
@@ -1265,25 +1440,12 @@ def _derive_d1_session_events_hashed(
         symbol_terms=symbol_terms,
         require_single_phase=False,
     )
-    factors = dict(symbol_terms.get("weekday_factors") or {})
-    if set(factors) != set(WEEKDAYS):
-        raise BrokerTermsError("seven weekday factors are required")
-    events: list[Dict[str, Any]] = []
-    for index, (opened, closed) in enumerate(zip(opens, closes)):
-        utc_mql5_weekday = (opened.weekday() + 1) % 7
-        from_weekday = (utc_mql5_weekday + weekday_offset) % 7
-        weekday_name = WEEKDAYS[from_weekday]
-        factor = _strict_int(factors[weekday_name], f"weekday_factors.{weekday_name}")
-        if factor not in {0, 1, 3}:
-            raise BrokerTermsError("session factor is outside the official factor set")
-        events.append({
-            "d1_bar_index": index,
-            "d1_open_utc": opened.isoformat(),
-            "event_utc": closed.isoformat(),
-            "from_weekday": from_weekday,
-            "from_weekday_name": weekday_name,
-            "factor": factor,
-        })
+    events = _d1_session_events_from_axes(
+        opens,
+        closes,
+        symbol_terms=symbol_terms,
+        weekday_offset=weekday_offset,
+    )
     return events, observed_sha256
 
 
@@ -1390,6 +1552,110 @@ def derive_d1_session_events(
         max_bytes=max_bytes,
     )
     return events
+
+
+def _research_interval_axis(
+    frame: pd.DataFrame,
+    *,
+    label: str,
+    cutoff: datetime,
+    allow_empty: bool = False,
+) -> Tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+    if not isinstance(frame, pd.DataFrame) or "_BAR_CLOSE_TS" not in frame.columns:
+        raise BrokerTermsError(f"{label} requires an explicit _BAR_CLOSE_TS column")
+    try:
+        opens = pd.DatetimeIndex(frame.index)
+        closes = pd.DatetimeIndex(pd.to_datetime(frame["_BAR_CLOSE_TS"], errors="coerce"))
+    except (TypeError, ValueError) as exc:
+        raise BrokerTermsError(f"{label} interval axis is invalid") from exc
+    if len(frame) == 0 and allow_empty:
+        return opens, closes
+    if opens.tz is None or closes.tz is None:
+        raise BrokerTermsError(f"{label} interval timestamps must be timezone-aware")
+    opens = opens.tz_convert("UTC")
+    closes = closes.tz_convert("UTC")
+    if (
+        len(frame) == 0
+        or len(closes) != len(opens)
+        or opens.isna().any()
+        or closes.isna().any()
+        or opens.has_duplicates
+        or closes.has_duplicates
+        or not opens.is_monotonic_increasing
+        or not closes.is_monotonic_increasing
+        or not bool((closes > opens).all())
+        or bool((closes[:-1] > opens[1:]).any())
+    ):
+        raise BrokerTermsError(f"{label} interval axis is invalid")
+    if closes[-1] > pd.Timestamp(cutoff):
+        raise BrokerTermsError(f"{label} interval exceeds the research cutoff")
+    return opens, closes
+
+
+def _research_d1_source_axis(
+    frame: pd.DataFrame, *, cutoff: datetime,
+) -> Tuple[pd.DatetimeIndex, pd.DatetimeIndex]:
+    opens, closes = _research_interval_axis(frame, label="research D1", cutoff=cutoff)
+    # Nominal acquisition clocks measured 24h; allow one hour for DST.
+    # This duration guard does not authenticate broker session timing.
+    durations = closes - opens
+    if not bool(((durations >= pd.Timedelta(hours=23))
+                 & (durations <= pd.Timedelta(hours=25))).all()):
+        raise BrokerTermsError(
+            "RESEARCH_D1_SOURCE_NOT_DAILY: nominal intervals require 23..25 hours; "
+            "this is not broker timing evidence"
+        )
+    return opens, closes
+
+
+def build_research_swap_context(
+    d1_frame: pd.DataFrame,
+    *,
+    symbol: str,
+    snapshot_path: Path,
+    cutoff_utc: Any,
+) -> ResearchSwapContext:
+    """Project the exact approved all-session stress onto a research prefix.
+
+    A later capture supplies declared stress rates, not authenticated historical
+    rates. Its weekday anchors need not overlap this prefix because every
+    weekday has the same approved factor. Production anchor checks are retained
+    in the production builder.
+    """
+
+    cutoff = _aware_utc(cutoff_utc, "research cutoff")
+    opens, closes = _research_d1_source_axis(d1_frame, cutoff=cutoff)
+    if len(opens) > 100_000:
+        raise BrokerTermsError("research D1 row count is outside the permitted bound")
+    snapshot, snapshot_sha, snapshot_bytes = _load_json_bounded_hashed(Path(snapshot_path))
+    content_sha = _validate_terms_snapshot(snapshot)
+    if snapshot.get("provenance_status") != STRESS_APPROVED:
+        raise BrokerTermsError("research swap context requires the exact approved stress snapshot")
+    canonical = str(symbol or "").strip().upper()
+    record = dict(snapshot["symbols"].get(canonical) or {})
+    if not record or record.get("canonical_symbol") != canonical:
+        raise BrokerTermsError("research swap context symbol is absent from the snapshot")
+    if record.get("weekday_factors") != {weekday: 3 for weekday in WEEKDAYS}:
+        raise BrokerTermsError("research swap context requires uniform approved factor 3")
+    event_records = _d1_session_events_from_axes(
+        opens, closes, symbol_terms=record, weekday_offset=0,
+    )
+    events = tuple((str(event["event_utc"]), int(event["factor"])) for event in event_records)
+    intervals = tuple((opened.isoformat(), closed.isoformat()) for opened, closed in zip(opens, closes))
+    return ResearchSwapContext(
+        symbol=canonical,
+        cutoff_utc=_iso(cutoff),
+        events=events,
+        d1_intervals=intervals,
+        terms_snapshot_sha256=snapshot_sha,
+        terms_snapshot_content_sha256=content_sha,
+        captured_at_utc=str(snapshot["captured_at_utc"]),
+        capture_started_at_utc=str(snapshot["capture_started_at_utc"]),
+        stress_policy_sha256=canonical_sha256(snapshot["stress_policy"]),
+        d1_axis_sha256=canonical_sha256(intervals),
+        schedule_sha256=canonical_sha256(events),
+        _snapshot_json=snapshot_bytes.decode("utf-8"),
+    )
 
 
 def project_session_events(

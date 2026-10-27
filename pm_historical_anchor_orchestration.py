@@ -44,21 +44,23 @@ PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA: Final = (
 SYMBOL_OUTPUT_SCHEMA: Final = "fxpm.historical-anchor-symbol-output.v1"
 RUN_RECEIPT_SCHEMA: Final = "fxpm.historical-anchor-orchestration-receipt.v1"
 HORIZON_BINDING_SCHEMA: Final = "fxpm.historical-horizon-plan-binding.v1"
+CURRENT_HORIZON_BINDING_SCHEMA: Final = "fxpm.historical-horizon-plan-binding.v2"
 AUTHORITY_SCOPE: Final = "HISTORICAL_ANCHOR_ORCHESTRATION_ONLY"
 
 _ADAPTER_PAYLOAD_SCHEMA: Final = "fxpm.historical-optimizer-payload.v1"
 _ADAPTER_INDEX_SCHEMA: Final = "fxpm.historical-symbol-production-index.v1"
 _ADAPTER_GRAPH_SCHEMA: Final = "fxpm.historical-raw-winner-descriptor-graph.v1"
-_ADAPTER_CROSS_BINDING_SCHEMA: Final = "fxpm.historical-horizon-winner-cross-binding.v1"
+_ADAPTER_CROSS_BINDING_SCHEMA: Final = "fxpm.historical-horizon-winner-cross-binding.v2"
 _ADAPTER_ASCII_JSON_FORMAT: Final = "fxpm-ascii-json-v1"
-_ADAPTER_CAPTURE_CONTRACT: Final = "fxpm.historical-search-capture.v2"
-_BOOK_ARTIFACT_TYPE: Final = "historical_book_multiplicity_v11"
+_ADAPTER_CAPTURE_CONTRACT: Final = "fxpm.historical-search-capture.v3"
+_BOOK_ARTIFACT_TYPE: Final = "historical_book_multiplicity_v14"
 _TERMINAL_TECHNICAL_REASON_CODE: Final = (
     "AUTHENTICATED_NATIVE_PREFIX_TERMINAL_TECHNICAL"
 )
 _WORKER_REQUEST_REOPEN_SEAL: Final = object()
 
-_HORIZON_PLAN_SCHEMA: Final = "fxpm.historical-horizon-plan.v1"
+_HORIZON_PLAN_SCHEMA: Final = "fxpm.historical-horizon-plan.v2"
+_CURRENT_HORIZON_PLAN_SCHEMA: Final = "fxpm.historical-horizon-plan.v3"
 _HORIZON_SCOPE: Final = "HISTORICAL_ANCHOR_LOCAL_HORIZON_EVIDENCE_ONLY"
 _MAX_PRECOMMIT_BYTES: Final = 16 * 1024 * 1024
 _MAX_RECEIPT_BYTES: Final = 16 * 1024 * 1024
@@ -1423,7 +1425,7 @@ def precommit_historical_anchor_run(
 
 
 def historical_horizon_plan_binding(plan: Any) -> dict[str, Any]:
-    """Derive the compact commitment from Horizon's exact sealed plan."""
+    """Bind a sealed plan without upgrading the issued anchor generation."""
 
     try:
         valid = training_horizon._valid_plan(plan)
@@ -1460,7 +1462,8 @@ def historical_horizon_plan_binding(plan: Any) -> dict[str, Any]:
     if not required.issubset(body):
         _fail("HORIZON_PLAN_FIELDS_INCOMPLETE")
     if (
-        body["schema_version"] != _HORIZON_PLAN_SCHEMA
+        body["schema_version"]
+        not in (_HORIZON_PLAN_SCHEMA, _CURRENT_HORIZON_PLAN_SCHEMA)
         or body["authority_scope"] != _HORIZON_SCOPE
         or body["confers_trading_or_capital_authority"] is not False
         or body["confers_final_oos_authority"] is not False
@@ -1496,7 +1499,11 @@ def historical_horizon_plan_binding(plan: Any) -> dict[str, Any]:
     if body["plan_status"] not in _HORIZON_PLAN_STATUSES:
         _fail("HORIZON_PLAN_STATUS_INVALID")
     return {
-        "schema_version": HORIZON_BINDING_SCHEMA,
+        "schema_version": (
+            HORIZON_BINDING_SCHEMA
+            if body["schema_version"] == _HORIZON_PLAN_SCHEMA
+            else CURRENT_HORIZON_BINDING_SCHEMA
+        ),
         "ordinal": ordinal,
         "cell": dict(cell),
         "anchor_id": _safe_id(anchor["anchor_id"], "HORIZON_ANCHOR_ID_INVALID"),
@@ -1584,6 +1591,7 @@ def historical_horizon_binding_roster_sha256(
         _fail("HORIZON_BINDING_ROSTER_ITERABLE_INVALID")
     iterator = iter(bindings)
     hasher = _CanonicalListHasher()
+    roster_schema = None
     for expected_cell in _CELL_ROSTER:
         try:
             binding = next(iterator)
@@ -1593,6 +1601,13 @@ def historical_horizon_binding_roster_sha256(
             ) from exc
         if type(binding) is not dict or set(binding) != _BINDING_FIELDS:
             _fail("HORIZON_BINDING_FIELDS_INVALID")
+        schema = binding["schema_version"]
+        if schema not in (HORIZON_BINDING_SCHEMA, CURRENT_HORIZON_BINDING_SCHEMA):
+            _fail("HORIZON_BINDING_SCHEMA_INVALID")
+        if roster_schema is None:
+            roster_schema = schema
+        elif schema != roster_schema:
+            _fail("HORIZON_BINDING_MIXED_GENERATIONS")
         if binding.get("ordinal") != _CELL_ORDINAL[expected_cell] or binding.get(
             "cell"
         ) != {
@@ -1907,7 +1922,7 @@ def _read_ascii_descriptor_json(
 def _reopen_verified_book_decision(
     payload: Any,
 ) -> book.BookMultiplicityDecision:
-    """Rehydrate persisted Book bytes and invoke Book v11's exact authority."""
+    """Rehydrate persisted Book bytes and invoke Book-v14's exact authority."""
 
     if type(payload) is not dict or "receipt_sha256" not in payload:
         _fail("BOOK_DECISION_PAYLOAD_INVALID")
@@ -3001,6 +3016,7 @@ __all__ = [
     "PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_SCHEMA",
     "BoundedRawWinnerCanaryRequest",
     "HORIZON_BINDING_SCHEMA",
+    "CURRENT_HORIZON_BINDING_SCHEMA",
     "HistoricalAnchorOrchestrationError",
     "HistoricalAnchorPrecommit",
     "HistoricalAnchorRunReceipt",
@@ -3020,3 +3036,510 @@ __all__ = [
     "verify_bounded_raw_winner_canary_request",
     "verify_historical_anchor_run_receipt",
 ]
+
+
+# Declared R&D slot authority is separate from the issued-v1 causal request.
+DECLARED_SLOT_PRECOMMIT_SCHEMA = "fxpm.declared-slot-run-precommit.v1"
+DECLARED_SLOT_REQUEST_SCHEMA = "fxpm.declared-slot-producer-request.v1"
+DECLARED_SLOT_PRECOMMIT_SCHEMA_V2 = "fxpm.declared-slot-run-precommit.v2"
+DECLARED_SLOT_REQUEST_SCHEMA_V2 = "fxpm.declared-slot-producer-request.v2"
+DECLARED_WINNER_TRANSPORT_V15 = "fxpm.winner-transport.v15"
+DECLARED_WINNER_TRANSPORT_V16 = "fxpm.winner-transport.v16"
+_DECLARED_PROTECTED_END_EXCLUSIVE_UTC = "2024-07-14T08:05:00Z"
+_DECLARED_SLOT_SEAL = object()
+_DECLARED_SOURCE_FILES = (
+    "pm_historical_anchor_orchestration.py", "pm_production_search_planner.py",
+    "pm_authoritative_search_execution.py", "pm_historical_production_adapter.py",
+    "pm_historical_search_producer.py",
+)
+
+
+def _declared_source_identity() -> dict[str, str]:
+    return {name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in _DECLARED_SOURCE_FILES}
+
+
+def _declared_slot_native_snapshot_status(context, snapshot, errors):
+    """Classify the actual portfolio contract, including unavailable baselines.
+
+    A full observation is compared before its errors are considered: an error
+    in another cell cannot hide a different observed activation.  The resolver's
+    four-field unavailable baseline is not an observed replacement snapshot.
+    This same check is used on saved bytes during cold completion verification.
+    """
+    baseline = {"pointer_schema", "manifest_schema", "symbols", "timeframes"}
+    full = baseline | {"activation_id", "activation_manifest_sha256", "activation_entry_count",
+        "eligible_symbols", "excluded_symbols", "universe_eligibility_explicit",
+        "activation_roster_sha256", "bars_sha256_by_source", "sidecar_sha256_by_source"}
+    if (type(snapshot) is not dict or type(errors) is not list
+            or any(type(value) is not str or not value for value in errors)):
+        _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_INVALID")
+    if set(snapshot) == baseline:
+        return "UNAVAILABLE" if errors else "INVALID"
+    if set(snapshot) != full:
+        return "INVALID"
+    import pm_portfolio_replay as portfolio_replay
+    if portfolio_replay.canonical_json_sha256(snapshot) != context.native_universe_sha256:
+        return "MISMATCH"
+    if (errors or snapshot["symbols"] != list(book.PINNED_SYMBOL_ORDER)
+            or snapshot["timeframes"] != list(book.TIMEFRAME_ORDER)
+            or type(snapshot["activation_id"]) is not str or not snapshot["activation_id"]
+            or type(snapshot["activation_manifest_sha256"]) is not str
+            or _HEX64.fullmatch(snapshot["activation_manifest_sha256"]) is None):
+        return "INVALID"
+    return "MATCH"
+
+
+def _declared_slot_consumed_native_snapshot_matches(snapshot, product):
+    """Join a reverified consumed product to the exact observed activation."""
+    activation = product.index.get("activation")
+    return (type(activation) is dict
+        and activation.get("activation_id") == snapshot.get("activation_id")
+        and activation.get("manifest_sha256") == snapshot.get("activation_manifest_sha256"))
+
+
+@dataclass(frozen=True)
+class DeclaredSlotRunPrecommit:
+    _body_json: bytes
+    _seal: object
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("ascii"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+
+@dataclass(frozen=True)
+class DeclaredSlotProducerRequest:
+    _body_json: bytes
+    _precommit: DeclaredSlotRunPrecommit
+    _sink: authority_spool.SymbolAuthoritySink
+    _seal: object
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("ascii"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+    def symbol_sink(self, symbol: str) -> authority_spool.SymbolAuthoritySink:
+        if symbol != self.to_dict()["symbol"]:
+            _fail("DECLARED_SLOT_CELL_INVALID")
+        return self._sink
+
+
+def _declared_json(value: Any) -> bytes:
+    # ASCII is the existing raw-Winner canonical byte contract.
+    return json.dumps(value, ensure_ascii=True, allow_nan=False, sort_keys=True,
+                      separators=(",", ":")).encode("ascii")
+
+
+def declared_slot_transport_edition(body: Mapping[str, Any]) -> str:
+    """Decode a declared edition; this does not authenticate the supplied body."""
+    if type(body) is not dict:
+        _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
+    schema = body.get("schema_version")
+    if schema in (DECLARED_SLOT_PRECOMMIT_SCHEMA, DECLARED_SLOT_REQUEST_SCHEMA):
+        if "winner_transport_edition" not in body:
+            return DECLARED_WINNER_TRANSPORT_V15
+    elif schema in (DECLARED_SLOT_PRECOMMIT_SCHEMA_V2, DECLARED_SLOT_REQUEST_SCHEMA_V2):
+        if body.get("winner_transport_edition") == DECLARED_WINNER_TRANSPORT_V16:
+            return DECLARED_WINNER_TRANSPORT_V16
+    _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
+
+
+def declared_slot_owner_id(*, cell_id: str, slot_id: str,
+                           winner_decision_sha256: str,
+                           process_receipt_sha256: str) -> str:
+    _hex(cell_id, "DECLARED_SLOT_OWNER_ID_INVALID")
+    if type(slot_id) is not str or not slot_id or len(slot_id) > 128:
+        _fail("DECLARED_SLOT_OWNER_ID_INVALID")
+    body = {"cell_id": cell_id, "slot_id": slot_id,
+            "winner_decision_sha256": _hex(winner_decision_sha256, "DECLARED_SLOT_OWNER_ID_INVALID"),
+            "process_receipt_sha256": _hex(process_receipt_sha256, "DECLARED_SLOT_OWNER_ID_INVALID")}
+    return hashlib.sha256(_declared_json(body)).hexdigest()
+
+
+def _declared_roster(roster: Any, *, launch_activation_utc,
+                     protected_end_exclusive_utc) -> dict[str, Any]:
+    import pm_production_anchor_plan as anchor_plan
+    if type(roster) is not dict:
+        _fail("DECLARED_SLOT_ROSTER_INVALID")
+    try:
+        return anchor_plan.verify_declared_owner_slot_roster(roster,
+            launch_activation_utc=launch_activation_utc,
+            frozen_refit_clock=roster["frozen_refit_clock"],
+            config_identity_refs=roster["config_identity_refs"],
+            extend_frozen_clock_backward=roster["clock_extended_backward"],
+            protected_end_exclusive_utc=protected_end_exclusive_utc)
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_ROSTER_INVALID") from exc
+
+
+def precommit_declared_slot_owner_run(context, *, run_id, process, slot_roster,
+        cell_roster, frozen_pipeline_config, spread_profile_identity,
+        source_access_window_utc, launch_activation_utc) -> DeclaredSlotRunPrecommit:
+    return _precommit_declared_slot_owner_run(context, run_id=run_id, process=process,
+        slot_roster=slot_roster, cell_roster=cell_roster,
+        frozen_pipeline_config=frozen_pipeline_config,
+        spread_profile_identity=spread_profile_identity,
+        source_access_window_utc=source_access_window_utc,
+        launch_activation_utc=launch_activation_utc,
+        transport_edition=DECLARED_WINNER_TRANSPORT_V15)
+
+
+def precommit_declared_slot_owner_run_v2(context, *, run_id, process, slot_roster,
+        cell_roster, frozen_pipeline_config, spread_profile_identity,
+        source_access_window_utc, launch_activation_utc) -> DeclaredSlotRunPrecommit:
+    return _precommit_declared_slot_owner_run(context, run_id=run_id, process=process,
+        slot_roster=slot_roster, cell_roster=cell_roster,
+        frozen_pipeline_config=frozen_pipeline_config,
+        spread_profile_identity=spread_profile_identity,
+        source_access_window_utc=source_access_window_utc,
+        launch_activation_utc=launch_activation_utc,
+        transport_edition=DECLARED_WINNER_TRANSPORT_V16)
+
+
+def _precommit_declared_slot_owner_run(context, *, run_id, process, slot_roster,
+        cell_roster, frozen_pipeline_config, spread_profile_identity,
+        source_access_window_utc, launch_activation_utc, transport_edition):
+    if transport_edition not in (DECLARED_WINNER_TRANSPORT_V15, DECLARED_WINNER_TRANSPORT_V16):
+        _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
+    import pm_production_search_planner as planner
+    import pm_production_config_binding as config_binding
+    planner.verify_frozen_production_search_process(context, process)
+    planner._require_current_process(process)
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    if frozen_pipeline_config.materialize(context).discovery_risk_per_trade_pct != 1.0:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    _utc(launch_activation_utc, "DECLARED_SLOT_LAUNCH_INVALID")
+    roster = _declared_roster(slot_roster,
+        launch_activation_utc=launch_activation_utc,
+        protected_end_exclusive_utc=_DECLARED_PROTECTED_END_EXCLUSIVE_UTC)
+    if (type(cell_roster) not in (list, tuple) or len(cell_roster) != 1
+            or type(cell_roster[0]) is not dict
+            or set(cell_roster[0]) != {"cell_id", "symbol", "timeframe", "regime"}):
+        _fail("DECLARED_SLOT_CELL_INVALID")
+    cell = dict(cell_roster[0])
+    import pm_winner_selection as selection
+    if (cell["cell_id"] != selection.compute_cell_id(cell["symbol"], cell["timeframe"], cell["regime"])
+            or cell["symbol"] not in book.PINNED_SYMBOL_ORDER
+            or cell["timeframe"] not in book.TIMEFRAME_ORDER or cell["regime"] not in book.REGIME_ORDER):
+        _fail("DECLARED_SLOT_CELL_INVALID")
+    if roster["config_identity_refs"] != {"config_sha256": context.config_sha256,
+            "effective_config_sha256": frozen_pipeline_config.effective_config_sha256}:
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    if (type(spread_profile_identity) is not dict
+            or set(spread_profile_identity) != {"profile_sha256"}):
+        _fail("DECLARED_SLOT_PROFILE_INVALID")
+    _hex(spread_profile_identity["profile_sha256"], "DECLARED_SLOT_PROFILE_INVALID")
+    if (type(source_access_window_utc) is not dict
+            or set(source_access_window_utc) != {"start_utc", "end_exclusive_utc"}):
+        _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    start = _utc(source_access_window_utc["start_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    end = _utc(source_access_window_utc["end_exclusive_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    now = datetime.now(timezone.utc)
+    if not start <= now < end:
+        _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    if process.to_dict().get("run_id") != run_id:
+        _fail("DECLARED_SLOT_PROCESS_BINDING_MISMATCH")
+    body = {"schema_version": (DECLARED_SLOT_PRECOMMIT_SCHEMA_V2
+            if transport_edition == DECLARED_WINNER_TRANSPORT_V16 else DECLARED_SLOT_PRECOMMIT_SCHEMA),
+        "run_id": _safe_id(run_id, "DECLARED_SLOT_PRECOMMIT_INVALID"),
+        "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
+        "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
+        "effective_config_sha256": frozen_pipeline_config.effective_config_sha256,
+        "search_process_receipt_sha256": process.receipt_sha256,
+        "source_identity": _declared_source_identity(), "slot_roster": roster,
+        "slot_roster_sha256": hashlib.sha256(_declared_json(roster)).hexdigest(),
+        "launch_activation_utc": launch_activation_utc,
+        "protected_end_exclusive_utc": _DECLARED_PROTECTED_END_EXCLUSIVE_UTC,
+        "cells": [cell], "spread_profile_identity": dict(spread_profile_identity),
+        "source_access_window_utc": dict(source_access_window_utc),
+        "precommitted_at_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+    if transport_edition == DECLARED_WINNER_TRANSPORT_V16:
+        body["winner_transport_edition"] = transport_edition
+    declared_slot_transport_edition(body)
+    result = DeclaredSlotRunPrecommit(_declared_json(body), _DECLARED_SLOT_SEAL)
+    authority_spool._publish_exact_json(context,
+        f"declared-slots/{result.receipt_sha256}/precommit.json", body, _MAX_PRECOMMIT_BYTES)
+    _register_declared_precommit(result, context)
+    return result
+
+
+def verify_declared_slot_owner_run_precommit(context, precommit, *, process=None) -> dict[str, Any]:
+    if type(precommit) is not DeclaredSlotRunPrecommit or precommit._seal is not _DECLARED_SLOT_SEAL:
+        _fail("DECLARED_SLOT_PRECOMMIT_INVALID")
+    _verify_declared_precommit_identity(precommit, context)
+    body = precommit.to_dict()
+    _validate_declared_precommit_body(context, body)
+    _verify_declared_issued_bytes(context, f"declared-slots/{precommit.receipt_sha256}/precommit.json", precommit._body_json)
+    source_identity = _declared_source_identity()
+    original_source = False
+    if body.get("source_identity") != source_identity:
+        from pm_current_refit_parameters import load_retained_strategy_domain_v1
+        retained_source = load_retained_strategy_domain_v1()["declared_source_identity"]
+        if body.get("source_identity") == retained_source:
+            source_identity, original_source = retained_source, True
+    expected = {"generation_id": context.generation_id,
+        "generation_context_sha256": context.context_sha256,
+        "native_universe_sha256": context.native_universe_sha256,
+        "config_sha256": context.config_sha256, "source_identity": source_identity}
+    if (_declared_json(body) != precommit._body_json
+            or (original_source and body.get("schema_version") != DECLARED_SLOT_PRECOMMIT_SCHEMA)
+            or any(body.get(k) != v for k, v in expected.items())
+            or _declared_roster(body.get("slot_roster"),
+                launch_activation_utc=body["launch_activation_utc"],
+                protected_end_exclusive_utc=_DECLARED_PROTECTED_END_EXCLUSIVE_UTC) != body["slot_roster"]
+            or body.get("slot_roster_sha256") != hashlib.sha256(_declared_json(body["slot_roster"])).hexdigest()
+            or any(body.get(k) is not False for k in ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_SLOT_PRECOMMIT_BINDING_MISMATCH")
+    if process is not None:
+        import pm_production_search_planner as planner
+        planner.verify_frozen_production_search_process(context, process)
+        original_process = process.to_dict().get("schema_version") == planner.ORIGINAL_PROCESS_SCHEMA
+        if (body.get("search_process_receipt_sha256") != process.receipt_sha256
+                or original_process != original_source):
+            _fail("DECLARED_SLOT_PROCESS_BINDING_MISMATCH")
+    return body
+
+
+def declared_slot_producer_request(context, *, precommit, process, cell_id, slot_id,
+                                   attempt_id, sink) -> DeclaredSlotProducerRequest:
+    body = verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    edition = declared_slot_transport_edition(body)
+    import pm_production_search_planner as planner
+    planner._require_current_process(process)
+    matches = [x for x in body["cells"] if x["cell_id"] == cell_id]
+    slots = [x for x in body["slot_roster"]["slots"] if x["slot_id"] == slot_id]
+    if len(matches) != 1 or len(slots) != 1:
+        _fail("DECLARED_SLOT_CELL_INVALID" if len(matches) != 1 else "DECLARED_SLOT_SLOT_INVALID")
+    cell, slot = matches[0], slots[0]
+    _safe_id(attempt_id, "DECLARED_SLOT_REQUEST_INVALID")
+    if (type(sink) is not authority_spool.SymbolAuthoritySink or sink.context is not context
+            or sink.symbol != cell["symbol"]):
+        _fail("DECLARED_SLOT_REQUEST_INVALID")
+    anchor = {"anchor_id": slot_id, "ordinal": slot["ordinal"],
+        "selection_cutoff_utc": slot["native_cutoff_utc"],
+        "forward_start_utc": slot["activation_utc"],
+        "forward_end_exclusive_utc": slot["end_exclusive_utc"],
+        "process_precommit_receipt_sha256": precommit.receipt_sha256}
+    request_body = {"schema_version": (DECLARED_SLOT_REQUEST_SCHEMA_V2
+            if edition == DECLARED_WINNER_TRANSPORT_V16 else DECLARED_SLOT_REQUEST_SCHEMA),
+        "precommit_sha256": precommit.receipt_sha256, "run_id": body["run_id"],
+        "generation_context_sha256": context.context_sha256,
+        "config_sha256": context.config_sha256, "effective_config_sha256": body["effective_config_sha256"],
+        "search_process_receipt_sha256": process.receipt_sha256,
+        "process_precommit_receipt_sha256": precommit.receipt_sha256,
+        "cell_id": cell_id, "slot_id": slot_id, "cell": cell, **{k:cell[k] for k in ("symbol", "timeframe", "regime")},
+        "attempt_id": attempt_id, "anchor": anchor,
+        "artifact_namespace": f"declared-slot/{body['run_id']}/{cell_id}/{slot_id}/{attempt_id}",
+        "source_access_window_utc": body["source_access_window_utc"],
+        "spread_profile_identity": body["spread_profile_identity"],
+        "confers_causal_or_current_authority": False}
+    if edition == DECLARED_WINNER_TRANSPORT_V16:
+        request_body["winner_transport_edition"] = edition
+    result = DeclaredSlotProducerRequest(_declared_json(request_body), precommit, sink, _DECLARED_SLOT_SEAL)
+    authority_spool._publish_exact_json(context, _declared_request_path(request_body), request_body, _MAX_PRECOMMIT_BYTES)
+    _register_declared_request(result, context, live=True)
+    verify_declared_slot_producer_request(context, result, precommit=precommit, process=process)
+    return result
+
+
+def verify_declared_slot_producer_request(context, request, *, precommit=None, process=None) -> dict[str, Any]:
+    if type(request) is not DeclaredSlotProducerRequest or request._seal is not _DECLARED_SLOT_SEAL:
+        _fail("DECLARED_SLOT_REQUEST_INVALID")
+    _verify_declared_request_identity(request, context)
+    committed = request._precommit if precommit is None else precommit
+    parent = verify_declared_slot_owner_run_precommit(context, committed, process=process)
+    body = request.to_dict()
+    edition = declared_slot_transport_edition(parent)
+    fields = {"schema_version", "precommit_sha256", "run_id", "generation_context_sha256", "config_sha256", "effective_config_sha256", "search_process_receipt_sha256", "process_precommit_receipt_sha256", "cell_id", "slot_id", "cell", "symbol", "timeframe", "regime", "attempt_id", "anchor", "artifact_namespace", "source_access_window_utc", "spread_profile_identity", "confers_causal_or_current_authority"}
+    if edition == DECLARED_WINNER_TRANSPORT_V16:
+        fields.add("winner_transport_edition")
+    if set(body) != fields:
+        _fail("DECLARED_SLOT_REQUEST_INVALID")
+    if declared_slot_transport_edition(body) != edition:
+        _fail("DECLARED_SLOT_REQUEST_BINDING_MISMATCH")
+    cell = next((x for x in parent["cells"] if x["cell_id"] == body.get("cell_id")), None)
+    slot = next((x for x in parent["slot_roster"]["slots"] if x["slot_id"] == body.get("slot_id")), None)
+    if (cell is None or slot is None or _declared_json(body) != request._body_json
+            or body.get("schema_version") != (DECLARED_SLOT_REQUEST_SCHEMA_V2
+                if edition == DECLARED_WINNER_TRANSPORT_V16 else DECLARED_SLOT_REQUEST_SCHEMA)
+            or body.get("run_id") != parent["run_id"]
+            or body.get("precommit_sha256") != committed.receipt_sha256
+            or body.get("generation_context_sha256") != context.context_sha256
+            or body.get("config_sha256") != context.config_sha256
+            or body.get("effective_config_sha256") != parent["effective_config_sha256"]
+            or body.get("search_process_receipt_sha256") != parent["search_process_receipt_sha256"]
+            or body.get("process_precommit_receipt_sha256") != committed.receipt_sha256
+            or body.get("cell") != cell or any(body.get(k) != cell[k] for k in ("symbol", "timeframe", "regime"))
+            or body.get("anchor") != {"anchor_id": slot["slot_id"], "ordinal": slot["ordinal"],
+                "selection_cutoff_utc": slot["native_cutoff_utc"], "forward_start_utc": slot["activation_utc"],
+                "forward_end_exclusive_utc": slot["end_exclusive_utc"], "process_precommit_receipt_sha256": committed.receipt_sha256}
+            or body.get("source_access_window_utc") != parent["source_access_window_utc"]
+            or body.get("spread_profile_identity") != parent["spread_profile_identity"]
+            or body.get("artifact_namespace") != f"declared-slot/{parent['run_id']}/{cell['cell_id']}/{slot['slot_id']}/{body.get('attempt_id')}"
+            or body.get("confers_causal_or_current_authority") is not False
+            or type(request._sink) is not authority_spool.SymbolAuthoritySink
+            or request._sink.context is not context or request._sink.symbol != cell["symbol"]):
+        _fail("DECLARED_SLOT_REQUEST_BINDING_MISMATCH")
+    _safe_id(body.get("attempt_id"), "DECLARED_SLOT_REQUEST_INVALID")
+    _verify_declared_issued_bytes(context, _declared_request_path(body), request._body_json)
+    return body
+
+
+__all__ += ["DeclaredSlotRunPrecommit", "DeclaredSlotProducerRequest",
+    "DECLARED_SLOT_PRECOMMIT_SCHEMA", "DECLARED_SLOT_REQUEST_SCHEMA",
+    "DECLARED_SLOT_PRECOMMIT_SCHEMA_V2", "DECLARED_SLOT_REQUEST_SCHEMA_V2",
+    "DECLARED_WINNER_TRANSPORT_V15", "DECLARED_WINNER_TRANSPORT_V16",
+    "declared_slot_transport_edition", "precommit_declared_slot_owner_run_v2",
+    "declared_slot_owner_id", "precommit_declared_slot_owner_run",
+    "verify_declared_slot_owner_run_precommit", "declared_slot_producer_request",
+    "verify_declared_slot_producer_request"]
+
+
+def _declared_request_path(body):
+    return f"declared-slots/{body['precommit_sha256']}/requests/{body['cell_id']}/{body['slot_id']}/{body['attempt_id']}.json"
+
+
+def _verify_declared_issued_bytes(context, relative_path, expected):
+    try:
+        digest, size, observed = authority_spool._stream_file(context.root, relative_path,
+            maximum_bytes=_MAX_PRECOMMIT_BYTES, collect=True)
+        if observed != expected or size != len(expected) or digest != hashlib.sha256(expected).hexdigest():
+            _fail("DECLARED_SLOT_ISSUED_BYTES_CHANGED")
+    except HistoricalAnchorOrchestrationError:
+        raise
+    except Exception as exc:
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_ISSUED_BYTES_MISSING") from exc
+
+
+def _make_declared_request_authority():
+    issued = {}
+
+    def register(request, context, *, live):
+        issued[id(request)] = (request, request._body_json, id(context), id(request._sink), live)
+
+    def verify(request, context, *, require_live=False):
+        row = issued.get(id(request))
+        if (row is None or row[0] is not request or row[1] != request._body_json
+                or row[2] != id(context) or row[3] != id(request._sink)
+                or (require_live and row[4] is not True)):
+            _fail("DECLARED_SLOT_REQUEST_CAPABILITY_INVALID")
+        return True
+
+    def release(request, context):
+        if id(request) not in issued:
+            return
+        verify(request, context)
+        del issued[id(request)]
+
+    return register, verify, release
+
+
+(_register_declared_request, _verify_declared_request_identity,
+ _release_declared_slot_producer_request) = _make_declared_request_authority()
+
+
+def _validate_declared_precommit_body(context, body):
+    if (type(body) is not dict or body.get("schema_version") not in
+            (DECLARED_SLOT_PRECOMMIT_SCHEMA, DECLARED_SLOT_PRECOMMIT_SCHEMA_V2)):
+        _fail("DECLARED_SLOT_PRECOMMIT_INVALID")
+    fields = {"schema_version", "run_id", "generation_id",
+            "generation_context_sha256", "native_universe_sha256", "config_sha256",
+            "effective_config_sha256", "search_process_receipt_sha256", "source_identity",
+            "slot_roster", "slot_roster_sha256", "cells", "spread_profile_identity",
+            "launch_activation_utc", "protected_end_exclusive_utc",
+            "source_access_window_utc", "precommitted_at_utc", "qualification_authority",
+            "capital_authority", "live_authority", "order_authority"}
+    if body.get("schema_version") == DECLARED_SLOT_PRECOMMIT_SCHEMA_V2:
+        fields.add("winner_transport_edition")
+    if set(body) != fields:
+        _fail("DECLARED_SLOT_PRECOMMIT_INVALID")
+    declared_slot_transport_edition(body)
+    _safe_id(body["run_id"], "DECLARED_SLOT_PRECOMMIT_INVALID")
+    _hex(body["effective_config_sha256"], "DECLARED_SLOT_CONFIG_INVALID")
+    _hex(body["search_process_receipt_sha256"], "DECLARED_SLOT_PROCESS_INVALID")
+    _utc(body["launch_activation_utc"], "DECLARED_SLOT_LAUNCH_INVALID")
+    if body["protected_end_exclusive_utc"] != _DECLARED_PROTECTED_END_EXCLUSIVE_UTC:
+        _fail("DECLARED_SLOT_PROTECTED_END_INVALID")
+    _declared_roster(body["slot_roster"],
+        launch_activation_utc=body["launch_activation_utc"],
+        protected_end_exclusive_utc=_DECLARED_PROTECTED_END_EXCLUSIVE_UTC)
+    if body["slot_roster"]["config_identity_refs"] != {"config_sha256": context.config_sha256,
+            "effective_config_sha256": body["effective_config_sha256"]}:
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    cells = body["cells"]
+    if (type(cells) is not list or len(cells) != 1 or type(cells[0]) is not dict
+            or set(cells[0]) != {"cell_id", "symbol", "timeframe", "regime"}):
+        _fail("DECLARED_SLOT_CELL_INVALID")
+    import pm_winner_selection as selection
+    cell = cells[0]
+    if (cell["symbol"] not in book.PINNED_SYMBOL_ORDER or cell["timeframe"] not in book.TIMEFRAME_ORDER
+            or cell["regime"] not in book.REGIME_ORDER
+            or cell["cell_id"] != selection.compute_cell_id(cell["symbol"], cell["timeframe"], cell["regime"])):
+        _fail("DECLARED_SLOT_CELL_INVALID")
+    profile, window = body["spread_profile_identity"], body["source_access_window_utc"]
+    if type(profile) is not dict or set(profile) != {"profile_sha256"}:
+        _fail("DECLARED_SLOT_PROFILE_INVALID")
+    _hex(profile["profile_sha256"], "DECLARED_SLOT_PROFILE_INVALID")
+    if type(window) is not dict or set(window) != {"start_utc", "end_exclusive_utc"}:
+        _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    start = _utc(window["start_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    end = _utc(window["end_exclusive_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    committed = _utc(body["precommitted_at_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    if not start <= committed < end:
+        _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+
+
+def _make_declared_precommit_authority():
+    issued = {}
+    def register(value, context):
+        issued[id(value)] = (value, value._body_json, id(context))
+    def verify(value, context):
+        row = issued.get(id(value))
+        if row is None or row[0] is not value or row[1] != value._body_json or row[2] != id(context):
+            _fail("DECLARED_SLOT_PRECOMMIT_CAPABILITY_INVALID")
+    return register, verify
+
+
+_register_declared_precommit, _verify_declared_precommit_identity = _make_declared_precommit_authority()
+
+
+def reopen_declared_slot_owner_run_precommit(context, *, receipt_sha256, process, frozen_pipeline_config):
+    digest = _hex(receipt_sha256, "DECLARED_SLOT_PRECOMMIT_INVALID")
+    observed_hash, _, encoded = authority_spool._stream_file(context.root,
+        f"declared-slots/{digest}/precommit.json", maximum_bytes=_MAX_PRECOMMIT_BYTES, collect=True)
+    if observed_hash != digest or encoded is None:
+        _fail("DECLARED_SLOT_PRECOMMIT_INVALID")
+    body = authority_spool._strict_json_bytes(encoded, _MAX_PRECOMMIT_BYTES)
+    if _declared_json(body) != encoded:
+        _fail("DECLARED_SLOT_PRECOMMIT_INVALID")
+    _validate_declared_precommit_body(context, body)
+    import pm_production_config_binding as config_binding
+    import pm_spread_profile as spread_profile
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    config = frozen_pipeline_config.materialize(context)
+    if (frozen_pipeline_config.effective_config_sha256 != body["effective_config_sha256"]
+            or config.discovery_risk_per_trade_pct != 1.0):
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    profile = spread_profile.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
+    if profile.sha256 != body["spread_profile_identity"]["profile_sha256"]:
+        _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    result = DeclaredSlotRunPrecommit(encoded, _DECLARED_SLOT_SEAL)
+    _register_declared_precommit(result, context)
+    verify_declared_slot_owner_run_precommit(context, result, process=process)
+    return result
+
+
+__all__ += ["reopen_declared_slot_owner_run_precommit"]

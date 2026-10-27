@@ -1,4 +1,4 @@
-"""Bounded production of decision-v9 historical causal evidence.
+"""Bounded production of decision-v10 historical causal evidence.
 
 The producer in this module is deliberately an adapter, not an authority.  It
 reopens an already verified historical-anchor orchestration run and a sealed,
@@ -8,7 +8,7 @@ derived from those bytes.  Callers cannot supply return vectors or evidence
 hashes.
 
 The resulting payloads still have to pass :mod:`pm_causal_process`'s released
-decision-v9 evaluator and verifier before a ``CausalEvidenceProduct`` is
+decision-v10 evaluator and verifier before a ``CausalEvidenceProduct`` is
 returned.  No current-refit, capital, publication, or trading authority is
 created here.
 """
@@ -20,6 +20,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, DecimalException
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import threading
@@ -36,9 +37,9 @@ import pm_winner_selection as winner_selection
 
 
 EVENT_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-portfolio-event-ledger.v1"
-FILL_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-fill-ledger.v1"
+FILL_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-fill-ledger.v2"
 MTM_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-daily-mtm-ledger.v1"
-COST_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-cost-ledger.v2"
+COST_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-cost-ledger.v3"
 EXPOSURE_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-exposure-ledger.v1"
 MARGIN_LEDGER_SCHEMA: Final = "fxpm.anchor-raw-margin-ledger.v1"
 SPECIALIST_SCHEMA: Final = "fxpm.anchor-replayed-specialist.v1"
@@ -257,7 +258,7 @@ _RAW_OPEN_FIELDS: Final = frozenset(
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     }
 )
 _RAW_CARRIED_OPEN_FIELDS: Final = frozenset(
@@ -273,7 +274,7 @@ _RAW_CLOSE_FIELDS: Final = frozenset(
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     }
 )
 _RAW_MARK_FIELDS: Final = frozenset(
@@ -287,7 +288,7 @@ _RAW_MARK_FIELDS: Final = frozenset(
     }
 )
 _MARK_COST_FIELDS: Final = frozenset(
-    {"event_id", "base_financing_cash", "stress_financing_cash"}
+    {"event_id", "base_financing_cash", "p75_financing_cash"}
 )
 _EXPOSURE_POSITION_FIELDS: Final = frozenset(
     {
@@ -484,7 +485,7 @@ def _forward_oos_replay_lineage(
     dict[str, tuple[Any, ...]],
     dict[str, dict[str, Any]],
 ]:
-    """Verify the sealed forward product and derive its persistent v9 lineage."""
+    """Verify the sealed forward product and derive its persistent v10 lineage."""
 
     try:
         # Local import avoids the intentional module cycle: the forward
@@ -830,7 +831,7 @@ class AnchorReplayArtifactDescriptors:
 
 @dataclass(frozen=True, slots=True)
 class FrozenCausalProcessPrecommit:
-    """Immutable canonical decision-v9 precommitment and identity manifest."""
+    """Immutable canonical decision-v10 precommitment and identity manifest."""
 
     _body_json: bytes
     _identity_manifest_json: bytes
@@ -976,7 +977,7 @@ def _policy_identities(
     return identities, manifests
 
 
-def freeze_causal_process_precommit_v9(
+def freeze_causal_process_precommit_v10(
     *,
     context: authority_spool.GenerationSpoolContext,
     search_process: Any,
@@ -1042,7 +1043,7 @@ def freeze_causal_process_precommit_v9(
             )
             for value in anchors
         ]
-        # Decision-v9 owns ordering, purge, overlap, and 4-16 bounds.
+        # Decision-v10 owns ordering, purge, overlap, and 4-16 bounds.
         causal._validate_anchor_plan(normalized_anchors)
         root = (
             Path(__file__).resolve().parent
@@ -1068,7 +1069,7 @@ def freeze_causal_process_precommit_v9(
         access_not_before = authorized
         deadline = authorized + timedelta(seconds=evidence_access_window_seconds)
         definition = {
-            "schema": "fxpm-frozen-historical-institution-process-v9",
+            "schema": "fxpm-frozen-historical-institution-process-v10",
             "symbols": list(causal.SYMBOLS),
             "timeframes": list(causal.TIMEFRAMES),
             "regimes": list(causal.REGIMES),
@@ -1139,7 +1140,7 @@ def freeze_causal_process_precommit_v9(
     except CausalEvidenceProductionError:
         raise
     except causal.ProcessVerificationError as exc:
-        raise CausalEvidenceProductionError("PRECOMMIT_V9_REJECTED") from exc
+        raise CausalEvidenceProductionError("PRECOMMIT_V10_REJECTED") from exc
     except Exception as exc:
         raise CausalEvidenceProductionError("PRECOMMIT_FREEZE_FAILED") from exc
 
@@ -1366,11 +1367,637 @@ def _validate_common_ledger(
     return ledger
 
 
+@dataclass(frozen=True, slots=True)
+class FrozenTierRawAccountsArtifact:
+    """Content-addressed raw R&D account transport; grants no authority."""
+
+    descriptor: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenTierRawAccountsProjection:
+    cell_id: str
+    account_tiers: tuple[str, ...]
+    descriptor_sha256: str
+    accounts: Mapping[str, Any]
+    qualification_authority: bool = False
+
+    def require_interval_qualification(self) -> None:
+        _fail("FROZEN_TIER_INTERVAL_QUALIFICATION_NOT_IMPLEMENTED")
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredCellRawAccountArtifact:
+    """Descriptor of one declared-cell raw account; grants no authority."""
+
+    descriptor: Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredCellRawAccountProjection:
+    cell_id: str
+    descriptor_sha256: str
+    progress_status: str
+    reason_code: str | None
+    slot_schedule: tuple[Mapping[str, Any], ...]
+    owner_records: tuple[Mapping[str, Any], ...]
+    account: Mapping[str, Any] | None
+    qualification_authority: bool = False
+    capital_authority: bool = False
+    live_authority: bool = False
+    order_authority: bool = False
+    _verified_body_json: bytes = b"{}"
+
+    @property
+    def verified_body(self) -> dict[str, Any]:
+        """Return a fresh view of the exact verified, nonauthorizing body."""
+        return json.loads(self._verified_body_json.decode("utf-8"))
+
+    def _verified_result_value(self, name: str) -> Any:
+        body = self.verified_body
+        if body.get("progress_status") != "COMPLETE" or body.get("account") is None:
+            return None
+        return body["account"]["engine_result"][name]
+
+    @property
+    def net_account_profit(self) -> Any:
+        return self._verified_result_value("net_account_profit")
+
+    @property
+    def final_equity(self) -> Any:
+        return self._verified_result_value("final_equity")
+
+    @property
+    def terminal(self) -> Any:
+        return self._verified_result_value("terminal")
+
+    @property
+    def first_depletion_bar(self) -> Any:
+        return self._verified_result_value("first_depletion_bar")
+
+    @property
+    def max_drawdown_pct(self) -> Any:
+        return self._verified_result_value("max_drawdown_pct")
+
+    @property
+    def admissible(self) -> bool:
+        """Raw account completeness, never interval qualification."""
+        return self.progress_status == "COMPLETE" and self.account is not None
+
+    def require_interval_qualification(self) -> None:
+        _fail("DECLARED_CELL_INTERVAL_QUALIFICATION_NOT_IMPLEMENTED")
+
+
+def _reopen_frozen_transport_source(
+    context, identity, config, *, pin_consumed_activation=False,
+):
+    """Use the retained native verifier so source and financing attrs survive."""
+    import pm_native_prefix_production as native
+    import pm_forward_oos_replay_producer as forward
+
+    try:
+        pinned = ({"pinned_activation_manifest_sha256": identity["activation_manifest_sha256"]}
+                  if pin_consumed_activation else {})
+        product = native.verify_activated_native_prefix(
+            data_dir=Path(config.data_dir), context=context,
+            index_descriptor=identity["index_descriptor"], expected_index_sha256=identity["index_sha256"],
+            expected_symbol=identity["symbol"], expected_timeframe=identity["timeframe"],
+            expected_cutoff_utc=identity["cutoff_utc"],
+            expected_activation_manifest_sha256=identity["activation_manifest_sha256"],
+            production_contract_required=not bool(config.research_mode), require_current_activation=False,
+            **pinned)
+        observed = forward._native_product_identity(product, expected_symbol=identity["symbol"],
+            expected_timeframe=identity["timeframe"], expected_cutoff_utc=identity["cutoff_utc"], role=identity["role"])
+        if observed != identity:
+            _fail("FROZEN_TIER_NATIVE_SOURCE_IDENTITY_CHANGED")
+        return native.open_verified_prefix_frame(product), product
+    except CausalEvidenceProductionError:
+        raise
+    except (native.NativePrefixError, forward.ForwardOOSReplayProductionError, KeyError, TypeError, ValueError) as exc:
+        raise CausalEvidenceProductionError("FROZEN_TIER_NATIVE_SOURCE_REOPEN_FAILED") from exc
+
+
+def _frozen_spread_read_model(derived: Mapping[str, Any], schema: str) -> dict[str, Any]:
+    """Reconstruct recorded metadata; v1 is an archive format, never execution."""
+    import pm_forward_oos_replay_producer as forward
+
+    result = dict(derived)
+    if schema == forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA:
+        result.pop("entry_admission_schema", None)
+        result["entry_admission_policy"] = "EXACT_PRIOR_FINE_CLOSE_CAP_MISSING_UNTESTED"
+    elif schema not in (forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+                         forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA):
+        _fail("FROZEN_TIER_RAW_SCHEMA_UNSUPPORTED")
+    return result
+
+
+def _verify_frozen_execution_spread_model(
+    derived: Mapping[str, Any], stored: Mapping[str, Any], schema: str,
+    *, features: Any, tier: Any, observations: Any,
+) -> dict[str, Any]:
+    """Rebuild execution bindings without changing retained/archive formats."""
+    import pandas as pd
+    import pm_forward_oos_replay_producer as forward
+
+    result = dict(derived)
+    if schema == forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA:
+        _, binding = forward.Backtester._entry_spread_admission_inputs(features, tier, observations)
+        result.update(binding)
+    else:
+        result["entry_observations_sha256"] = hashlib.sha256(
+            pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest()
+    result = _frozen_spread_read_model(result, schema)
+    if forward._raw_json(result) != stored:
+        _fail("FROZEN_TIER_EXECUTION_SPREAD_MODEL_CHANGED")
+    return result
+
+
+def _verify_frozen_spread_admission(*, schema: str, account: Mapping[str, Any], observations: Any,
+                                  tier: Any, opportunities: Any = None) -> None:
+    import numpy as np
+    import pm_forward_oos_replay_producer as forward
+
+    archived = schema == forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA
+    if not archived and schema not in (forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+                                       forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA):
+        _fail("FROZEN_TIER_RAW_SCHEMA_UNSUPPORTED")
+    admission, model = account["engine_spread_admission"], account["engine_spread_model"]
+    fields = {"signal_opportunities", "known_cap_pass_opportunities", "known_cap_refused_opportunities",
+              "entry_observations_sha256", "entry_admission_mask_sha256",
+              "input_provenance_authenticated", "qualification_authority"}
+    if archived:
+        missing_count, executed_count = "untested_missing_observation_opportunities", "untested_executed_legs"
+        if (model.get("entry_admission_policy") != "EXACT_PRIOR_FINE_CLOSE_CAP_MISSING_UNTESTED"
+                or "entry_admission_schema" in model):
+            _fail("FROZEN_TIER_ADMISSION_VERSION_MISMATCH")
+    else:
+        fields |= {"schema_version", "entry_admission_policy"}
+        missing_count, executed_count = "missing_refused_opportunities", "missing_executed_legs"
+        if (model.get("entry_admission_policy") != forward.spread_profile.ADMISSION_POLICY
+                or model.get("entry_admission_schema") != forward.spread_profile.ADMISSION_SCHEMA
+                or admission.get("entry_admission_policy") != forward.spread_profile.ADMISSION_POLICY
+                or admission.get("schema_version") != forward.spread_profile.ADMISSION_SCHEMA):
+            _fail("FROZEN_TIER_ADMISSION_VERSION_MISMATCH")
+    fields |= {missing_count, executed_count}
+    _exact_dict(admission, fields, "FROZEN_TIER_ADMISSION_VERSION_MISMATCH")
+    states = np.array([forward.spread_profile.spread_admission(tier, value) for value in observations])
+    allowed = states != "REFUSE" if archived else states == "ADMIT"
+    observations_sha = hashlib.sha256(
+        forward.pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest()
+    if (admission["entry_observations_sha256"] != observations_sha
+            or admission["entry_admission_mask_sha256"] != hashlib.sha256(allowed.astype(np.uint8).tobytes()).hexdigest()):
+        _fail("FROZEN_TIER_ENTRY_ADMISSION_BINDING_CHANGED")
+    counts = ("signal_opportunities", "known_cap_pass_opportunities", "known_cap_refused_opportunities", missing_count, executed_count)
+    scored = states[max(1, account["warmup_bars"]):]
+    if (any(type(admission[name]) is not int or admission[name] < 0 for name in counts)
+            or admission["signal_opportunities"] != sum(admission[name] for name in counts[1:4])
+            or admission["known_cap_pass_opportunities"] > int((scored == "ADMIT").sum())
+            or admission["known_cap_refused_opportunities"] > int((scored == "REFUSE").sum())
+            or admission[missing_count] > int((scored == "MISSING").sum())
+            or admission[executed_count] != 0):
+        _fail("FROZEN_TIER_ADMISSION_COUNTS_INVALID")
+    if not archived:
+        if (not isinstance(opportunities, np.ndarray) or opportunities.dtype != np.dtype(bool)
+                or opportunities.shape != states.shape):
+            _fail("FROZEN_TIER_ORIGINAL_SIGNAL_OPPORTUNITIES_UNAVAILABLE")
+        expected_counts = {"signal_opportunities": int(opportunities.sum()),
+            "known_cap_pass_opportunities": int((opportunities & (states == "ADMIT")).sum()),
+            "known_cap_refused_opportunities": int((opportunities & (states == "REFUSE")).sum()),
+            missing_count: int((opportunities & (states == "MISSING")).sum())}
+        if any(admission[name] != value for name, value in expected_counts.items()):
+            _fail("FROZEN_TIER_ADMISSION_COUNTS_INVALID")
+    if archived and bool(observations.iloc[account["warmup_bars"]:].isna().any()):
+        _fail("FROZEN_TIER_PRIOR_FINE_ROW_UNAVAILABLE")
+
+
+def _materialize_tier_source_rows(account: Mapping[str, Any], expected_retained: Any,
+                                  entry_half: Any, intrabar_half: Any,
+                                  spread_meta: Mapping[str, Any]) -> dict[str, Any]:
+    import pm_forward_oos_replay_producer as forward
+
+    fields = {"symbol", "timeframe", "cell_id", "tier", "initial_cash", "warmup_bars",
+              "instrument_spec", "position_namespace", "trades", "position_events",
+              "engine_equity", "engine_equity_growth", "engine_spread_admission",
+              "engine_spread_model", "execution_cost_timing_contract",
+              "numerical_execution_cost_attestation", "financing_model", "derived", "valuation_source"}
+    _exact_dict(account, fields, "FROZEN_TIER_ACCOUNT_FIELDS_INVALID")
+    curve = account["engine_equity"]
+    if type(curve) is not list or not curve or len(curve) != len(expected_retained):
+        _fail("FROZEN_TIER_ENGINE_EQUITY_AXIS_MISSING")
+    for value in curve:
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            valid = False
+        if not valid:
+            _fail("FROZEN_TIER_ENGINE_EQUITY_MARK_UNAVAILABLE")
+    result = {key: value for key, value in account.items() if key != "engine_equity"}
+    result["source_rows"] = forward._tier_source_rows(
+        expected_retained, entry_half, intrabar_half, spread_meta, curve)
+    return result
+
+
+def _read_frozen_tier_raw_accounts(
+    context: authority_spool.GenerationSpoolContext,
+    artifact: FrozenTierRawAccountsArtifact,
+    anchor: Mapping[str, Any],
+) -> FrozenTierRawAccountsProjection:
+    import numpy as np
+    import pandas as pd
+    import pm_forward_oos_replay_producer as forward
+
+    try:
+        if type(artifact) is not FrozenTierRawAccountsArtifact:
+            _fail("FROZEN_TIER_RAW_DESCRIPTOR_INVALID")
+        raw_descriptor = _descriptor(artifact.descriptor, "FROZEN_TIER_RAW_DESCRIPTOR_INVALID")
+        body = _read_descriptor_json(context, raw_descriptor, code="FROZEN_TIER_RAW_ACCOUNTS", maximum=_MAX_RAW_ARTIFACT_BYTES)
+        fields = {"schema_version", "generation_id", "anchor", "capital_phase", "capital_window", "genesis", "full_book_descriptor",
+                  "original_precommit_anchor", "cell_projection", "owner_provenance", "execution_source",
+                  "execution_spec_receipt", "spread_source", "spread_source_execution_spec_receipt",
+                  "source_observations", "spread_source_rows", "frozen_profile_descriptor", "accounts", "qualification_authority", "coverage_contract", "selection_policy",
+                  "owner_source", "original_global_precommit_descriptor", "pipeline_config_binding", "deployment_source_descriptors",
+                  "precommit_binding_scope", "release_authority_status"}
+        schema = body.get("schema_version") if type(body) is dict else None
+        if schema not in (forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+                          forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+                          forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA):
+            _fail("FROZEN_TIER_RAW_SCHEMA_UNSUPPORTED")
+        compact = schema == forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA
+        if compact:
+            fields -= {"source_observations", "spread_source_rows"}
+        _exact_dict(body, fields, "FROZEN_TIER_RAW_FIELDS_INVALID")
+        if (body["generation_id"] != context.generation_id or body["anchor"] != anchor
+                or body["qualification_authority"] is not False
+                or body["owner_provenance"].get("qualification_authority") is not False
+                or body["precommit_binding_scope"] != "REOPENED_INPUT_DESCRIPTOR_IDENTITY_NOT_ISSUED_RELEASE_AUTHORITY"
+                or body["release_authority_status"] != "UNAVAILABLE_AUTHORITY_MIGRATION_NOT_IMPLEMENTED"
+                or body["coverage_contract"] != "ACTUAL_CLOSE_AND_AVAILABLE_M5_MARKS_NOT_COMPLETE_DAILY_VALUATION"
+                or body["selection_policy"] != "P75_REQUIRED_P95_PREFERRED_AMONG_P75_PASSES"):
+            _fail("FROZEN_TIER_RAW_BINDING_INVALID")
+        projection, original = body["cell_projection"], body["original_precommit_anchor"]
+        _exact_dict(projection, {"cell_id", "process_sha256"}, "FROZEN_TIER_PROJECTION_INVALID")
+        if (original.get("full_book_descriptor") != body["full_book_descriptor"]
+                or original.get("full_book_sha256") != body["full_book_descriptor"].get("sha256")):
+            _fail("FROZEN_TIER_ORIGINAL_BOOK_BINDING_INVALID")
+        full_book = _read_descriptor_json(context, body["full_book_descriptor"], code="FROZEN_TIER_ORIGINAL_BOOK", maximum=_MAX_RAW_ARTIFACT_BYTES)
+        full_book = forward._owned_book(full_book, full_book.get("receipt_sha256"))
+        selected = [cell for cell in full_book.get("cells", ()) if type(cell) is dict and cell.get("cell_id") == projection["cell_id"]]
+        if len(selected) != 1 or selected[0].get("local_process_sha256") != projection["process_sha256"]:
+            _fail("FROZEN_TIER_ORIGINAL_BOOK_OWNER_MISMATCH")
+        original_owner = forward._reopen_owner_capture(context=context, anchor=anchor, book_body=full_book,
+            cell_id=projection["cell_id"], symbol_receipt=body["owner_source"]["symbol_receipt"],
+            adapter_index_descriptor=body["owner_source"]["adapter_index_descriptor"])
+        if (forward._owner_provenance(original_owner) != body["owner_provenance"]
+                or original_owner.process_sha256 != projection["process_sha256"]):
+            _fail("FROZEN_TIER_ORIGINAL_OWNER_PROVENANCE_CHANGED")
+        original_global = _read_descriptor_json(context, body["original_global_precommit_descriptor"],
+            code="FROZEN_TIER_ORIGINAL_GLOBAL_PRECOMMIT")
+        config, deployment, retained_deployment_bytes = forward._reopen_retained_deployment(
+            context=context, descriptors=body["deployment_source_descriptors"],
+            original_receipt=original_global["deployment_binding"], config_record=body["pipeline_config_binding"])
+        forward._reopen_original_global_precommit(context=context, descriptor=body["original_global_precommit_descriptor"],
+            precommit_anchor=original, deployment=deployment)
+        if (body["capital_phase"] not in forward.CAPITAL_PHASES
+                or original.get("anchor_id") != anchor.get("anchor_id")
+                or forward._original_capital_window(anchor, original, body["capital_phase"]) != body["capital_window"]):
+            _fail("FROZEN_TIER_ORIGINAL_WINDOW_BINDING_CHANGED")
+        start, end = forward._capital_window_datetimes(body["capital_window"],
+            phase_id=forward._capital_phase_id(anchor["anchor_id"], body["capital_phase"]))
+        def original_roster(field, digest_key):
+            values = original.get(field)
+            if type(values) is not list or original.get(digest_key) != forward._sha(values):
+                _fail("FROZEN_TIER_ORIGINAL_SOURCE_ROSTER_CHANGED")
+            result = {str(value.get("role")).rsplit(":", 1)[-1]: value for value in values if type(value) is dict}
+            if len(result) != len(values):
+                _fail("FROZEN_TIER_ORIGINAL_SOURCE_ROSTER_CHANGED")
+            return result
+        execution_roster = original_roster("execution_products", "execution_product_roster_sha256")
+        fine_roster = original_roster("spread_source_products", "spread_source_product_roster_sha256")
+        valuation_roster = original_roster("valuation_m5_products", "valuation_m5_product_roster_sha256")
+        for identity, roster in ((body["execution_source"], execution_roster), (body["spread_source"], fine_roster)):
+            key = forward.native_product_key(identity["symbol"], identity["timeframe"])
+            if roster.get(key) != identity:
+                _fail("FROZEN_TIER_USED_SOURCE_PRECOMMIT_SPLICE")
+        accounts = body["accounts"]
+        if type(accounts) is not dict or list(accounts) != ["P75", "P95"]:
+            # Canonical JSON sorts these two names in the same order.
+            _fail("FROZEN_TIER_ACCOUNT_ROSTER_INVALID")
+        descriptors = [dict(accounts[level]["tier"]) for level in ("P75", "P95")]
+        for value, level in zip(descriptors, ("P75", "P95"), strict=True):
+            if value.pop("tier") != level:
+                _fail("FROZEN_TIER_ACCOUNT_ROSTER_INVALID")
+            value.pop("spread_points")
+            value.pop("full_spread_price")
+        if descriptors[0] != descriptors[1] or accounts["P95"]["tier"]["spread_points"] < accounts["P75"]["tier"]["spread_points"]:
+            _fail("FROZEN_TIER_PROFILE_PAIR_SPLICE")
+        if not compact:
+            fine_rows = body["spread_source_rows"]
+            if type(fine_rows) is not list or not fine_rows:
+                _fail("FROZEN_TIER_CAPTURED_FINE_TIMEFRAME_UNAVAILABLE")
+            fine_frame = pd.DataFrame({"Spread": [row["spread_points"] for row in fine_rows],
+                                       "_BAR_CLOSE_TS": [row["close_utc"] for row in fine_rows]},
+                                      index=pd.DatetimeIndex([row["open_utc"] for row in fine_rows]))
+        try:
+            profile_descriptor, _ = forward.native_prefix._read_spool_descriptor(
+                context, body["frozen_profile_descriptor"], expected_format="json-profile", collect=False)
+            profile = forward.spread_profile.FrozenSpreadProfile(Path(context.root) / profile_descriptor["relative_path"])
+            if profile.sha256 != profile_descriptor["sha256"]:
+                _fail("FROZEN_TIER_PROFILE_ARTIFACT_CHANGED")
+            for receipt, identity in ((body["execution_spec_receipt"], body["execution_source"]),
+                                      (body["spread_source_execution_spec_receipt"], body["spread_source"])):
+                unsigned = dict(receipt)
+                receipt_sha = unsigned.pop("receipt_sha256", None)
+                if (receipt_sha != forward._sha(unsigned)
+                        or receipt.get("native_prefix_index_sha256") != identity["index_sha256"]
+                        or receipt.get("grants_search_authority") is not False
+                        or receipt.get("grants_trading_authority") is not False
+                        or receipt.get("instrument_spec") != body["execution_spec_receipt"].get("instrument_spec")):
+                    _fail("FROZEN_TIER_EXECUTION_SPEC_RECEIPT_CHANGED")
+            reopened_fine, fine_product = _reopen_frozen_transport_source(context, body["spread_source"], config)
+            if compact:
+                fine_frame = reopened_fine
+            else:
+                expected_fine = [{"open_utc": stamp.isoformat(), "close_utc": reopened_fine["_BAR_CLOSE_TS"].iloc[index].isoformat(),
+                                  "spread_points": (None if pd.isna(reopened_fine["Spread"].iloc[index])
+                                                    else float(reopened_fine["Spread"].iloc[index]))}
+                                 for index, stamp in enumerate(reopened_fine.index)]
+                if expected_fine != fine_rows:
+                    _fail("FROZEN_TIER_FINE_SOURCE_ROWS_CHANGED")
+            reopened_execution, execution_product = _reopen_frozen_transport_source(context, body["execution_source"], config)
+            actual_spec, actual_receipt = forward._derive_retained_execution_spec(product=execution_product,
+                deployment=deployment, source_bytes=retained_deployment_bytes)
+            _, actual_fine_receipt = forward._derive_retained_execution_spec(product=fine_product,
+                deployment=deployment, source_bytes=retained_deployment_bytes)
+            if actual_receipt != body["execution_spec_receipt"] or actual_fine_receipt != body["spread_source_execution_spec_receipt"]:
+                _fail("FROZEN_TIER_EXECUTION_SPEC_RECEIPT_CHANGED")
+            expected_retained = reopened_execution.loc[reopened_execution["_BAR_CLOSE_TS"] <= end]
+            expected_warmup = int(expected_retained.index.searchsorted(start, side="left"))
+            if not 1 <= expected_warmup < len(expected_retained) or not bool((expected_retained.index < end).all()):
+                _fail("FROZEN_TIER_PRECOMMITTED_WINDOW_UNAVAILABLE")
+            observations, matched_closes = forward.spread_profile.align_prior_completed_spreads(
+                (expected_retained.index if compact else
+                 pd.DatetimeIndex([row["target_open_utc"] for row in body["source_observations"]])), fine_frame,
+                accounts["P75"]["tier"]["source_timeframe"], include_matched_closes=True)
+            if schema == forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA:
+                expected_observations = [{"target_open_utc": stamp.isoformat(), "prior_fine_close_utc": stamp.isoformat(),
+                    "points": None if pd.isna(value) else float(value)} for stamp, value in observations.items()]
+            else:
+                expected_observations = forward._spread_source_observations(observations, matched_closes)
+            if not compact and expected_observations != body["source_observations"]:
+                _fail("FROZEN_TIER_SOURCE_OBSERVATIONS_CHANGED")
+            opportunities = None
+            if schema in (forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+                          forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA):
+                _, original_signals = forward._features_and_prefix_parity(expected_retained, [original_owner])
+                signal = original_signals[original_owner.cell_id]
+                if not signal.index.equals(expected_retained.index):
+                    _fail("FROZEN_TIER_ORIGINAL_SIGNAL_OPPORTUNITIES_UNAVAILABLE")
+                opportunities = np.zeros(len(expected_retained), dtype=bool)
+                scored_start = max(1, expected_warmup)
+                opportunities[scored_start:] = signal.to_numpy(dtype=np.int32)[scored_start - 1:-1] != 0
+            for level, account in accounts.items():
+                tier = profile.from_descriptor(account["tier"], symbol=account["symbol"], timeframe=account["timeframe"],
+                    point=account["instrument_spec"]["point"], source_identity_sha256=body["execution_source"]["source_identity_sha256"])
+                binding = tier.descriptor()["source_binding"]
+                if (tier.source_timeframe != body["spread_source"]["timeframe"]
+                        or binding["bars_sha256"] != body["spread_source"]["source_bars_sha256"]
+                        or binding["sidecar_sha256"] != body["spread_source"]["source_audit_sidecar_sha256"]
+                        or binding["provenance_sha256"] != body["spread_source"]["source_provenance_sha256"]
+                        or binding["target_bars_sha256"] != body["execution_source"]["source_bars_sha256"]
+                        or tier.descriptor()["activation"]["id"] != body["spread_source"]["activation_id"]
+                        or tier.descriptor()["activation"]["manifest_sha256"] != body["spread_source"]["activation_manifest_sha256"]
+                        or body["spread_source"]["source_identity_sha256"] != body["execution_source"]["source_identity_sha256"]):
+                    _fail("FROZEN_TIER_PROFILE_SOURCE_BINDING_MISMATCH")
+                if (account["cell_id"] != projection["cell_id"] or account["tier"]["tier"] != level
+                        or account["initial_cash"] != float(config.initial_capital)
+                        or account["position_namespace"] != "|".join((original_owner.symbol, original_owner.timeframe,
+                            str(getattr(forward._strategy(original_owner), "name", original_owner.strategy_class))))
+                        or body["genesis"] != {"mode": forward.NEW_SIMULATED_FLAT_GENESIS,
+                            "initial_cash": account["initial_cash"], "initial_inventory": [], "owner_changes": []}
+                        or account["instrument_spec"] != body["execution_spec_receipt"].get("instrument_spec")
+                        or account["engine_spread_admission"].get("input_provenance_authenticated") is not False
+                        or account["engine_spread_admission"].get("qualification_authority") is not False):
+                    _fail("FROZEN_TIER_ACCOUNT_GENESIS_OR_TERMS_SPLICE")
+                if not compact:
+                    if [row["open_utc"] for row in account["source_rows"]] != [row["target_open_utc"] for row in expected_observations]:
+                        _fail("FROZEN_TIER_ACCOUNT_OBSERVATION_AXIS_SPLICE")
+                    if (account["warmup_bars"] != expected_warmup
+                            or [row["open_utc"] for row in account["source_rows"]] != [stamp.isoformat() for stamp in expected_retained.index]
+                            or any(pd.Timestamp(row["close_utc"]) > end for row in account["source_rows"][expected_warmup:])):
+                        _fail("FROZEN_TIER_RETAINED_WINDOW_OR_WARMUP_CHANGED")
+                actual_entry_half, actual_intrabar_half, actual_spread_meta = forward.Backtester(config)._build_half_spread_arrays(
+                    expected_retained, actual_spec, spread_tier=tier, timeframe=account["timeframe"])
+                # V3 run() records the complete admission binding. Rebuild it
+                # from authenticated observations; v1/v2 retain obs-only models.
+                actual_spread_meta = _verify_frozen_execution_spread_model(
+                    actual_spread_meta, account["engine_spread_model"], schema,
+                    features=expected_retained, tier=tier, observations=observations)
+                if compact:
+                    account = _materialize_tier_source_rows(account, expected_retained,
+                        actual_entry_half, actual_intrabar_half, actual_spread_meta)
+                    accounts[level] = account
+                    if [row["open_utc"] for row in account["source_rows"]] != [row["target_open_utc"] for row in expected_observations]:
+                        _fail("FROZEN_TIER_ACCOUNT_OBSERVATION_AXIS_SPLICE")
+                    if (account["warmup_bars"] != expected_warmup
+                            or [row["open_utc"] for row in account["source_rows"]] != [stamp.isoformat() for stamp in expected_retained.index]
+                            or any(pd.Timestamp(row["close_utc"]) > end for row in account["source_rows"][expected_warmup:])):
+                        _fail("FROZEN_TIER_RETAINED_WINDOW_OR_WARMUP_CHANGED")
+                _verify_frozen_spread_admission(schema=schema, account=account, observations=observations,
+                    tier=tier, opportunities=opportunities)
+                entry_column, bar_column = actual_spread_meta["entry_column"], actual_spread_meta["bar_column"]
+                def source_points(source, column):
+                    return None if column not in source or pd.isna(source[column]) else float(source[column])
+                for row_index, row in enumerate(account["source_rows"]):
+                    source = reopened_execution.loc[pd.Timestamp(row["open_utc"])]
+                    if (row["close_utc"] != source["_BAR_CLOSE_TS"].isoformat()
+                            or row["open"] != float(source["Open"]) or row["close"] != float(source["Close"])
+                            or row["high"] != float(source["High"]) or row["low"] != float(source["Low"])
+                            or row["recorded_entry_points"] != source_points(source, entry_column)
+                            or row["recorded_intrabar_points"] != source_points(source, bar_column)
+                            or row["entry_half_spread"] != float(actual_entry_half[row_index])
+                            or row["intrabar_half_spread"] != float(actual_intrabar_half[row_index])):
+                        _fail("FROZEN_TIER_EXECUTION_SOURCE_ROWS_CHANGED")
+                for trade in account["trades"]:
+                    value = observations.iloc[trade["entry_bar"]]
+                    if pd.isna(value) or value > account["tier"]["spread_points"] or trade.get("entry_spread_admission") != "ADMIT":
+                        _fail("FROZEN_TIER_TRADE_ADMISSION_RECONCILIATION_FAILED")
+                entry_prices = np.full(len(expected_retained), np.nan)
+                for trade in account["trades"]:
+                    entry_prices[trade["entry_bar"]] = trade["entry_price"]
+                pre, close, long_rates, short_rates, enabled, contract = forward.Backtester(config)._build_causal_swap_inputs(
+                    expected_retained, actual_spec, entry_prices, timeframe=account["timeframe"])
+                reconstructed_model = {"pre_open_units": forward._raw_json(pre), "close_units": forward._raw_json(close),
+                    "long_per_lot": forward._raw_json(long_rates), "short_per_lot": forward._raw_json(short_rates),
+                    "enabled": bool(enabled), "contract": forward._raw_json(contract)}
+                if reconstructed_model != account["financing_model"]:
+                    _fail("FROZEN_TIER_ORIGINAL_FINANCING_MODEL_CHANGED")
+                rebuilt = forward._reconcile_tier_account(account)
+                if rebuilt != account["derived"]:
+                    _fail("FROZEN_TIER_DERIVED_STATE_CHANGED")
+                valuation = account["valuation_source"]
+                valuation_key = forward.native_product_key(account["symbol"], "M5")
+                if valuation_roster.get(valuation_key) != valuation["native_product_identity"]:
+                    _fail("FROZEN_TIER_USED_M5_SOURCE_PRECOMMIT_SPLICE")
+                if (valuation["native_product_identity"].get("timeframe") != "M5"
+                        or valuation["native_product_identity"].get("symbol") != account["symbol"]
+                        or valuation["execution_spec_receipt"].get("instrument_spec") != account["instrument_spec"]
+                        or valuation["spread_and_cost_surface"]["spread_model"].get("frozen_spread_tier") != account["tier"]):
+                    _fail("FROZEN_TIER_M5_TARGET_CELL_OR_TERMS_SPLICE")
+                rows = None if compact else account["valuation_rows"]
+                reopened_valuation, valuation_product = _reopen_frozen_transport_source(context, valuation["native_product_identity"], config)
+                _, actual_valuation_receipt = forward._derive_retained_execution_spec(product=valuation_product,
+                    deployment=deployment, source_bytes=retained_deployment_bytes)
+                if actual_valuation_receipt != valuation["execution_spec_receipt"]:
+                    _fail("FROZEN_TIER_M5_EXECUTION_SPEC_RECEIPT_CHANGED")
+                valuation_opens, valuation_closes = forward._frame_interval(reopened_valuation)
+                valuation_start = max(0, int(valuation_opens.searchsorted(start, side="left")) - 1)
+                valuation_end = int(valuation_closes.searchsorted(end, side="right"))
+                retained_valuation = reopened_valuation.iloc[valuation_start:valuation_end]
+                half, intrabar_half, spread_meta = forward.Backtester(config)._build_half_spread_arrays(
+                    retained_valuation, actual_spec, spread_tier=tier, timeframe=tier.timeframe)
+                spread_meta = _frozen_spread_read_model(spread_meta, schema)
+                expected_valuation_rows = [{"open_utc": stamp.isoformat(), "open": float(source["Open"]),
+                    "recorded_entry_points": source_points(source, spread_meta["entry_column"])}
+                    for stamp, source in retained_valuation.iterrows()]
+                if compact:
+                    rows = expected_valuation_rows
+                    account["valuation_rows"] = rows
+                elif rows != expected_valuation_rows:
+                    _fail("FROZEN_TIER_M5_RETAINED_SOURCE_ROWS_CHANGED")
+                index = pd.DatetimeIndex([row["open_utc"] for row in rows])
+                frame = pd.DataFrame({"Open": [row["open"] for row in rows],
+                                       "SpreadOpen": [row["recorded_entry_points"] for row in rows]}, index=index)
+                cost_attestation = forward.Backtester(config)._numerical_execution_cost_attestation(
+                    entry_half_spread=half, intrabar_half_spread=intrabar_half,
+                    spread_meta=spread_meta, spec=actual_spec)
+                actual_cost_surface = {"spread_model": forward._raw_json(spread_meta),
+                    "cost_attestation": forward._raw_json(cost_attestation),
+                    "valuation_price_field": "Open", "valuation_timeframe": "M5",
+                    "executable_liquidation": "BID_FOR_LONG_ASK_FOR_SHORT",
+                    "mark_cost_basis": "EXECUTABLE_BID_ASK_PLUS_ACCRUED_SWAP"}
+                if actual_cost_surface != valuation["spread_and_cost_surface"]:
+                    _fail("FROZEN_TIER_M5_COST_SURFACE_CHANGED")
+                tape = forward._M5ValuationTape(account["symbol"], frame, index, half,
+                    valuation["spread_and_cost_surface"], valuation["execution_spec_receipt"], valuation["native_product_identity"])
+                reconstructed_marks = forward._tier_m5_marks(account, tape)
+                if compact:
+                    account["m5_marks"] = reconstructed_marks
+                elif reconstructed_marks != account["m5_marks"]:
+                    _fail("FROZEN_TIER_M5_EXECUTABLE_MARK_CHANGED")
+        except CausalEvidenceProductionError:
+            raise
+        except forward.ForwardOOSReplayProductionError as exc:
+            raise CausalEvidenceProductionError(exc.code) from exc
+        except (KeyError, TypeError, ValueError, IndexError, OverflowError) as exc:
+            raise CausalEvidenceProductionError("FROZEN_TIER_RAW_ACCOUNT_INVALID") from exc
+        return FrozenTierRawAccountsProjection(projection["cell_id"], ("P75", "P95"), raw_descriptor["sha256"], accounts)
+    except CausalEvidenceProductionError:
+        raise
+    except forward.ForwardOOSReplayProductionError as exc:
+        raise CausalEvidenceProductionError(exc.code) from exc
+    except forward.config_binding.ProductionConfigBindingError as exc:
+        raise CausalEvidenceProductionError("FROZEN_TIER_ORIGINAL_PIPELINE_CONFIG_INVALID") from exc
+    except (KeyError, TypeError, ValueError, ArithmeticError, IndexError, AttributeError, OSError) as exc:
+        raise CausalEvidenceProductionError("FROZEN_TIER_RAW_ACCOUNT_INVALID") from exc
+
+
+def _verify_declared_cell_account_manifest(context, body, descriptor):
+    import pm_forward_oos_replay_producer as forward
+
+    try:
+        symbol = forward._declared_cell_transport_symbol(body)
+        relative_path = authority_spool._manifest_relative_path(
+            symbol, authority_spool.GENERAL_MANIFEST_DOMAIN)
+        digest, size, _ = authority_spool._stream_file(
+            context.root, relative_path, maximum_bytes=context.limits.max_manifest_bytes,
+            collect=False, chunk_bytes=context.limits.stream_chunk_bytes)
+        receipt = {
+            "schema_version": authority_spool.COMPACT_RECEIPT_SCHEMA,
+            "generation_id": context.generation_id,
+            "symbol": symbol,
+            "manifest_domain": authority_spool.GENERAL_MANIFEST_DOMAIN,
+            "native_universe_sha256": context.native_universe_sha256,
+            "config_sha256": context.config_sha256,
+            "generation_context_sha256": context.context_sha256,
+            "symbol_manifest": {
+                "schema_version": authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
+                "relative_path": relative_path,
+                "sha256": digest,
+                "size_bytes": size,
+                "format": authority_spool.CANONICAL_JSON_FORMAT,
+            },
+        }
+        manifest = authority_spool.verify_symbol_receipt(
+            context.root, receipt, expected_generation_id=context.generation_id,
+            expected_symbol=symbol, expected_native_universe_sha256=context.native_universe_sha256,
+            expected_config_sha256=context.config_sha256,
+            expected_manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
+    except (authority_spool.AuthoritySpoolError, OSError, KeyError, TypeError, ValueError) as exc:
+        raise CausalEvidenceProductionError("DECLARED_CELL_RAW_MANIFEST_INVALID") from exc
+    expected = [{"artifact_id": "declared-cell-account", "artifact_type": "declared_cell_raw_account",
+                 "descriptor": descriptor}]
+    if manifest["artifacts"] != expected:
+        _fail("DECLARED_CELL_RAW_MANIFEST_BINDING_MISMATCH")
+
+
+def read_declared_cell_account_artifact(
+    context: authority_spool.GenerationSpoolContext,
+    artifact: DeclaredCellRawAccountArtifact,
+    *,
+    process: Any,
+    frozen_pipeline_config: Any,
+) -> DeclaredCellRawAccountProjection:
+    """Reopen a declared raw account without replaying or qualifying it."""
+    import pm_forward_oos_replay_producer as forward
+
+    if type(artifact) is not DeclaredCellRawAccountArtifact:
+        _fail("DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
+    if process is None or frozen_pipeline_config is None:
+        _fail("DECLARED_CELL_ACCOUNT_INPUTS_REQUIRED")
+    try:
+        descriptor = _descriptor(artifact.descriptor, "DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
+        body = _read_descriptor_json(context, descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
+        if body.get("schema_version") != forward.DECLARED_CELL_RAW_ACCOUNT_SCHEMA:
+            _fail("DECLARED_CELL_RAW_SCHEMA_UNSUPPORTED")
+        _verify_declared_cell_account_manifest(context, body, descriptor)
+
+        def reopen_source(source_context, identity, config):
+            return _reopen_frozen_transport_source(
+                source_context, identity, config, pin_consumed_activation=True)
+
+        verified = forward.verify_declared_cell_account_transport(
+            context, body, process=process, frozen_pipeline_config=frozen_pipeline_config,
+            reopen_source=reopen_source)
+        if verified != body:
+            _fail("DECLARED_CELL_RAW_ACCOUNT_INVALID")
+        return DeclaredCellRawAccountProjection(
+            cell_id=body["cell"]["cell_id"], descriptor_sha256=descriptor["sha256"],
+            progress_status=body["progress_status"], reason_code=body["reason_code"],
+            slot_schedule=tuple(body["slot_schedule"]), owner_records=tuple(body["owner_records"]),
+            account=body["account"],
+            _verified_body_json=_canonical_bytes(verified, _MAX_RAW_ARTIFACT_BYTES))
+    except CausalEvidenceProductionError:
+        raise
+    except forward.ForwardOOSReplayProductionError as exc:
+        raise CausalEvidenceProductionError(exc.code) from exc
+    except (KeyError, TypeError, ValueError, ArithmeticError, IndexError, AttributeError, OSError) as exc:
+        raise CausalEvidenceProductionError("DECLARED_CELL_RAW_ACCOUNT_INVALID") from exc
+
+
 def _load_replay_ledgers(
     context: authority_spool.GenerationSpoolContext,
-    descriptors: AnchorReplayArtifactDescriptors,
+    descriptors: AnchorReplayArtifactDescriptors | DeclaredCellRawAccountArtifact,
     anchor: Mapping[str, Any],
+    *,
+    declared_process: Any = None,
+    declared_frozen_pipeline_config: Any = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    if type(descriptors) is DeclaredCellRawAccountArtifact:
+        read_declared_cell_account_artifact(
+            context, descriptors, process=declared_process,
+            frozen_pipeline_config=declared_frozen_pipeline_config).require_interval_qualification()
+    if type(descriptors) is FrozenTierRawAccountsArtifact:
+        _read_frozen_tier_raw_accounts(context, descriptors, anchor).require_interval_qualification()
     if type(descriptors) is not AnchorReplayArtifactDescriptors:
         _fail("REPLAY_DESCRIPTOR_SET_INVALID")
     total = 0
@@ -1811,7 +2438,7 @@ def _causal_open_fill(
             "reference_bid_price",
             "reference_ask_price",
             "base_fill_price",
-            "stress_fill_price",
+            "p75_fill_price",
         )
     }
     primitive["cell_decision_sha256"] = cell["cell_decision_sha256"]
@@ -1861,7 +2488,7 @@ def _causal_open_fill(
     return result
 
 
-def _opening_execution_cost(fill: Mapping[str, Any], *, stress: bool) -> Decimal:
+def _opening_execution_cost(fill: Mapping[str, Any], *, p75: bool) -> Decimal:
     side = Decimal(1) if fill["side"] == "LONG" else Decimal(-1)
     unit = _decimal(fill["quantity"], "QUANTITY_INVALID", positive=True) * _decimal(
         fill["contract_multiplier"], "CONTRACT_MULTIPLIER_INVALID", positive=True
@@ -1872,7 +2499,7 @@ def _opening_execution_cost(fill: Mapping[str, Any], *, stress: bool) -> Decimal
         "REFERENCE_EXECUTABLE_INVALID",
         positive=True,
     )
-    lane = "stress" if stress else "base"
+    lane = "p75" if p75 else "base"
     lane_fill = _decimal(
         fill[f"{lane}_fill_price"], "FILL_PRICE_INVALID", positive=True
     )
@@ -1882,7 +2509,7 @@ def _opening_execution_cost(fill: Mapping[str, Any], *, stress: bool) -> Decimal
 
 
 def _closing_execution_cost(
-    fill: Mapping[str, Any], state: Mapping[str, Any], *, stress: bool
+    fill: Mapping[str, Any], state: Mapping[str, Any], *, p75: bool
 ) -> Decimal:
     side = state["side_sign"]
     unit = state["unit_scale"]
@@ -1892,7 +2519,7 @@ def _closing_execution_cost(
         "REFERENCE_EXECUTABLE_INVALID",
         positive=True,
     )
-    lane = "stress" if stress else "base"
+    lane = "p75" if p75 else "base"
     lane_fill = _decimal(
         fill[f"{lane}_fill_price"], "FILL_PRICE_INVALID", positive=True
     )
@@ -1921,9 +2548,9 @@ def _assemble_activity(
     exposure = ledgers["EXPOSURE_LEDGER"]
     margin = ledgers["MARGIN_LEDGER"]
     if event["initial_positions"] != [] or fill["initial_positions"] != []:
-        # Carried positions are valid in decision-v9, but a production replay
+        # Carried positions are valid in decision-v10, but a production replay
         # seam must provide a dedicated forward-boundary valuation artifact.
-        # The raw v1 contract intentionally fails closed until that descriptor
+        # The raw contract intentionally fails closed until that descriptor
         # is available rather than inventing an opening mark receipt.
         _fail("CARRIED_POSITION_BOUNDARY_ARTIFACT_REQUIRED")
 
@@ -1931,18 +2558,18 @@ def _assemble_activity(
     activity_days: list[dict[str, Any]] = []
     gross_vector: list[Decimal] = []
     base_cost_vector: list[Decimal] = []
-    stress_cost_vector: list[Decimal] = []
+    p75_cost_vector: list[Decimal] = []
     seen_event_ids: set[str] = set()
     seen_positions: set[str] = set()
     cumulative_base_cost_return = Decimal(0)
-    cumulative_stress_cost_return = Decimal(0)
+    cumulative_p75_cost_return = Decimal(0)
 
     def require_position_cost_prefix(state: Mapping[str, Any]) -> None:
         if (
-            state["stress_cost_prefix"] + causal._RETURN_QUANTUM
+            state["p75_cost_prefix"] + causal._RETURN_QUANTUM
             < state["base_cost_prefix"]
         ):
-            _fail("STRESS_POSITION_COST_PREFIX_IMPROVEMENT")
+            _fail("P75_POSITION_COST_PREFIX_IMPROVEMENT")
 
     for index, date_text in enumerate(dates):
         event_day = event["days"][index]
@@ -2009,10 +2636,10 @@ def _assemble_activity(
                 "CONTRACT_MULTIPLIER_INVALID",
                 positive=True,
             )
-            base_open_cost = _opening_execution_cost(opened, stress=False)
-            stress_open_cost = _opening_execution_cost(opened, stress=True)
-            if stress_open_cost < base_open_cost:
-                _fail("STRESS_OPEN_COST_LESS_SEVERE")
+            base_open_cost = _opening_execution_cost(opened, p75=False)
+            p75_open_cost = _opening_execution_cost(opened, p75=True)
+            if p75_open_cost < base_open_cost:
+                _fail("P75_OPEN_COST_LESS_SEVERE")
             open_states[position_id] = {
                 "side": opened["side"],
                 "side_sign": side_sign,
@@ -2024,9 +2651,9 @@ def _assemble_activity(
                     opened["reference_mid_price"], "OPENING_MID_INVALID", positive=True
                 ),
                 "pending_base_cost": base_open_cost,
-                "pending_stress_cost": stress_open_cost,
+                "pending_p75_cost": p75_open_cost,
                 "base_cost_prefix": base_open_cost,
-                "stress_cost_prefix": stress_open_cost,
+                "p75_cost_prefix": p75_open_cost,
                 "cell_id": raw_open["cell_id"],
             }
             require_position_cost_prefix(open_states[position_id])
@@ -2048,7 +2675,7 @@ def _assemble_activity(
         marks: list[dict[str, Any]] = []
         gross_cash = Decimal(0)
         base_cost_cash = Decimal(0)
-        stress_cost_cash = Decimal(0)
+        p75_cost_cash = Decimal(0)
         marked_positions: set[str] = set()
         for event_id in sorted(
             raw_marks, key=lambda key: raw_marks[key]["position_id"]
@@ -2077,8 +2704,8 @@ def _assemble_activity(
             mark.update(
                 {
                     "base_financing_cash": mark_costs[event_id]["base_financing_cash"],
-                    "stress_financing_cash": mark_costs[event_id][
-                        "stress_financing_cash"
+                    "p75_financing_cash": mark_costs[event_id][
+                        "p75_financing_cash"
                     ],
                 }
             )
@@ -2117,16 +2744,16 @@ def _assemble_activity(
             base_finance = _decimal(
                 mark["base_financing_cash"], "BASE_FINANCING_INVALID"
             )
-            stress_finance = _decimal(
-                mark["stress_financing_cash"], "STRESS_FINANCING_INVALID"
+            p75_finance = _decimal(
+                mark["p75_financing_cash"], "P75_FINANCING_INVALID"
             )
             base_cost_cash += state["pending_base_cost"] + base_finance
-            stress_cost_cash += state["pending_stress_cost"] + stress_finance
+            p75_cost_cash += state["pending_p75_cost"] + p75_finance
             state["base_cost_prefix"] += base_finance
-            state["stress_cost_prefix"] += stress_finance
+            state["p75_cost_prefix"] += p75_finance
             require_position_cost_prefix(state)
             state["pending_base_cost"] = Decimal(0)
-            state["pending_stress_cost"] = Decimal(0)
+            state["pending_p75_cost"] = Decimal(0)
             state["last_mark"] = mark_price
             marks.append(mark)
 
@@ -2200,7 +2827,7 @@ def _assemble_activity(
                     "reference_bid_price",
                     "reference_ask_price",
                     "base_fill_price",
-                    "stress_fill_price",
+                    "p75_fill_price",
                 )
             }
             payload_sha = _sha(
@@ -2227,14 +2854,14 @@ def _assemble_activity(
                     }
                 ),
             }
-            base_exit = _closing_execution_cost(closing, state, stress=False)
-            stress_exit = _closing_execution_cost(closing, state, stress=True)
-            if stress_exit < base_exit:
-                _fail("STRESS_CLOSE_COST_LESS_SEVERE")
+            base_exit = _closing_execution_cost(closing, state, p75=False)
+            p75_exit = _closing_execution_cost(closing, state, p75=True)
+            if p75_exit < base_exit:
+                _fail("P75_CLOSE_COST_LESS_SEVERE")
             base_cost_cash += base_exit
-            stress_cost_cash += stress_exit
+            p75_cost_cash += p75_exit
             state["base_cost_prefix"] += base_exit
-            state["stress_cost_prefix"] += stress_exit
+            state["p75_cost_prefix"] += p75_exit
             require_position_cost_prefix(state)
             exits.append(closing)
             del open_states[position_id]
@@ -2246,25 +2873,25 @@ def _assemble_activity(
             base_cost_return = causal._cash_return(
                 -base_cost_cash, equity, "derived base cost return"
             )
-            stress_cost_return = causal._cash_return(
-                -stress_cost_cash, equity, "derived stress cost return"
+            p75_cost_return = causal._cash_return(
+                -p75_cost_cash, equity, "derived p75 cost return"
             )
         except Exception as exc:
             raise CausalEvidenceProductionError(
                 "DAILY_RETURN_DERIVATION_FAILED"
             ) from exc
         cumulative_base_cost_return += base_cost_return
-        cumulative_stress_cost_return += stress_cost_return
+        cumulative_p75_cost_return += p75_cost_return
         if (
-            cumulative_stress_cost_return
+            cumulative_p75_cost_return
             > cumulative_base_cost_return + causal._RETURN_QUANTUM
         ):
-            _fail("STRESS_CUMULATIVE_COST_PREFIX_IMPROVEMENT")
+            _fail("P75_CUMULATIVE_COST_PREFIX_IMPROVEMENT")
         for state in open_states.values():
             require_position_cost_prefix(state)
         gross_vector.append(gross_return)
         base_cost_vector.append(base_cost_return)
-        stress_cost_vector.append(stress_cost_return)
+        p75_cost_vector.append(p75_cost_return)
         activity_days.append(
             {
                 "date": date_text,
@@ -2286,7 +2913,7 @@ def _assemble_activity(
         },
         gross_vector,
         base_cost_vector,
-        stress_cost_vector,
+        p75_cost_vector,
     )
 
 
@@ -2302,17 +2929,17 @@ def _reconciliation_anchor(anchor: Mapping[str, Any]) -> dict[str, Any]:
         "calendar_dates",
         "daily_gross_mtm_returns",
         "daily_base_cost_returns",
-        "daily_stress_cost_returns",
+        "daily_p75_cost_returns",
         "daily_base_net_mtm_returns",
-        "daily_stress_net_mtm_returns",
+        "daily_p75_net_mtm_returns",
         "activity_ledger",
         "activity_ledger_sha256",
         "calendar_sha256",
         "gross_vector_sha256",
         "base_cost_vector_sha256",
-        "stress_cost_vector_sha256",
+        "p75_cost_vector_sha256",
         "base_vector_sha256",
-        "stress_vector_sha256",
+        "p75_vector_sha256",
         "completed_trade_count",
         "completed_trade_outcomes",
         "trade_vector_sha256",
@@ -2353,7 +2980,7 @@ def _build_anchor_evidence(
         specialists=specialists,
     )
     book_cells_by_id = {raw["cell_id"]: raw for raw in book_body["cells"]}
-    activity, gross, base_cost, stress_cost = _assemble_activity(
+    activity, gross, base_cost, p75_cost = _assemble_activity(
         anchor=anchor,
         ledgers=ledgers,
         descriptor_hashes=descriptor_hashes,
@@ -2364,16 +2991,16 @@ def _build_anchor_evidence(
         causal._quantized_return(g + c, "derived base net return")
         for g, c in zip(gross, base_cost, strict=True)
     ]
-    stress = [
-        causal._quantized_return(g + c, "derived stress net return")
-        for g, c in zip(gross, stress_cost, strict=True)
+    p75 = [
+        causal._quantized_return(g + c, "derived p75 net return")
+        for g, c in zip(gross, p75_cost, strict=True)
     ]
     dates = _expected_dates(anchor["forward_start_date"], anchor["forward_end_date"])
     gross_text = _decimal_texts(gross)
     base_cost_text = _decimal_texts(base_cost)
-    stress_cost_text = _decimal_texts(stress_cost)
+    p75_cost_text = _decimal_texts(p75_cost)
     base_text = _decimal_texts(base)
-    stress_text = _decimal_texts(stress)
+    p75_text = _decimal_texts(p75)
     skeleton: dict[str, Any] = {
         "anchor_id": anchor["anchor_id"],
         "book_cells": cells,
@@ -2382,7 +3009,7 @@ def _build_anchor_evidence(
     try:
         completed, observed_holding, ledger_ids, risk_diagnostics, activity_sha = (
             causal._validate_activity_ledger(
-                skeleton, dates, gross, base_cost, stress_cost
+                skeleton, dates, gross, base_cost, p75_cost
             )
         )
     except Exception as exc:
@@ -2418,11 +3045,11 @@ def _build_anchor_evidence(
         "base_cost_vector_sha256": causal._vector_hash(
             dates, base_cost_text, "BASE_COST_DEBIT"
         ),
-        "stress_cost_vector_sha256": causal._vector_hash(
-            dates, stress_cost_text, "STRESS_COST_DEBIT"
+        "p75_cost_vector_sha256": causal._vector_hash(
+            dates, p75_cost_text, "P75_COST_DEBIT"
         ),
         "base_vector_sha256": causal._vector_hash(dates, base_text, "BASE"),
-        "stress_vector_sha256": causal._vector_hash(dates, stress_text, "STRESS"),
+        "p75_vector_sha256": causal._vector_hash(dates, p75_text, "P75"),
     }
     completed_text = _decimal_texts(completed)
     trade_sha = _sha(
@@ -2453,9 +3080,9 @@ def _build_anchor_evidence(
         "calendar_sha256": calendar_sha,
         "daily_gross_mtm_returns": gross_text,
         "daily_base_cost_returns": base_cost_text,
-        "daily_stress_cost_returns": stress_cost_text,
+        "daily_p75_cost_returns": p75_cost_text,
         "daily_base_net_mtm_returns": base_text,
-        "daily_stress_net_mtm_returns": stress_text,
+        "daily_p75_net_mtm_returns": p75_text,
         **vector_hashes,
         "activity_ledger": activity,
         "activity_ledger_sha256": activity_sha,
@@ -2499,7 +3126,7 @@ def _build_anchor_evidence(
             "fill_ledger_sha256": ledger_ids["fill_ledger_sha256"],
             "gross_vector_sha256": vector_hashes["gross_vector_sha256"],
             "base_vector_sha256": vector_hashes["base_vector_sha256"],
-            "stress_vector_sha256": vector_hashes["stress_vector_sha256"],
+            "p75_vector_sha256": vector_hashes["p75_vector_sha256"],
         }
     )
     outputs.update(
@@ -3036,7 +3663,7 @@ class BoundedCausalEvidenceProducer:
         except CausalEvidenceProductionError:
             raise
         except causal.ProcessVerificationError as exc:
-            raise CausalEvidenceProductionError("CAUSAL_DECISION_V9_REJECTED") from exc
+            raise CausalEvidenceProductionError("CAUSAL_DECISION_V10_REJECTED") from exc
         except (DecimalException, ArithmeticError) as exc:
             raise CausalEvidenceProductionError("ECONOMIC_REPLAY_FAILED") from exc
         except Exception as exc:
@@ -3053,6 +3680,8 @@ __all__ = [
     "COST_LEDGER_SCHEMA",
     "CONTROLLER_EVENT_SCHEMA",
     "CausalEvidenceProductionError",
+    "DeclaredCellRawAccountArtifact",
+    "DeclaredCellRawAccountProjection",
     "EVENT_LEDGER_SCHEMA",
     "EXPOSURE_LEDGER_SCHEMA",
     "FILL_LEDGER_SCHEMA",
@@ -3064,5 +3693,6 @@ __all__ = [
     "MTM_LEDGER_SCHEMA",
     "ORDER_EVENT_SCHEMA",
     "SPECIALIST_SCHEMA",
-    "freeze_causal_process_precommit_v9",
+    "freeze_causal_process_precommit_v10",
+    "read_declared_cell_account_artifact",
 ]

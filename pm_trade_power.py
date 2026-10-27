@@ -28,8 +28,8 @@ TRADE_SAMPLE_SCHEMA_VERSION = "fxpm-net-r-sample-v4"
 TRADE_POWER_DECISION_SCHEMA_VERSION = "fxpm-trade-power-decision-v3"
 TRADE_POWER_MULTIPLICITY_VERSION = "fxpm-trade-power-multiplicity-v1"
 TRADE_POWER_PARTITION_VERSION = "fxpm-trade-power-partition-v1"
-TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v4"
-NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION = "fxpm-numerical-execution-cost-v2"
+TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION = "fxpm-trade-evidence-source-v5"
+NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION = "fxpm-numerical-execution-cost-v3"
 REQUIRED_SWAP_ACCRUAL_CONTRACT = "causal_swap_accrual_v1"
 REQUIRED_SWAP_PROJECTION_CONTRACT = "fxpm-swap-preopen-close-projection-v1"
 REQUIRED_TRADE_RECORD_SCHEMA = "2026-07-14-position-events-v2"
@@ -491,7 +491,8 @@ _NUMERICAL_COST_ATTESTATION_FIELDS = frozenset(
         "schema_version",
         "use_spread",
         "spread_mode",
-        "spread_values_sha256",
+        "entry_half_spread_values_sha256",
+        "intrabar_half_spread_values_sha256",
         "instrument_spec_sha256",
         "policy_sha256",
         "attestation_sha256",
@@ -499,14 +500,43 @@ _NUMERICAL_COST_ATTESTATION_FIELDS = frozenset(
 )
 
 
+def build_numerical_execution_cost_policy(
+    *,
+    use_spread: bool,
+    spread_mode: str,
+    instrument_spec_sha256: str,
+) -> dict[str, Any]:
+    """Build the array-independent policy identity shared by plans and evidence."""
+
+    if not isinstance(use_spread, (bool, np.bool_)):
+        raise ValueError("use_spread must be an explicit boolean")
+    mode = str(spread_mode or "").strip()
+    if not mode:
+        raise ValueError("spread_mode is missing")
+    spec_sha256 = str(instrument_spec_sha256 or "").lower()
+    if not _is_sha256(spec_sha256):
+        raise ValueError("instrument_spec_sha256 is malformed")
+    policy: dict[str, Any] = {
+        "schema_version": NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION,
+        "use_spread": bool(use_spread),
+        "spread_mode": mode,
+        "instrument_spec_sha256": spec_sha256,
+    }
+    return {
+        **policy,
+        "policy_sha256": _sha256_json(policy),
+    }
+
+
 def build_numerical_execution_cost_attestation(
     *,
     use_spread: bool,
     spread_mode: str,
-    spread_values_sha256: str,
+    entry_half_spread_values_sha256: str,
+    intrabar_half_spread_values_sha256: str,
     instrument_spec_sha256: str,
 ) -> dict[str, Any]:
-    """Build the exact immutable numerical spread-cost payload required by v2.
+    """Build the exact immutable numerical spread-cost payload required by v3.
 
     The caller remains responsible for deriving the two hashes from the
     actual arrays/model inputs used by the Backtester.  This helper only
@@ -514,27 +544,31 @@ def build_numerical_execution_cost_attestation(
     execution evidence after the fact.
     """
 
-    if not isinstance(use_spread, (bool, np.bool_)):
-        raise ValueError("use_spread must be an explicit boolean")
-    mode = str(spread_mode or "").strip()
-    if not mode:
-        raise ValueError("spread_mode is missing")
     hashes = {
-        "spread_values_sha256": str(spread_values_sha256 or "").lower(),
+        "entry_half_spread_values_sha256": str(
+            entry_half_spread_values_sha256 or ""
+        ).lower(),
+        "intrabar_half_spread_values_sha256": str(
+            intrabar_half_spread_values_sha256 or ""
+        ).lower(),
         "instrument_spec_sha256": str(instrument_spec_sha256 or "").lower(),
     }
     if not all(_is_sha256(value) for value in hashes.values()):
         raise ValueError("numerical execution-cost hashes are malformed")
-    policy: dict[str, Any] = {
-        "schema_version": NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION,
-        "use_spread": bool(use_spread),
-        "spread_mode": mode,
-        "instrument_spec_sha256": hashes["instrument_spec_sha256"],
-    }
-    policy_sha256 = _sha256_json(policy)
+    policy_identity = build_numerical_execution_cost_policy(
+        use_spread=use_spread,
+        spread_mode=spread_mode,
+        instrument_spec_sha256=hashes["instrument_spec_sha256"],
+    )
+    policy_sha256 = policy_identity.pop("policy_sha256")
     canonical: dict[str, Any] = {
-        **policy,
-        "spread_values_sha256": hashes["spread_values_sha256"],
+        **policy_identity,
+        "entry_half_spread_values_sha256": hashes[
+            "entry_half_spread_values_sha256"
+        ],
+        "intrabar_half_spread_values_sha256": hashes[
+            "intrabar_half_spread_values_sha256"
+        ],
         "policy_sha256": policy_sha256,
     }
     return {
@@ -587,7 +621,8 @@ def _validate_numerical_execution_cost_attestation(
     hashes = {
         name: str(value.get(name) or "").lower()
         for name in (
-            "spread_values_sha256",
+            "entry_half_spread_values_sha256",
+            "intrabar_half_spread_values_sha256",
             "instrument_spec_sha256",
         )
     }
@@ -598,13 +633,20 @@ def _validate_numerical_execution_cost_attestation(
             "numerical execution-cost hashes are malformed",
             ("SOURCE_CONTRACT_NUMERICAL_COST_INVALID",),
         )
-    policy = {
-        "schema_version": NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION,
-        "use_spread": True,
-        "spread_mode": mode,
-        "instrument_spec_sha256": hashes["instrument_spec_sha256"],
-    }
-    expected_policy = _sha256_json(policy)
+    try:
+        policy_identity = build_numerical_execution_cost_policy(
+            use_spread=True,
+            spread_mode=mode,
+            instrument_spec_sha256=hashes["instrument_spec_sha256"],
+        )
+    except ValueError:
+        return (
+            None,
+            None,
+            "numerical execution-cost policy is invalid",
+            ("SOURCE_CONTRACT_NUMERICAL_COST_INVALID",),
+        )
+    expected_policy = policy_identity.pop("policy_sha256")
     observed_policy = str(value.get("policy_sha256") or "").lower()
     if not _is_sha256(observed_policy) or observed_policy != expected_policy:
         return (
@@ -614,8 +656,13 @@ def _validate_numerical_execution_cost_attestation(
             ("SOURCE_CONTRACT_NUMERICAL_COST_HASH_INVALID",),
         )
     canonical = {
-        **policy,
-        "spread_values_sha256": hashes["spread_values_sha256"],
+        **policy_identity,
+        "entry_half_spread_values_sha256": hashes[
+            "entry_half_spread_values_sha256"
+        ],
+        "intrabar_half_spread_values_sha256": hashes[
+            "intrabar_half_spread_values_sha256"
+        ],
         "policy_sha256": expected_policy,
     }
     expected = _sha256_json(canonical)
@@ -1014,7 +1061,7 @@ def build_trade_power_multiplicity_receipt(
     if not isinstance(attempt_ledger_payload, Mapping):
         raise ValueError("attempt ledger must be a mapping")
     if str(attempt_ledger_payload.get("contract_version") or "") != (
-        "fxpm.winner-attempt-ledger.v2"
+        "fxpm.winner-attempt-ledger.v3"
     ):
         raise ValueError("attempt ledger contract is missing or stale")
     attempts = attempt_ledger_payload.get("attempts")
@@ -2037,6 +2084,7 @@ __all__ = [
     "TradeSampleEvidence",
     "adjusted_alpha",
     "build_numerical_execution_cost_attestation",
+    "build_numerical_execution_cost_policy",
     "build_trade_power_multiplicity_receipt",
     "build_trade_power_partition_contract",
     "build_trade_sample_evidence",

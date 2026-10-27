@@ -363,6 +363,8 @@ def _reopen_prefix_route(
     context: authority_spool.GenerationSpoolContext,
     symbol: str,
     timeframe: str,
+    include_technical_failure: bool = False,
+    _pin_consumed_activation: bool = False,
 ) -> native_prefix.NativePrefixProduct:
     owned = _owned_mapping(route, "NATIVE_PREFIX_ROUTE_INVALID")
     if (
@@ -378,13 +380,15 @@ def _reopen_prefix_route(
         }
         or owned["symbol"] != symbol
         or owned["timeframe"] != timeframe
-        or owned["source_state"] not in {
+        or owned["source_state"] not in ({
             native_prefix.AVAILABLE,
             native_prefix.SOURCE_UNAVAILABLE,
             native_prefix.TECHNICAL_TERMINAL,
-        }
+        } | ({native_prefix.TECHNICAL_FAILURE} if include_technical_failure else set()))
     ):
         _fail("NATIVE_PREFIX_ROUTE_BINDING_INVALID", symbol, timeframe)
+    pinned_arguments = ({"pinned_activation_manifest_sha256": owned["activation_manifest_sha256"]}
+                        if _pin_consumed_activation else {})
     try:
         product = native_prefix.verify_activated_native_prefix(
             data_dir=data_dir,
@@ -402,6 +406,7 @@ def _reopen_prefix_route(
                 "NATIVE_PREFIX_ROUTE_ACTIVATION_INVALID",
             ),
             production_contract_required=True,
+            **pinned_arguments,
         )
     except HistoricalSearchProducerError:
         raise
@@ -1960,3 +1965,721 @@ __all__ = [
     "historical_search_producer_contract",
     "preplan_historical_search",
 ]
+
+
+# One declared cell's search receipts; this is not a trading/account supervisor.
+DECLARED_CELL_RUN_SCHEMA = "fxpm.declared-cell-owner-run.v1"
+DECLARED_SLOT_COMMIT_SCHEMA = "fxpm.declared-slot-commit.v1"
+_DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA = "fxpm.declared-slot-commit.v2"
+_DECLARED_SLOT_POINTER_SCHEMA = "fxpm.declared-slot-commit-pointer.v1"
+_DECLARED_CELL_TERMINAL_SCHEMA = "fxpm.declared-cell-owner-terminal.v1"
+_DECLARED_CELL_POST_COMPLETION_TERMINAL_SCHEMA = "fxpm.declared-cell-owner-terminal.v2"
+
+
+@dataclass(frozen=True)
+class DeclaredCellOwnerRunReceipt:
+    _body_json: bytes
+    def to_dict(self):
+        return json.loads(self._body_json)
+    @property
+    def receipt_sha256(self):
+        return hashlib.sha256(self._body_json).hexdigest()
+
+
+@dataclass(frozen=True)
+class DeclaredCellOwnerProgress:
+    slot_summaries: tuple[dict[str, Any], ...]
+    slot_commit_artifacts: tuple[dict[str, Any], ...]
+    first_uncommitted_slot: dict[str, Any] | None
+    terminal_stop: bool
+    last_commit_sha256: str | None
+    terminal_failure: dict[str, Any] | None = None
+    symbol_receipt: dict[str, Any] | None = None
+    run_receipt: dict[str, Any] | None = None
+
+
+class _DeclaredSlotPostCompletionFailure(HistoricalSearchProducerError):
+    def __init__(self, completion, failure):
+        super().__init__("DECLARED_SLOT_POST_COMPLETION_FAILURE")
+        self.completion = json.loads(_canonical_bytes(completion))
+        self.failure = json.loads(_canonical_bytes(failure))
+
+
+def _declared_failure_details(exc):
+    return {"exception_type": type(exc).__name__[:128],
+        "failure_code": str(getattr(exc, "code", "DECLARED_SLOT_SOURCE_FAILURE"))[:128],
+        "failure_observed_at_utc": _now_utc_seconds()}
+
+
+@dataclass(frozen=True)
+class _DeclaredSlotSourceSession:
+    _body_json: bytes
+    _fitted: Any
+    _config: Any
+    _frozen_config: Any
+    _entry: Mapping[str, Any]
+    def to_dict(self):
+        return json.loads(self._body_json)
+    @property
+    def receipt_sha256(self):
+        return hashlib.sha256(self._body_json).hexdigest()
+
+
+def _declared_base_completion(request, *, status, reason_code, source_entry):
+    body = request.to_dict()
+    return {"schema_version": historical_adapter.DECLARED_SLOT_COMPLETION_SCHEMA,
+        "request_body": body, "request_sha256": request.receipt_sha256,
+        "precommit_sha256": body["precommit_sha256"], "cell_id": body["cell_id"], "slot_id": body["slot_id"],
+        "status": status, "reason_code": reason_code, "owner": None,
+        "source_session_entry": source_entry, "source_group": None, "regime_fit": None,
+        "horizon_plan": None, "plan_transport": None, "frozen_plan_receipt": None,
+        "frozen_descriptor_graph": None, "horizon_winner_cross_binding": None,
+        "winner_request_entry": None, "winner_decision_entry": None,
+        "raw_production_receipt": None, "production_descriptor_graph": None,
+        "completed_at_utc": _now_utc_seconds(), "qualification_authority": False,
+        "capital_authority": False, "live_authority": False, "order_authority": False}
+
+
+def _verify_declared_completion_transport(context, *, completion, expected_edition):
+    code = "DECLARED_SLOT_TRANSPORT_EDITION_MISMATCH"
+    if type(completion) is not dict:
+        _fail(code)
+    try:
+        actual = historical.declared_slot_transport_edition(completion.get("request_body"))
+    except historical.HistoricalAnchorOrchestrationError as exc:
+        raise HistoricalSearchProducerError(code) from exc
+    if (expected_edition not in (historical.DECLARED_WINNER_TRANSPORT_V15,
+            historical.DECLARED_WINNER_TRANSPORT_V16) or actual != expected_edition):
+        _fail(code)
+    descriptor = completion.get("frozen_plan_receipt")
+    if descriptor is None:
+        if completion.get("status") == "OWNER":
+            _fail(code)
+        return
+    try:
+        receipt, _ = historical_adapter._reopen_worker_ascii_json_descriptor(context,
+            descriptor, maximum_bytes=historical_adapter.winner_selection.MAX_REQUEST_BYTES,
+            code=code)
+    except historical_adapter.HistoricalProductionAdapterError as exc:
+        raise HistoricalSearchProducerError(code) from exc
+    expected_schema = (historical_adapter.raw_winner.V16_FROZEN_PLAN_SCHEMA
+        if expected_edition == historical.DECLARED_WINNER_TRANSPORT_V16
+        else historical_adapter.raw_winner.CURRENT_FROZEN_PLAN_SCHEMA)
+    if receipt.get("schema_version") != expected_schema:
+        _fail(code)
+
+
+def _make_declared_slot_source_authority():
+    sessions = {}
+
+    def verify(context, *, request, process, source_session):
+        historical.verify_declared_slot_producer_request(context, request, process=process)
+        historical._verify_declared_request_identity(request, context, require_live=True)
+        row = sessions.get(request.receipt_sha256)
+        if (type(source_session) is not _DeclaredSlotSourceSession or row is None
+                or row[0] is not source_session or row[1] != source_session._body_json
+                or row[2] != id(context) or row[3] is not request
+                or row[4] is not source_session._fitted or row[5] is not source_session._config
+                or row[6] != _canonical_bytes(dict(source_session._entry))):
+            _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
+        return source_session
+
+    def by_fitted(context, *, request, process, fitted):
+        row = sessions.get(request.receipt_sha256)
+        if row is None or row[4] is not fitted:
+            _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
+        return verify(context, request=request, process=process, source_session=row[0])
+
+    def execute(context, *, request, process, frozen_pipeline_config):
+        search_planner._require_current_process(process)
+        body = historical.verify_declared_slot_producer_request(context, request, process=process)
+        edition = historical.declared_slot_transport_edition(body)
+        historical._verify_declared_request_identity(request, context, require_live=True)
+
+        def finish(completion):
+            _verify_declared_completion_transport(context, completion=completion,
+                expected_edition=edition)
+            return completion
+
+        if request.receipt_sha256 in sessions:
+            _fail("DECLARED_SLOT_SOURCE_ALREADY_OPENED")
+        if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+            _fail("DECLARED_SLOT_CONFIG_INVALID")
+        frozen_pipeline_config.verify_current(context)
+        config = frozen_pipeline_config.materialize(context)
+        if (frozen_pipeline_config.effective_config_sha256 != body["effective_config_sha256"]
+                or config.discovery_risk_per_trade_pct != 1.0):
+            _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+        window = body["source_access_window_utc"]
+        in_window = window["start_utc"] <= _now_utc_seconds() < window["end_exclusive_utc"]
+        if in_window:
+            profile = search_execution.spread_profile.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
+            if profile.sha256 != body["spread_profile_identity"]["profile_sha256"]:
+                _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+        sink = request.symbol_sink(body["symbol"])
+        source_body = {"schema_version": "fxpm.declared-slot-source-session.v1",
+            "request_sha256": request.receipt_sha256, "generation_context_sha256": context.context_sha256,
+            "config_sha256": context.config_sha256,
+            "effective_config_sha256": body["effective_config_sha256"],
+            "spread_profile_identity": body["spread_profile_identity"],
+            "source_accessed_at_utc": None, "selection_cutoff_utc": body["anchor"]["selection_cutoff_utc"],
+            "source_state": "FAILED", "native_source_route": None, "native_prefix_index_descriptor": None,
+            "native_prefix_index_sha256": None, "source_group_decision_sha256": None,
+            "native_snapshot_entry": None, "native_snapshot_errors": None,
+            "regime_fit_decision_sha256": None, "caller_supplied_product_or_fit_accepted": False,
+            "qualification_authority": False, "live_authority": False, "order_authority": False}
+        capture = None
+        try:
+            if not in_window:
+                _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+            accessed = _now_utc_seconds()
+            if not window["start_utc"] <= accessed < window["end_exclusive_utc"]:
+                _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+            source_body["source_accessed_at_utc"] = accessed
+            import pm_portfolio_replay as portfolio_replay
+            snapshot, snapshot_errors = portfolio_replay.active_native_portfolio_contract(
+                Path(config.data_dir), book.PINNED_SYMBOL_ORDER, timeframes=book.TIMEFRAME_ORDER)
+            # Exact contract bytes deduplicate in the content-addressed spool;
+            # every slot keeps its own roster reference to that bound evidence.
+            source_body["native_snapshot_entry"] = sink.put_json(
+                f"{body['artifact_namespace']}/native-snapshot", "declared_slot_native_snapshot", snapshot)
+            source_body["native_snapshot_errors"] = snapshot_errors
+            snapshot_status = historical._declared_slot_native_snapshot_status(context, snapshot, snapshot_errors)
+            if snapshot_status == "MISMATCH":
+                _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_MISMATCH")
+            product = native_prefix.produce_activated_native_prefix(data_dir=Path(config.data_dir), context=context,
+                symbol=body["symbol"], timeframe=body["timeframe"],
+                cutoff_utc=body["anchor"]["selection_cutoff_utc"], source_accessed_at_utc=accessed,
+                production_contract_required=True)
+            product = native_prefix.reverify_activated_native_prefix_product(product, context, require_current_activation=True)
+            source_body.update(source_state=product.source_state, native_source_route=_prefix_route(product),
+                native_prefix_index_descriptor=dict(product.index_descriptor), native_prefix_index_sha256=product.index_sha256)
+            # Unavailable ACTIVE still follows the genuine technical-failure
+            # route. Every usable or authenticated-absence product must join
+            # the frozen snapshot, including an A/B/A pointer race.
+            if product.source_state != native_prefix.TECHNICAL_FAILURE:
+                if snapshot_status != "MATCH":
+                    _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_" + snapshot_status)
+                if not historical._declared_slot_consumed_native_snapshot_matches(snapshot, product):
+                    _fail("DECLARED_SLOT_CONSUMED_NATIVE_SNAPSHOT_MISMATCH")
+            if product.source_state != native_prefix.AVAILABLE:
+                entry = sink.put_json(f"{body['artifact_namespace']}/source-session", "declared_slot_source_session", source_body)
+                return finish(_declared_base_completion(request,
+                    status="MISSING" if product.source_state in {native_prefix.SOURCE_UNAVAILABLE, native_prefix.TECHNICAL_TERMINAL} else "STOP",
+                    reason_code="TERMINAL_TECHNICAL" if product.source_state == native_prefix.TECHNICAL_TERMINAL else product.source_state,
+                    source_entry=entry))
+            fitted = search_execution.fit_native_timeframe_for_search(product=product, config=config, acquisition_attempts_exact=1)
+            if any(t.descriptor()["profile_sha256"] != body["spread_profile_identity"]["profile_sha256"] for t in fitted._spread_tiers.values()):
+                _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+            source_body.update(source_group_decision_sha256=fitted.source_group_decision.receipt_sha256,
+                regime_fit_decision_sha256=fitted.regime_fit_decision.receipt_sha256)
+            entry = sink.put_json(f"{body['artifact_namespace']}/source-session", "declared_slot_source_session", source_body)
+            session = _DeclaredSlotSourceSession(_canonical_bytes(source_body), fitted, config, frozen_pipeline_config, entry)
+            sessions[request.receipt_sha256] = (session, session._body_json, id(context), request, fitted, config, _canonical_bytes(entry))
+            if (fitted.source_group_decision.to_dict().get("availability") != book.AVAILABLE
+                    or fitted.regime_fit_decision.to_dict().get("fit_state") != book.REGIME_FITTED):
+                _fail("DECLARED_SLOT_FIT_NOT_READY")
+            counts = _verified_support_counts(fitted)
+            if counts[body["regime"]] == 0:
+                completion = _declared_base_completion(request, status="NO_TRADE", reason_code="REGIME_UNOBSERVED", source_entry=entry)
+                completion["source_group"] = historical_adapter._owned_decision_envelope(fitted.source_group_decision, "DECLARED_SLOT_SOURCE_INVALID")
+                completion["regime_fit"] = historical_adapter._owned_decision_envelope(fitted.regime_fit_decision, "DECLARED_SLOT_FIT_INVALID")
+                return finish(completion)
+            plan = search_planner.build_declared_slot_observed_cell_plan(context, process=process, request=request, fitted=fitted)
+            open_capture = (historical_adapter.open_transport_declared_slot_capture
+                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
+                else historical_adapter.open_declared_slot_capture)
+            execute_cell = (search_execution.execute_transport_historical_observed_cell
+                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
+                else search_execution.execute_historical_observed_cell)
+            capture = open_capture(context, request=request, process=process, plan=plan, source_session=session)
+            execute_cell(capture=capture, fitted=fitted, regime=body["regime"],
+                search_process=process, cell_plan=plan, config=config)
+            return finish(capture.completion)
+        except Exception as exc:
+            if capture is not None and capture._completion is not None:
+                raise _DeclaredSlotPostCompletionFailure(capture.completion, _declared_failure_details(exc)) from exc
+            # A handled technical stop, never an economic abstention. Hard process
+            # interruptions (BaseException/termination) leave no final commit.
+            source_body.update(_declared_failure_details(exc))
+            source_body["failure_phase"] = "PRE_SOURCE" if source_body["source_accessed_at_utc"] is None else "SOURCE"
+            # Keep the earlier immutable source session if it has already issued.
+            failure_id = f"{body['artifact_namespace']}/technical-source-session"
+            entry = sink.put_json(failure_id, "declared_slot_source_session", source_body)
+            code = source_body["failure_code"]
+            reason = code if code in {"DECLARED_SLOT_NATIVE_SNAPSHOT_MISMATCH",
+                "DECLARED_SLOT_NATIVE_SNAPSHOT_UNAVAILABLE", "DECLARED_SLOT_NATIVE_SNAPSHOT_INVALID",
+                "DECLARED_SLOT_CONSUMED_NATIVE_SNAPSHOT_MISMATCH"} else "DECLARED_SLOT_SOURCE_FAILURE"
+            return finish(_declared_base_completion(request, status="STOP", reason_code=reason, source_entry=entry))
+        finally:
+            # No fitted frame or live permit survives the portable completion.
+            sessions.pop(request.receipt_sha256, None)
+
+    return execute, verify, by_fitted
+
+
+(execute_declared_slot_owner_search, _verified_declared_slot_source_session,
+ _verified_declared_slot_fitted) = _make_declared_slot_source_authority()
+
+
+def _declared_commit_path(precommit, cell_id, ordinal):
+    return f"declared-slots/{precommit.receipt_sha256}/{cell_id}/commits/{ordinal:02d}.json"
+
+
+def _declared_terminal_path(precommit, cell_id):
+    return f"declared-slots/{precommit.receipt_sha256}/{cell_id}/terminal.json"
+
+
+def _declared_failure_time_order_anomalies(failure, *, completed_at_utc, recorded_at_utc):
+    if (type(failure) is not dict or set(failure) != {"exception_type", "failure_code", "failure_observed_at_utc"}
+            or any(type(failure[key]) is not str or not 1 <= len(failure[key]) <= 128
+                for key in ("exception_type", "failure_code"))):
+        _fail("DECLARED_SLOT_TERMINAL_INVALID")
+    completed = _utc(completed_at_utc, "DECLARED_SLOT_TERMINAL_INVALID")
+    observed = _utc(failure["failure_observed_at_utc"], "DECLARED_SLOT_TERMINAL_INVALID")
+    recorded = _utc(recorded_at_utc, "DECLARED_SLOT_TERMINAL_INVALID")
+    anomalies = []
+    if observed < completed:
+        anomalies.append("FAILURE_OBSERVED_BEFORE_COMPLETION")
+    if recorded < observed:
+        anomalies.append("FAILURE_RECORDED_BEFORE_OBSERVED")
+    return anomalies
+
+
+def _verify_declared_terminal_failure(body, *, context, precommit, cell_id, completed, last_commit_sha256):
+    expected = {"schema_version", "precommit_sha256", "generation_context_sha256", "cell_id", "slot_id",
+        "ordinal", "request_sha256", "last_commit_sha256", "reason_code", "failure_phase", "failure",
+        "recorded_at_utc", "terminal_stop", "qualification_authority", "capital_authority", "live_authority", "order_authority"}
+    if type(body) is dict and body.get("schema_version") == _DECLARED_CELL_POST_COMPLETION_TERMINAL_SCHEMA:
+        expected.add("time_order_anomalies")
+    if type(body) is not dict or set(body) != expected or not completed or last_commit_sha256 is None:
+        _fail("DECLARED_SLOT_TERMINAL_INVALID")
+    last = completed[-1]
+    if (body["schema_version"] not in (_DECLARED_CELL_TERMINAL_SCHEMA, _DECLARED_CELL_POST_COMPLETION_TERMINAL_SCHEMA)
+            or body["precommit_sha256"] != precommit.receipt_sha256
+            or body["generation_context_sha256"] != context.context_sha256 or body["cell_id"] != cell_id
+            or body["slot_id"] != last["slot_id"] or body["ordinal"] != last["ordinal"]
+            or type(body["ordinal"]) is not int
+            or body["request_sha256"] != last["request_sha256"]
+            or body["last_commit_sha256"] != last_commit_sha256
+            or body["reason_code"] != "DECLARED_SLOT_POST_COMPLETION_FAILURE"
+            or body["failure_phase"] != "POST_COMPLETION" or body["terminal_stop"] is not True
+            or any(body[key] is not False for key in ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_SLOT_TERMINAL_BINDING_MISMATCH")
+    anomalies = _declared_failure_time_order_anomalies(body["failure"],
+        completed_at_utc=last["completed_at_utc"], recorded_at_utc=body["recorded_at_utc"])
+    if body["schema_version"] == _DECLARED_CELL_TERMINAL_SCHEMA:
+        if anomalies:
+            _fail("DECLARED_SLOT_TERMINAL_INVALID")
+    elif type(body["time_order_anomalies"]) is not list or body["time_order_anomalies"] != anomalies:
+        _fail("DECLARED_SLOT_TERMINAL_INVALID")
+    return body
+
+
+def _declared_terminal_failure_body(context, *, precommit, cell_id, completed, last_commit_sha256,
+                                    failure, recorded_at_utc, time_order_anomalies=None):
+    last = completed[-1]
+    body = {"schema_version": _DECLARED_CELL_TERMINAL_SCHEMA, "precommit_sha256": precommit.receipt_sha256,
+        "generation_context_sha256": context.context_sha256, "cell_id": cell_id,
+        "slot_id": last["slot_id"], "ordinal": last["ordinal"], "request_sha256": last["request_sha256"],
+        "last_commit_sha256": last_commit_sha256, "reason_code": "DECLARED_SLOT_POST_COMPLETION_FAILURE",
+        "failure_phase": "POST_COMPLETION", "failure": failure, "recorded_at_utc": recorded_at_utc,
+        "terminal_stop": True, "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+    if time_order_anomalies is not None:
+        body["schema_version"] = _DECLARED_CELL_POST_COMPLETION_TERMINAL_SCHEMA
+        body["time_order_anomalies"] = time_order_anomalies
+    _verify_declared_terminal_failure(body, context=context, precommit=precommit, cell_id=cell_id,
+        completed=completed, last_commit_sha256=last_commit_sha256)
+    return body
+
+
+def _commit_declared_terminal_failure(context, *, precommit, process, cell_id, completed, last_commit_sha256, failure):
+    historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    search_planner._require_current_process(process)
+    body = _declared_terminal_failure_body(context, precommit=precommit, cell_id=cell_id,
+        completed=completed, last_commit_sha256=last_commit_sha256, failure=failure,
+        recorded_at_utc=_now_utc_seconds())
+    authority_spool._publish_exact_json(context, _declared_terminal_path(precommit, cell_id), body, context.limits.max_json_bytes)
+    return body
+
+
+def _declared_terminal_failure_from_commit(body, *, context, precommit, cell_id, completed, last_commit_sha256):
+    envelope = body.get("post_completion_failure")
+    if (body.get("schema_version") != _DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA
+            or type(envelope) is not dict
+            or set(envelope) != {"failure", "recorded_at_utc", "time_order_anomalies"}
+            or type(envelope["time_order_anomalies"]) is not list):
+        _fail("DECLARED_SLOT_TERMINAL_INVALID")
+    return _declared_terminal_failure_body(context, precommit=precommit, cell_id=cell_id,
+        completed=completed, last_commit_sha256=last_commit_sha256, failure=envelope["failure"],
+        recorded_at_utc=envelope["recorded_at_utc"], time_order_anomalies=envelope["time_order_anomalies"])
+
+
+def _read_declared_record(context, path, *, maximum_bytes=None):
+    target = authority_spool._local_path(context.root, path)
+    if not target.exists():
+        return None
+    maximum = context.limits.max_json_bytes if maximum_bytes is None else maximum_bytes
+    digest, size, encoded = authority_spool._stream_file(context.root, path,
+        maximum_bytes=maximum, collect=True)
+    try:
+        body = authority_spool._strict_json_bytes(encoded, maximum)
+    except Exception as exc:
+        raise HistoricalSearchProducerError("DECLARED_SLOT_COMMIT_INVALID") from exc
+    descriptor = {"schema_version": authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
+        "relative_path": path, "sha256": digest, "size_bytes": size,
+        "format": authority_spool.CANONICAL_JSON_FORMAT}
+    return body, digest, descriptor
+
+
+def _read_declared_commit(context, path):
+    item = _read_declared_record(context, path)
+    if item is None:
+        return None
+    pointer = item[0]
+    if (type(pointer) is not dict or set(pointer) != {"schema_version", "commit_descriptor"}
+            or pointer["schema_version"] != _DECLARED_SLOT_POINTER_SCHEMA):
+        _fail("DECLARED_SLOT_COMMIT_POINTER_INVALID")
+    descriptor = authority_spool._validate_descriptor(pointer["commit_descriptor"], content_addressed=True)
+    if descriptor["format"] != authority_spool.CANONICAL_JSON_FORMAT:
+        _fail("DECLARED_SLOT_COMMIT_POINTER_INVALID")
+    item = _read_declared_record(context, descriptor["relative_path"])
+    if item is None or item[2] != descriptor:
+        _fail("DECLARED_SLOT_COMMIT_INTEGRITY_MISMATCH")
+    return item
+
+
+def _declared_commit_artifact(slot, descriptor):
+    return {"artifact_id": f"declared-slot-commit/{slot['ordinal']:02d}",
+        "artifact_type": "declared_slot_commit", "descriptor": descriptor}
+
+
+def _declared_slot_summary(body, digest):
+    completion = body["completion"]
+    return {"slot_id": body["slot_id"], "ordinal": body["ordinal"], "status": completion["status"],
+        "request_sha256": completion["request_sha256"], "completed_at_utc": completion["completed_at_utc"],
+        "commit_sha256": digest}
+
+
+def _declared_run_path(precommit, cell_id):
+    return f"declared-slots/{precommit.receipt_sha256}/{cell_id}/run-receipt.json"
+
+
+def _declared_run_body(context, *, precommit, cell_id, summaries, declared_slots,
+                       terminal_stop, previous, symbol_receipt, terminal_failure):
+    body = {"schema_version": DECLARED_CELL_RUN_SCHEMA, "precommit_sha256": precommit.receipt_sha256,
+        "generation_context_sha256": context.context_sha256, "cell_id": cell_id,
+        "completed_slots": len(summaries), "declared_slots": declared_slots, "terminal_stop": terminal_stop,
+        "slot_commits": [{"slot_id": item["slot_id"], "status": item["status"]} for item in summaries],
+        "last_commit_sha256": previous, "symbol_receipt": symbol_receipt,
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False}
+    if terminal_failure is not None:
+        body["terminal_failure"] = terminal_failure
+    return body
+
+
+def _declared_symbol_receipt(context, symbol, descriptor):
+    return {"schema_version": authority_spool.COMPACT_RECEIPT_SCHEMA, "generation_id": context.generation_id,
+        "symbol": symbol, "manifest_domain": authority_spool.GENERAL_MANIFEST_DOMAIN,
+        "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
+        "generation_context_sha256": context.context_sha256, "symbol_manifest": descriptor}
+
+
+def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id, frozen_pipeline_config):
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    if (frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]
+            or frozen_pipeline_config.materialize(context).discovery_risk_per_trade_pct != 1.0):
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    if len(parent["cells"]) != 1 or parent["cells"][0]["cell_id"] != cell_id:
+        _fail("DECLARED_SLOT_CELL_INVALID")
+    symbol = parent["cells"][0]["symbol"]
+    manifest_path = authority_spool._manifest_relative_path(symbol, authority_spool.GENERAL_MANIFEST_DOMAIN)
+    manifest = _read_declared_record(context, manifest_path, maximum_bytes=context.limits.max_manifest_bytes)
+    symbol_receipt, run_receipt, verified_manifest = None, None, None
+    if manifest is not None:
+        symbol_receipt = _declared_symbol_receipt(context, symbol, manifest[2])
+        verified_manifest = authority_spool.verify_symbol_receipt(context.root, symbol_receipt,
+            expected_generation_id=context.generation_id, expected_symbol=symbol,
+            expected_native_universe_sha256=context.native_universe_sha256,
+            expected_config_sha256=context.config_sha256, expected_manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
+    completed, commit_artifacts, previous = [], [], None
+    namespaces = set()
+    first, terminal, terminal_failure = None, False, None
+    for slot in parent["slot_roster"]["slots"]:
+        item = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"]))
+        if item is None:
+            if first is None:
+                first = dict(slot)
+            continue
+        body, digest, descriptor = item
+        if terminal:
+            _fail("DECLARED_SLOT_AFTER_TERMINAL_STOP")
+        if first is not None:
+            _fail("DECLARED_SLOT_PREFIX_GAP")
+        expected = {"schema_version", "precommit_sha256", "generation_context_sha256",
+            "cell_id", "slot_id", "ordinal", "previous_commit_sha256", "completion", "artifact_roster"}
+        if type(body) is dict and body.get("schema_version") == _DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA:
+            expected.add("post_completion_failure")
+        if (type(body) is not dict or set(body) != expected
+                or body["schema_version"] not in (DECLARED_SLOT_COMMIT_SCHEMA, _DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA)
+                or body["precommit_sha256"] != precommit.receipt_sha256
+                or body["generation_context_sha256"] != context.context_sha256
+                or body["cell_id"] != cell_id or body["slot_id"] != slot["slot_id"]
+                or body["ordinal"] != slot["ordinal"] or body["previous_commit_sha256"] != previous):
+            _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
+        _verify_declared_completion_transport(context, completion=body["completion"],
+            expected_edition=historical.declared_slot_transport_edition(parent))
+        verified = historical_adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
+            completion=body["completion"], artifact_roster=body["artifact_roster"], frozen_pipeline_config=frozen_pipeline_config)
+        if verified["slot_id"] != slot["slot_id"] or verified["cell_id"] != cell_id:
+            _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
+        namespace = verified["request_body"]["artifact_namespace"] + "/"
+        if any(namespace.startswith(prior) or prior.startswith(namespace) for prior in namespaces):
+            _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
+        namespaces.add(namespace)
+        for entry in body["artifact_roster"]:
+            if not entry["artifact_id"].startswith(namespace):
+                _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
+        completed.append(_declared_slot_summary(body, digest))
+        commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
+        previous, terminal = digest, verified["status"] == "STOP"
+        if body["schema_version"] == _DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA:
+            terminal_failure = _declared_terminal_failure_from_commit(body, context=context,
+                precommit=precommit, cell_id=cell_id, completed=completed, last_commit_sha256=previous)
+            terminal = True
+        del body, verified, item
+    sibling_terminal = _read_declared_record(context, _declared_terminal_path(precommit, cell_id))
+    if sibling_terminal is not None:
+        if (terminal_failure is None and type(sibling_terminal[0]) is dict
+                and sibling_terminal[0].get("schema_version") == _DECLARED_CELL_POST_COMPLETION_TERMINAL_SCHEMA):
+            _fail("DECLARED_SLOT_TERMINAL_INVALID")
+        sibling_terminal = _verify_declared_terminal_failure(sibling_terminal[0], context=context,
+            precommit=precommit, cell_id=cell_id, completed=completed, last_commit_sha256=previous)
+        if terminal_failure is not None and sibling_terminal != terminal_failure:
+            _fail("DECLARED_SLOT_TERMINAL_BINDING_MISMATCH")
+        terminal_failure = sibling_terminal
+        terminal = True
+    if terminal:
+        first = None
+    if manifest is not None:
+        if first is not None:
+            _fail("DECLARED_SLOT_FINALIZED_INCOMPLETE_PREFIX")
+        if verified_manifest["artifacts"] != commit_artifacts:
+            _fail("DECLARED_SLOT_FINAL_MANIFEST_BINDING_MISMATCH")
+    run = _read_declared_record(context, _declared_run_path(precommit, cell_id))
+    if run is not None:
+        if symbol_receipt is None:
+            _fail("DECLARED_SLOT_FINAL_MANIFEST_MISSING")
+        expected = _declared_run_body(context, precommit=precommit, cell_id=cell_id, summaries=completed,
+            declared_slots=len(parent["slot_roster"]["slots"]), terminal_stop=terminal, previous=previous,
+            symbol_receipt=symbol_receipt, terminal_failure=terminal_failure)
+        if run[0] != expected:
+            _fail("DECLARED_SLOT_RUN_RECEIPT_BINDING_MISMATCH")
+        run_receipt = run[0]
+    return DeclaredCellOwnerProgress(tuple(completed), tuple(commit_artifacts), first, terminal, previous,
+        terminal_failure, symbol_receipt, run_receipt)
+
+
+def _commit_declared_slot_completion(context, *, precommit, process, cell_id, slot, completion,
+                                      artifact_roster, previous_commit_sha256, frozen_pipeline_config,
+                                      post_completion_failure=None):
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    search_planner._require_current_process(process)
+    # Independently reopen the COMPLETE result before publishing an immutable
+    # completion marker. The marker, not process memory, commits the slot.
+    try:
+        if len(artifact_roster) > context.limits.max_artifacts_per_symbol:
+            _fail("DECLARED_SLOT_COMMIT_ROSTER_BOUND_EXCEEDED")
+        authority_spool._canonical_json_bytes(artifact_roster, min(context.limits.max_json_bytes, context.limits.max_manifest_bytes))
+    except authority_spool.AuthoritySpoolError as exc:
+        raise HistoricalSearchProducerError("DECLARED_SLOT_COMMIT_ROSTER_BOUND_EXCEEDED", (str(exc)[:128],)) from exc
+    _verify_declared_completion_transport(context, completion=completion,
+        expected_edition=historical.declared_slot_transport_edition(parent))
+    verified = historical_adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
+        completion=completion, artifact_roster=artifact_roster, frozen_pipeline_config=frozen_pipeline_config)
+    if verified["slot_id"] != slot["slot_id"] or verified["cell_id"] != cell_id:
+        _fail("DECLARED_SLOT_COMMIT_INVALID")
+    namespace = verified["request_body"]["artifact_namespace"] + "/"
+    if any(not entry["artifact_id"].startswith(namespace) for entry in artifact_roster):
+        _fail("DECLARED_SLOT_COMMIT_INVALID")
+    if authority_spool._local_path(context.root, _declared_terminal_path(precommit, cell_id)).exists():
+        _fail("DECLARED_SLOT_AFTER_TERMINAL_STOP")
+    path = _declared_commit_path(precommit, cell_id, slot["ordinal"])
+    if slot["ordinal"] == 1:
+        if previous_commit_sha256 is not None:
+            _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
+    else:
+        prior = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"] - 1))
+        if prior is None or prior[1] != previous_commit_sha256:
+            _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
+        if (prior[0]["completion"]["status"] == "STOP"
+                or prior[0]["schema_version"] == _DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA):
+            _fail("DECLARED_SLOT_AFTER_TERMINAL_STOP")
+    if authority_spool._local_path(context.root, path).exists():
+        _fail("DECLARED_SLOT_COMMITTED_SLOT_REEXECUTION")
+    body = {"schema_version": DECLARED_SLOT_COMMIT_SCHEMA, "precommit_sha256": precommit.receipt_sha256,
+        "generation_context_sha256": context.context_sha256, "cell_id": cell_id,
+        "slot_id": slot["slot_id"], "ordinal": slot["ordinal"], "previous_commit_sha256": previous_commit_sha256,
+        "completion": verified, "artifact_roster": list(artifact_roster)}
+    if post_completion_failure is not None:
+        # Completion and the already-known stop share one immutable pointer.
+        recorded_at_utc = _now_utc_seconds()
+        anomalies = _declared_failure_time_order_anomalies(post_completion_failure,
+            completed_at_utc=verified["completed_at_utc"], recorded_at_utc=recorded_at_utc)
+        body["schema_version"] = _DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA
+        body["post_completion_failure"] = {"failure": dict(post_completion_failure),
+            "recorded_at_utc": recorded_at_utc, "time_order_anomalies": anomalies}
+    try:
+        authority_spool._canonical_json_bytes(body, context.limits.max_json_bytes)
+    except authority_spool.AuthoritySpoolError as exc:
+        raise HistoricalSearchProducerError("DECLARED_SLOT_COMMIT_BOUND_EXCEEDED", (str(exc)[:128],)) from exc
+    descriptor = authority_spool.write_canonical_json_artifact(context, body)
+    pointer = {"schema_version": _DECLARED_SLOT_POINTER_SCHEMA, "commit_descriptor": descriptor}
+    authority_spool._publish_exact_json(context, path, pointer, context.limits.max_json_bytes)
+    return _declared_slot_summary(body, descriptor["sha256"]), descriptor
+
+
+def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, frozen_pipeline_config, cell_id):
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    search_planner._require_current_process(process)
+    frozen_pipeline_config.verify_current(context)
+    if frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]:
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    progress = reopen_declared_cell_owner_progress(context, precommit=precommit, process=process, cell_id=cell_id, frozen_pipeline_config=frozen_pipeline_config)
+    symbol = parent["cells"][0]["symbol"]
+    if progress.run_receipt is not None:
+        return DeclaredCellOwnerRunReceipt(_canonical_bytes(progress.run_receipt))
+    previous = progress.last_commit_sha256
+    completed = list(progress.slot_summaries)
+    commit_artifacts = list(progress.slot_commit_artifacts)
+    terminal_failure = progress.terminal_failure
+    if not progress.terminal_stop and progress.first_uncommitted_slot is not None:
+        start = progress.first_uncommitted_slot["ordinal"]
+        for slot in parent["slot_roster"]["slots"][start - 1:]:
+            import secrets
+            import os
+            sink = authority_spool.open_symbol_sink(context, symbol)
+            attempt_id = "attempt-" + secrets.token_hex(16)
+            request = historical.declared_slot_producer_request(context, precommit=precommit, process=process,
+                cell_id=cell_id, slot_id=slot["slot_id"], attempt_id=attempt_id, sink=sink)
+            attempt_body = {"schema_version": "fxpm.declared-slot-attempt-start.v1", "request_sha256": request.receipt_sha256,
+                "slot_id": slot["slot_id"], "started_at_utc": _now_utc_seconds(), "pid": os.getpid(),
+                "meaning": "START_ONLY_NOT_A_COMPLETION_OR_FUTURE_OUTCOME",
+                "prior_uncommitted_attempts": _declared_prior_attempt_starts(context, precommit, cell_id, slot)}
+            authority_spool._publish_exact_json(context,
+                f"declared-slots/{precommit.receipt_sha256}/{cell_id}/attempts/{slot['slot_id']}/{attempt_id}.json",
+                attempt_body, context.limits.max_json_bytes)
+            post_completion_failure = None
+            try:
+                completion = execute_declared_slot_owner_search(context, request=request, process=process,
+                    frozen_pipeline_config=frozen_pipeline_config)
+            except _DeclaredSlotPostCompletionFailure as exc:
+                completion, post_completion_failure = exc.completion, exc.failure
+            namespace = request.to_dict()["artifact_namespace"] + "/"
+            roster = [dict(sink._artifacts[k]) for k in sorted(sink._artifacts) if k.startswith(namespace)]
+            summary, descriptor = _commit_declared_slot_completion(context, precommit=precommit, process=process,
+                cell_id=cell_id, slot=slot, completion=completion, artifact_roster=roster,
+                previous_commit_sha256=previous, frozen_pipeline_config=frozen_pipeline_config,
+                post_completion_failure=post_completion_failure)
+            previous = descriptor["sha256"]
+            completed.append(summary)
+            commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
+            historical._release_declared_slot_producer_request(request, context)
+            del sink, roster, request
+            if post_completion_failure is not None:
+                committed = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"]))
+                if committed is None or committed[1] != previous:
+                    _fail("DECLARED_SLOT_COMMIT_INTEGRITY_MISMATCH")
+                terminal_failure = _declared_terminal_failure_from_commit(committed[0], context=context,
+                    precommit=precommit, cell_id=cell_id, completed=completed, last_commit_sha256=previous)
+                break
+            if completion["status"] == "STOP":
+                break
+    # This first surface precommits exactly one cell, so outer finalization is
+    # reached only after all13 slots or an authenticated terminal technical stop.
+    terminal_stop = bool(terminal_failure is not None or (completed and completed[-1]["status"] == "STOP"))
+    if not terminal_stop and len(completed) != len(parent["slot_roster"]["slots"]):
+        _fail("DECLARED_SLOT_FINALIZED_INCOMPLETE_PREFIX")
+    sink = authority_spool.open_symbol_sink(context, symbol)
+    for entry in commit_artifacts:
+        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+    symbol_receipt = sink.seal()
+    body = _declared_run_body(context, precommit=precommit, cell_id=cell_id, summaries=completed,
+        declared_slots=len(parent["slot_roster"]["slots"]), terminal_stop=terminal_stop, previous=previous,
+        symbol_receipt=symbol_receipt, terminal_failure=terminal_failure)
+    authority_spool._publish_exact_json(context, _declared_run_path(precommit, cell_id), body, context.limits.max_json_bytes)
+    return DeclaredCellOwnerRunReceipt(_canonical_bytes(body))
+
+
+__all__ += ["DECLARED_CELL_RUN_SCHEMA", "DECLARED_SLOT_COMMIT_SCHEMA", "DeclaredCellOwnerRunReceipt",
+    "DeclaredCellOwnerProgress", "execute_declared_slot_owner_search", "execute_declared_cell_owner_slots",
+    "reopen_declared_cell_owner_progress"]
+
+
+def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pipeline_config, cell_id):
+    """Hold the existing nonblocking OS primitive through restore and commit."""
+    import os
+    import pm_native_storage as storage
+    if (type(context) is not authority_spool.GenerationSpoolContext
+            or type(precommit) is not historical.DeclaredSlotRunPrecommit):
+        _fail("DECLARED_SLOT_PRECOMMIT_INVALID")
+    _hex64(cell_id, "DECLARED_SLOT_CELL_INVALID")
+    historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    search_planner._require_current_process(process)
+    relative = f"declared-slots/{precommit.receipt_sha256}/{cell_id}"
+    authority_spool._ensure_directory(context.root, relative)
+    path = authority_spool._local_path(context.root, relative + "/run.lock")
+    authority_spool._reject_reparse_chain(path)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "r+b", buffering=0) as handle:
+        authority_spool._reject_reparse_chain(path)
+        current, opened = os.stat(path, follow_symlinks=False), os.fstat(handle.fileno())
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            _fail("DECLARED_SLOT_RUN_LOCK_INVALID")
+        if opened.st_size == 0:
+            handle.write(b"\0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if not storage._try_kernel_lock(handle):
+            _fail("DECLARED_SLOT_RUN_ACTIVE")
+        try:
+            current, pinned = os.stat(path, follow_symlinks=False), os.fstat(handle.fileno())
+            if ((current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino)
+                    or (opened.st_dev, opened.st_ino) != (pinned.st_dev, pinned.st_ino)
+                    or pinned.st_size != 1):
+                _fail("DECLARED_SLOT_RUN_LOCK_INVALID")
+            return _execute_declared_cell_owner_slots_unlocked(context=context, precommit=precommit,
+                process=process, frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id)
+        finally:
+            storage._release_kernel_lock(handle)
+
+
+def _declared_prior_attempt_starts(context, precommit, cell_id, slot):
+    """Bounded diagnostics at the first uncommitted slot, never an outcome."""
+    relative = f"declared-slots/{precommit.receipt_sha256}/{cell_id}/attempts/{slot['slot_id']}"
+    directory = authority_spool._local_path(context.root, relative)
+    if not directory.exists():
+        return []
+    authority_spool._reject_reparse_chain(directory)
+    paths = list(directory.iterdir())
+    if len(paths) > context.limits.max_artifacts_per_symbol:
+        _fail("DECLARED_SLOT_ATTEMPT_ROSTER_BOUND_EXCEEDED")
+    result = []
+    for path in sorted(paths):
+        if path.suffix != ".json":
+            _fail("DECLARED_SLOT_ATTEMPT_RECORD_INVALID")
+        name = relative + "/" + path.name
+        digest, size, encoded = authority_spool._stream_file(context.root, name,
+            maximum_bytes=context.limits.max_json_bytes, collect=True)
+        body = authority_spool._strict_json_bytes(encoded, context.limits.max_json_bytes)
+        if (body.get("schema_version") != "fxpm.declared-slot-attempt-start.v1"
+                or body.get("slot_id") != slot["slot_id"]):
+            _fail("DECLARED_SLOT_ATTEMPT_RECORD_INVALID")
+        result.append({"relative_path": name, "sha256": digest, "size_bytes": size,
+            "state": "NO_COMMIT_OBSERVED_AT_RESUME", "cause": "UNKNOWN"})
+    return result

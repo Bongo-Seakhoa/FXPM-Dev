@@ -29,12 +29,12 @@ import pm_winner_raw_evidence as raw_winner
 import pm_winner_selection as winner_selection
 
 
-CAPTURE_CONTRACT_VERSION = "fxpm.historical-search-capture.v2"
+CAPTURE_CONTRACT_VERSION = "fxpm.historical-search-capture.v3"
 SYMBOL_INDEX_SCHEMA = "fxpm.historical-symbol-production-index.v1"
 OPTIMIZER_PAYLOAD_SCHEMA = "fxpm.historical-optimizer-payload.v1"
 FAILURE_ARTIFACT_SCHEMA = "fxpm.historical-search-technical-failure.v1"
 RAW_DESCRIPTOR_GRAPH_SCHEMA = "fxpm.historical-raw-winner-descriptor-graph.v1"
-HORIZON_WINNER_CROSS_BINDING_SCHEMA = "fxpm.historical-horizon-winner-cross-binding.v1"
+HORIZON_WINNER_CROSS_BINDING_SCHEMA = "fxpm.historical-horizon-winner-cross-binding.v2"
 SOURCE_COUNT_RECEIPT_SCHEMA = "fxpm.historical-attempt-source-count.v1"
 RAW_ARTIFACT_NAMESPACE_PREFIX = "historical-anchor"
 BOUNDED_RAW_WINNER_CANARY_RECEIPT_SCHEMA = "fxpm.bounded-raw-winner-canary-receipt.v2"
@@ -223,14 +223,25 @@ _FROZEN_ARTIFACT_TYPES = {
     "precommitment": "winner_precommitment",
     "attempt_ledger": "winner_attempt_ledger",
     "source_contract_seed": "winner_source_contract_seed",
-    "base_cost_contract": "winner_base_cost_contract",
-    "stress_cost_contract": "winner_stress_cost_contract",
-    "cost_stress_adversity_plan": "winner_cost_stress_adversity_plan",
+    "cost_ladder_contract": "winner_cost_ladder_contract",
+    "cost_ladder_adversity_plan": "winner_cost_ladder_adversity_plan",
     "risk_unit_contract": "winner_risk_unit_contract",
     "horizon_execution_contracts": "winner_horizon_execution_contracts",
     "trade_power_policy": "winner_trade_power_policy",
     "multiplicity_receipt": "winner_trade_power_multiplicity",
 }
+_CURRENT_FROZEN_ARTIFACT_TYPES = {
+    "precommitment": "winner_precommitment",
+    "attempt_ledger": "winner_attempt_ledger",
+    "source_contract_seeds": "winner_source_contract_seeds",
+    "frozen_tier_pair_contract": "winner_frozen_tier_pair_contract",
+    "partition_cost_precommitments": "winner_partition_cost_precommitments",
+    "risk_unit_contract": "winner_risk_unit_contract",
+    "horizon_execution_contracts": "winner_horizon_execution_contracts",
+    "trade_power_policy": "winner_trade_power_policy",
+    "multiplicity_receipt": "winner_trade_power_multiplicity",
+}
+
 
 
 class HistoricalProductionAdapterError(ValueError):
@@ -1680,7 +1691,7 @@ def _all_precommitted_attempts_process_rejected(
     decision: Any,
     attempted_trials_exact: int,
 ) -> bool:
-    """Project Winner v13's role-aware rejected roster without relabelling it."""
+    """Project Winner-v14's role-aware rejected roster without relabelling it."""
 
     decision_body = decision.to_dict()
     precommitment = request.precommitment.to_dict()
@@ -1698,34 +1709,32 @@ def _all_precommitted_attempts_process_rejected(
         or attempted_trials_exact <= 0
     ):
         return False
-    required_pbo_folds = len(fold_plan)
+    required_folds = len(fold_plan)
     for attempt, entry in zip(attempts, entries, strict=True):
         if (
             type(attempt) is not dict
             or type(entry) is not dict
             or entry.get("evidence_status") != "PROCESS_REJECTED"
-            or entry.get("fold_count") != 0
-            or entry.get("folds") != []
+            or entry.get("attempt_id") != attempt.get("attempt_id")
         ):
             return False
         role = attempt.get("precommitted_evidence_role")
         if role == "EVALUATION_REQUIRED":
+            folds = entry.get("folds")
             if (
                 entry.get("status_reason") != "EVALUATED_OOS_PROCESS_REJECTED"
-                or entry.get("pbo_evidence_source")
-                != "COMPLETE_EVALUATION_REQUIRED_FOLDS"
-                or entry.get("pbo_fold_count") != required_pbo_folds
-                or type(entry.get("pbo_folds")) is not list
-                or len(entry["pbo_folds"]) != required_pbo_folds
+                or entry.get("fold_count") != required_folds
+                or type(folds) is not list
+                or len(folds) != required_folds
+                or entry.get("folds_sha256") != _sha256(folds)
             ):
                 return False
         elif role == "PRESEARCH_PROCESS_REJECTED":
             if (
                 entry.get("status_reason") != "PRESEARCH_PROCESS_REJECTED"
-                or entry.get("pbo_evidence_source")
-                != "NOT_APPLICABLE_PRESEARCH_REJECTION"
-                or entry.get("pbo_fold_count") != 0
-                or entry.get("pbo_folds") != []
+                or entry.get("fold_count") != 0
+                or entry.get("folds") != []
+                or entry.get("folds_sha256") != _sha256([])
             ):
                 return False
         else:
@@ -1870,13 +1879,15 @@ def _cross_binding_body(
     prefix_sha = _hex64(
         prefix.get("prefix_content_sha256"), "HORIZON_PREFIX_SHA256_INVALID"
     )
+    generation = winner_selection.winner_generation_for_precommitment(precommitment)
+    current_costs = not generation.archived
+    pair_field = "frozen_tier_pair_contract_sha256" if current_costs else "cost_ladder_contract_sha256"
     policy = plan.get("horizon_policy")
     if (
         type(policy) is not dict
         or policy.get("cost_contract_sha256")
         != precommitment.get("cost_contract_sha256")
-        or policy.get("cost_stress_contract_sha256")
-        != precommitment.get("cost_stress_contract_sha256")
+        or policy.get(pair_field) != precommitment.get(pair_field)
     ):
         _fail("HORIZON_WINNER_COST_CONTRACT_SPLICE")
 
@@ -2113,12 +2124,17 @@ def _cross_binding_body(
         "causal_fold_plan_sha256": precommitment.get("causal_fold_plan_sha256"),
         "source_contract_sha256": precommitment.get("source_contract_sha256"),
         "cost_contract_sha256": precommitment.get("cost_contract_sha256"),
-        "cost_stress_contract_sha256": precommitment.get("cost_stress_contract_sha256"),
+        pair_field: precommitment.get(pair_field),
     }
+    if current_costs:
+        winner_roster["partition_cost_precommitments_sha256"] = precommitment.get("partition_cost_precommitments_sha256")
     for value in winner_roster.values():
         _hex64(value, "WINNER_CROSS_BINDING_ROSTER_INVALID")
     return {
-        "schema_version": HORIZON_WINNER_CROSS_BINDING_SCHEMA,
+        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+                           if generation is winner_selection.V16_GENERATION
+                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3
+                           if current_costs else HORIZON_WINNER_CROSS_BINDING_SCHEMA),
         "producer_request_sha256": producer_request_sha256,
         "anchor_id": anchor_id,
         "selection_cutoff_utc": plan["anchor"]["selection_cutoff_utc"],
@@ -2276,7 +2292,11 @@ class HistoricalSymbolSearchCapture:
         context: authority_spool.GenerationSpoolContext,
         request: orchestration.AnchorProducerRequest,
         symbol: str,
+        *, _winner_generation: Any = None,
     ) -> None:
+        if not any(_winner_generation is known for known in (None, winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION)):
+            _fail("WINNER_CAPTURE_GENERATION_INVALID")
+        self._winner_generation = _winner_generation or winner_selection.CURRENT_GENERATION
         if type(context) is not authority_spool.GenerationSpoolContext:
             _fail("GENERATION_CONTEXT_INVALID")
         if type(request) is not orchestration.AnchorProducerRequest:
@@ -2347,6 +2367,9 @@ class HistoricalSymbolSearchCapture:
     def _raw_cell_prefix(self, timeframe: str, regime: str) -> str:
         return f"{self.raw_artifact_namespace}/winner-search/{timeframe}/{regime}"
 
+    def _adapter_cell_prefix(self, timeframe: str, regime: str) -> str:
+        return f"{self.anchor['anchor_id']}/adapter/{timeframe}/{regime}"
+
     def _spool_descriptor_graph(
         self,
         *,
@@ -2397,8 +2420,7 @@ class HistoricalSymbolSearchCapture:
             "confers_causal_current_live_or_capital_authority": False,
         }
         entry = self.sink.put_json(
-            f"{self.anchor['anchor_id']}/adapter/{timeframe}/{regime}/"
-            f"{phase.lower()}-descriptor-graph",
+            f"{self._adapter_cell_prefix(timeframe, regime)}/{phase.lower()}-descriptor-graph",
             "historical_raw_winner_descriptor_graph",
             body,
         )
@@ -2425,7 +2447,13 @@ class HistoricalSymbolSearchCapture:
         attempts = frozen.attempt_ledger.get("attempts")
         if type(attempts) is not list:
             _fail("WINNER_FROZEN_ATTEMPT_ROSTER_INVALID")
-        expected_names = set(_FROZEN_ARTIFACT_TYPES)
+        if receipt.get("schema_version") in {raw_winner.CURRENT_FROZEN_PLAN_SCHEMA, raw_winner.V16_FROZEN_PLAN_SCHEMA}:
+            artifact_types = _CURRENT_FROZEN_ARTIFACT_TYPES
+        elif receipt.get("schema_version") == raw_winner.ARCHIVED_FROZEN_PLAN_SCHEMA:
+            artifact_types = _FROZEN_ARTIFACT_TYPES
+        else:
+            _fail("WINNER_FROZEN_RECEIPT_SCHEMA_INVALID")
+        expected_names = set(artifact_types)
         for attempt in attempts:
             ordinal = attempt.get("ordinal") if type(attempt) is dict else None
             if type(ordinal) is not int or ordinal < 0:
@@ -2438,9 +2466,9 @@ class HistoricalSymbolSearchCapture:
         prefix = f"{self._raw_cell_prefix(frozen.timeframe, frozen.regime)}/frozen"
         entries: list[dict[str, Any]] = []
         for name in sorted(roster):
-            if name in _FROZEN_ARTIFACT_TYPES:
+            if name in artifact_types:
                 artifact_id = f"{prefix}/{name}"
-                artifact_type = _FROZEN_ARTIFACT_TYPES[name]
+                artifact_type = artifact_types[name]
             else:
                 attempt_label, body_name = name.rsplit("-", 1)
                 # Artifact body names contain underscores, never hyphens.
@@ -2495,7 +2523,10 @@ class HistoricalSymbolSearchCapture:
         key = (timeframe, regime)
         if key in self._evidence:
             _fail("CELL_CAPTURE_DUPLICATED")
-        state = book.create_historical_process_state_decision(
+        state_factory = (book.create_transport_historical_process_state_decision
+                         if getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
+                         else book.create_historical_process_state_decision)
+        state = state_factory(
             symbol=self.symbol,
             timeframe=timeframe,
             regime=regime,
@@ -2837,10 +2868,9 @@ class HistoricalSymbolSearchCapture:
         attempts_frozen_at_utc: str,
         fold_plan: Sequence[Mapping[str, Any]],
         attempt_artifacts: Sequence[Mapping[str, Any]],
-        source_contract_seed: Mapping[str, Any],
-        base_cost_contract: Mapping[str, Any],
-        stress_cost_contract: Mapping[str, Any],
-        cost_stress_adversity_plan: Mapping[str, Any],
+        source_contract_seeds: Mapping[str, Any],
+        frozen_tier_pair_contract: Mapping[str, Any],
+        partition_cost_precommitments: Mapping[str, Any],
         risk_unit_contract: Mapping[str, Any],
     ) -> FrozenHistoricalCell:
         """Freeze the complete cell roster before raw evidence access."""
@@ -2877,12 +2907,13 @@ class HistoricalSymbolSearchCapture:
         precommitted_evidence_roles = _precommitted_evidence_roles(
             self._horizon_plan_bodies[key], len(normalized_attempts)
         )
-        if not _raw_namespace_supported(
-            raw_winner.freeze_winner_search_plan_v3
-        ) or not _raw_namespace_supported(raw_winner.produce_winner_v11_raw_evidence):
+        transport = getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
+        freeze = raw_winner.freeze_winner_search_plan_v5 if transport else raw_winner.freeze_winner_search_plan_v4
+        produce = raw_winner.produce_winner_v16_raw_evidence if transport else raw_winner.produce_winner_v15_raw_evidence
+        if not _raw_namespace_supported(freeze) or not _raw_namespace_supported(produce):
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
         try:
-            frozen = raw_winner.freeze_winner_search_plan_v3(
+            frozen = freeze(
                 self.sink,
                 symbol=self.symbol,
                 timeframe=timeframe,
@@ -2893,10 +2924,9 @@ class HistoricalSymbolSearchCapture:
                 attempt_artifacts=normalized_attempts,
                 precommitted_evidence_roles=precommitted_evidence_roles,
                 horizon_execution_contracts=execution_contracts,
-                source_contract_seed=source_contract_seed,
-                base_cost_contract=base_cost_contract,
-                stress_cost_contract=stress_cost_contract,
-                cost_stress_adversity_plan=cost_stress_adversity_plan,
+                source_contract_seeds=source_contract_seeds,
+                frozen_tier_pair_contract=frozen_tier_pair_contract,
+                partition_cost_precommitments=partition_cost_precommitments,
                 risk_unit_contract=risk_unit_contract,
                 artifact_namespace=self.raw_artifact_namespace,
             )
@@ -2922,8 +2952,7 @@ class HistoricalSymbolSearchCapture:
         )
         cross_binding_bytes = _canonical_bytes(cross_binding)
         cross_binding_entry = self.sink.put_opaque(
-            f"{self.anchor['anchor_id']}/adapter/{timeframe}/{regime}/"
-            "horizon-winner-cross-binding",
+            f"{self._adapter_cell_prefix(timeframe, regime)}/horizon-winner-cross-binding",
             "historical_horizon_winner_cross_binding",
             (cross_binding_bytes,),
             format=raw_winner.ASCII_JSON_FORMAT,
@@ -3042,10 +3071,13 @@ class HistoricalSymbolSearchCapture:
             or handle.cross_binding_descriptor["format"] != raw_winner.ASCII_JSON_FORMAT
         ):
             _fail("HORIZON_WINNER_CROSS_BINDING_REPLAY_FAILED")
-        if not _raw_namespace_supported(raw_winner.produce_winner_v11_raw_evidence):
+        produce = (raw_winner.produce_winner_v16_raw_evidence
+                   if handle.frozen.selection_generation is winner_selection.V16_GENERATION
+                   else raw_winner.produce_winner_v15_raw_evidence)
+        if not _raw_namespace_supported(produce):
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
         try:
-            production = raw_winner.produce_winner_v11_raw_evidence(
+            production = produce(
                 self.sink,
                 frozen=handle.frozen,
                 attempt_evidence=attempt_evidence,
@@ -3091,7 +3123,7 @@ class HistoricalSymbolSearchCapture:
         evidence_access_started_at_utc: str,
         evidence_access_completed_at_utc: str,
     ) -> raw_winner.WinnerRawEvidenceProduction:
-        """Consume un-compacted Backtester lanes and create Winner V11 evidence."""
+        """Consume un-compacted Backtester lanes and create Winner-v15 evidence."""
 
         key = (handle.timeframe, handle.regime)
         completed = self._complete_raw_winner_cell(
@@ -3942,12 +3974,16 @@ def _rebuild_horizon_plan(
         code="WORKER_HORIZON_PLAN_REOPEN_FAILED",
     )
     unobserved = "regime_support_binding" in body
+    if body.get("schema_version") == training_horizon._PLAN_SCHEMA:  # noqa: SLF001
+        request_schema = training_horizon._REQUEST_SCHEMA  # noqa: SLF001
+        unobserved_request_schema = training_horizon._UNOBSERVED_REQUEST_SCHEMA  # noqa: SLF001
+    elif body.get("schema_version") == training_horizon._CURRENT_PLAN_SCHEMA:  # noqa: SLF001
+        request_schema = training_horizon._CURRENT_REQUEST_SCHEMA  # noqa: SLF001
+        unobserved_request_schema = training_horizon._CURRENT_UNOBSERVED_REQUEST_SCHEMA  # noqa: SLF001
+    else:
+        _fail("WORKER_HORIZON_PLAN_INVALID")
     request = {
-        "schema_version": (
-            training_horizon._UNOBSERVED_REQUEST_SCHEMA  # noqa: SLF001
-            if unobserved
-            else training_horizon._REQUEST_SCHEMA  # noqa: SLF001
-        ),
+        "schema_version": unobserved_request_schema if unobserved else request_schema,
         "run_id": body.get("run_id"),
         "anchor": body.get("anchor"),
         "cell": body.get("cell"),
@@ -3988,12 +4024,15 @@ def _rebuild_winner_pair(
         "decision_sha256",
     }:
         _fail("WORKER_WINNER_BINDING_INVALID")
-    request_body, _ = _reopen_worker_ascii_json_descriptor(
+    request_body, request_bytes = _reopen_worker_ascii_json_descriptor(
         context,
         value["request"],
-        maximum_bytes=winner_selection.MAX_REQUEST_BYTES,
+        maximum_bytes=winner_selection.MAX_SUPPORTED_WINNER_REQUEST_BYTES,
         code="WORKER_WINNER_REQUEST_REOPEN_FAILED",
     )
+    if (request_body.get("contract_version") != winner_selection.V16_GENERATION.request_version
+            and len(request_bytes) > winner_selection.MAX_REQUEST_BYTES):
+        _fail("WORKER_WINNER_REQUEST_REOPEN_FAILED")
     if set(request_body) != {
         "contract_version",
         "precommitment",
@@ -4012,7 +4051,10 @@ def _rebuild_winner_pair(
         ):
             _fail("WORKER_WINNER_REQUEST_INVALID")
         wrappers.append(wrapper["payload"])
-    request = winner_selection.create_winner_selection_request(*wrappers)
+    try:
+        request = winner_selection.create_winner_selection_request(*wrappers)
+    except ValueError as exc:
+        raise HistoricalProductionAdapterError("WORKER_WINNER_REQUEST_INVALID") from exc
     if (
         request is None
         or request.to_dict() != request_body
@@ -4065,7 +4107,10 @@ def _verify_worker_production_receipt(
     )
     roster = body.get("artifact_roster")
     if (
-        body.get("schema_version") != raw_winner.PRODUCTION_SCHEMA
+        body.get("schema_version") not in (
+            {raw_winner.V16_PRODUCTION_SCHEMA}
+            if request.to_dict()["contract_version"] == winner_selection.V16_GENERATION.request_version
+            else {raw_winner.PRODUCTION_SCHEMA, raw_winner.CURRENT_PRODUCTION_SCHEMA})
         or body.get("generation_context_sha256") != context.context_sha256
         or body.get("symbol") != symbol
         or body.get("timeframe") != timeframe
@@ -4521,7 +4566,10 @@ def reopen_historical_symbol_worker_bundle(
                 != (insufficient is not None)
             ):
                 _fail("WORKER_PROCESS_CELL_SPLICE")
-            process_decision = book.create_historical_process_state_decision(
+            binding_schema = (process_payload.get("insufficient_evidence_binding") or {}).get("schema_version")
+            state_factory = (book.create_transport_historical_process_state_decision
+                if binding_schema == book.V16_GENERATION.insufficient_schema else book.create_historical_process_state_decision)
+            process_decision = state_factory(
                 symbol=symbol,
                 timeframe=timeframe,
                 regime=regime,
@@ -4651,13 +4699,13 @@ class BoundedRawWinnerCanaryCapture(HistoricalSymbolSearchCapture):
     def freeze_observed_cell(
         self,
         *args: Any,
-        cost_stress_adversity_plan: Mapping[str, Any],
+        partition_cost_precommitments: Mapping[str, Any],
         **kwargs: Any,
     ) -> FrozenHistoricalCell:
         _verify_bounded_raw_winner_canary_capture(self)
         return super().freeze_observed_cell(
             *args,
-            cost_stress_adversity_plan=cost_stress_adversity_plan,
+            partition_cost_precommitments=partition_cost_precommitments,
             **kwargs,
         )
 
@@ -5608,13 +5656,13 @@ def verify_bounded_raw_winner_canary_receipt(
         request_payload = _reopen_ascii_json_entry(
             context,
             request_entry,
-            expected_type="winner_v11_request",
+            expected_type="winner_v14_request",
             code="CANARY_WINNER_REQUEST_REOPEN_FAILED",
         )
         decision_payload = _reopen_ascii_json_entry(
             context,
             decision_entry,
-            expected_type="winner_v11_decision",
+            expected_type="winner_v14_decision",
             code="CANARY_WINNER_DECISION_REOPEN_FAILED",
         )
         try:
@@ -5741,7 +5789,14 @@ def open_historical_symbol_capture(
     return HistoricalSymbolSearchCapture(context, request, symbol)
 
 
+def open_transport_historical_symbol_capture(context, request, symbol) -> HistoricalSymbolSearchCapture:
+    """Open the explicit v16 R&D transport edition; legacy capture stays v15."""
+    return HistoricalSymbolSearchCapture(context, request, symbol, _winner_generation=winner_selection.V16_GENERATION)
+
+
 __all__ = [
+    "open_transport_historical_symbol_capture",
+    "open_transport_declared_slot_capture",
     "BOUNDED_RAW_WINNER_CANARY_EXCEPTION_TYPE_BYTES",
     "BOUNDED_RAW_WINNER_CANARY_FAILURE_ARTIFACT_TYPE",
     "BOUNDED_RAW_WINNER_CANARY_FAILURE_DETAIL_BYTES",
@@ -5770,3 +5825,755 @@ __all__ = [
     "spool_historical_symbol_worker_bundle",
     "verify_bounded_raw_winner_canary_receipt",
 ]
+
+
+DECLARED_SLOT_COMPLETION_SCHEMA = "fxpm.declared-slot-completion.v1"
+
+
+class DeclaredSlotSearchCapture(HistoricalSymbolSearchCapture):
+    """One live-authenticated cell, terminating before every Book projection."""
+
+    def __init__(self, *args, **kwargs):
+        _fail("DECLARED_SLOT_CAPTURE_USE_VERIFIED_OPENER")
+
+    def _adapter_cell_prefix(self, timeframe: str, regime: str) -> str:
+        return f"{self.raw_artifact_namespace}/adapter/{timeframe}/{regime}"
+
+    def freeze_observed_cell(self, *args, **kwargs):
+        _verify_declared_slot_capture(self)
+        return super().freeze_observed_cell(*args, **kwargs)
+
+    @property
+    def verified_fitted_timeframe(self):
+        _verify_declared_slot_capture(self)
+        return self.fitted_timeframe
+
+    @property
+    def verified_pipeline_config(self):
+        _verify_declared_slot_capture(self)
+        return self.pipeline_config
+
+    def _complete_slot(self, *, status, reason_code=None, handle=None, completed=None,
+                       technical_failure_entry=None):
+        _verify_declared_slot_capture(self)
+        if self._finished:
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        body = _declared_capture_completion_body(self, status=status, reason_code=reason_code,
+                                                handle=handle, completed=completed)
+        body["technical_failure_entry"] = technical_failure_entry
+        self._completion = body
+        self._finished = True
+        self._active = None
+        return body
+
+    def complete_observed_cell(self, handle, *, attempt_evidence,
+                               evidence_access_started_at_utc, evidence_access_completed_at_utc):
+        _verify_declared_slot_capture(self)
+        completed = self._complete_raw_winner_cell(handle, attempt_evidence=attempt_evidence,
+            evidence_access_started_at_utc=evidence_access_started_at_utc,
+            evidence_access_completed_at_utc=evidence_access_completed_at_utc)
+        status = "OWNER" if completed.production.decision.to_dict().get("winner") is not None else "NO_TRADE"
+        self._complete_slot(status=status, reason_code=(completed.production.decision.status if status == "NO_TRADE" else None), handle=handle, completed=completed)
+        return completed.production
+
+    def record_raw_evidence_failure(self, handle, failure, **diagnostic):
+        _verify_declared_slot_capture(self)
+        self._require_active(handle)
+        if type(failure) is not raw_winner.WinnerRawEvidenceIncomplete:
+            _fail("DECLARED_SLOT_FAILURE_INVALID")
+        entry = _declared_slot_failure_entry(self, failure_code=failure.code,
+            attempted_trials_exact=handle.attempted_trials_exact, handle=handle,
+            exception_type=diagnostic.get("exception_type", type(failure).__name__),
+            failure_details=diagnostic.get("failure_details", ()),
+            attempt_ordinal=diagnostic.get("attempt_ordinal"), fold_ordinal=diagnostic.get("fold_ordinal"))
+        self._complete_slot(status="STOP", reason_code=failure.code, handle=handle,
+                            technical_failure_entry=entry)
+
+    def record_search_infrastructure_failure(self, timeframe, regime, *, failure, attempted_trials_exact):
+        _verify_declared_slot_capture(self)
+        if ((timeframe, regime) != (self.cell_plan.timeframe, self.regime)
+                or self._active is not None or type(failure) is not SearchInfrastructureError
+                or type(failure.outcome) not in {TrialOutcome, FamilyCellOutcome}
+                or failure.outcome.kind is not SearchOutcomeKind.INFRA_FAILURE):
+            _fail("DECLARED_SLOT_CELL_INVALID")
+        outcome = failure.outcome.to_dict()
+        if any(outcome.get(k) not in ("", self.request_body[k]) for k in ("symbol", "timeframe", "regime")):
+            _fail("DECLARED_SLOT_FAILURE_INVALID")
+        entry = _declared_slot_failure_entry(self, failure_code=failure.outcome.reason_code,
+            attempted_trials_exact=attempted_trials_exact, search_outcome=outcome)
+        self._complete_slot(status="STOP", reason_code=failure.outcome.reason_code,
+                            technical_failure_entry=entry)
+
+    def record_unsearched_cell(self, timeframe, regime, *, reason_code):
+        _verify_declared_slot_capture(self)
+        if (timeframe, regime) != (self.cell_plan.timeframe, self.regime):
+            _fail("DECLARED_SLOT_CELL_INVALID")
+        self._complete_slot(status="NO_TRADE", reason_code=reason_code)
+
+    def finish(self):
+        _fail("DECLARED_SLOT_BOOK_FINISH_FORBIDDEN")
+
+    @property
+    def completion(self):
+        _verify_declared_slot_capture(self)
+        if self._completion is None:
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        return json.loads(_canonical_bytes(self._completion))
+
+
+def _declared_slot_failure_entry(capture, *, failure_code, attempted_trials_exact,
+                                 handle=None, search_outcome=None, exception_type=None,
+                                 failure_details=(), attempt_ordinal=None, fold_ordinal=None):
+    body = capture.request_body
+    diagnostic = _bounded_canary_failure_diagnostic(exception_type=exception_type,
+        failure_details=failure_details, attempt_ordinal=attempt_ordinal,
+        fold_ordinal=fold_ordinal, attempted_trials_exact=attempted_trials_exact)
+    failure = {"schema_version": "fxpm.declared-slot-technical-failure.v1",
+        "request_sha256": capture.request.receipt_sha256,
+        **{k: body[k] for k in ("cell_id", "slot_id", "symbol", "timeframe", "regime")},
+        "failure_code": _reason(failure_code, "DECLARED_SLOT_FAILURE_INVALID"),
+        "attempted_trials_exact": attempted_trials_exact,
+        "frozen_receipt_sha256": handle.frozen_receipt_descriptor["sha256"] if handle else None,
+        "search_outcome": search_outcome, **diagnostic,
+        "economic_no_trade_or_no_winner": False, "downstream_authority": False}
+    return capture.sink.put_json(f"{body['artifact_namespace']}/technical-failure",
+                                "declared_slot_technical_failure", failure)
+
+
+def _make_declared_slot_capture_authority():
+    key = secrets.token_bytes(32)
+
+    def tag(value):
+        body = {"capture_identity": id(value), "context_identity": id(value.context),
+            "sink_identity": id(value.sink),
+            "request_sha256": value.request.receipt_sha256,
+            "source_session_identity": id(value.source_session),
+            "cell_plan_sha256": value.cell_plan.receipt_sha256,
+            "fitted_identity": id(value.fitted_timeframe), "config_identity": id(value.pipeline_config),
+            "binding": value._bindings, "horizon": value._horizon_plan_bodies,
+            "winner_selection_version": value._winner_generation.selection_version}
+        # Tuple dictionary keys are represented as an ordered one-cell list.
+        body["binding"] = list(value._bindings.items())
+        body["horizon"] = list(value._horizon_plan_bodies.items())
+        return hmac.new(key, _canonical_bytes(body), hashlib.sha256).hexdigest()
+
+    def verify(value):
+        import pm_historical_search_producer as producer
+        if type(value) is not DeclaredSlotSearchCapture or any(not hasattr(value, k) for k in ("_capture_tag", "context", "request", "source_session", "cell_plan", "fitted_timeframe", "pipeline_config", "_bindings", "_horizon_plan_bodies", "process", "sink", "_source", "_fit", "_horizon_plans", "raw_artifact_namespace", "anchor", "symbol", "regime", "request_body")):
+            _fail("DECLARED_SLOT_CAPTURE_INVALID")
+        if not any(getattr(value, "_winner_generation", None) is known
+                   for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION)):
+            _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
+        if not hmac.compare_digest(value._capture_tag, tag(value)):
+            _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
+        session = producer._verified_declared_slot_source_session(value.context,
+            request=value.request, process=value.process, source_session=value.source_session)
+        body = value.request.to_dict()
+        cell_key = (body["timeframe"], body["regime"])
+        if (session._fitted is not value.fitted_timeframe or session._config is not value.pipeline_config
+                or value.request_body != body or value.sink is not value.request.symbol_sink(body["symbol"])
+                or value.anchor != body["anchor"] or value.symbol != body["symbol"]
+                or value.regime != body["regime"] or value.raw_artifact_namespace != body["artifact_namespace"]
+                or value.cell_plan._declared_slot_request is not value.request
+                or value._source != {body["timeframe"]: session._fitted.source_group_decision}
+                or value._fit != {body["timeframe"]: session._fitted.regime_fit_decision}
+                or value._horizon_plans != {cell_key: value.cell_plan.horizon_plan}):
+            _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
+        return True
+
+    def open_capture(context, *, request, process, plan, source_session, _winner_generation=winner_selection.CURRENT_GENERATION):
+        import pm_historical_search_producer as producer
+        import pm_production_search_planner as planner
+        body = orchestration.verify_declared_slot_producer_request(context, request, process=process)
+        session = producer._verified_declared_slot_source_session(context,
+            request=request, process=process, source_session=source_session)
+        sink = request.symbol_sink(body["symbol"])
+        planner.verify_production_cell_search_plan(context, process=process, sink=sink, plan=plan)
+        if (plan.mode != "DECLARED_SLOT_UNISSUED" or plan._declared_slot_request is not request
+                or (plan.symbol, plan.timeframe, plan.regime) != (body["symbol"], body["timeframe"], body["regime"])):
+            _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
+        if not any(_winner_generation is known for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION)):
+            _fail("WINNER_CAPTURE_GENERATION_INVALID")
+        value = object.__new__(DeclaredSlotSearchCapture)
+        value._winner_generation = _winner_generation
+        value.context, value.request, value.request_body = context, request, body
+        value.anchor, value.symbol, value.sink = dict(body["anchor"]), body["symbol"], sink
+        value.raw_artifact_namespace = body["artifact_namespace"]
+        value.process, value.cell_plan, value.source_session = process, plan, session
+        value.fitted_timeframe, value.pipeline_config = session._fitted, session._config
+        value.regime = body["regime"]
+        cell_key = (body["timeframe"], body["regime"])
+        value._bindings = {cell_key: orchestration.historical_horizon_plan_binding(plan.horizon_plan)}
+        value._horizon_plan_bodies = {cell_key: _released_horizon_plan_body(plan.horizon_plan, "DECLARED_SLOT_HORIZON_INVALID")}
+        value._horizon_plans = {cell_key: plan.horizon_plan}
+        value._source = {body["timeframe"]: session._fitted.source_group_decision}
+        value._fit = {body["timeframe"]: session._fitted.regime_fit_decision}
+        value._evidence, value._cell_records = {}, {}
+        value._active, value._finished, value._completion = None, False, None
+        value._capture_tag = tag(value)
+        verify(value)
+        return value
+
+    return open_capture, verify
+
+
+open_declared_slot_capture, _verify_declared_slot_capture = _make_declared_slot_capture_authority()
+
+
+def open_transport_declared_slot_capture(context, *, request, process, plan, source_session):
+    """Open a normally authenticated declared-slot capture using v16 transport."""
+    return open_declared_slot_capture(context, request=request, process=process, plan=plan,
+        source_session=source_session, _winner_generation=winner_selection.V16_GENERATION)
+
+
+def _declared_capture_completion_body(capture, *, status, reason_code, handle, completed):
+    body = capture.request_body
+    plan = capture.cell_plan
+    horizon_entry = capture.sink.put_json(f"{body['artifact_namespace']}/horizon-plan",
+        "declared_slot_horizon_plan", plan.horizon_plan.to_dict())
+    result = {"schema_version": DECLARED_SLOT_COMPLETION_SCHEMA,
+        "request_body": body, "request_sha256": capture.request.receipt_sha256,
+        "precommit_sha256": body["precommit_sha256"],
+        "cell_id": body["cell_id"], "slot_id": body["slot_id"],
+        "status": status, "reason_code": reason_code, "owner": None,
+        "source_session_entry": capture.source_session._entry,
+        "source_group": _owned_decision_envelope(capture.fitted_timeframe.source_group_decision, "DECLARED_SLOT_SOURCE_INVALID"),
+        "regime_fit": _owned_decision_envelope(capture.fitted_timeframe.regime_fit_decision, "DECLARED_SLOT_FIT_INVALID"),
+        "horizon_plan": {"descriptor": horizon_entry["descriptor"], "receipt_sha256": plan.horizon_plan.receipt_sha256},
+        "plan_transport": {"cell_receipt": plan.cell_receipt, "spool_entry": plan.spool_entry,
+            "attempt_artifacts": list(plan.attempt_artifacts()), "state_requirements": list(plan.state_requirements())},
+        "frozen_plan_receipt": handle.frozen_receipt_descriptor if handle else None,
+        "frozen_descriptor_graph": handle.frozen_descriptor_graph if handle else None,
+        "horizon_winner_cross_binding": handle.cross_binding_descriptor if handle else None,
+        "winner_request_entry": completed.production.entries["winner-request"] if completed else None,
+        "winner_decision_entry": completed.production.entries["winner-decision"] if completed else None,
+        "raw_production_receipt": completed.production_receipt_descriptor if completed else None,
+        "production_descriptor_graph": completed.production_descriptor_graph if completed else None,
+        "completed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "qualification_authority": False, "capital_authority": False, "live_authority": False,
+        "order_authority": False}
+    if completed:
+        result["winner_request_sha256"] = completed.production.request.request_sha256
+        result["winner_decision_sha256"] = completed.production.decision.receipt_sha256
+        if status == "OWNER":
+            result["owner"] = _declared_owner_from_verified_winner(body, completed.production.request,
+                completed.production.decision, handle.frozen, capture.fitted_timeframe.regime_fit_decision.to_dict())
+    return result
+
+
+def _declared_owner_from_verified_winner(body, request, decision, frozen, fit):
+    """Join schedule and capture times through the verified completion.
+
+    The owner key (cell_id, slot_id, winner_decision_sha256) joins exactly one
+    completion. Its request_body.anchor owns ordinal/forward_start_utc/
+    forward_end_exclusive_utc; the reopened source_session_entry owns
+    source_accessed_at_utc and completed_at_utc is the capture end.
+    """
+    selected = decision.to_dict().get("winner")
+    if type(selected) is not dict or not winner_selection.verify_historical_cell_winner_decision(decision, request):
+        _fail("DECLARED_SLOT_OWNER_INVALID")
+    attempts = frozen.attempt_ledger["attempts"]
+    matches = [(i, a) for i, a in enumerate(attempts)
+        if a.get("process_candidate_id") == selected.get("process_candidate_id")
+        and a.get("process_sha256") == selected.get("process_sha256")]
+    if len(matches) != 1:
+        _fail("DECLARED_SLOT_OWNER_INVALID")
+    ordinal, attempt = matches[0]
+    import pm_authoritative_search_execution as execution
+    detector = fit.get("regime_detector_record")
+    if type(detector) is not dict:
+        _fail("DECLARED_SLOT_DETECTOR_INVALID")
+    detector_body = dict(detector)
+    detector_sha = detector_body.pop("record_sha256", None)
+    try:
+        parameters_text = detector["parameters_canonical_json"]
+        detector_parameters = json.loads(parameters_text)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HistoricalProductionAdapterError("DECLARED_SLOT_DETECTOR_INVALID") from exc
+    if (detector_sha != _sha256(detector_body)
+            or detector.get("detector_code_sha256") != execution.pm_regime.detector_code_sha256()
+            or detector.get("parameters_sha256") != _sha256(detector_parameters)
+            or parameters_text != _canonical_bytes(detector_parameters).decode("ascii")
+            or fit.get("regime_params_sha256") != _sha256(detector_parameters)
+            or fit.get("regime_detector_record_sha256") != detector_sha):
+        _fail("DECLARED_SLOT_DETECTOR_BINDING_MISMATCH")
+    artifacts = json.loads(frozen.attempt_artifacts_bundle_bytes)[ordinal]
+    marginal = winner_selection.historical_book_marginal_receipt(decision, request)
+    if type(marginal) is not dict:
+        _fail("DECLARED_SLOT_OWNER_INVALID")
+    tier = marginal["validated_cost_ladder_tolerance"]["tier"]
+    tiers = [x for x in frozen.frozen_tier_pair_contract["tiers"] if x["tier"] == tier]
+    if len(tiers) != 1:
+        _fail("DECLARED_SLOT_PROFILE_INVALID")
+    return {"schema_version": "fxpm.declared-slot-owner.v1",
+        "owner_id": orchestration.declared_slot_owner_id(cell_id=body["cell_id"], slot_id=body["slot_id"],
+            winner_decision_sha256=decision.receipt_sha256, process_receipt_sha256=body["search_process_receipt_sha256"]),
+        "cell_id": body["cell_id"], "slot_id": body["slot_id"],
+        "winner_request_sha256": request.request_sha256, "winner_decision_sha256": decision.receipt_sha256,
+        "process_receipt_sha256": body["search_process_receipt_sha256"],
+        "selected_attempt": {"attempt_id": attempt["attempt_id"], "strategy_id": attempt["strategy_id"],
+            "encoded_parameters": artifacts["trial_definition"]["parameters"],
+            **{k: attempt[k] for k in ("process_candidate_id", "process_sha256", "trial_definition_sha256", "horizon_process_sha256", "refit_recipe_sha256")}},
+        "selected_artifacts": artifacts, "regime_detector_record": fit["regime_detector_record"],
+        "selection_cutoff_utc": body["anchor"]["selection_cutoff_utc"],
+        "selected_tier": tier, "selected_tier_contract": tiers[0],
+        "selected_marginal_receipt": marginal}
+
+
+def _restore_declared_slot_plan(context, *, request, process, completion, sink):
+    import pm_production_search_planner as planner
+    transport = completion["plan_transport"]
+    original = transport["spool_entry"]
+    if sink._artifacts.get(original["artifact_id"]) != original:
+        _fail("DECLARED_SLOT_PLAN_ORIGINAL_MISSING")
+    actual_receipt = _reopen_worker_json_descriptor(context, original["descriptor"],
+        maximum_bytes=context.limits.max_json_bytes, code="DECLARED_SLOT_PLAN_ORIGINAL_MISSING")
+    if actual_receipt != transport["cell_receipt"]:
+        _fail("DECLARED_SLOT_PLAN_BINDING_MISMATCH")
+    horizon = _rebuild_horizon_plan(context, completion["horizon_plan"])
+    receipt = transport["cell_receipt"]
+    result = planner.ProductionCellSearchPlan(mode="DECLARED_SLOT_UNISSUED",
+        symbol=request.to_dict()["symbol"], timeframe=request.to_dict()["timeframe"], regime=request.to_dict()["regime"],
+        causal_precommit_receipt_sha256=request.to_dict()["precommit_sha256"],
+        search_process_receipt_sha256=process.receipt_sha256, horizon_plan=horizon,
+        _attempt_artifacts_json=tuple(_canonical_bytes(x) for x in transport["attempt_artifacts"]),
+        _state_requirements_json=tuple(_canonical_bytes(x) for x in transport["state_requirements"]),
+        _cell_receipt_json=_canonical_bytes(receipt), _spool_entry_json=_canonical_bytes(transport["spool_entry"]),
+        boundary_limited=receipt["boundary_limited"], _seal=planner._CELL_PLAN_SEAL, _declared_slot_request=request)
+    planner.verify_production_cell_search_plan(context, process=process, sink=sink, plan=result)
+    return result
+
+
+def _reopen_declared_slot_native_source(context, *, body, config, source_session):
+    import pm_historical_search_producer as producer
+    from pathlib import Path
+    product = producer._reopen_prefix_route(route=source_session["native_source_route"],
+        data_dir=Path(config.data_dir), context=context, symbol=body["symbol"],
+        timeframe=body["timeframe"], include_technical_failure=True, _pin_consumed_activation=True)
+    native_index = _reopen_worker_json_descriptor(context, source_session["native_prefix_index_descriptor"],
+        maximum_bytes=context.limits.max_json_bytes, code="DECLARED_SLOT_SOURCE_INVALID")
+    if (native_index != dict(product.index)
+            or source_session.get("native_prefix_index_descriptor") != dict(product.index_descriptor)
+            or source_session.get("native_prefix_index_sha256") != product.index_sha256
+            or native_index.get("source_state") != source_session.get("source_state")
+            or native_index.get("symbol") != body["symbol"] or native_index.get("timeframe") != body["timeframe"]
+            or native_index.get("cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or native_index.get("source_accessed_at_utc") != source_session.get("source_accessed_at_utc")):
+        _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+    return product
+
+
+def _reopen_declared_slot_native_snapshot(context, *, source_session, entries):
+    entry = source_session.get("native_snapshot_entry")
+    errors = source_session.get("native_snapshot_errors")
+    if entry is None:
+        if errors is not None:
+            _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_INVALID")
+        return None, None
+    if entry not in entries.values():
+        _fail("DECLARED_SLOT_ORIGINAL_ARTIFACT_MISSING")
+    snapshot = _reopen_ascii_json_entry(context, entry,
+        expected_type="declared_slot_native_snapshot", code="DECLARED_SLOT_NATIVE_SNAPSHOT_INVALID")
+    # This joins saved exact bytes to the frozen generation, never CURRENT.
+    status = orchestration._declared_slot_native_snapshot_status(context, snapshot, errors)
+    return snapshot, status
+
+
+def _verify_declared_slot_snapshot_product(snapshot, snapshot_status, product):
+    if (snapshot_status != "MATCH"
+            or not orchestration._declared_slot_consumed_native_snapshot_matches(snapshot, product)):
+        _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_BINDING_MISMATCH")
+
+
+def _declared_slot_detector_cutoff(value):
+    if type(value) is not str or not 1 <= len(value) <= 64:
+        _fail("DECLARED_SLOT_DETECTOR_INVALID")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise HistoricalProductionAdapterError("DECLARED_SLOT_DETECTOR_INVALID") from exc
+    if (parsed.tzinfo is None or parsed.utcoffset() != timedelta(0)
+            or parsed.isoformat() != value or not value.endswith("+00:00")):
+        _fail("DECLARED_SLOT_DETECTOR_INVALID")
+    return parsed
+
+
+def _verify_declared_slot_failure(context, *, completion, body, request, entries):
+    entry = completion.get("technical_failure_entry")
+    if entry not in entries.values():
+        _fail("DECLARED_SLOT_FAILURE_INVALID")
+    failure = _reopen_ascii_json_entry(context, entry,
+        expected_type="declared_slot_technical_failure", code="DECLARED_SLOT_FAILURE_INVALID")
+    fields = {"schema_version", "request_sha256", "cell_id", "slot_id", "symbol", "timeframe", "regime",
+        "failure_code", "attempted_trials_exact", "frozen_receipt_sha256", "search_outcome", "exception_type",
+        "failure_details", "attempt_ordinal", "fold_ordinal", "economic_no_trade_or_no_winner", "downstream_authority"}
+    frozen = completion.get("frozen_plan_receipt")
+    if (type(failure) is not dict or set(failure) != fields
+            or failure.get("schema_version") != "fxpm.declared-slot-technical-failure.v1"
+            or failure.get("request_sha256") != request.receipt_sha256
+            or any(failure.get(k) != body[k] for k in ("cell_id", "slot_id", "symbol", "timeframe", "regime"))
+            or failure.get("failure_code") != _reason(completion.get("reason_code"), "DECLARED_SLOT_FAILURE_INVALID")
+            or failure.get("frozen_receipt_sha256") != (frozen["sha256"] if frozen is not None else None)
+            or failure.get("economic_no_trade_or_no_winner") is not False
+            or failure.get("downstream_authority") is not False):
+        _fail("DECLARED_SLOT_FAILURE_INVALID")
+    _bounded_canary_failure_diagnostic(exception_type=failure["exception_type"],
+        failure_details=failure["failure_details"], attempt_ordinal=failure["attempt_ordinal"],
+        fold_ordinal=failure["fold_ordinal"], attempted_trials_exact=failure["attempted_trials_exact"])
+    outcome = failure["search_outcome"]
+    if outcome is None:
+        if frozen is None or failure["exception_type"] is None:
+            _fail("DECLARED_SLOT_FAILURE_INVALID")
+    elif (type(outcome) is not dict or frozen is not None or outcome.get("kind") != "INFRA_FAILURE"
+            or outcome.get("reason_code") != failure["failure_code"]
+            or any(outcome.get(k) not in ("", body[k]) for k in ("symbol", "timeframe", "regime"))):
+        _fail("DECLARED_SLOT_FAILURE_INVALID")
+    return failure
+
+
+def _verify_declared_slot_phase_graph(context, *, completion, body, request, entries, phase):
+    field = {"FROZEN": "frozen_descriptor_graph", "PRODUCTION": "production_descriptor_graph"}[phase]
+    namespace = body["artifact_namespace"]
+    prefix = f"{namespace}/winner-search/{body['timeframe']}/{body['regime']}"
+    graph_id = (f"{namespace}/adapter/{body['timeframe']}/{body['regime']}/"
+        f"{phase.lower()}-descriptor-graph")
+    graph_entry = entries.get(graph_id)
+    if (graph_entry is None or graph_entry["artifact_type"] != "historical_raw_winner_descriptor_graph"
+            or graph_entry["descriptor"] != completion.get(field)):
+        _fail("DECLARED_SLOT_RAW_GRAPH_BINDING_MISMATCH")
+    graph = _reopen_worker_json_descriptor(context, completion[field],
+        maximum_bytes=context.limits.max_json_bytes, code="DECLARED_SLOT_RAW_GRAPH_INVALID")
+    leaves = orchestration._verify_graph_roster(graph,
+        expected_fields=orchestration._ADAPTER_PHASE_GRAPH_FIELDS, code="DECLARED_SLOT_RAW_GRAPH_INVALID")
+    if (graph.get("schema_version") != RAW_DESCRIPTOR_GRAPH_SCHEMA
+            or graph.get("generation_id") != context.generation_id or graph.get("generation_context_sha256") != context.context_sha256
+            or graph.get("producer_request_sha256") != request.receipt_sha256
+            or graph.get("run_id") != body["run_id"] or graph.get("anchor_id") != body["slot_id"]
+            or graph.get("symbol") != body["symbol"] or graph.get("timeframe") != body["timeframe"]
+            or graph.get("regime") != body["regime"] or graph.get("phase") != phase
+            or graph.get("artifact_namespace") != namespace
+            or any(entries.get(x["artifact_id"]) != x or not x["artifact_id"].startswith(prefix + "/") for x in leaves)):
+        _fail("DECLARED_SLOT_RAW_GRAPH_BINDING_MISMATCH")
+    return {entry["artifact_id"] for entry in leaves}
+
+
+def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, request,
+                                      plan, source, fit, entries, precommit):
+    namespace = body["artifact_namespace"]
+    prefix = f"{namespace}/winner-search/{body['timeframe']}/{body['regime']}"
+    frozen_ids = _verify_declared_slot_phase_graph(context, completion=completion,
+        body=body, request=request, entries=entries, phase="FROZEN")
+    frozen_entries = [entry for key, entry in sorted(entries.items()) if key.startswith(prefix + "/frozen/")]
+    if frozen_ids != {entry["artifact_id"] for entry in frozen_entries}:
+        _fail("DECLARED_SLOT_RAW_GRAPH_BINDING_MISMATCH")
+    frozen_entry = entries.get(f"{prefix}/frozen/receipt")
+    cross_entry = entries.get(
+        f"{namespace}/adapter/{body['timeframe']}/{body['regime']}/horizon-winner-cross-binding")
+    if (frozen_entry is None or frozen_entry["descriptor"] != completion.get("frozen_plan_receipt")
+            or cross_entry is None or cross_entry["artifact_type"] != "historical_horizon_winner_cross_binding"
+            or cross_entry["descriptor"] != completion.get("horizon_winner_cross_binding")):
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    frozen_bytes = [_reopen_worker_descriptor_bytes(context, entry["descriptor"],
+        maximum_bytes=winner_selection.MAX_REQUEST_BYTES, expected_format=raw_winner.ASCII_JSON_FORMAT,
+        code="DECLARED_SLOT_FROZEN_INVALID") for entry in frozen_entries]
+    frozen_schema = json.loads(_reopen_worker_descriptor_bytes(context, frozen_entry["descriptor"],
+        maximum_bytes=winner_selection.MAX_REQUEST_BYTES, expected_format=raw_winner.ASCII_JSON_FORMAT,
+        code="DECLARED_SLOT_FROZEN_INVALID")).get("schema_version")
+    restore = (raw_winner.restore_frozen_winner_search_plan_v5
+               if frozen_schema == raw_winner.V16_FROZEN_PLAN_SCHEMA
+               else raw_winner.restore_frozen_winner_search_plan_v4)
+    frozen = restore(context_identity={
+        "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
+        "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256},
+        symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"], artifact_namespace=namespace,
+        manifest_entries=frozen_entries, body_bytes=frozen_bytes)
+    if any(tier["frozen_spread_tier"]["profile_sha256"] != parent["spread_profile_identity"]["profile_sha256"]
+           for tier in frozen.frozen_tier_pair_contract["tiers"]):
+        _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    cross_bytes = _reopen_worker_descriptor_bytes(context, completion["horizon_winner_cross_binding"],
+        maximum_bytes=winner_selection.MAX_REQUEST_BYTES, expected_format=raw_winner.ASCII_JSON_FORMAT,
+        code="DECLARED_SLOT_CROSS_INVALID")
+    cross, _, _ = raw_winner.verify_historical_frozen_winner_cross_binding(cross_bytes, frozen=frozen)
+    binding = orchestration.historical_horizon_plan_binding(plan.horizon_plan)
+    expected_roster = {key: binding[key] for key in ("plan_receipt_sha256", "source_prefix_receipt_sha256",
+        "candidate_registry_sha256", "trial_registry_sha256", "attempt_roster_sha256", "evidence_roster_sha256")}
+    source_body = source.to_dict()
+    if (completion["frozen_plan_receipt"]["sha256"] != cross["winner_roster"]["frozen_receipt_sha256"]
+            or cross.get("producer_request_sha256") != request.receipt_sha256
+            or cross.get("anchor_id") != body["slot_id"]
+            or cross.get("horizon_roster") != expected_roster
+            or cross.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or cross.get("process_precommit_receipt_sha256") != precommit.receipt_sha256
+            or cross.get("source_group_decision_sha256") != source.receipt_sha256
+            or cross.get("regime_fit_decision_sha256") != fit.receipt_sha256
+            or source_body.get("source_contract_sha256") != frozen.precommitment.get("source_contract_sha256")
+            or source_body.get("source_group_evidence_sha256") != cross.get("native_prefix_index_sha256")
+            or any(row["source_count_receipt"]["native_prefix_index_sha256"] != cross.get("native_prefix_index_sha256")
+                or row["source_count_receipt"]["horizon_plan_receipt_sha256"] != binding["plan_receipt_sha256"]
+                for row in cross["mapping"])):
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    return frozen, cross, cross_bytes, frozen_ids
+
+
+def verify_declared_slot_completion(context, *, precommit, process, completion, artifact_roster, frozen_pipeline_config):
+    """Revalidate committed bytes at the established current-owner assurance level."""
+    parent = orchestration.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    import pm_production_config_binding as config_binding
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    config = frozen_pipeline_config.materialize(context)
+    if (frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]
+            or config.discovery_risk_per_trade_pct != 1.0):
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    if (type(completion) is not dict or completion.get("schema_version") != DECLARED_SLOT_COMPLETION_SCHEMA
+            or completion.get("status") not in {"OWNER", "NO_TRADE", "MISSING", "STOP"}
+            or completion.get("precommit_sha256") != precommit.receipt_sha256
+            or any(completion.get(k) is not False for k in ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_SLOT_COMPLETION_INVALID")
+    body = completion["request_body"]
+    sink = authority_spool.open_symbol_sink(context, body["symbol"])
+    entries = {}
+    for value in artifact_roster:
+        entry = _artifact_entry(dict(value), "DECLARED_SLOT_COMPLETION_INVALID")
+        if entry["artifact_id"] in entries:
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+        entries[entry["artifact_id"]] = entry
+    request = orchestration.DeclaredSlotProducerRequest(_canonical_bytes(body), precommit, sink, orchestration._DECLARED_SLOT_SEAL)
+    orchestration._register_declared_request(request, context, live=False)
+    try:
+        return _verify_declared_slot_completion_request(context, precommit=precommit,
+            process=process, completion=completion, parent=parent, config=config,
+            request=request, sink=sink, entries=entries)
+    finally:
+        orchestration._release_declared_slot_producer_request(request, context)
+
+
+def _verify_declared_slot_completion_request(context, *, precommit, process, completion,
+                                            parent, config, request, sink, entries):
+    body = orchestration.verify_declared_slot_producer_request(context, request, precommit=precommit, process=process)
+    if (completion.get("request_sha256") != request.receipt_sha256
+            or completion.get("cell_id") != body["cell_id"] or completion.get("slot_id") != body["slot_id"]):
+        _fail("DECLARED_SLOT_COMPLETION_BINDING_MISMATCH")
+    if any(not key.startswith(body["artifact_namespace"] + "/") for key in entries):
+        _fail("DECLARED_SLOT_ORIGINAL_ARTIFACT_MISSING")
+    for field in ("frozen_plan_receipt", "frozen_descriptor_graph", "horizon_winner_cross_binding", "raw_production_receipt", "production_descriptor_graph"):
+        descriptor = completion.get(field)
+        if descriptor is not None and not any(x["descriptor"] == descriptor for x in entries.values()):
+            _fail("DECLARED_SLOT_ORIGINAL_ARTIFACT_MISSING")
+    if completion.get("horizon_plan") is not None and not any(x["descriptor"] == completion["horizon_plan"]["descriptor"] for x in entries.values()):
+        _fail("DECLARED_SLOT_ORIGINAL_ARTIFACT_MISSING")
+    # Source-session bytes precede cell-plan and Winner verification.
+    source_session = _reopen_ascii_json_entry(context, completion["source_session_entry"],
+        expected_type="declared_slot_source_session", code="DECLARED_SLOT_SOURCE_INVALID")
+    if (completion["source_session_entry"] not in entries.values()
+            or source_session.get("request_sha256") != request.receipt_sha256
+            or source_session.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or source_session.get("generation_context_sha256") != context.context_sha256
+            or source_session.get("config_sha256") != context.config_sha256
+            or source_session.get("effective_config_sha256") != parent["effective_config_sha256"]
+            or source_session.get("spread_profile_identity") != parent["spread_profile_identity"]):
+        _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+    access_text = source_session.get("source_accessed_at_utc")
+    accessed = (orchestration._utc(access_text, "DECLARED_SLOT_SOURCE_INVALID")
+                if access_text is not None else None)
+    completed_at = orchestration._utc(completion.get("completed_at_utc"), "DECLARED_SLOT_COMPLETION_INVALID")
+    precommitted_at = orchestration._utc(parent["precommitted_at_utc"], "DECLARED_SLOT_SOURCE_INVALID")
+    if (completed_at < precommitted_at
+            or (accessed is not None and (accessed < precommitted_at or completed_at < accessed
+                or not body["source_access_window_utc"]["start_utc"] <= access_text < body["source_access_window_utc"]["end_exclusive_utc"]))
+            or source_session.get("caller_supplied_product_or_fit_accepted") is not False
+            or any(source_session.get(k) is not False for k in ("qualification_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+    snapshot, snapshot_status = _reopen_declared_slot_native_snapshot(
+        context, source_session=source_session, entries=entries)
+    if completion.get("plan_transport") is None:
+        if (completion["status"] not in {"NO_TRADE", "MISSING", "STOP"} or completion.get("owner") is not None
+                or any(completion.get(k) is not None for k in ("winner_request_entry", "winner_decision_entry",
+                    "frozen_plan_receipt", "frozen_descriptor_graph", "horizon_winner_cross_binding",
+                    "raw_production_receipt", "production_descriptor_graph", "technical_failure_entry", "horizon_plan",
+                    "winner_request_sha256", "winner_decision_sha256"))):
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        snapshot_failures = {"DECLARED_SLOT_NATIVE_SNAPSHOT_MISMATCH",
+            "DECLARED_SLOT_NATIVE_SNAPSHOT_UNAVAILABLE", "DECLARED_SLOT_NATIVE_SNAPSHOT_INVALID",
+            "DECLARED_SLOT_CONSUMED_NATIVE_SNAPSHOT_MISMATCH"}
+        if completion["status"] == "STOP" and completion.get("reason_code") in snapshot_failures | {"DECLARED_SLOT_SOURCE_FAILURE"}:
+            if (type(source_session.get("exception_type")) is not str
+                    or not source_session["exception_type"] or source_session.get("failure_phase") not in {"PRE_SOURCE", "SOURCE"}):
+                _fail("DECLARED_SLOT_COMPLETION_INVALID")
+            _reason(source_session.get("failure_code"), "DECLARED_SLOT_COMPLETION_INVALID")
+            _bounded_canary_failure_diagnostic(exception_type=source_session["exception_type"],
+                failure_details=(), attempt_ordinal=None, fold_ordinal=None, attempted_trials_exact=0)
+            observed_at = orchestration._utc(source_session.get("failure_observed_at_utc"), "DECLARED_SLOT_SOURCE_INVALID")
+            if observed_at < (accessed if accessed is not None else precommitted_at) or observed_at > completed_at:
+                _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+            if source_session["failure_phase"] == "PRE_SOURCE":
+                if (accessed is not None or source_session.get("source_state") != "FAILED"
+                        or source_session["failure_code"] != "DECLARED_SLOT_SOURCE_WINDOW_INVALID"
+                        or any(source_session.get(k) is not None for k in ("native_source_route", "native_prefix_index_descriptor",
+                            "native_prefix_index_sha256", "source_group_decision_sha256", "regime_fit_decision_sha256",
+                            "native_snapshot_entry", "native_snapshot_errors"))
+                        or body["source_access_window_utc"]["start_utc"] <= source_session["failure_observed_at_utc"] < body["source_access_window_utc"]["end_exclusive_utc"]):
+                    _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+            elif accessed is None:
+                _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+            product = None
+            if source_session.get("native_source_route") is not None:
+                product = _reopen_declared_slot_native_source(context, body=body, config=config, source_session=source_session)
+            elif (source_session.get("source_state") != "FAILED"
+                    or any(source_session.get(k) is not None for k in ("native_prefix_index_descriptor", "native_prefix_index_sha256",
+                        "source_group_decision_sha256", "regime_fit_decision_sha256"))):
+                _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+            reason = completion["reason_code"]
+            if reason in snapshot_failures:
+                expected_status = {"DECLARED_SLOT_NATIVE_SNAPSHOT_MISMATCH": "MISMATCH",
+                    "DECLARED_SLOT_NATIVE_SNAPSHOT_UNAVAILABLE": "UNAVAILABLE",
+                    "DECLARED_SLOT_NATIVE_SNAPSHOT_INVALID": "INVALID",
+                    "DECLARED_SLOT_CONSUMED_NATIVE_SNAPSHOT_MISMATCH": "MATCH"}[reason]
+                if (source_session["failure_phase"] != "SOURCE" or source_session["failure_code"] != reason
+                        or snapshot_status != expected_status
+                        or (reason == "DECLARED_SLOT_NATIVE_SNAPSHOT_MISMATCH" and product is not None)
+                        or (reason != "DECLARED_SLOT_NATIVE_SNAPSHOT_MISMATCH" and
+                            (product is None or product.source_state == native_prefix.TECHNICAL_FAILURE))
+                        or (reason == "DECLARED_SLOT_CONSUMED_NATIVE_SNAPSHOT_MISMATCH"
+                            and orchestration._declared_slot_consumed_native_snapshot_matches(snapshot, product))):
+                    _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_BINDING_MISMATCH")
+            else:
+                if snapshot_status == "MISMATCH" or source_session["failure_code"] in snapshot_failures:
+                    _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_BINDING_MISMATCH")
+                if product is not None and product.source_state != native_prefix.TECHNICAL_FAILURE:
+                    _verify_declared_slot_snapshot_product(snapshot, snapshot_status, product)
+            return json.loads(_canonical_bytes(completion))
+        if accessed is None:
+            _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+        product = _reopen_declared_slot_native_source(context, body=body, config=config, source_session=source_session)
+        if snapshot_status is None or snapshot_status == "MISMATCH":
+            _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_BINDING_MISMATCH")
+        if product.source_state != native_prefix.TECHNICAL_FAILURE:
+            _verify_declared_slot_snapshot_product(snapshot, snapshot_status, product)
+        if completion["reason_code"] == "REGIME_UNOBSERVED":
+            source = _rebuild_source_decision(completion["source_group"])
+            fit = _rebuild_regime_fit_decision(completion["regime_fit"], source)
+            source_body, fit_body = source.to_dict(), fit.to_dict()
+            support_body = fit_body.get("train_regime_support")
+            support = support_body.get("counts", {}).get(body["regime"]) if type(support_body) is dict else None
+            if (source_session["source_group_decision_sha256"] != source.receipt_sha256
+                    or source_session["regime_fit_decision_sha256"] != fit.receipt_sha256
+                    or product.source_state != native_prefix.AVAILABLE or source_body.get("availability") != book.AVAILABLE
+                    or source_body.get("source_group_evidence_sha256") != product.index_sha256
+                    or any(source_body.get(k) != product.native_prefix.get(k)
+                        for k in ("activation_id", "activation_manifest_sha256", "activation_entry_sha256"))
+                    or source_body.get("native_source_sha256") != product.native_prefix.get("artifact_sha256")
+                    or fit_body.get("fit_state") != book.REGIME_FITTED or type(support) is not int or support != 0
+                    or completion["status"] != "NO_TRADE"):
+                _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+        else:
+            expected = {native_prefix.SOURCE_UNAVAILABLE: ("MISSING", "SOURCE_UNAVAILABLE"),
+                native_prefix.TECHNICAL_TERMINAL: ("MISSING", "TERMINAL_TECHNICAL"),
+                native_prefix.TECHNICAL_FAILURE: ("STOP", "TECHNICAL_FAILURE")}.get(product.source_state)
+            if ((completion["status"], completion.get("reason_code")) != expected
+                    or completion.get("source_group") is not None or completion.get("regime_fit") is not None
+                    or source_session.get("source_group_decision_sha256") is not None
+                    or source_session.get("regime_fit_decision_sha256") is not None):
+                _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        return json.loads(_canonical_bytes(completion))
+    if accessed is None or source_session.get("source_state") != native_prefix.AVAILABLE:
+        _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+    product = _reopen_declared_slot_native_source(context, body=body, config=config, source_session=source_session)
+    _verify_declared_slot_snapshot_product(snapshot, snapshot_status, product)
+    source = _rebuild_source_decision(completion["source_group"])
+    fit = _rebuild_regime_fit_decision(completion["regime_fit"], source)
+    source_body, fit_body = source.to_dict(), fit.to_dict()
+    plan = _restore_declared_slot_plan(context, request=request, process=process, completion=completion, sink=sink)
+    if (plan.cell_receipt["source_group_decision_sha256"] != source.receipt_sha256
+            or plan.cell_receipt["regime_fit_decision_sha256"] != fit.receipt_sha256
+            or source_session.get("source_group_decision_sha256") != source.receipt_sha256
+            or source_session.get("regime_fit_decision_sha256") != fit.receipt_sha256):
+        _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+    frozen_fields = ("frozen_plan_receipt", "frozen_descriptor_graph", "horizon_winner_cross_binding")
+    frozen = None
+    if any(completion.get(field) is not None for field in frozen_fields):
+        if any(completion.get(field) is None for field in frozen_fields):
+            _fail("DECLARED_SLOT_FROZEN_INVALID")
+        frozen, cross, cross_bytes, frozen_ids = _verify_declared_slot_frozen_chain(context,
+            completion=completion, parent=parent, body=body, request=request, plan=plan,
+            source=source, fit=fit, entries=entries, precommit=precommit)
+    if completion["status"] == "STOP" or (completion["status"] == "NO_TRADE" and completion.get("winner_request_entry") is None):
+        if any(completion.get(field) is not None for field in ("owner", "winner_request_entry",
+                "winner_decision_entry", "raw_production_receipt", "production_descriptor_graph",
+                "winner_request_sha256", "winner_decision_sha256")):
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        if completion["status"] == "STOP":
+            failure = _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries)
+            if frozen is not None and failure["attempted_trials_exact"] != frozen.attempt_ledger["attempt_count"]:
+                _fail("DECLARED_SLOT_FAILURE_INVALID")
+        elif completion.get("technical_failure_entry") is not None:
+            _fail("DECLARED_SLOT_FAILURE_INVALID")
+        if completion["status"] == "NO_TRADE" and (completion.get("reason_code") != "SOURCE_BOUNDARY_SHORTFALL_ALL_CANDIDATES"
+                or any(x.get("status") == "PLANNED" for x in plan.horizon_plan.to_dict().get("attempts", []))):
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        return json.loads(_canonical_bytes(completion))
+    if frozen is None:
+        _fail("DECLARED_SLOT_FROZEN_INVALID")
+    if completion.get("technical_failure_entry") is not None:
+        _fail("DECLARED_SLOT_FAILURE_INVALID")
+    wr, wd = _rebuild_winner_pair(context, {"request": completion["winner_request_entry"]["descriptor"],
+        "request_sha256": completion["winner_request_sha256"],
+        "decision": completion["winner_decision_entry"]["descriptor"],
+        "decision_sha256": completion["winner_decision_sha256"]}, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
+    expected_status = "OWNER" if wd.to_dict().get("winner") is not None else "NO_TRADE"
+    if (completion["status"] != expected_status
+            or completion.get("reason_code") != (None if expected_status == "OWNER" else wd.status)):
+        _fail("DECLARED_SLOT_COMPLETION_BINDING_MISMATCH")
+    namespace = body["artifact_namespace"]
+    prefix = f"{namespace}/winner-search/{body['timeframe']}/{body['regime']}"
+    production_ids = _verify_declared_slot_phase_graph(context, completion=completion,
+        body=body, request=request, entries=entries, phase="PRODUCTION")
+    if {key for key in entries if key.startswith(prefix + "/")} != frozen_ids | production_ids:
+        _fail("DECLARED_SLOT_RAW_GRAPH_BINDING_MISMATCH")
+    if frozen.precommitment != wr.precommitment.to_dict() or frozen.attempt_ledger != wr.attempt_ledger.to_dict():
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    production_bytes = _verify_worker_production_receipt(context=context, descriptor=completion["raw_production_receipt"],
+        cross_descriptor=completion["horizon_winner_cross_binding"], cross_bytes=cross_bytes,
+        request_descriptor=completion["winner_request_entry"]["descriptor"], decision_descriptor=completion["winner_decision_entry"]["descriptor"],
+        request=wr, decision=wd, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
+    production = json.loads(production_bytes)
+    if (set(production) != {"schema_version", "generation_context_sha256", "run_id", "artifact_namespace", "symbol", "timeframe", "regime", "precommitment_sha256", "attempt_ledger_sha256", "provenance_cross_binding_sha256", "evidence_ledger_sha256", "request_sha256", "decision_receipt_sha256", "artifact_roster"}
+            or production.get("schema_version") != (raw_winner.V16_PRODUCTION_SCHEMA
+                if frozen.selection_generation is winner_selection.V16_GENERATION else raw_winner.CURRENT_PRODUCTION_SCHEMA)
+            or production.get("precommitment_sha256") != wr.precommitment.payload_sha256
+            or production.get("attempt_ledger_sha256") != wr.attempt_ledger.payload_sha256
+            or production.get("evidence_ledger_sha256") != wr.evidence_ledger.payload_sha256
+            or production.get("artifact_namespace") != namespace
+            or production.get("run_id") != frozen.precommitment["run_id"]):
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    descriptor_set = {_canonical_bytes(x["descriptor"]) for x in entries.values()}
+    if any(_canonical_bytes(_descriptor(x, "DECLARED_SLOT_RAW_INVALID")) not in descriptor_set
+           for x in production["artifact_roster"].values()):
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    for name in ("evidence-ledger", "winner-request", "winner-decision"):
+        entry = entries.get(f"{prefix}/authority/{name}")
+        if entry is None or production["artifact_roster"].get(name) != entry["descriptor"]:
+            _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    raw_winner.verify_source_observation_reference_closure(context, frozen=frozen,
+        manifest_entries=tuple(entries.values()), production_receipt=production)
+    if wd.to_dict().get("winner") is not None:
+        chosen = wd.to_dict()["winner"]
+        matched = [x for x in cross["mapping"] if x.get("winner_process_candidate_id") == chosen.get("process_candidate_id") and x.get("process_sha256") == chosen.get("process_sha256")]
+        if len(matched) != 1:
+            _fail("DECLARED_SLOT_OWNER_BINDING_MISMATCH")
+        detector_cutoff = _declared_slot_detector_cutoff(fit_body["regime_detector_record"]["fit_cutoff_utc"])
+        source_end = orchestration._utc(matched[0]["source_count_receipt"]["fit_end_exclusive_utc"], "DECLARED_SLOT_DETECTOR_INVALID")
+        selection_cutoff = orchestration._utc(body["anchor"]["selection_cutoff_utc"], "DECLARED_SLOT_DETECTOR_INVALID")
+        if detector_cutoff != source_end or source_end > selection_cutoff:
+            _fail("DECLARED_SLOT_DETECTOR_BINDING_MISMATCH")
+    expected_owner = (_declared_owner_from_verified_winner(body, wr, wd, frozen, fit_body)
+                      if wd.to_dict().get("winner") is not None else None)
+    if completion.get("owner") != expected_owner or (completion["status"] == "OWNER") != (expected_owner is not None):
+        _fail("DECLARED_SLOT_OWNER_BINDING_MISMATCH")
+    return json.loads(_canonical_bytes(completion))
+
+
+__all__ += ["DeclaredSlotSearchCapture", "DECLARED_SLOT_COMPLETION_SCHEMA",
+    "open_declared_slot_capture", "verify_declared_slot_completion"]

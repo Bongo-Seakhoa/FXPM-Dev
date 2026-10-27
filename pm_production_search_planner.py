@@ -47,19 +47,28 @@ import pm_regime
 import pm_state_contract as state_contract
 import pm_training_horizon as training_horizon
 from pm_current_refit_parameters import (
+    RETAINED_STRATEGY_SOURCE_V1_SHA256,
+    RETAINED_STRATEGY_V1_SUCCESSOR_SHA256,
+    build_parameter_domain,
     canonicalize_parameter_mapping,
     canonicalize_parameter_value,
     decode_parameter_mapping,
+    load_retained_strategy_domain_v1,
+    parameter_domain_default_ordinal,
+    parameter_domain_point,
     parameter_values_equal,
+    validate_parameter_domain_member,
 )
 from pm_strategies import StrategyRegistry
 
 
 UTC: Final = timezone.utc
-PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v1"
-PROCESS_SEMANTICS_SCHEMA: Final = "fxpm.production-search-process-semantics.v1"
-DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v2"
-ATTEMPT_POLICY_SCHEMA: Final = "fxpm.production-attempt-design-policy.v1"
+ORIGINAL_PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v1"
+ORIGINAL_DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v2"
+PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v2"
+PROCESS_SEMANTICS_SCHEMA: Final = "fxpm.production-search-process-semantics.v2"
+DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v3"
+ATTEMPT_POLICY_SCHEMA: Final = "fxpm.production-attempt-design-policy.v2"
 PROCESS_SPOOL_SYMBOL: Final = "__PRODUCTION_SEARCH_PROCESS__"
 CURRENT_AUTH_SPOOL_SYMBOL: Final = "__CURRENT_SEARCH_AUTHORIZATION__"
 PROCESS_ARTIFACT_ID: Final = "production-search-process-precommit"
@@ -78,8 +87,9 @@ STATE_ERROR_ENVELOPE_SCHEMA: Final = (
     "fxpm.production-preprotected-state-error-envelope.v1"
 )
 EFFECTIVE_STATE_DOMAIN_SCHEMA: Final = (
-    "fxpm.production-effective-state-domain.v1"
+    "fxpm.production-effective-state-domain.v2"
 )
+ORIGINAL_EFFECTIVE_STATE_DOMAIN_SCHEMA: Final = "fxpm.production-effective-state-domain.v1"
 STATE_DOMAIN_CEILING_RECORD_SCHEMA: Final = (
     "fxpm.production-state-domain-ceiling-record.v1"
 )
@@ -142,11 +152,8 @@ BASELINE_ATTEMPTS: Final = 100
 VARIANTS_PER_STRATEGY: Final = 2
 VARIANT_ATTEMPTS: Final = BASELINE_ATTEMPTS * VARIANTS_PER_STRATEGY
 ATTEMPT_COUNT: Final = BASELINE_ATTEMPTS + VARIANT_ATTEMPTS
-# Bounded deterministic retry budget when a variant collides with one already
-# emitted for the same strategy. Fails closed rather than silently emitting a
-# duplicate or collapsing to the registry default.
-_VARIANT_COLLISION_BUDGET: Final = 64
 PARAMETER_DESIGN_SEED: Final = "fxpm-production-space-fill-v1"
+GROUPED_PARAMETER_DESIGN_SEED: Final = "fxpm-production-grouped-mixed-radix-v2"
 MAX_PROCESS_BYTES: Final = 16 * 1024 * 1024
 STATE_INITIAL_ERROR_FLOOR: Final = 100.0
 
@@ -174,6 +181,7 @@ _REGIME_CATEGORY_AFFINITY: Final = {
     "BREAKOUT": "breakout",
     "CHOP": "mean_reversion",
 }
+
 
 
 class ProductionSearchPlannerError(ValueError):
@@ -208,6 +216,16 @@ def _canonical_bytes(value: Any, *, maximum: int = MAX_PROCESS_BYTES) -> bytes:
 
 def _sha(value: Any) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _frozen_tier_horizon_hashes(pair_contract: Mapping[str, Any]) -> tuple[str, str]:
+    """Bind the Horizon to both frozen policies, never an ordered PnL ladder."""
+    try:
+        pair = search_execution.pm_core.validate_backtest_frozen_tier_pair_contract(pair_contract)
+    except (TypeError, ValueError, KeyError, OverflowError) as exc:
+        raise ProductionSearchPlannerError("FROZEN_TIER_PAIR_CONTRACT_INVALID") from exc
+    policies = {level["tier"]: _sha(level["numerical_execution_cost_policy"]) for level in pair["tiers"]}
+    return _sha(policies), _sha(pair)
 
 
 def _hex64(value: Any, code: str) -> str:
@@ -304,22 +322,23 @@ def _required_feature_union(
     name: str,
     *,
     defaults: Mapping[str, Any],
-    grid: Mapping[str, Sequence[Any]],
+    parameter_domain: Mapping[str, Any],
 ) -> list[str]:
     """Derive the compact union whose exhaustive coverage is release-tested.
 
-    The runtime derivation is default plus every value of every single axis,
+    The runtime derivation uses defaults plus every legal atomic row,
     which is only thousands of materializations rather than millions.  The
-    state-contract suite independently visits the complete Cartesian registry
+    state-contract suite independently visits the complete legal registry
     and proves that every member's request is contained in this union.  A
     future interaction-dependent request therefore fails the release test
     before this compact producer can understate a cell domain.
     """
 
     parameter_points = [dict(defaults)]
-    for axis, choices in grid.items():
-        for choice in choices:
-            parameter_points.append({**defaults, axis: choice})
+    for axis in parameter_domain["axes"]:
+        for row in axis["choices"]:
+            wire = {**parameter_domain["defaults"], **dict(zip(axis["names"], row))}
+            parameter_points.append(decode_parameter_mapping(wire, defaults))
     requested: set[str] = set()
     try:
         for parameters in parameter_points:
@@ -344,8 +363,11 @@ def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
     raw_grid = strategy.get_param_grid()
     if type(raw_grid) is not dict or not raw_grid:
         _fail("STRATEGY_GRID_INVALID", name)
+    parameter_domain = build_parameter_domain(
+        strategy.get_default_params(), raw_grid,
+        coupled_groups=strategy.get_param_couplings(),
+    )
     axes: list[dict[str, Any]] = []
-    grid_size = 1
     for axis_name, raw_choices in raw_grid.items():
         if (
             type(axis_name) is not str
@@ -364,12 +386,11 @@ def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
             parameter_values_equal(defaults[axis_name], choice) for choice in choices
         ):
             _fail("STRATEGY_DEFAULT_OUTSIDE_GRID", name, axis_name)
-        grid_size *= len(choices)
         axes.append({"name": axis_name, "choices": choices})
     required_feature_union = _required_feature_union(
         name,
         defaults=strategy.get_default_params(),
-        grid=raw_grid,
+        parameter_domain=parameter_domain,
     )
     body = {
         "schema_version": DOMAIN_SCHEMA,
@@ -385,12 +406,12 @@ def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
         "required_features": sorted(strategy.get_feature_request()),
         "required_feature_union": required_feature_union,
         "required_feature_union_derivation": (
-            "DEFAULT_PLUS_EVERY_SINGLE_AXIS_VALUE_WITH_EXHAUSTIVE_CARTESIAN_"
-            "RELEASE_PROOF"
+            "DEFAULT_PLUS_EVERY_LEGAL_ATOMIC_ROW_WITH_EXHAUSTIVE_LEGAL_RELEASE_PROOF"
         ),
         "defaults": defaults,
         "grid_axes": axes,
-        "grid_size": grid_size,
+        "parameter_domain": parameter_domain,
+        "grid_size": parameter_domain["point_count"],
     }
     return {**body, "domain_sha256": _sha(body)}
 
@@ -423,6 +444,7 @@ def _live_candidate_domain_sha256() -> str:
                     strategy.get_default_params()
                 ),
                 "grid": _normalize_candidate_domain_value(strategy.get_param_grid()),
+                "coupled_groups": _normalize_candidate_domain_value(strategy.get_param_couplings()),
             }
         )
     try:
@@ -552,7 +574,7 @@ def _process_semantics(domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "state_contract_registry_sha256": state_contract.DEFAULT_AUTHORITY.registry_hash,
         "attempt_policy": {
             "schema_version": ATTEMPT_POLICY_SCHEMA,
-            "winner_contract_version": book.PINNED_WINNER_SELECTION_CONTRACT_VERSION,
+            "winner_contract_version": book.CURRENT_PINNED_WINNER_SELECTION_CONTRACT_VERSION,
             "winner_max_attempts": search_execution.MAX_ATTEMPTS,
             "attempt_count_per_observed_cell": ATTEMPT_COUNT,
             "one_full_default_per_strategy": True,
@@ -562,9 +584,9 @@ def _process_semantics(domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
                 "REGIME_CATEGORY_AFFINITY_THEN_FROZEN_CELL_HASH_PERMUTATION"
             ),
             "variant_parameter_sampler": (
-                "SHA256_AXIS_MODULO_WITH_FORCED_NONDEFAULT_V1"
+                "SHA256_COPRIME_MIXED_RADIX_LEGAL_POINTS_V2"
             ),
-            "parameter_design_seed": PARAMETER_DESIGN_SEED,
+            "parameter_design_seed": GROUPED_PARAMETER_DESIGN_SEED,
             "outcome_or_evidence_dependent_sampling": False,
             "adaptive_or_posthoc_attempts": False,
         },
@@ -596,6 +618,7 @@ def _expected_process_body(
     context: authority_spool.GenerationSpoolContext,
     *,
     run_id: str,
+    schema_version: str = PROCESS_SCHEMA,
 ) -> dict[str, Any]:
     observed = authority_spool.reopen_generation_context(
         context.root,
@@ -605,6 +628,20 @@ def _expected_process_body(
     )
     if observed.context_sha256 != context.context_sha256:
         _fail("GENERATION_CONTEXT_CHANGED")
+    if schema_version == ORIGINAL_PROCESS_SCHEMA:
+        _require_retained_registry_successor()
+        template = load_retained_strategy_domain_v1()["process_template"]
+        state_contract.retained_v1_authority()
+        return {
+            **template,
+            "run_id": _identity(run_id, "RUN_ID_INVALID"),
+            "generation_id": context.generation_id,
+            "generation_context_sha256": context.context_sha256,
+            "native_universe_sha256": context.native_universe_sha256,
+            "config_sha256": context.config_sha256,
+        }
+    if schema_version != PROCESS_SCHEMA:
+        _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
     domains = _strategy_domains()
     semantics = _process_semantics(domains)
     return {
@@ -690,6 +727,7 @@ class ProductionCellSearchPlan:
     _bounded_canary_request: Any = None
     _bounded_canary_source_session: Any = None
     _bounded_canary_plan_permit: Any = None
+    _declared_slot_request: Any = None
 
     def attempt_artifacts(self) -> tuple[dict[str, Any], ...]:
         return tuple(
@@ -770,7 +808,9 @@ def verify_frozen_production_search_process(
     body = process.to_dict()
     if _canonical_bytes(body) != process._body_json:
         _fail("PROCESS_BYTES_NONCANONICAL")
-    expected = _expected_process_body(context, run_id=body.get("run_id"))
+    expected = _expected_process_body(
+        context, run_id=body.get("run_id"), schema_version=body.get("schema_version"),
+    )
     if body != expected:
         _fail("PROCESS_SEMANTICS_CHANGED")
     manifest = authority_spool.verify_symbol_receipt(
@@ -795,6 +835,49 @@ def verify_frozen_production_search_process(
     return True
 
 
+def reopen_production_search_process(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    spool_receipt: Mapping[str, Any],
+    expected_receipt_sha256: str,
+) -> FrozenProductionSearchProcess:
+    """Read an existing process seal without issuing or changing its bytes."""
+
+    if type(context) is not authority_spool.GenerationSpoolContext:
+        _fail("GENERATION_CONTEXT_INVALID")
+    expected_sha = _hex64(expected_receipt_sha256, "PROCESS_RECEIPT_SHA256_INVALID")
+    manifest = authority_spool.verify_symbol_receipt(
+        context.root, spool_receipt,
+        expected_generation_id=context.generation_id,
+        expected_symbol=PROCESS_SPOOL_SYMBOL,
+        expected_native_universe_sha256=context.native_universe_sha256,
+        expected_config_sha256=context.config_sha256,
+    )
+    entries = manifest.get("artifacts")
+    if (type(entries) is not list or len(entries) != 1
+            or entries[0].get("artifact_id") != PROCESS_ARTIFACT_ID
+            or entries[0].get("artifact_type") != PROCESS_ARTIFACT_TYPE):
+        _fail("PROCESS_SPOOL_ROSTER_INVALID")
+    descriptor = entries[0].get("descriptor")
+    if (type(descriptor) is not dict or descriptor.get("sha256") != expected_sha
+            or descriptor.get("format") != authority_spool.CANONICAL_JSON_FORMAT
+            or type(descriptor.get("size_bytes")) is not int
+            or not 0 < descriptor["size_bytes"] <= MAX_PROCESS_BYTES):
+        _fail("PROCESS_SPOOL_DESCRIPTOR_MISMATCH")
+    digest, _, encoded = authority_spool._stream_file(
+        context.root, descriptor["relative_path"], maximum_bytes=MAX_PROCESS_BYTES,
+        expected_size=descriptor["size_bytes"], collect=True,
+        chunk_bytes=context.limits.stream_chunk_bytes,
+    )
+    if digest != expected_sha or encoded is None:
+        _fail("PROCESS_SPOOL_DESCRIPTOR_MISMATCH")
+    result = FrozenProductionSearchProcess(
+        encoded, _canonical_bytes(dict(spool_receipt), maximum=256 * 1024), _PROCESS_SEAL,
+    )
+    verify_frozen_production_search_process(context, result)
+    return result
+
+
 def freeze_current_search_authorization(
     context: authority_spool.GenerationSpoolContext,
     *,
@@ -807,6 +890,7 @@ def freeze_current_search_authorization(
     """Freeze one current-refit authorization only after raw causal PASS."""
 
     verify_frozen_production_search_process(context, process)
+    _require_current_process(process)
     values: list[dict[str, Any]] = []
     for value, code in (
         (causal_precommit_payload, "CAUSAL_PRECOMMIT_NOT_OBJECT"),
@@ -1037,11 +1121,17 @@ def _terminal_dependency_and_policy(
         "payload": payload,
     }
     horizon_policy = {
-        "schema_version": "fxpm.historical-horizon-policy.v1",
+        "schema_version": "fxpm.historical-horizon-policy.v3",
         "policy_id": f"fxpm-production-terminal-{timeframe}-v1",
         "policy_release_sha256": PRODUCTION_SEARCH_PLANNER_RELEASE_SHA256,
-        "cost_contract_sha256": _sha({**terminal_contract, "role": "BASE"}),
-        "cost_stress_contract_sha256": _sha({**terminal_contract, "role": "STRESS"}),
+        "cost_contract_sha256": _sha({
+            **terminal_contract,
+            "binding_domain": "fxpm.terminal-cost-not-applicable.v1",
+        }),
+        "frozen_tier_pair_contract_sha256": _sha({
+            **terminal_contract,
+            "binding_domain": "fxpm.terminal-frozen-tier-evaluation-not-applicable.v1",
+        }),
         "evaluator_release_sha256": (
             search_execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
         ),
@@ -1271,6 +1361,7 @@ def _seal_cell_plan(
     bounded_canary_request: Any = None,
     bounded_canary_source_session: Any = None,
     bounded_canary_plan_permit: Any = None,
+    declared_slot_request: Any = None,
 ) -> tuple[bytes, bytes]:
     if type(sink) is not authority_spool.SymbolAuthoritySink:
         _fail("CELL_PLAN_SINK_INVALID")
@@ -1279,6 +1370,7 @@ def _seal_cell_plan(
         "HISTORICAL_ANCHOR",
         "CURRENT_REFIT",
         "BOUNDED_RAW_WINNER_CANARY",
+        "DECLARED_SLOT_UNISSUED",
     }:
         _fail("CELL_PLAN_MODE_INVALID")
     if normalized_mode == "CURRENT_REFIT":
@@ -1406,6 +1498,13 @@ def _seal_cell_plan(
                 ),
             }
         )
+    if normalized_mode == "DECLARED_SLOT_UNISSUED":
+        declared = historical.verify_declared_slot_producer_request(context, declared_slot_request, process=process)
+        if declared["artifact_namespace"] != normalized_namespace:
+            _fail("DECLARED_SLOT_REQUEST_BINDING_MISMATCH")
+        body["declared_slot_request_sha256"] = declared_slot_request.receipt_sha256
+    elif declared_slot_request is not None:
+        _fail("DECLARED_SLOT_REQUEST_INVALID")
     receipt_body = {**body, "receipt_sha256": _sha(body)}
     artifact_id = f"{normalized_namespace}/search-cell-plan/{timeframe}/{regime}"
     entry = sink.put_json(artifact_id, CELL_PLAN_ARTIFACT_TYPE, receipt_body)
@@ -1865,6 +1964,15 @@ def verify_production_cell_search_plan(
         }
     ):
         _fail("CELL_PLAN_RECEIPT_BINDING_INVALID")
+    if plan.mode == "DECLARED_SLOT_UNISSUED":
+        declared = historical.verify_declared_slot_producer_request(context, plan._declared_slot_request, process=process)
+        if (receipt.get("declared_slot_request_sha256") != plan._declared_slot_request.receipt_sha256
+                or declared["artifact_namespace"] != receipt.get("artifact_namespace")
+                or declared["cell"] != {"cell_id": declared["cell_id"], "symbol": plan.symbol, "timeframe": plan.timeframe, "regime": plan.regime}
+                or declared["process_precommit_receipt_sha256"] != plan.causal_precommit_receipt_sha256):
+            _fail("DECLARED_SLOT_REQUEST_BINDING_MISMATCH")
+    elif plan._declared_slot_request is not None:
+        _fail("DECLARED_SLOT_REQUEST_INVALID")
     attempts = plan.attempt_artifacts()
     states = plan.state_requirements()
     source_capture = plan.current_refit_source_capture()
@@ -2069,6 +2177,7 @@ def verify_production_cell_search_plan(
             "HISTORICAL_ANCHOR",
             "CURRENT_REFIT",
             "BOUNDED_RAW_WINNER_CANARY",
+            "DECLARED_SLOT_UNISSUED",
         }
         or plan.native_prefix_product is not None
         or plan.fitted_timeframe is not None
@@ -2092,9 +2201,12 @@ def verify_production_cell_search_plan(
     return True
 
 
-def _cell_hash(symbol: str, timeframe: str, regime: str, *parts: str) -> str:
+def _cell_hash(
+    symbol: str, timeframe: str, regime: str, *parts: str,
+    seed: str = PARAMETER_DESIGN_SEED,
+) -> str:
     return hashlib.sha256(
-        "\x00".join((PARAMETER_DESIGN_SEED, symbol, timeframe, regime, *parts)).encode(
+        "\x00".join((seed, symbol, timeframe, regime, *parts)).encode(
             "ascii"
         )
     ).hexdigest()
@@ -2115,13 +2227,41 @@ def _domain_by_name(process_body: Mapping[str, Any]) -> dict[str, dict[str, Any]
     return result
 
 
+def _state_authority_for_candidate(candidate_domain_sha256: str):
+    if candidate_domain_sha256 == state_contract.ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256:
+        _require_retained_registry_successor()
+        return state_contract.retained_v1_authority()
+    if (
+        state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256 is not None
+        and candidate_domain_sha256 == state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
+    ):
+        return state_contract.DEFAULT_AUTHORITY
+    _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
+
+
+def _require_retained_registry_successor() -> None:
+    if _source_sha256(StrategyRegistry) not in {
+        RETAINED_STRATEGY_SOURCE_V1_SHA256, RETAINED_STRATEGY_V1_SUCCESSOR_SHA256,
+    }:
+        _fail("RETAINED_STRATEGY_SUCCESSOR_CHANGED")
+
+
+def _require_current_process(process: FrozenProductionSearchProcess) -> None:
+    if type(process) is not FrozenProductionSearchProcess or process._seal is not _PROCESS_SEAL:
+        _fail("PROCESS_OBJECT_INVALID")
+    if process.to_dict().get("schema_version") != PROCESS_SCHEMA:
+        _fail("RETAINED_PROCESS_IS_READ_ONLY")
+
+
 def _variant_strategy_names(
     domains: Sequence[Mapping[str, Any]],
     *,
     symbol: str,
     timeframe: str,
     regime: str,
-) -> list[str]:
+) -> list[tuple[str, int]]:
+    if any(item.get("schema_version") != DOMAIN_SCHEMA for item in domains):
+        _fail("RETAINED_PROCESS_IS_READ_ONLY")
     affinity = _REGIME_CATEGORY_AFFINITY[regime]
 
     def order(item: Mapping[str, Any]) -> tuple[int, str]:
@@ -2132,6 +2272,7 @@ def _variant_strategy_names(
             regime,
             str(item.get("strategy_id") or ""),
             "variant-strategy-permutation",
+            seed=GROUPED_PARAMETER_DESIGN_SEED,
         )
         return (-family_match, tie)
 
@@ -2161,74 +2302,57 @@ def _nondefault_parameters(
     regime: str,
     variant_ordinal: int = 0,
     already_emitted: Optional[Set[str]] = None,
+    domain: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """One deterministic, outcome-blind non-default grid point for a strategy.
 
     ``variant_ordinal`` selects which point, so a strategy can contribute several
     distinct designs to a cell plan without any of them depending on an outcome.
-    Selection stays a pure function of (seed, symbol, timeframe, regime,
-    strategy, axis, ordinal, salt), which is what keeps the plan reproducible and
-    the multiplicity correction honest.
-
-    ``already_emitted`` carries the canonical parameter hashes this strategy has
-    already produced for this cell. A collision advances a deterministic salt
-    rather than accepting a duplicate; exhausting the budget fails closed.
+    The current edition traverses a seeded coprime permutation of legal points.
+    Retained processes may be reopened but cannot generate new designs.
     """
-    strategy = StrategyRegistry.get(strategy_name)
-    defaults = strategy.get_default_params()
-    grid = strategy.get_param_grid()
-    baseline = canonicalize_parameter_mapping(strategy.get_params())
+    if domain is None:
+        domain = _strategy_domain(strategy_name, 0)
+    if domain.get("strategy_id") != strategy_name:
+        _fail("VARIANT_STRATEGY_OUTSIDE_DOMAIN", strategy_name)
+    if domain.get("schema_version") != DOMAIN_SCHEMA:
+        _fail("RETAINED_PROCESS_IS_READ_ONLY")
     seen = already_emitted if already_emitted is not None else set()
-
-    for salt in range(_VARIANT_COLLISION_BUDGET):
-        runtime = dict(defaults)
-        changed = False
-        for axis_ordinal, (axis_name, choices) in enumerate(grid.items()):
-            digest = _cell_hash(
-                symbol,
-                timeframe,
-                regime,
-                strategy_name,
-                axis_name,
-                str(axis_ordinal),
-                str(variant_ordinal),
-                str(salt),
-            )
-            selected = choices[int(digest[:16], 16) % len(choices)]
-            runtime[axis_name] = selected
-            changed = changed or not parameter_values_equal(
-                selected, defaults[axis_name]
-            )
-        if not changed:
-            for axis_name, choices in grid.items():
-                alternatives = [
-                    value
-                    for value in choices
-                    if not parameter_values_equal(value, defaults[axis_name])
-                ]
-                if alternatives:
-                    index = (variant_ordinal + salt) % len(alternatives)
-                    runtime[axis_name] = alternatives[index]
-                    changed = True
-                    break
-        if not changed:
+    if domain.get("schema_version") == DOMAIN_SCHEMA:
+        structured = domain.get("parameter_domain")
+        baseline = validate_parameter_domain_member(structured, domain.get("defaults"))
+        count = structured["point_count"]
+        if type(variant_ordinal) is not int or not 0 <= variant_ordinal < count - 1:
             _fail("NONDEFAULT_PARAMETER_POINT_UNAVAILABLE", strategy_name)
-        try:
-            fitted = StrategyRegistry.get(strategy_name, **runtime)
-            normalized = canonicalize_parameter_mapping(fitted.get_params())
-        except Exception as exc:
-            raise ProductionSearchPlannerError(
-                "NONDEFAULT_PARAMETER_MATERIALIZATION_FAILED", (strategy_name,)
-            ) from exc
-        if normalized == baseline:
-            continue  # collapsed onto the default; advance the salt
-        fingerprint = _sha(normalized)
-        if fingerprint in seen:
-            continue  # duplicate of an earlier variant for this strategy
-        seen.add(fingerprint)
-        return normalized
-
-    _fail("NONDEFAULT_PARAMETER_POINT_COLLAPSED", strategy_name)
+        digest = _cell_hash(
+            symbol, timeframe, regime, strategy_name, "legal-domain-permutation",
+            seed=GROUPED_PARAMETER_DESIGN_SEED,
+        )
+        start = int(digest[:32], 16) % count
+        stride = 1 + int(digest[32:], 16) % (count - 1)
+        while math.gcd(stride, count) != 1:
+            stride = 1 if stride == count - 1 else stride + 1
+        default_ordinal = parameter_domain_default_ordinal(structured)
+        selected = -1
+        for offset in range(variant_ordinal + 2):
+            ordinal = (start + offset * stride) % count
+            if ordinal == default_ordinal:
+                continue
+            selected += 1
+            if selected != variant_ordinal:
+                continue
+            wire = parameter_domain_point(structured, ordinal)
+            base = StrategyRegistry.get(strategy_name)
+            runtime = decode_parameter_mapping(wire, base.get_default_params())
+            normalized = canonicalize_parameter_mapping(
+                StrategyRegistry.get(strategy_name, **runtime).get_params()
+            )
+            if normalized != wire or normalized == baseline or _sha(normalized) in seen:
+                _fail("NONDEFAULT_PARAMETER_MATERIALIZATION_DRIFT", strategy_name)
+            validate_parameter_domain_member(structured, normalized)
+            seen.add(_sha(normalized))
+            return normalized
+        _fail("NONDEFAULT_PARAMETER_POINT_UNAVAILABLE", strategy_name)
 
 
 def _attempt_designs(
@@ -2240,12 +2364,12 @@ def _attempt_designs(
 ) -> list[dict[str, Any]]:
     domains = list(_domain_by_name(process_body).values())
     domains.sort(key=lambda value: int(value["ordinal"]))
+    if any(item.get("schema_version") != DOMAIN_SCHEMA for item in domains):
+        _fail("RETAINED_PROCESS_IS_READ_ONLY")
     designs: list[dict[str, Any]] = []
     for item in domains:
         name = str(item["strategy_id"])
-        parameters = canonicalize_parameter_mapping(
-            StrategyRegistry.get(name).get_params()
-        )
+        parameters = dict(item["defaults"])
         designs.append(
             {
                 "design_role": "REGISTRY_DEFAULT",
@@ -2271,6 +2395,7 @@ def _attempt_designs(
                     regime=regime,
                     variant_ordinal=variant_ordinal,
                     already_emitted=emitted_by_strategy.setdefault(name, set()),
+                    domain=by_name[name],
                 ),
             }
         )
@@ -2739,13 +2864,19 @@ def _effective_state_domains(
         process_body.get("candidate_domain_sha256"),
         "PROCESS_CANDIDATE_DOMAIN_SHA256_INVALID",
     )
+    _state_authority_for_candidate(candidate_domain_sha256)
     effective: list[dict[str, Any]] = []
     for ordinal, domain in enumerate(domains):
         defaults = domain.get("defaults")
         axes = domain.get("grid_axes")
         features = domain.get("required_feature_union")
+        grouped = domain.get("schema_version") == DOMAIN_SCHEMA
+        expected_domain_schema = (
+            DOMAIN_SCHEMA if candidate_domain_sha256 == state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
+            else ORIGINAL_DOMAIN_SCHEMA
+        )
         if (
-            domain.get("schema_version") != DOMAIN_SCHEMA
+            domain.get("schema_version") != expected_domain_schema
             or domain.get("ordinal") != ordinal
             or type(defaults) is not dict
             or not defaults
@@ -2755,10 +2886,8 @@ def _effective_state_domains(
             or any(type(value) is not str or not value for value in features)
             or features != sorted(set(features))
             or domain.get("required_feature_union_derivation")
-            != (
-                "DEFAULT_PLUS_EVERY_SINGLE_AXIS_VALUE_WITH_EXHAUSTIVE_"
-                "CARTESIAN_RELEASE_PROOF"
-            )
+            != ("DEFAULT_PLUS_EVERY_LEGAL_ATOMIC_ROW_WITH_EXHAUSTIVE_LEGAL_RELEASE_PROOF"
+                if grouped else "DEFAULT_PLUS_EVERY_SINGLE_AXIS_VALUE_WITH_EXHAUSTIVE_CARTESIAN_RELEASE_PROOF")
             or domain.get("domain_sha256")
             != _sha(
                 {
@@ -2783,11 +2912,18 @@ def _effective_state_domains(
             ):
                 _fail("EFFECTIVE_STATE_DOMAIN_AXIS_INVALID", ordinal)
             parameter_domains[axis["name"]] = list(axis["choices"])
-        full_count = math.prod(len(values) for values in parameter_domains.values())
+        if grouped:
+            parameter_domain = domain.get("parameter_domain")
+            validate_parameter_domain_member(parameter_domain, defaults)
+            full_count = parameter_domain["point_count"]
+        else:
+            parameter_domain = None
+            full_count = math.prod(len(values) for values in parameter_domains.values())
         if full_count != domain.get("grid_size"):
             _fail("EFFECTIVE_STATE_DOMAIN_COUNT_INVALID", ordinal)
         body = {
-            "schema_version": EFFECTIVE_STATE_DOMAIN_SCHEMA,
+            "schema_version": (EFFECTIVE_STATE_DOMAIN_SCHEMA if grouped
+                               else ORIGINAL_EFFECTIVE_STATE_DOMAIN_SCHEMA),
             "cell": {
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -2805,6 +2941,8 @@ def _effective_state_domains(
             ],
             "outcome_or_protected_value_dependent": False,
         }
+        if grouped:
+            body["parameter_domain"] = parameter_domain
         effective.append({**body, "effective_domain_sha256": _sha(body)})
     if (
         len(effective) != BASELINE_ATTEMPTS
@@ -2821,10 +2959,12 @@ def _sealed_state_replay_evidence(
     identity_body: Mapping[str, Any],
     schema_unavailable_code: str,
     error_context: Sequence[Any] = (),
+    authority: Optional[state_contract.StateContractAuthority] = None,
 ) -> tuple[state_contract.StateEvidence, dict[str, Any]]:
     """Bind one authenticated replay identity to the authority's path schema."""
 
-    contract = state_contract.DEFAULT_AUTHORITY._contracts.get(node)  # noqa: SLF001
+    authority = authority if authority is not None else state_contract.DEFAULT_AUTHORITY
+    contract = authority._contracts.get(node)  # noqa: SLF001
     if (
         contract is None
         or contract.kind != state_contract.StateKind.PATH_STATE
@@ -2843,7 +2983,7 @@ def _sealed_state_replay_evidence(
             node=node,
             mode=state_contract.EvidenceMode.AUTHENTICATED_REPLAY,
             identity_sha256=identity,
-            registry_hash=state_contract.DEFAULT_AUTHORITY.registry_hash,
+            registry_hash=authority.registry_hash,
             state_schema=str(contract.checkpoint_schema),
             transition_schema=str(contract.transition_schema),
         ),
@@ -2857,11 +2997,15 @@ def _domain_state_replay_evidence(
     effective_domain: Mapping[str, Any],
     initial_error_bound: float,
     tolerance: float,
+    authority: Optional[state_contract.StateContractAuthority] = None,
 ) -> tuple[dict[str, state_contract.StateEvidence], list[dict[str, Any]]]:
     parameter_domains = effective_domain.get("parameter_domains")
     requested = effective_domain.get("requested_feature_union")
     if type(parameter_domains) is not dict or type(requested) is not list:
         _fail("STATE_DOMAIN_EVIDENCE_INPUT_INVALID")
+    authority = authority if authority is not None else _state_authority_for_candidate(
+        effective_domain.get("candidate_domain_sha256")
+    )
     parameters = {
         key: values[0]
         for key, values in parameter_domains.items()
@@ -2869,7 +3013,9 @@ def _domain_state_replay_evidence(
     }
     if len(parameters) != len(parameter_domains):
         _fail("STATE_DOMAIN_EVIDENCE_PARAMETER_INVALID")
-    unresolved = state_contract.DEFAULT_AUTHORITY.resolve_cell(
+    if effective_domain.get("schema_version") == EFFECTIVE_STATE_DOMAIN_SCHEMA:
+        parameters = dict(effective_domain["parameter_domain"]["defaults"])
+    unresolved = authority.resolve_cell(
         str(effective_domain.get("strategy_id") or ""),
         parameters=parameters,
         requested_features=requested,
@@ -2886,7 +3032,7 @@ def _domain_state_replay_evidence(
             "node": node,
             "mode": state_contract.EvidenceMode.AUTHENTICATED_REPLAY.value,
             "state_contract_registry_sha256": (
-                state_contract.DEFAULT_AUTHORITY.registry_hash
+                authority.registry_hash
             ),
             "native_prefix_index_sha256": _hex64(
                 native_prefix.get("index_sha256"),
@@ -2913,6 +3059,7 @@ def _domain_state_replay_evidence(
             node=node,
             identity_body=identity_body,
             schema_unavailable_code="STATE_DOMAIN_REPLAY_SCHEMA_UNAVAILABLE",
+            authority=authority,
         )
         evidence[node] = item
         bodies.append(receipt)
@@ -2943,6 +3090,7 @@ def _state_domain_ceiling_records(
         timeframe=timeframe,
         regime=regime,
     )
+    authority = _state_authority_for_candidate(process_body.get("candidate_domain_sha256"))
     records: list[dict[str, Any]] = []
     for ordinal, effective_domain in enumerate(effective_domains):
         evidence, evidence_bodies = _domain_state_replay_evidence(
@@ -2950,9 +3098,10 @@ def _state_domain_ceiling_records(
             effective_domain=effective_domain,
             initial_error_bound=initial_error,
             tolerance=tolerance,
+            authority=authority,
         )
         try:
-            ceiling = state_contract.DEFAULT_AUTHORITY.resolve_cell_domain_ceiling(
+            ceiling = authority.resolve_cell_domain_ceiling(
                 effective_domain["strategy_id"],
                 parameter_domains=effective_domain["parameter_domains"],
                 requested_features=effective_domain["requested_feature_union"],
@@ -2964,6 +3113,7 @@ def _state_domain_ceiling_records(
                 initial_error_bound=initial_error,
                 tolerance=tolerance,
                 state_evidence=evidence,
+                parameter_domain=effective_domain.get("parameter_domain"),
             )
         except Exception as exc:
             raise ProductionSearchPlannerError(
@@ -3043,6 +3193,14 @@ def _state_replay_requirement(
         )
     ):
         _fail("STATE_ATTEMPT_OUTSIDE_EFFECTIVE_DOMAIN", strategy_name)
+    authority = _state_authority_for_candidate(effective_domain.get("candidate_domain_sha256"))
+    if effective_domain.get("schema_version") == EFFECTIVE_STATE_DOMAIN_SCHEMA:
+        try:
+            validate_parameter_domain_member(effective_domain["parameter_domain"], wire_parameters)
+        except Exception as exc:
+            raise ProductionSearchPlannerError(
+                "STATE_ATTEMPT_OUTSIDE_EFFECTIVE_DOMAIN", (strategy_name,)
+            ) from exc
     base = StrategyRegistry.get(strategy_name)
     try:
         parameters = decode_parameter_mapping(
@@ -3062,7 +3220,7 @@ def _state_replay_requirement(
         or not set(requested).issubset(feature_union)
     ):
         _fail("STATE_ATTEMPT_FEATURE_OUTSIDE_EFFECTIVE_DOMAIN", strategy_name)
-    unresolved = state_contract.DEFAULT_AUTHORITY.resolve_cell(
+    unresolved = authority.resolve_cell(
         strategy_name,
         parameters=parameters,
         requested_features=requested,
@@ -3079,7 +3237,7 @@ def _state_replay_requirement(
             "node": node,
             "mode": state_contract.EvidenceMode.AUTHENTICATED_REPLAY.value,
             "state_contract_registry_sha256": (
-                state_contract.DEFAULT_AUTHORITY.registry_hash
+                authority.registry_hash
             ),
             "native_prefix_index_sha256": fitted.product.index_sha256,
             "native_prefix_content_sha256": native["prefix_content_sha256"],
@@ -3099,10 +3257,11 @@ def _state_replay_requirement(
             identity_body=identity_body,
             schema_unavailable_code="STATE_REPLAY_SCHEMA_UNAVAILABLE",
             error_context=(strategy_name,),
+            authority=authority,
         )
         evidence[node] = item
         evidence_bodies.append(receipt)
-    resolved = state_contract.DEFAULT_AUTHORITY.resolve_cell(
+    resolved = authority.resolve_cell(
         strategy_name,
         parameters=parameters,
         requested_features=requested,
@@ -3951,7 +4110,7 @@ def _validate_request(
         or type(policies) is not dict
         or policies.get("trial_registry_policy_sha256") != process.receipt_sha256
         or body.get("optimizer_producer_release_sha256")
-        != historical_adapter.HISTORICAL_PRODUCER_RELEASE_SHA256
+        != process.to_dict()["historical_adapter_release_sha256"]
         or body.get("symbols") != list(book.PINNED_SYMBOL_ORDER)
         or body.get("timeframes") != list(TIMEFRAMES)
         or body.get("regimes") != list(REGIMES)
@@ -3996,6 +4155,7 @@ def _build_terminal_cell_plan(
     sink: authority_spool.SymbolAuthoritySink,
 ) -> ProductionCellSearchPlan:
     verify_frozen_production_search_process(context, process)
+    _require_current_process(process)
     normalized_regime = _identity(regime, "REGIME_INVALID").upper()
     if normalized_regime not in REGIMES:
         _fail("REGIME_INVALID")
@@ -4011,7 +4171,7 @@ def _build_terminal_cell_plan(
         product=reopened,
     )
     request_value = {
-        "schema_version": "fxpm.historical-horizon-request.v1",
+        "schema_version": "fxpm.historical-horizon-request.v3",
         "run_id": run_id,
         "anchor": dict(anchor),
         "cell": {
@@ -4171,6 +4331,7 @@ def _build_unobserved_cell_plan(
     sink: authority_spool.SymbolAuthoritySink,
 ) -> ProductionCellSearchPlan:
     verify_frozen_production_search_process(context, process)
+    _require_current_process(process)
     normalized_regime = _identity(regime, "REGIME_INVALID").upper()
     if normalized_regime not in REGIMES:
         _fail("REGIME_INVALID")
@@ -4212,18 +4373,21 @@ def _build_unobserved_cell_plan(
         "payload_sha256": payload_sha,
         "payload": payload,
     }
+    pair_cost_policy_sha256, frozen_tier_pair_contract_sha256 = (
+        _frozen_tier_horizon_hashes(fitted.frozen_tier_pair_contract)
+    )
     horizon_policy = {
-        "schema_version": "fxpm.historical-horizon-policy.v1",
+        "schema_version": "fxpm.historical-horizon-policy.v3",
         "policy_id": f"fxpm-production-unobserved-{timeframe}-v1",
         "policy_release_sha256": PRODUCTION_SEARCH_PLANNER_RELEASE_SHA256,
-        "cost_contract_sha256": _sha(dict(fitted.base_cost_policy)),
-        "cost_stress_contract_sha256": _sha(dict(fitted.stress_cost_policy)),
+        "cost_contract_sha256": pair_cost_policy_sha256,
+        "frozen_tier_pair_contract_sha256": frozen_tier_pair_contract_sha256,
         "evaluator_release_sha256": (
             search_execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
         ),
     }
     request_value = {
-        "schema_version": "fxpm.historical-horizon-unobserved-request.v1",
+        "schema_version": "fxpm.historical-horizon-unobserved-request.v3",
         "run_id": run_id,
         "anchor": dict(anchor),
         "cell": {
@@ -4648,10 +4812,12 @@ def _build_observed_cell_plan(
     bounded_canary_request: Any = None,
     bounded_canary_source_session: Any = None,
     bounded_canary_plan_permit: Any = None,
+    declared_slot_request: Any = None,
 ) -> ProductionCellSearchPlan:
     """Build one sealed cell plan after its outer authority is verified."""
 
     verify_frozen_production_search_process(context, process)
+    _require_current_process(process)
     normalized_mode = _identity(mode, "CELL_PLAN_MODE_INVALID").upper()
     canary_request_body: dict[str, Any] | None = None
     if normalized_mode == "BOUNDED_RAW_WINNER_CANARY":
@@ -4910,8 +5076,11 @@ def _build_observed_cell_plan(
             "payload_sha256": payload_sha,
         }
     )
+    pair_cost_policy_sha256, frozen_tier_pair_contract_sha256 = (
+        _frozen_tier_horizon_hashes(fitted.frozen_tier_pair_contract)
+    )
     request_value = {
-        "schema_version": "fxpm.historical-horizon-request.v1",
+        "schema_version": "fxpm.historical-horizon-request.v3",
         "run_id": run_id,
         "anchor": anchor,
         "cell": {
@@ -4928,11 +5097,11 @@ def _build_observed_cell_plan(
             "payload": payload,
         },
         "horizon_policy": {
-            "schema_version": "fxpm.historical-horizon-policy.v1",
+            "schema_version": "fxpm.historical-horizon-policy.v3",
             "policy_id": f"fxpm-production-horizon-{timeframe}-v1",
             "policy_release_sha256": PRODUCTION_SEARCH_PLANNER_RELEASE_SHA256,
-            "cost_contract_sha256": _sha(dict(fitted.base_cost_policy)),
-            "cost_stress_contract_sha256": _sha(dict(fitted.stress_cost_policy)),
+            "cost_contract_sha256": pair_cost_policy_sha256,
+            "frozen_tier_pair_contract_sha256": frozen_tier_pair_contract_sha256,
             "evaluator_release_sha256": (
                 search_execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
             ),
@@ -4985,6 +5154,7 @@ def _build_observed_cell_plan(
         bounded_canary_request=bounded_canary_request,
         bounded_canary_source_session=bounded_canary_source_session,
         bounded_canary_plan_permit=bounded_canary_plan_permit,
+        declared_slot_request=declared_slot_request,
     )
     result = ProductionCellSearchPlan(
         mode=mode,
@@ -5010,6 +5180,7 @@ def _build_observed_cell_plan(
         _bounded_canary_request=bounded_canary_request,
         _bounded_canary_source_session=bounded_canary_source_session,
         _bounded_canary_plan_permit=bounded_canary_plan_permit,
+        _declared_slot_request=declared_slot_request,
     )
     if result.attempt_count != ATTEMPT_COUNT:
         _fail("CELL_PLAN_ATTEMPT_ROSTER_INCOMPLETE")
@@ -5050,7 +5221,7 @@ def production_search_planner_contract() -> dict[str, Any]:
         "dataframe_free_exhaustive_state_domain_ceiling_required": True,
         "state_geometry_independent_of_sampled_attempts": True,
         "effective_per_cell_state_domain_hash_required": True,
-        "complete_cartesian_feature_union_release_proof_required": True,
+        "complete_legal_domain_feature_union_release_proof_required": True,
         "current_refit_reuses_historical_horizon_oracle": True,
         "full_grid_exhaustive_search_claimed": False,
         "technical_failure_is_market_verdict": False,
@@ -5082,9 +5253,26 @@ __all__ = [
     "build_historical_unobserved_cell_plan",
     "freeze_current_search_authorization",
     "freeze_production_search_process",
+    "reopen_production_search_process",
     "production_search_planner_contract",
     "verify_frozen_production_search_process",
     "verify_current_search_authorization",
     "verify_preprotected_state_error_envelope",
     "verify_production_cell_search_plan",
 ]
+
+
+def build_declared_slot_observed_cell_plan(context, *, process, request, fitted):
+    """Use the existing observed-cell planner under an explicit unissued slot."""
+    import pm_historical_search_producer as producer
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    session = producer._verified_declared_slot_fitted(context, request=request, process=process, fitted=fitted)
+    anchor = {**body["anchor"], "evidence_accessed_at_utc": session.to_dict()["source_accessed_at_utc"]}
+    return _build_observed_cell_plan(context, process=process, fitted=fitted,
+        regime=body["regime"], anchor=anchor, run_id=body["run_id"],
+        causal_precommit_receipt_sha256=body["precommit_sha256"],
+        mode="DECLARED_SLOT_UNISSUED", namespace=body["artifact_namespace"],
+        sink=request.symbol_sink(body["symbol"]), declared_slot_request=request)
+
+
+__all__ += ["build_declared_slot_observed_cell_plan"]

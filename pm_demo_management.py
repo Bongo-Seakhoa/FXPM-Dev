@@ -1313,12 +1313,24 @@ def create_demo_management_capsule(
     authorized_at_utc: Any,
     limits: ManagementLimits = ManagementLimits(),
 ) -> dict[str, Any]:
-    """Capture one successful DEMO authority generation atomically."""
+    """Capture reverified DEMO authority without granting management permissions."""
 
     try:
         limits = _limits(limits)
         if authorization_report is None or authorization_report.ok is not True:
-            raise _Blocked("MANAGEMENT_DEMO_AUTHORIZATION_REQUIRED")
+            from pm_demo_readiness import (
+                DemoProbationReadinessReport,
+                _demo_management_binding_checks_pass,
+                _only_interval_entry_policy_block,
+            )
+
+            if not (
+                type(authorization_report) is DemoProbationReadinessReport
+                and authorization_report.ok is False
+                and _only_interval_entry_policy_block(authorization_report.findings)
+                and _demo_management_binding_checks_pass(authorization_report)
+            ):
+                raise _Blocked("MANAGEMENT_DEMO_AUTHORIZATION_REQUIRED")
         binding = getattr(authorization_report, "_execution_binding", None)
         if binding is None or _binding_value(binding, "schema_version") != (
             "fxpm.demo-execution-binding.v1"

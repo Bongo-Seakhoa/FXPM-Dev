@@ -18,7 +18,7 @@ def _payload(tmp_path: Path) -> dict:
             "data_dir": "data",
             "output_dir": "outputs",
             "log_dir": "logs",
-            "backtest_spread_mode": "stress_p95",
+            "backtest_spread_mode": "conservative_max",
             "oos_validation_mode": "fixed_holdout",
             "false_discovery_symbol_count": 1,
         },
@@ -85,7 +85,7 @@ def test_public_loader_reproduces_complete_effective_config(tmp_path: Path) -> N
         config_payload=owned,
         supplied_config=effective,
     )
-    assert binding.BINDING_SCHEMA == "fxpm.production-effective-pipeline-config.v2"
+    assert binding.BINDING_SCHEMA == "fxpm.production-effective-pipeline-config.v3"
     assert json.loads(frozen._snapshot_json.decode("ascii"))["schema_version"] == (
         binding.BINDING_SCHEMA
     )
@@ -124,15 +124,15 @@ def test_binding_owns_effective_config_and_ignores_caller_mutation(
         config_payload=payload,
         supplied_config=supplied,
     )
-    supplied.backtest_spread_mode = "stress_max"
+    supplied.backtest_spread_mode = "historical_max"
     payload["pipeline"]["backtest_spread_mode"] = "historical_max"
 
     first = frozen.materialize(context)
     second = frozen.materialize(context)
     assert first is not second
-    assert first.backtest_spread_mode == second.backtest_spread_mode == "stress_p95"
-    first.backtest_spread_mode = "stress_max"
-    assert frozen.materialize(context).backtest_spread_mode == "stress_p95"
+    assert first.backtest_spread_mode == second.backtest_spread_mode == "conservative_max"
+    first.backtest_spread_mode = "historical_max"
+    assert frozen.materialize(context).backtest_spread_mode == "conservative_max"
 
 
 def test_initial_effective_config_mismatch_is_typed(tmp_path: Path) -> None:
@@ -141,7 +141,7 @@ def test_initial_effective_config_mismatch_is_typed(tmp_path: Path) -> None:
     _write(path, payload)
     context = _context(tmp_path, payload)
     supplied = _config(path, payload)
-    supplied.backtest_spread_mode = "stress_max"
+    supplied.backtest_spread_mode = "historical_max"
 
     with pytest.raises(binding.ProductionConfigBindingError) as caught:
         binding.freeze_production_pipeline_config(
@@ -192,7 +192,7 @@ def test_active_config_drift_is_rejected_before_materialization(tmp_path: Path) 
         supplied_config=_config(path, payload),
     )
     changed = json.loads(json.dumps(payload))
-    changed["pipeline"]["backtest_spread_mode"] = "stress_max"
+    changed["pipeline"]["backtest_spread_mode"] = "historical_max"
     _write(path, changed)
 
     with pytest.raises(binding.ProductionConfigBindingError) as caught:
@@ -207,7 +207,7 @@ def test_payload_and_context_hash_mismatch_fail_closed(tmp_path: Path) -> None:
     supplied = _config(path, payload)
     context = _context(tmp_path, payload)
     mismatch = json.loads(json.dumps(payload))
-    mismatch["pipeline"]["backtest_spread_mode"] = "stress_max"
+    mismatch["pipeline"]["backtest_spread_mode"] = "historical_max"
 
     with pytest.raises(binding.ProductionConfigBindingError) as caught:
         binding.freeze_production_pipeline_config(

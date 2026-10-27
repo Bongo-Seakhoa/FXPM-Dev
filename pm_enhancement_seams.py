@@ -459,7 +459,6 @@ class ExecutionQualityContext:
     atr_pips: float = 0.0
     slippage_pips: float = 0.0
     candidate_score: float = 0.0
-    rolling_spread_median: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -472,20 +471,17 @@ class ExecutionQualityDecision:
 
 class SpreadAwareExecutionOverlay:
     """
-    G5: Spread-aware signal filter + spike detection.
+    G5: ATR edge and sizing overlay after mandatory frozen-tier admission.
 
     - Rejects trades where ATR < min_edge_mult * spread (insufficient edge).
-    - Rejects trades during spread spikes (spread > spike_mult * rolling median).
     - Penalizes score when spread is high but still above threshold.
     """
 
     def __init__(self,
                  min_edge_mult: float = 1.5,
-                 spike_mult: float = 2.0,
                  penalty_start_mult: float = 0.5,
                  enabled: bool = True):
         self.min_edge_mult = min_edge_mult
-        self.spike_mult = spike_mult
         self.penalty_start_mult = penalty_start_mult
         self.enabled = enabled
 
@@ -494,15 +490,6 @@ class SpreadAwareExecutionOverlay:
             return ExecutionQualityDecision()
 
         notes: List[str] = []
-
-        # Spread spike detection
-        if context.rolling_spread_median > 0:
-            if context.spread_pips > self.spike_mult * context.rolling_spread_median:
-                return ExecutionQualityDecision(
-                    allow_trade=False,
-                    score_multiplier=0.0,
-                    notes=[f"Spread spike: {context.spread_pips:.1f} > {self.spike_mult}x median {context.rolling_spread_median:.1f}"],
-                )
 
         # Minimum edge filter
         if context.atr_pips > 0:
@@ -657,7 +644,6 @@ def create_default_enhancement_seams(config: Optional[Any] = None) -> Enhancemen
     risk_scalars_mode = _coerce_risk_scalars_mode(config, legacy_enabled=risk_scalars_enabled)
     exit_pack_mode = _coerce_exit_pack_mode(config)
     spread_min_edge_mult = _coerce_float("execution_spread_min_edge_mult", 1.5)
-    spread_spike_mult = _coerce_float("execution_spread_spike_mult", 2.0)
     spread_penalty_start_mult = _coerce_float("execution_spread_penalty_start_mult", 0.5)
     target_annual_vol = _coerce_float("target_annual_vol", 0.10)
     if risk_scalars_mode == "off":
@@ -685,7 +671,6 @@ def create_default_enhancement_seams(config: Optional[Any] = None) -> Enhancemen
         regime_model_adapter=RegimeModelAdapter(),
         execution_quality_overlay=SpreadAwareExecutionOverlay(
             min_edge_mult=spread_min_edge_mult,
-            spike_mult=spread_spike_mult,
             penalty_start_mult=spread_penalty_start_mult,
             enabled=spread_enabled,
         ),

@@ -1,2273 +1,1316 @@
+"""Current independent-tier production and strict original archive assurance."""
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
-from dataclasses import asdict, replace
+import os
+import shutil
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
 import pm_authority_spool as spool
-import pm_production_search_planner as planner
+import pm_forward_oos_replay_producer as forward
+import pm_winner_raw_evidence as raw
 import pm_winner_selection as winner
-from pm_core import (
-    BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
-    BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
-    BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
-    BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
-    Backtester,
-    InstrumentSpec,
-    PipelineConfig,
-)
-from pm_current_refit_artifacts import build_current_refit_search_artifacts_v2
-from pm_strategies import StrategyRegistry
-from pm_search_outcomes import SearchOutcomeKind, SearchStage, TrialOutcome
-from pm_trade_power import build_numerical_execution_cost_attestation
-from pm_winner_raw_evidence import (
-    COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK,
-    COST_STRESS_ADVERSITY_EXPECTED_STRICT,
-    COST_STRESS_ADVERSITY_PLAN_SCHEMA,
-    EXECUTION_SPEC_RECEIPT_SCHEMA,
-    FROZEN_COST_POLICY_SCHEMA,
-    WinnerRawEvidenceError,
-    WinnerRawEvidenceIncomplete,
-    _event_vectors,
-    build_flat_daily_r_surface,
-    build_frozen_numerical_execution_cost_policy,
-    build_precommitted_risk_unit_contract,
-    build_trade_source_contract_from_backtester_result,
-    freeze_winner_search_plan_v3,
-    produce_winner_v11_raw_evidence,
-)
+from pm_core import Backtester, InstrumentSpec, PipelineConfig
+from pm_winner_raw_evidence import (WinnerRawEvidenceError, WinnerRawEvidenceIncomplete,
+    build_flat_daily_r_surface, build_precommitted_risk_unit_contract)
 
-
-def _canonical(value):
-    return json.dumps(
-        value,
-        allow_nan=False,
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("ascii")
-
-
-def _sha(value):
-    if isinstance(value, str):
-        value = {"label": value}
-    return hashlib.sha256(_canonical(value)).hexdigest()
-
-
-def _sha1(value):
-    if isinstance(value, str):
-        value = {"label": value}
-    return hashlib.sha1(_canonical(value)).hexdigest()
-
-
-COST_SPEC = InstrumentSpec(
-    symbol="EURUSD",
-    pip_position=4,
-    pip_value=10.0,
-    spread_avg=1.0,
-)
-BASE_COST_BACKTESTER = Backtester(
-    PipelineConfig(
-        use_spread=True,
-        backtest_spread_mode="conservative_max",
-        swap_model_enabled=False,
-    )
-)
-STRESS_COST_BACKTESTER = Backtester(
-    PipelineConfig(
-        use_spread=True,
-        backtest_spread_mode="stress_p95",
-        swap_model_enabled=False,
-    )
-)
-
-
-def _genuine_partition_cost(*, label: str, bars: int, stress: bool):
-    """Use Backtester itself so each causal partition seals its own arrays."""
-
-    if bars <= 0:
-        raise AssertionError("partition must contain bars")
-    # The label fraction makes equal-length partitions byte-distinct too;
-    # bar count remains encoded by Backtester's own array hasher.
-    offset = int(_sha(f"spread:{label}")[:12], 16) / float(16**12)
-    spread_open = np.asarray(
-        [12.0 + offset + index % 3 for index in range(bars)], dtype=np.float64
-    )
-    spread_max = spread_open + 4.0
-    spread_p95 = spread_open + 3.0
-    frame = pd.DataFrame(
-        {
-            "Spread": spread_open,
-            "SpreadOpen": spread_open,
-            "SpreadMax": spread_max,
-            "SpreadP95": spread_p95,
-        }
-    )
-    backtester = STRESS_COST_BACKTESTER if stress else BASE_COST_BACKTESTER
-    entry, intrabar, meta = backtester._build_half_spread_arrays(frame, COST_SPEC)
-    return backtester._numerical_execution_cost_attestation(
-        entry_half_spread=entry,
-        intrabar_half_spread=intrabar,
-        spread_meta=meta,
-        spec=COST_SPEC,
-    )
-
-
-def _frozen_policy(attestation, lane):
-    return build_frozen_numerical_execution_cost_policy(
-        lane=lane,
-        use_spread=attestation["use_spread"],
-        spread_mode=attestation["spread_mode"],
-        instrument_spec_sha256=attestation["instrument_spec_sha256"],
-    )
-
-
-BASE_COST = _genuine_partition_cost(label="policy-base", bars=1, stress=False)
-STRESS_COST = _genuine_partition_cost(label="policy-stress", bars=1, stress=True)
-BASE_COST_POLICY = _frozen_policy(BASE_COST, "BASE")
-STRESS_COST_POLICY = _frozen_policy(STRESS_COST, "STRESS")
 RISK_CONTRACT = build_precommitted_risk_unit_contract()
 
 
-def _rebuilt_cost(attestation, **changes):
-    values = dict(attestation)
-    values.update(changes)
-    return build_numerical_execution_cost_attestation(
-        use_spread=values["use_spread"],
-        spread_mode=values["spread_mode"],
-        spread_values_sha256=values["spread_values_sha256"],
-        instrument_spec_sha256=values["instrument_spec_sha256"],
-    )
+def _canonical(value):
+    return json.dumps(value, allow_nan=False, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
 
 
-def _events(
-    start: date,
-    *,
-    namespace: str,
-    values: list[float] | None = None,
-):
-    observed = values or [0.30 + 0.01 * (index % 2) for index in range(12)]
-    rows = []
-    for index, value in enumerate(observed):
-        opened = datetime.combine(
-            start + timedelta(days=index),
-            datetime.min.time(),
-            tzinfo=timezone.utc,
-        ) + timedelta(hours=10)
-        rows.append(
-            {
-                "trade_record_schema_version": "2026-07-14-position-events-v2",
-                "position_id": f"{namespace}:position:{index:04d}",
-                "entry_time": opened.isoformat(),
-                "exit_time": (opened + timedelta(hours=1)).isoformat(),
-                "entry_event_order": index * 4 + 1,
-                "exit_event_order": index * 4 + 3,
-                "pnl_dollars": value * 100.0,
-                "risk_amount": 100.0,
-            }
-        )
-    return rows
+def _sha(value):
+    return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _swap(*, projection: str):
-    return {
-        "contract_version": "causal_swap_accrual_v1",
-        "status": "AVAILABLE",
-        "provenance_status": "STRESS_APPROVED",
-        "execution_state_compounding": True,
-        "historical_rates_authenticated": False,
-        "stress_policy_explicitly_approved": True,
-        "stress_policy_immutable": True,
-        "stress_policy_sha256": "a" * 64,
-        "timestamp_source": "_BAR_CLOSE_TS",
-        "price_activation_manifest_sha256": "1" * 64,
-        "terms_activation_manifest_sha256": "2" * 64,
-        "terms_snapshot_sha256": "3" * 64,
-        "schedule_sha256": "4" * 64,
-        "target_bars_sha256": "5" * 64,
-        "target_sidecar_sha256": "6" * 64,
-        "projection_contract": "fxpm-swap-preopen-close-projection-v1",
-        "projection_sha256": projection,
-    }
-
-
-def _result(
-    *,
-    start: date,
-    end: date,
-    namespace: str,
-    axis_label: str,
-    cost=None,
-    stress_cost_lane: bool = False,
-    values: list[float] | None = None,
-):
-    events = _events(start, namespace=namespace, values=values)
-    surface = build_flat_daily_r_surface(
-        events,
-        start_date_utc=start.isoformat(),
-        end_date_utc=end.isoformat(),
-        risk_unit_contract=RISK_CONTRACT,
-    )
-    axis = {
-        "schema_version": "fxpm.backtest-partition-axis.v1",
-        "timeframe": "H1",
-        "start_utc": datetime.combine(
-            start, datetime.min.time(), tzinfo=timezone.utc
-        ).isoformat(),
-        "end_utc": datetime.combine(
-            end + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
-        ).isoformat(),
-        "scored_bars": (end - start).days + 1,
-        "warmup_bars": 0,
-        "event_axis_sha256": _sha(f"axis:{axis_label}"),
-    }
-    axis["horizon_receipt_sha256"] = _sha(axis)
-    partition_bars = (end - start).days + 1
-    partition_cost = cost or _genuine_partition_cost(
-        label=axis_label,
-        bars=partition_bars,
-        stress=stress_cost_lane,
-    )
-    return {
-        "position_events": events,
-        "winner_daily_r_surface": surface,
-        "trade_power_partition_axis": axis,
-        "execution_cost_timing_contract": {
-            "swap_accrual": "causal_swap_accrual_v1",
-        },
-        "numerical_execution_cost_attestation": partition_cost,
-        "swap_accrual_contract": _swap(projection=_sha(f"projection:{axis_label}")),
-    }
-
-
-def _attempt_artifact(
-    ordinal: int,
-    strategy_id: str = "EMACrossoverStrategy",
-    *,
-    symbol: str = "EURUSD",
-):
-    """Build a GENUINE executable attempt via the accepted v2 producer."""
-    strategy = StrategyRegistry.get(strategy_id)
-    parameters = strategy.get_params()
-    if strategy_id == "EMACrossoverStrategy":
-        choices = strategy.get_param_grid()["fast_period"]
-        parameters["fast_period"] = choices[ordinal % len(choices)]
-    built = build_current_refit_search_artifacts_v2(
-        symbol=symbol,
-        timeframe="H1",
-        regime="TREND",
-        strategy_id=strategy_id,
-        parameters=parameters,
-        lookback_kind="NATIVE_OBSERVATIONS",
-        lookback_value=5_000,
-        fit_start_utc="2015-01-01T00:00:00Z",
-        fit_end_utc="2020-01-01T00:00:00Z",
-        latest_closed_bar_utc="2019-12-31T23:00:00Z",
-        source_snapshot_sha256="a" * 64,
-        source_bar_count=5_000,
-        seed=20260714,
-    )
-    return {
-        "winner_process": built.winner_process,
-        "horizon_process": built.horizon_process,
-        "trial_definition": built.trial_definition,
-        "refit_recipe": built.refit_recipe,
-    }
-
-
-def _fold_plan():
-    starts = [date(2021 + index, 2, 1) for index in range(4)]
-    return [
-        {
-            "anchor_as_of_utc": datetime.combine(
-                start, datetime.min.time(), tzinfo=timezone.utc
-            ).isoformat(),
-            "oos_start_date_utc": start.isoformat(),
-            "oos_end_date_utc": (start + timedelta(days=62)).isoformat(),
-        }
-        for start in starts
-    ]
-
-
-def _receipt(role: str, common: dict, **specific):
-    body = {
-        "schema_version": "fxpm.authoritative-search-provenance.v1",
-        **common,
-        "receipt_role": role,
-        **specific,
-    }
+def _reseal(value):
+    body = {key: child for key, child in value.items() if key != "receipt_sha256"}
     return {**body, "receipt_sha256": _sha(body)}
 
 
-def _partition_geometry(*, attempt_ordinal, fold_ordinal, lanes):
-    geometry = []
-    for index, (role, lane_name) in enumerate(
-        (
-            ("optimizer_train", "optimizer_train_base"),
-            ("tuning_validation", "tuning_validation_base"),
-            ("final_lockbox", "final_lockbox_base"),
-        )
-    ):
-        axis = lanes[lane_name]["trade_power_partition_axis"]
-        body = {
-            "schema_version": "fxpm.winner-partition-geometry.v1",
-            "role": role,
-            "frame_start_utc": axis["start_utc"],
-            "scored_start_utc": axis["start_utc"],
-            "end_exclusive_utc": axis["end_utc"],
-            "warmup_bars": axis["warmup_bars"],
-            "scored_bars": axis["scored_bars"],
-            "frame_rows": axis["warmup_bars"] + axis["scored_bars"],
-            "frame_sha256": _sha(f"frame:{attempt_ordinal}:{fold_ordinal}:{index}"),
-        }
-        geometry.append({**body, "receipt_sha256": _sha(body)})
-    return geometry
+def clone_current_native_case(case, tmp_path):
+    """Copy original nodes and restore the ORIGINAL frozen artifact-id roster."""
+    destination = tmp_path / "spool"
+    assert destination.resolve().is_relative_to(tmp_path.resolve())
+    shutil.copytree(case["context"].root, destination)
+    original = case["context"]
+    context = spool.reopen_generation_context(destination, expected_generation_id=original.generation_id,
+        expected_native_universe_sha256=original.native_universe_sha256, expected_config_sha256=original.config_sha256)
+    assert context.context_sha256 == original.context_sha256
+    sink = spool.SymbolAuthoritySink(context, case["sink"].symbol, manifest_domain=case["sink"].manifest_domain)
+    for entry in case["sink"].artifact_roster():
+        assert sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"]) == entry
+    return {**case, "context": context, "sink": sink, "evidence": copy.deepcopy(case["evidence"])}
 
 
-def _execution_spec_receipt(frozen):
-    instrument_spec = asdict(COST_SPEC)
-    instrument_spec_sha256 = Backtester._cost_attestation_json_sha256(
-        {
-            "schema_version": BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
-            "instrument_spec": instrument_spec,
-        }
-    )
-    body = {
-        "schema_version": EXECUTION_SPEC_RECEIPT_SCHEMA,
-        "symbol": frozen.symbol,
-        "authority_timing": "FROZEN_BEFORE_FIRST_SEARCH_EVALUATION",
-        "deployment_scope": "TEST_PRODUCTION_SCOPE",
-        "deployment_config_sha256": _sha("deployment-config"),
-        "deployment_config_size_bytes": 1024,
-        "broker_specs_relative_path": "broker_specs.json",
-        "broker_specs_sha256": _sha("broker-specs"),
-        "broker_specs_size_bytes": 2048,
-        "broker_record_key": frozen.symbol,
-        "broker_record_sha256": _sha("broker-record"),
-        "native_prefix_index_sha256": _sha("native-prefix-index"),
-        "native_provenance_sha256": _sha("native-provenance"),
-        "native_instrument_snapshot_sha256": _sha("native-instrument"),
-        "tick_value_source": "ACTIVATED_ACQUISITION_INSTRUMENT_SNAPSHOT",
-        "volume_source": "FROZEN_BROKER_SPECS_RECORD",
-        "instrument_spec": instrument_spec,
-        "instrument_spec_sha256": instrument_spec_sha256,
-        "grants_search_authority": False,
-        "grants_trading_authority": False,
-    }
-    return {**body, "receipt_sha256": _sha(body)}
+# Shared session fixture retains one native fit and six-account execution set.
+from tests.test_historical_production_adapter import current_native_case
 
 
-def _production_provenance(*, frozen, attempt_ordinal, fold_ordinal, planned, lanes):
-    attempt = frozen.attempt_ledger["attempts"][attempt_ordinal]
-    artifacts = frozen.attempt_artifacts_bundle[attempt_ordinal]
-    common = {
-        "authority_scope": "PRECOMMITTED_HISTORICAL_INNER_FOLD_ONLY",
-        "anchor_id": "anchor-test-001",
-        "symbol": frozen.symbol,
-        "timeframe": frozen.timeframe,
-        "regime": frozen.regime,
-        "attempt_ordinal": attempt_ordinal,
-        "horizon_attempt_id": _sha(f"horizon-attempt:{attempt_ordinal}"),
-        "fold_ordinal": fold_ordinal,
-        "fold_id": planned["fold_id"],
-        "confers_final_oos_or_trading_authority": False,
-    }
-    base = lanes["final_lockbox_base"]
-    stress = lanes["final_lockbox_stress"]
-    base_axis = base["trade_power_partition_axis"]
-    stress_surface = stress["winner_daily_r_surface"]
-    signal_values = [0] * (base_axis["warmup_bars"] + base_axis["scored_bars"])
-    signal_sha256 = hashlib.sha256(
-        np.asarray(signal_values, dtype="<i4").tobytes(order="C")
-    ).hexdigest()
-    signal_body = {
-        "schema_version": "fxpm.authoritative-search-signal-vector.v1",
-        "encoding": "little-endian-signed-int32",
-        "observation_count": len(signal_values),
-        "values": signal_values,
-        "signal_vector_sha256": signal_sha256,
-    }
-    signal_receipt = {**signal_body, "receipt_sha256": _sha(signal_body)}
-    geometry = _partition_geometry(
-        attempt_ordinal=attempt_ordinal,
-        fold_ordinal=fold_ordinal,
-        lanes=lanes,
-    )
-    stress_body = {
-        "schema_version": BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
-        "symbol": frozen.symbol,
-        "timeframe": frozen.timeframe,
-        "strategy_name": artifacts["winner_process"]["strategy_id"],
-        "stress_mode": "stress_p95",
-        "warmup_bars": base_axis["warmup_bars"],
-        "partition_axis_sha256": base_axis["horizon_receipt_sha256"],
-        "signal_vector_sha256": signal_sha256,
-        "base_cost_attestation_sha256": base["numerical_execution_cost_attestation"][
-            "attestation_sha256"
-        ],
-        "stress_cost_attestation_sha256": stress[
-            "numerical_execution_cost_attestation"
-        ]["attestation_sha256"],
-        "base_spread_values_sha256": base["numerical_execution_cost_attestation"][
-            "spread_values_sha256"
-        ],
-        "stress_spread_values_sha256": stress[
-            "numerical_execution_cost_attestation"
-        ]["spread_values_sha256"],
-        "base_position_roster_sha256": Backtester._cost_attestation_json_sha256(
-            {"position_events": base["position_events"]}
-        ),
-        "stress_position_roster_sha256": Backtester._cost_attestation_json_sha256(
-            {"position_events": stress["position_events"]}
-        ),
-        "position_count": len(stress["position_events"]),
-        "daily_observation_count": len(stress_surface["daily_net_mtm_r"]),
-        "path_identity_preserved": True,
-        "stress_never_improves": True,
-        "strictly_worse_trade_count": sum(
-            stress_event["pnl_dollars"] < base_event["pnl_dollars"]
-            for base_event, stress_event in zip(
-                base["position_events"],
-                stress["position_events"],
-                strict=True,
-            )
-        ),
-        "strictly_worse_daily_observation_count": sum(
-            stress_value < base_value
-            for base_value, stress_value in zip(
-                base["winner_daily_r_surface"]["daily_net_mtm_r"],
-                stress_surface["daily_net_mtm_r"],
-                strict=True,
-            )
-        ),
-        "stress_daily_improvement_observation_count": sum(
-            stress_value > base_value
-            for base_value, stress_value in zip(
-                base["winner_daily_r_surface"]["daily_net_mtm_r"],
-                stress_surface["daily_net_mtm_r"],
-                strict=True,
-            )
-        ),
-        "realized_adversity_status": (
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
-        ),
-    }
-    stress_receipt = {**stress_body, "receipt_sha256": _sha(stress_body)}
-    source_binding = frozen.source_contract_seed["source_binding"]
-    return {
-        "anchor_selection_receipt": _receipt(
-            "anchor_selection_receipt",
-            common,
-            process_precommit_receipt_sha256=_sha("process-precommit"),
-            horizon_plan_receipt_sha256=_sha("horizon-plan"),
-            selection_cutoff_utc="2020-01-01T00:00:00Z",
-        ),
-        "anchor_horizon_decision": _receipt(
-            "anchor_horizon_decision",
-            common,
-            candidate_id=f"candidate-{attempt_ordinal}",
-            candidate_definition_sha256=_sha(f"candidate:{attempt_ordinal}"),
-            horizon_process_sha256=attempt["horizon_process_sha256"],
-            fold_definition_sha256=_sha(f"fold:{attempt_ordinal}:{fold_ordinal}"),
-            partition_geometry=geometry,
-            partition_geometry_receipts=[item["receipt_sha256"] for item in geometry],
-        ),
-        "anchor_trial_ledger": _receipt(
-            "anchor_trial_ledger",
-            common,
-            trial_registry_sha256=frozen.precommitment["trial_registry_sha256"],
-            attempt_roster_sha256=_sha("horizon-attempt-roster"),
-            attempted_trials_exact=frozen.attempt_ledger["attempt_count"],
-        ),
-        "anchor_selected_trial": _receipt(
-            "anchor_selected_trial",
-            common,
-            selection_scope="PRECOMMITTED_ATTEMPT_NOT_POSTHOC_WINNER",
-            trial_id=f"trial-{attempt_ordinal}",
-            trial_definition_sha256=_sha(f"horizon-trial:{attempt_ordinal}"),
-            winner_process_sha256=attempt["process_sha256"],
-            executable_trial_sha256=attempt["trial_definition_sha256"],
-        ),
-        "anchor_refit_receipt": _receipt(
-            "anchor_refit_receipt",
-            common,
-            refit_recipe_sha256=attempt["refit_recipe_sha256"],
-            fit_start_utc=(
-                date.fromisoformat(planned["oos_start_date_utc"]) - timedelta(days=300)
-            ).isoformat()
-            + "T00:00:00Z",
-            fit_end_exclusive_utc=(
-                date.fromisoformat(planned["oos_start_date_utc"]) - timedelta(days=1)
-            ).isoformat()
-            + "T00:00:00Z",
-            post_selection_search=False,
-        ),
-        "attempt_replay_receipt": _receipt(
-            "attempt_replay_receipt",
-            common,
-            lane_sha256={name: _sha(lanes[name]) for name in lanes},
-            stress_method_receipt_sha256=stress_receipt["receipt_sha256"],
-            stress_method_receipt=stress_receipt,
-            signal_vector_receipt=signal_receipt,
-            position_events_are_genuine_backtester_v2=True,
-        ),
-        "oos_source_receipt": _receipt(
-            "oos_source_receipt",
-            common,
-            native_prefix_index_sha256=_sha("native-prefix-index"),
-            native_prefix_content_sha256=artifacts["horizon_process"][
-                "source_snapshot_sha256"
-            ],
-            source_contract_sha256=frozen.precommitment["source_contract_sha256"],
-            native_source_sha256=source_binding["target_bars_sha256"],
-            activation_manifest_sha256=source_binding[
-                "price_activation_manifest_sha256"
-            ],
-            source_group_decision_sha256=_sha("source-group-decision"),
-            regime_fit_decision_sha256=_sha("regime-fit-decision"),
-            execution_spec_receipt=_execution_spec_receipt(frozen),
-            partition_frame_sha256=[item["frame_sha256"] for item in geometry],
-        ),
-    }
+def _produce_case(case, *, evidence=None, frozen=None, cross_binding_bytes=None):
+    frozen = case["frozen"] if frozen is None else frozen
+    return raw.produce_winner_v15_raw_evidence(case["sink"], frozen=frozen,
+        attempt_evidence=case["evidence"] if evidence is None else evidence,
+        evidence_access_started_at_utc=case["evidence_started_at_utc"],
+        evidence_access_completed_at_utc=case["evidence_completed_at_utc"],
+        provenance_cross_binding_bytes=case["cross_binding_bytes"] if cross_binding_bytes is None else cross_binding_bytes,
+        artifact_namespace=frozen.artifact_namespace)
 
 
-def _raw_fold(*, attempt_ordinal: int, fold_ordinal: int, planned, frozen=None):
-    final_start = date.fromisoformat(planned["oos_start_date_utc"])
-    final_end = date.fromisoformat(planned["oos_end_date_utc"])
-    train_start = final_start - timedelta(days=300)
-    train_end = train_start + timedelta(days=62 + fold_ordinal)
-    tuning_start = final_start - timedelta(days=150)
-    tuning_end = tuning_start + timedelta(days=63 + fold_ordinal * 2)
-    prefix = f"a{attempt_ordinal}:f{fold_ordinal}"
-    final = _result(
-        start=final_start,
-        end=final_end,
-        namespace=f"{prefix}:final",
-        axis_label=f"{prefix}:final",
-    )
-    stress_values = [
-        event["pnl_dollars"] / event["risk_amount"] - 0.02
-        for event in final["position_events"]
-    ]
-    stress = _result(
-        start=final_start,
-        end=final_end,
-        namespace=f"{prefix}:final",
-        axis_label=f"{prefix}:final",
-        stress_cost_lane=True,
-        values=stress_values,
-    )
-    lanes = {
-        "optimizer_train_base": _result(
-            start=train_start,
-            end=train_end,
-            namespace=f"{prefix}:train",
-            axis_label=f"{prefix}:train",
-        ),
-        "tuning_validation_base": _result(
-            start=tuning_start,
-            end=tuning_end,
-            namespace=f"{prefix}:tuning",
-            axis_label=f"{prefix}:tuning",
-        ),
-        "final_lockbox_base": final,
-        "final_lockbox_stress": stress,
-    }
-    provenance = (
-        {}
-        if frozen is None
-        else _production_provenance(
-            frozen=frozen,
-            attempt_ordinal=attempt_ordinal,
-            fold_ordinal=fold_ordinal,
-            planned=planned,
-            lanes=lanes,
-        )
-    )
-    return {
-        "fold_ordinal": fold_ordinal,
-        "provenance": provenance,
-        "lanes": lanes,
-    }
+def _first_fold(case):
+    return next(attempt["folds"][0] for attempt in case["evidence"] if "folds" in attempt)
 
 
-def _context(tmp_path: Path, *, symbol: str = "EURUSD"):
-    context = spool.freeze_generation_context(
-        tmp_path / "authority",
-        generation_id="generation-raw-winner-001",
-        native_universe_sha256="b" * 64,
-        config_sha256="c" * 64,
-    )
-    return context, spool.open_symbol_sink(context, symbol)
+def _referenced_current_native_case(original, tmp_path):
+    """Reuse genuine synthetic-fixture accounts and publish their unchanged maps."""
+    case = clone_current_native_case(original, tmp_path)
+    case["inline_evidence"] = copy.deepcopy(case["evidence"])
+    for attempt in case["evidence"]:
+        for fold in attempt.get("folds", ()):
+            provenance = fold["provenance"]
+            replay = provenance["attempt_replay_receipt"]
+            bodies = replay.pop("source_observation_receipts")
+            replay["source_observation_references"] = {
+                partition: raw.publish_source_observation_receipt(case["sink"], frozen=case["frozen"], receipt=body)
+                for partition, body in bodies.items()}
+            for role, receipt in provenance.items():
+                receipt["schema_version"] = raw.REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA
+                provenance[role] = _reseal(receipt)
+    return case
 
 
-def _normalized_test_fold_plan(*, symbol: str = "EURUSD"):
-    normalized = []
-    for ordinal, raw in enumerate(_fold_plan()):
-        anchor = (
-            datetime.fromisoformat(
-                raw["anchor_as_of_utc"].replace("Z", "+00:00")
-            )
-            .astimezone(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z")
-        )
-        body = {
-            "schema_version": "fxpm.winner-fold-identity.v1",
-            "symbol": symbol,
-            "timeframe": "H1",
-            "regime": "TREND",
-            "fold_ordinal": ordinal,
-            "anchor_as_of_utc": anchor,
-            "oos_start_date_utc": raw["oos_start_date_utc"],
-            "oos_end_date_utc": raw["oos_end_date_utc"],
-        }
-        normalized.append(
-            {
-                "fold_ordinal": ordinal,
-                "fold_id": _sha1(body),
-                "anchor_as_of_utc": anchor,
-                "oos_start_date_utc": raw["oos_start_date_utc"],
-                "oos_end_date_utc": raw["oos_end_date_utc"],
-            }
-        )
-    return normalized
+def _record_real_source_observation_publication(monkeypatch):
+    original = raw.publish_source_observation_receipt
+    calls = []
+    def record(*args, **kwargs):
+        reference = original(*args, **kwargs)
+        calls.append((kwargs["frozen"], copy.deepcopy(reference)))
+        return reference
+    monkeypatch.setattr(raw, "publish_source_observation_receipt", record)
+    return calls
 
 
-def _cost_stress_adversity_plan(
-    *,
-    attempts: int,
-    roles,
-    no_shock_pairs=frozenset(),
-    symbol: str = "EURUSD",
-):
-    rows = []
-    normalized_folds = _normalized_test_fold_plan(symbol=symbol)
-    for attempt_ordinal in range(attempts):
-        if roles[attempt_ordinal] != "EVALUATION_REQUIRED":
+def _assert_real_referenced_production_closure(case, production, *, frozen=None, sink=None):
+    """Verify writer output and public closure on its sealed, cold-reopened spool."""
+    context = case["context"]
+    sink = case["sink"] if sink is None else sink
+    frozen = case["frozen"] if frozen is None else frozen
+    production_entry = production.entries["production-receipt"]
+    body = raw._source_observation_closure_body(context, production_entry)
+    entries = sink.artifact_roster()
+    raw.verify_source_observation_reference_closure(context, frozen=frozen,
+        manifest_entries=entries, production_receipt=body)
+    prefix = raw._artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    shared = {entry["artifact_id"]: entry for entry in entries
+        if entry["artifact_id"].startswith(prefix + "/source-observations/")}
+    assert shared
+    assert {entry["artifact_type"] for entry in shared.values()} == {"winner_source_observation_receipt"}
+    assert {key for key in body["artifact_roster"] if key.startswith("source-observation-")} == {
+        "source-observation-" + entry["descriptor"]["sha256"] for entry in shared.values()}
+    used = set()
+    provenance = [entry for entry in entries if entry["artifact_id"].startswith(prefix + "/")
+        and "/provenance/" in entry["artifact_id"]]
+    assert provenance
+    required_attempts = sum(attempt["precommitted_evidence_role"] == "EVALUATION_REQUIRED"
+        for attempt in frozen.attempt_ledger["attempts"])
+    assert len(provenance) == required_attempts * len(frozen.precommitment["causal_fold_plan"]) * 7
+    for entry in provenance:
+        receipt = raw._source_observation_closure_body(context, entry)
+        assert receipt["schema_version"] == "fxpm.authoritative-search-provenance.v5"
+        if receipt["receipt_role"] != "attempt_replay_receipt":
             continue
-        for planned in normalized_folds:
-            fold_ordinal = planned["fold_ordinal"]
-            lanes = _raw_fold(
-                attempt_ordinal=attempt_ordinal,
-                fold_ordinal=fold_ordinal,
-                planned=planned,
-            )["lanes"]
-            geometry = _partition_geometry(
-                attempt_ordinal=attempt_ordinal,
-                fold_ordinal=fold_ordinal,
-                lanes=lanes,
-            )[-1]
-            base_cost = lanes["final_lockbox_base"][
-                "numerical_execution_cost_attestation"
-            ]
-            stress_cost = lanes["final_lockbox_stress"][
-                "numerical_execution_cost_attestation"
-            ]
-            if (attempt_ordinal, fold_ordinal) in no_shock_pairs:
-                stress_cost = _rebuilt_cost(
-                    stress_cost,
-                    spread_values_sha256=base_cost["spread_values_sha256"],
-                )
-            equal_vectors = (
-                base_cost["spread_values_sha256"]
-                == stress_cost["spread_values_sha256"]
-            )
-            rows.append(
-                {
-                    "attempt_ordinal": attempt_ordinal,
-                    "horizon_attempt_id": _sha(
-                        f"horizon-attempt:{attempt_ordinal}"
-                    ),
-                    "fold_ordinal": fold_ordinal,
-                    "fold_id": planned["fold_id"],
-                    "final_partition_geometry_receipt_sha256": geometry[
-                        "receipt_sha256"
-                    ],
-                    "final_partition_frame_sha256": geometry["frame_sha256"],
-                    "base_cost_attestation_sha256": base_cost[
-                        "attestation_sha256"
-                    ],
-                    "stress_cost_attestation_sha256": stress_cost[
-                        "attestation_sha256"
-                    ],
-                    "base_spread_values_sha256": base_cost[
-                        "spread_values_sha256"
-                    ],
-                    "stress_spread_values_sha256": stress_cost[
-                        "spread_values_sha256"
-                    ],
-                    "expected_adversity_status": (
-                        COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
-                        if equal_vectors
-                        else COST_STRESS_ADVERSITY_EXPECTED_STRICT
-                    ),
-                }
-            )
-    return {
-        "schema_version": COST_STRESS_ADVERSITY_PLAN_SCHEMA,
-        "symbol": symbol,
-        "timeframe": "H1",
-        "regime": "TREND",
-        "row_count": len(rows),
-        "rows_sha256": _sha(rows),
-        "rows": rows,
-    }
+        assert "source_observation_receipts" not in receipt
+        assert set(receipt["source_observation_references"]) == set(raw._PARTITIONS)
+        for reference in receipt["source_observation_references"].values():
+            source = reference["artifact_entry"]
+            assert shared[source["artifact_id"]] == source
+            assert body["artifact_roster"]["source-observation-" + source["descriptor"]["sha256"]] == source["descriptor"]
+            used.add(source["artifact_id"])
+    assert used == set(shared)
+    symbol_receipt = sink.seal()
+    manifest = spool.verify_symbol_receipt(context.root, symbol_receipt,
+        expected_generation_id=context.generation_id, expected_symbol=sink.symbol,
+        expected_native_universe_sha256=context.native_universe_sha256, expected_config_sha256=context.config_sha256)
+    cold = spool.reopen_generation_context(context.root, expected_generation_id=context.generation_id,
+        expected_native_universe_sha256=context.native_universe_sha256, expected_config_sha256=context.config_sha256)
+    raw.verify_source_observation_reference_closure(cold, frozen=frozen,
+        manifest_entries=manifest["artifacts"], production_receipt=body)
 
 
-def _freeze(
-    tmp_path: Path,
-    *,
-    attempts=1,
-    symbol="EURUSD",
-    artifact_namespace=None,
-    sink=None,
-    context=None,
-    base_cost_policy=BASE_COST_POLICY,
-    stress_cost_policy=STRESS_COST_POLICY,
-    precommitted_evidence_roles=None,
-    no_shock_pairs=frozenset(),
-):
-    if sink is None:
-        context, sink = _context(tmp_path, symbol=symbol)
-    roles = (
-        ["EVALUATION_REQUIRED" for _ in range(attempts)]
-        if precommitted_evidence_roles is None
-        else list(precommitted_evidence_roles)
-    )
-    first_plan = _fold_plan()[0]
-    seed_result = _raw_fold(attempt_ordinal=0, fold_ordinal=0, planned=first_plan)[
-        "lanes"
-    ]["optimizer_train_base"]
-    seed_result["numerical_execution_cost_attestation"] = _genuine_partition_cost(
-        label="source-seed-precommit",
-        bars=17,
-        stress=False,
-    )
-    frozen = freeze_winner_search_plan_v3(
-        sink,
-        symbol=symbol,
-        timeframe="H1",
-        regime="TREND",
-        precommitted_at_utc="2020-01-01T00:00:00Z",
-        attempts_frozen_at_utc="2020-01-02T00:00:00Z",
-        fold_plan=_fold_plan(),
-        attempt_artifacts=[
-            _attempt_artifact(index, symbol=symbol) for index in range(attempts)
-        ],
-        precommitted_evidence_roles=roles,
-        horizon_execution_contracts=[
-            {
-                "lookback_kind": "NATIVE_OBSERVATIONS",
-                "lookback_value": 5_000,
-                "source_bar_count": 5_000,
-            }
-            for _ in range(attempts)
-        ],
-        source_contract_seed=build_trade_source_contract_from_backtester_result(
-            seed_result
-        ),
-        base_cost_contract=base_cost_policy,
-        stress_cost_contract=stress_cost_policy,
-        risk_unit_contract=RISK_CONTRACT,
-        cost_stress_adversity_plan=_cost_stress_adversity_plan(
-            attempts=attempts,
-            roles=roles,
-            no_shock_pairs=no_shock_pairs,
-            symbol=symbol,
-        ),
-        artifact_namespace=artifact_namespace,
-    )
-    return context, sink, frozen
+def _rebind_replay(fold, frozen):
+    replay = fold["provenance"]["attempt_replay_receipt"]
+    replay["lane_sha256"] = {name: _sha(body) for name, body in fold["lanes"].items()}
+    execution = raw._independent_tier_execution_receipt(fold["lanes"], frozen.precommitment["frozen_tier_pair_contract_sha256"])
+    replay["independent_tier_execution_receipt"] = execution
+    replay["independent_tier_execution_receipt_sha256"] = execution["receipt_sha256"]
+    fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
 
 
-def test_frozen_cost_policy_v2_is_exact_and_rejects_full_attestation(
-    tmp_path: Path,
-) -> None:
-    assert BASE_COST_POLICY["schema_version"] == FROZEN_COST_POLICY_SCHEMA
-    assert set(BASE_COST_POLICY) == {
-        "schema_version",
-        "lane",
-        "attestation_schema_version",
-        "use_spread",
-        "spread_mode",
-        "instrument_spec_sha256",
-        "numerical_execution_cost_policy_sha256",
-        "policy_identity_sha256",
-    }
-    with pytest.raises(WinnerRawEvidenceError, match="BASE_COST_POLICY_INVALID"):
-        _freeze(tmp_path, base_cost_policy=BASE_COST)
+def _source_observation_transport_case(tmp_path, *, generation_id="source-observation-transport"):
+    """Invented transport carrier; no fitted source, search or trading authority."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    context = spool.freeze_generation_context((tmp_path / "spool").resolve(),
+        generation_id=generation_id, native_universe_sha256="a" * 64, config_sha256="b" * 64,
+        limits=spool.SpoolLimits(max_artifact_bytes=65536, max_symbol_bytes=1024 * 1024,
+            max_artifacts_per_symbol=100, max_manifest_bytes=65536, max_json_bytes=65536,
+            stream_chunk_bytes=4096,
+            max_generation_bytes=2 * 1024 * 1024, min_free_bytes=0))
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    frozen = raw.FrozenWinnerSearchPlan(symbol="EURUSD", timeframe="H1", regime="TREND",
+        artifact_namespace="synthetic-observation-transport", generation_context_sha256=context.context_sha256,
+        precommitment_bytes=b"{}", attempt_ledger_bytes=b"{}", source_contract_seed_bytes=b"{}",
+        cost_ladder_contract_bytes=b"{}", risk_unit_contract_bytes=b"{}",
+        cost_ladder_adversity_plan_bytes=b"{}", frozen_receipt_bytes=b"{}",
+        frozen_receipt_entry_bytes=b"{}", horizon_execution_contracts_bytes=b"[]")
+    descriptor = spool.write_opaque_artifact(context,
+        [_canonical({"fixture_provenance": "SYNTHETIC_TRANSPORT_ONLY_NO_NATIVE_AUTHORITY"})],
+        format=raw.ASCII_JSON_FORMAT)
+    receipt = _reseal({"schema_version": raw.SOURCE_OBSERVATIONS_SCHEMA,
+        "symbol": "EURUSD", "timeframe": "H1", "source_timeframe": "M5",
+        "source_product": {"data_dir": str(tmp_path / "synthetic-source"),
+            "index_descriptor": descriptor, "index_sha256": descriptor["sha256"],
+            "symbol": "EURUSD", "timeframe": "M5", "cutoff_utc": "2020-01-02T00:00:00Z",
+            "activation_manifest_sha256": "c" * 64, "production_contract_required": False},
+        "observations": [{"target_open_utc": "2020-01-01T00:00:00Z",
+            "expected_prior_fine_close_utc": "2020-01-01T00:00:00Z",
+            "prior_fine_close_utc": "2020-01-01T00:00:00Z", "points": 9.0}],
+        "entry_observations_sha256": "d" * 64})
+    return {"context": context, "sink": sink, "frozen": frozen, "receipt": receipt}
 
 
-@pytest.mark.parametrize("symbol", ("Platinum", "Palladium"))
-def test_frozen_plan_preserves_exact_mt5_symbol(
-    tmp_path: Path,
-    symbol: str,
-) -> None:
-    _context_value, _sink, frozen = _freeze(tmp_path, symbol=symbol)
-
-    assert frozen.symbol == symbol
-    assert frozen.precommitment["symbol"] == symbol
-    assert frozen.attempt_ledger["symbol"] == symbol
-    assert json.loads(frozen.frozen_receipt_bytes)["symbol"] == symbol
+def _publish_observation_transport(case, receipt=None):
+    return raw.publish_source_observation_receipt(case["sink"], frozen=case["frozen"],
+        receipt=case["receipt"] if receipt is None else receipt)
 
 
-@pytest.mark.parametrize("wrong_case", ("PLATINUM", "platinum"))
-def test_frozen_plan_rejects_wrong_case_mt5_symbol(
-    tmp_path: Path,
-    wrong_case: str,
-) -> None:
-    context, sink = _context(tmp_path, symbol="Platinum")
-
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="AUTHORITY_SINK_SYMBOL_MISMATCH",
-    ):
-        _freeze(
-            tmp_path,
-            symbol=wrong_case,
-            context=context,
-            sink=sink,
-        )
+def _resolve_observation_transport(case, reference, *, expected_sha256=None):
+    return raw.resolve_source_observation_reference(case["sink"], frozen=case["frozen"],
+        reference=reference, expected_receipt_sha256=(case["receipt"]["receipt_sha256"]
+            if expected_sha256 is None else expected_sha256))
 
 
-def _attempt_evidence(frozen, ordinal=0):
-    attempt = frozen.attempt_ledger["attempts"][ordinal]
-    return {
-        "attempt_id": attempt["attempt_id"],
-        "folds": [
-            _raw_fold(
-                attempt_ordinal=ordinal,
-                fold_ordinal=fold["fold_ordinal"],
-                planned=fold,
-                frozen=frozen,
-            )
-            for fold in frozen.precommitment["causal_fold_plan"]
-        ],
-    }
+def test_source_observation_reference_real_writer_resolver_preserves_exact_body(tmp_path):
+    case = _source_observation_transport_case(tmp_path)
+    original = _canonical(case["receipt"])
+    reference = _publish_observation_transport(case)
+    assert set(reference) == {"schema_version", "source_observation_receipt_sha256", "artifact_entry"}
+    assert reference["schema_version"] == "fxpm.original-fine-spread-observation-reference.v1"
+    entry = reference["artifact_entry"]
+    assert entry["artifact_type"] == "winner_source_observation_receipt"
+    descriptor = entry["descriptor"]
+    physical_sha = hashlib.sha256(original).hexdigest()
+    assert descriptor["sha256"] == physical_sha
+    assert descriptor["sha256"] != reference["source_observation_receipt_sha256"]
+    assert descriptor["size_bytes"] == len(original)
+    assert descriptor["format"] == raw.ASCII_JSON_FORMAT
+    assert entry["artifact_id"].endswith("/source-observations/" + physical_sha)
+    assert "/frozen/" not in entry["artifact_id"]
+    assert (case["context"].root / descriptor["relative_path"]).read_bytes() == original
+    assert _canonical(_resolve_observation_transport(case, reference)) == original
+    assert _publish_observation_transport(case) == reference
+    assert [item for item in case["sink"].artifact_roster()
+        if item["artifact_type"] == "winner_source_observation_receipt"] == [entry]
+    assert _canonical(case["receipt"]) == original
 
 
-def _cross_binding_bytes(frozen):
-    precommitment = frozen.precommitment
-    ledger = frozen.attempt_ledger
-    mapping = []
-    for attempt in ledger["attempts"]:
-        ordinal = attempt["ordinal"]
-        artifacts = frozen.attempt_artifacts_bundle[ordinal]
-        horizon = artifacts["horizon_process"]
-        horizon_contract = frozen.horizon_execution_contracts[ordinal]
-        candidate_id = f"candidate-{ordinal}"
-        candidate_sha256 = _sha(f"candidate:{ordinal}")
-        source_count_body = {
-            "schema_version": "fxpm.historical-attempt-source-count.v1",
-            "anchor_id": "anchor-test-001",
-            "symbol": frozen.symbol,
-            "timeframe": frozen.timeframe,
-            "regime": frozen.regime,
-            "horizon_plan_receipt_sha256": _sha("horizon-plan"),
-            "native_prefix_index_sha256": _sha("native-prefix-index"),
-            "native_prefix_content_sha256": horizon["source_snapshot_sha256"],
-            "horizon_attempt_id": _sha(f"horizon-attempt:{ordinal}"),
-            "horizon_candidate_id": candidate_id,
-            "horizon_candidate_definition_sha256": candidate_sha256,
-            **horizon_contract,
-            "fit_start_utc": datetime.fromisoformat(
-                horizon["fit_start_utc"].replace("Z", "+00:00")
-            )
-            .astimezone(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z"),
-            "fit_end_exclusive_utc": datetime.fromisoformat(
-                horizon["fit_end_utc"].replace("Z", "+00:00")
-            )
-            .astimezone(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z"),
-            "latest_closed_bar_utc": datetime.fromisoformat(
-                horizon["latest_closed_bar_utc"].replace("Z", "+00:00")
-            )
-            .astimezone(timezone.utc)
-            .isoformat(timespec="seconds")
-            .replace("+00:00", "Z"),
-            "fit_frame_sha256": _sha(f"fit-frame:{ordinal}"),
-        }
-        source_count_receipt = {
-            **source_count_body,
-            "receipt_sha256": _sha(source_count_body),
-        }
-        folds = []
-        planned_fold_roster = (
-            precommitment["causal_fold_plan"]
-            if attempt["precommitted_evidence_role"] == "EVALUATION_REQUIRED"
-            else []
-        )
-        for planned in planned_fold_roster:
-            end = date.fromisoformat(planned["oos_end_date_utc"]) + timedelta(days=1)
-            folds.append(
-                {
-                    "horizon_fold_id": planned["fold_id"],
-                    "horizon_fold_definition_sha256": _sha(
-                        f"fold:{ordinal}:{planned['fold_ordinal']}"
-                    ),
-                    "horizon_context_sha256": _sha(
-                        f"horizon-context:{ordinal}:{planned['fold_ordinal']}"
-                    ),
-                    "winner_fold_id": planned["fold_id"],
-                    "validation_start_utc": planned["anchor_as_of_utc"],
-                    "validation_end_exclusive_utc": end.isoformat() + "T00:00:00Z",
-                }
-            )
-        mapping.append(
-            {
-                "ordinal": ordinal,
-                "horizon_attempt_id": _sha(f"horizon-attempt:{ordinal}"),
-                "horizon_candidate_id": candidate_id,
-                "horizon_candidate_definition_sha256": candidate_sha256,
-                "horizon_trial_id": f"trial-{ordinal}",
-                "horizon_trial_definition_sha256": _sha(f"horizon-trial:{ordinal}"),
-                "winner_attempt_id": attempt["attempt_id"],
-                "winner_process_candidate_id": attempt["process_candidate_id"],
-                "process_sha256": attempt["process_sha256"],
-                "horizon_process_sha256": attempt["horizon_process_sha256"],
-                "trial_definition_sha256": attempt["trial_definition_sha256"],
-                "refit_recipe_sha256": attempt["refit_recipe_sha256"],
-                "horizon_execution_contract": horizon_contract,
-                "source_count_receipt": source_count_receipt,
-                "fold_mapping": folds,
-                "fold_mapping_sha256": _sha(folds),
-            }
-        )
-    horizon_roster = {
-        "plan_receipt_sha256": _sha("horizon-plan"),
-        "source_prefix_receipt_sha256": _sha("source-prefix"),
-        "candidate_registry_sha256": _sha("candidate-registry"),
-        "trial_registry_sha256": precommitment["trial_registry_sha256"],
-        "attempt_roster_sha256": _sha("horizon-attempt-roster"),
-        "evidence_roster_sha256": _sha("evidence-roster"),
-    }
-    winner_roster = {
-        "precommitment_sha256": _sha(precommitment),
-        "attempt_ledger_sha256": _sha(ledger),
-        "frozen_receipt_sha256": hashlib.sha256(
-            frozen.frozen_receipt_bytes
-        ).hexdigest(),
-        "process_registry_sha256": precommitment["process_registry_sha256"],
-        "horizon_registry_sha256": precommitment["horizon_registry_sha256"],
-        "trial_registry_sha256": precommitment["trial_registry_sha256"],
-        "attempts_sha256": ledger["attempts_sha256"],
-        "causal_fold_plan_sha256": precommitment["causal_fold_plan_sha256"],
-        "source_contract_sha256": precommitment["source_contract_sha256"],
-        "cost_contract_sha256": precommitment["cost_contract_sha256"],
-        "cost_stress_contract_sha256": precommitment["cost_stress_contract_sha256"],
-    }
-    binding = {
-        "schema_version": "fxpm.historical-horizon-winner-cross-binding.v1",
-        "producer_request_sha256": _sha("producer-request"),
-        "anchor_id": "anchor-test-001",
-        "selection_cutoff_utc": "2020-01-01T00:00:00Z",
-        "process_precommit_receipt_sha256": _sha("process-precommit"),
-        "source_group_decision_sha256": _sha("source-group-decision"),
-        "regime_fit_decision_sha256": _sha("regime-fit-decision"),
-        "native_prefix_index_sha256": _sha("native-prefix-index"),
-        "symbol": frozen.symbol,
-        "timeframe": frozen.timeframe,
-        "regime": frozen.regime,
-        "artifact_namespace": frozen.artifact_namespace,
-        "horizon_roster": horizon_roster,
-        "winner_roster": winner_roster,
-        "mapping_count": len(mapping),
-        "mapping_sha256": _sha(mapping),
-        "mapping": mapping,
-        "bijective_coverage": True,
-        "created_before_winner_evidence_access": True,
-        "confers_causal_current_live_or_capital_authority": False,
-    }
-    return _canonical(binding)
+@pytest.mark.parametrize("mutation,expected", [
+    ("omitted", "SOURCE_OBSERVATION_REFERENCE_SCHEMA_INVALID"),
+    ("extra_key", "SOURCE_OBSERVATION_REFERENCE_SCHEMA_INVALID"),
+    ("wrong_version", "SOURCE_OBSERVATION_REFERENCE_SCHEMA_INVALID"),
+    ("extra_entry_key", "SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID"),
+    ("extra_descriptor_key", "SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID"),
+    ("namespace", "SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID"),
+    ("type", "SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID"),
+    ("path", "SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID"),
+    ("oversized_descriptor", "SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID"),
+    ("logical_sha", "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"),
+    ("precommit_sha", "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"),
+])
+def test_source_observation_reference_rejects_exact_transport_mutations(tmp_path, mutation, expected):
+    case = _source_observation_transport_case(tmp_path)
+    reference = copy.deepcopy(_publish_observation_transport(case))
+    expected_sha = case["receipt"]["receipt_sha256"]
+    if mutation == "omitted": reference = None
+    elif mutation == "extra_key": reference["unexpected"] = False
+    elif mutation == "wrong_version": reference["schema_version"] = raw.SOURCE_OBSERVATIONS_SCHEMA
+    elif mutation == "extra_entry_key": reference["artifact_entry"]["unexpected"] = False
+    elif mutation == "extra_descriptor_key": reference["artifact_entry"]["descriptor"]["unexpected"] = False
+    elif mutation == "namespace": reference["artifact_entry"]["artifact_id"] = "other-cell/source-observations/" + reference["artifact_entry"]["descriptor"]["sha256"]
+    elif mutation == "type": reference["artifact_entry"]["artifact_type"] = "winner_attempt_replay_receipt"
+    elif mutation == "path": reference["artifact_entry"]["descriptor"]["relative_path"] = "../outside.fxpm-ascii-json-v1"
+    elif mutation == "oversized_descriptor": reference["artifact_entry"]["descriptor"]["size_bytes"] = case["context"].limits.max_artifact_bytes + 1
+    elif mutation == "logical_sha": reference["source_observation_receipt_sha256"] = "0" * 64
+    else: expected_sha = "0" * 64
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _resolve_observation_transport(case, reference, expected_sha256=expected_sha)
+    assert error.value.code == expected
 
 
-class _CurrentHorizonPlan:
-    def __init__(self, body):
-        self._body = json.loads(_canonical(body).decode("ascii"))
-
-    def to_dict(self):
-        return json.loads(_canonical(self._body).decode("ascii"))
-
-
-def _current_cross_binding_fixture(frozen):
-    """Make a one-attempt CURRENT plan congruent with the baseline raw fixture."""
-
-    binding = json.loads(_cross_binding_bytes(frozen).decode("ascii"))
-    row = binding["mapping"][0]
-    artifacts = frozen.attempt_artifacts_bundle[0]
-    horizon = artifacts["horizon_process"]
-    process_artifact = artifacts["winner_process"]
-    trial_definition = artifacts["trial_definition"]
-    candidate = {
-        "candidate_id": row["horizon_candidate_id"],
-        "candidate_definition_sha256": row["horizon_candidate_definition_sha256"],
-        "lookback_kind": horizon["lookback_kind"],
-        "lookback_value": horizon["lookback_value"],
-        # Historical discovery geometry is intentionally distinct from the
-        # latest-cutoff current-refit interval carried by the artifact.
-        "realized_start_utc": (
-            datetime.fromisoformat(horizon["fit_start_utc"].replace("Z", "+00:00"))
-            - timedelta(days=90)
-        )
-        .astimezone(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z"),
-        "folds": [
-            {
-                "fold_id": fold["horizon_fold_id"],
-                "fold_definition_sha256": fold["horizon_fold_definition_sha256"],
-            }
-            for fold in row["fold_mapping"]
-        ],
-    }
-    trial = {
-        "trial_id": row["horizon_trial_id"],
-        "trial_definition_sha256": row["horizon_trial_definition_sha256"],
-        "strategy_id": process_artifact["strategy_id"],
-        "strategy_release_sha256": process_artifact["strategy_code_sha256"],
-        "parameter_set_sha256": _sha(trial_definition["parameters"]),
-    }
-    plan_attempt = {
-        "attempt_id": row["horizon_attempt_id"],
-        "candidate_id": candidate["candidate_id"],
-        "trial_id": trial["trial_id"],
-        "strategy_id": process_artifact["strategy_id"],
-        "status": "PLANNED",
-    }
-    expected_evaluations = [
-        {
-            "attempt_id": plan_attempt["attempt_id"],
-            "fold_id": fold["horizon_fold_id"],
-            "context_sha256": fold["horizon_context_sha256"],
-            "validation_start_utc": fold["validation_start_utc"],
-            "validation_end_exclusive_utc": fold["validation_end_exclusive_utc"],
-            "expected_status": "EVALUATION_REQUIRED",
-            "downstream_causal_eligible": True,
-        }
-        for fold in row["fold_mapping"]
-    ]
-    candidates = [candidate]
-    trials = [trial]
-    plan_attempts = [plan_attempt]
-    horizon_roster = {
-        "plan_receipt_sha256": binding["horizon_roster"]["plan_receipt_sha256"],
-        "source_prefix_receipt_sha256": binding["horizon_roster"][
-            "source_prefix_receipt_sha256"
-        ],
-        "candidate_registry_sha256": _sha(candidates),
-        "trial_registry_sha256": _sha(trials),
-        "attempt_roster_sha256": _sha(plan_attempts),
-        "evidence_roster_sha256": _sha(expected_evaluations),
-    }
-    binding["horizon_roster"] = horizon_roster
-    plan_body = {
-        "anchor": {
-            "anchor_id": "anchor-test-001",
-            "selection_cutoff_utc": "2020-01-01T00:00:00Z",
-            "process_precommit_receipt_sha256": _sha("process-precommit"),
-        },
-        "cell": {
-            "symbol": frozen.symbol,
-            "timeframe": frozen.timeframe,
-            "regime": frozen.regime,
-        },
-        "native_prefix": {
-            "source_state": "AVAILABLE",
-            "prefix_index_sha256": binding["native_prefix_index_sha256"],
-            "prefix_content_sha256": horizon["source_snapshot_sha256"],
-            "prefix_end_exclusive_utc": horizon["fit_end_utc"],
-            "prefix_last_close_utc": horizon["latest_closed_bar_utc"],
-        },
-        "horizon_policy": {
-            "cost_contract_sha256": frozen.precommitment["cost_contract_sha256"],
-            "cost_stress_contract_sha256": frozen.precommitment[
-                "cost_stress_contract_sha256"
-            ],
-        },
-        "source_prefix_receipt_sha256": horizon_roster["source_prefix_receipt_sha256"],
-        "candidate_registry_sha256": horizon_roster["candidate_registry_sha256"],
-        "trial_registry_sha256": horizon_roster["trial_registry_sha256"],
-        "attempt_roster_sha256": horizon_roster["attempt_roster_sha256"],
-        "evidence_roster_sha256": horizon_roster["evidence_roster_sha256"],
-        "candidates": candidates,
-        "trials": trials,
-        "attempts": plan_attempts,
-        "expected_evaluations": expected_evaluations,
-        "plan_status": "READY_FOR_HISTORICAL_EVIDENCE",
-    }
-    process = planner.FrozenProductionSearchProcess(
-        _canonical({"run_id": frozen.precommitment["run_id"]}),
-        _canonical({"test_spool_receipt": True}),
-        planner._PROCESS_SEAL,
-    )
-    horizon_plan_binding = {
-        "anchor_id": plan_body["anchor"]["anchor_id"],
-        "selection_cutoff_utc": plan_body["anchor"]["selection_cutoff_utc"],
-        "process_precommit_receipt_sha256": plan_body["anchor"][
-            "process_precommit_receipt_sha256"
-        ],
-        "plan_status": plan_body["plan_status"],
-        **horizon_roster,
-    }
-    receipt_body = {
-        "artifact_namespace": frozen.artifact_namespace,
-        "cell": plan_body["cell"],
-        "causal_process_precommit_receipt_sha256": plan_body["anchor"][
-            "process_precommit_receipt_sha256"
-        ],
-        "search_process_receipt_sha256": process.receipt_sha256,
-        "native_prefix": {
-            "index_sha256": binding["native_prefix_index_sha256"],
-            "content_sha256": horizon["source_snapshot_sha256"],
-        },
-        "source_group_decision_sha256": binding["source_group_decision_sha256"],
-        "regime_fit_decision_sha256": binding["regime_fit_decision_sha256"],
-        "horizon_plan_binding": horizon_plan_binding,
-        "attempts_frozen_before_search": True,
-        "state_replay_required_before_scored_partition": True,
-        "confers_winner_causal_current_capital_publication_or_live_authority": False,
-    }
-    receipt = {**receipt_body, "receipt_sha256": _sha(receipt_body)}
-    plan = planner.ProductionCellSearchPlan(
-        mode="CURRENT_REFIT",
-        symbol=frozen.symbol,
-        timeframe=frozen.timeframe,
-        regime=frozen.regime,
-        causal_precommit_receipt_sha256=plan_body["anchor"][
-            "process_precommit_receipt_sha256"
-        ],
-        search_process_receipt_sha256=process.receipt_sha256,
-        horizon_plan=_CurrentHorizonPlan(plan_body),
-        _attempt_artifacts_json=tuple(
-            _canonical(value) for value in frozen.attempt_artifacts_bundle
-        ),
-        _state_requirements_json=(),
-        _cell_receipt_json=_canonical(receipt),
-        _spool_entry_json=_canonical({"test_spool_entry": True}),
-        boundary_limited=False,
-        _seal=planner._CELL_PLAN_SEAL,
-    )
-    for name in (
-        "producer_request_sha256",
-        "anchor_id",
-        "selection_cutoff_utc",
-        "process_precommit_receipt_sha256",
-    ):
-        binding.pop(name)
-    binding.update(
-        {
-            "schema_version": "fxpm.horizon-winner-cross-binding.v2",
-            "mode": "CURRENT",
-            "cell_plan_receipt_sha256": plan.receipt_sha256,
-            "causal_precommit_receipt_sha256": (plan.causal_precommit_receipt_sha256),
-            "search_process_receipt_sha256": process.receipt_sha256,
-        }
-    )
-    return _canonical(binding), plan, process
+@pytest.mark.parametrize("mutation", ["missing", "changed_bytes", "physical_oversize"])
+def test_source_observation_reference_rejects_missing_or_changed_physical_body(tmp_path, mutation):
+    case = _source_observation_transport_case(tmp_path)
+    reference = _publish_observation_transport(case)
+    path = case["context"].root / reference["artifact_entry"]["descriptor"]["relative_path"]
+    if mutation == "missing":
+        path.unlink()
+    elif mutation == "changed_bytes":
+        original = path.read_bytes()
+        assert b'"points":9.0' in original
+        path.write_bytes(original.replace(b'"points":9.0', b'"points":8.0', 1))
+    else:
+        original = path.read_bytes()
+        path.write_bytes(original + b" " * (case["context"].limits.max_artifact_bytes - len(original) + 1))
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _resolve_observation_transport(case, reference)
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_REOPEN_FAILED"
 
 
-def _current_attempt_evidence(frozen, binding_bytes):
-    binding = json.loads(binding_bytes.decode("ascii"))
-    evidence = _copied_attempt_evidence(frozen)
-    for fold in evidence["folds"]:
-        selection = fold["provenance"]["anchor_selection_receipt"]
-        selection["horizon_plan_receipt_sha256"] = binding["horizon_roster"][
-            "plan_receipt_sha256"
-        ]
-        fold["provenance"]["anchor_selection_receipt"] = _reseal(selection)
-        trial = fold["provenance"]["anchor_trial_ledger"]
-        trial["trial_registry_sha256"] = binding["horizon_roster"][
-            "trial_registry_sha256"
-        ]
-        trial["attempt_roster_sha256"] = binding["horizon_roster"][
-            "attempt_roster_sha256"
-        ]
-        fold["provenance"]["anchor_trial_ledger"] = _reseal(trial)
-    return evidence
+def test_source_observation_reference_refuses_other_generation_context(tmp_path):
+    first = _source_observation_transport_case(tmp_path / "first", generation_id="source-reference-first")
+    second = _source_observation_transport_case(tmp_path / "second", generation_id="source-reference-second")
+    reference = _publish_observation_transport(first)
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        raw.resolve_source_observation_reference(second["sink"], frozen=first["frozen"],
+            reference=reference, expected_receipt_sha256=first["receipt"]["receipt_sha256"])
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_CONTEXT_INVALID"
 
 
-def _produce(sink, frozen, evidence, *, artifact_namespace=None):
-    return produce_winner_v11_raw_evidence(
-        sink,
-        frozen=frozen,
-        attempt_evidence=evidence,
-        evidence_access_started_at_utc="2025-01-01T00:00:00Z",
-        evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
-        provenance_cross_binding_bytes=_cross_binding_bytes(frozen),
-        artifact_namespace=artifact_namespace,
-    )
+def test_source_observation_reference_refuses_resealed_partition_body_splice(tmp_path):
+    case = _source_observation_transport_case(tmp_path)
+    alternate = copy.deepcopy(case["receipt"])
+    alternate["observations"][0]["target_open_utc"] = "2020-01-01T01:00:00Z"
+    alternate["observations"][0]["expected_prior_fine_close_utc"] = "2020-01-01T01:00:00Z"
+    alternate["observations"][0]["prior_fine_close_utc"] = "2020-01-01T01:00:00Z"
+    alternate = _reseal(alternate)
+    reference = _publish_observation_transport(case, alternate)
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _resolve_observation_transport(case, reference)
+    assert error.value.code == "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"
 
 
-def _produce_current(
-    sink,
-    frozen,
-    evidence,
-    *,
-    binding_bytes,
-    plan,
-    process,
-):
-    return produce_winner_v11_raw_evidence(
-        sink,
-        frozen=frozen,
-        attempt_evidence=evidence,
-        evidence_access_started_at_utc="2025-01-01T00:00:00Z",
-        evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
-        provenance_cross_binding_bytes=binding_bytes,
-        production_cell_search_plan=plan,
-        production_search_process=process,
-        artifact_namespace=frozen.artifact_namespace,
-    )
+def test_source_observation_reference_resolver_is_read_only_before_complete_closure(tmp_path):
+    case = _source_observation_transport_case(tmp_path)
+    reference = _publish_observation_transport(case)
+    unregistered = spool.SymbolAuthoritySink(case["context"], "EURUSD")
+    assert raw.resolve_source_observation_reference(unregistered, frozen=case["frozen"],
+        reference=reference, expected_receipt_sha256=case["receipt"]["receipt_sha256"]) == case["receipt"]
+    assert unregistered.artifact_roster() == []
 
 
-def _reseal(receipt):
-    body = dict(receipt)
-    body.pop("receipt_sha256", None)
-    return {**body, "receipt_sha256": _sha(body)}
+@pytest.mark.parametrize("mutation,expected", [
+    ("extra_body_key", "SOURCE_OBSERVATION_RECEIPT_SCHEMA_INVALID"),
+    ("extra_carrier_key", "SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID"),
+    ("extra_row_key", "SOURCE_OBSERVATION_ROW_INVALID"),
+    ("row_not_object", "SOURCE_OBSERVATION_ROW_INVALID"),
+    ("rows_not_list", "SOURCE_OBSERVATION_ROSTER_INVALID"),
+    ("empty_rows", "SOURCE_OBSERVATION_ROSTER_INVALID"),
+    ("negative_points", "SOURCE_OBSERVATION_VALUE_INVALID"),
+    ("noninteger_points", "SOURCE_OBSERVATION_VALUE_INVALID"),
+    ("noncanonical_utc", "SOURCE_OBSERVATION_AXIS_INVALID"),
+    ("stale_self_hash", "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"),
+])
+def test_source_observation_reference_publisher_rejects_malformed_body(tmp_path, mutation, expected):
+    case = _source_observation_transport_case(tmp_path)
+    body = copy.deepcopy(case["receipt"])
+    if mutation == "extra_body_key": body["unexpected"] = False
+    elif mutation == "extra_carrier_key": body["source_product"]["unexpected"] = False
+    elif mutation == "extra_row_key": body["observations"][0]["unexpected"] = False
+    elif mutation == "row_not_object": body["observations"][0] = 1
+    elif mutation == "rows_not_list": body["observations"] = {}
+    elif mutation == "empty_rows": body["observations"] = []
+    elif mutation == "negative_points": body["observations"][0]["points"] = -1.0
+    elif mutation == "noninteger_points": body["observations"][0]["points"] = 0.5
+    elif mutation == "noncanonical_utc": body["observations"][0]["target_open_utc"] = "2020-01-01T00:00:00+00:00"
+    else: body["observations"][0]["points"] = 8.0
+    if mutation != "stale_self_hash": body = _reseal(body)
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _publish_observation_transport(case, body)
+    assert error.value.code == expected
+    assert case["sink"].artifact_roster() == []
 
 
-def _copied_attempt_evidence(frozen, ordinal=0):
-    return json.loads(_canonical(_attempt_evidence(frozen, ordinal)).decode("ascii"))
+@pytest.mark.parametrize("encoding", ["duplicate_key", "whitespace", "not_object", "malformed"])
+def test_source_observation_reference_rejects_noncanonical_stored_body(tmp_path, encoding):
+    case = _source_observation_transport_case(tmp_path)
+    encoded = _canonical(case["receipt"])
+    if encoding == "duplicate_key": encoded = encoded.replace(b'"symbol":"EURUSD"', b'"symbol":"EURUSD","symbol":"EURUSD"', 1)
+    elif encoding == "whitespace": encoded += b" "
+    elif encoding == "not_object": encoded = b"[]"
+    else: encoded = b"{"
+    digest = hashlib.sha256(encoded).hexdigest()
+    prefix = raw._artifact_prefix(case["frozen"].artifact_namespace, "H1", "TREND")
+    entry = case["sink"].put_opaque(prefix + "/source-observations/" + digest,
+        "winner_source_observation_receipt", (encoded,), format=raw.ASCII_JSON_FORMAT)
+    reference = {"schema_version": "fxpm.original-fine-spread-observation-reference.v1",
+        "source_observation_receipt_sha256": case["receipt"]["receipt_sha256"], "artifact_entry": entry}
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _resolve_observation_transport(case, reference)
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_REOPEN_FAILED"
 
 
-def test_real_raw_chain_round_trips_v11_and_spool(tmp_path: Path) -> None:
-    context, sink, frozen = _freeze(tmp_path)
-    produced = _produce(sink, frozen, [_attempt_evidence(frozen)])
+@pytest.mark.parametrize("mutation,expected", [
+    ("mixed_version", "ANCHOR_REFIT_RECEIPT_PROVENANCE_ROLE_INVALID"),
+    ("inline_field", "ATTEMPT_REPLAY_RECEIPT_PROVENANCE_SCHEMA_INVALID"),
+    ("extra_key", "ATTEMPT_REPLAY_RECEIPT_PROVENANCE_SCHEMA_INVALID"),
+])
+def test_source_observation_reference_provenance_rejects_version_or_schema_mix(tmp_path, mutation, expected):
+    from tests.test_authoritative_search_execution import _fold_provenance_transport_fixture
+    case = _source_observation_transport_case(tmp_path)
+    reference = _publish_observation_transport(case)
+    provenance, _, _ = _fold_provenance_transport_fixture(
+        source_observation_references={partition: reference for partition in raw._PARTITIONS})
+    if mutation == "mixed_version":
+        provenance["anchor_refit_receipt"]["schema_version"] = raw.CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+        provenance["anchor_refit_receipt"] = _reseal(provenance["anchor_refit_receipt"])
+    else:
+        replay = provenance["attempt_replay_receipt"]
+        if mutation == "inline_field":
+            replay["source_observation_receipts"] = replay.pop("source_observation_references")
+        else:
+            replay["unexpected"] = False
+        provenance["attempt_replay_receipt"] = _reseal(replay)
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        raw._validated_provenance(frozen=replace(case["frozen"], frozen_tier_pair_contract_bytes=b"{}"),
+            attempt={}, attempt_artifacts={}, cross_binding={}, cross_binding_context={},
+            cross_binding_attempt={}, planned_fold={}, lanes={}, raw=provenance, sink=case["sink"])
+    assert error.value.code == expected
 
-    assert produced.decision.to_dict()["validated"] is True
-    assert produced.evidence_ledger["entries"][0]["evidence_status"] == "AUTHENTICATED"
-    assert produced.evidence_ledger["entries"][0]["fold_count"] == 4
+
+def _source_observation_closure_case(tmp_path, *, referenced=True, replay_mutation=None,
+        provenance_mutation=None):
+    from tests.test_authoritative_search_execution import _fold_provenance_transport_fixture
+    case = _source_observation_transport_case(tmp_path)
+    reference = _publish_observation_transport(case) if referenced else None
+    provenance, _, _ = _fold_provenance_transport_fixture(source_observation_references=(
+        {partition: reference for partition in raw._PARTITIONS} if referenced else None))
+    replay = provenance["attempt_replay_receipt"]
+    if replay_mutation is not None:
+        replay_mutation(replay)
+        replay = _reseal(replay)
+        provenance["attempt_replay_receipt"] = replay
+    if provenance_mutation is not None:
+        provenance_mutation(provenance)
+    frozen = replace(case["frozen"],
+        attempt_ledger_bytes=_canonical({"attempts": [
+            {"ordinal": 0, "precommitted_evidence_role": "EVALUATION_REQUIRED"}]}),
+        precommitment_bytes=_canonical({"causal_fold_plan": [{"fold_ordinal": 0}]}),
+        partition_cost_precommitments_bytes=_canonical({"rows": [
+            {"attempt_ordinal": 0, "fold_ordinal": 0, "partition": partition,
+                "source_observation_receipt_sha256": case["receipt"]["receipt_sha256"]}
+            for partition in raw._PARTITIONS]}))
+    prefix = raw._artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    roster = {}
+    for role, body in provenance.items():
+        entry = raw._put_ascii_json(case["sink"],
+            prefix + "/attempt-0000/fold-000/provenance/" + role, "winner_" + role, body)
+        roster["attempt-0000-fold-000-provenance-" + role] = entry["descriptor"]
+    if referenced:
+        descriptor = reference["artifact_entry"]["descriptor"]
+        roster["source-observation-" + descriptor["sha256"]] = descriptor
+    return {**case, "frozen": frozen, "reference": reference, "replay": replay,
+        "production_receipt": {"artifact_roster": roster}, "entries": case["sink"].artifact_roster()}
+
+
+def _verify_observation_transport_closure(case, *, context=None):
+    return raw.verify_source_observation_reference_closure(case["context"] if context is None else context,
+        frozen=case["frozen"], manifest_entries=case["entries"], production_receipt=case["production_receipt"])
+
+
+def test_source_observation_reference_symbol_seal_and_cold_closure(tmp_path):
+    case = _source_observation_closure_case(tmp_path)
+    receipt = case["sink"].seal()
+    manifest = spool.verify_symbol_receipt(case["context"].root, receipt,
+        expected_generation_id=case["context"].generation_id, expected_symbol="EURUSD",
+        expected_native_universe_sha256=case["context"].native_universe_sha256,
+        expected_config_sha256=case["context"].config_sha256)
+    cold_context = spool.reopen_generation_context(case["context"].root,
+        expected_generation_id=case["context"].generation_id,
+        expected_native_universe_sha256=case["context"].native_universe_sha256,
+        expected_config_sha256=case["context"].config_sha256)
+    cold_case = {**case, "entries": manifest["artifacts"]}
+    assert _verify_observation_transport_closure(cold_case, context=cold_context) is None
+    cold_sink = spool.SymbolAuthoritySink(cold_context, "EURUSD", manifest_domain=case["sink"].manifest_domain)
+    for entry in manifest["artifacts"]:
+        cold_sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+    assert _canonical(raw.resolve_source_observation_reference(cold_sink, frozen=case["frozen"],
+        reference=case["reference"], expected_receipt_sha256=case["receipt"]["receipt_sha256"])) == _canonical(case["receipt"])
+
+
+def test_source_observation_reference_closure_expands_actual_compact_cost_precommitments(tmp_path):
+    case = _source_observation_closure_case(tmp_path)
+    costs = _partition_transport_case(attempt_count=1, fold_count=1)
+    for row in costs["rows"]:
+        row["source_observation_receipt_sha256"] = case["receipt"]["receipt_sha256"]
+    compact = raw.build_partition_cost_precommitments(costs["rows"], pair=costs["pair"])
+    assert compact["schema_version"] == raw.PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA
+    assert all("source_observation_receipt_sha256" not in row for row in compact["rows"])
+    case["frozen"] = replace(case["frozen"], frozen_tier_pair_contract_bytes=_canonical(costs["pair"]),
+        partition_cost_precommitments_bytes=_canonical(compact))
+    assert _verify_observation_transport_closure(case) is None
+
+
+@pytest.mark.parametrize("mutation", ["orphan", "omitted_manifest_source", "omitted_production_source",
+    "extra_production_source", "duplicate_manifest", "omitted_replay"])
+def test_source_observation_reference_closure_rejects_omitted_or_unused_objects(tmp_path, mutation):
+    case = _source_observation_closure_case(tmp_path)
+    source_entry = case["reference"]["artifact_entry"]
+    source_key = "source-observation-" + source_entry["descriptor"]["sha256"]
+    if mutation == "orphan":
+        body = copy.deepcopy(case["receipt"])
+        body["observations"][0]["points"] = 8.0
+        reference = _publish_observation_transport(case, _reseal(body))
+        case["entries"] = case["sink"].artifact_roster()
+        descriptor = reference["artifact_entry"]["descriptor"]
+        case["production_receipt"]["artifact_roster"]["source-observation-" + descriptor["sha256"]] = descriptor
+    elif mutation == "omitted_manifest_source":
+        case["entries"] = [entry for entry in case["entries"] if entry != source_entry]
+    elif mutation == "omitted_production_source":
+        del case["production_receipt"]["artifact_roster"][source_key]
+    elif mutation == "extra_production_source":
+        case["production_receipt"]["artifact_roster"]["source-observation-" + "0" * 64] = source_entry["descriptor"]
+    elif mutation == "duplicate_manifest":
+        case["entries"].append(copy.deepcopy(source_entry))
+    else:
+        case["entries"] = [entry for entry in case["entries"] if entry["artifact_type"] != "winner_attempt_replay_receipt"]
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _verify_observation_transport_closure(case)
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID"
+
+
+@pytest.mark.parametrize("mutation", ["missing_partition", "extra_partition"])
+def test_source_observation_reference_closure_requires_exact_partition_roster(tmp_path, mutation):
+    def change(replay):
+        references = replay["source_observation_references"]
+        if mutation == "missing_partition": references.pop("optimizer_train")
+        else: references["other"] = references["optimizer_train"]
+    case = _source_observation_closure_case(tmp_path, replay_mutation=change)
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _verify_observation_transport_closure(case)
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID"
+
+
+@pytest.mark.parametrize("mutation", ["omitted_sibling", "mixed_sibling"])
+def test_source_observation_reference_cold_closure_requires_coherent_seven_roles(tmp_path, mutation):
+    def change(provenance):
+        if mutation == "omitted_sibling":
+            provenance.pop("anchor_refit_receipt")
+        else:
+            receipt = provenance["anchor_refit_receipt"]
+            receipt["schema_version"] = raw.CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+            provenance["anchor_refit_receipt"] = _reseal(receipt)
+    case = _source_observation_closure_case(tmp_path, provenance_mutation=change)
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _verify_observation_transport_closure(case)
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID"
+
+
+def test_source_observation_reference_closure_keeps_inline_v4_transport_bytes(tmp_path):
+    case = _source_observation_closure_case(tmp_path, referenced=False)
+    original = _canonical(case["replay"])
+    assert case["replay"]["schema_version"] == raw.CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+    assert case["replay"]["schema_version"] == "fxpm.authoritative-search-provenance.v4"
+    assert "source_observation_references" not in case["replay"]
+    assert _verify_observation_transport_closure(case) is None
+    assert _canonical(case["replay"]) == original
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_source_observation_complete_current_closure_refuses_total_provenance_omission(tmp_path, referenced):
+    case = _source_observation_closure_case(tmp_path, referenced=referenced)
+    case["entries"] = []
+    case["production_receipt"]["artifact_roster"] = {}
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _verify_observation_transport_closure(case)
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID"
+
+
+def test_current_raw_v15_uses_six_real_accounts_and_original_spool(current_native_case, tmp_path):
+    case = clone_current_native_case(current_native_case, tmp_path)
+    result = _produce_case(case)
+    assert result.decision.to_dict()["validated"] is True
+    assert result.request.to_dict()["contract_version"] == winner.CURRENT_GENERATION.request_version
+    assert result.evidence_ledger["contract_version"] == winner.CURRENT_GENERATION.evidence_version
+    assert case["frozen"].precommitment["contract_version"] == winner.CURRENT_GENERATION.precommitment_version
+    assert case["frozen"].precommitment["frozen_tier_pair_contract"] == case["fitted"].frozen_tier_pair_contract
+    required = {partition + "_" + tier for partition in ("optimizer_train", "tuning_validation", "final_lockbox") for tier in ("p75", "p95")}
+    for attempt in case["evidence"]:
+        for fold in attempt.get("folds", ()):
+            assert set(fold["lanes"]) == required
+            assert fold["lanes"]["final_lockbox_p75"] is not fold["lanes"]["final_lockbox_p95"]
+    for entry in result.evidence_ledger["entries"]:
+        assert entry["evidence_status"] == "AUTHENTICATED"
+        for fold in entry["folds"]:
+            assert set(fold["tier_evidence"]) == {"P75", "P95"}
+            assert "completed_trade_open_offset_seconds" not in fold and "trade_power_binding" not in fold
+            for tier, data in fold["tier_evidence"].items():
+                assert data["spread_tier"] == tier
+                assert data["daily_surface_sha256"] and data["trade_vector_sha256"]
+    receipt = case["sink"].seal()
+    manifest = spool.verify_symbol_receipt(case["context"].root, receipt,
+        expected_generation_id=case["context"].generation_id, expected_symbol=case["sink"].symbol,
+        expected_native_universe_sha256=case["context"].native_universe_sha256, expected_config_sha256=case["context"].config_sha256)
+    assert any(entry["artifact_type"] == "winner_v15_request" for entry in manifest["artifacts"])
+    assert not any(entry["artifact_type"] == "winner_v14_request" for entry in manifest["artifacts"])
+
+
+def test_transport_raw_v16_real_synthetic_accounts_and_cold_lineage(tmp_path, monkeypatch):
+    """Small genuine engine lineage over invented bars, never a market qualification."""
+    from tests.test_historical_production_adapter import build_current_native_case
+    import pm_historical_production_adapter as adapter
+
+    observed_guard = []
+    original_guard = raw._check_cumulative_completed_trades
+
+    def record_guard(total, generation):
+        original_guard(total, generation)
+        assert generation is winner.V16_GENERATION
+        observed_guard.append(total)
+
+    monkeypatch.setattr(raw, "_check_cumulative_completed_trades", record_guard)
+    case = build_current_native_case(tmp_path / "native-case", retained_native_root=None,
+        selected_owner=False, winner_generation=winner.V16_GENERATION)
+    assert case["qualification_authority"] is False and case["selected_owner_case"] is False
+    assert case["retained_native_root"] is None and case["evidence_deferred"] is False
+    native_root = Path(case["native_product"]._data_dir) / "native"
+    creation_bytes = (native_root / "synthetic_fixture_creation.json").read_bytes()
+    creation = json.loads(creation_bytes)
+    assert creation["fixture_provenance"] == "SYNTHETIC_NATIVE_ENGINEERING_INPUT_NO_MARKET_OR_TRADING_AUTHORITY"
+    assert creation["qualification_authority"] is False
+    assert creation["status"] == "GENERATION_AUDIT_AND_TERMS_COMPLETE"
+    assert Path(creation["native_root"]).resolve() == native_root.resolve()
+    frozen, context, sink = case["frozen"], case["context"], case["sink"]
+    assert frozen.selection_generation is winner.V16_GENERATION
+    assert frozen.precommitment["contract_version"] == winner.V16_GENERATION.precommitment_version
+    assert json.loads(frozen.frozen_receipt_bytes)["schema_version"] == raw.V16_FROZEN_PLAN_SCHEMA
+    assert len(case["evidence"]) == 1 and len(case["evidence"][0]["folds"]) == 4
+    required_lanes = {partition + "_" + tier for partition in raw._PARTITIONS for tier in ("p75", "p95")}
+    for fold in case["evidence"][0]["folds"]:
+        assert set(fold["lanes"]) == required_lanes
+    account_lane_count = sum(len(fold["lanes"]) for attempt in case["evidence"] for fold in attempt["folds"])
+    assert account_lane_count == 24
+    cross_entry = sink.put_opaque(
+        raw._artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime) + "/horizon-winner-cross-binding",
+        "historical_horizon_winner_cross_binding", (case["cross_binding_bytes"],), format=raw.ASCII_JSON_FORMAT)
+    result = raw.produce_winner_v16_raw_evidence(sink, frozen=frozen, attempt_evidence=case["evidence"],
+        evidence_access_started_at_utc=case["evidence_started_at_utc"],
+        evidence_access_completed_at_utc=case["evidence_completed_at_utc"],
+        provenance_cross_binding_bytes=case["cross_binding_bytes"], artifact_namespace=frozen.artifact_namespace)
+    assert result.request.to_dict()["contract_version"] == winner.V16_GENERATION.request_version
+    assert result.evidence_ledger["contract_version"] == winner.V16_GENERATION.evidence_version
+    assert frozen.attempt_ledger["contract_version"] == winner.ATTEMPT_LEDGER_VERSION
+    assert all(axis["shared_oos_partition"]["schema_version"] == winner.V16_GENERATION.shared_partition_version
+        for axis in result.evidence_ledger["shared_fold_axis"])
+    decision_body = result.decision.to_dict()
+    assert decision_body["contract_version"] == winner.V16_GENERATION.selection_version
+    assert decision_body["validated"] is True and result.decision.status == "NO_PROCESS_WINNER"
+    for field in ("live_authorized", "capital_sizing_authorized", "profitability_claimed", "production_integrated"):
+        assert decision_body[field] is False
+    assert result.marginal_receipt is not None
+    assert result.marginal_receipt["contract_version"] == winner.V16_GENERATION.marginal_version
+    expected_guard, total = [], 0
+    for entry in result.evidence_ledger["entries"]:
+        assert entry["evidence_status"] == "AUTHENTICATED" and len(entry["folds"]) == 4
+        for fold in entry["folds"]:
+            assert set(fold["tier_evidence"]) == {"P75", "P95"}
+            for tier in ("P75", "P95"):
+                total += len(fold["tier_evidence"][tier]["completed_trade_open_offset_seconds"])
+                expected_guard.append(total)
+    assert len(observed_guard) == 8 and observed_guard == expected_guard
     receipt = sink.seal()
-    manifest = spool.verify_symbol_receipt(
-        context.root,
-        receipt,
-        expected_generation_id=context.generation_id,
-        expected_symbol="EURUSD",
-        expected_native_universe_sha256=context.native_universe_sha256,
-        expected_config_sha256=context.config_sha256,
-    )
-    assert manifest["artifact_count"] > 40
-    assert any(
-        entry["artifact_type"] == "winner_v11_request"
-        for entry in manifest["artifacts"]
-    )
-
-
-def test_two_evaluated_candidates_share_only_candidate_neutral_oos_axis(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path, attempts=2)
-    produced = _produce(
-        sink,
-        frozen,
-        [_attempt_evidence(frozen, ordinal) for ordinal in range(2)],
-    )
-
-    entries = produced.evidence_ledger["entries"]
-    assert all(entry["pbo_fold_count"] == 4 for entry in entries)
-    for fold_ordinal in range(4):
-        left = entries[0]["pbo_folds"][fold_ordinal]
-        right = entries[1]["pbo_folds"][fold_ordinal]
-        assert (
-            left["shared_oos_partition"]["receipt_sha256"]
-            == right["shared_oos_partition"]["receipt_sha256"]
-        )
-        assert (
-            left["attempt_oos_source_receipt_sha256"]
-            != right["attempt_oos_source_receipt_sha256"]
-        )
-    assert produced.decision.to_dict()["validated"] is True
-
-
-def test_evaluation_required_outcome_only_cannot_remove_pbo_column(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    attempt = frozen.attempt_ledger["attempts"][0]
-    outcome = TrialOutcome(
-        kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
-        stage=SearchStage.PARAMETER_VALIDATION,
-        reason_code="POSTHOC_OUTCOME_ONLY",
-        reason="evaluated attempt cannot discard its daily column",
-        symbol="EURUSD",
-        timeframe="H1",
-        regime="TREND",
-        strategy_family=attempt["strategy_family"],
-    )
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="EVALUATION_REQUIRED_ATTEMPT_OUTCOME_ONLY",
-    ):
-        _produce(
-            sink,
-            frozen,
-            [{"attempt_id": attempt["attempt_id"], "outcome": outcome}],
-        )
-
-
-def test_v2_historical_mode_replays_v1_semantics_exactly(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding = json.loads(_cross_binding_bytes(frozen).decode("ascii"))
-    binding["schema_version"] = "fxpm.horizon-winner-cross-binding.v2"
-    binding["mode"] = "HISTORICAL"
-
-    produced = produce_winner_v11_raw_evidence(
-        sink,
-        frozen=frozen,
-        attempt_evidence=[_attempt_evidence(frozen)],
-        evidence_access_started_at_utc="2025-01-01T00:00:00Z",
-        evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
-        provenance_cross_binding_bytes=_canonical(binding),
-    )
-
-    assert produced.decision.to_dict()["validated"] is True
-
-
-def test_current_mode_reverifies_sealed_plan_before_evidence_access(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding_bytes, plan, process = _current_cross_binding_fixture(frozen)
-    events = []
-
-    def verify(context, *, process, sink, plan):
-        events.append(("PLAN_REVERIFIED", context.context_sha256, sink.symbol))
-        return True
-
-    monkeypatch.setattr(planner, "verify_production_cell_search_plan", verify)
-
-    def evidence_stream():
-        events.append(("EVIDENCE_ACCESSED",))
-        yield _current_attempt_evidence(frozen, binding_bytes)
-
-    produced = _produce_current(
-        sink,
-        frozen,
-        evidence_stream(),
-        binding_bytes=binding_bytes,
-        plan=plan,
-        process=process,
-    )
-
-    plan_body = plan.horizon_plan.to_dict()
-    assert (
-        plan_body["candidates"][0]["realized_start_utc"]
-        != frozen.attempt_artifacts_bundle[0]["horizon_process"]["fit_start_utc"]
-    )
-    assert events[0][0] == "PLAN_REVERIFIED"
-    assert events[1][0] == "EVIDENCE_ACCESSED"
-    assert produced.decision.to_dict()["validated"] is True
-
-
-def test_current_mode_rejects_historical_field_mixing_before_plan_reopen(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding_bytes, plan, process = _current_cross_binding_fixture(frozen)
-    binding = json.loads(binding_bytes.decode("ascii"))
-    binding["anchor_id"] = "posthoc-field-injection"
-    called = []
-    monkeypatch.setattr(
-        planner,
-        "verify_production_cell_search_plan",
-        lambda *_args, **_kwargs: called.append(True) or True,
-    )
-
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="PROVENANCE_CROSS_BINDING_SCHEMA_INVALID",
-    ):
-        _produce_current(
-            sink,
-            frozen,
-            iter(()),
-            binding_bytes=_canonical(binding),
-            plan=plan,
-            process=process,
-        )
-    assert called == []
-
-
-def test_current_mode_rejects_cell_plan_receipt_splice_before_evidence(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding_bytes, plan, process = _current_cross_binding_fixture(frozen)
-    binding = json.loads(binding_bytes.decode("ascii"))
-    binding["cell_plan_receipt_sha256"] = "f" * 64
-    monkeypatch.setattr(
-        planner, "verify_production_cell_search_plan", lambda *_a, **_k: True
-    )
-    touched = []
-
-    def evidence_stream():
-        touched.append(True)
-        yield _current_attempt_evidence(frozen, binding_bytes)
-
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="PROVENANCE_CURRENT_CELL_PLAN_SPLICE",
-    ):
-        _produce_current(
-            sink,
-            frozen,
-            evidence_stream(),
-            binding_bytes=_canonical(binding),
-            plan=plan,
-            process=process,
-        )
-    assert touched == []
-
-
-def test_current_mode_rejects_horizon_mapping_splice_before_evidence(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding_bytes, plan, process = _current_cross_binding_fixture(frozen)
-    binding = json.loads(binding_bytes.decode("ascii"))
-    row = binding["mapping"][0]
-    row["horizon_candidate_id"] = "posthoc-candidate"
-    count = row["source_count_receipt"]
-    count["horizon_candidate_id"] = "posthoc-candidate"
-    row["source_count_receipt"] = _reseal(count)
-    binding["mapping_sha256"] = _sha(binding["mapping"])
-    monkeypatch.setattr(
-        planner, "verify_production_cell_search_plan", lambda *_a, **_k: True
-    )
-    touched = []
-
-    def evidence_stream():
-        touched.append(True)
-        yield _current_attempt_evidence(frozen, binding_bytes)
-
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="PROVENANCE_CURRENT_PLAN_BIJECTION_SPLICE",
-    ):
-        _produce_current(
-            sink,
-            frozen,
-            evidence_stream(),
-            binding_bytes=_canonical(binding),
-            plan=plan,
-            process=process,
-        )
-    assert touched == []
-
-
-def test_current_mode_rejects_posthoc_flag_and_v1_mode_confusion(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding_bytes, plan, process = _current_cross_binding_fixture(frozen)
-    binding = json.loads(binding_bytes.decode("ascii"))
-    binding["created_before_winner_evidence_access"] = False
-    monkeypatch.setattr(
-        planner, "verify_production_cell_search_plan", lambda *_a, **_k: True
-    )
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="PROVENANCE_CROSS_BINDING_SCHEMA_INVALID",
-    ):
-        _produce_current(
-            sink,
-            frozen,
-            iter(()),
-            binding_bytes=_canonical(binding),
-            plan=plan,
-            process=process,
-        )
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="HISTORICAL_CROSS_BINDING_CURRENT_PLAN_FORBIDDEN",
-    ):
-        _produce_current(
-            sink,
-            frozen,
-            iter(()),
-            binding_bytes=_cross_binding_bytes(frozen),
-            plan=plan,
-            process=process,
-        )
-
-
-def test_current_mode_rejects_carried_attempt_or_verifier_splice(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding_bytes, plan, process = _current_cross_binding_fixture(frozen)
-    changed = list(plan._attempt_artifacts_json)
-    body = json.loads(changed[0].decode("ascii"))
-    body["horizon_process"]["source_snapshot_sha256"] = "f" * 64
-    changed[0] = _canonical(body)
-    forged = replace(plan, _attempt_artifacts_json=tuple(changed))
-    monkeypatch.setattr(
-        planner, "verify_production_cell_search_plan", lambda *_a, **_k: True
-    )
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="PROVENANCE_CURRENT_CELL_PLAN_ATTEMPT_SPLICE",
-    ):
-        _produce_current(
-            sink,
-            frozen,
-            iter(()),
-            binding_bytes=binding_bytes,
-            plan=forged,
-            process=process,
-        )
-
-    def rejected(*_args, **_kwargs):
-        raise planner.ProductionSearchPlannerError("CELL_PLAN_SPOOL_REOPEN_INVALID")
-
-    monkeypatch.setattr(planner, "verify_production_cell_search_plan", rejected)
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="CURRENT_CELL_PLAN_REVERIFY_FAILED: CELL_PLAN_SPOOL_REOPEN_INVALID",
-    ):
-        _produce_current(
-            sink,
-            frozen,
-            iter(()),
-            binding_bytes=binding_bytes,
-            plan=plan,
-            process=process,
-        )
-
-
-def test_current_mode_requires_both_sealed_plan_and_process(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding_bytes, plan, process = _current_cross_binding_fixture(frozen)
-    for missing_plan, missing_process in ((None, process), (plan, None)):
-        with pytest.raises(WinnerRawEvidenceError, match="CURRENT_CELL_PLAN_REQUIRED"):
-            _produce_current(
-                sink,
-                frozen,
-                iter(()),
-                binding_bytes=binding_bytes,
-                plan=missing_plan,
-                process=missing_process,
-            )
-
-
-def test_arbitrary_provenance_body_is_typed_technical_failure(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    raw["folds"][0]["provenance"]["anchor_selection_receipt"] = {
-        "schema_version": "fxpm.test-provenance.v1",
-        "kind": "anchor_selection_receipt",
-    }
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="ANCHOR_SELECTION_RECEIPT_PROVENANCE_SCHEMA_INVALID",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_missing_pre_evidence_cross_binding_is_typed_failure(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="PROVENANCE_CROSS_BINDING_BYTES_INVALID",
-    ):
-        produce_winner_v11_raw_evidence(
-            sink,
-            frozen=frozen,
-            attempt_evidence=[_attempt_evidence(frozen)],
-            evidence_access_started_at_utc="2025-01-01T00:00:00Z",
-            evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
-        )
-
-
-def test_cross_binding_candidate_substitution_fails_closed(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding = json.loads(_cross_binding_bytes(frozen).decode("ascii"))
-    binding["mapping"][0]["horizon_candidate_id"] = "substituted-candidate"
-    source_count = binding["mapping"][0]["source_count_receipt"]
-    source_count["horizon_candidate_id"] = "substituted-candidate"
-    binding["mapping"][0]["source_count_receipt"] = _reseal(source_count)
-    binding["mapping_sha256"] = _sha(binding["mapping"])
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="HORIZON_DECISION_PROVENANCE_SPLICE",
-    ):
-        produce_winner_v11_raw_evidence(
-            sink,
-            frozen=frozen,
-            attempt_evidence=[_attempt_evidence(frozen)],
-            evidence_access_started_at_utc="2025-01-01T00:00:00Z",
-            evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
-            provenance_cross_binding_bytes=_canonical(binding),
-        )
-
-
-def test_resealed_replay_lane_hash_substitution_fails_closed(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    replay = raw["folds"][0]["provenance"]["attempt_replay_receipt"]
-    replay["lane_sha256"]["optimizer_train_base"] = "f" * 64
-    raw["folds"][0]["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="ATTEMPT_REPLAY_PROVENANCE_SPLICE",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_resealed_native_source_substitution_fails_closed(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    source = raw["folds"][0]["provenance"]["oos_source_receipt"]
-    source["native_source_sha256"] = "f" * 64
-    raw["folds"][0]["provenance"]["oos_source_receipt"] = _reseal(source)
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="OOS_SOURCE_PROVENANCE_SPLICE",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_resealed_partition_geometry_body_substitution_fails_closed(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    horizon = raw["folds"][0]["provenance"]["anchor_horizon_decision"]
-    geometry = horizon["partition_geometry"][0]
-    geometry["scored_bars"] += 1
-    geometry["frame_rows"] += 1
-    geometry = _reseal(geometry)
-    horizon["partition_geometry"][0] = geometry
-    horizon["partition_geometry_receipts"][0] = geometry["receipt_sha256"]
-    raw["folds"][0]["provenance"]["anchor_horizon_decision"] = _reseal(horizon)
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="PARTITION_GEOMETRY_0_LANE_SPLICE",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_resealed_signal_vector_content_substitution_fails_closed(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    replay = raw["folds"][0]["provenance"]["attempt_replay_receipt"]
-    signal = replay["signal_vector_receipt"]
-    signal["values"][0] = 1
-    replay["signal_vector_receipt"] = _reseal(signal)
-    raw["folds"][0]["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="SIGNAL_VECTOR_CONTENT_HASH_INVALID",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-@pytest.mark.parametrize(
-    ("field", "replacement"),
-    (
-        ("strategy_name", "SubstitutedStrategy"),
-        ("stress_mode", "stress_max"),
-    ),
-)
-def test_resealed_stress_executable_identity_substitution_fails_closed(
-    tmp_path: Path,
-    field: str,
-    replacement: str,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    replay = raw["folds"][0]["provenance"]["attempt_replay_receipt"]
-    stress = replay["stress_method_receipt"]
-    stress[field] = replacement
-    stress = _reseal(stress)
-    replay["stress_method_receipt"] = stress
-    replay["stress_method_receipt_sha256"] = stress["receipt_sha256"]
-    raw["folds"][0]["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="STRESS_METHOD_RECEIPT_BINDING_INVALID",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_resealed_execution_spec_cost_identity_substitution_fails_closed(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    source = raw["folds"][0]["provenance"]["oos_source_receipt"]
-    execution_spec = source["execution_spec_receipt"]
-    execution_spec["instrument_spec_sha256"] = "f" * 64
-    source["execution_spec_receipt"] = _reseal(execution_spec)
-    raw["folds"][0]["provenance"]["oos_source_receipt"] = _reseal(source)
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="EXECUTION_SPEC_RECEIPT_BINDING_INVALID",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_resealed_execution_spec_accepts_bound_zero_native_tick_fallback(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    source = raw["folds"][0]["provenance"]["oos_source_receipt"]
-    execution_spec = source["execution_spec_receipt"]
-    execution_spec[
-        "tick_value_source"
-    ] = "FROZEN_BROKER_SPECS_RECORD_NATIVE_ZERO_UNAVAILABLE"
-    source["execution_spec_receipt"] = _reseal(execution_spec)
-    raw["folds"][0]["provenance"]["oos_source_receipt"] = _reseal(source)
-
-    product = _produce(sink, frozen, [raw])
-
-    assert product.evidence_ledger["entries"][0]["evidence_status"] == "AUTHENTICATED"
-
-
-def test_resealed_execution_spec_rejects_unknown_tick_value_source(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    source = raw["folds"][0]["provenance"]["oos_source_receipt"]
-    execution_spec = source["execution_spec_receipt"]
-    execution_spec["tick_value_source"] = "UNBOUND_FALLBACK"
-    source["execution_spec_receipt"] = _reseal(execution_spec)
-    raw["folds"][0]["provenance"]["oos_source_receipt"] = _reseal(source)
-
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="EXECUTION_SPEC_RECEIPT_BINDING_INVALID",
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_postfreeze_horizon_execution_contract_substitution_fails_closed(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    contracts = frozen.horizon_execution_contracts
-    contracts[0]["source_bar_count"] -= 1
-    forged = replace(
-        frozen,
-        horizon_execution_contracts_bytes=_canonical(contracts),
-    )
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="HORIZON_EXECUTION_CONTRACT_0000_VALUE_INVALID",
-    ):
-        _produce(sink, forged, [_attempt_evidence(frozen)])
-
-
-def test_cross_binding_native_prefix_index_substitution_fails_closed(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    binding = json.loads(_cross_binding_bytes(frozen).decode("ascii"))
-    binding["native_prefix_index_sha256"] = "f" * 64
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="PROVENANCE_CROSS_BINDING_SOURCE_COUNT_SPLICE",
-    ):
-        produce_winner_v11_raw_evidence(
-            sink,
-            frozen=frozen,
-            attempt_evidence=[_attempt_evidence(frozen)],
-            evidence_access_started_at_utc="2025-01-01T00:00:00Z",
-            evidence_access_completed_at_utc="2025-01-01T00:00:01Z",
-            provenance_cross_binding_bytes=_canonical(binding),
-        )
-
-
-def test_postfreeze_attempt_body_substitution_fails_before_evidence(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    bundle = frozen.attempt_artifacts_bundle
-    bundle[0]["horizon_process"]["source_snapshot_sha256"] = "f" * 64
-    forged = replace(
-        frozen,
-        attempt_artifacts_bundle_bytes=_canonical(bundle),
-    )
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="ATTEMPT_0000_ARTIFACT_UNVERIFIABLE|ATTEMPT_0000_ARTIFACT_BUNDLE_HASH_INVALID",
-    ):
-        _produce(sink, forged, [_attempt_evidence(frozen)])
-
-
-def test_label_only_cost_stress_is_rejected_even_when_receipts_are_resealed(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    fold = raw["folds"][0]
-    base = fold["lanes"]["final_lockbox_base"]
-    stress = fold["lanes"]["final_lockbox_stress"]
-    stress["position_events"] = json.loads(_canonical(base["position_events"]))
-    stress["winner_daily_r_surface"] = json.loads(
-        _canonical(base["winner_daily_r_surface"])
-    )
+    manifest = spool.verify_symbol_receipt(context.root, receipt, expected_generation_id=context.generation_id,
+        expected_symbol=sink.symbol, expected_native_universe_sha256=context.native_universe_sha256,
+        expected_config_sha256=context.config_sha256, expected_manifest_domain=spool.GENERAL_MANIFEST_DOMAIN)
+    cold = spool.reopen_generation_context(context.root, expected_generation_id=context.generation_id,
+        expected_native_universe_sha256=context.native_universe_sha256, expected_config_sha256=context.config_sha256)
+    assert manifest["manifest_domain"] == spool.GENERAL_MANIFEST_DOMAIN
+    cross_matches = [entry for entry in manifest["artifacts"] if entry["artifact_id"] == cross_entry["artifact_id"]]
+    assert cross_matches == [cross_entry]
+    cold_cross_entry = cross_matches[0]
+    cold_cross_bytes = (cold.root / cold_cross_entry["descriptor"]["relative_path"]).read_bytes()
+    assert cold_cross_bytes == case["cross_binding_bytes"]
+    cross_sha256 = hashlib.sha256(cold_cross_bytes).hexdigest()
+    assert cross_sha256 == cold_cross_entry["descriptor"]["sha256"]
+    assert len(cold_cross_bytes) == cold_cross_entry["descriptor"]["size_bytes"]
+    production_bytes = (cold.root / result.entries["production-receipt"]["descriptor"]["relative_path"]).read_bytes()
+    production = json.loads(production_bytes)
+    assert production["provenance_cross_binding_sha256"] == cross_sha256
+    artifact_types = {entry["artifact_type"] for entry in manifest["artifacts"]}
+    assert {"winner_v16_request", "winner_v16_decision"} <= artifact_types
+    assert not artifact_types.intersection({"winner_v14_request", "winner_v15_request", "winner_v15_decision"})
+    frozen_prefix = raw._artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime) + "/frozen/"
+    frozen_entries = [entry for entry in manifest["artifacts"] if entry["artifact_id"].startswith(frozen_prefix)]
+    frozen_bodies = [(cold.root / entry["descriptor"]["relative_path"]).read_bytes() for entry in frozen_entries]
+    identity = {"generation_id": cold.generation_id, "generation_context_sha256": cold.context_sha256,
+        "native_universe_sha256": cold.native_universe_sha256, "config_sha256": cold.config_sha256}
+    cell = {key: getattr(frozen, key) for key in ("symbol", "timeframe", "regime")}
+    restored = raw.restore_frozen_winner_search_plan_v5(context_identity=identity, **cell,
+        artifact_namespace=frozen.artifact_namespace, manifest_entries=frozen_entries, body_bytes=frozen_bodies)
+    assert restored == frozen
+    logical_entries = {entry["artifact_id"][len(frozen_prefix):].replace("/", "-"): entry
+        for entry in frozen_entries if entry["artifact_id"] != frozen_prefix + "receipt"}
+    rebuilt_receipt = raw.build_frozen_winner_search_plan_v5_receipt(context_identity=identity, **cell,
+        artifact_namespace=restored.artifact_namespace, precommitment=restored.precommitment,
+        attempt_ledger=restored.attempt_ledger, horizon_execution_contracts=json.loads(restored.horizon_execution_contracts_bytes),
+        partition_cost_precommitments=restored.partition_cost_precommitments, artifact_entries=logical_entries)
+    assert _canonical(rebuilt_receipt) == frozen.frozen_receipt_bytes
+    cross, cross_attempts, _ = raw.verify_historical_frozen_winner_cross_binding(cold_cross_bytes, frozen=restored)
+    assert cross["schema_version"] == raw.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+    assert len(cross_attempts) == 1
+    reopened_request, reopened_decision = adapter._rebuild_winner_pair(cold,
+        {"request": result.entries["winner-request"]["descriptor"], "request_sha256": result.request.request_sha256,
+         "decision": result.entries["winner-decision"]["descriptor"], "decision_sha256": result.decision.receipt_sha256}, **cell)
+    assert _canonical(reopened_request.to_dict()) == _canonical(result.request.to_dict())
+    assert reopened_decision._body_json == result.decision._body_json
+    assert winner.verify_historical_cell_winner_decision(reopened_decision, reopened_request)
+    assert production["schema_version"] == raw.V16_PRODUCTION_SCHEMA
+    assert production["request_sha256"] == reopened_request.request_sha256
+    assert production["decision_receipt_sha256"] == reopened_decision.receipt_sha256
+    assert production["provenance_cross_binding_sha256"] == cross_sha256
+    assert observed_guard == expected_guard
+    output = os.environ.get("FXPM_WINNER_QA_OUTPUT")
+    if output:
+        record = {"schema_version": "fxpm.qa177.synthetic-raw-lineage.v1",
+            "fixture_provenance": creation["fixture_provenance"], "qualification_authority": False,
+            "profitability_claimed": False, "live_or_order_authority": False, "selected_owner": False,
+            "source_creation_sha256": hashlib.sha256(creation_bytes).hexdigest(),
+            "attempt_count": len(case["evidence"]), "fold_count": len(case["evidence"][0]["folds"]),
+            "independent_account_lane_count": account_lane_count,
+            "raw_cumulative_guard_observations": observed_guard, "completed_tier_account_trades": total,
+            "versions": {"frozen": rebuilt_receipt["schema_version"], "cross": cross["schema_version"],
+                "production": production["schema_version"], "request": reopened_request.to_dict()["contract_version"],
+                "decision": decision_body["contract_version"], "evidence": result.evidence_ledger["contract_version"],
+                "marginal": result.marginal_receipt["contract_version"],
+                "attempt_ledger": frozen.attempt_ledger["contract_version"],
+                "shared_partition": winner.V16_GENERATION.shared_partition_version},
+            "frozen_cold_restore_byte_exact": True, "cross_cold_reopen_byte_exact": True,
+            "cross_sha256": cross_sha256, "request_and_decision_cold_replay_verified": True,
+            "dense_at_cap_production_or_thirteen_owner_chain": False}
+        with (Path(output) / "raw_lineage_v16.json").open("xb") as handle:
+            handle.write(_canonical(record))
+
+
+def test_current_referenced_raw_v15_uses_original_native_accounts_and_cold_closure(current_native_case, tmp_path):
+    case = _referenced_current_native_case(current_native_case, tmp_path)
+    for original, compact in zip(case["inline_evidence"], case["evidence"], strict=True):
+        for original_fold, compact_fold in zip(original.get("folds", ()), compact.get("folds", ()), strict=True):
+            assert compact_fold["lanes"] == original_fold["lanes"]
+            references = compact_fold["provenance"]["attempt_replay_receipt"]["source_observation_references"]
+            original_maps = original_fold["provenance"]["attempt_replay_receipt"]["source_observation_receipts"]
+            for partition in raw._PARTITIONS:
+                rebuilt = raw.resolve_source_observation_reference(case["sink"], frozen=case["frozen"],
+                    reference=references[partition], expected_receipt_sha256=original_maps[partition]["receipt_sha256"])
+                assert _canonical(rebuilt) == _canonical(original_maps[partition])
+    result = _produce_case(case)
+    assert result.request.to_dict()["contract_version"] == winner.CURRENT_GENERATION.request_version
+    assert result.decision.to_dict()["validated"] is True
+    assert result.decision.status == "NO_PROCESS_WINNER"
+    assert case["qualification_authority"] is False
+    _assert_real_referenced_production_closure(case, result)
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("missing_reference", "ATTEMPT_REPLAY_PROVENANCE_SPLICE"),
+    ("extra_reference", "ATTEMPT_REPLAY_PROVENANCE_SPLICE"),
+    ("rebound_claim", "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"),
+    ("orphan_body", "SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID"),
+    ("mixed_fold_versions", "ATTEMPT_REPLAY_PROVENANCE_VERSION_MIXED"),
+    ("unknown_first_schema", "FOLD_PROVENANCE_SCHEMA_INVALID"),
+    ("unhashable_first_schema", "FOLD_PROVENANCE_SCHEMA_INVALID"),
+    ("registered_body_splice", "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"),
+], ids=["missing_reference", "extra_reference", "rebound_claim", "orphan_body", "mixed_fold_versions",
+    "unknown_first_schema", "unhashable_first_schema", "registered_body_splice"])
+def test_current_referenced_raw_v15_refuses_production_transport_tamper(
+        current_native_case, tmp_path, monkeypatch, mutation, expected):
+    case = _referenced_current_native_case(current_native_case, tmp_path)
+    fold = _first_fold(case)
     replay = fold["provenance"]["attempt_replay_receipt"]
-    stress_receipt = replay["stress_method_receipt"]
-    stress_receipt["stress_position_roster_sha256"] = (
-        Backtester._cost_attestation_json_sha256(
-            {"position_events": stress["position_events"]}
-        )
-    )
-    stress_receipt["position_count"] = len(stress["position_events"])
-    stress_receipt["daily_observation_count"] = len(
-        stress["winner_daily_r_surface"]["daily_net_mtm_r"]
-    )
-    stress_receipt = _reseal(stress_receipt)
-    replay["stress_method_receipt"] = stress_receipt
-    replay["stress_method_receipt_sha256"] = stress_receipt["receipt_sha256"]
-    replay["lane_sha256"]["final_lockbox_stress"] = _sha(stress)
+    references = replay["source_observation_references"]
+    body_binding_calls = []
+    original_sha = alternate_sha = None
+    if mutation == "missing_reference":
+        references.pop("optimizer_train")
+    elif mutation == "extra_reference":
+        references["other"] = copy.deepcopy(references["optimizer_train"])
+    elif mutation == "rebound_claim":
+        references["optimizer_train"]["source_observation_receipt_sha256"] = "0" * 64
+    elif mutation in {"orphan_body", "registered_body_splice"}:
+        original_reference = references["optimizer_train"]
+        original_sha = original_reference["source_observation_receipt_sha256"]
+        alternate = raw.resolve_source_observation_reference(case["sink"], frozen=case["frozen"],
+            reference=original_reference, expected_receipt_sha256=original_sha)
+        alternate = copy.deepcopy(alternate)
+        point = alternate["observations"][0]["points"]
+        alternate["observations"][0]["points"] = 1.0 if point is None else point + 1.0
+        alternate = _reseal(alternate)
+        alternate_sha = alternate["receipt_sha256"]
+        assert alternate_sha != original_sha
+        registered = raw.publish_source_observation_receipt(case["sink"], frozen=case["frozen"], receipt=alternate)
+        assert registered["artifact_entry"] in case["sink"].artifact_roster()
+        if mutation == "registered_body_splice":
+            original_reference["artifact_entry"] = registered["artifact_entry"]
+            assert original_reference["source_observation_receipt_sha256"] == original_sha
+            original_validator = raw._source_observation_body
+            def observe_body(value, **kwargs):
+                body_binding_calls.append((value.get("receipt_sha256"), kwargs.get("expected_receipt_sha256")))
+                return original_validator(value, **kwargs)
+            monkeypatch.setattr(raw, "_source_observation_body", observe_body)
+    elif mutation == "mixed_fold_versions":
+        compact_attempt = next(attempt for attempt in case["evidence"] if "folds" in attempt)
+        inline_attempt = next(attempt for attempt in case["inline_evidence"] if "folds" in attempt)
+        assert len(compact_attempt["folds"]) > 1
+        compact_attempt["folds"][1]["provenance"] = copy.deepcopy(inline_attempt["folds"][1]["provenance"])
+    else:
+        role = raw._PROVENANCE_KEYS[0]
+        first = fold["provenance"][role]
+        first["schema_version"] = "fxpm.authoritative-search-provenance.unknown" if mutation == "unknown_first_schema" else {}
+        fold["provenance"][role] = _reseal(first)
     fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="STRESS_METHOD_ADVERSITY_STATUS_MISMATCH",
-    ):
-        _produce(sink, frozen, [raw])
+    if mutation == "orphan_body":
+        with pytest.raises(raw.WinnerRawEvidenceError) as error:
+            _produce_case(case)
+        assert not isinstance(error.value, raw.WinnerRawEvidenceIncomplete)
+        assert error.value.code == expected
+    else:
+        with pytest.raises(raw.WinnerRawEvidenceIncomplete) as error:
+            _produce_case(case)
+        assert error.value.code == "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE"
+        assert isinstance(error.value.__cause__, raw.WinnerRawEvidenceError)
+        assert error.value.__cause__.code == expected
+    if mutation == "registered_body_splice":
+        assert (alternate_sha, original_sha) in body_binding_calls
+    assert not any(entry["artifact_type"] == "winner_raw_evidence_production_receipt"
+        for entry in case["sink"].artifact_roster())
 
 
-def test_resealed_adversity_status_cannot_relabel_genuine_shock(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    replay = raw["folds"][0]["provenance"]["attempt_replay_receipt"]
-    stress_receipt = replay["stress_method_receipt"]
-    stress_receipt["realized_adversity_status"] = (
-        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
-    stress_receipt["strictly_worse_trade_count"] = 0
-    stress_receipt["strictly_worse_daily_observation_count"] = 0
-    stress_receipt = _reseal(stress_receipt)
-    replay["stress_method_receipt"] = stress_receipt
-    replay["stress_method_receipt_sha256"] = stress_receipt["receipt_sha256"]
-    raw["folds"][0]["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="STRESS_METHOD_ADVERSITY_STATUS_MISMATCH",
-    ):
-        _produce(sink, frozen, [raw])
+@pytest.mark.parametrize("name", ["freeze_winner_search_plan_v3", "produce_winner_v14_raw_evidence"])
+def test_original_v14_writer_entrypoints_refuse_before_inputs(name):
+    class Forbidden:
+        def __getattribute__(self, attribute):
+            pytest.fail("retired writer touched an input")
+    with pytest.raises(raw.WinnerRawEvidenceError, match="^ARCHIVED_WINNER_V14_WRITER_RETIRED_FROZEN_TIER_PAIR_REQUIRED$"):
+        getattr(raw, name)(Forbidden(), frozen=Forbidden(), attempt_evidence=Forbidden())
 
 
-def _reseal_first_fold_as_no_numerical_shock(
-    raw,
-    *,
-    preserve_changed_spread_vector: bool = False,
-):
-    fold = raw["folds"][0]
-    base = fold["lanes"]["final_lockbox_base"]
-    stress = fold["lanes"]["final_lockbox_stress"]
-    stress["position_events"] = json.loads(_canonical(base["position_events"]))
-    stress["winner_daily_r_surface"] = json.loads(
-        _canonical(base["winner_daily_r_surface"])
-    )
-    if not preserve_changed_spread_vector:
-        stress["numerical_execution_cost_attestation"] = _rebuilt_cost(
-            stress["numerical_execution_cost_attestation"],
-            spread_values_sha256=base["numerical_execution_cost_attestation"][
-                "spread_values_sha256"
-            ],
-        )
+@pytest.mark.parametrize("mutation,expected", [
+    ("extra_base", "FOLD_000_RAW_SCHEMA_INVALID"),
+    ("lane_hash", "ATTEMPT_REPLAY_PROVENANCE_SPLICE"),
+    ("execution_receipt", "ATTEMPT_REPLAY_PROVENANCE_SPLICE"),
+    ("legacy_replay", "ATTEMPT_REPLAY_RECEIPT_PROVENANCE_SCHEMA_INVALID"),
+    ("signal_content", "SIGNAL_VECTOR_CONTENT_HASH_INVALID"),
+    ("geometry", "PARTITION_GEOMETRY_0_LANE_SPLICE"),
+    ("source_native", "OOS_SOURCE_PROVENANCE_SPLICE"),
+    ("spec_source", "EXECUTION_SPEC_RECEIPT_BINDING_INVALID"),
+    ("cost_array", "PARTITION_COST_PRECOMMITMENTS_ACTUAL_ACCOUNT_SPLICE"),
+    ("admission_mask", "TIER_ADMISSION_RECONSTRUCTION_FAILED"),
+    ("admission_counts", "TIER_ADMISSION_RECONSTRUCTION_FAILED"),
+    ("observation", "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"),
+    ("source_receipt_role", "OOS_SOURCE_RECEIPT_PROVENANCE_ROLE_INVALID"),
+    ("posthoc_trial", "SELECTED_TRIAL_PROVENANCE_SPLICE"),
+])
+def test_current_raw_resealed_tamper_is_technical(current_native_case, tmp_path, mutation, expected):
+    case = clone_current_native_case(current_native_case, tmp_path)
+    fold = _first_fold(case)
     replay = fold["provenance"]["attempt_replay_receipt"]
-    stress_receipt = replay["stress_method_receipt"]
-    stress_receipt["stress_cost_attestation_sha256"] = stress[
-        "numerical_execution_cost_attestation"
-    ]["attestation_sha256"]
-    stress_receipt["stress_spread_values_sha256"] = stress[
-        "numerical_execution_cost_attestation"
-    ]["spread_values_sha256"]
-    stress_receipt["stress_position_roster_sha256"] = (
-        Backtester._cost_attestation_json_sha256(
-            {"position_events": stress["position_events"]}
-        )
-    )
-    stress_receipt["position_count"] = len(stress["position_events"])
-    stress_receipt["daily_observation_count"] = len(
-        stress["winner_daily_r_surface"]["daily_net_mtm_r"]
-    )
-    stress_receipt["strictly_worse_trade_count"] = 0
-    stress_receipt["strictly_worse_daily_observation_count"] = 0
-    stress_receipt["stress_daily_improvement_observation_count"] = 0
-    stress_receipt["realized_adversity_status"] = (
-        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
-    stress_receipt = _reseal(stress_receipt)
-    replay["stress_method_receipt"] = stress_receipt
-    replay["stress_method_receipt_sha256"] = stress_receipt["receipt_sha256"]
-    replay["lane_sha256"]["final_lockbox_stress"] = _sha(stress)
-    fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-    return raw
+    if mutation == "extra_base":
+        fold["lanes"]["final_lockbox_base"] = copy.deepcopy(fold["lanes"]["final_lockbox_p75"])
+    elif mutation == "lane_hash":
+        replay["lane_sha256"]["optimizer_train_p75"] = "0" * 64
+        fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+    elif mutation == "execution_receipt":
+        replay["independent_tier_execution_receipt"]["lanes"]["optimizer_train_p75"]["position_events_sha256"] = "0" * 64
+        replay["independent_tier_execution_receipt"] = _reseal(replay["independent_tier_execution_receipt"])
+        replay["independent_tier_execution_receipt_sha256"] = replay["independent_tier_execution_receipt"]["receipt_sha256"]
+        fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+    elif mutation == "legacy_replay":
+        replay["cost_ladder_method_receipt"] = {}
+        fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+    elif mutation == "signal_content":
+        signal = replay["signal_vector_receipts"]["optimizer_train"]
+        signal["values"][0] = 1 if signal["values"][0] == 0 else 0
+        replay["signal_vector_receipts"]["optimizer_train"] = _reseal(signal)
+        fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+    elif mutation == "geometry":
+        horizon = fold["provenance"]["anchor_horizon_decision"]
+        horizon["partition_geometry"][0]["scored_bars"] += 1
+        horizon["partition_geometry"][0] = _reseal(horizon["partition_geometry"][0])
+        horizon["partition_geometry_receipts"][0] = horizon["partition_geometry"][0]["receipt_sha256"]
+        fold["provenance"]["anchor_horizon_decision"] = _reseal(horizon)
+    elif mutation == "source_native":
+        source = fold["provenance"]["oos_source_receipt"]
+        source["native_source_sha256"] = "0" * 64
+        fold["provenance"]["oos_source_receipt"] = _reseal(source)
+    elif mutation == "spec_source":
+        source = fold["provenance"]["oos_source_receipt"]
+        source["execution_spec_receipt"]["tick_value_source"] = "UNBOUND_FALLBACK"
+        source["execution_spec_receipt"] = _reseal(source["execution_spec_receipt"])
+        fold["provenance"]["oos_source_receipt"] = _reseal(source)
+    elif mutation == "cost_array":
+        lane = fold["lanes"]["optimizer_train_p75"]
+        attestation = lane["numerical_execution_cost_attestation"]
+        from pm_trade_power import build_numerical_execution_cost_attestation
+        changed_entry_sha = "0" * 64 if attestation["entry_half_spread_values_sha256"] != "0" * 64 else "1" * 64
+        lane["numerical_execution_cost_attestation"] = build_numerical_execution_cost_attestation(
+            use_spread=attestation["use_spread"], spread_mode=attestation["spread_mode"],
+            instrument_spec_sha256=attestation["instrument_spec_sha256"],
+            entry_half_spread_values_sha256=changed_entry_sha,
+            intrabar_half_spread_values_sha256=attestation["intrabar_half_spread_values_sha256"])
+        assert lane["numerical_execution_cost_attestation"] != attestation
+        _rebind_replay(fold, case["frozen"])
+    elif mutation == "admission_mask":
+        fold["lanes"]["optimizer_train_p75"]["spread_admission"]["entry_admission_mask_sha256"] = "0" * 64
+        _rebind_replay(fold, case["frozen"])
+    elif mutation == "admission_counts":
+        data = fold["lanes"]["optimizer_train_p75"]["spread_admission"]
+        assert data["signal_opportunities"] > 0
+        for key in ("signal_opportunities", "known_cap_pass_opportunities", "known_cap_refused_opportunities", "missing_refused_opportunities"):
+            data[key] = 0
+        _rebind_replay(fold, case["frozen"])
+    elif mutation == "observation":
+        original = replay["source_observation_receipts"]["optimizer_train"]
+        original["observations"][0]["points"] = 12345.0
+        replay["source_observation_receipts"]["optimizer_train"] = _reseal(original)
+        fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
+    elif mutation == "source_receipt_role":
+        source = fold["provenance"]["oos_source_receipt"]
+        source["receipt_role"] = "anchor_refit_receipt"
+        fold["provenance"]["oos_source_receipt"] = _reseal(source)
+    elif mutation == "posthoc_trial":
+        selected = fold["provenance"]["anchor_selected_trial"]
+        selected["selection_scope"] = "POSTHOC_WINNER"
+        fold["provenance"]["anchor_selected_trial"] = _reseal(selected)
+    with pytest.raises(raw.WinnerRawEvidenceIncomplete, match=expected):
+        _produce_case(case)
 
 
-def _reseal_first_fold_as_zero_trade(raw):
-    raw = _reseal_first_fold_as_no_numerical_shock(raw)
-    fold = raw["folds"][0]
-    train = fold["lanes"]["optimizer_train_base"]
-    base = fold["lanes"]["final_lockbox_base"]
-    stress = fold["lanes"]["final_lockbox_stress"]
-    train_dates = train["winner_daily_r_surface"]["daily_dates_utc"]
-    train_zero_surface = build_flat_daily_r_surface(
-        [],
-        start_date_utc=train_dates[0],
-        end_date_utc=train_dates[-1],
-        risk_unit_contract=RISK_CONTRACT,
-    )
-    final_dates = base["winner_daily_r_surface"]["daily_dates_utc"]
-    final_zero_surface = build_flat_daily_r_surface(
-        [],
-        start_date_utc=final_dates[0],
-        end_date_utc=final_dates[-1],
-        risk_unit_contract=RISK_CONTRACT,
-    )
-    train["position_events"] = []
-    train["winner_daily_r_surface"] = json.loads(_canonical(train_zero_surface))
-    base["position_events"] = []
-    base["winner_daily_r_surface"] = json.loads(_canonical(final_zero_surface))
-    stress["position_events"] = []
-    stress["winner_daily_r_surface"] = json.loads(_canonical(final_zero_surface))
+@pytest.mark.parametrize("mutation,expected", [
+    ("missing", "PROVENANCE_CROSS_BINDING_BYTES_INVALID"),
+    ("pair", "PROVENANCE_CROSS_BINDING_WINNER_SPLICE"),
+    ("partition", "PROVENANCE_CROSS_BINDING_WINNER_SPLICE"),
+    ("roster", "PROVENANCE_CROSS_BINDING_MAPPING_INVALID"),
+    ("mixed_mode", "PROVENANCE_CROSS_BINDING_SCHEMA_INVALID"),
+])
+def test_current_raw_cross_binding_rejects_before_evidence(current_native_case, tmp_path, mutation, expected):
+    case = clone_current_native_case(current_native_case, tmp_path)
+    binding = json.loads(case["cross_binding_bytes"])
+    encoded = case["cross_binding_bytes"]
+    if mutation == "missing": encoded = b""
+    elif mutation == "pair": binding["winner_roster"]["frozen_tier_pair_contract_sha256"] = "0" * 64
+    elif mutation == "partition": binding["winner_roster"]["partition_cost_precommitments_sha256"] = "0" * 64
+    elif mutation == "roster": binding["mapping_count"] += 1
+    elif mutation == "mixed_mode":
+        binding["schema_version"] = raw.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+        binding["mode"] = "CURRENT"
+    if mutation != "missing": encoded = _canonical(binding)
+    def forbidden():
+        pytest.fail("invalid original cross-binding consumed outcome evidence")
+        yield None
+    with pytest.raises(raw.WinnerRawEvidenceError, match=expected):
+        _produce_case(case, evidence=forbidden(), cross_binding_bytes=encoded)
 
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("points", "SOURCE_OBSERVATION_VALUES_CHANGED"),
+    ("matched_close", "SOURCE_OBSERVATION_VALUES_CHANGED"),
+    ("carrier", "SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID"),
+])
+def test_current_source_receipt_is_rebuilt_from_original_native_rows(current_native_case, tmp_path, mutation, expected):
+    case = clone_current_native_case(current_native_case, tmp_path)
+    fold = _first_fold(case)
     replay = fold["provenance"]["attempt_replay_receipt"]
-    stress_receipt = replay["stress_method_receipt"]
-    empty_roster_sha256 = Backtester._cost_attestation_json_sha256(
-        {"position_events": []}
-    )
-    stress_receipt["base_position_roster_sha256"] = empty_roster_sha256
-    stress_receipt["stress_position_roster_sha256"] = empty_roster_sha256
-    stress_receipt["position_count"] = 0
-    stress_receipt["daily_observation_count"] = len(
-        final_zero_surface["daily_net_mtm_r"]
-    )
-    stress_receipt["strictly_worse_trade_count"] = 0
-    stress_receipt["strictly_worse_daily_observation_count"] = 0
-    stress_receipt["stress_daily_improvement_observation_count"] = 0
-    stress_receipt["realized_adversity_status"] = (
-        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
-    stress_receipt = _reseal(stress_receipt)
-    replay["stress_method_receipt"] = stress_receipt
-    replay["stress_method_receipt_sha256"] = stress_receipt["receipt_sha256"]
-    replay["lane_sha256"]["optimizer_train_base"] = _sha(train)
-    replay["lane_sha256"]["final_lockbox_base"] = _sha(base)
-    replay["lane_sha256"]["final_lockbox_stress"] = _sha(stress)
-    fold["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-    return raw
+    observation = replay["source_observation_receipts"]["optimizer_train"]
+    if mutation == "points":
+        point = observation["observations"][0]["points"]
+        observation["observations"][0]["points"] = 1 if point is None else point + 1
+    elif mutation == "matched_close":
+        row = observation["observations"][0]
+        row["prior_fine_close_utc"] = row["target_open_utc"] if row["prior_fine_close_utc"] is None else None
+    else:
+        observation["source_product"]["timeframe"] = "INVALID"
+    observation = _reseal(observation)
+    # Even a self-consistent receipt hash cannot replace original native rows.
+    with pytest.raises(raw.WinnerRawEvidenceError, match=expected):
+        raw._validated_source_observation_receipt(observation, sink=case["sink"], frozen=case["frozen"],
+            expected_sha256=observation["receipt_sha256"], partition="optimizer_train",
+            signals=replay["signal_vector_receipts"]["optimizer_train"], lanes=fold["lanes"])
 
 
-def test_changed_spread_without_realized_degradation_is_process_rejected(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _reseal_first_fold_as_no_numerical_shock(
-        _copied_attempt_evidence(frozen),
-        preserve_changed_spread_vector=True,
-    )
-
-    receipt = raw["folds"][0]["provenance"]["attempt_replay_receipt"][
-        "stress_method_receipt"
-    ]
-    assert receipt["base_spread_values_sha256"] != receipt[
-        "stress_spread_values_sha256"
-    ]
-    assert receipt["realized_adversity_status"] == (
-        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
-
-    produced = _produce(sink, frozen, [raw])
-
-    entry = produced.evidence_ledger["entries"][0]
-    assert entry["evidence_status"] == "PROCESS_REJECTED"
-    assert entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
-    assert produced.decision.to_dict()["validated"] is True
-    assert entry["folds"] == []
-    assert entry["pbo_fold_count"] == len(frozen.precommitment["causal_fold_plan"])
+@pytest.mark.parametrize("mutation,expected", [
+    ("attempt_omitted", "ATTEMPT_EVIDENCE_ROSTER_OMISSION"),
+    ("attempt_extra", "ATTEMPT_EVIDENCE_ROSTER_EXTRA"),
+    ("attempt_identity", "ATTEMPT_0000_EVIDENCE_IDENTITY_MISMATCH"),
+    ("fold_omitted", "ATTEMPT_0000_FOLD_ROSTER_INCOMPLETE"),
+    ("fold_order", "FOLD_000_RAW_SCHEMA_INVALID"),
+])
+def test_current_raw_keeps_exact_frozen_attempt_and_fold_roster(current_native_case, tmp_path, mutation, expected):
+    case = clone_current_native_case(current_native_case, tmp_path)
+    evidence = case["evidence"]
+    if mutation == "attempt_omitted": evidence.clear()
+    elif mutation == "attempt_extra": evidence.append(copy.deepcopy(evidence[-1]))
+    elif mutation == "attempt_identity": evidence[0]["attempt_id"] = "substituted"
+    elif mutation == "fold_omitted": evidence[0]["folds"].pop()
+    else: evidence[0]["folds"][0], evidence[0]["folds"][1] = evidence[0]["folds"][1], evidence[0]["folds"][0]
+    with pytest.raises(raw.WinnerRawEvidenceError, match=expected):
+        _produce_case(case)
 
 
-def test_authenticated_no_numerical_shock_keeps_pbo_and_rejects_attempt(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path, no_shock_pairs={(0, 0)})
-    raw = _reseal_first_fold_as_no_numerical_shock(
-        _copied_attempt_evidence(frozen)
-    )
-
-    produced = _produce(sink, frozen, [raw])
-
-    entry = produced.evidence_ledger["entries"][0]
-    assert entry["evidence_status"] == "PROCESS_REJECTED"
-    assert entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
-    assert produced.decision.to_dict()["validated"] is True
-    assert entry["fold_count"] == 0
-    assert entry["folds"] == []
-    assert entry["pbo_fold_count"] == len(frozen.precommitment["causal_fold_plan"])
-    assert len(entry["pbo_folds"]) == entry["pbo_fold_count"]
-
-
-def test_authenticated_zero_trade_fold_is_process_rejected_with_pbo(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path, no_shock_pairs={(0, 0)})
-    raw = _reseal_first_fold_as_zero_trade(_copied_attempt_evidence(frozen))
-
-    produced = _produce(sink, frozen, [raw])
-
-    entry = produced.evidence_ledger["entries"][0]
-    assert entry["evidence_status"] == "PROCESS_REJECTED"
-    assert entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
-    assert entry["folds"] == []
-    assert entry["pbo_fold_count"] == len(frozen.precommitment["causal_fold_plan"])
-    zero_fold = entry["pbo_folds"][0]
-    assert zero_fold["completed_trade_position_ids"] == []
-    assert zero_fold["completed_trade_net_mtm_r"] == []
-    assert zero_fold["completed_trade_net_mtm_r_cost_stress"] == []
-    assert all(value == 0.0 for value in zero_fold["daily_net_mtm_r"])
-    assert all(value == 0.0 for value in zero_fold["daily_net_mtm_r_cost_stress"])
+@pytest.mark.parametrize("field", ["attempt_artifacts_bundle_bytes", "horizon_execution_contracts_bytes", "partition_cost_precommitments_bytes"])
+def test_current_postfreeze_transport_tamper_fails_before_evidence(current_native_case, tmp_path, field):
+    case = clone_current_native_case(current_native_case, tmp_path)
+    value = json.loads(getattr(case["frozen"], field))
+    if field == "attempt_artifacts_bundle_bytes": value[0]["trial_definition"]["parameters"] = {"forged": True}
+    elif field == "horizon_execution_contracts_bytes": value[0]["source_bar_count"] += 1
+    else:
+        row = value["rows"][0]
+        record = value["records"][row["partition_geometry_receipt_sha256"]] if (
+            value["schema_version"] == raw.PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA) else row
+        original_sha = record["source_observation_receipt_sha256"]
+        record["source_observation_receipt_sha256"] = "0" * 64 if original_sha != "0" * 64 else "1" * 64
+        assert record["source_observation_receipt_sha256"] != original_sha
+        value = _reseal(value)
+    changed = replace(case["frozen"], **{field: _canonical(value)})
+    def forbidden():
+        pytest.fail("post-freeze transport tamper consumed evidence")
+        yield None
+    with pytest.raises(raw.WinnerRawEvidenceError):
+        _produce_case(case, evidence=forbidden(), frozen=changed)
 
 
-def test_genuine_base_stress_trade_count_mismatch_remains_technical(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _copied_attempt_evidence(frozen)
-    raw["folds"][0]["lanes"]["final_lockbox_stress"]["position_events"].pop()
-
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete,
-        match="FINAL_BASE_STRESS_TRADE_COUNT_MISMATCH",
-    ):
-        _produce(sink, frozen, [raw])
+def test_current_frozen_receipt_reseal_conflicts_with_original_sink(current_native_case, tmp_path):
+    case = clone_current_native_case(current_native_case, tmp_path)
+    precommitment = case["frozen"].precommitment
+    precommitment["precommitted_at_utc"] = "2024-01-01T00:00:00Z"
+    changed = replace(case["frozen"], precommitment_bytes=_canonical(precommitment))
+    with pytest.raises(raw.WinnerRawEvidenceError, match="FROZEN_PARTITION_COST_BINDING_INVALID"):
+        _produce_case(case, frozen=changed)
 
 
-def test_event_vectors_keep_mismatch_and_trade_count_bounds_fail_closed() -> None:
-    fold_start = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    fold_end = datetime(2024, 2, 1, tzinfo=timezone.utc)
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="FINAL_BASE_STRESS_TRADE_COUNT_MISMATCH",
-    ):
-        _event_vectors(
-            [],
-            [{}],
-            fold_start=fold_start,
-            fold_end_exclusive=fold_end,
-        )
-
-    oversized = [{}] * (winner.MAX_TRADES_PER_FOLD + 1)
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="FINAL_TRADE_COUNT_LIMIT_EXCEEDED",
-    ):
-        _event_vectors(
-            oversized,
-            oversized,
-            fold_start=fold_start,
-            fold_end_exclusive=fold_end,
-        )
+@pytest.mark.parametrize("mutation,expected", [
+    ("rows_omitted", "PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID"),
+    ("rows_reordered", "PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID"),
+    ("pair_splice", "PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID"),
+])
+def test_current_partition_precommitment_has_exact_source_roster(current_native_case, mutation, expected):
+    frozen = current_native_case["frozen"]
+    body = frozen.partition_cost_precommitments
+    if mutation == "rows_omitted": body["rows"].pop()
+    elif mutation == "rows_reordered": body["rows"][0], body["rows"][1] = body["rows"][1], body["rows"][0]
+    else: body["frozen_tier_pair_contract_sha256"] = "0" * 64
+    body = _reseal(body)
+    with pytest.raises(raw.WinnerRawEvidenceError, match=expected):
+        raw._validated_partition_cost_precommitments(body, pair=frozen.frozen_tier_pair_contract,
+            attempts=frozen.attempt_ledger["attempts"], folds=frozen.precommitment["causal_fold_plan"])
 
 
-def test_genuine_partition_cost_vectors_vary_under_one_frozen_policy(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    base_attestations = [
-        fold["lanes"][lane]["numerical_execution_cost_attestation"]
-        for fold in raw["folds"]
-        for lane in (
-            "optimizer_train_base",
-            "tuning_validation_base",
-            "final_lockbox_base",
-        )
-    ]
-    base_bar_counts = [
-        fold["lanes"][lane]["trade_power_partition_axis"]["scored_bars"]
-        for fold in raw["folds"]
-        for lane in ("optimizer_train_base", "tuning_validation_base")
-    ]
-    assert len(set(base_bar_counts)) > 1
-    assert len({item["spread_values_sha256"] for item in base_attestations}) == len(
-        base_attestations
-    )
-    assert len({item["attestation_sha256"] for item in base_attestations}) == len(
-        base_attestations
-    )
-    assert {item["policy_sha256"] for item in base_attestations} == {
-        BASE_COST_POLICY["numerical_execution_cost_policy_sha256"]
-    }
-    assert frozen.source_contract_seed["numerical_execution_cost_attestation"][
-        "spread_values_sha256"
-    ] not in {item["spread_values_sha256"] for item in base_attestations}
-    assert "spread_values_sha256" not in frozen.base_cost_policy
-    assert "attestation_sha256" not in frozen.base_cost_policy
-
-    produced = _produce(sink, frozen, [raw])
-    assert produced.decision.to_dict()["validated"] is True
+def _partition_transport_case(**kwargs):
+    from tests.test_authoritative_search_execution import _partition_cost_transport_fixture
+    return _partition_cost_transport_fixture(**kwargs)
 
 
-def test_internally_valid_partition_policy_mutation_fails_closed(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    lane = raw["folds"][0]["lanes"]["optimizer_train_base"]
-    lane["numerical_execution_cost_attestation"] = _rebuilt_cost(
-        lane["numerical_execution_cost_attestation"],
-        instrument_spec_sha256="f" * 64,
-    )
-
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete, match="BASE_COST_ATTESTATION_INVALID_POLICY_DRIFT"
-    ):
-        _produce(sink, frozen, [raw])
+def _validate_partition_transport(body, case):
+    return raw._validated_partition_cost_precommitments(body, pair=case["pair"],
+        attempts=case["attempts"], folds=case["folds"])
 
 
-def test_base_stress_attestation_pair_swap_fails_closed(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    lanes = raw["folds"][0]["lanes"]
-    base = lanes["final_lockbox_base"]
-    stress = lanes["final_lockbox_stress"]
-    base_cost = base["numerical_execution_cost_attestation"]
-    stress_cost = stress["numerical_execution_cost_attestation"]
-    base["numerical_execution_cost_attestation"] = stress_cost
-    stress["numerical_execution_cost_attestation"] = base_cost
-
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete, match="BASE_COST_ATTESTATION_INVALID_POLICY_DRIFT"
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_stress_lane_improvement_still_fails_closed(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    planned = frozen.precommitment["causal_fold_plan"][0]
-    lanes = raw["folds"][0]["lanes"]
-    base = lanes["final_lockbox_base"]
-    stress = lanes["final_lockbox_stress"]
-    for base_event, stress_event in zip(
-        base["position_events"], stress["position_events"], strict=True
-    ):
-        stress_event["pnl_dollars"] = base_event["pnl_dollars"] + 1.0
-    stress["winner_daily_r_surface"] = build_flat_daily_r_surface(
-        stress["position_events"],
-        start_date_utc=planned["oos_start_date_utc"],
-        end_date_utc=planned["oos_end_date_utc"],
-        risk_unit_contract=RISK_CONTRACT,
-    )
-
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete, match="COST_STRESS_IMPROVES_DAILY_R"
-    ):
-        _produce(sink, frozen, [raw])
+def test_partition_cost_v1_transport_preserves_original_bytes_and_hash():
+    """An original v1 body is validated and expanded without normalization to v2."""
+    case = _partition_transport_case(attempt_count=1)
+    original = _reseal({"schema_version": raw.PARTITION_COST_PRECOMMITMENTS_SCHEMA,
+        "frozen_tier_pair_contract_sha256": _sha(case["pair"]), "rows": copy.deepcopy(case["rows"])})
+    original_bytes = _canonical(original)
+    original_sha = hashlib.sha256(original_bytes).hexdigest()
+    restored = _validate_partition_transport(json.loads(original_bytes), case)
+    assert _canonical(restored) == original_bytes
+    assert _sha(restored) == original_sha
+    assert restored["schema_version"] == "fxpm.winner-partition-cost-precommitments.v1"
+    assert "records" not in restored
+    for row in restored["rows"]:
+        assert raw.expand_partition_cost_precommitment(restored, row, pair=case["pair"]) == row
 
 
-def test_base_and_stress_execution_policies_must_be_distinct(tmp_path: Path) -> None:
-    same_execution_policy = _frozen_policy(BASE_COST, "STRESS")
-    with pytest.raises(WinnerRawEvidenceError, match="COST_STRESS_POLICY_NOT_DISTINCT"):
-        _freeze(tmp_path, stress_cost_policy=same_execution_policy)
+def test_compact_partition_cost_transport_roundtrips_exact_semantic_rows():
+    case = _partition_transport_case()
+    original_bytes = _canonical(case["rows"])
+    compact = raw.build_partition_cost_precommitments(case["rows"], pair=case["pair"])
+    encoded = _canonical(compact)
+    restored = _validate_partition_transport(json.loads(encoded), case)
+    assert restored["schema_version"] == raw.PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA
+    assert _canonical(restored) == encoded
+    assert _sha(restored) == hashlib.sha256(encoded).hexdigest()
+    assert len(restored["rows"]) == 2 * 4 * 3
+    assert len(restored["records"]) == 4 * 3
+    for stored, expected in zip(restored["rows"], case["rows"], strict=True):
+        assert set(stored) == {"attempt_ordinal", "fold_ordinal", "partition", "partition_geometry_receipt_sha256"}
+        expanded = raw.expand_partition_cost_precommitment(restored, stored, pair=case["pair"])
+        assert expanded == expected
+        record = restored["records"][stored["partition_geometry_receipt_sha256"]]
+        assert set(record) == {"partition_frame_sha256", "source_observation_receipt_sha256", "tiers"}
+        for tier in ("P75", "P95"):
+            full = expected["tiers"][tier]["numerical_execution_cost_attestation"]
+            compact_tier = record["tiers"][tier]
+            assert compact_tier["numerical_execution_cost_attestation_sha256"] == _sha(full)
+            assert compact_tier["numerical_execution_cost_attestation_sha256"] != full["attestation_sha256"]
+            assert expanded["tiers"][tier]["numerical_execution_cost_attestation"] == full
+    assert _canonical(case["rows"]) == original_bytes
 
 
-def test_frozen_attempt_omission_fails_before_v11(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(
-        tmp_path,
-        attempts=2,
-        precommitted_evidence_roles=[
-            "PRESEARCH_PROCESS_REJECTED",
-            "EVALUATION_REQUIRED",
-        ],
-    )
-    first = frozen.attempt_ledger["attempts"][0]
-    outcome = TrialOutcome(
-        kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
-        stage=SearchStage.PARAMETER_VALIDATION,
-        reason_code="PARAMETER_SCREEN_REJECTED",
-        reason="predeclared parameter screen rejected this process",
-        symbol="EURUSD",
-        timeframe="H1",
-        regime="TREND",
-        strategy_family=first["strategy_family"],
-    )
-    with pytest.raises(
-        WinnerRawEvidenceError, match="ATTEMPT_EVIDENCE_ROSTER_OMISSION"
-    ):
-        _produce(
-            sink,
-            frozen,
-            [{"attempt_id": first["attempt_id"], "outcome": outcome}],
-        )
+@pytest.mark.parametrize("mutation,expected", [
+    ("row_missing", "PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID"),
+    ("row_order", "PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID"),
+    ("row_identity", "PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID"),
+    ("geometry_hash", "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID"),
+    ("record_missing", "PARTITION_COST_PRECOMMITMENTS_RECORD_UNAVAILABLE"),
+    ("record_orphan", "PARTITION_COST_PRECOMMITMENTS_RECORD_ROSTER_INVALID"),
+    ("record_schema", "PARTITION_COST_PRECOMMITMENTS_RECORD_INVALID"),
+    ("tier_missing", "PARTITION_COST_PRECOMMITMENTS_TIER_INVALID"),
+    ("tier_schema", "PARTITION_COST_PRECOMMITMENTS_TIER_INVALID"),
+    ("frame_hash", "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID"),
+    ("source_hash", "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID"),
+    ("entry_array", "PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID"),
+    ("intrabar_array", "PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID"),
+    ("attestation_hash", "PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID"),
+    ("observations_hash", "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID"),
+    ("admission_hash", "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID"),
+    ("pair_hash", "PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID"),
+    ("receipt_hash", "PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID"),
+])
+def test_compact_partition_cost_transport_rejects_resealed_tamper(mutation, expected):
+    case = _partition_transport_case()
+    body = raw.build_partition_cost_precommitments(case["rows"], pair=case["pair"])
+    geometry = body["rows"][0]["partition_geometry_receipt_sha256"]
+    record = body["records"][geometry]
+    tier = record["tiers"]["P75"]
+    if mutation == "row_missing": body["rows"].pop()
+    elif mutation == "row_order": body["rows"][0], body["rows"][1] = body["rows"][1], body["rows"][0]
+    elif mutation == "row_identity": body["rows"][0]["attempt_ordinal"] += 1
+    elif mutation == "geometry_hash": body["rows"][0]["partition_geometry_receipt_sha256"] = "invalid"
+    elif mutation == "record_missing": body["records"].pop(geometry)
+    elif mutation == "record_orphan": body["records"][_sha("ORPHAN_STRUCTURAL_GEOMETRY")] = copy.deepcopy(record)
+    elif mutation == "record_schema": record.pop("partition_frame_sha256")
+    elif mutation == "tier_missing": record["tiers"].pop("P95")
+    elif mutation == "tier_schema": tier["unexpected"] = "0" * 64
+    elif mutation == "frame_hash": record["partition_frame_sha256"] = "invalid"
+    elif mutation == "source_hash": record["source_observation_receipt_sha256"] = "invalid"
+    elif mutation == "entry_array": tier["entry_half_spread_values_sha256"] = _sha("ALTERED_ENTRY_ARRAY")
+    elif mutation == "intrabar_array": tier["intrabar_half_spread_values_sha256"] = _sha("ALTERED_INTRABAR_ARRAY")
+    elif mutation == "attestation_hash":
+        tier["numerical_execution_cost_attestation_sha256"] = case["rows"][0]["tiers"]["P75"][
+            "numerical_execution_cost_attestation"]["attestation_sha256"]
+    elif mutation == "observations_hash": tier["entry_observations_sha256"] = "invalid"
+    elif mutation == "admission_hash": tier["entry_admission_mask_sha256"] = "invalid"
+    elif mutation == "pair_hash": body["frozen_tier_pair_contract_sha256"] = "0" * 64
+    body = _reseal(body)
+    if mutation == "receipt_hash": body["receipt_sha256"] = "0" * 64
+    with pytest.raises(raw.WinnerRawEvidenceError, match="^" + expected + "$"):
+        _validate_partition_transport(body, case)
 
 
-def test_underpowered_is_process_rejected_not_technical(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    raw["folds"][0]["lanes"]["optimizer_train_base"]["position_events"] = raw["folds"][
-        0
-    ]["lanes"]["optimizer_train_base"]["position_events"][:2]
-    replay = raw["folds"][0]["provenance"]["attempt_replay_receipt"]
-    replay["lane_sha256"]["optimizer_train_base"] = _sha(
-        raw["folds"][0]["lanes"]["optimizer_train_base"]
-    )
-    raw["folds"][0]["provenance"]["attempt_replay_receipt"] = _reseal(replay)
-
-    produced = _produce(sink, frozen, [raw])
-
-    entry = produced.evidence_ledger["entries"][0]
-    assert entry["evidence_status"] == "PROCESS_REJECTED"
-    assert entry["status_reason"] == "EVALUATED_OOS_PROCESS_REJECTED"
-    assert entry["folds"] == []
-    assert entry["pbo_fold_count"] == len(frozen.precommitment["causal_fold_plan"])
-    assert len(entry["pbo_folds"]) == entry["pbo_fold_count"]
-
-
-def test_malformed_positive_evidence_is_technical_not_no_trade(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    raw["folds"][0]["lanes"]["optimizer_train_base"]["position_events"][0][
-        "trade_record_schema_version"
-    ] = "stale"
-
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete, match="ATTEMPT_TECHNICAL_EVIDENCE_FAILURE"
-    ):
-        _produce(sink, frozen, [raw])
+@pytest.mark.parametrize("changed", ["frame", "source", "attestation", "observations", "admission"])
+def test_compact_partition_cost_transport_rejects_conflicting_geometry(changed):
+    case = _partition_transport_case()
+    first, duplicate = case["rows"][0], case["rows"][4 * 3]
+    assert first["partition_geometry_receipt_sha256"] == duplicate["partition_geometry_receipt_sha256"]
+    original_record = copy.deepcopy({key: duplicate[key] for key in (
+        "partition_frame_sha256", "source_observation_receipt_sha256", "tiers")})
+    if changed in {"frame", "source"}:
+        field = "partition_frame_sha256" if changed == "frame" else "source_observation_receipt_sha256"
+        duplicate[field] = _sha(["ALTERED_REPEATED_GEOMETRY", field])
+    elif changed == "attestation":
+        duplicate["tiers"]["P75"]["numerical_execution_cost_attestation"] = copy.deepcopy(
+            duplicate["tiers"]["P95"]["numerical_execution_cost_attestation"])
+    else:
+        field = "entry_observations_sha256" if changed == "observations" else "entry_admission_mask_sha256"
+        duplicate["tiers"]["P75"][field] = _sha(["ALTERED_REPEATED_GEOMETRY", field])
+    assert {key: duplicate[key] for key in original_record} != original_record
+    with pytest.raises(raw.WinnerRawEvidenceError, match="^PARTITION_COST_PRECOMMITMENTS_RECORD_CONFLICT$"):
+        raw.build_partition_cost_precommitments(case["rows"], pair=case["pair"])
 
 
-def test_cost_stress_identity_tamper_is_technical(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    raw["folds"][0]["lanes"]["final_lockbox_stress"]["position_events"][0][
-        "position_id"
-    ] = "tampered-position"
+def test_compact_partition_cost_transport_rejects_rebound_pair_policy():
+    case = _partition_transport_case()
+    body = raw.build_partition_cost_precommitments(case["rows"], pair=case["pair"])
+    changed_pair = copy.deepcopy(case["pair"])
+    changed_pair["tiers"][0]["numerical_execution_cost_policy"]["instrument_spec_sha256"] = _sha("ALTERED_POLICY_SPEC")
+    body["frozen_tier_pair_contract_sha256"] = _sha(changed_pair)
+    body = _reseal(body)
+    with pytest.raises(raw.WinnerRawEvidenceError) as exc:
+        raw._validated_partition_cost_precommitments(body, pair=changed_pair,
+            attempts=case["attempts"], folds=case["folds"])
+    assert exc.value.code == "PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID_POLICY_DRIFT"
 
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete, match="ATTEMPT_TECHNICAL_EVIDENCE_FAILURE"
-    ):
-        _produce(sink, frozen, [raw])
+
+def test_compact_partition_cost_transport_binds_actual_source_receipt_before_reopen():
+    """Header-only unit: a valid reseal cannot replace the consumed source receipt hash."""
+    case = _partition_transport_case(attempt_count=1, fold_count=1)
+    semantic = case["rows"][0]
+    receipt = _reseal({"schema_version": raw.SOURCE_OBSERVATIONS_SCHEMA, "symbol": "EURUSD", "timeframe": "D1",
+        "source_timeframe": "D1", "source_product": {}, "observations": [],
+        "entry_observations_sha256": semantic["tiers"]["P75"]["entry_observations_sha256"]})
+    semantic["source_observation_receipt_sha256"] = receipt["receipt_sha256"]
+    body = raw.build_partition_cost_precommitments(case["rows"], pair=case["pair"])
+    geometry = body["rows"][0]["partition_geometry_receipt_sha256"]
+    body["records"][geometry]["source_observation_receipt_sha256"] = _sha("ALTERED_SOURCE_RECEIPT")
+    body = _validate_partition_transport(_reseal(body), case)
+    expanded = raw.expand_partition_cost_precommitment(body, body["rows"][0], pair=case["pair"])
+    assert expanded["source_observation_receipt_sha256"] != receipt["receipt_sha256"]
+    class Forbidden:
+        def __getattribute__(self, name):
+            pytest.fail("source-hash mismatch reached native reopening or account evidence")
+    with pytest.raises(raw.WinnerRawEvidenceError, match="^SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID$"):
+        raw._validated_source_observation_receipt(receipt, sink=Forbidden(),
+            frozen=SimpleNamespace(symbol="EURUSD", timeframe="D1"),
+            expected_sha256=expanded["source_observation_receipt_sha256"], partition="optimizer_train",
+            signals=Forbidden(), lanes=Forbidden())
+
+
+def test_compact_partition_cost_transport_fits_canonical300_four_fold_shape():
+    """Measured structural encoding only: 300x4x3 distinct records, no actual fits or market claim."""
+    case = _partition_transport_case(attempt_count=300, fold_count=4, unique_geometry=True)
+    body = raw.build_partition_cost_precommitments(case["rows"], pair=case["pair"])
+    encoded = _canonical(body)
+    assert winner.MAX_REQUEST_BYTES == 16 * 1024 * 1024
+    assert len(encoded) <= winner.MAX_REQUEST_BYTES
+    restored = _validate_partition_transport(json.loads(encoded), case)
+    assert _canonical(restored) == encoded
+    assert len(restored["rows"]) == len(restored["records"]) == 300 * 4 * 3
+    assert sum(len(record["tiers"]) for record in restored["records"].values()) == 300 * 4 * 3 * 2
+    original_hash, expanded_hash = hashlib.sha256(), hashlib.sha256()
+    for stored, expected in zip(restored["rows"], case["rows"], strict=True):
+        expanded = raw.expand_partition_cost_precommitment(restored, stored, pair=case["pair"])
+        assert expanded == expected
+        original_hash.update(_canonical(expected) + b"\n")
+        expanded_hash.update(_canonical(expanded) + b"\n")
+    assert expanded_hash.digest() == original_hash.digest()
+
+
+def test_current_packed_r_transport_refuses_non_grid_values():
+    quantum = Decimal(1).scaleb(-RISK_CONTRACT["r_decimal_places"])
+    with pytest.raises(raw.WinnerRawEvidenceError, match="TIER_R_NOT_EXACT_E12"):
+        raw._packed_r_e12_vector([float(Decimal(1) + quantum / 2)], maximum_abs_r=winner.MAX_ABS_DAILY_R, code="TIER_R_NOT_EXACT_E12")
+
+
+def test_current_completed_trade_transport_keeps_own_axes_and_limits():
+    start, end = datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2024, 2, 1, tzinfo=timezone.utc)
+    assert raw._tier_event_vectors([], fold_start=start, fold_end_exclusive=end) == ([], [], [], [], [], [])
+    with pytest.raises(raw.WinnerRawEvidenceError, match="TIER_COMPLETED_POSITION_ROSTER_INVALID"):
+        raw._tier_event_vectors([{}] * (winner.MAX_TRADES_PER_FOLD + 1), fold_start=start, fold_end_exclusive=end)
+
+
+def test_public_archive_schema_aliases_preserve_original_meanings():
+    assert raw.FROZEN_PLAN_SCHEMA == "fxpm.winner-search-plan-frozen.v3"
+    assert raw.PRODUCTION_SCHEMA == "fxpm.winner-raw-evidence-production.v4"
+    assert raw.RAW_LANE_SCHEMA == "fxpm.winner-raw-backtester-lane.v4"
+    assert raw.AUTHORITATIVE_PROVENANCE_SCHEMA == "fxpm.authoritative-search-provenance.v3"
+    assert raw.CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA == "fxpm.authoritative-search-provenance.v4"
+    assert raw.REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA == "fxpm.authoritative-search-provenance.v5"
+    assert raw.CURRENT_FROZEN_PLAN_SCHEMA == "fxpm.winner-search-plan-frozen.v4"
+    assert raw.CURRENT_PRODUCTION_SCHEMA == "fxpm.winner-raw-evidence-production.v5"
+
+
+@pytest.fixture(scope="module")
+def original_v14_archive(tmp_path_factory):
+    from tests.test_forward_oos_replay_producer import load_retained_raw_transport
+    context, anchor, packet, artifact = load_retained_raw_transport(
+        tmp_path_factory.mktemp("original-v14-archive"), version="v1")
+    owner = packet["owner_source"]
+    symbol = owner["symbol_receipt"]["symbol"]
+    _, entries = forward._verified_manifest(context, owner["symbol_receipt"], symbol)
+    prefix = f"historical-anchor/historical-run-001/{anchor['anchor_id']}/winner-search/D1/TREND"
+    def read(suffix):
+        entry = entries[prefix + suffix]
+        _, data = forward.native_prefix._read_spool_descriptor(context, entry["descriptor"],
+            expected_format=entry["descriptor"]["format"], collect=True)
+        return json.loads(data), entry
+    receipt, receipt_entry = read("/frozen/receipt")
+    assert receipt["schema_version"] == raw.FROZEN_PLAN_SCHEMA
+    names = {"precommitment": "precommitment_bytes", "attempt_ledger": "attempt_ledger_bytes",
+        "source_contract_seed": "source_contract_seed_bytes", "cost_ladder_contract": "cost_ladder_contract_bytes",
+        "risk_unit_contract": "risk_unit_contract_bytes", "cost_ladder_adversity_plan": "cost_ladder_adversity_plan_bytes",
+        "horizon_execution_contracts": "horizon_execution_contracts_bytes"}
+    fields = {}
+    for name, field in names.items():
+        body, entry = read("/frozen/" + name)
+        assert entry["descriptor"] == receipt["artifact_roster"][name]
+        fields[field] = _canonical(body)
+    frozen = raw.FrozenWinnerSearchPlan(symbol=receipt["symbol"], timeframe=receipt["timeframe"],
+        regime=receipt["regime"], artifact_namespace=receipt["artifact_namespace"],
+        generation_context_sha256=context.context_sha256, frozen_receipt_bytes=_canonical(receipt),
+        frozen_receipt_entry_bytes=_canonical(receipt_entry), **fields)
+    request_body, request_entry = read("/authority/winner-request")
+    decision_body, decision_entry = read("/authority/winner-decision")
+    production_receipt, _ = read("/authority/production-receipt")
+    assert production_receipt["artifact_roster"]["winner-request"] == request_entry["descriptor"]
+    lanes = {name: read("/attempt-0000/fold-000/raw/" + name)[0] for name in (
+        "optimizer_train_base", "tuning_validation_base", "final_lockbox_base", "final_lockbox_p75", "final_lockbox_p95")}
+    process = read("/frozen/attempt-0000/winner_process")[0]
+    replay = read("/attempt-0000/fold-000/provenance/attempt_replay_receipt")[0]
+    return dict(context=context, frozen=frozen, lanes=lanes, process=process, replay=replay,
+        request_body=request_body, request_entry=request_entry, decision_body=decision_body,
+        decision_entry=decision_entry, production_receipt=production_receipt,
+        packet=packet, artifact=artifact, anchor=anchor)
+
+
+def test_original_v14_request_and_decision_reopen_without_old_writer(original_v14_archive):
+    case = original_v14_archive
+    # The request binding hashes its three payload hashes; it is not the
+    # serialized wrapper artifact's content hash.
+    request = forward._winner_request(case["request_body"], case["production_receipt"]["request_sha256"])
+    decision = forward._winner_decision(case["decision_body"], request, case["decision_body"]["receipt_sha256"])
+    assert request.to_dict()["contract_version"] == winner.ARCHIVED_GENERATION.request_version
+    assert decision.to_dict()["contract_version"] == winner.ARCHIVED_GENERATION.selection_version
+    assert case["frozen"].precommitment["selection_policy_sha256"] == winner.ARCHIVED_GENERATION.policy_sha256
+    assert case["frozen"].frozen_tier_pair_contract_bytes == b""
+
+
+def test_original_v14_method_receipt_reopens_original_five_accounts(original_v14_archive):
+    case = original_v14_archive
+    receipt = case["replay"]["cost_ladder_method_receipt"]
+    assert raw._validated_cost_ladder_method_receipt(receipt, frozen=case["frozen"],
+        attempt_artifacts={"winner_process": case["process"]}, lanes=case["lanes"]) == receipt
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("policy", "WINNER_REQUEST_RAW_REPLAY_FAILED"),
+    ("receipt", "COST_LADDER_METHOD_RECEIPT_BINDING_INVALID"),
+    ("reprice", "COST_LADDER_METHOD_LEVEL_BINDING_INVALID"),
+    ("trade_projection", "COST_LADDER_METHOD_BASE_TRADE_POSITION_RECONCILIATION_INVALID"),
+])
+def test_original_archive_resealed_tamper_does_not_become_new_authority(original_v14_archive, mutation, expected):
+    case = original_v14_archive
+    if mutation == "policy":
+        request = copy.deepcopy(case["request_body"])
+        wrapper = request["precommitment"]
+        wrapper["payload"]["selection_policy_sha256"] = winner.CURRENT_GENERATION.policy_sha256
+        wrapper["payload_sha256"] = _sha(wrapper["payload"])
+        with pytest.raises(forward.ForwardOOSReplayProductionError, match=expected):
+            forward._winner_request(request, _sha(request))
+        return
+    receipt = copy.deepcopy(case["replay"]["cost_ladder_method_receipt"])
+    lanes = copy.deepcopy(case["lanes"])
+    if mutation == "receipt":
+        receipt["base_entry_half_spread_values_sha256"] = "0" * 64
+    elif mutation == "reprice":
+        receipt["levels"][0]["entry_half_spread_values_sha256"] = "0" * 64
+        level = receipt["levels"][0]
+        level["level_receipt_sha256"] = _sha({key: value for key, value in level.items() if key != "level_receipt_sha256"})
+    else:
+        assert lanes["final_lockbox_base"]["trade_identity_pnl"]
+        lanes["final_lockbox_base"]["trade_identity_pnl"][0]["pnl_dollars"] += 1
+    receipt = _reseal(receipt)
+    with pytest.raises(raw.WinnerRawEvidenceError, match=expected):
+        raw._validated_cost_ladder_method_receipt(receipt, frozen=case["frozen"],
+            attempt_artifacts={"winner_process": case["process"]}, lanes=lanes)
 
 
 class _OneTradeStrategy:
@@ -2276,75 +1319,22 @@ class _OneTradeStrategy:
     def calculate_stops(self, *_args, **_kwargs):
         return 10.0, 10.0
 
-
-def test_core_returns_authenticated_no_numerical_shock_after_full_replay() -> None:
-    config = PipelineConfig(
-        use_spread=True,
-        swap_model_enabled=False,
-        backtest_spread_mode="conservative_max",
-    )
-    backtester = Backtester(config)
-    index = pd.date_range("2024-01-01T00:00:00Z", periods=4, freq="h")
-    features = pd.DataFrame(
-        {
-            "Open": [100.0, 100.0, 100.0, 100.0],
-            "High": [100.0, 100.2, 100.0, 100.0],
-            "Low": [100.0, 99.95, 100.0, 100.0],
-            "Close": [100.0, 100.1, 100.0, 100.0],
-            "Volume": [100, 100, 100, 100],
-            "Spread": [1.0, 1.0, 1.0, 1.0],
-            "_BAR_CLOSE_TS": index + pd.Timedelta(hours=1),
-        },
-        index=index,
-    )
-    signals = pd.Series([1, 0, 0, 0], index=index)
-    spec = InstrumentSpec(
-        symbol="EURUSD",
-        pip_position=2,
-        pip_value=10.0,
-        spread_avg=1.0,
-    )
-    base = backtester.run(
-        features,
-        signals,
-        "EURUSD",
-        _OneTradeStrategy(),
-        spec=spec,
-        timeframe="H1",
-    )
-    assert base["position_events"]
-
-    stress = backtester.replay_frozen_path_cost_stress(
-        features,
-        signals,
-        "EURUSD",
-        _OneTradeStrategy(),
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="H1",
-    )
-
-    receipt = stress["cost_stress_frozen_path_receipt"]
-    assert receipt["schema_version"] == (
-        BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION
-    )
-    assert receipt["realized_adversity_status"] == (
-        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
-    assert receipt["base_spread_values_sha256"] == (
-        receipt["stress_spread_values_sha256"]
-    )
-    assert receipt["strictly_worse_trade_count"] == 0
-    assert receipt["strictly_worse_daily_observation_count"] == 0
-    assert stress["position_events"] == base["position_events"]
-    assert stress["winner_daily_r_surface"] == base["winner_daily_r_surface"]
-
+def test_retired_zero_spread_multiplier_replay_refuses_execution() -> None:
+    """Replaces the retired zero-base-spread/full-multiplier-replay success case."""
+    backtester = Backtester(PipelineConfig(use_spread=True, swap_model_enabled=False))
+    with pytest.raises(
+        ValueError,
+        match="^RETIRED_MULTIPLIER_COST_POLICY_INTERVAL_QUALIFICATION_REQUIRED$",
+    ):
+        backtester.replay_frozen_path_cost_ladder(
+            None, None, "EURUSD", None, None, timeframe="H1",
+        )
 
 def test_real_backtester_position_events_feed_daily_surface() -> None:
     config = PipelineConfig(
         use_spread=False,
         swap_model_enabled=False,
+        backtest_spread_mode="historical_bar",
     )
     backtester = Backtester(config)
     index = pd.date_range("2024-01-01T00:00:00Z", periods=4, freq="h")
@@ -2385,300 +1375,3 @@ def test_real_backtester_position_events_feed_daily_surface() -> None:
             for event in result["position_events"]
         )
     )
-
-
-NAMESPACE = "historical-anchor/run-001/anchor-000"
-
-
-def test_namespace_prefixes_every_artifact_and_binds_receipt(
-    tmp_path: Path,
-) -> None:
-    context, sink, frozen = _freeze(tmp_path, artifact_namespace=NAMESPACE)
-    assert frozen.artifact_namespace == NAMESPACE
-    receipt = json.loads(frozen.frozen_receipt_bytes.decode("ascii"))
-    assert receipt["artifact_namespace"] == NAMESPACE
-    assert all(
-        descriptor["relative_path"]
-        for descriptor in receipt["artifact_roster"].values()
-    )
-
-    produced = _produce(
-        sink, frozen, [_attempt_evidence(frozen)], artifact_namespace=NAMESPACE
-    )
-    assert produced.decision.to_dict()["validated"] is True
-    sealed = sink.seal()
-    manifest = spool.verify_symbol_receipt(
-        context.root,
-        sealed,
-        expected_generation_id=context.generation_id,
-        expected_symbol="EURUSD",
-        expected_native_universe_sha256=context.native_universe_sha256,
-        expected_config_sha256=context.config_sha256,
-    )
-    prefixed = f"{NAMESPACE}/winner-search/"
-    assert all(
-        entry["artifact_id"].startswith(prefixed) for entry in manifest["artifacts"]
-    )
-
-
-def test_second_anchor_namespace_shares_one_sink_without_collision(
-    tmp_path: Path,
-) -> None:
-    context, sink, first = _freeze(
-        tmp_path, artifact_namespace="historical-anchor/run-001/anchor-000"
-    )
-    _, _, second = _freeze(
-        tmp_path,
-        artifact_namespace="historical-anchor/run-001/anchor-001",
-        sink=sink,
-        context=context,
-    )
-    assert first.artifact_namespace != second.artifact_namespace
-    roster_first = json.loads(first.frozen_receipt_bytes.decode("ascii"))
-    roster_second = json.loads(second.frozen_receipt_bytes.decode("ascii"))
-    assert set(roster_first["artifact_roster"]) == set(roster_second["artifact_roster"])
-
-
-def test_namespace_mismatch_fails_closed(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path, artifact_namespace=NAMESPACE)
-    with pytest.raises(WinnerRawEvidenceError, match="ARTIFACT_NAMESPACE_MISMATCH"):
-        _produce(sink, frozen, [_attempt_evidence(frozen)])
-    with pytest.raises(WinnerRawEvidenceError, match="ARTIFACT_NAMESPACE_MISMATCH"):
-        _produce(
-            sink,
-            frozen,
-            [_attempt_evidence(frozen)],
-            artifact_namespace="historical-anchor/run-001/anchor-999",
-        )
-
-
-def test_invalid_namespace_rejected(tmp_path: Path) -> None:
-    with pytest.raises(WinnerRawEvidenceError, match="ARTIFACT_NAMESPACE_INVALID"):
-        _freeze(tmp_path, artifact_namespace="bad//segment")
-    with pytest.raises(WinnerRawEvidenceError, match="ARTIFACT_NAMESPACE_INVALID"):
-        _freeze(tmp_path, artifact_namespace="/leading-slash")
-
-
-def _freeze_single(tmp_path, artifact):
-    context, sink = _context(tmp_path)
-    first_plan = _fold_plan()[0]
-    seed_result = _raw_fold(attempt_ordinal=0, fold_ordinal=0, planned=first_plan)[
-        "lanes"
-    ]["optimizer_train_base"]
-    seed_result["numerical_execution_cost_attestation"] = _genuine_partition_cost(
-        label="single-source-seed-precommit",
-        bars=19,
-        stress=False,
-    )
-    return freeze_winner_search_plan_v3(
-        sink,
-        symbol="EURUSD",
-        timeframe="H1",
-        regime="TREND",
-        precommitted_at_utc="2020-01-01T00:00:00Z",
-        attempts_frozen_at_utc="2020-01-02T00:00:00Z",
-        fold_plan=_fold_plan(),
-        attempt_artifacts=[artifact],
-        precommitted_evidence_roles=["EVALUATION_REQUIRED"],
-        horizon_execution_contracts=[
-            {
-                "lookback_kind": "NATIVE_OBSERVATIONS",
-                "lookback_value": 5_000,
-                "source_bar_count": 5_000,
-            }
-        ],
-        source_contract_seed=build_trade_source_contract_from_backtester_result(
-            seed_result
-        ),
-        base_cost_contract=BASE_COST_POLICY,
-        stress_cost_contract=STRESS_COST_POLICY,
-        risk_unit_contract=RISK_CONTRACT,
-        cost_stress_adversity_plan=_cost_stress_adversity_plan(
-            attempts=1,
-            roles=["EVALUATION_REQUIRED"],
-        ),
-    )
-
-
-def _forged(mutate):
-    artifact = _attempt_artifact(0)
-    mutate(artifact)
-    return artifact
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        # caller-chosen candidate identity
-        lambda a: a["winner_process"].__setitem__("process_candidate_id", "0" * 40),
-        # forged executable code pin
-        lambda a: a["winner_process"].__setitem__("strategy_code_sha256", "b" * 64),
-        # invented strategy class on a real strategy id
-        lambda a: a["winner_process"].__setitem__("strategy_class", "InventedStrategy"),
-        # invented strategy id (no executable process exists)
-        lambda a: [
-            body.__setitem__("strategy_id", "strategy-0")
-            for body in (
-                a["winner_process"],
-                a["trial_definition"],
-                a["refit_recipe"],
-            )
-        ],
-        # non-grid fixed default mutated (never searchable)
-        lambda a: a["trial_definition"]["parameters"].__setitem__(
-            "structural_sl_lookback", 27
-        ),
-        # forged entry-rule identity
-        lambda a: a["winner_process"].__setitem__(
-            "entry_rule_identity_sha256", "c" * 64
-        ),
-        # minimal (keyset-stripped) process body
-        lambda a: a.__setitem__(
-            "winner_process",
-            {
-                name: a["winner_process"][name]
-                for name in (
-                    "schema_version",
-                    "process_candidate_id",
-                    "strategy_id",
-                    "strategy_family",
-                )
-            },
-        ),
-    ],
-)
-def test_forged_attempt_artifacts_are_rejected(tmp_path: Path, mutate) -> None:
-    with pytest.raises(WinnerRawEvidenceError, match="ARTIFACT_UNVERIFIABLE"):
-        _freeze_single(tmp_path, _forged(mutate))
-
-
-def test_tuple_and_list_grid_strategy_freezes(tmp_path: Path) -> None:
-    frozen = _freeze_single(
-        tmp_path, _attempt_artifact(0, strategy_id="RegimeTransitionBreakoutStrategy")
-    )
-    attempt = frozen.attempt_ledger["attempts"][0]
-    assert attempt["strategy_id"] == "RegimeTransitionBreakoutStrategy"
-
-
-def test_frozen_receipt_entry_is_the_genuine_sink_entry(tmp_path: Path) -> None:
-    context, sink, frozen = _freeze(tmp_path, artifact_namespace=NAMESPACE)
-    entry = frozen.frozen_receipt_entry
-    expected_id = f"{NAMESPACE}/winner-search/H1/TREND/frozen/receipt"
-    assert entry["artifact_id"] == expected_id
-    assert entry["artifact_type"] == "winner_frozen_search_plan_receipt"
-    assert (
-        entry["descriptor"]["sha256"]
-        == hashlib.sha256(frozen.frozen_receipt_bytes).hexdigest()
-    )
-    sealed = sink.seal()
-    manifest = spool.verify_symbol_receipt(
-        context.root,
-        sealed,
-        expected_generation_id=context.generation_id,
-        expected_symbol="EURUSD",
-        expected_native_universe_sha256=context.native_universe_sha256,
-        expected_config_sha256=context.config_sha256,
-    )
-    registered = {item["artifact_id"]: item for item in manifest["artifacts"]}
-    assert registered[expected_id] == entry
-
-
-def test_post_freeze_receipt_reseal_conflicts_with_original_sink(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    receipt = json.loads(frozen.frozen_receipt_bytes.decode("ascii"))
-    receipt["schema_version"] = "attacker-resealed-after-freeze"
-    forged_receipt_bytes = _canonical(receipt)
-    forged_entry = json.loads(frozen.frozen_receipt_entry_bytes.decode("ascii"))
-    forged_entry["descriptor"]["sha256"] = hashlib.sha256(
-        forged_receipt_bytes
-    ).hexdigest()
-    forged = replace(
-        frozen,
-        frozen_receipt_bytes=forged_receipt_bytes,
-        frozen_receipt_entry_bytes=_canonical(forged_entry),
-    )
-
-    with pytest.raises(spool.AuthoritySpoolError, match="ARTIFACT_ID_CONFLICT"):
-        _produce(sink, forged, [_attempt_evidence(forged)])
-
-
-def test_cost_stress_adversity_plan_is_run_bound_and_reopened(
-    tmp_path: Path,
-) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    plan = frozen.cost_stress_adversity_plan
-    plan_sha256 = _sha(plan)
-    receipt = json.loads(frozen.frozen_receipt_bytes.decode("ascii"))
-    (tmp_path / "alternate").mkdir()
-    _, _, alternate = _freeze(
-        tmp_path / "alternate",
-        no_shock_pairs={(0, 0)},
-    )
-
-    assert alternate.precommitment["run_id"] != frozen.precommitment["run_id"]
-    assert receipt["cost_stress_adversity_plan_sha256"] == plan_sha256
-    assert (
-        receipt["artifact_roster"]["cost_stress_adversity_plan"]["sha256"]
-        == plan_sha256
-    )
-
-    plan["rows"][0]["final_partition_frame_sha256"] = "f" * 64
-    plan["rows_sha256"] = _sha(plan["rows"])
-    forged = replace(
-        frozen,
-        cost_stress_adversity_plan_bytes=_canonical(plan),
-    )
-    with pytest.raises(
-        WinnerRawEvidenceError,
-        match="FROZEN_PLAN_RECEIPT_MISMATCH",
-    ):
-        _produce(sink, forged, [_attempt_evidence(frozen)])
-
-
-def test_namespace_maximum_length_bound(tmp_path: Path) -> None:
-    segment = "p" * 128
-    at_cap = "/".join([segment, segment, segment, "q" * 125])
-    assert len(at_cap) == 512
-    _, _, frozen = _freeze(tmp_path, artifact_namespace=at_cap)
-    assert frozen.artifact_namespace == at_cap
-    over_cap = "/".join([segment, segment, segment, "q" * 126])
-    with pytest.raises(WinnerRawEvidenceError, match="ARTIFACT_NAMESPACE_INVALID"):
-        _freeze(tmp_path, artifact_namespace=over_cap)
-
-
-def test_out_of_order_final_events_fail_with_typed_code(tmp_path: Path) -> None:
-    _, sink, frozen = _freeze(tmp_path)
-    raw = _attempt_evidence(frozen)
-    lanes = raw["folds"][0]["lanes"]
-    for lane in ("final_lockbox_base", "final_lockbox_stress"):
-        events = lanes[lane]["position_events"]
-        events[0], events[1] = events[1], events[0]
-    with pytest.raises(
-        WinnerRawEvidenceIncomplete, match="ATTEMPT_TECHNICAL_EVIDENCE_FAILURE"
-    ):
-        _produce(sink, frozen, [raw])
-
-
-def test_registry_commitments_derive_from_frozen_bytes(tmp_path: Path) -> None:
-    _, _, frozen = _freeze(tmp_path)
-    commitments = frozen.registry_commitments()
-    precommitment = frozen.precommitment
-    assert commitments["run_id"] == precommitment["run_id"]
-    assert (
-        commitments["process_registry_sha256"]
-        == precommitment["process_registry_sha256"]
-    )
-    assert (
-        commitments["causal_fold_plan_sha256"]
-        == precommitment["causal_fold_plan_sha256"]
-    )
-    assert commitments["precommitment_sha256"] == _sha(precommitment)
-    receipt = json.loads(frozen.frozen_receipt_bytes.decode("ascii"))
-    for name in (
-        "process_registry_sha256",
-        "horizon_registry_sha256",
-        "trial_registry_sha256",
-    ):
-        assert receipt[name] == commitments[name]

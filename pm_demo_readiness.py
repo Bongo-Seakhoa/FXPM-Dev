@@ -114,6 +114,19 @@ class _DemoManagementBinding:
 class DemoProbationReadinessReport(ReadinessReport):
     _execution_binding: Optional[_DemoExecutionBinding] = None
     _management_binding: Optional[_DemoManagementBinding] = None
+    _management_projection_json: str = ""
+
+    @property
+    def management_only(self) -> bool:
+        return (not self.ok and _only_interval_entry_policy_block(self.findings)
+                and self._management_binding is not None
+                and bool(self._management_projection_json))
+
+    @property
+    def management_projection(self) -> Dict[str, Dict[str, Any]]:
+        if not self.management_only:
+            return {}
+        return json.loads(self._management_projection_json)
 
     @property
     def execution_ledger_sha256(self) -> Optional[str]:
@@ -193,6 +206,19 @@ class DemoProbationReadinessReport(ReadinessReport):
 
 
 _TIMEFRAMES = ("M5", "M15", "M30", "H1", "H4", "D1")
+
+
+def _only_interval_entry_policy_block(findings) -> bool:
+    errors = [item for item in findings if item.severity == "error"]
+    return (len(errors) == 1
+            and errors[0].code == "interval_cell_qualification_policy_unadopted"
+            and errors[0].scope == "evidence")
+
+
+def _demo_management_binding_checks_pass(report) -> bool:
+    # This entry-policy exception keeps all other management checks mandatory.
+    return (report._execution_binding is not None
+            and (not report.errors or _only_interval_entry_policy_block(report.findings)))
 _REGIMES = ("TREND", "RANGE", "BREAKOUT", "CHOP")
 _ROSTER_FIELDS = (
     "selected_cell_ids",
@@ -1232,6 +1258,13 @@ def validate_demo_probation_readiness(
         "demo_cost_contract_invalid",
         "DEMO probation requires spread and swap modeling",
     )
+    add(
+        "error",
+        "interval_cell_qualification_policy_unadopted",
+        "new entries require the adopted interval cell qualification policy; "
+        "the previous multiplier cost evidence is retired",
+        "evidence",
+    )
 
     config_file = Path(config_path).resolve()
     config_sha: Optional[str] = None
@@ -1415,7 +1448,8 @@ def validate_demo_probation_readiness(
     for error in demo_account_errors(account_info):
         add("error", error.lower(), error, "runtime")
     execution_binding: Optional[_DemoExecutionBinding] = None
-    if not any(finding.severity == "error" for finding in findings):
+    if (not any(finding.severity == "error" for finding in findings)
+            or _only_interval_entry_policy_block(findings)):
         try:
             if (
                 not isinstance(ledger, Mapping)
@@ -1482,7 +1516,7 @@ def _capture_demo_management_authority(
         reverify_demo_management_capsule,
     )
 
-    if not report.ok or report._execution_binding != binding:
+    if not _demo_management_binding_checks_pass(report) or report._execution_binding != binding:
         raise ValueError("DEMO_MANAGEMENT_EXECUTION_AUTHORITY_INVALID")
     authority = json.loads(binding.authority_result_json)
     if (
@@ -1586,7 +1620,7 @@ def authorize_demo_probation_execution(
         account_info=account_info,
         position_config=position_config,
     )
-    if not first_report.ok or first_report._execution_binding is None:
+    if not _demo_management_binding_checks_pass(first_report):
         return first_report, None
     report = validate_demo_probation_readiness(
         config,
@@ -1597,7 +1631,7 @@ def authorize_demo_probation_execution(
         position_config=position_config,
     )
     binding = report._execution_binding
-    if not report.ok or binding is None:
+    if not _demo_management_binding_checks_pass(report):
         return report, None
     if binding != first_report._execution_binding:
         report.findings.append(
@@ -1723,6 +1757,11 @@ def authorize_demo_probation_execution(
         report.ok = False
         report._execution_binding = None
         report._management_binding = None
+        return report, None
+    if _only_interval_entry_policy_block(report.findings):
+        report._management_projection_json = _canonical_json_text(projection)
+        # Preserve the public failed-entry contract. Only the verified management
+        # context is available through its explicitly named report property.
         return report, None
     return report, projection
 

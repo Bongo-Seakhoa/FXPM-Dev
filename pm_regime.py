@@ -6,20 +6,21 @@ Market regime detection with:
 - 4 regimes: TREND, RANGE, BREAKOUT, CHOP
 - Per-regime strength scores (0-1)
 - Gap calculation (top - second) for crossover awareness
-- Hysteresis state machine (k_confirm, gap_min, k_hold)
+- Symmetric accumulated-evidence confirmation and carried stream state
 - Causal computation (no lookahead)
 - REGIME_LIVE shift for backtest/live parity
 - Numba JIT compilation for performance-critical loops
 
-This module is called from the pipeline layer (not FeatureComputer) so that
-symbol/timeframe-specific parameters can be loaded and applied.
+The pipeline and FeatureComputer share this canonical detector and its
+symbol/timeframe-specific parameters.
 
-Version: 3.1 (Portfolio Manager - Numba optimizations)
+Version: causal classifier v2, R4 reconstruction from the accepted review narrative
 """
 
 import hashlib
 import json
 import logging
+import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from numba import jit, prange
+    from numba.extending import register_jitable
     NUMBA_AVAILABLE = True
     logger.debug("Numba JIT compilation available - using optimized loops")
 except Exception:
@@ -51,195 +53,9 @@ except Exception:
         def decorator(func):
             return func
         return decorator
+    def register_jitable(func):
+        return func
     prange = range
-
-
-# =============================================================================
-# NUMBA JIT-COMPILED FUNCTIONS (10x speedup for critical loops)
-# =============================================================================
-
-@jit(nopython=True, cache=True)
-def _hysteresis_loop_numba(regime_raw_int: np.ndarray, 
-                           gap: np.ndarray,
-                           k_confirm: int, 
-                           gap_min: float, 
-                           k_hold: int) -> np.ndarray:
-    """
-    Numba JIT-compiled hysteresis state machine.
-    
-    Provides ~10x speedup over pure Python for large arrays.
-    
-    Args:
-        regime_raw_int: Integer-encoded regime labels (0=TREND, 1=RANGE, 2=BREAKOUT, 3=CHOP)
-        gap: Gap between top and second regime scores
-        k_confirm: Bars required to confirm switch
-        gap_min: Minimum gap required to switch
-        k_hold: Minimum bars to hold regime
-        
-    Returns:
-        Integer-encoded final regime labels
-    """
-    n = len(regime_raw_int)
-    regime_final = np.zeros(n, dtype=np.int32)
-    
-    if n == 0:
-        return regime_final
-    
-    # State tracking
-    current_regime = regime_raw_int[0]
-    bars_in_current = 0
-    candidate_regime = -1
-    candidate_count = 0
-    
-    for i in range(n):
-        raw = regime_raw_int[i]
-        
-        # First bar: initialize
-        if i == 0:
-            current_regime = raw if raw >= 0 else 3  # Default to CHOP
-            bars_in_current = 1
-            regime_final[i] = current_regime
-            continue
-        
-        bars_in_current += 1
-        
-        # Check if raw regime is different from current
-        if raw != current_regime and raw >= 0:
-            # Check if gap is sufficient
-            if gap[i] >= gap_min:
-                # Track candidate
-                if raw == candidate_regime:
-                    candidate_count += 1
-                else:
-                    candidate_regime = raw
-                    candidate_count = 1
-                
-                # Check if confirmed
-                if candidate_count >= k_confirm and bars_in_current >= k_hold:
-                    current_regime = candidate_regime
-                    bars_in_current = 1
-                    candidate_regime = -1
-                    candidate_count = 0
-            else:
-                # Gap too small, reset candidate
-                candidate_regime = -1
-                candidate_count = 0
-        else:
-            # Same regime or invalid, reset candidate
-            candidate_regime = -1
-            candidate_count = 0
-        
-        regime_final[i] = current_regime
-    
-    return regime_final
-
-
-@jit(nopython=True, cache=True)
-def _compute_whipsaw_numba(open_p: np.ndarray, high: np.ndarray, 
-                           low: np.ndarray, close: np.ndarray, 
-                           period: int) -> np.ndarray:
-    """
-    Numba JIT-compiled whipsaw/wickiness computation.
-    
-    Replaces nested Python loops with fast native code.
-    """
-    n = len(close)
-    whipsaw = np.zeros(n)
-    
-    for i in range(period, n):
-        total_wick = 0.0
-        total_range = 0.0
-        
-        for j in range(i - period + 1, i + 1):
-            bar_range = high[j] - low[j]
-            
-            if bar_range > 1e-10:
-                body_top = max(open_p[j], close[j])
-                body_bottom = min(open_p[j], close[j])
-                upper_wick = high[j] - body_top
-                lower_wick = body_bottom - low[j]
-                total_wick += upper_wick + lower_wick
-                total_range += bar_range
-        
-        if total_range > 1e-10:
-            whipsaw[i] = total_wick / total_range
-    
-    return whipsaw
-
-
-@jit(nopython=True, cache=True)
-def _compute_direction_flips_numba(close: np.ndarray, period: int) -> np.ndarray:
-    """
-    Numba JIT-compiled direction flip frequency computation.
-    
-    Replaces nested Python loops with fast native code.
-    """
-    n = len(close)
-    flips = np.zeros(n)
-    
-    for i in range(period + 1, n):
-        flip_count = 0
-        for j in range(i - period + 1, i):
-            prev_change = close[j] - close[j - 1]
-            curr_change = close[j + 1] - close[j]
-            
-            # Determine directions
-            if prev_change > 0:
-                prev_dir = 1
-            elif prev_change < 0:
-                prev_dir = -1
-            else:
-                prev_dir = 0
-            
-            if curr_change > 0:
-                curr_dir = 1
-            elif curr_change < 0:
-                curr_dir = -1
-            else:
-                curr_dir = 0
-            
-            if prev_dir != 0 and curr_dir != 0 and prev_dir != curr_dir:
-                flip_count += 1
-        
-        flips[i] = flip_count / max(1, period - 1)
-    
-    return flips
-
-
-@jit(nopython=True, cache=True)
-def _compute_structure_break_numba(high: np.ndarray, low: np.ndarray, 
-                                    close: np.ndarray, atr: np.ndarray,
-                                    period: int, atr_mult: float) -> np.ndarray:
-    """
-    Numba JIT-compiled structure break detection.
-    """
-    n = len(close)
-    structure_break = np.zeros(n)
-    
-    for i in range(period, n):
-        # Find recent high/low
-        recent_high = high[i - period]
-        recent_low = low[i - period]
-        for j in range(i - period + 1, i):
-            if high[j] > recent_high:
-                recent_high = high[j]
-            if low[j] < recent_low:
-                recent_low = low[j]
-        
-        margin = atr[i] * atr_mult if atr[i] > 0 else 0
-        
-        if close[i] > recent_high + margin:
-            structure_break[i] = 1.0
-        elif close[i] < recent_low - margin:
-            structure_break[i] = 1.0
-        elif margin > 0:
-            # Partial score based on proximity
-            dist_high = (close[i] - recent_high) / (margin + 1e-10)
-            dist_low = (recent_low - close[i]) / (margin + 1e-10)
-            max_dist = max(dist_high, dist_low)
-            structure_break[i] = max(0.0, min(1.0, max_dist))
-    
-    return structure_break
 
 
 # =============================================================================
@@ -300,8 +116,8 @@ class RegimeParams:
     Can be customized per symbol/timeframe via regime_params.json.
     """
     # Hysteresis parameters
-    k_confirm: int = 3          # Bars required to confirm regime switch
-    gap_min: float = 0.10       # Minimum gap (top - second) to switch
+    k_confirm: int = 3          # Evidence-budget multiplier
+    gap_min: float = 0.10       # Evidence budget per multiplier
     k_hold: int = 5             # Minimum bars to hold a regime
     
     # Lookback windows
@@ -1356,833 +1172,554 @@ def clear_regime_params_cache():
 # REGIME DETECTOR
 # =============================================================================
 
-class MarketRegimeDetector:
-    """
-    Market regime detector with hysteresis.
-    
-    Computes 4 regime scores (TREND, RANGE, BREAKOUT, CHOP) and applies
-    a state machine with confirmation delay to prevent rapid flipping.
-    
-    All computations are causal (no lookahead).
-    """
-    
-    def __init__(self, params: Optional[RegimeParams] = None):
-        """
-        Initialize detector.
+REGIME_STREAM_SCHEMA_VERSION = "fxpm.regime-stream-state.v2"
+REGIME_STREAM_TRANSITION_VERSION = "fxpm.regime-stream-transition.v2"
+REGIME_ALGORITHM_VERSION = "fxpm.causal-regime.v2-reconstruction-r4"
+REGIME_OUTPUT_COLUMNS = (
+    "TREND_SCORE", "RANGE_SCORE", "BREAKOUT_SCORE", "CHOP_SCORE",
+    "REGIME_RAW", "REGIME", "REGIME_STRENGTH", "REGIME_GAP",
+    "REGIME_WARMUP", "REGIME_LIVE", "REGIME_STRENGTH_LIVE",
+    "REGIME_RAW_STRENGTH", "REGIME_RAW_STRENGTH_LIVE", "REGIME_ADX",
+    "REGIME_ATR", "REGIME_BB_WIDTH", "REGIME_CONFIRM_EVIDENCE",
+)
+_REGIME_INTEGER_LIMITS = {
+    "k_confirm": 64, "k_hold": 256, "adx_period": 512,
+    "atr_period": 512, "bb_period": 512, "efficiency_period": 512,
+    "bb_squeeze_lookback": 10_000, "atr_lookback": 10_000,
+    "structure_period": 512,
+}
+_REGIME_PARAM_NAMES = tuple(RegimeParams.__dataclass_fields__)
+_REGIME_RUNTIME_CODE_SHA256 = _source_sha256(Path(__file__).resolve())
 
-        Args:
-            params: Regime parameters (uses defaults if None)
-        """
-        self.params = params or RegimeParams()
+
+def validated_regime_params(value: Any = None) -> RegimeParams:
+    """Validate and isolate one complete numeric detector parameter row."""
+    if value is None:
+        value = RegimeParams()
+    if isinstance(value, RegimeParams):
+        payload = value.to_dict()
+    elif type(value) is dict:
+        payload = dict(value)
+    else:
+        raise TypeError("regime parameters must be RegimeParams or dict")
+    if set(payload) != set(_REGIME_PARAM_NAMES):
+        raise ValueError("regime parameters require the complete canonical keyset")
+    for name, raw in payload.items():
+        if isinstance(raw, (bool, np.bool_)):
+            raise ValueError(f"regime parameter {name} must be numeric")
+        if name in _REGIME_INTEGER_LIMITS:
+            if not isinstance(raw, (int, np.integer)) or not 1 <= int(raw) <= _REGIME_INTEGER_LIMITS[name]:
+                raise ValueError(f"regime parameter {name} must be a positive integer")
+        elif not isinstance(raw, (int, float, np.integer, np.floating)):
+            raise ValueError(f"regime parameter {name} must be numeric")
+        if not math.isfinite(float(raw)):
+            raise ValueError(f"regime parameter {name} must be finite")
+        if isinstance(raw, np.generic):
+            payload[name] = raw.item()
+    weights = {name for name in payload if name.endswith("_weight")}
+    for name in weights | {"gap_min"}:
+        if not 0 <= payload[name] <= 1:
+            raise ValueError(f"regime parameter {name} must be within [0, 1]")
+    if not 0 <= payload["bb_squeeze_percentile"] <= 100:
+        raise ValueError("regime parameter bb_squeeze_percentile must be within [0, 100]")
+    if not 0 < payload["adx_trend_threshold"] <= 100:
+        raise ValueError("regime parameter adx_trend_threshold must be positive")
+    if not 0 < payload["bb_std"] <= 10:
+        raise ValueError("regime parameter bb_std must be positive")
+    if not 0 <= payload["structure_atr_mult"] <= 10:
+        raise ValueError("regime parameter structure_atr_mult must be nonnegative")
+    for prefix in ("trend", "range", "breakout", "chop"):
+        total = sum(payload[name] for name in weights if name.startswith(prefix))
+        if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(f"regime {prefix} weights must sum to 1")
+    return RegimeParams(**payload)
+
+
+def _regime_warmup(params: RegimeParams) -> int:
+    return max(
+        50, 2 * params.adx_period, params.atr_period + params.atr_lookback,
+        params.bb_period + params.bb_squeeze_lookback,
+        params.efficiency_period, params.structure_period,
+    )
+
+
+@register_jitable
+def _trend_adx_evidence(adx: float, threshold: float) -> float:
+    return max(0.0, min(1.0, adx / (1.6 * threshold)))
+
+
+@register_jitable
+def _chop_adx_evidence(adx: float, threshold: float) -> float:
+    x = adx / threshold
+    if x <= 0.0:
+        return 0.0
+    if x < 0.6:
+        return 0.5 * x / 0.6
+    if x < 0.9:
+        return 0.5 + 0.5 * (x - 0.6) / 0.3
+    if x < 1.2:
+        return 1.0 - 0.5 * (x - 0.9) / 0.3
+    return max(0.0, 0.5 * (2.8 - x) / 1.6)
+
+
+@register_jitable
+def _confirm_regime(scores, current, held, challenger, evidence, k_confirm, gap_min, k_hold):
+    leader = int(np.argmax(scores))
+    unique = True
+    for label in range(4):
+        if label != leader and scores[label] == scores[leader]:
+            unique = False
+    # Reconstructed startup: unique leader or CHOP on ties, held=1, no warmup credit.
+    if current < 0:
+        return (leader if unique else 3), 1, -1, 0.0
+    if unique and leader != current:
+        if challenger != leader:
+            challenger, evidence = leader, 0.0
+        evidence += scores[leader] - scores[current]
+        # held counts assignments completed before this observation.
+        if held >= k_hold and evidence >= k_confirm * gap_min:
+            return leader, 1, -1, 0.0
+    else:
+        challenger, evidence = -1, 0.0
+    return current, held + 1, challenger, evidence
+
+
+@jit(nopython=True, cache=True)
+def _regime_numeric_kernel(bars, p, warmup, state, ohlc, atr_ring, width_ring, squeeze_ring):
+    """One carried closed-bar implementation for both batch and incremental use."""
+    adx_period, atr_period, bb_period = int(p[3]), int(p[4]), int(p[5])
+    efficiency_period, squeeze_lookback = int(p[7]), int(p[8])
+    atr_lookback, structure_period = int(p[10]), int(p[11])
+    capacity = len(ohlc)
+    output = np.zeros((len(bars), 17), dtype=np.float64)
+    for row in range(len(bars)):
+        i = int(state[0])
+        open_p, high, low, close = bars[row, 0], bars[row, 1], bars[row, 2], bars[row, 3]
+        tr, plus_dm, minus_dm = 0.0, 0.0, 0.0
+        if i > 0:
+            prev = ohlc[(i - 1) % capacity]
+            tr = max(high - low, abs(high - prev[3]), abs(low - prev[3]))
+            up, down = high - prev[1], prev[2] - low
+            if up > down and up > 0:
+                plus_dm = up
+            if down > up and down > 0:
+                minus_dm = down
+        ohlc[i % capacity] = bars[row]
+        if i < atr_period:
+            state[1] += tr
+            if i == atr_period - 1:
+                state[1] /= atr_period
+        else:
+            state[1] += (tr - state[1]) / atr_period
+        atr = state[1] if i >= atr_period - 1 else 0.0
+        if i < adx_period:
+            state[2] += tr
+            state[3] += plus_dm
+            state[4] += minus_dm
+            if i == adx_period - 1:
+                state[2:5] /= adx_period
+        else:
+            state[2] += (tr - state[2]) / adx_period
+            state[3] += (plus_dm - state[3]) / adx_period
+            state[4] += (minus_dm - state[4]) / adx_period
+        dx = 0.0
+        if i >= adx_period and state[2] > 1e-10:
+            plus_di, minus_di = 100 * state[3] / state[2], 100 * state[4] / state[2]
+            if plus_di + minus_di > 1e-10:
+                dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        if i >= adx_period:
+            state[5] += (dx - state[5]) / adx_period
+        adx = state[5]
+        width, mean, sigma = 0.0, 0.0, 0.0
+        if i >= bb_period - 1:
+            for offset in range(bb_period):
+                mean += ohlc[(i - offset) % capacity, 3]
+            mean /= bb_period
+            for offset in range(bb_period):
+                sigma += (ohlc[(i - offset) % capacity, 3] - mean) ** 2
+            sigma = math.sqrt(sigma / bb_period)
+            if mean > 1e-10:
+                width = 2 * p[6] * sigma / mean
+        width_ring[i % squeeze_lookback] = width
+        squeeze = 0.0
+        if i >= squeeze_lookback:
+            positive_widths = width_ring[width_ring > 0]
+            if len(positive_widths) > 10 and width > 0:
+                threshold = np.percentile(positive_widths, p[9])
+                squeeze = min(1.0, threshold / width)
+        release = 0.0
+        if i >= 5:
+            recent_squeeze = np.max(squeeze_ring)
+            if recent_squeeze > 0.5 and squeeze < 0.5:
+                release = min(1.0, recent_squeeze * (1.0 - squeeze) * 2)
+        squeeze_ring[i % 5] = squeeze
+        atr_percentile = 0.0
+        if i >= atr_lookback and atr > 0:
+            positive, lower = 0, 0
+            for offset in range(1, atr_lookback):
+                previous_atr = atr_ring[(i - offset) % atr_lookback]
+                if previous_atr > 0:
+                    positive += 1
+                    if previous_atr <= atr:
+                        lower += 1
+            if positive > 10:
+                atr_percentile = lower / positive
+        atr_ring[i % atr_lookback] = atr
+        efficiency, slope, containment, structure, whipsaw, flips = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        if i >= efficiency_period:
+            moves = 0.0
+            for offset in range(efficiency_period):
+                moves += abs(ohlc[(i - offset) % capacity, 3] - ohlc[(i - offset - 1) % capacity, 3])
+            if moves > 1e-10:
+                efficiency = min(1.0, abs(close - ohlc[(i - efficiency_period) % capacity, 3]) / moves)
+        if i >= 20:
+            positive, negative = 0, 0
+            for offset in range(20):
+                change = ohlc[(i - offset) % capacity, 3] - ohlc[(i - offset - 1) % capacity, 3]
+                if change > 0:
+                    positive += 1
+                if change < 0:
+                    negative += 1
+            slope = max(positive, negative) / 20
+        if i >= max(bb_period, 10):
+            upper, lower = mean + p[6] * sigma, mean - p[6] * sigma
+            for offset in range(10):
+                bar = ohlc[(i - offset) % capacity]
+                if bar[1] <= upper and bar[2] >= lower:
+                    containment += 0.1
+        if i >= structure_period:
+            recent_high, recent_low = -np.inf, np.inf
+            for offset in range(1, structure_period + 1):
+                bar = ohlc[(i - offset) % capacity]
+                recent_high, recent_low = max(recent_high, bar[1]), min(recent_low, bar[2])
+            margin = atr * p[12] if atr > 0 else 0.0
+            if close > recent_high + margin or close < recent_low - margin:
+                structure = 1.0
+            elif margin > 0:
+                structure = max(0.0, min(1.0, max(close - recent_high, recent_low - close) / (margin + 1e-10)))
+        if i >= 10:
+            wick_sum, range_sum = 0.0, 0.0
+            for offset in range(10):
+                bar = ohlc[(i - offset) % capacity]
+                bar_range = bar[1] - bar[2]
+                if bar_range > 1e-10:
+                    wick_sum += bar_range - abs(bar[3] - bar[0])
+                    range_sum += bar_range
+            if range_sum > 1e-10:
+                whipsaw = wick_sum / range_sum
+        if i >= 11:
+            for offset in range(9):
+                current_move = ohlc[(i - offset) % capacity, 3] - ohlc[(i - offset - 1) % capacity, 3]
+                previous_move = ohlc[(i - offset - 1) % capacity, 3] - ohlc[(i - offset - 2) % capacity, 3]
+                if current_move * previous_move < 0:
+                    flips += 1 / 9
+        scores = np.full(4, 0.25)
+        if i >= warmup:
+            trend_adx = _trend_adx_evidence(adx, p[25])
+            chop_adx = _chop_adx_evidence(adx, p[25])
+            scores[0] = p[13] * trend_adx + p[14] * efficiency + p[15] * slope
+            scores[1] = p[16] * (1 - trend_adx) + p[17] * (1 - efficiency) + p[18] * containment
+            scores[2] = p[19] * release + p[20] * atr_percentile + p[21] * structure
+            scores[3] = p[22] * chop_adx + p[23] * (1 - efficiency) + p[24] * (whipsaw + flips) * 0.5
+            total = np.sum(scores)
+            if total > 1e-10:
+                scores /= total
+            else:
+                scores[:] = 0.25
+        raw = int(np.argmax(scores)) if i >= warmup else 3
+        raw_strength = scores[raw]
+        ordered = np.sort(scores)
+        gap = ordered[3] - ordered[2]
+        if i >= warmup:
+            current, held, challenger, evidence = _confirm_regime(
+                scores, int(state[6]), int(state[7]), int(state[8]), state[9], int(p[0]), p[1], int(p[2])
+            )
+            state[6], state[7], state[8], state[9] = current, held, challenger, evidence
+        confirmed = int(state[6]) if state[6] >= 0 else 3
+        strength = scores[confirmed]
+        output[row, :4] = scores
+        output[row, 4:9] = np.array([raw, confirmed, strength, gap, 1.0 if i < warmup else 0.0])
+        output[row, 9], output[row, 10] = state[10], state[11] if i else np.nan
+        output[row, 11], output[row, 12] = raw_strength, state[12] if i else np.nan
+        output[row, 13:17] = np.array([adx, atr, width, state[9]])
+        state[10], state[11], state[12] = confirmed, strength, raw_strength
+        state[0] += 1
+    return output
+
+
+class RegimeStream:
+    """Bounded causal classifier state; timestamps denote bar opens."""
+
+    def __init__(self, params: Any = None, *, stream_key: str, use_numba: Optional[bool] = None):
+        if type(stream_key) is not str or not stream_key.strip():
+            raise ValueError("stream_key must be a nonempty canonical string")
+        if use_numba is not None and type(use_numba) is not bool:
+            raise TypeError("use_numba must be bool or None")
+        isolated = validated_regime_params(params)
+        self._params_payload = isolated.to_dict()
+        self._params_sha256 = regime_params_sha256(self._params_payload)
+        self._stream_key = stream_key
+        self._code_sha256 = _source_sha256(Path(__file__).resolve())
+        if self._code_sha256 != _REGIME_RUNTIME_CODE_SHA256:
+            raise ValueError("regime source changed after module load; restart before processing")
+        self._warmup = _regime_warmup(isolated)
+        self._numeric_params = np.array([self._params_payload[name] for name in _REGIME_PARAM_NAMES], dtype=np.float64)
+        self._use_numba = NUMBA_AVAILABLE if use_numba is None else (use_numba and NUMBA_AVAILABLE)
+        self._state = np.zeros(13, dtype=np.float64)
+        self._state[[6, 8, 10]] = -1
+        self._ohlc = np.zeros((max(isolated.bb_period, isolated.efficiency_period + 1, isolated.structure_period + 1, 21), 4))
+        self._atr = np.zeros(isolated.atr_lookback)
+        self._width = np.zeros(isolated.bb_squeeze_lookback)
+        self._squeeze = np.zeros(5)
+        self._last_index = None
+        self._index_kind = None
+        self._last_bar = None
+        self._last_output = None
+
+    @property
+    def params(self) -> RegimeParams:
+        return RegimeParams(**self._params_payload)
+
+    @property
+    def stream_key(self) -> str:
+        return self._stream_key
 
     @property
     def warmup_bars(self) -> int:
-        """Number of bars required for warmup before regime scores are meaningful."""
-        return max(self.params.bb_squeeze_lookback, self.params.atr_lookback, 50)
-    
+        return self._warmup
+
+    @property
+    def bars_processed(self) -> int:
+        return int(self._state[0])
+
+    @property
+    def numeric_state_nbytes(self) -> int:
+        return sum(array.nbytes for array in (self._numeric_params, self._state, self._ohlc, self._atr, self._width, self._squeeze))
+
+    @staticmethod
+    def _index_type(index: pd.Index) -> str:
+        if isinstance(index, pd.DatetimeIndex):
+            return "datetime-aware" if index.tz is not None else "datetime-naive"
+        if index.dtype.kind in "iu":
+            return "integer"
+        if index.dtype.kind == "f":
+            return "float"
+        raise ValueError("bar index must be datetime or numeric")
+
+    @staticmethod
+    def _frame(values: np.ndarray, index: pd.Index) -> pd.DataFrame:
+        result = pd.DataFrame(values, index=index, columns=REGIME_OUTPUT_COLUMNS)
+        for column in ("REGIME_RAW", "REGIME", "REGIME_LIVE"):
+            codes = result[column].to_numpy(dtype=np.int64)
+            result[column] = pd.Categorical.from_codes(codes, dtype=REGIME_DTYPE)
+        result["REGIME_WARMUP"] = result["REGIME_WARMUP"].astype(bool)
+        return result
+
+    def update(self, closed_bars: pd.DataFrame, *, observed_at: Any = None, bar_duration: Any = None) -> pd.DataFrame:
+        if _source_sha256(Path(__file__).resolve()) != self._code_sha256:
+            raise ValueError("regime source changed after module load; restart before processing")
+        if not isinstance(closed_bars, pd.DataFrame):
+            raise TypeError("closed_bars must be a DataFrame")
+        missing = set(("Open", "High", "Low", "Close")) - set(closed_bars.columns)
+        if missing:
+            raise ValueError(f"closed bars missing OHLC columns: {sorted(missing)}")
+        index = closed_bars.index
+        kind = self._index_type(index)
+        if index.hasnans or not index.is_unique or not index.is_monotonic_increasing:
+            raise ValueError("bars require unique, finite, strictly increasing times")
+        if kind in ("integer", "float") and not np.isfinite(index.to_numpy()).all():
+            raise ValueError("bars require finite numeric times")
+        if self._index_kind is not None and kind != self._index_kind:
+            raise ValueError("bar index type/timezone awareness changed within stream")
+        try:
+            bars = closed_bars.loc[:, ["Open", "High", "Low", "Close"]].to_numpy(dtype=np.float64, copy=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("OHLC values must be finite numeric values") from exc
+        if bars.shape != (len(index), 4) or not np.isfinite(bars).all():
+            raise ValueError("OHLC values must be finite numeric values")
+        if np.any(bars[:, 1] < np.maximum(bars[:, 0], bars[:, 3])) or np.any(bars[:, 2] > np.minimum(bars[:, 0], bars[:, 3])):
+            raise ValueError("invalid OHLC envelope")
+        if (observed_at is None) != (bar_duration is None):
+            raise ValueError("observed_at and bar_duration must be supplied together")
+        if observed_at is not None:
+            observed = pd.Timestamp(observed_at)
+            duration = pd.Timedelta(bar_duration)
+            if kind != "datetime-aware" or observed.tzinfo is None:
+                raise ValueError("closed-time validation requires timezone-aware bars and observed_at")
+            if pd.isna(observed) or pd.isna(duration) or duration <= pd.Timedelta(0):
+                raise ValueError("observed_at and bar_duration must be valid")
+            if np.any(index + duration > observed):
+                raise ValueError("unfinished bar supplied before its close")
+        if len(index) == 0:
+            return self._frame(np.empty((0, 17)), index)
+        replay = False
+        if self._last_index is not None:
+            if index[0] < self._last_index:
+                raise ValueError("reversed or overlapping history requires verified replay")
+            if index[0] == self._last_index:
+                if not np.array_equal(bars[0], self._last_bar):
+                    raise ValueError("revised last bar requires verified replay")
+                replay = True
+        # All input validation precedes mutation, including revisions in a batch.
+        offset = 1 if replay else 0
+        kernel = _regime_numeric_kernel
+        if not self._use_numba and hasattr(kernel, "py_func"):
+            kernel = kernel.py_func
+        values = kernel(bars[offset:], self._numeric_params, self._warmup, self._state, self._ohlc, self._atr, self._width, self._squeeze)
+        if replay:
+            values = np.vstack((self._last_output, values))
+        self._index_kind, self._last_index = kind, index[-1]
+        self._last_bar, self._last_output = bars[-1].copy(), values[-1].copy()
+        return self._frame(values, index)
+
+    def snapshot(self) -> Dict[str, Any]:
+        last_index = self._last_index
+        if isinstance(last_index, pd.Timestamp):
+            last_index = last_index.isoformat()
+        elif isinstance(last_index, np.generic):
+            last_index = last_index.item()
+        payload = {
+            "schema_version": REGIME_STREAM_SCHEMA_VERSION,
+            "algorithm_version": REGIME_ALGORITHM_VERSION,
+            "code_sha256": self._code_sha256,
+            "params": dict(self._params_payload), "params_sha256": self._params_sha256,
+            "stream_key": self._stream_key, "state": self._state.tolist(),
+            "ohlc_ring": self._ohlc.tolist(), "atr_ring": self._atr.tolist(),
+            "width_ring": self._width.tolist(), "squeeze_ring": self._squeeze.tolist(),
+            "index_kind": self._index_kind, "last_index": last_index,
+            "last_bar": None if self._last_bar is None else self._last_bar.tolist(),
+            "last_output": None if self._last_output is None else [float(value) if np.isfinite(value) else None for value in self._last_output],
+        }
+        payload["state_sha256"] = _tuner_canonical_sha256(payload)
+        return payload
+
+    @classmethod
+    def restore(cls, checkpoint: Any, *, expected_params: Any, expected_stream_key: str, use_numba: Optional[bool] = None) -> 'RegimeStream':
+        if isinstance(checkpoint, str):
+            try:
+                checkpoint = json.loads(checkpoint)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid JSON regime checkpoint") from exc
+        if type(checkpoint) is not dict:
+            raise ValueError("checkpoint must be a JSON object")
+        stream = cls(expected_params, stream_key=expected_stream_key, use_numba=use_numba)
+        expected_keys = set(stream.snapshot())
+        if set(checkpoint) != expected_keys:
+            raise ValueError("checkpoint has an invalid schema keyset")
+        payload = {key: value for key, value in checkpoint.items() if key != "state_sha256"}
+        try:
+            encoded = json.dumps(payload, allow_nan=False)
+            del encoded
+        except (TypeError, ValueError) as exc:
+            raise ValueError("checkpoint must contain finite JSON values") from exc
+        if checkpoint["state_sha256"] != _tuner_canonical_sha256(payload):
+            raise ValueError("checkpoint state digest mismatch")
+        bindings = {
+            "schema_version": REGIME_STREAM_SCHEMA_VERSION,
+            "algorithm_version": REGIME_ALGORITHM_VERSION,
+            "code_sha256": stream._code_sha256, "stream_key": stream.stream_key,
+            "params_sha256": stream._params_sha256,
+        }
+        for name, expected in bindings.items():
+            if type(checkpoint[name]) is not str or checkpoint[name] != expected:
+                raise ValueError(f"checkpoint {name} binding mismatch")
+        params = validated_regime_params(checkpoint["params"])
+        if regime_params_sha256(params.to_dict()) != stream._params_sha256:
+            raise ValueError("checkpoint parameter binding mismatch")
+        for name, attr in (("state", "_state"), ("ohlc_ring", "_ohlc"), ("atr_ring", "_atr"), ("width_ring", "_width"), ("squeeze_ring", "_squeeze")):
+            try:
+                array = np.asarray(checkpoint[name], dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"invalid checkpoint {name}") from exc
+            if array.shape != getattr(stream, attr).shape or not np.isfinite(array).all():
+                raise ValueError(f"invalid checkpoint {name}")
+            setattr(stream, attr, array.copy())
+        state = stream._state
+        if any(state[pos] != int(state[pos]) for pos in (0, 6, 7, 8, 10)) or not 0 <= state[0] < 2**53:
+            raise ValueError("invalid checkpoint integral state")
+        if any(not -1 <= state[pos] <= 3 for pos in (6, 8, 10)) or not 0 <= state[7] <= state[0] or state[9] < 0 or np.any(state[1:6] < 0):
+            raise ValueError("invalid checkpoint confirmation or Wilder state")
+        if np.any(stream._atr < 0) or np.any(stream._width < 0) or np.any((stream._squeeze < 0) | (stream._squeeze > 1)):
+            raise ValueError("invalid checkpoint indicator rings")
+        kind = checkpoint["index_kind"]
+        if state[0] == 0:
+            if any(checkpoint[key] is not None for key in ("index_kind", "last_index", "last_bar", "last_output")):
+                raise ValueError("empty checkpoint has a last observation")
+            initial = np.zeros(13)
+            initial[[6, 8, 10]] = -1
+            if not np.array_equal(state, initial) or any(np.any(array) for array in (stream._ohlc, stream._atr, stream._width, stream._squeeze)):
+                raise ValueError("empty checkpoint has nonempty numeric state")
+        else:
+            if kind not in ("datetime-aware", "datetime-naive", "integer", "float"):
+                raise ValueError("invalid checkpoint index kind")
+            try:
+                index_value = pd.Timestamp(checkpoint["last_index"]) if kind.startswith("datetime") else checkpoint["last_index"]
+                probe_index = pd.DatetimeIndex([index_value]) if kind.startswith("datetime") else pd.Index([index_value])
+                last_bar = np.asarray(checkpoint["last_bar"], dtype=np.float64)
+                last_output = np.asarray(checkpoint["last_output"], dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid checkpoint last observation") from exc
+            allowed_missing = np.zeros(17, dtype=bool)
+            if state[0] == 1:
+                allowed_missing[[10, 12]] = True
+            if cls._index_type(probe_index) != kind or probe_index.hasnans or last_bar.shape != (4,) or last_output.shape != (17,) or not np.isfinite(last_bar).all():
+                raise ValueError("invalid checkpoint last observation")
+            if np.any(~np.isfinite(last_output) & ~allowed_missing):
+                raise ValueError("invalid checkpoint last output")
+            if not np.array_equal(last_bar, stream._ohlc[(int(state[0]) - 1) % len(stream._ohlc)]):
+                raise ValueError("checkpoint last bar and ring disagree")
+            if last_bar[1] < max(last_bar[0], last_bar[3]) or last_bar[2] > min(last_bar[0], last_bar[3]):
+                raise ValueError("invalid checkpoint last OHLC envelope")
+            for position in (4, 5, 9):
+                lower = -1 if position == 9 and state[0] == 1 else 0
+                if last_output[position] != int(last_output[position]) or not lower <= last_output[position] <= 3:
+                    raise ValueError("invalid checkpoint output label")
+            scores = last_output[:4]
+            if np.any((scores < 0) | (scores > 1)) or not math.isclose(float(scores.sum()), 1, abs_tol=1e-12):
+                raise ValueError("invalid checkpoint output scores")
+            if last_output[8] != float(state[0] <= stream._warmup):
+                raise ValueError("checkpoint readiness and count disagree")
+            if last_output[6] != scores[int(last_output[5])] or last_output[11] != scores[int(last_output[4])]:
+                raise ValueError("checkpoint output strength ownership mismatch")
+            if state[10] != last_output[5] or state[11] != last_output[6] or state[12] != last_output[11]:
+                raise ValueError("checkpoint carried output and state disagree")
+            if state[0] <= stream._warmup:
+                if state[6] != -1 or state[7] != 0 or state[8] != -1 or state[9] != 0:
+                    raise ValueError("checkpoint accumulated warmup evidence")
+            elif state[6] != last_output[5] or state[7] < 1:
+                raise ValueError("checkpoint confirmed output and state disagree")
+            if state[8] == -1 and state[9] != 0:
+                raise ValueError("checkpoint evidence has no challenger")
+            stream._last_index, stream._index_kind = index_value, kind
+            stream._last_bar, stream._last_output = last_bar.copy(), last_output.copy()
+        return stream
+
+
+class MarketRegimeDetector:
+    """Batch adapter for the same closed-bar sequential RegimeStream kernel."""
+
+    def __init__(self, params: Any = None):
+        self.params = validated_regime_params(params)
+
+    @property
+    def warmup_bars(self) -> int:
+        return _regime_warmup(self.params)
+
     def compute_regime_scores(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Compute regime scores and labels for all bars.
-        
-        This is the main entry point. Requires a DataFrame with at minimum
-        Open, High, Low, Close columns. If ADX/ATR are already computed,
-        they will be used; otherwise they are computed here.
-        
-        Args:
-            df: DataFrame with OHLCV data (and optionally precomputed indicators)
-            
-        Returns:
-            DataFrame with columns:
-            - TREND_SCORE, RANGE_SCORE, BREAKOUT_SCORE, CHOP_SCORE (0-1)
-            - REGIME_RAW (highest score regime, no hysteresis)
-            - REGIME (with hysteresis applied)
-            - REGIME_STRENGTH (top score)
-            - REGIME_GAP (top - second)
-            - REGIME_LIVE (shifted by 1 for decision-time parity)
-            - REGIME_STRENGTH_LIVE (shifted by 1)
-        """
-        n = len(df)
-        p = self.params
-        
-        if n < max(p.bb_squeeze_lookback, p.atr_lookback, 50) + 10:
-            # Not enough data for meaningful regime detection
-            return self._create_empty_regime_df(df.index)
-        
-        # Initialize output arrays
-        trend_scores = np.zeros(n)
-        range_scores = np.zeros(n)
-        breakout_scores = np.zeros(n)
-        chop_scores = np.zeros(n)
-        
-        # =====================================================================
-        # COMPUTE RAW INDICATOR VALUES
-        # =====================================================================
-        
-        # Seed ADX warmup NaNs at the local trend anchor.
-        adx_threshold = float(getattr(p, 'adx_trend_threshold', 25.0))
-        if 'ADX' in df.columns:
-            adx = df['ADX'].values.copy()
-            adx = np.nan_to_num(adx, nan=adx_threshold)
-        else:
-            adx = self._compute_adx(df, p.adx_period)
-        
-        # ATR (use precomputed if available)
-        atr_col = f'ATR_{p.atr_period}'
-        if atr_col in df.columns:
-            atr = df[atr_col].values.copy()
-            atr = np.nan_to_num(atr, nan=0.0)
-        elif 'ATR_14' in df.columns:
-            atr = df['ATR_14'].values.copy()
-            atr = np.nan_to_num(atr, nan=0.0)
-        else:
-            atr = self._compute_atr(df, p.atr_period)
-        
-        # Bollinger Band width
-        bb_width = self._compute_bb_width(df, p.bb_period, p.bb_std)
-        
-        # Directional efficiency
-        efficiency = self._compute_directional_efficiency(df, p.efficiency_period)
-        
-        # MA slope consistency
-        slope_consistency = self._compute_slope_consistency(df, period=20)
-        
-        # Band containment (for RANGE)
-        containment = self._compute_band_containment(df, p.bb_period, p.bb_std)
-        
-        # BB squeeze detection (adaptive percentile)
-        bb_squeeze = self._compute_bb_squeeze(bb_width, p.bb_squeeze_lookback, p.bb_squeeze_percentile)
-        
-        # ATR percentile (for BREAKOUT)
-        atr_percentile = self._compute_atr_percentile(atr, p.atr_lookback)
-        
-        # Structure break detection
-        structure_break = self._compute_structure_break(df, atr, p.structure_period, p.structure_atr_mult)
-        
-        # Whipsaw/wickiness (for CHOP)
-        whipsaw = self._compute_whipsaw(df, period=10)
-        
-        # Direction flip frequency (for CHOP)
-        direction_flips = self._compute_direction_flips(df, period=10)
-        
-        # =====================================================================
-        # COMPUTE REGIME SCORES (0-1) - VECTORIZED
-        # =====================================================================
-        
-        warmup = max(p.bb_squeeze_lookback, p.atr_lookback, 50)
-        
-        # Anchor both curves at the local ADX threshold.
-        adx_norm = self._normalize_adx_vectorized(adx, adx_threshold)
-        adx_mid = self._normalize_adx_mid_vectorized(adx, adx_threshold)
-        squeeze_release = self._compute_squeeze_release_vectorized(bb_squeeze)
-        
-        # Vectorized score computation (warmup region stays zero)
-        # --- TREND SCORE ---
-        trend_scores[warmup:] = (
-            p.trend_adx_weight * adx_norm[warmup:] +
-            p.trend_efficiency_weight * efficiency[warmup:] +
-            p.trend_slope_weight * slope_consistency[warmup:]
-        )
-        
-        # --- RANGE SCORE ---
-        range_scores[warmup:] = (
-            p.range_adx_weight * (1.0 - adx_norm[warmup:]) +
-            p.range_efficiency_weight * (1.0 - efficiency[warmup:]) +
-            p.range_containment_weight * containment[warmup:]
-        )
-        
-        # --- BREAKOUT SCORE ---
-        breakout_scores[warmup:] = (
-            p.breakout_squeeze_weight * squeeze_release[warmup:] +
-            p.breakout_atr_weight * atr_percentile[warmup:] +
-            p.breakout_structure_weight * structure_break[warmup:]
-        )
-        
-        # --- CHOP SCORE ---
-        chop_scores[warmup:] = (
-            p.chop_adx_weight * adx_mid[warmup:] +
-            p.chop_efficiency_weight * (1.0 - efficiency[warmup:]) +
-            p.chop_whipsaw_weight * (whipsaw[warmup:] * 0.5 + direction_flips[warmup:] * 0.5)
-        )
-        
-        # Vectorized normalization to sum to 1
-        total_scores = trend_scores + range_scores + breakout_scores + chop_scores
-        # Avoid division by zero
-        valid_mask = total_scores > 1e-10
-        
-        trend_scores[valid_mask] /= total_scores[valid_mask]
-        range_scores[valid_mask] /= total_scores[valid_mask]
-        breakout_scores[valid_mask] /= total_scores[valid_mask]
-        chop_scores[valid_mask] /= total_scores[valid_mask]
-        
-        # Set defaults for invalid regions
-        invalid_mask = ~valid_mask
-        trend_scores[invalid_mask] = 0.25
-        range_scores[invalid_mask] = 0.25
-        breakout_scores[invalid_mask] = 0.25
-        chop_scores[invalid_mask] = 0.25
-        
-        # =====================================================================
-        # DETERMINE RAW REGIME (highest score)
-        # =====================================================================
-        
-        regime_raw = [None] * n
-        regime_strength = np.zeros(n)
-        regime_gap = np.zeros(n)
-        
-        for i in range(n):
-            if i < warmup:
-                regime_raw[i] = RegimeType.CHOP  # Default during warmup
-                regime_strength[i] = 0.25
-                regime_gap[i] = 0.0
-                continue
-            
-            scores = {
-                RegimeType.TREND: trend_scores[i],
-                RegimeType.RANGE: range_scores[i],
-                RegimeType.BREAKOUT: breakout_scores[i],
-                RegimeType.CHOP: chop_scores[i]
-            }
-            
-            sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-            top_regime, top_score = sorted_scores[0]
-            second_score = sorted_scores[1][1]
-            
-            regime_raw[i] = top_regime
-            regime_strength[i] = top_score
-            regime_gap[i] = top_score - second_score
-        
-        # =====================================================================
-        # APPLY HYSTERESIS STATE MACHINE
-        # =====================================================================
-        
-        regime_final = self._apply_hysteresis(
-            regime_raw, regime_strength, regime_gap,
-            p.k_confirm, p.gap_min, p.k_hold
-        )
-        
-        # =====================================================================
-        # BUILD OUTPUT DATAFRAME
-        # =====================================================================
-        
-        result = pd.DataFrame(index=df.index)
-        result['TREND_SCORE'] = trend_scores
-        result['RANGE_SCORE'] = range_scores
-        result['BREAKOUT_SCORE'] = breakout_scores
-        result['CHOP_SCORE'] = chop_scores
-        result['REGIME_RAW'] = as_regime_category(regime_raw)
-        result['REGIME'] = as_regime_category(regime_final)
-        result['REGIME_STRENGTH'] = regime_strength
-        result['REGIME_GAP'] = regime_gap
-        result['REGIME_WARMUP'] = False
-        result.iloc[:warmup, result.columns.get_loc('REGIME_WARMUP')] = True
+        # Public inputs always derive indicators from OHLC, never supplied ADX/ATR.
+        return RegimeStream(self.params, stream_key="batch").update(df)
 
-        # REGIME_LIVE = REGIME.shift(1) for decision-time parity.
-        # Shifting a categorical preserves the dtype and yields NaN at row 0,
-        # exactly as the object column did with None.
-        result['REGIME_LIVE'] = result['REGIME'].shift(1)
-        result['REGIME_STRENGTH_LIVE'] = result['REGIME_STRENGTH'].shift(1)
-
-        return result
-    
-    def _create_empty_regime_df(self, index: pd.Index) -> pd.DataFrame:
-        """Create empty regime DataFrame for insufficient data."""
-        n = len(index)
-        result = pd.DataFrame(index=index)
-        result['TREND_SCORE'] = 0.25
-        result['RANGE_SCORE'] = 0.25
-        result['BREAKOUT_SCORE'] = 0.25
-        result['CHOP_SCORE'] = 0.25
-        result['REGIME_RAW'] = as_regime_category([RegimeType.CHOP] * n)
-        result['REGIME'] = as_regime_category([RegimeType.CHOP] * n)
-        result['REGIME_STRENGTH'] = 0.25
-        result['REGIME_GAP'] = 0.0
-        result['REGIME_WARMUP'] = True  # All bars are warmup when data insufficient
-        result['REGIME_LIVE'] = as_regime_category([RegimeType.CHOP] * n)
-        result['REGIME_STRENGTH_LIVE'] = 0.25
-        return result
-    
-    # =========================================================================
-    # INDICATOR COMPUTATION METHODS
-    # =========================================================================
-    
-    def _compute_adx(self, df: pd.DataFrame, period: int) -> np.ndarray:
-        """Compute ADX using Wilder's smoothing."""
-        high = df['High'].values
-        low = df['Low'].values
-        close = df['Close'].values
-        n = len(df)
-        
-        tr = np.zeros(n)
-        plus_dm = np.zeros(n)
-        minus_dm = np.zeros(n)
-        
-        for i in range(1, n):
-            hl = high[i] - low[i]
-            hc = abs(high[i] - close[i-1])
-            lc = abs(low[i] - close[i-1])
-            tr[i] = max(hl, hc, lc)
-            
-            up_move = high[i] - high[i-1]
-            down_move = low[i-1] - low[i]
-            
-            if up_move > down_move and up_move > 0:
-                plus_dm[i] = up_move
-            if down_move > up_move and down_move > 0:
-                minus_dm[i] = down_move
-        
-        # Wilder smoothing
-        atr = self._wilder_smooth(tr, period)
-        smoothed_plus_dm = self._wilder_smooth(plus_dm, period)
-        smoothed_minus_dm = self._wilder_smooth(minus_dm, period)
-        
-        # Directional indicators
-        plus_di = np.zeros(n)
-        minus_di = np.zeros(n)
-        dx = np.zeros(n)
-        
-        for i in range(period, n):
-            if atr[i] > 1e-10:
-                plus_di[i] = 100 * smoothed_plus_dm[i] / atr[i]
-                minus_di[i] = 100 * smoothed_minus_dm[i] / atr[i]
-            
-            di_sum = plus_di[i] + minus_di[i]
-            if di_sum > 1e-10:
-                dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / di_sum
-        
-        adx = self._wilder_smooth(dx, period)
-        
-        return adx
-    
-    def _compute_atr(self, df: pd.DataFrame, period: int) -> np.ndarray:
-        """Compute ATR using Wilder's smoothing."""
-        high = df['High'].values
-        low = df['Low'].values
-        close = df['Close'].values
-        n = len(df)
-        
-        tr = np.zeros(n)
-        for i in range(1, n):
-            hl = high[i] - low[i]
-            hc = abs(high[i] - close[i-1])
-            lc = abs(low[i] - close[i-1])
-            tr[i] = max(hl, hc, lc)
-        
-        return self._wilder_smooth(tr, period)
-    
-    def _wilder_smooth(self, data: np.ndarray, period: int) -> np.ndarray:
-        """Wilder's smoothing (EMA with alpha = 1/period)."""
-        n = len(data)
-        result = np.zeros(n)
-        alpha = 1.0 / period
-        
-        # Initialize with SMA
-        if n >= period:
-            result[period-1] = np.mean(data[:period])
-            
-            for i in range(period, n):
-                result[i] = alpha * data[i] + (1 - alpha) * result[i-1]
-        
-        return result
-    
-    def _compute_bb_width(self, df: pd.DataFrame, period: int, std: float) -> np.ndarray:
-        """Compute Bollinger Band width (normalized).
-        
-        Optimized using pandas rolling operations for 2-3x speedup.
-        """
-        close = df['Close']
-        n = len(df)
-        
-        # Use pandas rolling which is highly optimized
-        ma = close.rolling(window=period, min_periods=period).mean()
-        sigma = close.rolling(window=period, min_periods=period).std(ddof=0)
-        
-        upper = ma + std * sigma
-        lower = ma - std * sigma
-        
-        # Avoid division by zero
-        width = np.where(ma > 1e-10, (upper - lower) / ma, 0.0)
-        
-        return width.values if hasattr(width, 'values') else np.array(width)
-    
-    def _compute_directional_efficiency(self, df: pd.DataFrame, period: int) -> np.ndarray:
-        """
-        Compute directional efficiency ratio (vectorized).
-        
-        Efficiency = |net_move| / sum(|individual_moves|)
-        High efficiency = trending, low efficiency = choppy
-        
-        Optimized with NumPy operations for 3-5x speedup over loop-based version.
-        """
-        close = df['Close'].values
-        n = len(df)
-        
-        efficiency = np.zeros(n)
-        
-        if n <= period:
-            return efficiency
-        
-        # Vectorized: compute price changes
-        price_changes = np.abs(np.diff(close))
-        
-        # Rolling sum of absolute moves using cumsum trick
-        cumsum_moves = np.cumsum(np.concatenate([[0], price_changes]))
-        
-        for i in range(period, n):
-            net_move = abs(close[i] - close[i-period])
-            sum_moves = cumsum_moves[i] - cumsum_moves[i-period]
-            
-            if sum_moves > 1e-10:
-                efficiency[i] = net_move / sum_moves
-        
-        return efficiency
-    
-    def _compute_slope_consistency(self, df: pd.DataFrame, period: int) -> np.ndarray:
-        """
-        Compute MA slope consistency (vectorized).
-        
-        Measures how consistent the direction of short-term price changes is.
-        
-        Optimized with NumPy operations for 3-5x speedup.
-        """
-        close = df['Close'].values
-        n = len(df)
-        
-        consistency = np.zeros(n)
-        
-        if n <= period:
-            return consistency
-        
-        # Vectorized: compute sign of changes
-        changes = np.diff(close)
-        positive_changes = (changes > 0).astype(np.float64)
-        negative_changes = (changes < 0).astype(np.float64)
-        
-        # Rolling sums using cumsum
-        cumsum_pos = np.cumsum(np.concatenate([[0], positive_changes]))
-        cumsum_neg = np.cumsum(np.concatenate([[0], negative_changes]))
-        
-        for i in range(period, n):
-            positive = cumsum_pos[i] - cumsum_pos[i-period]
-            negative = cumsum_neg[i] - cumsum_neg[i-period]
-            consistency[i] = max(positive, negative) / period
-        
-        return consistency
-    
-    def _compute_band_containment(self, df: pd.DataFrame, period: int, std: float) -> np.ndarray:
-        """
-        Compute band containment score.
-        
-        Measures how well price stays within Bollinger Bands.
-        """
-        close = df['Close'].values
-        high = df['High'].values
-        low = df['Low'].values
-        n = len(df)
-        
-        containment = np.zeros(n)
-        lookback = 10
-        
-        for i in range(max(period, lookback), n):
-            window = close[i-period+1:i+1]
-            ma = np.mean(window)
-            sigma = np.std(window, ddof=0)
-            
-            upper = ma + std * sigma
-            lower = ma - std * sigma
-            
-            if sigma > 1e-10:
-                contained = 0
-                for j in range(i-lookback+1, i+1):
-                    if high[j] <= upper and low[j] >= lower:
-                        contained += 1
-                
-                containment[i] = contained / lookback
-        
-        return containment
-    
-    def _compute_bb_squeeze(self, bb_width: np.ndarray, lookback: int, 
-                            percentile: float) -> np.ndarray:
-        """
-        Detect Bollinger Band squeeze using adaptive percentile.
-        
-        Returns score 0-1 where 1.0 = in squeeze.
-        """
-        n = len(bb_width)
-        squeeze = np.zeros(n)
-        
-        for i in range(lookback, n):
-            window = bb_width[max(0, i-lookback+1):i+1]
-            window = window[window > 0]  # Filter zeros
-            
-            if len(window) > 10:
-                threshold = np.percentile(window, percentile)
-                
-                if bb_width[i] <= threshold and bb_width[i] > 0:
-                    squeeze[i] = 1.0
-                elif bb_width[i] > 0:
-                    ratio = threshold / bb_width[i]
-                    squeeze[i] = max(0.0, min(1.0, ratio))
-        
-        return squeeze
-    
-    def _compute_squeeze_release(self, squeeze: np.ndarray, idx: int) -> float:
-        """
-        Detect squeeze release (transition from squeeze to expansion).
-        
-        Returns score 0-1 based on recent squeeze and current expansion.
-        """
-        if idx < 5:
-            return 0.0
-        
-        # Was in squeeze recently (last 5 bars)?
-        recent_squeeze = np.max(squeeze[max(0, idx-5):idx])
-        
-        # Currently NOT in squeeze
-        current_squeeze = squeeze[idx]
-        
-        # Release = was squeezed AND now expanding
-        if recent_squeeze > 0.5 and current_squeeze < 0.5:
-            return min(1.0, recent_squeeze * (1.0 - current_squeeze) * 2)
-        
-        return 0.0
-    
-    def _compute_atr_percentile(self, atr: np.ndarray, lookback: int) -> np.ndarray:
-        """
-        Compute ATR percentile (0-1) relative to recent history.
-        
-        High percentile = volatility expanding.
-        """
-        n = len(atr)
-        percentile = np.zeros(n)
-        
-        for i in range(lookback, n):
-            # Exclude current bar from percentile window to avoid self-reference bias
-            window = atr[max(0, i-lookback+1):i]
-            window = window[window > 0]
-
-            if len(window) > 10 and atr[i] > 0:
-                rank = np.sum(window <= atr[i]) / len(window)
-                percentile[i] = rank
-
-        return percentile
-    
-    def _compute_structure_break(self, df: pd.DataFrame, atr: np.ndarray,
-                                  period: int, atr_mult: float) -> np.ndarray:
-        """
-        Detect structure break (price beyond recent high/low + ATR margin).
-        
-        Returns 1.0 for breakout, 0.0 for contained.
-        
-        Uses Numba JIT compilation when available for ~5x speedup.
-        """
-        close = df['Close'].values.astype(np.float64)
-        high = df['High'].values.astype(np.float64)
-        low = df['Low'].values.astype(np.float64)
-        atr_arr = atr.astype(np.float64)
-        
-        if NUMBA_AVAILABLE:
-            return _compute_structure_break_numba(high, low, close, atr_arr, period, atr_mult)
-        
-        # Fallback: Pure Python implementation
-        n = len(df)
-        structure_break = np.zeros(n)
-        
-        for i in range(period, n):
-            recent_high = np.max(high[i-period:i])
-            recent_low = np.min(low[i-period:i])
-            margin = atr_arr[i] * atr_mult if atr_arr[i] > 0 else 0
-            
-            if close[i] > recent_high + margin:
-                structure_break[i] = 1.0
-            elif close[i] < recent_low - margin:
-                structure_break[i] = 1.0
-            elif margin > 0:
-                # Partial score based on proximity
-                dist_high = (close[i] - recent_high) / (margin + 1e-10)
-                dist_low = (recent_low - close[i]) / (margin + 1e-10)
-                structure_break[i] = max(0.0, min(1.0, max(dist_high, dist_low)))
-        
-        return structure_break
-    
-    def _compute_whipsaw(self, df: pd.DataFrame, period: int) -> np.ndarray:
-        """
-        Compute whipsaw/wickiness score.
-        
-        High wickiness = large wicks relative to body = choppy price action.
-        
-        Uses Numba JIT compilation when available for ~5x speedup.
-        """
-        open_p = df['Open'].values.astype(np.float64)
-        high = df['High'].values.astype(np.float64)
-        low = df['Low'].values.astype(np.float64)
-        close = df['Close'].values.astype(np.float64)
-        
-        if NUMBA_AVAILABLE:
-            return _compute_whipsaw_numba(open_p, high, low, close, period)
-        
-        # Fallback: Pure Python implementation
-        n = len(df)
-        whipsaw = np.zeros(n)
-        
-        for i in range(period, n):
-            total_wick = 0.0
-            total_range = 0.0
-            
-            for j in range(i-period+1, i+1):
-                bar_range = high[j] - low[j]
-                
-                if bar_range > 1e-10:
-                    upper_wick = high[j] - max(open_p[j], close[j])
-                    lower_wick = min(open_p[j], close[j]) - low[j]
-                    total_wick += upper_wick + lower_wick
-                    total_range += bar_range
-            
-            if total_range > 1e-10:
-                whipsaw[i] = total_wick / total_range
-        
-        return whipsaw
-    
-    def _compute_direction_flips(self, df: pd.DataFrame, period: int) -> np.ndarray:
-        """
-        Compute direction flip frequency.
-        
-        High flip frequency = choppy, indecisive market.
-        
-        Uses Numba JIT compilation when available for ~5x speedup.
-        """
-        close = df['Close'].values.astype(np.float64)
-        
-        if NUMBA_AVAILABLE:
-            return _compute_direction_flips_numba(close, period)
-        
-        # Fallback: Pure Python implementation
-        n = len(df)
-        flips = np.zeros(n)
-        
-        for i in range(period + 1, n):
-            flip_count = 0
-            for j in range(i-period+1, i):
-                prev_change = close[j] - close[j-1]
-                curr_change = close[j+1] - close[j]
-                
-                prev_dir = 1 if prev_change > 0 else (-1 if prev_change < 0 else 0)
-                curr_dir = 1 if curr_change > 0 else (-1 if curr_change < 0 else 0)
-                
-                if prev_dir != 0 and curr_dir != 0 and prev_dir != curr_dir:
-                    flip_count += 1
-            
-            flips[i] = flip_count / max(1, period - 1)
-        
-        return flips
-    
-    # =========================================================================
-    # NORMALIZATION HELPERS
-    # =========================================================================
-    
     def _normalize_adx(self, adx_value: float, threshold: float = 25.0) -> float:
-        """
-        Normalize ADX to 0-1 range, anchored at `threshold`.
-
-        Knees are defined in terms of the trend anchor so the curve re-scales
-        for asset classes whose natural trend floor differs from the classic
-        Wilder 25. At threshold=25 the knees collapse to the original 20/40
-        bands, preserving legacy behavior for FX / indices.
-
-        Knees (as multiples of threshold):
-            adx < 0.8·T  → weak (0.0 → 0.5)
-            adx < 1.6·T  → moderate (0.5 → 1.0)
-            adx ≥ 1.6·T  → strong (0.75 → 1.0, saturates at 2.4·T)
-        """
-        low = 0.8 * threshold
-        high = 1.6 * threshold
-        tail = 3.2 * threshold
-        if adx_value < low:
-            return adx_value / high
-        elif adx_value < high:
-            return 0.5 + (adx_value - low) / high
-        else:
-            return min(1.0, 0.75 + (adx_value - high) / tail)
+        return float(_trend_adx_evidence(adx_value, threshold))
 
     def _normalize_adx_vectorized(self, adx: np.ndarray, threshold: float = 25.0) -> np.ndarray:
-        """Vectorized ADX normalization anchored at `threshold`."""
-        low = 0.8 * threshold
-        high = 1.6 * threshold
-        tail = 3.2 * threshold
-        result = np.zeros_like(adx, dtype=float)
-
-        # adx < 0.8·T
-        mask1 = adx < low
-        result[mask1] = adx[mask1] / high
-
-        # 0.8·T <= adx < 1.6·T
-        mask2 = (adx >= low) & (adx < high)
-        result[mask2] = 0.5 + (adx[mask2] - low) / high
-
-        # adx >= 1.6·T
-        mask3 = adx >= high
-        result[mask3] = np.minimum(1.0, 0.75 + (adx[mask3] - high) / tail)
-
-        return result
+        return np.array([self._normalize_adx(float(value), threshold) for value in adx], dtype=float)
 
     def _normalize_adx_mid(self, adx_value: float, threshold: float = 25.0) -> float:
-        """
-        Normalize ADX for CHOP detection, anchored at `threshold`.
-
-        Peaks at `0.9·T` (mid of the 0.6·T — 1.2·T band) — the regime where
-        ADX shows meaningful movement but no clear direction. At threshold=25
-        this collapses to the original 15 / 22.5 / 30 knees.
-        """
-        low_mid = 0.6 * threshold
-        peak = 0.9 * threshold
-        high_mid = 1.2 * threshold
-        tail_mid = 1.6 * threshold
-        if adx_value < low_mid:
-            return adx_value / high_mid
-        elif adx_value < high_mid:
-            return 0.5 + (high_mid - abs(adx_value - peak)) / high_mid
-        else:
-            return max(0.0, 1.0 - (adx_value - high_mid) / tail_mid)
+        return float(_chop_adx_evidence(adx_value, threshold))
 
     def _normalize_adx_mid_vectorized(self, adx: np.ndarray, threshold: float = 25.0) -> np.ndarray:
-        """Vectorized ADX mid-range normalization anchored at `threshold`."""
-        low_mid = 0.6 * threshold
-        peak = 0.9 * threshold
-        high_mid = 1.2 * threshold
-        tail_mid = 1.6 * threshold
-        result = np.zeros_like(adx, dtype=float)
-
-        # adx < 0.6·T
-        mask1 = adx < low_mid
-        result[mask1] = adx[mask1] / high_mid
-
-        # 0.6·T <= adx < 1.2·T
-        mask2 = (adx >= low_mid) & (adx < high_mid)
-        result[mask2] = 0.5 + (high_mid - np.abs(adx[mask2] - peak)) / high_mid
-
-        # adx >= 1.2·T
-        mask3 = adx >= high_mid
-        result[mask3] = np.maximum(0.0, 1.0 - (adx[mask3] - high_mid) / tail_mid)
-
-        return result
-    
-    def _compute_squeeze_release_vectorized(self, squeeze: np.ndarray) -> np.ndarray:
-        """Vectorized squeeze release computation."""
-        n = len(squeeze)
-        release = np.zeros(n)
-        
-        if n < 5:
-            return release
-        
-        # For each position, compute max of last 5 bars using rolling
-        for i in range(5, n):
-            recent_squeeze = np.max(squeeze[i-5:i])
-            current_squeeze = squeeze[i]
-            
-            if recent_squeeze > 0.5 and current_squeeze < 0.5:
-                release[i] = min(1.0, recent_squeeze * (1.0 - current_squeeze) * 2)
-        
-        return release
-    
-    # =========================================================================
-    # HYSTERESIS STATE MACHINE
-    # =========================================================================
-    
-    def _apply_hysteresis(self, regime_raw: List[str], 
-                          strength: np.ndarray, gap: np.ndarray,
-                          k_confirm: int, gap_min: float, k_hold: int) -> List[str]:
-        """
-        Apply hysteresis to regime labels.
-        
-        Rules:
-        1. Require k_confirm consecutive bars of new regime before switching
-        2. Require gap >= gap_min before switching
-        3. Hold current regime for at least k_hold bars
-        
-        Uses Numba JIT compilation when available for ~10x speedup.
-        
-        Args:
-            regime_raw: Raw regime labels (highest score)
-            strength: Regime strength scores
-            gap: Gap between top and second regime
-            k_confirm: Bars required to confirm switch
-            gap_min: Minimum gap required to switch
-            k_hold: Minimum bars to hold regime
-            
-        Returns:
-            Regime labels with hysteresis applied
-        """
-        n = len(regime_raw)
-        
-        if n == 0:
-            return [None] * n
-        
-        if NUMBA_AVAILABLE:
-            # Convert string regimes to integers for Numba
-            regime_raw_int = np.array([
-                RegimeType.to_int(r) if r else 3 for r in regime_raw
-            ], dtype=np.int32)
-            
-            gap_arr = gap.astype(np.float64)
-            
-            # Call Numba JIT-compiled function
-            regime_final_int = _hysteresis_loop_numba(
-                regime_raw_int, gap_arr, k_confirm, gap_min, k_hold
-            )
-            
-            # Convert back to strings
-            return [RegimeType.from_int(i) for i in regime_final_int]
-        
-        # Fallback: Pure Python implementation
-        regime_final = [None] * n
-        
-        # State tracking
-        current_regime = regime_raw[0]
-        bars_in_current = 0
-        candidate_regime = None
-        candidate_count = 0
-        
-        for i in range(n):
-            raw = regime_raw[i]
-            
-            # First bar or None: initialize
-            if current_regime is None:
-                current_regime = raw if raw else RegimeType.CHOP
-                bars_in_current = 1
-                regime_final[i] = current_regime
-                continue
-            
-            bars_in_current += 1
-            
-            # Check if raw regime is different from current
-            if raw != current_regime and raw is not None:
-                # Check if gap is sufficient
-                if gap[i] >= gap_min:
-                    # Track candidate
-                    if raw == candidate_regime:
-                        candidate_count += 1
-                    else:
-                        candidate_regime = raw
-                        candidate_count = 1
-                    
-                    # Check if confirmed (k_confirm bars + k_hold elapsed)
-                    if candidate_count >= k_confirm and bars_in_current >= k_hold:
-                        # Switch regime
-                        current_regime = candidate_regime
-                        bars_in_current = 1
-                        candidate_regime = None
-                        candidate_count = 0
-                else:
-                    # Gap too small, reset candidate
-                    candidate_regime = None
-                    candidate_count = 0
-            else:
-                # Same as current, reset candidate
-                candidate_regime = None
-                candidate_count = 0
-            
-            regime_final[i] = current_regime
-        
-        return regime_final
+        return np.array([self._normalize_adx_mid(float(value), threshold) for value in adx], dtype=float)
 
 
 # =============================================================================
@@ -2231,6 +1768,11 @@ __all__ = [
     'RegimeType',
     'RegimeParams',
     'MarketRegimeDetector',
+    'RegimeStream',
+    'REGIME_OUTPUT_COLUMNS',
+    'REGIME_STREAM_SCHEMA_VERSION',
+    'REGIME_STREAM_TRANSITION_VERSION',
+    'validated_regime_params',
     'load_regime_params',
     'has_tuned_regime_params',
     'validate_regime_params_provenance',

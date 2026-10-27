@@ -31,9 +31,16 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from pm_current_refit_parameters import (
+    iter_parameter_domain_projection,
+    load_retained_strategy_domain_v1,
+    validate_parameter_domain_member,
+)
+
 
 STATE_CONTRACT_SCHEMA_VERSION = "fxpm.state-contract.v2"
-STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION = "fxpm.state-candidate-domain.v1"
+ORIGINAL_STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION = "fxpm.state-candidate-domain.v1"
+STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION = "fxpm.state-candidate-domain.v2"
 STATE_DOMAIN_CEILING_SCHEMA_VERSION = "fxpm.state-domain-ceiling.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -66,12 +73,16 @@ _BARS_PER_UTC_DAY = {
     "D1": 1,
 }
 
-# FeatureComputer materializes both columns for compatibility, but they are
-# views of one hysteretic controller state, not two independently checkpointed
-# path states.  Resolution canonicalizes either request to this single node.
+# Scores, readiness and lagged views share the kernel's recursive/path state.
 STATE_FEATURE_ALIASES: Mapping[str, str] = {
-    "REGIME": "controller:REGIME_HYSTERESIS",
-    "REGIME_LIVE": "controller:REGIME_HYSTERESIS",
+    name: "controller:REGIME_HYSTERESIS"
+    for name in (
+        "TREND_SCORE", "RANGE_SCORE", "BREAKOUT_SCORE", "CHOP_SCORE",
+        "REGIME_RAW", "REGIME", "REGIME_STRENGTH", "REGIME_GAP",
+        "REGIME_WARMUP", "REGIME_LIVE", "REGIME_STRENGTH_LIVE",
+        "REGIME_RAW_STRENGTH", "REGIME_RAW_STRENGTH_LIVE", "REGIME_ADX",
+        "REGIME_ATR", "REGIME_BB_WIDTH", "REGIME_CONFIRM_EVIDENCE",
+    )
 }
 
 
@@ -454,7 +465,7 @@ class StateResolution:
 
 @dataclass(frozen=True)
 class StateDomainCeiling:
-    """DataFrame-free upper bound over one explicit Cartesian strategy domain."""
+    """DataFrame-free bound over an explicit legal domain, including coupled rows."""
 
     status: str
     strategy_name: str
@@ -828,13 +839,14 @@ class StateContractAuthority:
         initial_error_bound: Optional[float] = None,
         tolerance: Optional[float] = None,
         state_evidence: Optional[Mapping[str, StateEvidence]] = None,
+        parameter_domain: Optional[Mapping[str, Any]] = None,
     ) -> StateDomainCeiling:
         """Prove one safe state-context ceiling without reading market data.
 
-        The full parameter Cartesian product remains hashed and counted.  The
-        resolver itself is evaluated only over axes the reachable declarative
-        state DAG can read; omitted axes therefore cannot alter its result.
-        This is an exact projection of the resolver, not sampled search.
+        The complete legal domain remains hashed and counted. The resolver
+        visits only distinct state-relevant rows, retaining complete legal
+        witnesses for coupled parameters. The original Cartesian path retains
+        its issued hashes when no structured domain is supplied.
         """
 
         normalized_name = str(strategy_name or "")
@@ -896,33 +908,49 @@ class StateContractAuthority:
             include_regime_controller=include_regime_controller,
         )
         state_keys = self._state_parameter_keys(roots, normalized_domains)
-        full_count = math.prod(len(choices) for choices in normalized_domains.values())
-        projection_count = math.prod(
-            len(normalized_domains[key]) for key in state_keys
-        )
-        parameter_domain_sha256 = _canonical_sha256(
-            {
-                "parameter_domains": {
-                    key: list(choices)
-                    for key, choices in normalized_domains.items()
-                }
-            }
-        )
+        if parameter_domain is None:
+            full_count = math.prod(len(choices) for choices in normalized_domains.values())
+            projection_count = math.prod(len(normalized_domains[key]) for key in state_keys)
+            parameter_domain_sha256 = _canonical_sha256(
+                {"parameter_domains": {key: list(choices) for key, choices in normalized_domains.items()}}
+            )
+            base_parameters = {key: choices[0] for key, choices in normalized_domains.items()}
+            axes = [normalized_domains[key] for key in state_keys]
+            projections = (
+                ({**base_parameters, **dict(zip(state_keys, values))}, dict(zip(state_keys, values)))
+                for values in itertools.product(*axes)
+            )
+        else:
+            domain = dict(parameter_domain)
+            validate_parameter_domain_member(domain, domain.get("defaults"))
+            marginal = {key: [value] for key, value in domain["defaults"].items()}
+            for axis in domain["axes"]:
+                for column, name in enumerate(axis["names"]):
+                    unique = {}
+                    for row in axis["choices"]:
+                        unique.setdefault(_canonical_sha256(row[column]), row[column])
+                    marginal[name] = list(unique.values())
+            if set(marginal) != set(normalized_domains) or any(
+                {_canonical_sha256(value) for value in marginal[key]}
+                != {_canonical_sha256(value) for value in normalized_domains[key]}
+                for key in marginal
+            ):
+                raise ValueError("parameter domain marginals differ from parameter_domains")
+            full_count = domain["point_count"]
+            projection_count = 0
+            parameter_domain_sha256 = _canonical_sha256({"parameter_domain": domain})
+            projections = iter_parameter_domain_projection(domain, state_keys)
         evidence = dict(state_evidence or {})
         if any(not isinstance(item, StateEvidence) for item in evidence.values()):
             raise ValueError("state_evidence values must be StateEvidence")
-        base_parameters = {
-            key: choices[0] for key, choices in normalized_domains.items()
-        }
-        axes = [normalized_domains[key] for key in state_keys]
         projection_roster: list[dict[str, Any]] = []
         reasons: list[str] = []
         maximum: Optional[int] = None
         witness_parameters_sha256: Optional[str] = None
         witness_decision_sha256: Optional[str] = None
-        for values in itertools.product(*axes):
-            state_parameters = dict(zip(state_keys, values))
-            parameters = {**base_parameters, **state_parameters}
+        for parameters, state_parameters in projections:
+            if parameter_domain is not None:
+                projection_count += 1
             resolution = self.resolve_cell(
                 normalized_name,
                 parameters=parameters,
@@ -1065,11 +1093,15 @@ ACTUAL_STRATEGY_NAMES: tuple[str, ...] = (
 )
 
 # SHA-256 of the exact sorted StrategyRegistry candidate-domain document:
-# schema version plus every strategy name, normalized default parameters, and
-# normalized grid axes/values.  The contract remains import-independent while
+# schema version plus every strategy name, normalized defaults, grid axes and
+# coupled_groups. The retained v1 document omits groups. The authority stays
+# independent of strategy imports while
 # tests make any candidate addition, removal, or value drift explicit.
-STRATEGY_CANDIDATE_DOMAIN_SHA256 = (
+ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256 = (
     "d4d8ae2deee050989bdc8e93b21d779c8d68ddb4666668a9c34c5d65177803e3"
+)
+STRATEGY_CANDIDATE_DOMAIN_SHA256 = (
+    "a4305a9d256602158563c9edb8eb4ee2c857eba710825555a3f621327f0f25ef"
 )
 
 
@@ -1139,12 +1171,11 @@ def _feature_contracts() -> list[StateContract]:
             checkpoint_schema="fxpm.previous-month-level-state.v1",
             transition_schema="fxpm.previous-month-level-transition.v1",
         ),
-        StateContract("feature:REGIME_SCORE_SURFACE", StateKind.FINITE_WINDOW, finite_rule=FiniteWindowRule(400)),
         StateContract(
             "controller:REGIME_HYSTERESIS", StateKind.PATH_STATE,
-            dependencies=("feature:REGIME_SCORE_SURFACE",),
-            checkpoint_schema="fxpm.regime-hysteresis-state.v1",
-            transition_schema="fxpm.regime-hysteresis-transition.v1",
+            dependencies=("feature:OHLCV",),
+            checkpoint_schema="fxpm.regime-stream-state.v2",
+            transition_schema="fxpm.regime-stream-transition.v2",
         ),
     ]
     for period in (7, 10, 14, 20):
@@ -1171,8 +1202,6 @@ def _feature_contracts() -> list[StateContract]:
         contracts.append(StateContract(f"feature:{name}", StateKind.FINITE_WINDOW, dependencies=dependencies, finite_rule=FiniteWindowRule(bars)))
     for name in ("KC_MID", "KC_UPPER", "KC_LOWER"):
         contracts.append(StateContract(f"feature:{name}", StateKind.FINITE_WINDOW, dependencies=("feature:EMA_20", "feature:ATR_20"), finite_rule=FiniteWindowRule(1)))
-    for name in ("TREND_SCORE", "RANGE_SCORE", "BREAKOUT_SCORE", "CHOP_SCORE", "REGIME_RAW", "REGIME_STRENGTH", "REGIME_GAP", "REGIME_STRENGTH_LIVE"):
-        contracts.append(StateContract(f"feature:{name}", StateKind.FINITE_WINDOW, dependencies=("feature:REGIME_SCORE_SURFACE",), finite_rule=FiniteWindowRule(2)))
     return contracts
 
 
@@ -1348,6 +1377,31 @@ DEFAULT_AUTHORITY = StateContractAuthority(
 DEFAULT_REGISTRY_HASH = DEFAULT_AUTHORITY.registry_hash
 
 
+def retained_v1_authority() -> StateContractAuthority:
+    """Reconstruct only the pinned original authority, with unchanged rules."""
+
+    retained = load_retained_strategy_domain_v1()
+    contracts = (*_feature_contracts(), *_strategy_contracts())
+    canonical = sorted(
+        (contract.canonical() for contract in contracts),
+        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"), allow_nan=False),
+    )
+    body = {
+        "schema_version": STATE_CONTRACT_SCHEMA_VERSION,
+        "candidate_domain_hash": ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256,
+        "contracts": canonical,
+        "ambiguous_names": [],
+    }
+    if body != retained["canonical_contracts"]["state_registry"]:
+        raise ValueError("retained state contracts differ from the accepted original")
+    authority = StateContractAuthority(
+        contracts, candidate_domain_hash=ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256,
+    )
+    if authority.registry_hash != retained["process_template"]["state_contract_registry_sha256"]:
+        raise ValueError("retained state registry identity differs")
+    return authority
+
+
 __all__ = [
     "ACTUAL_STRATEGY_NAMES",
     "ContractionFormula",
@@ -1359,10 +1413,13 @@ __all__ = [
     "RecursiveRule",
     "ResolvedNode",
     "STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION",
+    "ORIGINAL_STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION",
     "STATE_CONTRACT_SCHEMA_VERSION",
     "STATE_DOMAIN_CEILING_SCHEMA_VERSION",
     "STATE_FEATURE_ALIASES",
     "STRATEGY_CANDIDATE_DOMAIN_SHA256",
+    "ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256",
+    "retained_v1_authority",
     "StateContract",
     "StateContractAuthority",
     "StateDomainCeiling",

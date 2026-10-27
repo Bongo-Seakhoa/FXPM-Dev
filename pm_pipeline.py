@@ -114,6 +114,10 @@ from pm_current_refit_parameters import (
     canonicalize_parameter_mapping,
     decode_parameter_mapping,
     parameter_values_equal,
+    build_parameter_domain,
+    validate_parameter_domain_member,
+    parameter_domain_point,
+    RETAINED_STRATEGY_SOURCE_V1_SHA256,
 )
 from pm_book_multiplicity import BOOK_MULTIPLICITY_CONTRACT_VERSION
 from pm_two_phase_lockbox import FROZEN_PRELOCKBOX_STATUS
@@ -201,7 +205,7 @@ def _optimization_ledger_lock_path(filepath: Any) -> Path:
         ledger_path = Path.cwd() / ledger_path
     ledger_path = ledger_path.resolve()
     return ledger_path.with_name(f".{ledger_path.name}.generation.lock")
-PIPELINE_ARTIFACT_VERSION = "2026-08-24-spread-swap-execution-v8"
+PIPELINE_ARTIFACT_VERSION = "2026-08-25-winner-v14-cost-ladder-v9"
 
 # Runtime-only optimizer resource contract.  These values control scheduling
 # and failure isolation only; they never alter bars, features, trials, scoring,
@@ -379,6 +383,7 @@ _CURRENT_REFIT_BOOK_ENTRY_FIELDS = {
     "winner_evidence_ledger_payload_sha256",
     "local_process_candidate_id",
     "local_process_sha256",
+    "validated_cost_ladder_tolerance",
     "process_state_payload",
     "process_state_receipt_sha256",
     "within_cell_attempted_trials_exact",
@@ -787,6 +792,7 @@ def _current_refit_validate_trial(
     strategy_id: str,
     process_sha256: str,
     horizon_sha256: str,
+    process_source_sha256: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     trial = _current_refit_exact(
         value, _CURRENT_REFIT_TRIAL_FIELDS, "CURRENT_REFIT_TRIAL_FIELDS_INVALID"
@@ -818,18 +824,16 @@ def _current_refit_validate_trial(
     normalized = _current_refit_json_parameters(fitted.get_params())
     if canonical_parameter_bytes(normalized) != canonical_parameter_bytes(parameters):
         raise ValueError("CURRENT_REFIT_TRIAL_PARAMETERS_NONCANONICAL")
-    defaults = base.get_default_params()
-    grid = base.get_param_grid()
-    for name, choices in grid.items():
-        if name in parameters and not any(
-            parameter_values_equal(parameters[name], choice) for choice in choices
-        ):
-            raise ValueError("CURRENT_REFIT_TRIAL_PARAMETER_OUTSIDE_PROCESS")
-    for name, expected in defaults.items():
-        if name not in grid and not parameter_values_equal(
-            parameters.get(name), expected
-        ):
-            raise ValueError("CURRENT_REFIT_TRIAL_FIXED_DEFAULT_MISMATCH")
+    if process_source_sha256 == RETAINED_STRATEGY_SOURCE_V1_SHA256:
+        from pm_current_refit_artifacts import retained_strategy_metadata_v1
+        _, _, defaults, grid = retained_strategy_metadata_v1(strategy_id)
+        groups = ()
+    else:
+        defaults, grid, groups = base.get_default_params(), base.get_param_grid(), base.get_param_couplings()
+    try:
+        validate_parameter_domain_member(build_parameter_domain(defaults, grid, coupled_groups=groups), parameters)
+    except CurrentRefitParameterCodecError as exc:
+        raise ValueError("CURRENT_REFIT_TRIAL_PARAMETER_OUTSIDE_PROCESS") from exc
     return dict(trial), parameters
 
 
@@ -842,6 +846,10 @@ def _current_refit_validate_process(
         value, _CURRENT_REFIT_PROCESS_FIELDS, "CURRENT_REFIT_PROCESS_FIELDS_INVALID"
     )
     strategy = StrategyRegistry.get(strategy_id)
+    retained = process.get("strategy_code_sha256") == RETAINED_STRATEGY_SOURCE_V1_SHA256
+    if retained:
+        from pm_current_refit_artifacts import retained_strategy_metadata_v1
+        _, domain, _, _ = retained_strategy_metadata_v1(strategy_id)
     if (
         process["schema_version"] != CURRENT_REFIT_PROCESS_VERSION
         or process["strategy_id"] != strategy_id
@@ -851,11 +859,11 @@ def _current_refit_validate_process(
         or type(process["process_candidate_id"]) is not str
         or not 1 <= len(process["process_candidate_id"]) <= 512
         or process["strategy_code_sha256"]
-        != _current_refit_strategy_code_sha256(strategy_id)
+        != (RETAINED_STRATEGY_SOURCE_V1_SHA256 if retained else _current_refit_strategy_code_sha256(strategy_id))
         or process["entry_rule_identity_sha256"]
-        != _current_refit_callable_sha256(type(strategy).generate_signals)
+        != (domain["entry_rule_identity_sha256"] if retained else _current_refit_callable_sha256(type(strategy).generate_signals))
         or process["exit_rule_identity_sha256"]
-        != _current_refit_callable_sha256(type(strategy).calculate_stops)
+        != (domain["exit_rule_identity_sha256"] if retained else _current_refit_callable_sha256(type(strategy).calculate_stops))
         or process["regime_conditioning"]
         != "EXACT_SYMBOL_TIMEFRAME_REGIME_CELL"
     ):
@@ -904,11 +912,17 @@ def _current_refit_validate_recipe(
     horizon_sha256: str,
     trial_sha256: str,
     source_bar_count: int,
+    process_source_sha256: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str]:
     recipe = _current_refit_exact(
         value, _CURRENT_REFIT_RECIPE_FIELDS, "CURRENT_REFIT_RECIPE_FIELDS_INVALID"
     )
     strategy = StrategyRegistry.get(strategy_id)
+    retained_pins = None
+    if process_source_sha256 == RETAINED_STRATEGY_SOURCE_V1_SHA256:
+        from pm_current_refit_artifacts import retained_strategy_metadata_v1
+        table, _, _, _ = retained_strategy_metadata_v1(strategy_id)
+        retained_pins = table["recipe_version_pins"]
     seed = recipe.get("seed")
     if type(seed) is not int or not 0 <= seed <= 0x7FFFFFFF:
         raise ValueError("CURRENT_REFIT_RECIPE_SEED_INVALID")
@@ -924,7 +938,7 @@ def _current_refit_validate_recipe(
         "fit_window_rule": "HORIZON_NATIVE_PREFIX_THROUGH_CURRENT_CUTOFF",
         "deterministic_fit_procedure_id": "FXPM_STATELESS_RULE_MATERIALIZE_V1",
         "seed": seed,
-        "version_pins": {
+        "version_pins": retained_pins if retained_pins is not None else {
             "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             "numpy": np.__version__,
             "pandas": pd.__version__,
@@ -1199,6 +1213,7 @@ def replay_current_refit_execution_from_raw_manifest(
             strategy_id=request["strategy_id"],
             process_sha256=process_sha256,
             horizon_sha256=horizon_sha256,
+            process_source_sha256=process["strategy_code_sha256"],
         )
         expected_process_candidate_id = _current_refit_process_candidate_id(
             symbol=request["symbol"],
@@ -1222,6 +1237,7 @@ def replay_current_refit_execution_from_raw_manifest(
             horizon_sha256=horizon_sha256,
             trial_sha256=trial_sha256,
             source_bar_count=source["bar_count"],
+            process_source_sha256=process["strategy_code_sha256"],
         )
         book_entry, book_entry_sha256 = _current_refit_validate_book_entry(
             _current_refit_read_json(
@@ -1619,6 +1635,20 @@ def _bounded_cartesian_combinations(
     return [decode((start + offset * step) % total) for offset in range(count)], total
 
 
+def _bounded_parameter_points(domain, *, limit, seed):
+    if not domain["axes"]:
+        return ([dict(domain["defaults"])] if limit > 0 else []), 1
+    combinations, total = _bounded_cartesian_combinations(
+        [axis["choices"] for axis in domain["axes"]], limit=limit, seed=seed)
+    points = []
+    for combination in combinations:
+        parameters = dict(domain["defaults"])
+        for axis, row in zip(domain["axes"], combination):
+            parameters.update(zip(axis["names"], row))
+        points.append(validate_parameter_domain_member(domain, parameters))
+    return points, total
+
+
 class _BoundedNativeSource:
     """Lazy one-timeframe-resident native source (seq1019/seq1055).
 
@@ -1970,6 +2000,7 @@ def _strategy_surface_fingerprint(strategies: Optional[List[BaseStrategy]] = Non
                 "name": strategy.name,
                 "params": strategy.get_params(),
                 "grid": strategy.get_param_grid(),
+                "couplings": strategy.get_param_couplings(),
                 "implementation_sha256": hashlib.sha256(
                     implementation.encode("utf-8", errors="replace")
                 ).hexdigest(),
@@ -2147,18 +2178,9 @@ def build_artifact_meta(config: PipelineConfig,
         "oos_evidence_periods": int(getattr(config, "oos_evidence_periods", 64) or 64),
         "oos_evidence_min_periods": int(getattr(config, "oos_evidence_min_periods", 8) or 8),
         "oos_evidence_dirname": str(getattr(config, "oos_evidence_dirname", "oos_evidence") or "oos_evidence"),
-        "oos_evidence_record_schema": "oos_candidate_returns_v4_one_touch_evidence",
+        "oos_evidence_record_schema": "oos_candidate_returns_v5_one_touch_evidence",
         "oos_evidence_trade_path_max_points": int(
             getattr(config, "oos_evidence_trade_path_max_points", 256) or 0
-        ),
-        "oos_evidence_include_execution_cost_survival": bool(
-            getattr(config, "oos_evidence_include_execution_cost_survival", False)
-        ),
-        "oos_evidence_execution_stress_mode": str(
-            getattr(config, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95"
-        ),
-        "oos_evidence_execution_cost_max_candidates_per_tf": int(
-            getattr(config, "oos_evidence_execution_cost_max_candidates_per_tf", 0) or 0
         ),
         "scoring_use_consistency": bool(getattr(config, "scoring_use_consistency", False)),
         "scoring_use_continuous_dd": bool(getattr(config, "scoring_use_continuous_dd", False)),
@@ -4033,8 +4055,7 @@ class HyperparameterOptimizer:
         default_params = strategy.get_params()
         
         # Decode at most the configured cap; never allocate the full grid.
-        param_names = list(param_grid.keys())
-        param_values = [list(param_grid[name] or []) for name in param_names]
+        domain = build_parameter_domain(default_params, param_grid, coupled_groups=strategy.get_param_couplings())
         _seed = _stable_seed(
             symbol,
             strategy_name,
@@ -4044,8 +4065,8 @@ class HyperparameterOptimizer:
             str(train_features.index[-1]) if len(train_features) else "",
             len(val_features),
         )
-        combinations, _total_space = _bounded_cartesian_combinations(
-            param_values,
+        combinations, _total_space = _bounded_parameter_points(
+            domain,
             limit=self.config.max_param_combos,
             seed=_seed,
         )
@@ -4055,9 +4076,7 @@ class HyperparameterOptimizer:
         # FX backtester selection: train-score shortlist, then validation-aware tiebreak.
         candidates: List[Dict[str, Any]] = []
 
-        for combo in combinations:
-            params = dict(zip(param_names, combo))
-            test_params = {**default_params, **params}
+        for test_params in combinations:
             test_strategy = StrategyRegistry.get(strategy_name, **test_params)
 
             try:
@@ -5080,7 +5099,7 @@ class RegimeOptimizer:
             for ordinal in range(count)
         ]
         ledger = {
-            "contract_version": "fxpm.winner-attempt-ledger.v2",
+            "contract_version": "fxpm.winner-attempt-ledger.v3",
             "attempt_count": count,
             "attempts_sha256": self._trade_power_sha256(attempts),
             "attempts": attempts,
@@ -6048,51 +6067,13 @@ class RegimeOptimizer:
             "time_underwater_fraction": round(float((drawdown_pct > 1e-9).mean()), 6),
         }
 
-    @staticmethod
-    def _execution_cost_survival_evidence(baseline: Dict[str, Any],
-                                          stress: Optional[Dict[str, Any]],
-                                          stress_mode: str) -> Dict[str, Any]:
-        if not isinstance(stress, dict):
-            return {"status": "not_requested", "stress_mode": stress_mode}
-        status = str(stress.get("status", "") or "").strip().lower()
-        if status in {"capped", "error"}:
-            payload = {"status": status, "stress_mode": stress_mode}
-            if stress.get("error"):
-                payload["error"] = str(stress.get("error"))[:240]
-            return payload
-        base_ret = float(baseline.get("total_return_pct", 0.0) or 0.0)
-        stress_ret = float(stress.get("total_return_pct", 0.0) or 0.0)
-        base_pf = float(baseline.get("profit_factor", 0.0) or 0.0)
-        stress_pf = float(stress.get("profit_factor", 0.0) or 0.0)
-        base_dd = float(baseline.get("max_drawdown_pct", 0.0) or 0.0)
-        stress_dd = float(stress.get("max_drawdown_pct", 0.0) or 0.0)
-        return {
-            "status": "available",
-            "stress_mode": stress_mode,
-            "baseline_return_pct": round(base_ret, 6),
-            "stress_return_pct": round(stress_ret, 6),
-            "baseline_profit_factor": round(base_pf, 6),
-            "stress_profit_factor": round(stress_pf, 6),
-            "baseline_max_drawdown_pct": round(base_dd, 6),
-            "stress_max_drawdown_pct": round(stress_dd, 6),
-            "return_retention": round(float(stress_ret / base_ret), 6)
-            if abs(base_ret) > 1e-9 else 0.0,
-            "profit_factor_retention": round(float(stress_pf / base_pf), 6)
-            if base_pf > 1e-9 else 0.0,
-            "drawdown_delta_pct": round(float(stress_dd - base_dd), 6),
-            "survives_positive_return": bool(stress_ret > 0.0),
-            "survives_pf_ge_1": bool(stress_pf >= 1.0),
-        }
-
     def _build_oos_evidence_record(self,
                                    symbol: str,
                                    timeframe: str,
                                    candidate: Dict[str, Any],
                                    val_result: Dict[str, Any],
                                    val_features: pd.DataFrame,
-                                   val_warmup_bars: int,
-                                   stress_result: Optional[Dict[str, Any]] = None,
-                                   stress_mode: str = "") -> Optional[Dict[str, Any]]:
+                                   val_warmup_bars: int) -> Optional[Dict[str, Any]]:
         periods = int(getattr(self.config, "oos_evidence_periods", 64) or 64)
         min_periods = int(getattr(self.config, "oos_evidence_min_periods", 8) or 8)
         scored_equity_curve = self._trim_equity_curve_for_warmup(
@@ -6164,7 +6145,7 @@ class RegimeOptimizer:
             raise ValueError("frozen validation signal attestation is missing or mismatched")
         candidate["_baseline_gated_signals_sha256"] = baseline_signal_sha256
         record = {
-            "format_version": "oos_candidate_returns_v4",
+            "format_version": "oos_candidate_returns_v5",
             "candidate_id": candidate_id,
             "symbol": symbol,
             "timeframe": timeframe,
@@ -6207,11 +6188,6 @@ class RegimeOptimizer:
             "train_metrics": train_metrics,
             "train_regime_metrics": train_regime_metrics,
             "val_regime_metrics": val_regime_metrics,
-            "execution_cost_survival": self._execution_cost_survival_evidence(
-                val_metrics,
-                stress_result,
-                stress_mode or str(getattr(self.config, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95"),
-            ),
             "parameter_stability_evidence": self._compact_metric_tree(
                 candidate.get("parameter_stability_evidence", {"status": "not_available"})
             ),
@@ -6269,7 +6245,6 @@ class RegimeOptimizer:
             "val_regime_metrics",
             "trade_path_evidence",
             "equity_path_evidence",
-            "execution_cost_survival",
             "parameter_stability_evidence",
             "generalization_metrics",
         )
@@ -6294,7 +6269,7 @@ class RegimeOptimizer:
         except (TypeError, ValueError, OverflowError) as exc:
             raise ValueError("OOS baseline evidence is malformed") from exc
         if (
-            str(record.get("format_version") or "") != "oos_candidate_returns_v4"
+            str(record.get("format_version") or "") != "oos_candidate_returns_v5"
             or str(record.get("candidate_id") or "") != expected_id
             or str(record.get("symbol") or "") != str(symbol)
             or str(record.get("timeframe") or "").upper() != str(timeframe).upper()
@@ -6362,21 +6337,6 @@ class RegimeOptimizer:
         if val_features is None or len(val_features) <= max(2, int(val_warmup_bars or 0)):
             return
         records_by_id: Dict[str, Dict[str, Any]] = {}
-        stress_enabled = bool(getattr(self.config, "oos_evidence_include_execution_cost_survival", False))
-        stress_mode = str(getattr(self.config, "oos_evidence_execution_stress_mode", "stress_p95") or "stress_p95")
-        stress_cap = int(getattr(self.config, "oos_evidence_execution_cost_max_candidates_per_tf", 0) or 0)
-        stress_backtester = None
-        stress_attempts = 0
-        if stress_enabled:
-            try:
-                stress_config = replace(self.config, backtest_spread_mode=stress_mode)
-                stress_backtester = Backtester(stress_config)
-            except Exception as exc:
-                logger.warning(
-                    f"[{symbol}] [{timeframe}] Execution-cost evidence disabled: "
-                    f"failed to build stress backtester ({exc})"
-                )
-                stress_enabled = False
         for cand in candidates:
             try:
                 evaluation_regime = self._candidate_evaluation_regime(cand)
@@ -6427,7 +6387,7 @@ class RegimeOptimizer:
                     ))
                 strategy = None
                 signals = None
-                if stress_enabled or not isinstance(existing_record, Mapping):
+                if not isinstance(existing_record, Mapping):
                     strategy = (
                         StrategyRegistry.get(
                             cand.get("strategy_name", ""),
@@ -6456,7 +6416,7 @@ class RegimeOptimizer:
                             kind=SearchOutcomeKind.INFRA_FAILURE,
                             stage=SearchStage.FROZEN_VALIDATION,
                             reason_code="FROZEN_VALIDATION_SIGNAL_REPLAY_MISMATCH",
-                            reason="stress replay signal vector differs from frozen baseline",
+                            reason="signal replay differs from frozen baseline",
                             symbol=symbol,
                             timeframe=timeframe,
                             regime=evaluation_regime,
@@ -6475,38 +6435,8 @@ class RegimeOptimizer:
                     val_result["_baseline_gated_signals_sha256"] = (
                         _signal_vector_sha256(signals)
                     )
-                stress_result = None
-                if stress_enabled and stress_backtester is not None:
-                    if stress_cap > 0 and stress_attempts >= stress_cap:
-                        stress_result = {"status": "capped", "stress_mode": stress_mode}
-                    else:
-                        stress_attempts += 1
-                        try:
-                            stress_result = stress_backtester.run(
-                                val_features,
-                                signals,
-                                symbol,
-                                strategy,
-                                timeframe=timeframe,
-                                warmup_bars=val_warmup_bars,
-                            )
-                        except Exception as stress_exc:
-                            stress_result = {
-                                "status": "error",
-                                "stress_mode": stress_mode,
-                                "error": f"{type(stress_exc).__name__}: {stress_exc}",
-                            }
                 if isinstance(existing_record, Mapping):
                     record = dict(existing_record)
-                    if stress_result is not None:
-                        baseline = dict(record.get("metrics") or {})
-                        record["execution_cost_survival"] = (
-                            self._execution_cost_survival_evidence(
-                                baseline,
-                                stress_result,
-                                stress_mode,
-                            )
-                        )
                 else:
                     record = self._build_oos_evidence_record(
                         symbol,
@@ -6515,8 +6445,6 @@ class RegimeOptimizer:
                         dict(val_result or {}),
                         val_features,
                         val_warmup_bars,
-                        stress_result=stress_result,
-                        stress_mode=stress_mode,
                     )
                 if record:
                     if record["candidate_id"] in records_by_id:
@@ -6531,9 +6459,6 @@ class RegimeOptimizer:
                             strategy_family=str(cand.get("strategy_name", "")),
                         ))
                     cand["oos_evidence"] = record
-                    cost_evidence = record.get("execution_cost_survival")
-                    if isinstance(cost_evidence, dict):
-                        cand["selection_execution_cost_survival"] = cost_evidence
                     records_by_id[record["candidate_id"]] = record
             except Exception as exc:
                 if isinstance(exc, SearchInfrastructureError):
@@ -7149,11 +7074,10 @@ class RegimeOptimizer:
         add(base_params, None)
         target_budget = max(int(self.family_probe_trials), len(specs), 1)
         param_grid = dict(strategy.get_param_grid() or {})
-        param_names = list(param_grid.keys())
-        choices_by_name = [list(param_grid[name] or []) for name in param_names]
-        if not param_names or any(not choices for choices in choices_by_name):
+        if not param_grid:
             return specs
-        total_space = int(math.prod(len(choices) for choices in choices_by_name))
+        domain = build_parameter_domain(base_params, param_grid, coupled_groups=strategy.get_param_couplings())
+        total_space = domain["point_count"]
         if total_space <= 0:
             return specs
         seed = _stable_seed(
@@ -7172,11 +7096,7 @@ class RegimeOptimizer:
             if len(specs) >= target_budget:
                 break
             encoded = int((start + offset * step) % total_space)
-            decoded = dict(base_params)
-            remainder = encoded
-            for name, choices in reversed(list(zip(param_names, choices_by_name))):
-                decoded[name] = choices[remainder % len(choices)]
-                remainder //= len(choices)
+            decoded = parameter_domain_point(domain, encoded)
             add(decoded, None)
         return specs
 
@@ -8146,22 +8066,6 @@ class RegimeOptimizer:
         
         Returns list of tuned candidate dicts with regime metrics.
         """
-        # Generate only the bounded deterministic design; never materialize the
-        # full Cartesian domain before applying the configured cap.
-        try:
-            param_names = list(param_grid.keys())
-            param_values = [list(param_grid[name] or []) for name in param_names]
-        except Exception as exc:
-            outcome = _classify_staged_search_exception(
-                exc,
-                stage=SearchStage.PARAMETER_VALIDATION,
-                symbol=symbol,
-                timeframe=timeframe,
-                regime="",
-                strategy_family=strategy_name,
-                parameter_hash="",
-            )
-            raise SearchInfrastructureError(outcome) from exc
         try:
             base_strategy = StrategyRegistry.get(strategy_name)
             default_params = base_strategy.get_params()
@@ -8171,6 +8075,22 @@ class RegimeOptimizer:
             outcome = _classify_staged_search_exception(
                 exc,
                 stage=SearchStage.STRATEGY_CONSTRUCTION,
+                symbol=symbol,
+                timeframe=timeframe,
+                regime="",
+                strategy_family=strategy_name,
+                parameter_hash="",
+            )
+            raise SearchInfrastructureError(outcome) from exc
+        # Generate only the bounded deterministic design; never materialize the
+        # full Cartesian domain before applying the configured cap.
+        try:
+            domain = build_parameter_domain(default_params, param_grid,
+                coupled_groups=base_strategy.get_param_couplings())
+        except Exception as exc:
+            outcome = _classify_staged_search_exception(
+                exc,
+                stage=SearchStage.PARAMETER_VALIDATION,
                 symbol=symbol,
                 timeframe=timeframe,
                 regime="",
@@ -8193,8 +8113,8 @@ class RegimeOptimizer:
                 "regime_grid_train_only",
                 len(train_features),
             )
-            combos, _total_space = _bounded_cartesian_combinations(
-                param_values,
+            combos, _total_space = _bounded_parameter_points(
+                domain,
                 limit=self.hyperparam_max_combos,
                 seed=seed,
             )
@@ -8206,8 +8126,7 @@ class RegimeOptimizer:
             eligible_train_trials = 0
             early_dd_rejections = 0
             trial_outcomes: List[TrialOutcome] = []
-            for combo in combos:
-                params = {**default_params, **dict(zip(param_names, combo))}
+            for params in combos:
                 current_stage = SearchStage.PARAMETER_VALIDATION
                 parameter_hash = ""
                 try:
@@ -12230,7 +12149,7 @@ class OptimizationPipeline:
                 "created_at": datetime.now().isoformat(),
                 "record_count": 0,
                 "return_index": "relative_equal_blocks",
-                "record_schema": "oos_candidate_returns_v4_one_touch_evidence",
+                "record_schema": "oos_candidate_returns_v5_one_touch_evidence",
                 "completion_status": "NO_CANDIDATE_RECORDS",
                 "completion_reason": "no candidates survived training eligibility/evidence gates",
                 "matrix_contract": {
@@ -12303,7 +12222,7 @@ class OptimizationPipeline:
             "created_at": datetime.now().isoformat(),
             "record_count": len(ordered_records),
             "return_index": "relative_equal_blocks",
-            "record_schema": "oos_candidate_returns_v4_one_touch_evidence",
+            "record_schema": "oos_candidate_returns_v5_one_touch_evidence",
             "matrix_contract": {
                 "returns_shape": [int(returns.shape[0]), int(returns.shape[1])],
                 "rows": "common trailing OOS periods",
@@ -13642,15 +13561,11 @@ class PortfolioManager:
             verify_promotion_authorization,
         )
 
-        mode = str(
-            getattr(self.config, "production_promotion_gate_mode", "ledger_status") or ""
-        ).strip().lower()
-        if mode in {"immutable", "authorization", "authorization_exact"}:
-            mode = "immutable_exact"
+        mode = getattr(self.config, "production_promotion_gate_mode", None)
         if mode != "immutable_exact":
             result = PromotionAuthorizationResult(
                 valid=False,
-                errors=[f"PROMOTION_GATE_MODE_NOT_IMMUTABLE_EXACT:{mode or 'missing'}"],
+                errors=[f"PROMOTION_GATE_MODE_NOT_IMMUTABLE_EXACT:{mode!r}"],
             )
             self._last_promotion_authorization = result
             return result
@@ -13680,15 +13595,9 @@ class PortfolioManager:
             if bool(getattr(self.config, "_funded_live_execution", False)):
                 return False, "funded execution cannot disable the promotion gate"
             return True, "promotion gate disabled for research"
-        mode = str(
-            getattr(self.config, "production_promotion_gate_mode", "ledger_status") or ""
-        ).strip().lower()
-        if mode in {"immutable", "authorization", "authorization_exact"}:
-            mode = "immutable_exact"
+        mode = getattr(self.config, "production_promotion_gate_mode", None)
         if mode != "immutable_exact":
-            if bool(getattr(self.config, "_funded_live_execution", False)):
-                return False, f"funded execution rejects weak promotion gate mode {mode!r}"
-            return True, f"legacy promotion mode {mode!r} retained for research"
+            return False, f"enabled promotion gate requires literal immutable_exact, got {mode!r}"
         verification = None if refresh else getattr(self, "_last_promotion_authorization", None)
         if verification is None:
             try:
@@ -18915,12 +18824,31 @@ class PortfolioManager:
         rejections: Dict[str, str] = {}
         drift_warnings: Dict[str, str] = {}
 
-        gate_mode = str(
-            getattr(self.config, "production_promotion_gate_mode", "ledger_status") or ""
-        ).strip().lower()
-        if gate_mode in {"immutable", "authorization", "authorization_exact"}:
-            gate_mode = "immutable_exact"
-        if bool(getattr(self.config, "production_require_promotion_gate", True)) and gate_mode == "immutable_exact":
+        gate_required = bool(
+            getattr(self.config, "production_require_promotion_gate", True)
+        )
+        gate_mode = getattr(self.config, "production_promotion_gate_mode", None)
+        gate_rejection_reason: Optional[str] = None
+        if (
+            not gate_required
+            and bool(getattr(self.config, "_funded_live_execution", False))
+        ):
+            gate_rejection_reason = "funded execution cannot disable the promotion gate"
+        elif gate_required and gate_mode != "immutable_exact":
+            gate_rejection_reason = (
+                "enabled promotion gate requires literal immutable_exact, "
+                f"got {gate_mode!r}"
+            )
+        if gate_rejection_reason is not None:
+            for symbol in self.symbol_configs:
+                rejections[symbol] = gate_rejection_reason
+            self._last_live_eligibility_rejections = dict(rejections)
+            self._last_live_eligibility_warnings = {}
+            if log_rejections:
+                for symbol, reason in sorted(rejections.items()):
+                    logger.warning(f"LIVE BLOCK {symbol}: {reason}")
+            return {}
+        if gate_required:
             try:
                 authorization = self.verify_live_promotion_authorization()
             except Exception as exc:

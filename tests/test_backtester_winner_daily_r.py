@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from decimal import Decimal
 from pathlib import Path
 
@@ -16,6 +17,20 @@ from pm_core import (
     build_backtest_winner_daily_r_surface,
     canonical_backtest_winner_r,
 )
+
+EXPECTED_RISK_UNIT_CONTRACT = {
+    "schema_version": "fxpm.precommitted-cell-risk-unit.v2",
+    "unit": "PRECOMMITTED_CELL_RISK_UNIT",
+    "position_denominator": "ENTRY_BROKER_STOP_PRICE_LOSS_DOLLARS",
+    "daily_surface": "SEARCH_TIME_FULL_PATH_POSITION_NORMALIZED_NET_MTM",
+    "inventory_boundary": "FLAT_TO_FLAT_LIQUIDATED_POST_COST",
+    "accounting_identity": (
+        "EXACT_DECIMAL_SUM_DAILY_NET_MTM_EQUALS_COMPLETED_TRADE_NET_MTM_"
+        "IN_SAME_PRECOMMITTED_CELL_RISK_UNIT"
+    ),
+    "r_decimal_places": 12,
+    "r_rounding": "ROUND_HALF_EVEN",
+}
 
 
 class _AtrHoldStrategy:
@@ -58,8 +73,10 @@ def _spec(**overrides) -> InstrumentSpec:
     return InstrumentSpec(**values)
 
 
-def _signals(frame: pd.DataFrame) -> pd.Series:
-    return pd.Series([1, 0, 0, 0, 0], index=frame.index, dtype=np.int32)
+def _signals(frame: pd.DataFrame, direction: int = 1) -> pd.Series:
+    values = np.zeros(len(frame), dtype=np.int32)
+    values[0] = direction
+    return pd.Series(values, index=frame.index, dtype=np.int32)
 
 
 def _run(
@@ -88,7 +105,7 @@ def _assert_accounting(result) -> None:
         (Decimal(str(value)) for value in surface["daily_net_mtm_r"]),
         Decimal(0),
     )
-    trade_total = sum(
+    position_total = sum(
         (
             Decimal(
                 str(
@@ -101,7 +118,20 @@ def _assert_accounting(result) -> None:
         ),
         Decimal(0),
     )
-    assert daily_total == trade_total
+    assert daily_total == position_total
+
+
+def test_canonical_winner_r_normalizes_quantized_zero_sign() -> None:
+    risk_contract = pm_core.build_backtest_winner_risk_unit_contract()
+    assert risk_contract == EXPECTED_RISK_UNIT_CONTRACT
+    assert pm_core._BACKTEST_WINNER_R_QUANTUM == Decimal(1).scaleb(
+        -risk_contract["r_decimal_places"]
+    )
+    result = canonical_backtest_winner_r("-0.0000000000004", "1")
+
+    assert result == 0.0
+    assert not np.signbit(result)
+    assert json.dumps(result, allow_nan=False) == "0.0"
 
 
 def test_overnight_full_path_matches_python_and_numba(monkeypatch) -> None:
@@ -122,19 +152,7 @@ def test_overnight_full_path_matches_python_and_numba(monkeypatch) -> None:
 
     surface = results[0]["winner_daily_r_surface"]
     assert surface["schema_version"] == "fxpm.backtester-winner-daily-r.v2"
-    assert surface["risk_unit_contract"] == {
-        "schema_version": "fxpm.precommitted-cell-risk-unit.v2",
-        "unit": "PRECOMMITTED_CELL_RISK_UNIT",
-        "position_denominator": "ENTRY_BROKER_STOP_PRICE_LOSS_DOLLARS",
-        "daily_surface": "SEARCH_TIME_FULL_PATH_POSITION_NORMALIZED_NET_MTM",
-        "inventory_boundary": "FLAT_TO_FLAT_LIQUIDATED_POST_COST",
-        "accounting_identity": (
-            "EXACT_DECIMAL_SUM_DAILY_NET_MTM_EQUALS_COMPLETED_TRADE_NET_MTM_"
-            "IN_SAME_PRECOMMITTED_CELL_RISK_UNIT"
-        ),
-        "r_decimal_places": 12,
-        "r_rounding": "ROUND_HALF_EVEN",
-    }
+    assert surface["risk_unit_contract"] == EXPECTED_RISK_UNIT_CONTRACT
     assert surface["daily_dates_utc"] == [
         "2026-01-05",
         "2026-01-06",
@@ -149,11 +167,220 @@ def test_overnight_full_path_matches_python_and_numba(monkeypatch) -> None:
         ]
 
 
+@pytest.mark.parametrize("warmup_bars", [0, 2])
+def test_no_signal_backtest_exports_full_actual_equity_axis(monkeypatch, warmup_bars) -> None:
+    """Synthetic timing fixture: no entries still produce every engine mark."""
+    frame = _frame()
+    config = PipelineConfig(
+        initial_capital=12_345.67,
+        research_mode=True,
+        use_spread=False,
+        swap_model_enabled=True,
+    )
+    modes = [False, True] if pm_core.NUMBA_AVAILABLE else [False]
+    results = []
+    for mode in modes:
+        monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", mode)
+        result = Backtester(config).run(
+            frame,
+            pd.Series(0, index=frame.index, dtype=np.int32),
+            "ZZZUSD",
+            _AtrHoldStrategy(),
+            spec=_spec(swap_long=-1.0),
+            timeframe="D1",
+            warmup_bars=warmup_bars,
+        )
+        assert result["total_trades"] == 0
+        assert result["trades"] == result["position_events"] == []
+        assert result["position_event_count"] == 0
+        assert type(result["equity_curve"]) is list
+        assert result["equity_curve"] == [config.initial_capital] * len(frame)
+        assert result["final_equity"] == config.initial_capital
+        assert result["equity_growth"]["raw_mark_count"] == len(frame) - warmup_bars
+        axis = result["trade_power_partition_axis"]
+        assert axis["start_utc"] == frame.index[warmup_bars].isoformat()
+        assert axis["end_utc"] == frame["_BAR_CLOSE_TS"].iloc[-1].isoformat()
+        assert axis["scored_bars"] == len(frame) - warmup_bars
+        assert axis["warmup_bars"] == warmup_bars
+        assert result["swap_accrual_contract"]["execution_state_compounding"] is True
+        assert result["swap_accrual_contract"]["source_provenance_authenticated"] is False
+        results.append(result)
+    if len(results) == 2:
+        assert results[0]["equity_curve"] == results[1]["equity_curve"]
+        assert results[0]["equity_growth"] == results[1]["equity_growth"]
+
+
+def test_no_trade_metrics_preserve_supplied_curve_without_recreating_marks() -> None:
+    backtester = Backtester(PipelineConfig(initial_capital=10_000.0))
+    # Invented export-only values distinguish preservation from a flat reset.
+    supplied_curve = [10_000.0, 9_997.5, 10_001.25]
+    result = backtester._calculate_metrics([], 10_001.25, supplied_curve, 0.025)
+    assert result["equity_curve"] == supplied_curve
+    defaults = backtester._empty_result()
+    assert {key: value for key, value in result.items() if key != "equity_curve"} == {
+        key: value for key, value in defaults.items() if key != "equity_curve"
+    }
+
+
+@pytest.mark.parametrize("curve", [None, []])
+def test_no_trade_metrics_without_engine_curve_keep_empty_schema(curve) -> None:
+    backtester = Backtester(PipelineConfig(initial_capital=12_345.67))
+    assert backtester._calculate_metrics([], 12_345.67, curve, 0.0) == backtester._empty_result()
+
+
+@pytest.mark.parametrize(
+    ("warmup_bars", "min_periods"),
+    [(0, 8), (2, 8), (2, 10)],
+    ids=["0", "2", "2-min10"],
+)
+def test_no_trade_oos_record_isolates_full_curve_content_changes(warmup_bars, min_periods) -> None:
+    """Measure legacy export versus actual marks through the real OOS builder."""
+    import pm_pipeline
+
+    index = pd.date_range("2026-01-05", periods=12, freq="1D", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "Open": 1.0,
+            "High": 1.0002,
+            "Low": 0.9998,
+            "Close": 1.0,
+            "ATR_14": 0.001,
+            "_BAR_CLOSE_TS": index + pd.Timedelta(days=1),
+        },
+        index=index,
+    )
+    signals = pd.Series(0, index=index, dtype=np.int32)
+    config = PipelineConfig(
+        initial_capital=12_345.67,
+        research_mode=True,
+        use_spread=False,
+        swap_model_enabled=False,
+        oos_evidence_periods=64,
+        oos_evidence_min_periods=min_periods,
+    )
+    result = Backtester(config).run(
+        frame,
+        signals,
+        "ZZZUSD",
+        _AtrHoldStrategy(),
+        spec=_spec(),
+        timeframe="D1",
+        warmup_bars=warmup_bars,
+    )
+    assert result["total_trades"] == 0 and result["trades"] == []
+    assert result["equity_curve"] == [config.initial_capital] * len(frame)
+    result["_baseline_gated_signals_sha256"] = pm_pipeline._signal_vector_sha256(signals)
+    # The measured pre-repair export discarded this path and kept one seed.
+    legacy_result = {**result, "equity_curve": [config.initial_capital]}
+    candidate = {
+        "strategy_name": _AtrHoldStrategy.name,
+        "params": dict(_AtrHoldStrategy.params),
+        "evaluation_regime": "TREND",
+    }
+    optimizer = pm_pipeline.RegimeOptimizer(config)
+    old_record = optimizer._build_oos_evidence_record(
+        "ZZZUSD", "D1", copy.deepcopy(candidate), legacy_result, frame, warmup_bars
+    )
+    new_record = optimizer._build_oos_evidence_record(
+        "ZZZUSD", "D1", copy.deepcopy(candidate), result, frame, warmup_bars
+    )
+    if min_periods == 10:
+        # The threshold stays ten: nine legacy fallback periods are insufficient.
+        assert config.oos_evidence_min_periods == 10
+        assert old_record is None
+        assert new_record is not None
+        assert new_record["period_count"] == 10
+        assert new_record["period_returns"] == [0.0] * 10
+        assert new_record["candidate_id"] == optimizer._exact_cell_candidate_id(
+            "ZZZUSD", "D1", "TREND", candidate
+        )
+        assert new_record["metrics"] == {
+            "total_trades": 0,
+            "profit_factor": 0.0,
+            "total_return_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "win_rate": 0.0,
+        }
+        assert new_record["window"] == {
+            "start_ts": index[0].isoformat(),
+            "end_ts": index[-1].isoformat(),
+            "bars": 12,
+            "warmup_bars": 2,
+        }
+        assert new_record["equity_path_evidence"]["status"] == "available"
+        assert new_record["equity_path_evidence"]["stored_points"] == 11
+        assert new_record["equity_path_evidence"]["return_pct_blocks"] == [0.0] * 11
+        assert new_record["baseline_evidence_sha256"] == pm_pipeline._oos_baseline_evidence_sha256(new_record)
+        return
+    assert old_record is not None and new_record is not None
+    old_periods = 11 if warmup_bars == 0 else 9
+    new_periods = 11 if warmup_bars == 0 else 10
+    assert old_record["period_count"] == old_periods
+    assert old_record["period_returns"] == [0.0] * old_periods
+    assert new_record["period_count"] == new_periods
+    assert new_record["period_returns"] == [0.0] * new_periods
+    assert old_record["equity_path_evidence"] == {
+        "status": "unavailable",
+        "stored_points": 0,
+        "return_pct_blocks": [],
+        "capital_preservation_blocks": [],
+    }
+    stored_points = 12 if warmup_bars == 0 else 11
+    assert new_record["equity_path_evidence"] == {
+        "status": "available",
+        "stored_points": stored_points,
+        "truncated": False,
+        "return_pct_blocks": [0.0] * stored_points,
+        "drawdown_pct_blocks": [0.0] * stored_points,
+        "capital_preservation_blocks": [1.0] * stored_points,
+        "max_drawdown_pct": 0.0,
+        "time_underwater_fraction": 0.0,
+    }
+    changed = {"equity_path_evidence", "baseline_evidence_sha256"}
+    if warmup_bars:
+        changed |= {"period_count", "period_returns"}
+    assert old_record.keys() == new_record.keys()
+    assert {key for key in old_record if old_record[key] != new_record[key]} == changed
+    for key in pm_pipeline._OOS_BASELINE_IMMUTABLE_KEYS:
+        if key not in changed:
+            assert old_record[key] == new_record[key]
+    for record in (old_record, new_record):
+        assert record["baseline_evidence_sha256"] == pm_pipeline._oos_baseline_evidence_sha256(record)
+
+
+@pytest.mark.parametrize("bar_count", [0, 1])
+def test_empty_or_single_bar_backtest_keeps_no_execution_schema(bar_count) -> None:
+    frame = _frame().iloc[:bar_count]
+    config = PipelineConfig(
+        initial_capital=12_345.67,
+        research_mode=True,
+        use_spread=False,
+        swap_model_enabled=False,
+    )
+    backtester = Backtester(config)
+    result = backtester.run(
+        frame,
+        pd.Series(0, index=frame.index, dtype=np.int32),
+        "ZZZUSD",
+        _AtrHoldStrategy(),
+        spec=_spec(),
+        timeframe="D1",
+    )
+    assert {key: result[key] for key in backtester._empty_result()} == backtester._empty_result()
+    assert result["equity_curve"] == [config.initial_capital]
+    assert result["numerical_execution_cost_attestation"]
+    if bar_count == 0:
+        assert result["winner_daily_r_surface"]["status"] == "UNAVAILABLE"
+        assert result["equity_growth"]["reason"] == "EMPTY_EVALUATION_WINDOW"
+    else:
+        assert result["winner_daily_r_surface"]["status"] == "AVAILABLE"
+        assert result["equity_growth"]["raw_mark_count"] == 1
+
+
 def test_partial_close_reconciles_one_flat_to_flat_position(monkeypatch) -> None:
     monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
-    frame = _frame()
     result = _run(
-        frame,
+        _frame(),
         config=PipelineConfig(
             research_mode=True,
             use_spread=False,
@@ -187,136 +414,41 @@ def test_spread_and_carry_are_in_daily_r() -> None:
     }
     base = _run(
         frame,
-        config=PipelineConfig(
-            **common,
-            use_spread=False,
-        ),
+        config=PipelineConfig(**common, use_spread=False),
         spec=_spec(swap_long=-1.0),
     )
-    stress = _run(
+    costed = _run(
         frame,
-        config=PipelineConfig(
-            **common,
-            use_spread=True,
-        ),
-        spec=_spec(
-            spread_avg=1.0,
-            swap_long=-1.0,
-        ),
+        config=PipelineConfig(**common, use_spread=True),
+        spec=_spec(spread_avg=1.0, swap_long=-1.0),
     )
 
     _assert_accounting(base)
-    _assert_accounting(stress)
+    _assert_accounting(costed)
     assert base["trades"][0]["swap_dollars"] < 0.0
-    assert stress["position_events"][0]["position_id"] == base[
+    assert costed["position_events"][0]["position_id"] == base[
         "position_events"
     ][0]["position_id"]
-    assert stress["position_events"][0]["pnl_dollars"] < base[
+    assert costed["position_events"][0]["pnl_dollars"] < base[
         "position_events"
     ][0]["pnl_dollars"]
-    assert sum(stress["winner_daily_r_surface"]["daily_net_mtm_r"]) < sum(
-        base["winner_daily_r_surface"]["daily_net_mtm_r"]
-    )
 
 
-def test_frozen_path_cost_stress_uses_genuine_arrays_and_preserves_positions() -> None:
-    frame = _frame().assign(
-        SpreadOpen=[1, 1, 1, 1, 1],
-        SpreadMax=[5, 5, 5, 5, 5],
-        SpreadP95=[4, 4, 4, 4, 4],
-    )
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=False,
-        backtest_spread_mode="conservative_max",
-        discovery_risk_per_trade_pct=1.0,
-    )
-    strategy = _AtrHoldStrategy()
-    spec = _spec()
-    backtester = Backtester(config)
-    signals = _signals(frame)
-    base = backtester.run(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        spec=spec,
-        timeframe="D1",
-    )
+@pytest.mark.parametrize("maximum_level", [
+    "BASE", "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+    "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P95",
+])
+def test_retired_frozen_ladder_cannot_create_new_receipts(monkeypatch, maximum_level):
+    from pm_spread_profile import RETIRED_COST_POLICY
 
-    stress = backtester.replay_frozen_path_cost_stress(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="D1",
-    )
+    def execution_must_not_start(*args, **kwargs):
+        pytest.fail("retired frozen-path replay reached execution")
 
-    assert stress["position_events"]
-    assert [
-        (
-            event["position_id"],
-            event["entry_time"],
-            event["exit_time"],
-            event["risk_amount"],
-        )
-        for event in stress["position_events"]
-    ] == [
-        (
-            event["position_id"],
-            event["entry_time"],
-            event["exit_time"],
-            event["risk_amount"],
-        )
-        for event in base["position_events"]
-    ]
-    assert all(
-        stressed["pnl_dollars"] <= baseline["pnl_dollars"]
-        for baseline, stressed in zip(
-            base["position_events"], stress["position_events"], strict=True
-        )
-    )
-    receipt = stress["cost_stress_frozen_path_receipt"]
-    assert receipt["path_identity_preserved"] is True
-    assert receipt["stress_never_improves"] is True
-    assert (
-        stress["numerical_execution_cost_attestation"]["spread_values_sha256"]
-        != base["numerical_execution_cost_attestation"]["spread_values_sha256"]
-    )
-    _assert_accounting(stress)
-
-    tampered_event = copy.deepcopy(base)
-    tampered_event["position_events"][0]["pnl_dollars"] += 0.01
-    with pytest.raises(ValueError, match="position reconciliation"):
-        backtester.replay_frozen_path_cost_stress(
-            frame,
-            signals,
-            "ZZZUSD",
-            strategy,
-            tampered_event,
-            stress_mode="stress_p95",
-            spec=spec,
-            timeframe="D1",
-        )
-
-    tampered_cost = copy.deepcopy(base)
-    tampered_cost["numerical_execution_cost_attestation"][
-        "spread_values_sha256"
-    ] = "0" * 64
-    with pytest.raises(ValueError, match="numerical cost attestation drift"):
-        backtester.replay_frozen_path_cost_stress(
-            frame,
-            signals,
-            "ZZZUSD",
-            strategy,
-            tampered_cost,
-            stress_mode="stress_p95",
-            spec=spec,
-            timeframe="D1",
+    monkeypatch.setattr(Backtester, "run", execution_must_not_start)
+    with pytest.raises(ValueError, match=RETIRED_COST_POLICY):
+        Backtester(PipelineConfig(research_mode=True)).replay_frozen_path_cost_ladder(
+            None, None, "ZZZUSD", _AtrHoldStrategy(), {},
+            spec=_spec(), timeframe="D1", maximum_level_id=maximum_level,
         )
 
 
@@ -330,7 +462,6 @@ def test_swap_contract_cache_is_shared_only_with_explicit_sibling() -> None:
     parent._swap_terms_pointer_pin = "a" * 64
 
     parent._share_immutable_swap_cache_with(sibling)
-
     assert sibling._swap_contract_cache is parent._swap_contract_cache
     assert sibling._swap_terms_pointer_pin == parent._swap_terms_pointer_pin
     assert unrelated._swap_contract_cache == {}
@@ -343,441 +474,97 @@ def test_swap_contract_cache_is_shared_only_with_explicit_sibling() -> None:
         parent._share_immutable_swap_cache_with(different_root)
 
 
-def test_frozen_path_cost_stress_rejects_base_from_other_signals() -> None:
-    frame = _frame().assign(
-        SpreadOpen=[1, 1, 1, 1, 1],
-        SpreadMax=[5, 5, 5, 5, 5],
-        SpreadP95=[4, 4, 4, 4, 4],
-    )
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=False,
-        backtest_spread_mode="conservative_max",
-        discovery_risk_per_trade_pct=1.0,
-    )
-    strategy = _AtrHoldStrategy()
-    spec = _spec()
-    backtester = Backtester(config)
-    supplied_signals = _signals(frame)
-    other_signals = pd.Series(
-        [-1, 0, 0, 0, 0],
-        index=frame.index,
-        dtype=np.int32,
-    )
-    fabricated_but_self_consistent = backtester.run(
-        frame,
-        other_signals,
-        "ZZZUSD",
-        strategy,
-        spec=spec,
-        timeframe="D1",
-    )
-
-    with pytest.raises(pm_core.FrozenPathCostStressError) as error:
-        backtester.replay_frozen_path_cost_stress(
-            frame,
-            supplied_signals,
-            "ZZZUSD",
-            strategy,
-            fabricated_but_self_consistent,
-            stress_mode="stress_p95",
-            spec=spec,
-            timeframe="D1",
-        )
-
-    assert error.value.code == "BASE_REPLAY_MISMATCH"
-
-
-def test_spread_only_frozen_path_stress_uses_closed_partition_p95() -> None:
-    frame = _frame().assign(Spread=[8, 1, 1, 1, 1])
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=False,
-        backtest_spread_mode="conservative_max",
-        discovery_risk_per_trade_pct=1.0,
-    )
-    strategy = _AtrHoldStrategy()
-    spec = _spec()
-    backtester = Backtester(config)
-    signals = _signals(frame)
-    base = backtester.run(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        spec=spec,
-        timeframe="D1",
-    )
-
-    stress = backtester.replay_frozen_path_cost_stress(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="D1",
-    )
-
-    spread = stress["spread_model"]
-    assert spread["stress_derivation_schema"] == (
-        pm_core.BACKTEST_CLOSED_PARTITION_SPREAD_STRESS_SCHEMA_VERSION
-    )
-    assert spread["stress_distribution_scope"] == (
-        "EXACT_CLOSED_BACKTEST_PARTITION"
-    )
-    assert spread["stress_distribution_statistic"] == (
-        "EMPIRICAL_P95_LINEAR_ORDER_STATISTIC"
-    )
-    assert spread["stress_distribution_observation_count"] == len(frame)
-    assert spread["stress_distribution_value_points"] == pytest.approx(6.6)
-    assert stress["position_events"][0]["pnl_dollars"] < (
-        base["position_events"][0]["pnl_dollars"]
-    )
-
-
-def test_trade_bearing_equal_cost_vectors_are_explicitly_non_adverse() -> None:
-    frame = _frame().assign(Spread=[2, 2, 2, 2, 2])
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=False,
-        backtest_spread_mode="conservative_max",
-        discovery_risk_per_trade_pct=1.0,
-    )
-    strategy = _AtrHoldStrategy()
-    spec = _spec()
-    backtester = Backtester(config)
-    signals = _signals(frame)
-    base = backtester.run(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        spec=spec,
-        timeframe="D1",
-    )
-
-    stress = backtester.replay_frozen_path_cost_stress(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="D1",
-    )
-
-    receipt = stress["cost_stress_frozen_path_receipt"]
-    assert receipt["schema_version"] == (
-        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION
-    )
-    assert receipt["realized_adversity_status"] == (
-        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
-    assert (
-        receipt["base_spread_values_sha256"]
-        == receipt["stress_spread_values_sha256"]
-    )
-    assert receipt["strictly_worse_trade_count"] == 0
-    assert receipt["strictly_worse_daily_observation_count"] == 0
-    assert receipt["stress_never_improves"] is True
-    assert stress["position_events"] == base["position_events"]
-    assert stress["winner_daily_r_surface"] == base["winner_daily_r_surface"]
-
-
-def test_equal_swap_inputs_preserve_already_settled_base_cents() -> None:
-    frame = _frame().iloc[:3].copy().assign(Spread=[2, 2, 2])
-    signals = pd.Series([1, 0, 0], index=frame.index, dtype=np.int32)
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=True,
-        swap_model_min_holding_hours=0.0,
-        backtest_spread_mode="conservative_max",
-        discovery_risk_per_trade_pct=2.5,
-    )
-    strategy = _AtrHoldStrategy()
-    spec = _spec(swap_long=-4.095, swap_short=-4.095, swap_mode=-1)
-    backtester = Backtester(config)
-    base = backtester.run(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        spec=spec,
-        timeframe="D1",
-    )
-
-    assert base["trades"][0]["position_size"] == pytest.approx(0.25)
-    assert base["trades"][0]["swap_rollover_units"] == 4
-    assert base["trades"][0]["swap_dollars"] == -4.10
-
-    stress = backtester.replay_frozen_path_cost_stress(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="D1",
-    )
-
-    assert stress["trades"][0]["swap_dollars"] == -4.10
-    assert stress["position_events"] == base["position_events"]
-    assert stress["winner_daily_r_surface"] == base["winner_daily_r_surface"]
-    receipt = stress["cost_stress_frozen_path_receipt"]
-    assert receipt["strictly_worse_trade_count"] == 0
-    assert receipt["strictly_worse_daily_observation_count"] == 0
-
-
-def test_frozen_path_swap_delta_uses_settled_base_and_rejects_nonfinite() -> None:
-    settle = Backtester._settle_frozen_path_stress_swap
-
-    # This is the exact preserved Gate-2 boundary: the base path has already
-    # settled NumPy's representation of -5.46 * .25 * 3 to -4.10.
+def test_ladder_swap_delta_uses_settled_base_and_rejects_nonfinite() -> None:
+    settle = Backtester._settle_frozen_path_ladder_swap
     assert settle(
         base_swap=-4.10,
         rollover_units=3,
         position_size=0.25,
         base_rate=-5.46,
-        stress_rate=-5.46,
+        ladder_rate=-5.46,
     ) == -4.10
     assert settle(
         base_swap=-4.10,
         rollover_units=3,
         position_size=0.25,
         base_rate=-5.46,
-        stress_rate=-5.50,
+        ladder_rate=-5.50,
     ) == -4.13
-    assert settle(
-        base_swap=-4.10,
-        rollover_units=3,
-        position_size=0.25,
-        base_rate=-5.46,
-        stress_rate=-5.42,
-    ) == -4.07
 
     for field, value in (
         ("base_swap", float("nan")),
         ("base_rate", float("inf")),
-        ("stress_rate", float("-inf")),
+        ("ladder_rate", float("-inf")),
     ):
         values = {
             "base_swap": -4.10,
             "rollover_units": 3,
             "position_size": 0.25,
             "base_rate": -5.46,
-            "stress_rate": -5.50,
+            "ladder_rate": -5.50,
         }
         values[field] = value
         with pytest.raises(ValueError, match="swap counterfactual is invalid"):
             settle(**values)
 
 
-@pytest.mark.parametrize(
-    ("direction", "raw_swap", "must_reject_improvement"),
-    (
-        ("LONG", 36000.0, True),
-        ("LONG", -36000.0, False),
-        ("SHORT", 36000.0, False),
-        ("SHORT", -36000.0, True),
-    ),
-)
-def test_mode6_entry_notional_delta_remains_economic_and_fail_closed(
-    direction: str,
-    raw_swap: float,
-    must_reject_improvement: bool,
-) -> None:
-    frame = _frame().iloc[:3].copy().assign(
-        SpreadOpen=[1, 1, 1],
-        SpreadMax=[5, 5, 5],
-        SpreadP95=[4, 4, 4],
-    )
-    signals = pd.Series(
-        [1 if direction == "LONG" else -1, 0, 0],
-        index=frame.index,
-        dtype=np.int32,
-    )
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=True,
-        swap_model_min_holding_hours=0.0,
-        backtest_spread_mode="conservative_max",
-        discovery_risk_per_trade_pct=2.5,
-    )
-    strategy = _AtrHoldStrategy()
-    spec = _spec(
-        swap_long=raw_swap,
-        swap_short=raw_swap,
-        swap_mode=6,
-        contract_size=100000.0,
-    )
-    backtester = Backtester(config)
-    base = backtester.run(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        spec=spec,
-        timeframe="D1",
-    )
-
-    if must_reject_improvement:
-        with pytest.raises(ValueError, match="improves under stress"):
-            backtester.replay_frozen_path_cost_stress(
-                frame,
-                signals,
-                "ZZZUSD",
-                strategy,
-                base,
-                stress_mode="stress_p95",
-                spec=spec,
-                timeframe="D1",
-            )
-        return
-
-    stress = backtester.replay_frozen_path_cost_stress(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="D1",
-    )
-    assert stress["trades"][0]["swap_dollars"] < base["trades"][0][
-        "swap_dollars"
-    ]
-    assert stress["trades"][0]["pnl_dollars"] < base["trades"][0][
-        "pnl_dollars"
-    ]
-
-
-def test_mode6_rollover_rebound_passes_cumulative_stress_rule() -> None:
-    frame = _frame().iloc[:3].copy().assign(
-        SpreadOpen=[1, 1, 1],
-        SpreadMax=[5, 5, 5],
-        SpreadP95=[4, 4, 4],
-    )
-    signals = pd.Series([-1, 0, 0], index=frame.index, dtype=np.int32)
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=True,
-        swap_model_min_holding_hours=0.0,
-        backtest_spread_mode="conservative_max",
-        discovery_risk_per_trade_pct=2.5,
-    )
-    strategy = _AtrHoldStrategy()
-    spec = _spec(
-        swap_long=-36.0,
-        swap_short=-36.0,
-        swap_mode=6,
-        contract_size=100000.0,
-    )
-    backtester = Backtester(config)
-    base = backtester.run(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        spec=spec,
-        timeframe="D1",
-    )
-
-    stress = backtester.replay_frozen_path_cost_stress(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="D1",
-    )
-
-    base_trade = base["trades"][0]
-    stress_trade = stress["trades"][0]
-    assert stress_trade["entry_price"] < base_trade["entry_price"]
-    assert stress_trade["swap_dollars"] > base_trade["swap_dollars"]
-    assert stress_trade["pnl_dollars"] < base_trade["pnl_dollars"]
-
-    base_daily = base["winner_daily_r_surface"]["daily_net_mtm_r"]
-    stress_daily = stress["winner_daily_r_surface"]["daily_net_mtm_r"]
-    improvement_count = sum(
-        Decimal(str(stress_value)) > Decimal(str(base_value))
-        for base_value, stress_value in zip(base_daily, stress_daily, strict=True)
-    )
-    assert improvement_count > 0  # The retired componentwise rule rejected this path.
-
-    base_cumulative = Decimal(0)
-    stress_cumulative = Decimal(0)
-    for base_value, stress_value in zip(base_daily, stress_daily, strict=True):
-        base_cumulative += Decimal(str(base_value))
-        stress_cumulative += Decimal(str(stress_value))
-        assert stress_cumulative <= base_cumulative + Decimal("1e-12")
-
-    receipt = stress["cost_stress_frozen_path_receipt"]
-    assert receipt["stress_daily_improvement_observation_count"] == improvement_count
-    assert receipt["realized_adversity_status"] == (
-        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
-    )
-
-
-def test_changed_spread_without_realized_degradation_is_insufficient() -> None:
-    frame = _frame().assign(
-        SpreadOpen=[1, 1, 1, 1, 1],
-        SpreadMax=[5, 5, 5, 5, 5],
-        SpreadP95=[4, 4, 4, 4, 4],
-    )
-    signals = pd.Series(np.zeros(len(frame), dtype=np.int32), index=frame.index)
-    config = PipelineConfig(
-        research_mode=True,
-        use_spread=True,
-        swap_model_enabled=False,
-        backtest_spread_mode="conservative_max",
-    )
-    strategy = _AtrHoldStrategy()
+def test_position_cumulative_prefix_improvement_fails_closed() -> None:
+    frame = _frame()
     spec = _spec()
-    backtester = Backtester(config)
-    base = backtester.run(
+    base = _run(
         frame,
-        signals,
-        "ZZZUSD",
-        strategy,
+        config=PipelineConfig(
+            research_mode=True,
+            use_spread=False,
+            swap_model_enabled=False,
+        ),
         spec=spec,
-        timeframe="D1",
     )
+    changed_trades = copy.deepcopy(base["trades"])
+    changed_trades[0]["entry_price"] -= 0.0001
+    changed_trades[0]["pnl_dollars"] -= 1.0
+    changed_events = pm_core.build_backtest_position_events(
+        changed_trades,
+        namespace="ZZZUSD|D1|winner-daily-r-hold",
+    )
+    zeros = np.zeros(len(frame), dtype=np.float64)
+    units = np.zeros(len(frame), dtype=np.int64)
 
-    stress = backtester.replay_frozen_path_cost_stress(
-        frame,
-        signals,
-        "ZZZUSD",
-        strategy,
-        base,
-        stress_mode="stress_p95",
-        spec=spec,
-        timeframe="D1",
-    )
-
-    receipt = stress["cost_stress_frozen_path_receipt"]
-    assert receipt["base_spread_values_sha256"] != receipt[
-        "stress_spread_values_sha256"
-    ]
-    assert receipt["strictly_worse_trade_count"] == 0
-    assert receipt["strictly_worse_daily_observation_count"] == 0
-    assert receipt["stress_daily_improvement_observation_count"] == 0
-    assert receipt["realized_adversity_status"] == (
-        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
+    with pytest.raises(pm_core.FrozenPathCostLadderError) as error:
+        pm_core._build_backtest_winner_daily_r_lanes(
+            frame,
+            (
+                pm_core._BacktestWinnerDailyRLane(
+                    name="BASE",
+                    trades=base["trades"],
+                    position_events=base["position_events"],
+                    half_spread_arr=zeros,
+                    use_spread=False,
+                    swap_model_enabled=False,
+                    causal_swap_enabled=False,
+                    pre_open_rollover_units_arr=units,
+                    rollover_units_arr=units,
+                    swap_long_per_lot_arr=zeros,
+                    swap_short_per_lot_arr=zeros,
+                ),
+                pm_core._BacktestWinnerDailyRLane(
+                    name="CHANGED",
+                    trades=changed_trades,
+                    position_events=changed_events,
+                    half_spread_arr=zeros,
+                    use_spread=False,
+                    swap_model_enabled=False,
+                    causal_swap_enabled=False,
+                    pre_open_rollover_units_arr=units,
+                    rollover_units_arr=units,
+                    swap_long_per_lot_arr=zeros,
+                    swap_short_per_lot_arr=zeros,
+                ),
+            ),
+            namespace="ZZZUSD|D1|winner-daily-r-hold",
+            spec=spec,
+        )
+    assert error.value.code == "LADDER_POSITION_CUMULATIVE_PREFIX_IMPROVEMENT"
 
 
 def test_noncausal_swap_never_claims_full_path_daily_r() -> None:
@@ -787,12 +574,11 @@ def test_noncausal_swap_never_claims_full_path_daily_r() -> None:
         config=PipelineConfig(research_mode=True, swap_model_enabled=True),
         spec=_spec(swap_long=-1.0),
     )
-
     assert result["winner_daily_r_surface"]["status"] == "UNAVAILABLE"
     assert result["winner_daily_r_surface"]["daily_net_mtm_r"] == []
 
 
-def test_tampered_position_event_fails_reconciliation(monkeypatch) -> None:
+def test_tampered_position_event_fails_reconciliation() -> None:
     frame = _frame()
     spec = _spec()
     result = _run(

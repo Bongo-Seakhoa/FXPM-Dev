@@ -22,6 +22,12 @@ from pm_current_refit_parameters import (
     canonicalize_parameter_mapping,
     decode_parameter_mapping,
     parameter_values_equal,
+    build_parameter_domain,
+    validate_parameter_domain_member,
+    load_retained_strategy_domain_v1,
+    decode_retained_parameter_metadata,
+    RETAINED_STRATEGY_SOURCE_V1_SHA256,
+    RETAINED_STRATEGY_V1_SUCCESSOR_SHA256,
 )
 from pm_strategies import StrategyRegistry
 
@@ -150,7 +156,7 @@ def canonical_artifact_bytes(value: Any) -> bytes:
         raise CurrentRefitArtifactError("ARTIFACT_NOT_CANONICAL_JSON") from exc
     if not encoded.isascii():
         _fail("ARTIFACT_NON_ASCII")
-    # Winner V11 uses ensure_ascii=True.  Once the ASCII law above holds, its
+    # Winner-v14 uses ensure_ascii=True.  Once the ASCII law above holds, its
     # serializer and the current-refit serializer must be byte-identical.
     escaped = json.dumps(
         value,
@@ -260,19 +266,105 @@ def _normalized_parameters(
         raise CurrentRefitArtifactError("STRATEGY_PARAMETERS_INVALID") from exc
     if canonical_parameter_bytes(normalized) != canonical_parameter_bytes(supplied):
         _fail("PARAMETERS_NOT_FULL_CANONICAL_SET")
-    for name, choices in grid.items():
-        if name not in normalized:
-            continue
-        selected = normalized[name]
-        if not any(parameter_values_equal(selected, choice) for choice in choices):
-            _fail("PARAMETER_VALUE_OUTSIDE_PROCESS")
-    for name, expected in defaults.items():
-        if name not in grid and not parameter_values_equal(
-            normalized.get(name), expected
-        ):
+    for name, value in normalized.items():
+        if name not in grid and not parameter_values_equal(value, defaults[name]):
             _fail("PARAMETER_FIXED_DEFAULT_MISMATCH")
+    try:
+        domain = build_parameter_domain(base.get_default_params(), grid,
+            coupled_groups=base.get_param_couplings())
+        validate_parameter_domain_member(domain, normalized)
+    except CurrentRefitParameterCodecError as exc:
+        raise CurrentRefitArtifactError("PARAMETER_VALUE_OUTSIDE_PROCESS") from exc
     canonical_artifact_bytes(normalized)
     return normalized
+
+
+def retained_strategy_metadata_v1(strategy_id):
+    table = load_retained_strategy_domain_v1()
+    pins = table["recipe_version_pins"]
+    if (pins["pm_core_sha256"] != _source_file_sha256(FeatureComputer)
+            or pins["python"] != f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            or pins["numpy"] != np.__version__ or pins["pandas"] != pd.__version__):
+        _fail("RETAINED_REFIT_RUNTIME_CHANGED")
+    try:
+        ordinal = table["strategy_names"].index(strategy_id)
+    except ValueError as exc:
+        raise CurrentRefitArtifactError("STRATEGY_ID_UNKNOWN") from exc
+    record = table["strategies"][ordinal]
+    domain = table["process_template"]["semantics"]["strategy_domains"][ordinal]
+    strategy = StrategyRegistry.get(strategy_id)
+    if _source_file_sha256(type(strategy)) not in {
+            RETAINED_STRATEGY_SOURCE_V1_SHA256, RETAINED_STRATEGY_V1_SUCCESSOR_SHA256}:
+        _fail("RETAINED_STRATEGY_SUCCESSOR_CHANGED")
+    if (type(strategy).__name__ != domain["strategy_class"]
+            or type(strategy).__module__ != domain["strategy_module"]
+            or strategy.category.value != domain["strategy_family"]
+            or int(strategy.MIN_BARS) != domain["minimum_bars"]):
+        _fail("RETAINED_STRATEGY_METADATA_CHANGED")
+    for name in ("__init__", "normalize_params", "get_params", "set_params", "get_default_params",
+                 "get_feature_request", "get_required_features"):
+        expected = record["metadata_callables"][name]
+        observed = getattr(strategy, name, None)
+        if ((expected is None) != (observed is None)
+                or expected is not None and _callable_sha256(observed) != expected["source_sha256"]):
+            _fail("RETAINED_STRATEGY_METADATA_CHANGED")
+    defaults = decode_retained_parameter_metadata(record["typed_metadata"]["defaults"])
+    grid = decode_retained_parameter_metadata(record["typed_metadata"]["grid"])
+    if (canonical_parameter_bytes(strategy.get_default_params()) != canonical_parameter_bytes(defaults)
+            or sorted(strategy.get_feature_request()) != domain["required_features"]):
+        _fail("RETAINED_STRATEGY_METADATA_CHANGED")
+    return table, domain, defaults, grid
+
+
+def _retained_search_artifacts_v1(*, strategy_id, trial, symbol, timeframe, regime,
+        lookback_kind, lookback_value, fit_start_utc, fit_end_utc, latest_closed_bar_utc,
+        source_snapshot_sha256, source_bar_count, seed):
+    symbol, timeframe, regime = _cell_identity(symbol, timeframe, regime)
+    name = _identity(strategy_id, "STRATEGY_ID_INVALID", maximum=256)
+    table, domain, defaults, grid = retained_strategy_metadata_v1(name)
+    try:
+        parameters = validate_parameter_domain_member(
+            build_parameter_domain(defaults, grid, coupled_groups=()), trial["parameters"])
+        runtime = decode_parameter_mapping(parameters, defaults)
+        if canonical_parameter_bytes(StrategyRegistry.get(name, **runtime).get_params()) != canonical_parameter_bytes(parameters):
+            _fail("PARAMETERS_NOT_FULL_CANONICAL_SET")
+    except CurrentRefitParameterCodecError as exc:
+        raise CurrentRefitArtifactError("PARAMETER_VALUE_OUTSIDE_PROCESS") from exc
+    horizon, horizon_sha = build_horizon_process_artifact_v2(symbol=symbol, timeframe=timeframe,
+        lookback_kind=lookback_kind, lookback_value=lookback_value, fit_start_utc=fit_start_utc,
+        fit_end_utc=fit_end_utc, latest_closed_bar_utc=latest_closed_bar_utc,
+        source_snapshot_sha256=source_snapshot_sha256, source_bar_count=source_bar_count)
+    process_body = {"schema_version": WINNER_PROCESS_SCHEMA,
+        "process_candidate_id": _candidate_id(symbol, timeframe, regime, name, parameters, horizon_sha),
+        "strategy_id": name, "strategy_family": domain["strategy_family"],
+        "strategy_module": domain["strategy_module"], "strategy_class": domain["strategy_class"],
+        "strategy_code_sha256": RETAINED_STRATEGY_SOURCE_V1_SHA256,
+        "entry_rule_identity_sha256": domain["entry_rule_identity_sha256"],
+        "exit_rule_identity_sha256": domain["exit_rule_identity_sha256"],
+        "regime_conditioning": "EXACT_SYMBOL_TIMEFRAME_REGIME_CELL"}
+    process_sha = canonical_artifact_sha256(process_body)
+    trial_body = {"schema_version": TRIAL_DEFINITION_SCHEMA, "strategy_id": name,
+        "strategy_family": domain["strategy_family"], "process_sha256": process_sha,
+        "horizon_process_sha256": horizon_sha,
+        "feature_contract_sha256": canonical_artifact_sha256({"schema_version": "fxpm.current-refit-feature-contract.v1",
+            "required_features": domain["required_features"], "minimum_bars": domain["minimum_bars"]}),
+        "indicator_contract_sha256": table["recipe_version_pins"]["pm_core_sha256"],
+        "parameter_count": len(parameters), "parameters": parameters}
+    trial_sha = canonical_artifact_sha256(trial_body)
+    if (type(seed) is not int or not 0 <= seed <= 0x7fffffff
+            or source_bar_count < max(2, domain["minimum_bars"])):
+        _fail("REFIT_SOURCE_TOO_SHORT")
+    recipe = {"schema_version": REFIT_RECIPE_SCHEMA, "strategy_id": name,
+        "winner_process_sha256": process_sha, "winner_horizon_process_sha256": horizon_sha,
+        "winner_trial_definition_sha256": trial_sha, "refit_mode": "STATELESS_RULE_MATERIALIZATION",
+        "parameter_source": "CURRENT_WINNER_TRIAL", "source_validation": "FULL_NATIVE_PREFIX_STREAM",
+        "fit_window_rule": "HORIZON_NATIVE_PREFIX_THROUGH_CURRENT_CUTOFF",
+        "deterministic_fit_procedure_id": "FXPM_STATELESS_RULE_MATERIALIZE_V1", "seed": seed,
+        "version_pins": table["recipe_version_pins"], "data_requirements": {"columns": list(_BAR_COLUMNS),
+            "minimum_bars": max(2, domain["minimum_bars"]), "warmup_bars": max(0, domain["minimum_bars"])},
+        "attempts": 1, "post_selection_search": False, "output_schema_version": SPECIALIST_OUTPUT_SCHEMA}
+    return CurrentRefitSearchArtifacts(process_body["process_candidate_id"], process_body, process_sha,
+        horizon, horizon_sha, trial_body, trial_sha, recipe, canonical_artifact_sha256(recipe))
 
 
 def _candidate_id(
@@ -635,21 +727,28 @@ def verify_current_refit_search_artifacts_bytes_v2(
         fields_code="REFIT_RECIPE_FIELDS_INVALID",
     )
 
-    expected = build_current_refit_search_artifacts_v2(
-        symbol=symbol,
-        timeframe=timeframe,
-        regime=regime,
-        strategy_id=strategy_id,
-        parameters=trial["parameters"],
-        lookback_kind=lookback_kind,
-        lookback_value=lookback_value,
-        fit_start_utc=fit_start_utc,
-        fit_end_utc=fit_end_utc,
-        latest_closed_bar_utc=latest_closed_bar_utc,
-        source_snapshot_sha256=source_snapshot_sha256,
-        source_bar_count=source_bar_count,
-        seed=seed,
-    )
+    if process["strategy_code_sha256"] == RETAINED_STRATEGY_SOURCE_V1_SHA256:
+        expected = _retained_search_artifacts_v1(strategy_id=strategy_id, trial=trial,
+            symbol=symbol, timeframe=timeframe, regime=regime, lookback_kind=lookback_kind,
+            lookback_value=lookback_value, fit_start_utc=fit_start_utc, fit_end_utc=fit_end_utc,
+            latest_closed_bar_utc=latest_closed_bar_utc, source_snapshot_sha256=source_snapshot_sha256,
+            source_bar_count=source_bar_count, seed=seed)
+    else:
+        expected = build_current_refit_search_artifacts_v2(
+            symbol=symbol,
+            timeframe=timeframe,
+            regime=regime,
+            strategy_id=strategy_id,
+            parameters=trial["parameters"],
+            lookback_kind=lookback_kind,
+            lookback_value=lookback_value,
+            fit_start_utc=fit_start_utc,
+            fit_end_utc=fit_end_utc,
+            latest_closed_bar_utc=latest_closed_bar_utc,
+            source_snapshot_sha256=source_snapshot_sha256,
+            source_bar_count=source_bar_count,
+            seed=seed,
+        )
     observed = (
         (
             process,

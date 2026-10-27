@@ -1333,18 +1333,17 @@ def test_execution_spec_rejects_caller_override_but_uses_native_structural_terms
 ):
     _data_dir, _facts, _context_value, product = _produce(tmp_path / "native")
     config = pm_core.PipelineConfig(research_mode=True)
-    with pytest.raises(
-        execution.AuthoritativeSearchExecutionError,
-        match="CALLER_INSTRUMENT_SPEC_FORBIDDEN",
-    ):
+    override = pm_core.InstrumentSpec(
+        symbol=SYMBOL, pip_position=4, tick_value=99.0,
+    )
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
         execution.fit_native_timeframe_for_search(
-            product=product,
-            config=config,
-            instrument_spec=pm_core.InstrumentSpec(
-                symbol=SYMBOL,
-                pip_position=4,
-                tick_value=99.0,
-            ),
+            product=product, config=config, instrument_spec=override,
+        )
+    assert caught.value.code == "CALLER_INSTRUMENT_SPEC_FORBIDDEN"
+    with pytest.raises(TypeError, match="unexpected keyword argument 'instrument_spec'"):
+        execution._freeze_bound_execution_spec(
+            product=product, config=config, instrument_spec=override,
         )
 
     config._deployment_config_path = str(
@@ -2157,3 +2156,279 @@ def test_cutoff_terminal_cannot_launder_corrupt_activated_source(tmp_path):
     assert product.native_prefix["artifact_sha256"] is None
     assert product.native_prefix["source_reason"].startswith("TECHNICAL_FAILURE:")
     assert "NO_TRADE" not in json.dumps(product.index, sort_keys=True)
+
+
+def _write_distinct_fixture_activation(data_dir: Path, activation_id: str):
+    """Publish nonproduction B over unchanged fixture source bytes; preserve immutable A."""
+    native = data_dir / "native"
+    pointer_path = native / "ACTIVE.json"
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    original_manifest_path = native / pointer["manifest_relative_path"]
+    original_manifest_bytes = original_manifest_path.read_bytes()
+    manifest = json.loads(original_manifest_bytes)
+    assert manifest["activation_id"] != activation_id
+    preserved = {original_manifest_path: original_manifest_bytes}
+    for symbol, timeframes in manifest["entries"].items():
+        for timeframe, entry in timeframes.items():
+            sidecar_path = native / entry["sidecar_relative_path"]
+            sidecar_bytes = sidecar_path.read_bytes()
+            preserved[sidecar_path] = sidecar_bytes
+            sidecar = json.loads(sidecar_bytes)
+            provenance_path = native / sidecar["source_provenance_relative_path"]
+            preserved[provenance_path] = provenance_path.read_bytes()
+            bars_path = native / entry["bars_relative_path"]
+            preserved[bars_path] = bars_path.read_bytes()
+            sidecar["activation_id"] = activation_id
+            sidecar_relative = f"audits/{activation_id}/{symbol}/{timeframe}/sidecar.json"
+            assert not (native / sidecar_relative).exists()
+            entry["sidecar_relative_path"] = sidecar_relative
+            entry["sidecar_sha256"] = _write_json(native / sidecar_relative, sidecar)
+    run_manifest_path = native / manifest["run_manifest_relative_path"]
+    preserved[run_manifest_path] = run_manifest_path.read_bytes()
+    manifest["activation_id"] = activation_id
+    manifest_relative = f"activations/{activation_id}.json"
+    assert not (native / manifest_relative).exists()
+    manifest_sha = _write_json(native / manifest_relative, manifest)
+    pointer.update(activation_id=activation_id, manifest_relative_path=manifest_relative,
+                   manifest_sha256=manifest_sha)
+    _write_json(pointer_path, pointer)
+    assert all(path.read_bytes() == original for path, original in preserved.items())
+    return manifest_sha
+
+
+def _verify_saved_fixture_prefix(data_dir, context, product, *, entrypoint="scalar",
+                                 pin=None, require_current_activation=None):
+    options = {"production_contract_required": False}
+    if pin is not None:
+        options["pinned_activation_manifest_sha256"] = pin
+    if require_current_activation is not None:
+        options["require_current_activation"] = require_current_activation
+    expected = dict(data_dir=data_dir, context=context,
+        index_descriptor=product.index_descriptor, expected_index_sha256=product.index_sha256,
+        expected_symbol=product.index["symbol"], expected_timeframe=product.index["timeframe"],
+        expected_cutoff_utc=product.index["cutoff_utc"],
+        expected_activation_manifest_sha256=product.index["activation"]["manifest_sha256"])
+    if entrypoint == "private-single":
+        return prefix._verify_activated_native_prefix_single(**expected, **options)
+    if entrypoint == "scalar":
+        return prefix.verify_activated_native_prefix(**expected, **options)
+    assert entrypoint == "candidates"
+    candidate = {"schema_version": prefix.PREFIX_CANDIDATE_SCHEMA,
+        "symbol": product.index["symbol"], "timeframe": product.index["timeframe"],
+        "cutoff_utc": product.index["cutoff_utc"], "source_state": product.source_state,
+        "index_descriptor": dict(product.index_descriptor), "index_sha256": product.index_sha256,
+        "activation_manifest_sha256": product.index["activation"]["manifest_sha256"]}
+    return prefix.verify_activated_native_prefix_candidates(data_dir=data_dir, context=context,
+        symbol=product.index["symbol"], timeframe=product.index["timeframe"],
+        candidates=(candidate,), **options)[0]
+
+
+def _assert_exact_saved_prefix(saved, reopened):
+    assert reopened.index == saved.index
+    assert _canonical(reopened.index) == _canonical(saved.index)
+    assert reopened.index_sha256 == saved.index_sha256
+    assert reopened.native_prefix == saved.native_prefix
+    assert reopened.source_state == saved.source_state
+    assert reopened.artifact_descriptors == saved.artifact_descriptors
+
+
+@pytest.mark.parametrize("entrypoint", ["scalar", "candidates", "private-single"])
+def test_explicit_pin_reopens_saved_activation_after_current_changes(tmp_path, monkeypatch, entrypoint):
+    data_dir, facts, context, saved_a = _produce(tmp_path)
+    pointer_a = (data_dir / "native" / "ACTIVE.json").read_bytes()
+    manifest_b_sha = _write_distinct_fixture_activation(data_dir, "native-activation-pinned-B")
+    assert manifest_b_sha != facts["activation_sha"]
+    assert (data_dir / "native" / "ACTIVE.json").read_bytes() != pointer_a
+    with pytest.raises(prefix.NativePrefixError) as exc:
+        _verify_saved_fixture_prefix(data_dir, context, saved_a, entrypoint=entrypoint)
+    assert exc.value.code == "PREFIX_INDEX_SOURCE_BINDING_MISMATCH"
+
+    def forbidden_current(*args, **kwargs):
+        pytest.fail("explicit pin consulted CURRENT instead of retained native evidence")
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", forbidden_current)
+    reopened = _verify_saved_fixture_prefix(data_dir, context, saved_a, entrypoint=entrypoint,
+        pin=facts["activation_sha"], require_current_activation=False)
+    _assert_exact_saved_prefix(saved_a, reopened)
+    assert reopened.index["activation"]["activation_id"] == ACTIVATION_ID
+    assert reopened.index["activation"]["manifest_sha256"] == facts["activation_sha"]
+    assert reopened.native_prefix["activation_manifest_sha256"] == facts["activation_sha"]
+    assert len(prefix.open_verified_prefix_frame(reopened)) == 3
+
+
+@pytest.mark.parametrize("entrypoint", ["scalar", "candidates"])
+def test_explicit_pin_preserves_consumed_identity_across_a_b_a(tmp_path, monkeypatch, entrypoint):
+    data_dir, facts, context, _saved_a = _produce(tmp_path)
+    pointer_path = data_dir / "native" / "ACTIVE.json"
+    pointer_a = pointer_path.read_bytes()
+    manifest_b_sha = _write_distinct_fixture_activation(data_dir, "native-activation-consumed-B")
+    consumed_b = prefix.produce_activated_native_prefix(data_dir=data_dir, context=context,
+        symbol=SYMBOL, timeframe="M5", cutoff_utc=facts["cutoff"],
+        source_accessed_at_utc=SOURCE_ACCESSED, production_contract_required=False)
+    assert consumed_b.index["activation"]["activation_id"] == "native-activation-consumed-B"
+    assert consumed_b.index["activation"]["manifest_sha256"] == manifest_b_sha
+    pointer_path.write_bytes(pointer_a)
+    with pytest.raises(prefix.NativePrefixError) as exc:
+        _verify_saved_fixture_prefix(data_dir, context, consumed_b, entrypoint=entrypoint)
+    assert exc.value.code == "PREFIX_INDEX_SOURCE_BINDING_MISMATCH"
+
+    def forbidden_current(*args, **kwargs):
+        pytest.fail("A/B/A replay consulted CURRENT")
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", forbidden_current)
+    reopened = _verify_saved_fixture_prefix(data_dir, context, consumed_b, entrypoint=entrypoint,
+        pin=manifest_b_sha, require_current_activation=False)
+    _assert_exact_saved_prefix(consumed_b, reopened)
+    assert reopened.index["activation"]["manifest_sha256"] != facts["activation_sha"]
+    assert json.loads(pointer_path.read_bytes())["manifest_sha256"] == facts["activation_sha"]
+
+
+@pytest.mark.parametrize("entrypoint", ["scalar", "candidates"])
+def test_explicit_pin_refuses_current_requirement(tmp_path, entrypoint):
+    data_dir, facts, context, product = _produce(tmp_path)
+    with pytest.raises(prefix.NativePrefixError) as exc:
+        _verify_saved_fixture_prefix(data_dir, context, product, entrypoint=entrypoint,
+            pin=facts["activation_sha"], require_current_activation=True)
+    assert exc.value.code == "PREFIX_PINNED_ACTIVATION_CURRENT_REQUIRED"
+
+
+@pytest.mark.parametrize("entrypoint", ["scalar", "candidates"])
+def test_explicit_pin_refuses_other_candidate_activation_sha(tmp_path, entrypoint):
+    data_dir, facts, context, product = _produce(tmp_path)
+    wrong_sha = "0" * 64 if facts["activation_sha"] != "0" * 64 else "1" * 64
+    with pytest.raises(prefix.NativePrefixError) as exc:
+        _verify_saved_fixture_prefix(data_dir, context, product, entrypoint=entrypoint,
+            pin=wrong_sha, require_current_activation=False)
+    assert exc.value.code == "PREFIX_PINNED_ACTIVATION_CANDIDATE_MISMATCH"
+
+
+@pytest.mark.parametrize("pin", ["A" * 64, "a" * 63, True], ids=["uppercase", "short", "non-string"])
+def test_explicit_pin_requires_exact_lowercase_sha(tmp_path, pin):
+    data_dir, _facts, context, product = _produce(tmp_path)
+    with pytest.raises(prefix.NativePrefixError) as exc:
+        _verify_saved_fixture_prefix(data_dir, context, product, pin=pin, require_current_activation=False)
+    assert exc.value.code == "PREFIX_PINNED_ACTIVATION_SHA_INVALID"
+
+
+@pytest.mark.parametrize("entrypoint", ["scalar", "candidates", "private-single"])
+def test_explicit_pin_preserves_cutoff_terminal_replay(tmp_path, monkeypatch, entrypoint):
+    data_dir = tmp_path / "data"
+    facts = _write_authenticated_suffix_activation(data_dir)
+    context = _context(tmp_path)
+    saved = prefix.produce_activated_native_prefix(data_dir=data_dir, context=context,
+        symbol=SYMBOL, timeframe="D1", cutoff_utc=_iso(facts["boundary_open"]),
+        source_accessed_at_utc="2026-07-14T00:00:00Z", production_contract_required=False)
+    assert saved.source_state == prefix.SOURCE_UNAVAILABLE
+    assert saved.index["source_reason"] == prefix.SOURCE_UNAVAILABLE_AT_CUTOFF
+    _write_distinct_fixture_activation(data_dir, "native-activation-cutoff-B")
+
+    def forbidden_current(*args, **kwargs):
+        pytest.fail("pinned cutoff-terminal replay consulted CURRENT")
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", forbidden_current)
+    reopened = _verify_saved_fixture_prefix(data_dir, context, saved, entrypoint=entrypoint,
+        pin=facts["activation_sha"], require_current_activation=False)
+    _assert_exact_saved_prefix(saved, reopened)
+    assert reopened.index["terminal_receipt"] == saved.index["terminal_receipt"]
+
+
+@pytest.mark.parametrize("entrypoint", ["scalar", "candidates"])
+def test_explicit_pin_preserves_missing_pointer_technical_failure(tmp_path, monkeypatch, entrypoint):
+    data_dir = tmp_path / "missing-data"
+    context = _context(tmp_path)
+    saved = prefix.produce_activated_native_prefix(data_dir=data_dir, context=context,
+        symbol=SYMBOL, timeframe="M5", cutoff_utc="2026-01-01T00:05:00Z",
+        source_accessed_at_utc=SOURCE_ACCESSED, production_contract_required=False)
+    assert saved.source_state == prefix.TECHNICAL_FAILURE
+    normal = _verify_saved_fixture_prefix(data_dir, context, saved, entrypoint=entrypoint)
+    _assert_exact_saved_prefix(saved, normal)
+
+    def forbidden_current(*args, **kwargs):
+        pytest.fail("pinned technical-failure replay consulted CURRENT")
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", forbidden_current)
+    reopened = _verify_saved_fixture_prefix(data_dir, context, saved, entrypoint=entrypoint,
+        pin=saved.index["activation"]["manifest_sha256"], require_current_activation=False)
+    _assert_exact_saved_prefix(saved, reopened)
+    assert "NO_TRADE" not in json.dumps(reopened.index, sort_keys=True)
+
+
+@pytest.mark.parametrize("entrypoint", ["scalar", "candidates"])
+def test_explicit_pin_generic_terminal_resolver_boundary_preserves_bytes(tmp_path, monkeypatch, entrypoint):
+    """Structural resolver-boundary unit only; no genuine terminal-acquisition or MISSING claim."""
+    data_dir = tmp_path / "data"
+    manifest_path = data_dir / "native" / "activations" / "terminal.json"
+    manifest_path.parent.mkdir(parents=True)
+    entry = {"symbol": SYMBOL, "timeframe": "M5", "status": "technical_error",
+             "source_provenance_sha256": "7" * 64}
+    manifest = {"activation_id": "terminal-activation", "entries": {SYMBOL: {"M5": entry}},
+        "run_manifest_relative_path": "runs/terminal/run_manifest.json", "run_manifest_sha256": "8" * 64}
+    manifest_path.write_bytes(_canonical(manifest))
+    manifest_sha = _sha(manifest_path.read_bytes())
+
+    def structural_terminal_resolution(*args, **kwargs):
+        return ActiveNativeResolution(symbol=SYMBOL, timeframe="M5", activation_id="terminal-activation",
+            activation_manifest_path=manifest_path, activation_manifest_sha256=manifest_sha,
+            errors=["NATIVE_ACTIVE_CELL_TERMINAL_TECHNICAL"])
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", structural_terminal_resolution)
+    context = _context(tmp_path)
+    saved = prefix.produce_activated_native_prefix(data_dir=data_dir, context=context,
+        symbol=SYMBOL, timeframe="M5", cutoff_utc="2026-01-01T00:05:00Z",
+        source_accessed_at_utc=SOURCE_ACCESSED, production_contract_required=False)
+    assert saved.source_state == prefix.TECHNICAL_TERMINAL
+    normal = _verify_saved_fixture_prefix(data_dir, context, saved, entrypoint=entrypoint)
+    _assert_exact_saved_prefix(saved, normal)
+
+    def forbidden_current(*args, **kwargs):
+        pytest.fail("pinned generic-terminal replay consulted CURRENT")
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", forbidden_current)
+    reopened = _verify_saved_fixture_prefix(data_dir, context, saved, entrypoint=entrypoint,
+        pin=manifest_sha, require_current_activation=False)
+    _assert_exact_saved_prefix(saved, reopened)
+
+
+@pytest.mark.parametrize("damage", ["missing-manifest", "corrupt-manifest", "missing-leaf", "corrupt-leaf", "corrupt-leaf-after-cutoff"])
+def test_explicit_pin_requires_intact_retained_manifest_and_leaf(tmp_path, monkeypatch, damage):
+    """Corrupt only this isolated tmp fixture; retained source originals are outside the test."""
+    data_dir, facts, context, saved = _produce(tmp_path)
+    manifest_path = data_dir / "native" / "activations" / f"{ACTIVATION_ID}.json"
+    bars_path = Path(facts["bars_path"])
+    if damage == "missing-manifest":
+        manifest_path.unlink()
+    elif damage == "corrupt-manifest":
+        manifest_path.write_bytes(manifest_path.read_bytes() + b" ")
+    elif damage == "missing-leaf":
+        bars_path.unlink()
+    elif damage == "corrupt-leaf":
+        original = bars_path.read_bytes()
+        changed = original.replace(b"1.100000", b"1.100001", 1)
+        assert changed != original and len(changed) == len(original)
+        bars_path.write_bytes(changed)
+    else:
+        original = bars_path.read_bytes()
+        rows = original.splitlines(keepends=True)
+        assert len(rows) == 6 and saved.native_prefix["prefix_rows"] == 3
+        last_open = rows[-1].split(b",", 1)[0].decode("ascii")
+        assert last_open.endswith("Z") and facts["cutoff"].endswith("Z")
+        assert last_open > facts["cutoff"]
+        changed_last = rows[-1].replace(b"1.104000", b"1.104001", 1)
+        changed = b"".join(rows[:-1]) + changed_last
+        assert changed != original and len(changed) == len(original)
+        assert changed.startswith(b"".join(rows[:4]))
+        bars_path.write_bytes(changed)
+
+    def forbidden_current(*args, **kwargs):
+        pytest.fail("damaged pinned source attempted CURRENT fallback")
+    monkeypatch.setattr(prefix, "resolve_active_native_artifact", forbidden_current)
+    if damage == "missing-leaf":
+        # The existing source-binding lstat failure is an exact OS error, not a native receipt.
+        with pytest.raises(FileNotFoundError) as exc:
+            _verify_saved_fixture_prefix(data_dir, context, saved,
+                pin=facts["activation_sha"], require_current_activation=False)
+        assert exc.value.filename == str(bars_path)
+    else:
+        with pytest.raises(prefix.NativePrefixError) as exc:
+            _verify_saved_fixture_prefix(data_dir, context, saved,
+                pin=facts["activation_sha"], require_current_activation=False)
+        assert exc.value.code == {
+            "missing-manifest": "PREFIX_ACTIVATION_MANIFEST_OPEN_FAILED",
+            "corrupt-manifest": "PREFIX_ACTIVATION_MANIFEST_RESOLUTION_MISMATCH",
+            "corrupt-leaf": "PREFIX_CONTENT_NOT_EXACT_SOURCE_PREFIX",
+            "corrupt-leaf-after-cutoff": "PREFIX_SOURCE_BARS_SHA_MISMATCH",
+        }[damage]

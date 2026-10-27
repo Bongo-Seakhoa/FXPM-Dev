@@ -1,4 +1,4 @@
-"""Search-time Winner V11 evidence capture and authority spooling."""
+"""Search-time Winner-v14 evidence capture and authority spooling."""
 
 from __future__ import annotations
 
@@ -10,25 +10,34 @@ import struct
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 
+import pm_authority_spool as authority_spool
 import pm_current_refit_artifacts as refit_artifacts
 import pm_winner_selection as winner
-from pm_authority_spool import SymbolAuthoritySink
+from pm_authority_spool import ARTIFACT_DESCRIPTOR_SCHEMA, SymbolAuthoritySink
 from pm_core import (
     BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
-    BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
-    BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
-    BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
+    BACKTEST_COST_LADDER_CONTRACT_SCHEMA_VERSION,
+    BACKTEST_FROZEN_PATH_COST_LADDER_ADVERSITY_INSUFFICIENT,
+    BACKTEST_FROZEN_PATH_COST_LADDER_ADVERSITY_STRICT,
+    BACKTEST_FROZEN_PATH_COST_LADDER_SCHEMA_VERSION,
+    BACKTEST_TRADE_IDENTITY_PNL_FIELDS,
     BACKTEST_WINNER_DAILY_R_SCHEMA_VERSION,
     BACKTEST_WINNER_RISK_UNIT_SCHEMA_VERSION,
     InstrumentSpec,
+    build_backtest_cost_ladder_contract,
+    build_backtest_frozen_tier_pair_contract,
+    validate_backtest_frozen_tier_pair_contract,
+    build_backtest_position_events,
     build_backtest_winner_risk_unit_contract,
     canonical_backtest_winner_r,
 )
 from pm_search_outcomes import SearchOutcomeKind, TrialOutcome
+from pm_spread_profile import ADMISSION_POLICY, ADMISSION_SCHEMA, FrozenSpreadTier, align_prior_completed_spreads, spread_admission
 from pm_trade_power import (
     NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION,
     REQUIRED_TRADE_RECORD_SCHEMA,
@@ -36,6 +45,7 @@ from pm_trade_power import (
     TradePowerDecision,
     TradePowerPolicy,
     build_numerical_execution_cost_attestation,
+    build_numerical_execution_cost_policy,
     build_trade_power_multiplicity_receipt,
     build_trade_power_partition_contract,
     build_trade_sample_evidence,
@@ -46,36 +56,65 @@ from pm_trade_power import (
 )
 
 
-FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v1"
-FROZEN_COST_POLICY_SCHEMA = "fxpm.winner-numerical-execution-cost-policy.v2"
-RAW_LANE_SCHEMA = "fxpm.winner-raw-backtester-lane.v1"
+ARCHIVED_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v3"
+FROZEN_PLAN_SCHEMA = ARCHIVED_FROZEN_PLAN_SCHEMA
+CURRENT_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v4"
+V16_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v5"
+FROZEN_COST_LADDER_CONTRACT_SCHEMA = BACKTEST_COST_LADDER_CONTRACT_SCHEMA_VERSION
+ARCHIVED_RAW_LANE_SCHEMA = "fxpm.winner-raw-backtester-lane.v4"
+RAW_LANE_SCHEMA = ARCHIVED_RAW_LANE_SCHEMA
+CURRENT_RAW_LANE_SCHEMA = "fxpm.winner-raw-backtester-lane.v5"
 DAILY_R_SURFACE_SCHEMA = BACKTEST_WINNER_DAILY_R_SCHEMA_VERSION
 RISK_UNIT_SCHEMA = BACKTEST_WINNER_RISK_UNIT_SCHEMA_VERSION
-POSITION_ACTIVITY_SCHEMA = "fxpm.winner-position-activity-ledger.v1"
+ARCHIVED_POSITION_ACTIVITY_SCHEMA = "fxpm.winner-position-activity-ledger.v2"
+POSITION_ACTIVITY_SCHEMA = ARCHIVED_POSITION_ACTIVITY_SCHEMA
+CURRENT_POSITION_ACTIVITY_SCHEMA = "fxpm.winner-position-activity-ledger.v3"
 SHARED_OOS_PARTITION_SCHEMA = winner.SHARED_OOS_PARTITION_VERSION
 POWER_CHAIN_SCHEMA = "fxpm.winner-trade-power-chain.v1"
-PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v1"
-AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v1"
-HORIZON_WINNER_CROSS_BINDING_SCHEMA = "fxpm.historical-horizon-winner-cross-binding.v1"
-HORIZON_WINNER_CROSS_BINDING_SCHEMA_V2 = "fxpm.horizon-winner-cross-binding.v2"
+ARCHIVED_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v4"
+PRODUCTION_SCHEMA = ARCHIVED_PRODUCTION_SCHEMA
+CURRENT_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v5"
+V16_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v6"
+ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v3"
+AUTHORITATIVE_PROVENANCE_SCHEMA = ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA
+CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v4"
+REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v5"
+HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA = (
+    "fxpm.historical-horizon-winner-cross-binding.v2"
+)
+CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA = (
+    "fxpm.horizon-winner-cross-binding.v3"
+)
+HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3 = "fxpm.historical-horizon-winner-cross-binding.v3"
+CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 = "fxpm.horizon-winner-cross-binding.v4"
+HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 = "fxpm.historical-horizon-winner-cross-binding.v4"
+CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 = "fxpm.horizon-winner-cross-binding.v5"
 HISTORICAL_CROSS_BINDING_MODE = "HISTORICAL"
 CURRENT_CROSS_BINDING_MODE = "CURRENT"
 PARTITION_GEOMETRY_SCHEMA = "fxpm.winner-partition-geometry.v1"
 SIGNAL_VECTOR_SCHEMA = "fxpm.authoritative-search-signal-vector.v1"
 SOURCE_COUNT_RECEIPT_SCHEMA = "fxpm.historical-attempt-source-count.v1"
 EXECUTION_SPEC_RECEIPT_SCHEMA = "fxpm.execution-instrument-spec-receipt.v2"
-COST_STRESS_ADVERSITY_PLAN_SCHEMA = (
-    "fxpm.winner-cost-stress-adversity-plan.v1"
+COST_LADDER_ADVERSITY_PLAN_SCHEMA = (
+    "fxpm.winner-cost-ladder-adversity-plan.v1"
 )
-COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK = (
-    BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
+COST_LADDER_ADVERSITY_EXPECTED_NO_SHOCK = (
+    BACKTEST_FROZEN_PATH_COST_LADDER_ADVERSITY_INSUFFICIENT
 )
-COST_STRESS_ADVERSITY_EXPECTED_STRICT = (
+COST_LADDER_ADVERSITY_EXPECTED_STRICT = (
     "STRICT_NUMERICAL_ADVERSITY_REQUIRED"
 )
 MAX_SIGNAL_VECTOR_OBSERVATIONS = 5_000_000
-FROZEN_PATH_COST_STRESS_SCHEMA = BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION
+FROZEN_PATH_COST_LADDER_SCHEMA = BACKTEST_FROZEN_PATH_COST_LADDER_SCHEMA_VERSION
 ASCII_JSON_FORMAT = "fxpm-ascii-json-v1"
+PARTITION_COST_PRECOMMITMENTS_SCHEMA = "fxpm.winner-partition-cost-precommitments.v1"
+PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA = "fxpm.winner-partition-cost-precommitments.v2"
+INDEPENDENT_TIER_EXECUTION_SCHEMA = "fxpm.independent-frozen-tier-execution.v1"
+SOURCE_OBSERVATIONS_SCHEMA = "fxpm.original-fine-spread-observations.v1"
+SOURCE_OBSERVATION_REFERENCE_SCHEMA = "fxpm.original-fine-spread-observation-reference.v1"
+SOURCE_OBSERVATION_ARTIFACT_TYPE = "winner_source_observation_receipt"
+_TIERS = ("P75", "P95")
+_PARTITIONS = ("optimizer_train", "tuning_validation", "final_lockbox")
 
 PRODUCTION_TRADE_POWER_POLICY = TradePowerPolicy(
     minimum_economic_edge_r=0.25,
@@ -85,6 +124,7 @@ PRODUCTION_TRADE_POWER_POLICY = TradePowerPolicy(
 PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS = 8
 
 _HEX = frozenset("0123456789abcdef")
+_BACKTEST_POSITION_ID = re.compile(r"btp:[0-9a-f]{64}\Z", re.ASCII)
 _NAMESPACE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", re.ASCII)
 _ATTEMPT_ARTIFACT_KEYS = frozenset(
     {"winner_process", "horizon_process", "trial_definition", "refit_recipe"}
@@ -105,12 +145,17 @@ _PROVENANCE_KEYS = (
     "oos_source_receipt",
 )
 _LANE_KEYS = (
-    "optimizer_train_base",
-    "tuning_validation_base",
-    "final_lockbox_base",
-    "final_lockbox_stress",
+    "optimizer_train_p75",
+    "optimizer_train_p95",
+    "tuning_validation_p75",
+    "tuning_validation_p95",
+    "final_lockbox_p75",
+    "final_lockbox_p95",
 )
-_V11_STATUS_REASONS = {
+_ARCHIVED_LANE_KEYS = (
+    "optimizer_train_base", "tuning_validation_base", "final_lockbox_base", "final_lockbox_p75", "final_lockbox_p95",
+)
+_WINNER_STATUS_REASONS = {
     "AUTHENTICATED": None,
     "PROCESS_REJECTED": "EVALUATED_OOS_PROCESS_REJECTED",
     "TECHNICAL_FAILURE": "EVALUATOR_TECHNICAL_FAILURE",
@@ -118,20 +163,11 @@ _V11_STATUS_REASONS = {
 _PRECOMMITTED_EVIDENCE_ROLES = frozenset(
     {"EVALUATION_REQUIRED", "PRESEARCH_PROCESS_REJECTED"}
 )
-_FROZEN_COST_POLICY_BODY_FIELDS = frozenset(
-    {
-        "schema_version",
-        "lane",
-        "attestation_schema_version",
-        "use_spread",
-        "spread_mode",
-        "instrument_spec_sha256",
-        "numerical_execution_cost_policy_sha256",
-    }
+_COST_LADDER_LEVEL_IDS = (
+    "BASE",
+    "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+    "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P95",
 )
-_FROZEN_COST_POLICY_FIELDS = _FROZEN_COST_POLICY_BODY_FIELDS | {
-    "policy_identity_sha256"
-}
 
 
 class WinnerRawEvidenceError(ValueError):
@@ -177,10 +213,9 @@ class FrozenWinnerSearchPlan:
     precommitment_bytes: bytes
     attempt_ledger_bytes: bytes
     source_contract_seed_bytes: bytes
-    base_cost_contract_bytes: bytes
-    stress_cost_contract_bytes: bytes
+    cost_ladder_contract_bytes: bytes
     risk_unit_contract_bytes: bytes
-    cost_stress_adversity_plan_bytes: bytes
+    cost_ladder_adversity_plan_bytes: bytes
     frozen_receipt_bytes: bytes
     frozen_receipt_entry_bytes: bytes
     horizon_execution_contracts_bytes: bytes
@@ -189,6 +224,25 @@ class FrozenWinnerSearchPlan:
     # inputs frozen before search.  Hash-only attempt ledgers are insufficient
     # for binding source snapshots and refit geometry at this boundary.
     attempt_artifacts_bundle_bytes: bytes = b""
+    source_contract_seeds_bytes: bytes = b""
+    frozen_tier_pair_contract_bytes: bytes = b""
+    partition_cost_precommitments_bytes: bytes = b""
+
+    @property
+    def selection_generation(self):
+        return winner.winner_generation_for_precommitment(self.precommitment)
+
+    @property
+    def source_contract_seeds(self) -> dict[str, Any]:
+        return _decode_object(self.source_contract_seeds_bytes, "SOURCE_SEEDS_BYTES_INVALID")
+
+    @property
+    def frozen_tier_pair_contract(self) -> dict[str, Any]:
+        return _decode_object(self.frozen_tier_pair_contract_bytes, "FROZEN_TIER_PAIR_CONTRACT_BYTES_INVALID")
+
+    @property
+    def partition_cost_precommitments(self) -> dict[str, Any]:
+        return _decode_object(self.partition_cost_precommitments_bytes, "PARTITION_COST_PRECOMMITMENTS_BYTES_INVALID")
 
     @property
     def frozen_receipt_entry(self) -> dict[str, Any]:
@@ -218,34 +272,21 @@ class FrozenWinnerSearchPlan:
         )
 
     @property
-    def base_cost_contract(self) -> dict[str, Any]:
-        """Frozen BASE cost policy (the historical property name is retained)."""
-        return _decode_object(self.base_cost_contract_bytes, "BASE_COST_BYTES_INVALID")
-
-    @property
-    def stress_cost_contract(self) -> dict[str, Any]:
-        """Frozen STRESS cost policy (the historical property name is retained)."""
+    def cost_ladder_contract(self) -> dict[str, Any]:
         return _decode_object(
-            self.stress_cost_contract_bytes, "STRESS_COST_BYTES_INVALID"
+            self.cost_ladder_contract_bytes,
+            "COST_LADDER_CONTRACT_BYTES_INVALID",
         )
-
-    @property
-    def base_cost_policy(self) -> dict[str, Any]:
-        return self.base_cost_contract
-
-    @property
-    def stress_cost_policy(self) -> dict[str, Any]:
-        return self.stress_cost_contract
 
     @property
     def risk_unit_contract(self) -> dict[str, Any]:
         return _decode_object(self.risk_unit_contract_bytes, "RISK_UNIT_BYTES_INVALID")
 
     @property
-    def cost_stress_adversity_plan(self) -> dict[str, Any]:
+    def cost_ladder_adversity_plan(self) -> dict[str, Any]:
         return _decode_object(
-            self.cost_stress_adversity_plan_bytes,
-            "COST_STRESS_ADVERSITY_PLAN_BYTES_INVALID",
+            self.cost_ladder_adversity_plan_bytes,
+            "COST_LADDER_ADVERSITY_PLAN_BYTES_INVALID",
         )
 
     @property
@@ -320,8 +361,8 @@ class WinnerRawEvidenceProduction:
 @dataclass(frozen=True)
 class _FoldOutcome:
     status: str
-    fold: Optional[dict[str, Any]]
-    pbo_fold: Optional[dict[str, Any]]
+    fold: dict[str, Any]
+    shared_fold_axis_row: dict[str, Any]
     reason_code: str
 
 
@@ -405,6 +446,36 @@ def _backtester_receipt_sha256(value: Any) -> str:
         if isinstance(item, (list, tuple)):
             return [exact(child) for child in item]
         _fail("BACKTESTER_RECEIPT_VALUE_INVALID")
+
+    return _sha_json(exact(value))
+
+
+def _backtester_exact_sha256(value: Any) -> str:
+    """Mirror the Backtester type-tagged exact hash for transported trade rows."""
+
+    def exact(item: Any) -> Any:
+        if item is None:
+            return {"type": "none"}
+        if isinstance(item, bool):
+            return {"type": "bool", "value": item}
+        if isinstance(item, int):
+            return {"type": "int", "value": str(item)}
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                _fail("BACKTESTER_EXACT_FLOAT_INVALID")
+            return {"type": "float64", "value": item.hex().lower()}
+        if isinstance(item, str):
+            return {"type": "str", "value": item}
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                _fail("BACKTESTER_EXACT_MAPPING_INVALID")
+            return {
+                "type": "mapping",
+                "value": {key: exact(item[key]) for key in sorted(item)},
+            }
+        if isinstance(item, list):
+            return {"type": "list", "value": [exact(child) for child in item]}
+        _fail("BACKTESTER_EXACT_VALUE_INVALID")
 
     return _sha_json(exact(value))
 
@@ -578,15 +649,17 @@ def _validated_execution_spec_receipt(
         _fail("EXECUTION_SPEC_BODY_ECONOMICS_INVALID")
     if _canonical_bytes(asdict(rebuilt)) != _canonical_bytes(dict(spec)):
         _fail("EXECUTION_SPEC_BODY_REPLAY_INVALID")
-    expected_instrument_hashes = {
-        frozen.base_cost_policy.get("instrument_spec_sha256"),
-        frozen.stress_cost_policy.get("instrument_spec_sha256"),
-        (
-            frozen.source_contract_seed.get("numerical_execution_cost_attestation")
-            or {}
-        ).get("instrument_spec_sha256"),
-    }
-    for lane in _LANE_KEYS:
+    current = bool(frozen.frozen_tier_pair_contract_bytes)
+    if current:
+        pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
+        expected_instrument_hashes = {item["numerical_execution_cost_policy"]["instrument_spec_sha256"] for item in pair["tiers"]}
+        expected_instrument_hashes |= {seed["numerical_execution_cost_attestation"]["instrument_spec_sha256"]
+            for seed in frozen.source_contract_seeds.values()}
+    else:
+        ladder_contract = _validated_cost_ladder_contract(frozen.cost_ladder_contract, code="FROZEN_COST_LADDER_CONTRACT_INVALID")
+        expected_instrument_hashes = {policy.get("instrument_spec_sha256") for policy in _cost_ladder_policies(ladder_contract)} | {
+            (frozen.source_contract_seed.get("numerical_execution_cost_attestation") or {}).get("instrument_spec_sha256")}
+    for lane in (_LANE_KEYS if current else _ARCHIVED_LANE_KEYS):
         lane_body = lanes.get(lane)
         attestation = (
             lane_body.get("numerical_execution_cost_attestation")
@@ -682,6 +755,28 @@ def _utc(value: Any, code: str) -> str:
     )
 
 
+def _utc_second(value: Any, code: str) -> str:
+    """Canonicalize a timestamp only when no subsecond information is lost."""
+
+    if type(value) is not str or not 1 <= len(value) <= 64:
+        _fail(code)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise WinnerRawEvidenceError(code) from exc
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or parsed.microsecond != 0
+    ):
+        _fail(code)
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
 def _day(value: Any, code: str) -> date:
     if type(value) is not str:
         _fail(code)
@@ -713,84 +808,89 @@ def _put_ascii_json(
     return entry
 
 
-def build_frozen_numerical_execution_cost_policy(
-    *,
-    lane: str,
-    use_spread: bool,
-    spread_mode: str,
-    instrument_spec_sha256: str,
-) -> dict[str, Any]:
-    """Freeze only invariant numerical-cost facts, never partition arrays.
-
-    Backtester spread arrays are causal-partition-local.  Their exact hash belongs
-    in each numerical execution-cost attestation, not in the pre-search policy.
-    This policy is intentionally constructible from broker/config/method facts
-    before any train, tuning, or lockbox result is evaluated.
-    """
-
-    normalized_lane = str(lane or "").strip().upper()
-    if normalized_lane not in {"BASE", "STRESS"}:
-        _fail("COST_POLICY_LANE_INVALID")
-    try:
-        # The TradePower builder is the canonical owner of policy
-        # canonicalization.  The dummy vector hash cannot enter policy_sha256.
-        reference = build_numerical_execution_cost_attestation(
-            use_spread=use_spread,
-            spread_mode=spread_mode,
-            spread_values_sha256="0" * 64,
-            instrument_spec_sha256=instrument_spec_sha256,
-        )
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise WinnerRawEvidenceError("COST_POLICY_FACTS_INVALID") from exc
-    if reference["use_spread"] is not True:
-        _fail("COST_POLICY_COMPONENT_DISABLED")
-    body = {
-        "schema_version": FROZEN_COST_POLICY_SCHEMA,
-        "lane": normalized_lane,
-        "attestation_schema_version": (NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION),
-        "use_spread": reference["use_spread"],
-        "spread_mode": reference["spread_mode"],
-        "instrument_spec_sha256": reference["instrument_spec_sha256"],
-        "numerical_execution_cost_policy_sha256": reference["policy_sha256"],
-    }
-    return {**body, "policy_identity_sha256": _sha_json(body)}
-
-
-def _validated_frozen_cost_policy(
+def _validated_cost_ladder_contract(
     value: Any,
     *,
-    lane: str,
     code: str,
 ) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or set(value) != _FROZEN_COST_POLICY_FIELDS:
+    """Rebuild the one frozen ordered BASE/P75/P95 policy contract."""
+
+    if not isinstance(value, Mapping):
         _fail(code)
-    policy = dict(value)
+    try:
+        contract = json.loads(_canonical_bytes(dict(value)).decode("ascii"))
+    except WinnerRawEvidenceError as exc:
+        raise WinnerRawEvidenceError(code) from exc
+    levels = contract.get("levels")
     if (
-        policy.get("schema_version") != FROZEN_COST_POLICY_SCHEMA
-        or policy.get("lane") != lane
-        or policy.get("attestation_schema_version")
-        != NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION
+        set(contract)
+        != {
+            "schema_version",
+            "percentile_choice_kind",
+            "p95_over_max_rationale",
+            "levels",
+        }
+        or contract.get("schema_version") != FROZEN_COST_LADDER_CONTRACT_SCHEMA
+        or type(levels) is not list
+        or len(levels) != len(_COST_LADDER_LEVEL_IDS)
+        or any(not isinstance(level, Mapping) for level in levels)
+        or tuple(level.get("level_id") for level in levels)
+        != _COST_LADDER_LEVEL_IDS
+    ):
+        _fail(code)
+    base_level = levels[0]
+    base_policy = base_level.get("numerical_execution_cost_policy")
+    if not isinstance(base_level.get("spread_model"), Mapping) or not isinstance(
+        base_policy, Mapping
     ):
         _fail(code)
     try:
-        rebuilt = build_frozen_numerical_execution_cost_policy(
-            lane=lane,
-            use_spread=policy.get("use_spread"),
-            spread_mode=policy.get("spread_mode"),
-            instrument_spec_sha256=policy.get("instrument_spec_sha256"),
+        rebuilt = build_backtest_cost_ladder_contract(
+            base_level["spread_model"],
+            use_spread=base_policy.get("use_spread"),
+            instrument_spec_sha256=base_policy.get("instrument_spec_sha256"),
         )
-    except WinnerRawEvidenceError as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise WinnerRawEvidenceError(code) from exc
-    if rebuilt != policy:
+    policies: list[dict[str, Any]] = []
+    for level in levels:
+        policy = level.get("numerical_execution_cost_policy")
+        if not isinstance(policy, Mapping):
+            _fail(code)
+        try:
+            normalized_policy = build_numerical_execution_cost_policy(
+                use_spread=policy.get("use_spread"),
+                spread_mode=policy.get("spread_mode"),
+                instrument_spec_sha256=policy.get("instrument_spec_sha256"),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise WinnerRawEvidenceError(code) from exc
+        if normalized_policy != dict(policy) or policy.get("use_spread") is not True:
+            _fail(code)
+        policies.append(normalized_policy)
+    if (
+        rebuilt != contract
+        or len({policy["policy_sha256"] for policy in policies}) != len(policies)
+        or len({policy["instrument_spec_sha256"] for policy in policies}) != 1
+    ):
         _fail(code)
     return rebuilt
+
+
+def _cost_ladder_policies(
+    contract: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    levels = contract["levels"]
+    policies = tuple(
+        dict(level["numerical_execution_cost_policy"]) for level in levels
+    )
+    return policies[0], policies[1], policies[2]
 
 
 def _validated_partition_cost_attestation(
     value: Any,
     *,
     policy: Mapping[str, Any],
-    lane: str,
     code: str,
 ) -> dict[str, Any]:
     """Rebuild one exact Backtester attestation and bind it to frozen policy."""
@@ -802,15 +902,19 @@ def _validated_partition_cost_attestation(
         rebuilt = build_numerical_execution_cost_attestation(
             use_spread=attestation.get("use_spread"),
             spread_mode=attestation.get("spread_mode"),
-            spread_values_sha256=attestation.get("spread_values_sha256"),
+            entry_half_spread_values_sha256=attestation.get(
+                "entry_half_spread_values_sha256"
+            ),
+            intrabar_half_spread_values_sha256=attestation.get(
+                "intrabar_half_spread_values_sha256"
+            ),
             instrument_spec_sha256=attestation.get("instrument_spec_sha256"),
         )
     except (TypeError, ValueError, OverflowError) as exc:
         raise WinnerRawEvidenceError(code) from exc
     if rebuilt != attestation:
         _fail(code)
-    derived_policy = build_frozen_numerical_execution_cost_policy(
-        lane=lane,
+    derived_policy = build_numerical_execution_cost_policy(
         use_spread=rebuilt["use_spread"],
         spread_mode=rebuilt["spread_mode"],
         instrument_spec_sha256=rebuilt["instrument_spec_sha256"],
@@ -1133,7 +1237,7 @@ def _normalize_fold_plan(
     regime: str,
 ) -> tuple[list[dict[str, Any]], str]:
     if not isinstance(raw_plan, (list, tuple)) or not (
-        int(winner.PINNED_SELECTION_POLICY["min_causal_folds"])
+        int(winner.CURRENT_GENERATION.policy["min_causal_folds"])
         <= len(raw_plan)
         <= winner.MAX_FOLDS
     ):
@@ -1161,7 +1265,7 @@ def _normalize_fold_plan(
             _fail(f"FOLD_PLAN_{ordinal:03d}_ANCHOR_MISMATCH")
         span = (end - start).days + 1
         if not (
-            int(winner.PINNED_SELECTION_POLICY["min_days_per_fold"])
+            int(winner.CURRENT_GENERATION.policy["min_days_per_fold"])
             <= span
             <= winner.MAX_DAYS_PER_FOLD
         ):
@@ -1199,7 +1303,7 @@ def _normalize_fold_plan(
     return normalized, latest.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _normalized_cost_stress_adversity_plan(
+def _normalized_cost_ladder_adversity_plan(
     value: Any,
     *,
     symbol: str,
@@ -1225,20 +1329,26 @@ def _normalized_cost_stress_adversity_plan(
         "final_partition_geometry_receipt_sha256",
         "final_partition_frame_sha256",
         "base_cost_attestation_sha256",
-        "stress_cost_attestation_sha256",
-        "base_spread_values_sha256",
-        "stress_spread_values_sha256",
-        "expected_adversity_status",
+        "p75_cost_attestation_sha256",
+        "p95_cost_attestation_sha256",
+        "base_entry_half_spread_values_sha256",
+        "p75_entry_half_spread_values_sha256",
+        "p95_entry_half_spread_values_sha256",
+        "base_intrabar_half_spread_values_sha256",
+        "p75_intrabar_half_spread_values_sha256",
+        "p95_intrabar_half_spread_values_sha256",
+        "expected_p75_adversity_status",
+        "expected_p95_adversity_status",
     }
     if not isinstance(value, Mapping) or set(value) != expected_body_keys:
-        _fail("COST_STRESS_ADVERSITY_PLAN_SCHEMA_INVALID")
+        _fail("COST_LADDER_ADVERSITY_PLAN_SCHEMA_INVALID")
     if (
         not isinstance(attempts, (list, tuple))
         or not isinstance(folds, (list, tuple))
         or any(not isinstance(item, Mapping) for item in attempts)
         or any(not isinstance(item, Mapping) for item in folds)
     ):
-        _fail("COST_STRESS_ADVERSITY_PLAN_FROZEN_ROSTER_INVALID")
+        _fail("COST_LADDER_ADVERSITY_PLAN_FROZEN_ROSTER_INVALID")
     rows = value.get("rows")
     expected_pairs = [
         (attempt, fold)
@@ -1247,7 +1357,7 @@ def _normalized_cost_stress_adversity_plan(
         for fold in folds
     ]
     if (
-        value.get("schema_version") != COST_STRESS_ADVERSITY_PLAN_SCHEMA
+        value.get("schema_version") != COST_LADDER_ADVERSITY_PLAN_SCHEMA
         or value.get("symbol") != symbol
         or value.get("timeframe") != timeframe
         or value.get("regime") != regime
@@ -1256,14 +1366,14 @@ def _normalized_cost_stress_adversity_plan(
         or type(rows) is not list
         or len(rows) != len(expected_pairs)
     ):
-        _fail("COST_STRESS_ADVERSITY_PLAN_BINDING_INVALID")
+        _fail("COST_LADDER_ADVERSITY_PLAN_BINDING_INVALID")
 
     normalized_rows: list[dict[str, Any]] = []
     horizon_attempt_ids: dict[int, str] = {}
     for row_ordinal, (raw, (attempt, fold)) in enumerate(
         zip(rows, expected_pairs, strict=True)
     ):
-        label = f"COST_STRESS_ADVERSITY_PLAN_ROW_{row_ordinal:04d}"
+        label = f"COST_LADDER_ADVERSITY_PLAN_ROW_{row_ordinal:04d}"
         if not isinstance(raw, Mapping) or set(raw) != expected_row_keys:
             _fail(f"{label}_SCHEMA_INVALID")
         row = dict(raw)
@@ -1289,28 +1399,48 @@ def _normalized_cost_stress_adversity_plan(
             "final_partition_geometry_receipt_sha256",
             "final_partition_frame_sha256",
             "base_cost_attestation_sha256",
-            "stress_cost_attestation_sha256",
-            "base_spread_values_sha256",
-            "stress_spread_values_sha256",
+            "p75_cost_attestation_sha256",
+            "p95_cost_attestation_sha256",
+            "base_entry_half_spread_values_sha256",
+            "p75_entry_half_spread_values_sha256",
+            "p95_entry_half_spread_values_sha256",
+            "base_intrabar_half_spread_values_sha256",
+            "p75_intrabar_half_spread_values_sha256",
+            "p95_intrabar_half_spread_values_sha256",
         ):
             _hex(row.get(name), 64, f"{label}_{name.upper()}_INVALID")
         if (
-            row["base_cost_attestation_sha256"]
-            == row["stress_cost_attestation_sha256"]
+            len(
+                {
+                    row["base_cost_attestation_sha256"],
+                    row["p75_cost_attestation_sha256"],
+                    row["p95_cost_attestation_sha256"],
+                }
+            )
+            != 3
         ):
             _fail(f"{label}_COST_ATTESTATION_NOT_DISTINCT")
-        expected_status = (
-            COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
-            if row["base_spread_values_sha256"]
-            == row["stress_spread_values_sha256"]
-            else COST_STRESS_ADVERSITY_EXPECTED_STRICT
-        )
-        if row.get("expected_adversity_status") != expected_status:
-            _fail(f"{label}_EXPECTED_STATUS_INVALID")
+        if len(
+            {
+                row["base_intrabar_half_spread_values_sha256"],
+                row["p75_intrabar_half_spread_values_sha256"],
+                row["p95_intrabar_half_spread_values_sha256"],
+            }
+        ) != 1:
+            _fail(f"{label}_INTRABAR_VECTOR_DRIFT")
+        for level in ("p75", "p95"):
+            expected_status = (
+                COST_LADDER_ADVERSITY_EXPECTED_NO_SHOCK
+                if row["base_entry_half_spread_values_sha256"]
+                == row[f"{level}_entry_half_spread_values_sha256"]
+                else COST_LADDER_ADVERSITY_EXPECTED_STRICT
+            )
+            if row.get(f"expected_{level}_adversity_status") != expected_status:
+                _fail(f"{label}_{level.upper()}_EXPECTED_STATUS_INVALID")
         normalized_rows.append(row)
 
     normalized = {
-        "schema_version": COST_STRESS_ADVERSITY_PLAN_SCHEMA,
+        "schema_version": COST_LADDER_ADVERSITY_PLAN_SCHEMA,
         "symbol": symbol,
         "timeframe": timeframe,
         "regime": regime,
@@ -1322,11 +1452,303 @@ def _normalized_cost_stress_adversity_plan(
         value.get("rows_sha256") != normalized["rows_sha256"]
         or _canonical_bytes(dict(value)) != _canonical_bytes(normalized)
     ):
-        _fail("COST_STRESS_ADVERSITY_PLAN_HASH_INVALID")
+        _fail("COST_LADDER_ADVERSITY_PLAN_HASH_INVALID")
     return normalized
 
 
-def freeze_winner_search_plan_v3(
+def _current_pair_inputs(source_contract_seeds: Any, frozen_tier_pair_contract: Any) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    if (not isinstance(source_contract_seeds, Mapping) or set(source_contract_seeds) != set(_TIERS)
+            or any(not isinstance(source_contract_seeds[tier], Mapping) for tier in _TIERS)):
+        _fail("SOURCE_SEED_TIER_ROSTER_INVALID")
+    try:
+        pair = validate_backtest_frozen_tier_pair_contract(frozen_tier_pair_contract)
+    except (TypeError, ValueError, KeyError, OverflowError) as exc:
+        raise WinnerRawEvidenceError("FROZEN_TIER_PAIR_CONTRACT_INVALID") from exc
+    seeds = {tier: dict(source_contract_seeds[tier]) for tier in _TIERS}
+    source_hashes, cost_hashes = {}, {}
+    for tier, level in zip(_TIERS, pair["tiers"], strict=True):
+        policy = level["numerical_execution_cost_policy"]
+        _validated_partition_cost_attestation(seeds[tier].get("numerical_execution_cost_attestation"),
+            policy=policy, code=f"{tier}_SOURCE_SEED_COST_ATTESTATION_INVALID")
+        source_hashes[tier] = _validated_source_identity(seeds[tier])
+        cost_hashes[tier] = _sha_json(policy)
+    for field in ("source_binding", "trade_record_schema_version", "execution_cost_timing_contract", "swap_accrual_contract"):
+        if seeds["P75"].get(field) != seeds["P95"].get(field):
+            _fail("SOURCE_SEED_PAIR_NATIVE_BINDING_MISMATCH")
+    return seeds, pair, {"source_contract_sha256": _sha_json(source_hashes),
+        "cost_contract_sha256": _sha_json(cost_hashes), "frozen_tier_pair_contract_sha256": _sha_json(pair)}
+
+
+def _validated_partition_cost_precommitments_v1(value: Any, *, pair: Mapping[str, Any],
+        attempts: Sequence[Mapping[str, Any]], folds: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {"schema_version", "frozen_tier_pair_contract_sha256", "rows", "receipt_sha256"}:
+        _fail("PARTITION_COST_PRECOMMITMENTS_SCHEMA_INVALID")
+    body = dict(value)
+    receipt_sha = body.pop("receipt_sha256")
+    rows = body.get("rows")
+    if (body.get("schema_version") != PARTITION_COST_PRECOMMITMENTS_SCHEMA
+            or body.get("frozen_tier_pair_contract_sha256") != _sha_json(pair)
+            or receipt_sha != _sha_json(body) or type(rows) is not list):
+        _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
+    if (type(attempts) is not list or type(folds) is not list
+            or any(not isinstance(attempt, Mapping) or type(attempt.get("ordinal")) is not int
+                   or attempt.get("precommitted_evidence_role") not in _PRECOMMITTED_EVIDENCE_ROLES for attempt in attempts)
+            or any(not isinstance(fold, Mapping) or type(fold.get("fold_ordinal")) is not int for fold in folds)):
+        _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+    expected = [(attempt["ordinal"], fold["fold_ordinal"], partition)
+        for attempt in attempts if attempt["precommitted_evidence_role"] == "EVALUATION_REQUIRED"
+        for fold in folds for partition in _PARTITIONS]
+    if len(rows) != len(expected):
+        _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+    for row, identity in zip(rows, expected, strict=True):
+        if (not isinstance(row, Mapping) or set(row) != {"attempt_ordinal", "fold_ordinal", "partition",
+                "partition_geometry_receipt_sha256", "partition_frame_sha256", "source_observation_receipt_sha256", "tiers"}
+                or (row["attempt_ordinal"], row["fold_ordinal"], row["partition"]) != identity
+                or not isinstance(row["tiers"], Mapping) or set(row["tiers"]) != set(_TIERS)):
+            _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+        for name in ("partition_geometry_receipt_sha256", "partition_frame_sha256", "source_observation_receipt_sha256"):
+            _hex(row[name], 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+        for tier, level in zip(_TIERS, pair["tiers"], strict=True):
+            data = row["tiers"][tier]
+            if not isinstance(data, Mapping) or set(data) != {"numerical_execution_cost_attestation",
+                    "entry_observations_sha256", "entry_admission_mask_sha256"}:
+                _fail("PARTITION_COST_PRECOMMITMENTS_TIER_INVALID")
+            _validated_partition_cost_attestation(data["numerical_execution_cost_attestation"],
+                policy=level["numerical_execution_cost_policy"], code="PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID")
+            for name in ("entry_observations_sha256", "entry_admission_mask_sha256"):
+                _hex(data[name], 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+    return json.loads(_canonical_bytes(dict(value)))
+
+
+def _compact_partition_cost_record(row: Mapping[str, Any], *,
+        pair: Mapping[str, Any]) -> dict[str, Any]:
+    if (not isinstance(row, Mapping) or set(row) != {"attempt_ordinal", "fold_ordinal", "partition",
+            "partition_geometry_receipt_sha256", "partition_frame_sha256", "source_observation_receipt_sha256", "tiers"}
+            or type(row["attempt_ordinal"]) is not int or type(row["fold_ordinal"]) is not int
+            or row["partition"] not in _PARTITIONS
+            or not isinstance(row["tiers"], Mapping) or set(row["tiers"]) != set(_TIERS)):
+        _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+    for name in ("partition_geometry_receipt_sha256", "partition_frame_sha256", "source_observation_receipt_sha256"):
+        _hex(row[name], 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+    tiers = {}
+    for tier, level in zip(_TIERS, pair["tiers"], strict=True):
+        data = row["tiers"][tier]
+        if not isinstance(data, Mapping) or set(data) != {"numerical_execution_cost_attestation",
+                "entry_observations_sha256", "entry_admission_mask_sha256"}:
+            _fail("PARTITION_COST_PRECOMMITMENTS_TIER_INVALID")
+        attestation = _validated_partition_cost_attestation(data["numerical_execution_cost_attestation"],
+            policy=level["numerical_execution_cost_policy"], code="PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID")
+        for name in ("entry_observations_sha256", "entry_admission_mask_sha256"):
+            _hex(data[name], 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+        tiers[tier] = {
+            "entry_half_spread_values_sha256": attestation["entry_half_spread_values_sha256"],
+            "intrabar_half_spread_values_sha256": attestation["intrabar_half_spread_values_sha256"],
+            "numerical_execution_cost_attestation_sha256": _sha_json(attestation),
+            "entry_observations_sha256": data["entry_observations_sha256"],
+            "entry_admission_mask_sha256": data["entry_admission_mask_sha256"],
+        }
+    return {"partition_frame_sha256": row["partition_frame_sha256"],
+        "source_observation_receipt_sha256": row["source_observation_receipt_sha256"], "tiers": tiers}
+
+
+def build_partition_cost_precommitments(rows: Sequence[Mapping[str, Any]], *,
+        pair: Mapping[str, Any]) -> dict[str, Any]:
+    """Store exact repeated geometry once without changing its cost commitments."""
+    if type(rows) is not list:
+        _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+    records, record_sources, identities = {}, {}, []
+    for row in rows:
+        if (not isinstance(row, Mapping) or set(row) != {"attempt_ordinal", "fold_ordinal", "partition",
+                "partition_geometry_receipt_sha256", "partition_frame_sha256", "source_observation_receipt_sha256", "tiers"}
+                or type(row["attempt_ordinal"]) is not int or type(row["fold_ordinal"]) is not int
+                or row["partition"] not in _PARTITIONS):
+            _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+        identity = row["partition_geometry_receipt_sha256"]
+        _hex(identity, 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+        source = {key: row[key] for key in (
+            "partition_frame_sha256", "source_observation_receipt_sha256", "tiers")}
+        if identity in record_sources and record_sources[identity] != source:
+            _fail("PARTITION_COST_PRECOMMITMENTS_RECORD_CONFLICT")
+        if identity not in records:
+            records[identity] = _compact_partition_cost_record(row, pair=pair)
+            record_sources[identity] = source
+        identities.append({key: row[key] for key in (
+            "attempt_ordinal", "fold_ordinal", "partition", "partition_geometry_receipt_sha256")})
+    body = {"schema_version": PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA,
+        "frozen_tier_pair_contract_sha256": _sha_json(pair), "rows": identities, "records": records}
+    return {**body, "receipt_sha256": _sha_json(body)}
+
+
+def _expanded_partition_cost_record(record: Any, *, pair: Mapping[str, Any]) -> dict[str, Any]:
+    if (not isinstance(record, Mapping) or set(record) != {
+            "partition_frame_sha256", "source_observation_receipt_sha256", "tiers"}):
+        _fail("PARTITION_COST_PRECOMMITMENTS_RECORD_INVALID")
+    for name in ("partition_frame_sha256", "source_observation_receipt_sha256"):
+        _hex(record[name], 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+    if not isinstance(record["tiers"], Mapping) or set(record["tiers"]) != set(_TIERS):
+        _fail("PARTITION_COST_PRECOMMITMENTS_TIER_INVALID")
+    tiers = {}
+    for tier, level in zip(_TIERS, pair["tiers"], strict=True):
+        data = record["tiers"][tier]
+        if not isinstance(data, Mapping) or set(data) != {
+                "entry_half_spread_values_sha256", "intrabar_half_spread_values_sha256",
+                "numerical_execution_cost_attestation_sha256", "entry_observations_sha256",
+                "entry_admission_mask_sha256"}:
+            _fail("PARTITION_COST_PRECOMMITMENTS_TIER_INVALID")
+        for value in data.values():
+            _hex(value, 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+        policy = level["numerical_execution_cost_policy"]
+        try:
+            attestation = build_numerical_execution_cost_attestation(
+                use_spread=policy["use_spread"], spread_mode=policy["spread_mode"],
+                instrument_spec_sha256=policy["instrument_spec_sha256"],
+                entry_half_spread_values_sha256=data["entry_half_spread_values_sha256"],
+                intrabar_half_spread_values_sha256=data["intrabar_half_spread_values_sha256"])
+        except (TypeError, ValueError, KeyError, OverflowError) as exc:
+            raise WinnerRawEvidenceError("PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID") from exc
+        _validated_partition_cost_attestation(attestation, policy=policy,
+            code="PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID")
+        if _sha_json(attestation) != data["numerical_execution_cost_attestation_sha256"]:
+            _fail("PARTITION_COST_PRECOMMITMENTS_ATTESTATION_INVALID")
+        tiers[tier] = {"numerical_execution_cost_attestation": attestation,
+            "entry_observations_sha256": data["entry_observations_sha256"],
+            "entry_admission_mask_sha256": data["entry_admission_mask_sha256"]}
+    return {"partition_frame_sha256": record["partition_frame_sha256"],
+        "source_observation_receipt_sha256": record["source_observation_receipt_sha256"], "tiers": tiers}
+
+
+def expand_partition_cost_precommitment(precommitments: Mapping[str, Any], row: Mapping[str, Any], *,
+        pair: Mapping[str, Any]) -> dict[str, Any]:
+    """Expand one selected row; archived v1 bodies retain their original meaning."""
+    if precommitments.get("schema_version") == PARTITION_COST_PRECOMMITMENTS_SCHEMA:
+        return dict(row)
+    if precommitments.get("schema_version") != PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA:
+        _fail("PARTITION_COST_PRECOMMITMENTS_SCHEMA_INVALID")
+    if precommitments.get("frozen_tier_pair_contract_sha256") != _sha_json(pair):
+        _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
+    if (not isinstance(row, Mapping) or set(row) != {
+            "attempt_ordinal", "fold_ordinal", "partition", "partition_geometry_receipt_sha256"}):
+        _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+    identity = _hex(row["partition_geometry_receipt_sha256"], 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+    records = precommitments.get("records")
+    if not isinstance(records, Mapping) or identity not in records:
+        _fail("PARTITION_COST_PRECOMMITMENTS_RECORD_UNAVAILABLE")
+    return {**dict(row), **_expanded_partition_cost_record(records[identity], pair=pair)}
+
+
+def _validated_partition_cost_precommitments(value: Any, *, pair: Mapping[str, Any],
+        attempts: Sequence[Mapping[str, Any]], folds: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    if isinstance(value, Mapping) and value.get("schema_version") == PARTITION_COST_PRECOMMITMENTS_SCHEMA:
+        return _validated_partition_cost_precommitments_v1(value, pair=pair, attempts=attempts, folds=folds)
+    if not isinstance(value, Mapping) or set(value) != {
+            "schema_version", "frozen_tier_pair_contract_sha256", "rows", "records", "receipt_sha256"}:
+        _fail("PARTITION_COST_PRECOMMITMENTS_SCHEMA_INVALID")
+    body = dict(value)
+    receipt_sha = body.pop("receipt_sha256")
+    rows, records = body.get("rows"), body.get("records")
+    if (body.get("schema_version") != PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA
+            or body.get("frozen_tier_pair_contract_sha256") != _sha_json(pair)
+            or receipt_sha != _sha_json(body) or type(rows) is not list):
+        _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
+    if (type(attempts) is not list or type(folds) is not list
+            or any(not isinstance(attempt, Mapping) or type(attempt.get("ordinal")) is not int
+                   or attempt.get("precommitted_evidence_role") not in _PRECOMMITTED_EVIDENCE_ROLES for attempt in attempts)
+            or any(not isinstance(fold, Mapping) or type(fold.get("fold_ordinal")) is not int for fold in folds)):
+        _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+    expected = [(attempt["ordinal"], fold["fold_ordinal"], partition)
+        for attempt in attempts if attempt["precommitted_evidence_role"] == "EVALUATION_REQUIRED"
+        for fold in folds for partition in _PARTITIONS]
+    if len(rows) != len(expected):
+        _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+    if not isinstance(records, Mapping):
+        _fail("PARTITION_COST_PRECOMMITMENTS_RECORD_INVALID")
+    used = set()
+    for row, identity in zip(rows, expected, strict=True):
+        if (not isinstance(row, Mapping) or set(row) != {
+                "attempt_ordinal", "fold_ordinal", "partition", "partition_geometry_receipt_sha256"}
+                or (row["attempt_ordinal"], row["fold_ordinal"], row["partition"]) != identity):
+            _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+        geometry = _hex(row["partition_geometry_receipt_sha256"], 64, "PARTITION_COST_PRECOMMITMENTS_HASH_INVALID")
+        if geometry not in used:
+            expand_partition_cost_precommitment(value, row, pair=pair)
+            used.add(geometry)
+    if set(records) != used:
+        _fail("PARTITION_COST_PRECOMMITMENTS_RECORD_ROSTER_INVALID")
+    return json.loads(_canonical_bytes(dict(value)))
+
+
+def _restored_frozen_context_identity(context_identity: Any) -> dict[str, str]:
+    identity_fields = {"generation_id", "generation_context_sha256",
+                       "native_universe_sha256", "config_sha256"}
+    if not isinstance(context_identity, Mapping) or set(context_identity) != identity_fields:
+        _fail("FROZEN_PLAN_RESTORE_CONTEXT_INVALID")
+    identity = dict(context_identity)
+    _identity(identity["generation_id"], "FROZEN_PLAN_RESTORE_CONTEXT_INVALID", 512)
+    for name in identity_fields - {"generation_id"}:
+        _hex(identity[name], 64, "FROZEN_PLAN_RESTORE_CONTEXT_INVALID")
+    return identity
+
+
+def _build_frozen_winner_search_plan_receipt(
+    *,
+    context_identity: Mapping[str, str],
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    artifact_namespace: Optional[str],
+    precommitment: Mapping[str, Any],
+    attempt_ledger: Mapping[str, Any],
+    horizon_execution_contracts: Sequence[Mapping[str, Any]],
+    partition_cost_precommitments: Mapping[str, Any],
+    artifact_entries: Mapping[str, Mapping[str, Any]],
+    _generation=winner.CURRENT_GENERATION,
+) -> dict[str, Any]:
+    """Reconstruct the canonical current receipt without reading or writing a sink."""
+    identity = _restored_frozen_context_identity(context_identity)
+    if (not isinstance(precommitment, Mapping) or not isinstance(attempt_ledger, Mapping)
+            or not isinstance(partition_cost_precommitments, Mapping)
+            or not isinstance(artifact_entries, Mapping)
+            or any(type(key) is not str or not isinstance(entry, Mapping)
+                   or not isinstance(entry.get("descriptor"), Mapping)
+                   for key, entry in artifact_entries.items())):
+        _fail("FROZEN_PLAN_RECEIPT_MISMATCH")
+    attempts = attempt_ledger.get("attempts")
+    fold_plan = precommitment.get("causal_fold_plan")
+    if (type(attempts) is not list or type(fold_plan) is not list
+            or attempt_ledger.get("run_id") != precommitment.get("run_id")
+            or len(horizon_execution_contracts) != len(attempts)):
+        _fail("FROZEN_PLAN_RECEIPT_MISMATCH")
+    multiplicity = build_trade_power_multiplicity_receipt(attempt_ledger)
+    registries = {
+        "process_registry_sha256": _process_registry(attempts),
+        "horizon_registry_sha256": _horizon_registry(attempts),
+        "trial_registry_sha256": _trial_registry(attempts),
+    }
+    return {
+        "schema_version": V16_FROZEN_PLAN_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA,
+        **identity,
+        "artifact_namespace": artifact_namespace,
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "regime": regime,
+        "run_id": precommitment.get("run_id"),
+        "precommitment_sha256": _sha_json(precommitment),
+        "attempt_ledger_sha256": _sha_json(attempt_ledger),
+        "attempts_sha256": _sha_json(attempts),
+        "attempt_count": len(attempts),
+        "fold_plan_sha256": _sha_json(fold_plan),
+        "fold_count": len(fold_plan),
+        "horizon_execution_contracts_sha256": _sha_json(horizon_execution_contracts),
+        "partition_cost_precommitments_sha256": _sha_json(partition_cost_precommitments),
+        "multiplicity_receipt_sha256": multiplicity.get("receipt_sha256"),
+        **registries,
+        "artifact_roster": {
+            key: entry["descriptor"] for key, entry in sorted(artifact_entries.items())
+        },
+    }
+
+
+def _freeze_winner_search_plan(
     sink: SymbolAuthoritySink,
     *,
     symbol: str,
@@ -1338,12 +1760,12 @@ def freeze_winner_search_plan_v3(
     attempt_artifacts: Sequence[Mapping[str, Any]],
     precommitted_evidence_roles: Sequence[str],
     horizon_execution_contracts: Sequence[Mapping[str, Any]],
-    source_contract_seed: Mapping[str, Any],
-    base_cost_contract: Mapping[str, Any],
-    stress_cost_contract: Mapping[str, Any],
+    source_contract_seeds: Mapping[str, Any],
+    frozen_tier_pair_contract: Mapping[str, Any],
     risk_unit_contract: Mapping[str, Any],
-    cost_stress_adversity_plan: Mapping[str, Any],
+    partition_cost_precommitments: Mapping[str, Any],
     artifact_namespace: Optional[str] = None,
+    _generation=winner.CURRENT_GENERATION,
 ) -> FrozenWinnerSearchPlan:
     """Freeze exact attempt/fold truth and persist it before evaluation.
 
@@ -1382,38 +1804,14 @@ def freeze_winner_search_plan_v3(
     ) <= datetime.fromisoformat(precommitted_at.replace("Z", "+00:00")):
         _fail("ATTEMPTS_NOT_FROZEN_AFTER_PRECOMMITMENT")
 
-    source_seed = dict(source_contract_seed)
-    base_cost = _validated_frozen_cost_policy(
-        base_cost_contract,
-        lane="BASE",
-        code="BASE_COST_POLICY_INVALID",
-    )
-    stress_cost = _validated_frozen_cost_policy(
-        stress_cost_contract,
-        lane="STRESS",
-        code="STRESS_COST_POLICY_INVALID",
-    )
+    source_seeds, pair_contract, pair_hashes = _current_pair_inputs(source_contract_seeds, frozen_tier_pair_contract)
     risk_contract = dict(risk_unit_contract)
     if risk_contract != build_precommitted_risk_unit_contract():
         _fail("RISK_UNIT_CONTRACT_INVALID")
-    _validated_partition_cost_attestation(
-        source_seed.get("numerical_execution_cost_attestation"),
-        policy=base_cost,
-        lane="BASE",
-        code="BASE_COST_SOURCE_SEED_INVALID",
-    )
-    source_sha = _validated_source_identity(source_seed)
     common_hashes = {
-        "source_contract_sha256": source_sha,
-        "cost_contract_sha256": _sha_json(base_cost),
-        "cost_stress_contract_sha256": _sha_json(stress_cost),
+        **pair_hashes,
         "risk_unit_contract_sha256": _sha_json(risk_contract),
     }
-    if (
-        base_cost["numerical_execution_cost_policy_sha256"]
-        == stress_cost["numerical_execution_cost_policy_sha256"]
-    ):
-        _fail("COST_STRESS_POLICY_NOT_DISTINCT")
 
     attempts, raw_artifacts = _normalize_attempt_artifacts(
         attempt_artifacts,
@@ -1430,15 +1828,9 @@ def freeze_winner_search_plan_v3(
         timeframe=normalized_timeframe,
         regime=normalized_regime,
     )
-    normalized_adversity_plan = _normalized_cost_stress_adversity_plan(
-        cost_stress_adversity_plan,
-        symbol=normalized_symbol,
-        timeframe=normalized_timeframe,
-        regime=normalized_regime,
-        attempts=attempts,
-        folds=normalized_folds,
-    )
-    adversity_plan_sha256 = _sha_json(normalized_adversity_plan)
+    partition_precommits = _validated_partition_cost_precommitments(partition_cost_precommitments,
+        pair=pair_contract, attempts=attempts, folds=normalized_folds)
+    partition_precommits_sha256 = _sha_json(partition_precommits)
     registries = {
         "process_registry_sha256": _process_registry(attempts),
         "horizon_registry_sha256": _horizon_registry(attempts),
@@ -1446,7 +1838,7 @@ def freeze_winner_search_plan_v3(
     }
     run_id = _sha_json(
         {
-            "schema_version": FROZEN_PLAN_SCHEMA,
+            "schema_version": V16_FROZEN_PLAN_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA,
             "generation_context_sha256": sink.context.context_sha256,
             "artifact_namespace": namespace,
             "precommitted_at_utc": precommitted_at,
@@ -1456,7 +1848,7 @@ def freeze_winner_search_plan_v3(
             "attempts": attempts,
             "fold_plan": normalized_folds,
             "horizon_execution_contracts_sha256": horizon_contracts_sha256,
-            "cost_stress_adversity_plan_sha256": adversity_plan_sha256,
+            "partition_cost_precommitments_sha256": partition_precommits_sha256,
             **common_hashes,
             **registries,
         }
@@ -1475,11 +1867,13 @@ def freeze_winner_search_plan_v3(
         **registries,
     }
     precommitment = {
-        "contract_version": winner.PRECOMMITMENT_VERSION,
+        "contract_version": _generation.precommitment_version,
         "run_id": run_id,
         "precommitted_at_utc": precommitted_at,
         **common,
-        "selection_policy_sha256": winner.PINNED_SELECTION_POLICY_SHA256,
+        "selection_policy_sha256": _generation.policy_sha256,
+        "frozen_tier_pair_contract": pair_contract,
+        "partition_cost_precommitments_sha256": partition_precommits_sha256,
         "planned_attempt_count": len(attempts),
         "planned_fold_count": len(normalized_folds),
         "causal_fold_plan_sha256": _sha_json(normalized_folds),
@@ -1493,6 +1887,7 @@ def freeze_winner_search_plan_v3(
         "frozen_at_utc": frozen_at,
         "precommitment_payload_sha256": precommitment_sha,
         **common,
+        "partition_cost_precommitments_sha256": partition_precommits_sha256,
         "attempt_count": len(attempts),
         "attempts_sha256": _sha_json(attempts),
         "attempts": attempts,
@@ -1504,14 +1899,10 @@ def freeze_winner_search_plan_v3(
     bodies = {
         "precommitment": ("winner_precommitment", precommitment),
         "attempt_ledger": ("winner_attempt_ledger", attempt_ledger),
-        "source_contract_seed": ("winner_source_contract_seed", source_seed),
-        "base_cost_contract": ("winner_base_cost_contract", base_cost),
-        "stress_cost_contract": ("winner_stress_cost_contract", stress_cost),
+        "source_contract_seeds": ("winner_source_contract_seeds", source_seeds),
+        "frozen_tier_pair_contract": ("winner_frozen_tier_pair_contract", pair_contract),
         "risk_unit_contract": ("winner_risk_unit_contract", risk_contract),
-        "cost_stress_adversity_plan": (
-            "winner_cost_stress_adversity_plan",
-            normalized_adversity_plan,
-        ),
+        "partition_cost_precommitments": ("winner_partition_cost_precommitments", partition_precommits),
         "horizon_execution_contracts": (
             "winner_horizon_execution_contracts",
             normalized_horizon_contracts,
@@ -1535,31 +1926,24 @@ def freeze_winner_search_plan_v3(
                 f"winner_attempt_{name}",
                 body,
             )
-    receipt_body = {
-        "schema_version": FROZEN_PLAN_SCHEMA,
-        "generation_id": sink.context.generation_id,
-        "generation_context_sha256": sink.context.context_sha256,
-        "native_universe_sha256": sink.context.native_universe_sha256,
-        "config_sha256": sink.context.config_sha256,
-        "artifact_namespace": namespace,
-        "symbol": normalized_symbol,
-        "timeframe": normalized_timeframe,
-        "regime": normalized_regime,
-        "run_id": run_id,
-        "precommitment_sha256": precommitment_sha,
-        "attempt_ledger_sha256": _sha_json(attempt_ledger),
-        "attempts_sha256": attempt_ledger["attempts_sha256"],
-        "attempt_count": len(attempts),
-        "fold_plan_sha256": precommitment["causal_fold_plan_sha256"],
-        "fold_count": len(normalized_folds),
-        "horizon_execution_contracts_sha256": horizon_contracts_sha256,
-        "cost_stress_adversity_plan_sha256": adversity_plan_sha256,
-        "multiplicity_receipt_sha256": multiplicity["receipt_sha256"],
-        **registries,
-        "artifact_roster": {
-            key: entry["descriptor"] for key, entry in sorted(spool_entries.items())
+    receipt_body = _build_frozen_winner_search_plan_receipt(
+        context_identity={
+            "generation_id": sink.context.generation_id,
+            "generation_context_sha256": sink.context.context_sha256,
+            "native_universe_sha256": sink.context.native_universe_sha256,
+            "config_sha256": sink.context.config_sha256,
         },
-    }
+        symbol=normalized_symbol,
+        timeframe=normalized_timeframe,
+        regime=normalized_regime,
+        artifact_namespace=namespace,
+        precommitment=precommitment,
+        attempt_ledger=attempt_ledger,
+        horizon_execution_contracts=normalized_horizon_contracts,
+        partition_cost_precommitments=partition_precommits,
+        artifact_entries=spool_entries,
+        _generation=_generation,
+    )
     receipt_bytes = _canonical_bytes(receipt_body)
     receipt_entry = _put_ascii_json(
         sink,
@@ -1579,9 +1963,9 @@ def freeze_winner_search_plan_v3(
     horizon_contracts_bytes = _canonical_bytes(normalized_horizon_contracts)
     if len(horizon_contracts_bytes) > winner.MAX_REQUEST_BYTES:
         _fail("HORIZON_EXECUTION_CONTRACT_BYTE_BOUND_EXCEEDED")
-    adversity_plan_bytes = _canonical_bytes(normalized_adversity_plan)
-    if len(adversity_plan_bytes) > winner.MAX_REQUEST_BYTES:
-        _fail("COST_STRESS_ADVERSITY_PLAN_BYTE_BOUND_EXCEEDED")
+    partition_bytes = _canonical_bytes(partition_precommits)
+    if len(partition_bytes) > winner.MAX_REQUEST_BYTES:
+        _fail("PARTITION_COST_PRECOMMITMENTS_BYTE_BOUND_EXCEEDED")
     return FrozenWinnerSearchPlan(
         symbol=normalized_symbol,
         timeframe=normalized_timeframe,
@@ -1590,15 +1974,17 @@ def freeze_winner_search_plan_v3(
         generation_context_sha256=sink.context.context_sha256,
         precommitment_bytes=_canonical_bytes(precommitment),
         attempt_ledger_bytes=_canonical_bytes(attempt_ledger),
-        source_contract_seed_bytes=_canonical_bytes(source_seed),
-        base_cost_contract_bytes=_canonical_bytes(base_cost),
-        stress_cost_contract_bytes=_canonical_bytes(stress_cost),
+        source_contract_seed_bytes=b"",
+        cost_ladder_contract_bytes=b"",
         risk_unit_contract_bytes=_canonical_bytes(risk_contract),
-        cost_stress_adversity_plan_bytes=adversity_plan_bytes,
+        cost_ladder_adversity_plan_bytes=b"",
         frozen_receipt_bytes=receipt_bytes,
         frozen_receipt_entry_bytes=_canonical_bytes(receipt_entry),
         horizon_execution_contracts_bytes=horizon_contracts_bytes,
         attempt_artifacts_bundle_bytes=attempt_bundle_bytes,
+        source_contract_seeds_bytes=_canonical_bytes(source_seeds),
+        frozen_tier_pair_contract_bytes=_canonical_bytes(pair_contract),
+        partition_cost_precommitments_bytes=partition_bytes,
     )
 
 
@@ -1779,6 +2165,130 @@ def _partition_axis(result: Mapping[str, Any], partition: str) -> dict[str, Any]
     return body
 
 
+_TRADE_IDENTITY_PNL_FIELDS = BACKTEST_TRADE_IDENTITY_PNL_FIELDS
+_TRADE_PATH_IDENTITY_FIELDS = _TRADE_IDENTITY_PNL_FIELDS[:-1]
+
+
+def _trade_identity_pnl_evidence(
+    result: Mapping[str, Any],
+    *,
+    lane: str,
+) -> list[dict[str, Any]]:
+    """Project the exact trade identity and PnL needed by the raw verifier."""
+
+    trades = result.get("trade_identity_pnl")
+    code = f"{lane.upper()}_TRADE_EVIDENCE_INVALID"
+    if type(trades) is not list:
+        _fail(code)
+    projected: list[dict[str, Any]] = []
+    for ordinal, raw in enumerate(trades):
+        if not isinstance(raw, Mapping) or set(raw) != set(
+            _TRADE_IDENTITY_PNL_FIELDS
+        ):
+            _fail(f"{code}_{ordinal:05d}")
+        row = {field: raw[field] for field in _TRADE_IDENTITY_PNL_FIELDS}
+        entry_bar = row["entry_bar"]
+        exit_bar = row["exit_bar"]
+        signal_bar = row["signal_bar"]
+        direction = row["direction"]
+        exit_reason = row["exit_reason"]
+        if (
+            type(entry_bar) is not int
+            or type(exit_bar) is not int
+            or type(signal_bar) is not int
+            or entry_bar < 0
+            or exit_bar < entry_bar
+            or signal_bar < 0
+            or type(direction) is not str
+            or direction not in {"LONG", "SHORT"}
+            or type(exit_reason) is not str
+            or not exit_reason
+            or len(exit_reason.encode("utf-8")) > 256
+        ):
+            _fail(f"{code}_{ordinal:05d}")
+        entry_time = _utc(row["entry_time"], f"{code}_{ordinal:05d}_ENTRY_TIME")
+        exit_time = _utc(row["exit_time"], f"{code}_{ordinal:05d}_EXIT_TIME")
+        if (
+            row["entry_time"] != entry_time
+            or row["exit_time"] != exit_time
+            or exit_time < entry_time
+        ):
+            _fail(f"{code}_{ordinal:05d}")
+        for field in ("position_size", "risk_amount", "pnl_dollars"):
+            raw_number = row[field]
+            if (
+                type(raw_number) is not float
+                or not math.isfinite(raw_number)
+                or (field != "pnl_dollars" and raw_number <= 0.0)
+            ):
+                _fail(f"{code}_{ordinal:05d}_{field.upper()}")
+        canonical = {
+            "entry_bar": entry_bar,
+            "exit_bar": exit_bar,
+            "signal_bar": signal_bar,
+            "entry_time": entry_time,
+            "exit_time": exit_time,
+            "direction": direction,
+            "position_size": row["position_size"],
+            "risk_amount": row["risk_amount"],
+            "exit_reason": exit_reason,
+            "pnl_dollars": row["pnl_dollars"],
+        }
+        if row != canonical:
+            _fail(f"{code}_{ordinal:05d}")
+        projected.append(row)
+    return projected
+
+
+def _canonical_trade_events(
+    trades: Sequence[Mapping[str, Any]],
+    *,
+    namespace: str,
+    lane: str,
+) -> list[dict[str, Any]]:
+    try:
+        return build_backtest_position_events(trades, namespace=namespace)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise WinnerRawEvidenceError(
+            f"{lane.upper()}_TRADE_POSITION_RECONCILIATION_INVALID"
+        ) from exc
+
+
+def _trade_position_reconciliation_evidence(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    lane: str,
+) -> list[dict[str, Any]]:
+    fields = (
+        "trade_record_schema_version",
+        "position_id",
+        "entry_time",
+        "exit_time",
+        "entry_event_order",
+        "exit_event_order",
+        "pnl_dollars",
+        "risk_amount",
+    )
+    result: list[dict[str, Any]] = []
+    for ordinal, event in enumerate(events):
+        if not isinstance(event, Mapping) or any(field not in event for field in fields):
+            _fail(f"{lane.upper()}_TRADE_POSITION_{ordinal:05d}_INVALID")
+        result.append(
+            {
+                **{field: event[field] for field in fields},
+                "entry_time": _utc(
+                    event["entry_time"],
+                    f"{lane.upper()}_TRADE_POSITION_{ordinal:05d}_ENTRY_TIME_INVALID",
+                ),
+                "exit_time": _utc(
+                    event["exit_time"],
+                    f"{lane.upper()}_TRADE_POSITION_{ordinal:05d}_EXIT_TIME_INVALID",
+                ),
+            }
+        )
+    return result
+
+
 def _decision_relevant_lane(
     result: Mapping[str, Any],
     *,
@@ -1790,8 +2300,9 @@ def _decision_relevant_lane(
     if type(events) is not list:
         _fail(f"{lane.upper()}_POSITION_EVENTS_INVALID")
     return {
-        "schema_version": RAW_LANE_SCHEMA,
+        "schema_version": CURRENT_RAW_LANE_SCHEMA,
         "lane": lane,
+        "trade_identity_pnl": _trade_identity_pnl_evidence(result, lane=lane),
         "position_events": events,
         "winner_daily_r_surface": result.get("winner_daily_r_surface"),
         "trade_power_partition_axis": result.get("trade_power_partition_axis"),
@@ -1800,24 +2311,28 @@ def _decision_relevant_lane(
             "numerical_execution_cost_attestation"
         ),
         "swap_accrual_contract": result.get("swap_accrual_contract"),
+        "spread_model": result.get("spread_model"),
+        "spread_admission": result.get("spread_admission"),
     }
 
 
-def _validate_base_result(
+def _validate_tier_result(
     result: Mapping[str, Any],
     *,
     frozen: FrozenWinnerSearchPlan,
     partition: str,
+    tier: str,
 ) -> dict[str, Any]:
+    pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
+    policy = next(item["numerical_execution_cost_policy"] for item in pair["tiers"] if item["tier"] == tier)
     _validated_partition_cost_attestation(
         result.get("numerical_execution_cost_attestation"),
-        policy=frozen.base_cost_policy,
-        lane="BASE",
-        code=f"{partition.upper()}_BASE_COST_ATTESTATION_INVALID",
+        policy=policy,
+        code=f"{partition.upper()}_{tier}_COST_ATTESTATION_INVALID",
     )
     source = _source_contract_from_result(result)
     observed_source_sha = _validated_source_identity(source)
-    expected_source_sha = frozen.precommitment["source_contract_sha256"]
+    expected_source_sha = _validated_source_identity(frozen.source_contract_seeds[tier])
     if observed_source_sha != expected_source_sha:
         _fail(f"{partition.upper()}_SOURCE_CONTRACT_DRIFT")
     axis = _partition_axis(result, partition)
@@ -1828,38 +2343,6 @@ def _validate_base_result(
     return source
 
 
-def _validate_stress_pair(
-    base: Mapping[str, Any],
-    stress: Mapping[str, Any],
-    *,
-    frozen: FrozenWinnerSearchPlan,
-) -> None:
-    _validated_partition_cost_attestation(
-        base.get("numerical_execution_cost_attestation"),
-        policy=frozen.base_cost_policy,
-        lane="BASE",
-        code="FINAL_LOCKBOX_BASE_COST_ATTESTATION_INVALID",
-    )
-    _validated_partition_cost_attestation(
-        stress.get("numerical_execution_cost_attestation"),
-        policy=frozen.stress_cost_policy,
-        lane="STRESS",
-        code="FINAL_LOCKBOX_STRESS_COST_ATTESTATION_INVALID",
-    )
-    base_contract = _source_contract_from_result(base)
-    stress_contract = _source_contract_from_result(stress)
-    for field in (
-        "source_binding",
-        "trade_record_schema_version",
-        "execution_cost_timing_contract",
-        "swap_accrual_contract",
-    ):
-        if base_contract.get(field) != stress_contract.get(field):
-            _fail("FINAL_LOCKBOX_BASE_STRESS_SOURCE_DRIFT")
-    if base.get("trade_power_partition_axis") != stress.get(
-        "trade_power_partition_axis"
-    ):
-        _fail("FINAL_LOCKBOX_BASE_STRESS_AXIS_DRIFT")
 
 
 def _spool_lane(
@@ -1884,6 +2367,7 @@ def _power_chain(
     tuning: Mapping[str, Any],
     final: Mapping[str, Any],
     frozen: FrozenWinnerSearchPlan,
+    tier: str,
 ) -> tuple[
     TradePowerDecision, Optional[TradePowerDecision], Optional[TradePowerDecision]
 ]:
@@ -1902,8 +2386,8 @@ def _power_chain(
         policy=PRODUCTION_TRADE_POWER_POLICY,
         multiplicity_receipt=multiplicity,
         partition_contract=train_contract,
-        source_contract=_validate_base_result(
-            train, frozen=frozen, partition="optimizer_train"
+        source_contract=_validate_tier_result(
+            train, frozen=frozen, partition="optimizer_train", tier=tier
         ),
         minimum_observations=PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
     )
@@ -1928,8 +2412,8 @@ def _power_chain(
         partition="tuning_validation",
         partition_contract=tuning_contract,
         prior_partition_contract=train_contract,
-        source_contract=_validate_base_result(
-            tuning, frozen=frozen, partition="tuning_validation"
+        source_contract=_validate_tier_result(
+            tuning, frozen=frozen, partition="tuning_validation", tier=tier
         ),
         minimum_observations=PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
     )
@@ -1951,8 +2435,8 @@ def _power_chain(
         partition="final_lockbox",
         partition_contract=final_contract,
         prior_partition_contract=tuning_contract,
-        source_contract=_validate_base_result(
-            final, frozen=frozen, partition="final_lockbox"
+        source_contract=_validate_tier_result(
+            final, frozen=frozen, partition="final_lockbox", tier=tier
         ),
         minimum_observations=PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS,
     )
@@ -1990,116 +2474,6 @@ def _power_chain_artifact(
     }
 
 
-def _event_vectors(
-    base_events: Any,
-    stress_events: Any,
-    *,
-    fold_start: datetime,
-    fold_end_exclusive: datetime,
-) -> tuple[
-    list[str], list[str], list[str], list[int], list[int], list[float], list[float]
-]:
-    if type(base_events) is not list or type(stress_events) is not list:
-        _fail("FINAL_POSITION_EVENTS_INVALID")
-    if len(base_events) != len(stress_events):
-        _fail("FINAL_BASE_STRESS_TRADE_COUNT_MISMATCH")
-    if len(base_events) > winner.MAX_TRADES_PER_FOLD:
-        _fail("FINAL_TRADE_COUNT_LIMIT_EXCEEDED")
-    opens: list[str] = []
-    closes: list[str] = []
-    ids: list[str] = []
-    open_orders: list[int] = []
-    close_orders: list[int] = []
-    base_r: list[float] = []
-    stress_r: list[float] = []
-    for ordinal, (base, stress) in enumerate(
-        zip(base_events, stress_events, strict=True)
-    ):
-        if not isinstance(base, Mapping) or not isinstance(stress, Mapping):
-            _fail(f"FINAL_POSITION_EVENT_{ordinal:05d}_INVALID")
-        identity_fields = (
-            "trade_record_schema_version",
-            "position_id",
-            "entry_time",
-            "exit_time",
-            "entry_event_order",
-            "exit_event_order",
-            "risk_amount",
-        )
-        if any(base.get(field) != stress.get(field) for field in identity_fields):
-            _fail(f"FINAL_POSITION_EVENT_{ordinal:05d}_STRESS_IDENTITY_DRIFT")
-        if base.get("trade_record_schema_version") != REQUIRED_TRADE_RECORD_SCHEMA:
-            _fail(f"FINAL_POSITION_EVENT_{ordinal:05d}_SCHEMA_INVALID")
-        try:
-            base_pnl = float(base.get("pnl_dollars"))
-            stress_pnl = float(stress.get("pnl_dollars"))
-            risk = float(base.get("risk_amount"))
-            base_value = canonical_backtest_winner_r(base_pnl, risk)
-            stress_value = canonical_backtest_winner_r(stress_pnl, risk)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise WinnerRawEvidenceError(
-                f"FINAL_POSITION_EVENT_{ordinal:05d}_VALUE_INVALID"
-            ) from exc
-        if (
-            not math.isfinite(base_pnl)
-            or not math.isfinite(stress_pnl)
-            or not math.isfinite(risk)
-            or risk <= 0.0
-            or stress_pnl > base_pnl + 1e-12
-        ):
-            _fail(f"FINAL_POSITION_EVENT_{ordinal:05d}_VALUE_INVALID")
-        if (
-            not math.isfinite(base_value)
-            or not math.isfinite(stress_value)
-            or abs(base_value) > winner.MAX_ABS_TRADE_R
-            or abs(stress_value) > winner.MAX_ABS_TRADE_R
-        ):
-            _fail(f"FINAL_POSITION_EVENT_{ordinal:05d}_R_INVALID")
-        ids.append(str(base.get("position_id") or ""))
-        opens.append(_utc(str(base.get("entry_time")), "FINAL_ENTRY_TIME_INVALID"))
-        closes.append(_utc(str(base.get("exit_time")), "FINAL_EXIT_TIME_INVALID"))
-        open_order = base.get("entry_event_order")
-        close_order = base.get("exit_event_order")
-        if (
-            type(open_order) is not int
-            or type(close_order) is not int
-            or not 0 <= open_order <= 2_147_483_647
-            or not 0 <= close_order <= 2_147_483_647
-        ):
-            _fail(f"FINAL_POSITION_EVENT_{ordinal:05d}_ORDER_INVALID")
-        open_orders.append(open_order)
-        close_orders.append(close_order)
-        base_r.append(float(base_value))
-        stress_r.append(float(stress_value))
-    if len(set(ids)) != len(ids) or any(not value or len(value) > 256 for value in ids):
-        _fail("FINAL_POSITION_IDS_INVALID")
-    # Mirror the exact V11 causal-order contract before spooling: strictly
-    # increasing (close, close_order, open, open_order, position_id), each
-    # open event strictly before its close event (an open_order greater than
-    # its close_order stays legal across different timestamps — counter
-    # reset), and every trade inside the planned OOS fold boundary.
-    prior_key: Optional[tuple[datetime, int, datetime, int, str]] = None
-    for ordinal in range(len(ids)):
-        opened_dt = datetime.fromisoformat(opens[ordinal].replace("Z", "+00:00"))
-        closed_dt = datetime.fromisoformat(closes[ordinal].replace("Z", "+00:00"))
-        open_event = (opened_dt, open_orders[ordinal])
-        close_event = (closed_dt, close_orders[ordinal])
-        order_key = (
-            closed_dt,
-            close_orders[ordinal],
-            opened_dt,
-            open_orders[ordinal],
-            ids[ordinal],
-        )
-        if (
-            opened_dt < fold_start
-            or open_event >= close_event
-            or closed_dt >= fold_end_exclusive
-            or (prior_key is not None and order_key <= prior_key)
-        ):
-            _fail(f"FINAL_POSITION_EVENT_{ordinal:05d}_CAUSAL_ORDER_INVALID")
-        prior_key = order_key
-    return opens, closes, ids, open_orders, close_orders, base_r, stress_r
 
 
 def _validated_self_hashed_receipt(
@@ -2107,13 +2481,14 @@ def _validated_self_hashed_receipt(
     *,
     role: str,
     expected_keys: frozenset[str],
+    schema_version: str = ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA,
 ) -> dict[str, Any]:
     code = role.upper()
     if not isinstance(value, Mapping) or set(value) != set(expected_keys):
         _fail(f"{code}_PROVENANCE_SCHEMA_INVALID")
     body = dict(value)
     if (
-        body.get("schema_version") != AUTHORITATIVE_PROVENANCE_SCHEMA
+        body.get("schema_version") != schema_version
         or body.get("receipt_role") != role
     ):
         _fail(f"{code}_PROVENANCE_ROLE_INVALID")
@@ -2124,184 +2499,407 @@ def _validated_self_hashed_receipt(
     return dict(value)
 
 
-def _validated_stress_method_receipt(
+def _validated_cost_ladder_method_receipt(
     value: Any,
     *,
     frozen: FrozenWinnerSearchPlan,
     attempt_artifacts: Mapping[str, Any],
     lanes: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """Independently bind the core BASE/P75/P95 frozen-path receipt."""
+
     expected_keys = {
         "schema_version",
         "symbol",
         "timeframe",
         "strategy_name",
-        "stress_mode",
+        "position_namespace",
         "warmup_bars",
         "partition_axis_sha256",
         "signal_vector_sha256",
+        "base_trade_identity_pnl_sha256",
         "base_cost_attestation_sha256",
-        "stress_cost_attestation_sha256",
-        "base_spread_values_sha256",
-        "stress_spread_values_sha256",
-        "base_position_roster_sha256",
-        "stress_position_roster_sha256",
+        "base_entry_half_spread_values_sha256",
+        "base_intrabar_half_spread_values_sha256",
+        "cost_ladder_contract_sha256",
+        "shared_position_roster_sha256",
         "position_count",
         "daily_observation_count",
+        "entry_cost_application",
+        "uniform_application",
+        "uplift_distribution_basis",
+        "stochastic_scenario",
+        "intrabar_spread_unchanged",
+        "swap_financing_policy_unchanged",
         "path_identity_preserved",
-        "stress_never_improves",
-        "strictly_worse_trade_count",
-        "strictly_worse_daily_observation_count",
-        "realized_adversity_status",
+        "levels",
         "receipt_sha256",
     }
-    diagnostic_key = "stress_daily_improvement_observation_count"
-    valid_keysets = (expected_keys, expected_keys | {diagnostic_key})
-    if not isinstance(value, Mapping) or set(value) not in valid_keysets:
-        _fail("STRESS_METHOD_RECEIPT_SCHEMA_INVALID")
+    if not isinstance(value, Mapping) or set(value) != expected_keys:
+        _fail("COST_LADDER_METHOD_RECEIPT_SCHEMA_INVALID")
     receipt = dict(value)
-    receipt_sha = receipt.pop("receipt_sha256", None)
-    _hex(receipt_sha, 64, "STRESS_METHOD_RECEIPT_HASH_INVALID")
-    if receipt.get(
-        "schema_version"
-    ) != FROZEN_PATH_COST_STRESS_SCHEMA or receipt_sha != _sha_json(receipt):
-        _fail("STRESS_METHOD_RECEIPT_HASH_INVALID")
+    receipt_body = dict(receipt)
+    receipt_sha = receipt_body.pop("receipt_sha256", None)
+    _hex(receipt_sha, 64, "COST_LADDER_METHOD_RECEIPT_HASH_INVALID")
+    if (
+        receipt.get("schema_version") != FROZEN_PATH_COST_LADDER_SCHEMA
+        or receipt_sha != _sha_json(receipt_body)
+    ):
+        _fail("COST_LADDER_METHOD_RECEIPT_HASH_INVALID")
+
     base = lanes.get("final_lockbox_base")
-    stress = lanes.get("final_lockbox_stress")
-    if not isinstance(base, Mapping) or not isinstance(stress, Mapping):
-        _fail("STRESS_METHOD_LANES_INVALID")
+    p75 = lanes.get("final_lockbox_p75")
+    p95 = lanes.get("final_lockbox_p95")
+    process = attempt_artifacts.get("winner_process")
+    if any(not isinstance(item, Mapping) for item in (base, p75, p95, process)):
+        _fail("COST_LADDER_METHOD_LANES_INVALID")
+    assert isinstance(base, Mapping)
+    assert isinstance(p75, Mapping)
+    assert isinstance(p95, Mapping)
     base_axis = base.get("trade_power_partition_axis")
     base_cost = base.get("numerical_execution_cost_attestation")
-    stress_cost = stress.get("numerical_execution_cost_attestation")
     base_events = base.get("position_events")
-    stress_events = stress.get("position_events")
-    stress_surface = stress.get("winner_daily_r_surface")
-    process = attempt_artifacts.get("winner_process")
+    base_surface = base.get("winner_daily_r_surface")
     if (
-        any(
-            not isinstance(item, Mapping)
-            for item in (base_axis, base_cost, stress_cost, stress_surface, process)
-        )
+        any(not isinstance(item, Mapping) for item in (base_axis, base_cost, base_surface))
         or type(base_events) is not list
-        or type(stress_events) is not list
     ):
-        _fail("STRESS_METHOD_LANES_INVALID")
-    frozen_spread_mode = frozen.stress_cost_policy.get("spread_mode")
-    try:
-        spread_policy = json.loads(frozen_spread_mode)
-    except (TypeError, json.JSONDecodeError):
-        spread_policy = None
-    expected_stress_mode = (
-        spread_policy.get("mode") if isinstance(spread_policy, Mapping) else None
+        _fail("COST_LADDER_METHOD_LANES_INVALID")
+    assert isinstance(base_axis, Mapping)
+    assert isinstance(base_cost, Mapping)
+    assert isinstance(base_surface, Mapping)
+    strategy_name = process.get("strategy_id")
+    if type(strategy_name) is not str:
+        _fail("COST_LADDER_METHOD_LANES_INVALID")
+    position_namespace = "|".join(
+        (frozen.symbol.upper(), frozen.timeframe.upper(), strategy_name)
     )
-    if (
-        not isinstance(spread_policy, Mapping)
-        or _canonical_bytes(spread_policy).decode("ascii") != frozen_spread_mode
-        or expected_stress_mode not in {"stress_p90", "stress_p95", "stress_max"}
+    base_trades = _trade_identity_pnl_evidence(
+        base,
+        lane="final_lockbox_base",
+    )
+    rebuilt_base_events = _canonical_trade_events(
+        base_trades,
+        namespace=position_namespace,
+        lane="final_lockbox_base",
+    )
+    if _trade_position_reconciliation_evidence(
+        rebuilt_base_events,
+        lane="final_lockbox_base",
+    ) != _trade_position_reconciliation_evidence(
+        base_events,
+        lane="final_lockbox_base",
     ):
-        _fail("STRESS_METHOD_POLICY_MODE_INVALID")
+        _fail("COST_LADDER_METHOD_BASE_TRADE_POSITION_RECONCILIATION_INVALID")
+    ladder_contract = _validated_cost_ladder_contract(
+        frozen.cost_ladder_contract,
+        code="FROZEN_COST_LADDER_CONTRACT_INVALID",
+    )
+    try:
+        r_quantum = winner.risk_unit_quantum(frozen.risk_unit_contract)
+    except ValueError as exc:
+        raise WinnerRawEvidenceError("RISK_UNIT_CONTRACT_INVALID") from exc
+    if receipt.get("cost_ladder_contract_sha256") != _sha_json(ladder_contract):
+        _fail("COST_LADDER_METHOD_CONTRACT_BINDING_INVALID")
+    for name in (
+        "signal_vector_sha256",
+        "base_trade_identity_pnl_sha256",
+        "shared_position_roster_sha256",
+    ):
+        _hex(receipt.get(name), 64, f"COST_LADDER_METHOD_{name.upper()}_INVALID")
+    roster_fields = (
+        "trade_record_schema_version",
+        "position_id",
+        "entry_time",
+        "exit_time",
+        "entry_event_order",
+        "exit_event_order",
+        "risk_amount",
+    )
+    shared_roster = [
+        {field: event.get(field) for field in roster_fields}
+        for event in base_events
+        if isinstance(event, Mapping)
+    ]
     if (
-        receipt.get("symbol") != frozen.symbol
+        len(shared_roster) != len(base_events)
+        or receipt.get("symbol") != frozen.symbol
         or receipt.get("timeframe") != frozen.timeframe
-        or receipt.get("strategy_name") != process.get("strategy_id")
-        or receipt.get("stress_mode") != expected_stress_mode
+        or receipt.get("strategy_name") != strategy_name
+        or receipt.get("position_namespace") != position_namespace
         or receipt.get("warmup_bars") != base_axis.get("warmup_bars")
         or receipt.get("partition_axis_sha256")
         != base_axis.get("horizon_receipt_sha256")
         or receipt.get("base_cost_attestation_sha256")
         != base_cost.get("attestation_sha256")
-        or receipt.get("stress_cost_attestation_sha256")
-        != stress_cost.get("attestation_sha256")
-        or receipt.get("base_spread_values_sha256")
-        != base_cost.get("spread_values_sha256")
-        or receipt.get("stress_spread_values_sha256")
-        != stress_cost.get("spread_values_sha256")
-        or receipt.get("base_position_roster_sha256")
-        != _backtester_receipt_sha256({"position_events": base_events})
-        or receipt.get("stress_position_roster_sha256")
-        != _backtester_receipt_sha256({"position_events": stress_events})
-        or receipt.get("position_count") != len(stress_events)
+        or receipt.get("base_entry_half_spread_values_sha256")
+        != base_cost.get("entry_half_spread_values_sha256")
+        or receipt.get("base_intrabar_half_spread_values_sha256")
+        != base_cost.get("intrabar_half_spread_values_sha256")
+        or receipt.get("base_trade_identity_pnl_sha256")
+        != _backtester_exact_sha256(base_trades)
+        or receipt.get("shared_position_roster_sha256")
+        != _backtester_receipt_sha256({"position_events": shared_roster})
+        or receipt.get("position_count") != len(base_events)
         or receipt.get("daily_observation_count")
-        != len(stress_surface.get("daily_net_mtm_r") or [])
+        != len(base_surface.get("daily_net_mtm_r") or [])
+        or receipt.get("entry_cost_application") != "ENTRY_SIDE_ONLY"
+        or receipt.get("uniform_application") != "EVERY_FILL"
+        or receipt.get("uplift_distribution_basis")
+        != "UNCONDITIONAL_MEASURED_SINGLE_FILL_UPLIFT_DISTRIBUTION"
+        or receipt.get("stochastic_scenario") is not False
+        or receipt.get("intrabar_spread_unchanged") is not True
+        or receipt.get("swap_financing_policy_unchanged") is not True
         or receipt.get("path_identity_preserved") is not True
-        or receipt.get("stress_never_improves") is not True
-        or type(receipt.get("strictly_worse_trade_count")) is not int
-        or receipt.get("strictly_worse_trade_count") < 0
-        or type(receipt.get("strictly_worse_daily_observation_count")) is not int
-        or receipt.get("strictly_worse_daily_observation_count") < 0
-        or (
-            diagnostic_key in receipt
-            and (
-                type(receipt.get(diagnostic_key)) is not int
-                or receipt.get(diagnostic_key) < 0
-            )
-        )
-        or receipt.get("realized_adversity_status")
-        not in {
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
+    ):
+        _fail("COST_LADDER_METHOD_RECEIPT_BINDING_INVALID")
+
+    receipt_levels = receipt.get("levels")
+    contract_levels = ladder_contract["levels"][1:]
+    if type(receipt_levels) is not list or len(receipt_levels) != 2:
+        _fail("COST_LADDER_METHOD_LEVEL_ROSTER_INVALID")
+    lane_results = (base, p75, p95)
+    prior_daily = list(base_surface.get("daily_net_mtm_r") or [])
+    base_daily = prior_daily
+    prior_events = base_events
+    prior_trades = base_trades
+    for index, (raw_level, contract_level, current) in enumerate(
+        zip(receipt_levels, contract_levels, lane_results[1:], strict=True),
+        start=1,
+    ):
+        if not isinstance(raw_level, Mapping):
+            _fail("COST_LADDER_METHOD_LEVEL_SCHEMA_INVALID")
+        level = dict(raw_level)
+        level_body = dict(level)
+        level_sha = level_body.pop("level_receipt_sha256", None)
+        expected_level_keys = {
+            "level_id",
+            "single_fill_uplift_percentile",
+            "uniform_entry_half_spread_multiplier_float64_hex",
+            "trade_identity_pnl_sha256",
+            "cost_attestation_sha256",
+            "cost_policy_sha256",
+            "entry_half_spread_values_sha256",
+            "intrabar_half_spread_values_sha256",
+            "base_relative",
+            "adjacent_guard",
+            "level_receipt_sha256",
         }
-    ):
-        _fail("STRESS_METHOD_RECEIPT_BINDING_INVALID")
-    _hex(
-        receipt.get("signal_vector_sha256"),
-        64,
-        "STRESS_METHOD_SIGNAL_HASH_INVALID",
-    )
-    # Independently derive the receipt's adversity status.  A resealed label
-    # cannot turn an unchanged path into stress-survival evidence, nor can it
-    # demote a genuinely degraded path without being detected.
-    base_trade = [
-        Decimal(str(row.get("pnl_dollars"))) / Decimal(str(row.get("risk_amount")))
-        for row in base_events
-    ]
-    stress_trade = [
-        Decimal(str(row.get("pnl_dollars"))) / Decimal(str(row.get("risk_amount")))
-        for row in stress_events
-    ]
-    base_daily = (base.get("winner_daily_r_surface") or {}).get(
-        "daily_net_mtm_r"
-    ) or []
-    stress_daily = stress_surface.get("daily_net_mtm_r") or []
-    strictly_worse_trade_count = sum(
-        right < left for left, right in zip(base_trade, stress_trade, strict=True)
-    )
-    strictly_worse_daily_observation_count = sum(
-        Decimal(str(right)) < Decimal(str(left))
-        for left, right in zip(base_daily, stress_daily, strict=True)
-    )
-    stress_daily_improvement_observation_count = sum(
-        Decimal(str(right)) > Decimal(str(left))
-        for left, right in zip(base_daily, stress_daily, strict=True)
-    )
-    vector_changed = (
-        receipt["base_spread_values_sha256"]
-        != receipt["stress_spread_values_sha256"]
-    )
-    strictly_adverse = bool(
-        strictly_worse_trade_count
-        or strictly_worse_daily_observation_count
-    )
-    if strictly_adverse and not vector_changed:
-        _fail("STRESS_METHOD_VECTOR_ADVERSITY_INCONSISTENT")
-    expected_adversity_status = (
-        BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
-        if strictly_adverse
-        else BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    )
-    if (
-        receipt.get("strictly_worse_trade_count")
-        != strictly_worse_trade_count
-        or receipt.get("strictly_worse_daily_observation_count")
-        != strictly_worse_daily_observation_count
-        or (
-            diagnostic_key in receipt
-            and receipt.get(diagnostic_key)
-            != stress_daily_improvement_observation_count
+        current_cost = current.get("numerical_execution_cost_attestation")
+        current_events = current.get("position_events")
+        current_surface = current.get("winner_daily_r_surface")
+        if (
+            set(level) != expected_level_keys
+            or level_sha != _sha_json(level_body)
+            or not isinstance(current_cost, Mapping)
+            or type(current_events) is not list
+            or not isinstance(current_surface, Mapping)
+        ):
+            _fail("COST_LADDER_METHOD_LEVEL_SCHEMA_INVALID")
+        for name in (
+            "trade_identity_pnl_sha256",
+            "cost_attestation_sha256",
+            "cost_policy_sha256",
+            "entry_half_spread_values_sha256",
+            "intrabar_half_spread_values_sha256",
+            "level_receipt_sha256",
+        ):
+            _hex(level.get(name), 64, f"COST_LADDER_METHOD_LEVEL_{name.upper()}_INVALID")
+        policy = contract_level["numerical_execution_cost_policy"]
+        current_daily = list(current_surface.get("daily_net_mtm_r") or [])
+        current_trades = _trade_identity_pnl_evidence(
+            current,
+            lane=f"final_lockbox_{'p75' if index == 1 else 'p95'}",
         )
-        or receipt.get("realized_adversity_status") != expected_adversity_status
-    ):
-        _fail("STRESS_METHOD_ADVERSITY_STATUS_MISMATCH")
+        level_lane = f"final_lockbox_{'p75' if index == 1 else 'p95'}"
+        rebuilt_current_events = _canonical_trade_events(
+            current_trades,
+            namespace=position_namespace,
+            lane=level_lane,
+        )
+        if _trade_position_reconciliation_evidence(
+            rebuilt_current_events,
+            lane=level_lane,
+        ) != _trade_position_reconciliation_evidence(
+            current_events,
+            lane=level_lane,
+        ):
+            _fail("COST_LADDER_METHOD_LEVEL_TRADE_POSITION_RECONCILIATION_INVALID")
+        if (
+            level.get("level_id") != contract_level.get("level_id")
+            or level.get("single_fill_uplift_percentile")
+            != contract_level.get("single_fill_uplift_percentile")
+            or level.get("uniform_entry_half_spread_multiplier_float64_hex")
+            != contract_level.get("uniform_entry_half_spread_multiplier_float64_hex")
+            or level.get("cost_attestation_sha256")
+            != current_cost.get("attestation_sha256")
+            or level.get("cost_policy_sha256") != policy.get("policy_sha256")
+            or level.get("entry_half_spread_values_sha256")
+            != current_cost.get("entry_half_spread_values_sha256")
+            or level.get("intrabar_half_spread_values_sha256")
+            != current_cost.get("intrabar_half_spread_values_sha256")
+            or level.get("trade_identity_pnl_sha256")
+            != _backtester_exact_sha256(current_trades)
+            or current_cost.get("intrabar_half_spread_values_sha256")
+            != base_cost.get("intrabar_half_spread_values_sha256")
+            or len(current_events) != len(base_events)
+            or len(current_trades) != len(base_trades)
+            or len(current_trades) != len(prior_trades)
+            or len(current_daily) != len(base_daily)
+        ):
+            _fail("COST_LADDER_METHOD_LEVEL_BINDING_INVALID")
+
+        base_trade_worse = 0
+        adjacent_trade_worse = 0
+        for ordinal, (base_trade, prior_trade, current_trade) in enumerate(
+            zip(base_trades, prior_trades, current_trades, strict=True)
+        ):
+            if any(
+                current_trade[field] != base_trade[field]
+                for field in _TRADE_PATH_IDENTITY_FIELDS
+            ) or any(
+                prior_trade[field] != base_trade[field]
+                for field in _TRADE_PATH_IDENTITY_FIELDS
+            ):
+                _fail(f"COST_LADDER_METHOD_TRADE_{ordinal:05d}_IDENTITY_DRIFT")
+            base_trade_pnl = Decimal(str(base_trade["pnl_dollars"]))
+            prior_trade_pnl = Decimal(str(prior_trade["pnl_dollars"]))
+            current_trade_pnl = Decimal(str(current_trade["pnl_dollars"]))
+            if current_trade_pnl > prior_trade_pnl + Decimal("1e-12"):
+                _fail(f"COST_LADDER_METHOD_TRADE_{ordinal:05d}_IMPROVES")
+            base_trade_worse += int(current_trade_pnl < base_trade_pnl)
+            adjacent_trade_worse += int(current_trade_pnl < prior_trade_pnl)
+
+        identity_fields = roster_fields
+        base_final_worse = 0
+        adjacent_final_worse = 0
+        for ordinal, (base_event, prior_event, current_event) in enumerate(
+            zip(base_events, prior_events, current_events, strict=True)
+        ):
+            if any(
+                not isinstance(event, Mapping)
+                for event in (base_event, prior_event, current_event)
+            ) or any(
+                current_event.get(field) != base_event.get(field)
+                for field in identity_fields
+            ):
+                _fail(f"COST_LADDER_METHOD_POSITION_{ordinal:05d}_IDENTITY_DRIFT")
+            try:
+                base_pnl = Decimal(str(base_event.get("pnl_dollars")))
+                prior_pnl = Decimal(str(prior_event.get("pnl_dollars")))
+                current_pnl = Decimal(str(current_event.get("pnl_dollars")))
+            except InvalidOperation as exc:
+                raise WinnerRawEvidenceError(
+                    f"COST_LADDER_METHOD_POSITION_{ordinal:05d}_VALUE_INVALID"
+                ) from exc
+            if current_pnl > prior_pnl + Decimal("1e-12"):
+                _fail(f"COST_LADDER_METHOD_POSITION_{ordinal:05d}_IMPROVES")
+            base_final_worse += int(current_pnl < base_pnl)
+            adjacent_final_worse += int(current_pnl < prior_pnl)
+
+        base_running = Decimal(0)
+        current_running = Decimal(0)
+        prior_running = Decimal(0)
+        base_prefix_worse = 0
+        adjacent_prefix_worse = 0
+        base_daily_improvements = 0
+        adjacent_daily_improvements = 0
+        for base_value, prior_value, current_value in zip(
+            base_daily, prior_daily, current_daily, strict=True
+        ):
+            base_decimal = Decimal(str(base_value))
+            prior_decimal = Decimal(str(prior_value))
+            current_decimal = Decimal(str(current_value))
+            base_running += base_decimal
+            prior_running += prior_decimal
+            current_running += current_decimal
+            if current_running > prior_running + r_quantum:
+                _fail("COST_LADDER_METHOD_CUMULATIVE_PREFIX_IMPROVES")
+            base_prefix_worse += int(current_running < base_running)
+            adjacent_prefix_worse += int(current_running < prior_running)
+            base_daily_improvements += int(current_decimal > base_decimal)
+            adjacent_daily_improvements += int(current_decimal > prior_decimal)
+
+        base_relative = level.get("base_relative")
+        adjacent = level.get("adjacent_guard")
+        if not isinstance(base_relative, Mapping) or set(base_relative) != {
+            "strictly_worse_trade_count",
+            "strictly_worse_position_final_count",
+            "strictly_worse_aggregate_prefix_count",
+            "daily_increment_improvement_observation_count",
+            "realized_adversity_status",
+        }:
+            _fail("COST_LADDER_METHOD_BASE_RELATIVE_INVALID")
+        for name in (
+            "strictly_worse_trade_count",
+            "strictly_worse_position_final_count",
+            "strictly_worse_aggregate_prefix_count",
+            "daily_increment_improvement_observation_count",
+        ):
+            if type(base_relative.get(name)) is not int or base_relative[name] < 0:
+                _fail("COST_LADDER_METHOD_BASE_RELATIVE_INVALID")
+        strictly_adverse = bool(
+            base_trade_worse
+            or base_final_worse
+            or base_prefix_worse
+        )
+        expected_status = (
+            BACKTEST_FROZEN_PATH_COST_LADDER_ADVERSITY_STRICT
+            if strictly_adverse
+            else BACKTEST_FROZEN_PATH_COST_LADDER_ADVERSITY_INSUFFICIENT
+        )
+        if (
+            base_relative.get("strictly_worse_trade_count") != base_trade_worse
+            or base_relative.get("strictly_worse_position_final_count")
+            != base_final_worse
+            or base_relative.get("strictly_worse_aggregate_prefix_count")
+            != base_prefix_worse
+            or base_relative.get("daily_increment_improvement_observation_count")
+            != base_daily_improvements
+            or base_relative.get("realized_adversity_status") != expected_status
+            or (
+                strictly_adverse
+                and level.get("entry_half_spread_values_sha256")
+                == receipt.get("base_entry_half_spread_values_sha256")
+            )
+        ):
+            _fail("COST_LADDER_METHOD_ADVERSITY_STATUS_MISMATCH")
+        adjacent_expected_keys = {
+            "predecessor_level_id",
+            "trade_comparison_count",
+            "strictly_worse_trade_count",
+            "position_final_comparison_count",
+            "strictly_worse_position_final_count",
+            "aggregate_prefix_comparison_count",
+            "strictly_worse_aggregate_prefix_count",
+            "daily_increment_improvement_observation_count",
+            "non_improvement_verified",
+        }
+        if not isinstance(adjacent, Mapping) or set(adjacent) != adjacent_expected_keys:
+            _fail("COST_LADDER_METHOD_ADJACENT_GUARD_INVALID")
+        for name in adjacent_expected_keys - {"predecessor_level_id", "non_improvement_verified"}:
+            if type(adjacent.get(name)) is not int or adjacent[name] < 0:
+                _fail("COST_LADDER_METHOD_ADJACENT_GUARD_INVALID")
+        expected_predecessor = "BASE" if index == 1 else contract_levels[index - 2]["level_id"]
+        if (
+            adjacent.get("predecessor_level_id") != expected_predecessor
+            or adjacent.get("trade_comparison_count") != len(current_trades)
+            or adjacent.get("strictly_worse_trade_count")
+            != adjacent_trade_worse
+            or adjacent.get("position_final_comparison_count") != len(current_events)
+            or adjacent.get("strictly_worse_position_final_count")
+            != adjacent_final_worse
+            or adjacent.get("aggregate_prefix_comparison_count") != len(current_daily)
+            or adjacent.get("strictly_worse_aggregate_prefix_count")
+            != adjacent_prefix_worse
+            or adjacent.get("daily_increment_improvement_observation_count")
+            != adjacent_daily_improvements
+            or adjacent.get("non_improvement_verified") is not True
+        ):
+            _fail("COST_LADDER_METHOD_ADJACENT_GUARD_INVALID")
+        prior_trades = current_trades
+        prior_events = current_events
+        prior_daily = current_daily
     return dict(value)
 
 
@@ -2329,11 +2927,10 @@ def _validated_partition_geometry(
     *,
     lanes: Mapping[str, Any],
 ) -> tuple[dict[str, Any], ...]:
-    lane_order = (
-        ("optimizer_train", "optimizer_train_base"),
-        ("tuning_validation", "tuning_validation_base"),
-        ("final_lockbox", "final_lockbox_base"),
-    )
+    archived = set(lanes) == set(_ARCHIVED_LANE_KEYS)
+    if not archived and set(lanes) != set(_LANE_KEYS):
+        _fail("PARTITION_GEOMETRY_LANE_ROSTER_INVALID")
+    lane_order = tuple((role, role + ("_base" if archived else "_p75")) for role in _PARTITIONS)
     expected_keys = {
         "schema_version",
         "role",
@@ -2408,6 +3005,8 @@ def _validated_partition_geometry(
             > datetime.fromisoformat(scored_start.replace("Z", "+00:00"))
         ):
             _fail(f"PARTITION_GEOMETRY_{ordinal}_LANE_SPLICE")
+        if not archived and lanes[role + "_p95"].get("trade_power_partition_axis") != axis:
+            _fail(f"PARTITION_GEOMETRY_{ordinal}_TIER_AXIS_SPLICE")
         _hex(
             body.get("frame_sha256"),
             64,
@@ -2570,8 +3169,8 @@ def _validated_current_cell_plan_context(
     ):
         _fail("PROVENANCE_CURRENT_HORIZON_PLAN_SPLICE")
     for roster_hash, roster_name in (
-        ("candidate_registry_sha256", "candidates"),
-        ("trial_registry_sha256", "trials"),
+        ("candidate_registry_sha256", "candidate_registry"),
+        ("trial_registry_sha256", "trial_registry"),
         ("attempt_roster_sha256", "attempts"),
         ("evidence_roster_sha256", "expected_evaluations"),
     ):
@@ -2585,8 +3184,8 @@ def _validated_current_cell_plan_context(
         or not isinstance(horizon_policy, Mapping)
         or horizon_policy.get("cost_contract_sha256")
         != frozen.precommitment.get("cost_contract_sha256")
-        or horizon_policy.get("cost_stress_contract_sha256")
-        != frozen.precommitment.get("cost_stress_contract_sha256")
+        or horizon_policy.get("frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256")
+        != frozen.precommitment.get("frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256")
     ):
         _fail("PROVENANCE_CURRENT_HORIZON_POLICY_SPLICE")
     return {
@@ -2763,7 +3362,7 @@ def _validated_current_plan_bijection(
 def _validated_horizon_winner_cross_binding(
     encoded: Any,
     *,
-    sink: SymbolAuthoritySink,
+    sink: Optional[SymbolAuthoritySink],
     frozen: FrozenWinnerSearchPlan,
     attempt_artifacts: Sequence[Mapping[str, Any]],
     production_cell_search_plan: Any = None,
@@ -2806,7 +3405,13 @@ def _validated_horizon_winner_cross_binding(
         "search_process_receipt_sha256",
     }
     schema = binding.get("schema_version")
-    if schema == HORIZON_WINNER_CROSS_BINDING_SCHEMA:
+    current_pair = bool(frozen.frozen_tier_pair_contract_bytes)
+    transport_v16 = frozen.selection_generation is winner.V16_GENERATION
+    historical_schema = (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if transport_v16
+        else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3 if current_pair else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
+    current_schema = (CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 if transport_v16
+        else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if current_pair else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
+    if schema == historical_schema:
         mode = HISTORICAL_CROSS_BINDING_MODE
         expected_top = common_top | historical_fields
         if (
@@ -2814,16 +3419,9 @@ def _validated_horizon_winner_cross_binding(
             or production_search_process is not None
         ):
             _fail("HISTORICAL_CROSS_BINDING_CURRENT_PLAN_FORBIDDEN")
-    elif schema == HORIZON_WINNER_CROSS_BINDING_SCHEMA_V2:
+    elif schema == current_schema:
         mode = binding.get("mode")
-        if mode == HISTORICAL_CROSS_BINDING_MODE:
-            expected_top = common_top | historical_fields | {"mode"}
-            if (
-                production_cell_search_plan is not None
-                or production_search_process is not None
-            ):
-                _fail("HISTORICAL_CROSS_BINDING_CURRENT_PLAN_FORBIDDEN")
-        elif mode == CURRENT_CROSS_BINDING_MODE:
+        if mode == CURRENT_CROSS_BINDING_MODE:
             expected_top = common_top | current_fields | {"mode"}
         else:
             _fail("PROVENANCE_CROSS_BINDING_MODE_INVALID")
@@ -2893,8 +3491,10 @@ def _validated_horizon_winner_cross_binding(
         "causal_fold_plan_sha256",
         "source_contract_sha256",
         "cost_contract_sha256",
-        "cost_stress_contract_sha256",
+        "frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256",
     }
+    if frozen.frozen_tier_pair_contract_bytes:
+        expected_winner.add("partition_cost_precommitments_sha256")
     if (
         not isinstance(horizon_roster, Mapping)
         or set(horizon_roster) != expected_horizon
@@ -2919,11 +3519,16 @@ def _validated_horizon_winner_cross_binding(
         "causal_fold_plan_sha256": precommitment["causal_fold_plan_sha256"],
         "source_contract_sha256": precommitment["source_contract_sha256"],
         "cost_contract_sha256": precommitment["cost_contract_sha256"],
-        "cost_stress_contract_sha256": precommitment["cost_stress_contract_sha256"],
+        ("frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256"):
+            precommitment["frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256"],
     }
+    if frozen.frozen_tier_pair_contract_bytes:
+        expected_winner_values["partition_cost_precommitments_sha256"] = precommitment["partition_cost_precommitments_sha256"]
     if dict(winner_roster) != expected_winner_values:
         _fail("PROVENANCE_CROSS_BINDING_WINNER_SPLICE")
     if mode == CURRENT_CROSS_BINDING_MODE:
+        if sink is None:
+            _fail("CURRENT_CROSS_BINDING_AUTHORITY_SINK_REQUIRED")
         binding_context = _validated_current_cell_plan_context(
             sink,
             frozen=frozen,
@@ -3182,20 +3787,400 @@ def _validated_horizon_winner_cross_binding(
     return binding, tuple(result), binding_context
 
 
-def _validated_provenance(
-    *,
-    frozen: FrozenWinnerSearchPlan,
-    attempt: Mapping[str, Any],
-    attempt_artifacts: Mapping[str, Any],
-    cross_binding: Mapping[str, Any],
-    cross_binding_context: Mapping[str, Any],
-    cross_binding_attempt: Mapping[str, Any],
-    planned_fold: Mapping[str, Any],
-    lanes: Mapping[str, Any],
-    raw: Any,
-) -> dict[str, dict[str, Any]]:
-    if not isinstance(raw, Mapping) or set(raw) != set(_PROVENANCE_KEYS):
-        _fail("FOLD_PROVENANCE_SCHEMA_INVALID")
+def _independent_tier_execution_receipt(lanes: Mapping[str, Any], pair_sha256: str) -> dict[str, Any]:
+    if set(lanes) != set(_LANE_KEYS):
+        _fail("INDEPENDENT_TIER_LANE_ROSTER_INVALID")
+    hashes = {}
+    for name in _LANE_KEYS:
+        result = lanes[name]
+        admission = result.get("spread_admission")
+        if not isinstance(admission, Mapping):
+            _fail("INDEPENDENT_TIER_ADMISSION_MISSING")
+        hashes[name] = {
+            "trade_identity_pnl_sha256": _sha_json(_trade_identity_pnl_evidence(result, lane=name)),
+            "position_events_sha256": _sha_json(result.get("position_events")),
+            "partition_axis_sha256": _sha_json(result.get("trade_power_partition_axis")),
+            "numerical_execution_cost_attestation_sha256": _sha_json(result.get("numerical_execution_cost_attestation")),
+            "entry_observations_sha256": admission.get("entry_observations_sha256"),
+            "entry_admission_mask_sha256": admission.get("entry_admission_mask_sha256")}
+        for value in hashes[name].values():
+            _hex(value, 64, "INDEPENDENT_TIER_EXECUTION_HASH_INVALID")
+    body = {"schema_version": INDEPENDENT_TIER_EXECUTION_SCHEMA,
+        "frozen_tier_pair_contract_sha256": pair_sha256, "lanes": hashes}
+    return {**body, "receipt_sha256": _sha_json(body)}
+
+
+def _source_observation_identity(context: Any, frozen: FrozenWinnerSearchPlan) -> str:
+    if (type(context) is not authority_spool.GenerationSpoolContext
+            or type(frozen) is not FrozenWinnerSearchPlan
+            or context.context_sha256 != frozen.generation_context_sha256):
+        _fail("SOURCE_OBSERVATION_REFERENCE_CONTEXT_INVALID")
+    return _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+
+
+def _source_observation_body(value: Any, *, frozen: FrozenWinnerSearchPlan,
+        expected_receipt_sha256: Optional[str] = None) -> dict[str, Any]:
+    keys = {"schema_version", "symbol", "timeframe", "source_timeframe", "source_product", "observations",
+        "entry_observations_sha256", "receipt_sha256"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        _fail("SOURCE_OBSERVATION_RECEIPT_SCHEMA_INVALID")
+    body = dict(value)
+    receipt_sha = _hex(body.pop("receipt_sha256"), 64, "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
+    if (body["schema_version"] != SOURCE_OBSERVATIONS_SCHEMA
+            or body["symbol"] != frozen.symbol or body["timeframe"] != frozen.timeframe
+            or receipt_sha != _sha_json(body)
+            or (expected_receipt_sha256 is not None and receipt_sha != expected_receipt_sha256)):
+        _fail("SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
+    _identity(body["source_timeframe"], "SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID", 16)
+    _hex(body["entry_observations_sha256"], 64, "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
+    carrier = body["source_product"]
+    carrier_keys = {"data_dir", "index_descriptor", "index_sha256", "symbol", "timeframe", "cutoff_utc",
+        "activation_manifest_sha256", "production_contract_required"}
+    if (not isinstance(carrier, Mapping) or set(carrier) != carrier_keys
+            or not isinstance(carrier["index_descriptor"], Mapping)
+            or type(carrier["data_dir"]) is not str or not carrier["data_dir"]
+            or type(carrier["production_contract_required"]) is not bool
+            or carrier["symbol"] != frozen.symbol or carrier["timeframe"] != body["source_timeframe"]):
+        _fail("SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID")
+    for name in ("index_sha256", "activation_manifest_sha256"):
+        _hex(carrier[name], 64, "SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID")
+    if _utc_second(carrier["cutoff_utc"], "SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID") != carrier["cutoff_utc"]:
+        _fail("SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID")
+    rows = body["observations"]
+    if type(rows) is not list or not 1 <= len(rows) <= MAX_SIGNAL_VECTOR_OBSERVATIONS:
+        _fail("SOURCE_OBSERVATION_ROSTER_INVALID")
+    row_keys = {"target_open_utc", "expected_prior_fine_close_utc", "prior_fine_close_utc", "points"}
+    for row in rows:
+        if not isinstance(row, Mapping) or set(row) != row_keys:
+            _fail("SOURCE_OBSERVATION_ROW_INVALID")
+        for name in ("target_open_utc", "expected_prior_fine_close_utc", "prior_fine_close_utc"):
+            if name == "prior_fine_close_utc" and row[name] is None:
+                continue
+            if _utc_second(row[name], "SOURCE_OBSERVATION_AXIS_INVALID") != row[name]:
+                _fail("SOURCE_OBSERVATION_AXIS_INVALID")
+        point = row["points"]
+        if point is not None and (type(point) not in {int, float}
+                or not math.isfinite(point) or point < 0 or point != math.floor(point)):
+            _fail("SOURCE_OBSERVATION_VALUE_INVALID")
+    return dict(value)
+
+
+def _source_observation_reference_entry(context: Any, *, frozen: FrozenWinnerSearchPlan,
+        reference: Any, expected_receipt_sha256: str) -> dict[str, Any]:
+    prefix = _source_observation_identity(context, frozen)
+    if (not isinstance(reference, Mapping)
+            or set(reference) != {"schema_version", "source_observation_receipt_sha256", "artifact_entry"}
+            or reference.get("schema_version") != SOURCE_OBSERVATION_REFERENCE_SCHEMA):
+        _fail("SOURCE_OBSERVATION_REFERENCE_SCHEMA_INVALID")
+    _hex(expected_receipt_sha256, 64, "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
+    if reference["source_observation_receipt_sha256"] != expected_receipt_sha256:
+        _fail("SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
+    entry = reference["artifact_entry"]
+    if (not isinstance(entry, Mapping) or set(entry) != {"artifact_id", "artifact_type", "descriptor"}
+            or entry.get("artifact_type") != SOURCE_OBSERVATION_ARTIFACT_TYPE):
+        _fail("SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID")
+    descriptor = entry["descriptor"]
+    if (not isinstance(descriptor, Mapping)
+            or set(descriptor) != {"schema_version", "relative_path", "sha256", "size_bytes", "format"}
+            or descriptor.get("schema_version") != ARTIFACT_DESCRIPTOR_SCHEMA
+            or descriptor.get("format") != ASCII_JSON_FORMAT
+            or type(descriptor.get("size_bytes")) is not int
+            or not 0 < descriptor["size_bytes"] <= context.limits.max_artifact_bytes):
+        _fail("SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID")
+    digest = _hex(descriptor.get("sha256"), 64, "SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID")
+    if (descriptor["relative_path"] != f"objects/sha256/{digest[:2]}/{digest}.{ASCII_JSON_FORMAT}"
+            or entry["artifact_id"] != f"{prefix}/source-observations/{digest}"):
+        _fail("SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID")
+    return {"artifact_id": entry["artifact_id"], "artifact_type": entry["artifact_type"],
+        "descriptor": dict(descriptor)}
+
+
+def _reopen_source_observation_reference(context: Any, *, frozen: FrozenWinnerSearchPlan,
+        reference: Any, expected_receipt_sha256: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    entry = _source_observation_reference_entry(context, frozen=frozen, reference=reference,
+        expected_receipt_sha256=expected_receipt_sha256)
+    descriptor = entry["descriptor"]
+    try:
+        digest, size, encoded = authority_spool._stream_file(context.root, descriptor["relative_path"],
+            maximum_bytes=context.limits.max_artifact_bytes, expected_size=descriptor["size_bytes"],
+            collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+        if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
+            _fail("SOURCE_OBSERVATION_REFERENCE_REOPEN_FAILED")
+        value = _decode_object(encoded, "SOURCE_OBSERVATION_REFERENCE_REOPEN_FAILED")
+    except (authority_spool.AuthoritySpoolError, OSError, TypeError, ValueError) as exc:
+        raise WinnerRawEvidenceError("SOURCE_OBSERVATION_REFERENCE_REOPEN_FAILED") from exc
+    return _source_observation_body(value, frozen=frozen,
+        expected_receipt_sha256=expected_receipt_sha256), entry
+
+
+def publish_source_observation_receipt(sink: SymbolAuthoritySink, *, frozen: FrozenWinnerSearchPlan,
+        receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Publish the unchanged logical map once, outside the frozen-plan subtree."""
+    if (type(sink) is not SymbolAuthoritySink or type(frozen) is not FrozenWinnerSearchPlan
+            or sink.symbol != frozen.symbol):
+        _fail("SOURCE_OBSERVATION_REFERENCE_CONTEXT_INVALID")
+    prefix = _source_observation_identity(sink.context, frozen)
+    body = _source_observation_body(receipt, frozen=frozen)
+    physical_sha = _sha_json(body)
+    entry = _put_ascii_json(sink, f"{prefix}/source-observations/{physical_sha}",
+        SOURCE_OBSERVATION_ARTIFACT_TYPE, body)
+    if entry["descriptor"]["sha256"] != physical_sha:
+        _fail("SOURCE_OBSERVATION_REFERENCE_ARTIFACT_INVALID")
+    return {"schema_version": SOURCE_OBSERVATION_REFERENCE_SCHEMA,
+        "source_observation_receipt_sha256": body["receipt_sha256"], "artifact_entry": entry}
+
+
+def resolve_source_observation_reference(sink: SymbolAuthoritySink, *, frozen: FrozenWinnerSearchPlan,
+        reference: Mapping[str, Any], expected_receipt_sha256: str) -> dict[str, Any]:
+    """Reopen physical bytes and their separate logical receipt commitment."""
+    if (type(sink) is not SymbolAuthoritySink or type(frozen) is not FrozenWinnerSearchPlan
+            or sink.symbol != frozen.symbol):
+        _fail("SOURCE_OBSERVATION_REFERENCE_CONTEXT_INVALID")
+    authority_spool._assert_context_current(sink.context)
+    body, _ = _reopen_source_observation_reference(sink.context, frozen=frozen,
+        reference=reference, expected_receipt_sha256=expected_receipt_sha256)
+    return body
+
+
+def _source_observation_closure_body(context: Any, entry: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        if set(entry) != {"artifact_id", "artifact_type", "descriptor"}:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        descriptor = authority_spool._validate_descriptor(dict(entry["descriptor"]), content_addressed=True)
+        if descriptor["format"] != ASCII_JSON_FORMAT:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        digest, size, encoded = authority_spool._stream_file(context.root, descriptor["relative_path"],
+            maximum_bytes=context.limits.max_artifact_bytes, expected_size=descriptor["size_bytes"],
+            collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+        if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        return _decode_object(encoded, "SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+    except (authority_spool.AuthoritySpoolError, OSError, TypeError, ValueError, KeyError) as exc:
+        raise WinnerRawEvidenceError("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID") from exc
+
+
+def verify_source_observation_reference_closure(context: Any, *, frozen: FrozenWinnerSearchPlan,
+        manifest_entries: Iterable[Mapping[str, Any]], production_receipt: Mapping[str, Any]) -> None:
+    """Verify completed referenced transport, one receipt or source map at a time."""
+    prefix = _source_observation_identity(context, frozen)
+    authority_spool._assert_context_current(context)
+    if not isinstance(production_receipt, Mapping) or not isinstance(production_receipt.get("artifact_roster"), Mapping):
+        _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+    production_roster = production_receipt["artifact_roster"]
+    entries: dict[str, Mapping[str, Any]] = {}
+    for entry in manifest_entries:
+        if not isinstance(entry, Mapping) or type(entry.get("artifact_id")) is not str:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        if not entry["artifact_id"].startswith(prefix + "/"):
+            continue
+        if entry["artifact_id"] in entries:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        entries[entry["artifact_id"]] = entry
+    source_entries = {name: entry for name, entry in entries.items()
+        if name.startswith(prefix + "/source-observations/")
+        or entry.get("artifact_type") == SOURCE_OBSERVATION_ARTIFACT_TYPE}
+    provenance_entries = {name: entry for name, entry in entries.items()
+        if any(name.endswith("/provenance/" + role)
+            or entry.get("artifact_type") == "winner_" + role for role in _PROVENANCE_KEYS)}
+    versions: set[str] = set()
+    pair_common: dict[tuple[int, int], dict[str, Any]] = {}
+    replay_entries: dict[tuple[int, int], Mapping[str, Any]] = {}
+    specifics = {schema: _provenance_specific_keys(current=True,
+        referenced=schema == REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA)
+        for schema in (CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA, REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA)}
+    for artifact_id, entry in provenance_entries.items():
+        receipt = _source_observation_closure_body(context, entry)
+        schema = receipt.get("schema_version")
+        if type(schema) is not str or schema not in {CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA, REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA}:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        versions.add(schema)
+        if len(versions) > 1:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        specific = specifics[schema]
+        role = receipt.get("receipt_role")
+        if type(role) is not str or role not in specific:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        _validated_self_hashed_receipt(receipt, role=role,
+            expected_keys=_PROVENANCE_COMMON_KEYS | specific[role],
+            schema_version=schema)
+        ordinal, fold_ordinal = receipt.get("attempt_ordinal"), receipt.get("fold_ordinal")
+        if (type(ordinal) is not int or type(fold_ordinal) is not int
+                or entry.get("artifact_type") != "winner_" + role
+                or artifact_id != f"{prefix}/attempt-{ordinal:04d}/fold-{fold_ordinal:03d}/provenance/{role}"
+                or receipt.get("symbol") != frozen.symbol or receipt.get("timeframe") != frozen.timeframe
+                or receipt.get("regime") != frozen.regime
+                or receipt.get("confers_final_oos_or_trading_authority") is not False):
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        common = {key: receipt[key] for key in _PROVENANCE_COMMON_KEYS
+            if key not in {"receipt_role", "receipt_sha256", "schema_version"}}
+        pair = (ordinal, fold_ordinal)
+        if pair in pair_common and pair_common[pair] != common:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        pair_common[pair] = common
+        production_key = f"attempt-{ordinal:04d}-fold-{fold_ordinal:03d}-provenance-{role}"
+        if production_roster.get(production_key) != entry["descriptor"]:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        if role == "attempt_replay_receipt":
+            replay_entries[pair] = entry
+    observed_keys = {key for key in production_roster if type(key) is str and key.startswith("source-observation-")}
+    expected_pairs = {(attempt["ordinal"], fold["fold_ordinal"])
+        for attempt in frozen.attempt_ledger["attempts"]
+        if attempt["precommitted_evidence_role"] == "EVALUATION_REQUIRED"
+        for fold in frozen.precommitment["causal_fold_plan"]}
+    expected_provenance_ids = {f"{prefix}/attempt-{ordinal:04d}/fold-{fold_ordinal:03d}/provenance/{role}"
+        for ordinal, fold_ordinal in expected_pairs for role in _PROVENANCE_KEYS}
+    if set(provenance_entries) != expected_provenance_ids or set(replay_entries) != expected_pairs:
+        _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+    if REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA not in versions:
+        if source_entries or observed_keys:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        return
+    precommits: dict[tuple[int, int, str], str] = {}
+    partition_precommits = frozen.partition_cost_precommitments
+    compact_precommits = partition_precommits.get("schema_version") == PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA
+    pair_contract = frozen.frozen_tier_pair_contract if compact_precommits else None
+    for row in partition_precommits["rows"]:
+        key = (row["attempt_ordinal"], row["fold_ordinal"], row["partition"])
+        if key in precommits:
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        expanded = (expand_partition_cost_precommitment(partition_precommits, row,
+            pair=pair_contract) if compact_precommits else row)
+        precommits[key] = expanded["source_observation_receipt_sha256"]
+        del expanded
+    used_sources: set[str] = set()
+    for (ordinal, fold_ordinal), entry in replay_entries.items():
+        replay = _source_observation_closure_body(context, entry)
+        references = replay["source_observation_references"]
+        if not isinstance(references, Mapping) or set(references) != set(_PARTITIONS):
+            _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+        for partition in _PARTITIONS:
+            expected_source_sha = precommits.get((ordinal, fold_ordinal, partition))
+            if expected_source_sha is None:
+                _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+            body, source_entry = _reopen_source_observation_reference(context, frozen=frozen,
+                reference=references[partition], expected_receipt_sha256=expected_source_sha)
+            source_id = source_entry["artifact_id"]
+            digest = source_entry["descriptor"]["sha256"]
+            if (source_entries.get(source_id) != source_entry
+                    or production_roster.get(f"source-observation-{digest}") != source_entry["descriptor"]):
+                _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+            used_sources.add(source_id)
+            del body
+    expected_keys = {f"source-observation-{entries[name]['descriptor']['sha256']}" for name in used_sources}
+    if used_sources != set(source_entries) or observed_keys != expected_keys:
+        _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+
+
+def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySink,
+        frozen: FrozenWinnerSearchPlan, expected_sha256: str, partition: str,
+        signals: Mapping[str, Any], lanes: Mapping[str, Any]) -> dict[str, Any]:
+    import numpy as np
+    import pm_native_prefix_production as native
+
+    keys = {"schema_version", "symbol", "timeframe", "source_timeframe", "source_product", "observations",
+        "entry_observations_sha256", "receipt_sha256"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        _fail("SOURCE_OBSERVATION_RECEIPT_SCHEMA_INVALID")
+    body = dict(value)
+    receipt_sha = body.pop("receipt_sha256")
+    if (body["schema_version"] != SOURCE_OBSERVATIONS_SCHEMA or body["symbol"] != frozen.symbol
+            or body["timeframe"] != frozen.timeframe or receipt_sha != _sha_json(body)
+            or receipt_sha != expected_sha256):
+        _fail("SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
+    carrier = body["source_product"]
+    carrier_keys = {"data_dir", "index_descriptor", "index_sha256", "symbol", "timeframe", "cutoff_utc",
+        "activation_manifest_sha256", "production_contract_required"}
+    if (not isinstance(carrier, Mapping) or set(carrier) != carrier_keys
+            or type(carrier["production_contract_required"]) is not bool
+            or carrier["symbol"] != frozen.symbol or carrier["timeframe"] != body["source_timeframe"]):
+        _fail("SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID")
+    try:
+        product = native.verify_activated_native_prefix(data_dir=Path(carrier["data_dir"]), context=sink.context,
+            index_descriptor=carrier["index_descriptor"], expected_index_sha256=carrier["index_sha256"],
+            expected_symbol=frozen.symbol, expected_timeframe=carrier["timeframe"], expected_cutoff_utc=carrier["cutoff_utc"],
+            expected_activation_manifest_sha256=carrier["activation_manifest_sha256"],
+            production_contract_required=carrier["production_contract_required"], require_current_activation=False)
+        fine = native.open_verified_prefix_frame(product)
+    except (native.NativePrefixError, TypeError, ValueError, OSError, KeyError) as exc:
+        raise WinnerRawEvidenceError("SOURCE_OBSERVATION_NATIVE_REOPEN_FAILED") from exc
+    rows = body["observations"]
+    if type(rows) is not list or not 1 <= len(rows) <= MAX_SIGNAL_VECTOR_OBSERVATIONS:
+        _fail("SOURCE_OBSERVATION_ROSTER_INVALID")
+    row_keys = {"target_open_utc", "expected_prior_fine_close_utc", "prior_fine_close_utc", "points"}
+    if any(not isinstance(row, Mapping) or set(row) != row_keys for row in rows):
+        _fail("SOURCE_OBSERVATION_ROW_INVALID")
+    if any(row["points"] is not None and (type(row["points"]) not in {int, float}
+            or not math.isfinite(row["points"]) or row["points"] < 0 or row["points"] != math.floor(row["points"])) for row in rows):
+        _fail("SOURCE_OBSERVATION_VALUE_INVALID")
+    try:
+        target = pd.DatetimeIndex([row["target_open_utc"] for row in rows])
+        observations, matched = align_prior_completed_spreads(target, fine, body["source_timeframe"], include_matched_closes=True)
+    except (TypeError, ValueError, KeyError, OverflowError) as exc:
+        raise WinnerRawEvidenceError("SOURCE_OBSERVATION_AXIS_INVALID") from exc
+    rebuilt_rows = [{"target_open_utc": _utc_second(stamp.isoformat(), "SOURCE_OBSERVATION_AXIS_INVALID"),
+        "expected_prior_fine_close_utc": _utc_second(stamp.isoformat(), "SOURCE_OBSERVATION_AXIS_INVALID"),
+        "prior_fine_close_utc": None if pd.isna(matched.iloc[index]) else _utc_second(
+            matched.iloc[index].isoformat(), "SOURCE_OBSERVATION_AXIS_INVALID"),
+        "points": None if pd.isna(point) else float(point)} for index, (stamp, point) in enumerate(observations.items())]
+    observations_sha = hashlib.sha256(pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest()
+    if rows != rebuilt_rows or body["entry_observations_sha256"] != observations_sha:
+        _fail("SOURCE_OBSERVATION_VALUES_CHANGED")
+    source, activation = product.index["source"], product.index["activation"]
+    pair = frozen.frozen_tier_pair_contract
+    for level in pair["tiers"]:
+        name = level["tier"]
+        descriptor = level["frozen_spread_tier"]
+        binding = descriptor["source_binding"]
+        if (descriptor["source_timeframe"] != body["source_timeframe"]
+                or source["bars_sha256"] != binding["bars_sha256"]
+                or source["audit_sidecar_sha256"] != binding["sidecar_sha256"]
+                or source["provenance_sha256"] != binding["provenance_sha256"]
+                or source["source_identity_sha256"] != descriptor["source_identity_sha256"]
+                or activation["manifest_sha256"] != descriptor["activation"]["manifest_sha256"]
+                or activation["activation_id"] != descriptor["activation"]["id"]):
+            _fail("SOURCE_OBSERVATION_PROFILE_NATIVE_SPLICE")
+        tier = FrozenSpreadTier(json.dumps(descriptor, sort_keys=True, separators=(",", ":"), allow_nan=False))
+        result = lanes[partition + "_" + name.lower()]
+        axis = _partition_axis(result, partition)
+        if len(target) != axis["warmup_bars"] + axis["scored_bars"] or len(signals["values"]) != len(target):
+            _fail("SOURCE_OBSERVATION_PARTITION_AXIS_SPLICE")
+        if target[axis["warmup_bars"]] != pd.Timestamp(axis["start_utc"]) or target[-1] >= pd.Timestamp(axis["end_utc"]):
+            _fail("SOURCE_OBSERVATION_PARTITION_AXIS_SPLICE")
+        states = np.array([spread_admission(tier, point) for point in observations])
+        if (states == "INVALID").any():
+            _fail("SOURCE_OBSERVATION_VALUE_INVALID")
+        mask = states == "ADMIT"
+        opportunities = np.zeros(len(target), dtype=bool)
+        start = max(1, axis["warmup_bars"])
+        opportunities[start:] = np.array(signals["values"], dtype=np.int32)[start - 1:-1] != 0
+        admission = result.get("spread_admission")
+        model = result.get("spread_model")
+        if not isinstance(admission, Mapping) or not isinstance(model, Mapping):
+            _fail("TIER_ADMISSION_EVIDENCE_MISSING")
+        counts = {"signal_opportunities": int(opportunities.sum()),
+            "known_cap_pass_opportunities": int((opportunities & (states == "ADMIT")).sum()),
+            "known_cap_refused_opportunities": int((opportunities & (states == "REFUSE")).sum()),
+            "missing_refused_opportunities": int((opportunities & (states == "MISSING")).sum()), "missing_executed_legs": 0}
+        if (admission.get("schema_version") != ADMISSION_SCHEMA or admission.get("entry_admission_policy") != ADMISSION_POLICY
+                or admission.get("entry_observations_sha256") != observations_sha
+                or admission.get("entry_admission_mask_sha256") != hashlib.sha256(mask.astype(np.uint8).tobytes()).hexdigest()
+                or admission.get("input_provenance_authenticated") is not False or admission.get("qualification_authority") is not False
+                or model.get("entry_admission_schema") != ADMISSION_SCHEMA or model.get("entry_admission_policy") != ADMISSION_POLICY
+                or model.get("entry_observations_sha256") != observations_sha
+                or any(type(admission.get(key)) is not int or admission[key] != count for key, count in counts.items())):
+            _fail("TIER_ADMISSION_RECONSTRUCTION_FAILED")
+        for trade in _trade_identity_pnl_evidence(result, lane=partition + "_" + name.lower()):
+            entry_bar = trade["entry_bar"]
+            if (not max(1, axis["warmup_bars"]) <= entry_bar <= trade["exit_bar"] < len(target)
+                    or trade["signal_bar"] != entry_bar - 1 or not mask[entry_bar]
+                    or signals["values"][trade["signal_bar"]] != (1 if trade["direction"] == "LONG" else -1)
+                    or pd.Timestamp(trade["entry_time"]) != target[entry_bar]
+                    or pd.Timestamp(trade["exit_time"]) != target[trade["exit_bar"]]):
+                _fail("TIER_TRADE_ENTRY_ADMISSION_FAILED")
+    return dict(value)
+
+
+def _provenance_specific_keys(*, current: bool, referenced: bool = False) -> dict[str, frozenset[str]]:
     specific = {
         "anchor_selection_receipt": frozenset(
             {
@@ -3241,8 +4226,8 @@ def _validated_provenance(
         "attempt_replay_receipt": frozenset(
             {
                 "lane_sha256",
-                "stress_method_receipt_sha256",
-                "stress_method_receipt",
+                "cost_ladder_method_receipt_sha256",
+                "cost_ladder_method_receipt",
                 "signal_vector_receipt",
                 "position_events_are_genuine_backtester_v2",
             }
@@ -3261,14 +4246,54 @@ def _validated_provenance(
             }
         ),
     }
+    if current:
+        specific["attempt_replay_receipt"] = frozenset({"lane_sha256", "independent_tier_execution_receipt_sha256",
+            "independent_tier_execution_receipt", "signal_vector_receipts",
+            "source_observation_references" if referenced else "source_observation_receipts",
+            "position_events_are_genuine_backtester_v2"})
+    return specific
+
+
+def _validated_provenance(
+    *,
+    frozen: FrozenWinnerSearchPlan,
+    attempt: Mapping[str, Any],
+    attempt_artifacts: Mapping[str, Any],
+    cross_binding: Mapping[str, Any],
+    cross_binding_context: Mapping[str, Any],
+    cross_binding_attempt: Mapping[str, Any],
+    planned_fold: Mapping[str, Any],
+    lanes: Mapping[str, Any],
+    raw: Any,
+    sink: Optional[SymbolAuthoritySink] = None,
+    source_observation_entries: Optional[dict[str, dict[str, Any]]] = None,
+    provenance_schemas: Optional[set[str]] = None,
+) -> dict[str, dict[str, Any]]:
+    current = bool(frozen.frozen_tier_pair_contract_bytes)
+    if not isinstance(raw, Mapping) or set(raw) != set(_PROVENANCE_KEYS):
+        _fail("FOLD_PROVENANCE_SCHEMA_INVALID")
+    provenance_schema = ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA
+    referenced = False
+    if current:
+        first_raw = raw.get(_PROVENANCE_KEYS[0])
+        provenance_schema = first_raw.get("schema_version") if isinstance(first_raw, Mapping) else None
+        if type(provenance_schema) is not str or provenance_schema not in {CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA, REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA}:
+            _fail("FOLD_PROVENANCE_SCHEMA_INVALID")
+        referenced = provenance_schema == REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA
+    specific = _provenance_specific_keys(current=current, referenced=referenced)
     receipts = {
         name: _validated_self_hashed_receipt(
             raw.get(name),
             role=name,
             expected_keys=_PROVENANCE_COMMON_KEYS | specific[name],
+            schema_version=provenance_schema,
         )
         for name in _PROVENANCE_KEYS
     }
+    if provenance_schemas is not None:
+        provenance_schemas.add(provenance_schema)
+        if len(provenance_schemas) > 1:
+            _fail("ATTEMPT_REPLAY_PROVENANCE_VERSION_MIXED")
     first = receipts[_PROVENANCE_KEYS[0]]
     common = {
         name: first[name]
@@ -3406,33 +4431,96 @@ def _validated_provenance(
         _fail("REFIT_PROVENANCE_INTERVAL_INVALID")
 
     replay = receipts["attempt_replay_receipt"]
-    expected_lanes = {name: _sha_json(dict(lanes[name])) for name in _LANE_KEYS}
-    stress_receipt = _validated_stress_method_receipt(
-        replay.get("stress_method_receipt"),
-        frozen=frozen,
-        attempt_artifacts=attempt_artifacts,
-        lanes=lanes,
-    )
-    signal_receipt = _validated_signal_vector_receipt(
-        replay.get("signal_vector_receipt")
-    )
-    final_axis = lanes.get("final_lockbox_base", {}).get("trade_power_partition_axis")
-    if (
-        replay.get("lane_sha256") != expected_lanes
-        or replay.get("stress_method_receipt_sha256")
-        != stress_receipt["receipt_sha256"]
-        or signal_receipt.get("signal_vector_sha256")
-        != stress_receipt.get("signal_vector_sha256")
-        or not isinstance(final_axis, Mapping)
-        or signal_receipt.get("observation_count")
-        != final_axis.get("warmup_bars", 0) + final_axis.get("scored_bars", 0)
-        or replay.get("position_events_are_genuine_backtester_v2") is not True
-    ):
-        _fail("ATTEMPT_REPLAY_PROVENANCE_SPLICE")
-
+    if current:
+        if type(sink) is not SymbolAuthoritySink:
+            _fail("CURRENT_PROVENANCE_SINK_REQUIRED")
+        expected_receipt = _independent_tier_execution_receipt(lanes, frozen.precommitment["frozen_tier_pair_contract_sha256"])
+        signals = replay.get("signal_vector_receipts")
+        observation_receipts = replay.get("source_observation_references" if referenced else "source_observation_receipts")
+        if (replay.get("lane_sha256") != {name: _sha_json(dict(lanes[name])) for name in _LANE_KEYS}
+                or replay.get("independent_tier_execution_receipt") != expected_receipt
+                or replay.get("independent_tier_execution_receipt_sha256") != expected_receipt["receipt_sha256"]
+                or replay.get("position_events_are_genuine_backtester_v2") is not True
+                or not isinstance(signals, Mapping) or set(signals) != set(_PARTITIONS)
+                or not isinstance(observation_receipts, Mapping) or set(observation_receipts) != set(_PARTITIONS)):
+            _fail("ATTEMPT_REPLAY_PROVENANCE_SPLICE")
+        all_precommits = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
+            pair=frozen.frozen_tier_pair_contract, attempts=frozen.attempt_ledger["attempts"],
+            folds=frozen.precommitment["causal_fold_plan"])
+        selected = [expand_partition_cost_precommitment(all_precommits, row, pair=frozen.frozen_tier_pair_contract)
+            for row in all_precommits["rows"] if row["attempt_ordinal"] == attempt["ordinal"]
+            and row["fold_ordinal"] == planned_fold["fold_ordinal"]]
+        if [row["partition"] for row in selected] != list(_PARTITIONS):
+            _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
+        raw_spec = receipts["oos_source_receipt"].get("execution_spec_receipt", {}).get("instrument_spec")
+        if not isinstance(raw_spec, Mapping):
+            _fail("EXECUTION_SPEC_BODY_SCHEMA_INVALID")
+        spec = InstrumentSpec(**dict(raw_spec))
+        for partition, geometry, precommit_row in zip(_PARTITIONS, geometry_bodies, selected, strict=True):
+            signal = _validated_signal_vector_receipt(signals[partition])
+            if (precommit_row["partition_geometry_receipt_sha256"] != geometry["receipt_sha256"]
+                    or precommit_row["partition_frame_sha256"] != geometry["frame_sha256"]
+                    or signal["observation_count"] != geometry["frame_rows"]):
+                _fail("PARTITION_COST_PRECOMMITMENTS_GEOMETRY_SPLICE")
+            tier_results = {tier: lanes[partition + "_" + tier.lower()] for tier in _TIERS}
+            try:
+                actual_pair = build_backtest_frozen_tier_pair_contract(tier_results, spec=spec, use_spread=True)
+            except (TypeError, ValueError, KeyError, OverflowError) as exc:
+                raise WinnerRawEvidenceError("ACTUAL_TIER_PAIR_CONTRACT_INVALID") from exc
+            if actual_pair != frozen.frozen_tier_pair_contract:
+                _fail("ACTUAL_TIER_PAIR_FROZEN_POLICY_DRIFT")
+            observation_receipt = observation_receipts[partition]
+            if referenced:
+                observation_receipt = resolve_source_observation_reference(sink, frozen=frozen,
+                    reference=observation_receipt, expected_receipt_sha256=precommit_row["source_observation_receipt_sha256"])
+                source_entry = _source_observation_reference_entry(sink.context, frozen=frozen,
+                    reference=observation_receipts[partition], expected_receipt_sha256=precommit_row["source_observation_receipt_sha256"])
+                if source_observation_entries is not None:
+                    source_observation_entries[source_entry["artifact_id"]] = source_entry
+            _validated_source_observation_receipt(observation_receipt, sink=sink, frozen=frozen,
+                expected_sha256=precommit_row["source_observation_receipt_sha256"], partition=partition,
+                signals=signal, lanes=lanes)
+            for tier, result in tier_results.items():
+                expected = precommit_row["tiers"][tier]
+                admission = result["spread_admission"]
+                if (result.get("numerical_execution_cost_attestation") != expected["numerical_execution_cost_attestation"]
+                        or admission.get("entry_observations_sha256") != expected["entry_observations_sha256"]
+                        or admission.get("entry_admission_mask_sha256") != expected["entry_admission_mask_sha256"]):
+                    _fail("PARTITION_COST_PRECOMMITMENTS_ACTUAL_ACCOUNT_SPLICE")
+                _validate_tier_result(result, frozen=frozen, partition=partition, tier=tier)
+                namespace = "|".join((frozen.symbol.upper(), frozen.timeframe.upper(), attempt_artifacts["winner_process"]["strategy_id"]))
+                rebuilt = _canonical_trade_events(_trade_identity_pnl_evidence(result, lane=partition + "_" + tier.lower()),
+                    namespace=namespace, lane=partition + "_" + tier.lower())
+                if _trade_position_reconciliation_evidence(rebuilt, lane=tier) != _trade_position_reconciliation_evidence(result["position_events"], lane=tier):
+                    _fail("TIER_TRADE_POSITION_RECONCILIATION_INVALID")
+    else:
+        replay = receipts["attempt_replay_receipt"]
+        expected_lanes = {name: _sha_json(dict(lanes[name])) for name in _ARCHIVED_LANE_KEYS}
+        ladder_receipt = _validated_cost_ladder_method_receipt(
+            replay.get("cost_ladder_method_receipt"),
+            frozen=frozen,
+            attempt_artifacts=attempt_artifacts,
+            lanes=lanes,
+        )
+        signal_receipt = _validated_signal_vector_receipt(
+            replay.get("signal_vector_receipt")
+        )
+        final_axis = lanes.get("final_lockbox_base", {}).get("trade_power_partition_axis")
+        if (
+            replay.get("lane_sha256") != expected_lanes
+            or replay.get("cost_ladder_method_receipt_sha256")
+            != ladder_receipt["receipt_sha256"]
+            or signal_receipt.get("signal_vector_sha256")
+            != ladder_receipt.get("signal_vector_sha256")
+            or not isinstance(final_axis, Mapping)
+            or signal_receipt.get("observation_count")
+            != final_axis.get("warmup_bars", 0) + final_axis.get("scored_bars", 0)
+            or replay.get("position_events_are_genuine_backtester_v2") is not True
+        ):
+            _fail("ATTEMPT_REPLAY_PROVENANCE_SPLICE")
     source = receipts["oos_source_receipt"]
     horizon_process = attempt_artifacts.get("horizon_process")
-    source_binding = frozen.source_contract_seed.get("source_binding")
+    source_binding = (frozen.source_contract_seeds["P75"] if current else frozen.source_contract_seed).get("source_binding")
     if not isinstance(horizon_process, Mapping) or not isinstance(
         source_binding, Mapping
     ):
@@ -3489,6 +4577,8 @@ def _provenance_artifacts(
     planned_fold: Mapping[str, Any],
     lanes: Mapping[str, Any],
     raw: Any,
+    source_observation_entries: Optional[dict[str, dict[str, Any]]] = None,
+    provenance_schemas: Optional[set[str]] = None,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     validated = _validated_provenance(
         frozen=frozen,
@@ -3500,6 +4590,9 @@ def _provenance_artifacts(
         planned_fold=planned_fold,
         lanes=lanes,
         raw=raw,
+        sink=sink,
+        source_observation_entries=source_observation_entries,
+        provenance_schemas=provenance_schemas,
     )
     hashes: dict[str, str] = {}
     entries: dict[str, dict[str, Any]] = {}
@@ -3526,16 +4619,12 @@ def _shared_oos_partition_receipt(
     if not isinstance(execution_spec, Mapping):
         _fail("SHARED_OOS_PARTITION_EXECUTION_SPEC_INVALID")
     body = {
-        "schema_version": SHARED_OOS_PARTITION_SCHEMA,
+        "schema_version": frozen.selection_generation.shared_partition_version,
         "cell_id": frozen.precommitment["cell_id"],
         "symbol": frozen.symbol,
         "timeframe": frozen.timeframe,
         "regime": frozen.regime,
-        "fold_ordinal": planned_fold["fold_ordinal"],
-        "fold_id": planned_fold["fold_id"],
-        "anchor_as_of_utc": planned_fold["anchor_as_of_utc"],
-        "oos_start_date_utc": planned_fold["oos_start_date_utc"],
-        "oos_end_date_utc": planned_fold["oos_end_date_utc"],
+        "causal_fold_plan_row_sha256": _sha_json(dict(planned_fold)),
         "native_prefix_index_sha256": source_receipt["native_prefix_index_sha256"],
         "native_prefix_content_sha256": source_receipt["native_prefix_content_sha256"],
         "source_contract_sha256": source_receipt["source_contract_sha256"],
@@ -3545,9 +4634,8 @@ def _shared_oos_partition_receipt(
         "regime_fit_decision_sha256": source_receipt["regime_fit_decision_sha256"],
         "execution_spec_receipt_sha256": execution_spec["receipt_sha256"],
         "cost_contract_sha256": frozen.precommitment["cost_contract_sha256"],
-        "cost_stress_contract_sha256": frozen.precommitment[
-            "cost_stress_contract_sha256"
-        ],
+        ("frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256"):
+            frozen.precommitment["frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256"],
         "risk_unit_contract_sha256": frozen.precommitment["risk_unit_contract_sha256"],
     }
     return {**body, "receipt_sha256": _sha_json(body)}
@@ -3588,370 +4676,162 @@ def _fold_power_binding(
     return {**body, "binding_sha256": _sha_json(body)}
 
 
-def _build_authenticated_fold(
-    sink: SymbolAuthoritySink,
+
+
+def _packed_r_e12_vector(
+    values: Sequence[float],
     *,
-    frozen: FrozenWinnerSearchPlan,
-    attempt: Mapping[str, Any],
-    attempt_artifacts: Mapping[str, Any],
-    cross_binding: Mapping[str, Any],
-    cross_binding_context: Mapping[str, Any],
-    cross_binding_attempt: Mapping[str, Any],
-    planned_fold: Mapping[str, Any],
-    expected_adversity_row: Mapping[str, Any],
-    raw_fold: Mapping[str, Any],
-    evidence_access_completed_at_utc: str,
+    maximum_abs_r: float,
+    code: str,
+) -> str:
+    try:
+        e12_values = [
+            winner._encode_r_e12(value, maximum_abs_r, code) for value in values
+        ]
+        return winner._encode_r_e12_i64be_base64(
+            e12_values,
+            maximum_abs_r,
+            code,
+        )
+    except ValueError as exc:
+        raise WinnerRawEvidenceError(code) from exc
+
+
+
+
+def _tier_event_vectors(events: Any, *, fold_start: datetime, fold_end_exclusive: datetime) -> tuple[list, list, list, list, list, list]:
+    if type(events) is not list or len(events) > winner.MAX_TRADES_PER_FOLD:
+        _fail("TIER_COMPLETED_POSITION_ROSTER_INVALID")
+    opens, closes, ids, open_orders, close_orders, values = [], [], [], [], [], []
+    previous = None
+    for ordinal, event in enumerate(events):
+        if not isinstance(event, Mapping) or event.get("trade_record_schema_version") != REQUIRED_TRADE_RECORD_SCHEMA:
+            _fail("TIER_COMPLETED_POSITION_SCHEMA_INVALID")
+        position = event.get("position_id")
+        if type(position) is not str or _BACKTEST_POSITION_ID.fullmatch(position) is None or position in ids:
+            _fail("TIER_COMPLETED_POSITION_ID_INVALID")
+        opened = _utc_second(event.get("entry_time"), "TIER_COMPLETED_POSITION_ENTRY_INVALID")
+        closed = _utc_second(event.get("exit_time"), "TIER_COMPLETED_POSITION_EXIT_INVALID")
+        opening = datetime.fromisoformat(opened.replace("Z", "+00:00"))
+        closing = datetime.fromisoformat(closed.replace("Z", "+00:00"))
+        open_order, close_order = event.get("entry_event_order"), event.get("exit_event_order")
+        if any(type(value) is not int or not 0 <= value <= 2_147_483_647 for value in (open_order, close_order)):
+            _fail("TIER_COMPLETED_POSITION_ORDER_INVALID")
+        key = (closing, close_order, opening, open_order, position)
+        if (opening < fold_start or closing >= fold_end_exclusive or (opening, open_order) >= (closing, close_order)
+                or (previous is not None and key <= previous)):
+            _fail("TIER_COMPLETED_POSITION_CAUSAL_ORDER_INVALID")
+        previous = key
+        try:
+            value = canonical_backtest_winner_r(event.get("pnl_dollars"), event.get("risk_amount"))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise WinnerRawEvidenceError("TIER_COMPLETED_POSITION_R_INVALID") from exc
+        if not math.isfinite(value) or abs(value) > winner.MAX_ABS_TRADE_R:
+            _fail("TIER_COMPLETED_POSITION_R_INVALID")
+        opens.append(opened); closes.append(closed); ids.append(position)
+        open_orders.append(open_order); close_orders.append(close_order); values.append(value)
+    return opens, closes, ids, open_orders, close_orders, values
+
+
+def _current_tier_trade_vector_body(row: Mapping[str, Any], *, axis_sha256: str, risk_sha256: str) -> dict[str, Any]:
+    policy = winner.CURRENT_GENERATION.policy
+    keys = ("spread_tier", "source_contract_sha256", "cost_contract_sha256", "entry_spread_admission_policy_sha256",
+        "completed_trade_open_offset_seconds", "completed_trade_close_offset_seconds", "completed_trade_position_id_digests_base64",
+        "completed_trade_event_order_anchor", "completed_trade_open_event_order_offsets", "completed_trade_close_event_order_offsets",
+        "completed_trade_net_mtm_r_e12_i64be_base64", "position_activity_ledger_sha256", "trade_power_binding")
+    return {"shared_fold_axis_row_sha256": axis_sha256, "accounting_identity_kind": policy["accounting_identity"],
+        "completed_trade_unit": policy["daily_unit"], "inventory_boundary_kind": policy["inventory_boundary"],
+        **{key: row[key] for key in keys}, "risk_unit_contract_sha256": risk_sha256}
+
+
+def _build_evaluated_fold(
+    sink: SymbolAuthoritySink, *, frozen: FrozenWinnerSearchPlan, attempt: Mapping[str, Any],
+    attempt_artifacts: Mapping[str, Any], cross_binding: Mapping[str, Any],
+    cross_binding_context: Mapping[str, Any], cross_binding_attempt: Mapping[str, Any],
+    planned_fold: Mapping[str, Any], raw_fold: Mapping[str, Any],
+    source_observation_entries: Optional[dict[str, dict[str, Any]]] = None,
+    provenance_schemas: Optional[set[str]] = None,
 ) -> tuple[_FoldOutcome, dict[str, dict[str, Any]]]:
     ordinal = planned_fold["fold_ordinal"]
-    if not isinstance(raw_fold, Mapping) or set(raw_fold) != {
-        "fold_ordinal",
-        "provenance",
-        "lanes",
-    }:
+    if (not isinstance(raw_fold, Mapping) or set(raw_fold) != {"fold_ordinal", "provenance", "lanes"}
+            or raw_fold["fold_ordinal"] != ordinal or not isinstance(raw_fold["lanes"], Mapping)
+            or set(raw_fold["lanes"]) != set(_LANE_KEYS)):
         _fail(f"FOLD_{ordinal:03d}_RAW_SCHEMA_INVALID")
-    if raw_fold.get("fold_ordinal") != ordinal:
-        _fail(f"FOLD_{ordinal:03d}_ORDINAL_MISMATCH")
-    lanes = raw_fold.get("lanes")
-    if not isinstance(lanes, Mapping) or set(lanes) != set(_LANE_KEYS):
-        _fail(f"FOLD_{ordinal:03d}_LANE_ROSTER_INVALID")
-    lane_bodies = {name: lanes[name] for name in _LANE_KEYS}
-    if any(not isinstance(value, Mapping) for value in lane_bodies.values()):
-        _fail(f"FOLD_{ordinal:03d}_LANE_INVALID")
-    train = lane_bodies["optimizer_train_base"]
-    tuning = lane_bodies["tuning_validation_base"]
-    final = lane_bodies["final_lockbox_base"]
-    stress = lane_bodies["final_lockbox_stress"]
-    prefix = (
-        f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}/"
-        f"attempt-{attempt['ordinal']:04d}/fold-{ordinal:03d}"
-    )
-    entries: dict[str, dict[str, Any]] = {}
-    for name, result in lane_bodies.items():
-        entries[f"raw-{name}"] = _spool_lane(
-            sink, prefix=prefix, lane=name, result=result
-        )
-    _validate_stress_pair(final, stress, frozen=frozen)
-
-    final_axis = _partition_axis(final, "final_lockbox")
-    fold_start = datetime.combine(
-        _day(planned_fold["oos_start_date_utc"], "FOLD_START_INVALID"),
-        datetime.min.time(),
-        tzinfo=timezone.utc,
-    )
-    fold_end = datetime.combine(
-        _day(planned_fold["oos_end_date_utc"], "FOLD_END_INVALID") + timedelta(days=1),
-        datetime.min.time(),
-        tzinfo=timezone.utc,
-    )
-    if (
-        pd.Timestamp(final_axis["start_utc"]).to_pydatetime() != fold_start
-        or pd.Timestamp(final_axis["end_utc"]).to_pydatetime() != fold_end
-    ):
+    lanes = raw_fold["lanes"]
+    prefix = f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}/attempt-{attempt['ordinal']:04d}/fold-{ordinal:03d}"
+    entries = {"raw-" + name: _spool_lane(sink, prefix=prefix, lane=name, result=lanes[name]) for name in _LANE_KEYS}
+    hashes, provenance_entries, provenance = _provenance_artifacts(sink, prefix=prefix, frozen=frozen, attempt=attempt,
+        attempt_artifacts=attempt_artifacts, cross_binding=cross_binding, cross_binding_context=cross_binding_context,
+        cross_binding_attempt=cross_binding_attempt, planned_fold=planned_fold, lanes=lanes, raw=raw_fold["provenance"],
+        source_observation_entries=source_observation_entries, provenance_schemas=provenance_schemas)
+    entries.update({"provenance-" + key: value for key, value in provenance_entries.items()})
+    start = datetime.combine(_day(planned_fold["oos_start_date_utc"], "FOLD_START_INVALID"), datetime.min.time(), tzinfo=timezone.utc)
+    end = datetime.combine(_day(planned_fold["oos_end_date_utc"], "FOLD_END_INVALID") + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    final_axis = _partition_axis(lanes["final_lockbox_p75"], "final_lockbox")
+    if pd.Timestamp(final_axis["start_utc"]).to_pydatetime() != start or pd.Timestamp(final_axis["end_utc"]).to_pydatetime() != end:
         _fail(f"FOLD_{ordinal:03d}_FINAL_AXIS_PLAN_MISMATCH")
-
-    decisions = _power_chain(
-        attempt_ledger=frozen.attempt_ledger,
-        train=train,
-        tuning=tuning,
-        final=final,
-        frozen=frozen,
-    )
-    power_artifact = _power_chain_artifact(decisions)
-    entries["trade-power-chain"] = _put_ascii_json(
-        sink,
-        f"{prefix}/trade-power-chain",
-        "winner_trade_power_chain",
-        power_artifact,
-    )
-    risk_contract = frozen.risk_unit_contract
-    base_surface, dates, base_daily = _validate_daily_surface(
-        final,
-        risk_contract=risk_contract,
-        planned_fold=planned_fold,
-    )
-    stress_surface, stress_dates, stress_daily = _validate_daily_surface(
-        stress,
-        risk_contract=risk_contract,
-        planned_fold=planned_fold,
-    )
-    if dates != stress_dates:
-        _fail(f"FOLD_{ordinal:03d}_BASE_STRESS_DAILY_AXIS_MISMATCH")
-    base_cumulative = Decimal(0)
-    stress_cumulative = Decimal(0)
-    cumulative_mtm_improves = False
-    for base_value, stress_value in zip(base_daily, stress_daily, strict=True):
-        base_cumulative += Decimal(str(base_value))
-        stress_cumulative += Decimal(str(stress_value))
-        if stress_cumulative > base_cumulative + Decimal("1e-12"):
-            cumulative_mtm_improves = True
-            break
-    if cumulative_mtm_improves:
-        _fail(f"FOLD_{ordinal:03d}_COST_STRESS_IMPROVES_DAILY_R")
-    (
-        trade_opens,
-        trade_closes,
-        position_ids,
-        open_orders,
-        close_orders,
-        base_trade_r,
-        stress_trade_r,
-    ) = _event_vectors(
-        final.get("position_events"),
-        stress.get("position_events"),
-        fold_start=fold_start,
-        fold_end_exclusive=fold_end,
-    )
-    base_daily_total = sum((Decimal(str(value)) for value in base_daily), Decimal(0))
-    stress_daily_total = sum(
-        (Decimal(str(value)) for value in stress_daily), Decimal(0)
-    )
-    base_trade_total = sum((Decimal(str(value)) for value in base_trade_r), Decimal(0))
-    stress_trade_total = sum(
-        (Decimal(str(value)) for value in stress_trade_r), Decimal(0)
-    )
-    if base_daily_total != base_trade_total or stress_daily_total != stress_trade_total:
-        _fail(f"FOLD_{ordinal:03d}_DAILY_TRADE_ACCOUNTING_MISMATCH")
-    entries["base-daily-surface"] = _put_ascii_json(
-        sink,
-        f"{prefix}/base-daily-r-surface",
-        "winner_base_daily_r_surface",
-        base_surface,
-    )
-    entries["stress-daily-surface"] = _put_ascii_json(
-        sink,
-        f"{prefix}/stress-daily-r-surface",
-        "winner_stress_daily_r_surface",
-        stress_surface,
-    )
-    activity = {
-        "schema_version": POSITION_ACTIVITY_SCHEMA,
-        "attempt_id": attempt["attempt_id"],
-        "fold_ordinal": ordinal,
-        "base_position_events": final["position_events"],
-        "stress_position_events": stress["position_events"],
-    }
-    entries["position-activity"] = _put_ascii_json(
-        sink,
-        f"{prefix}/position-activity",
-        "winner_position_activity_ledger",
-        activity,
-    )
-    provenance_hashes, provenance_entries, provenance_bodies = _provenance_artifacts(
-        sink,
-        prefix=prefix,
-        frozen=frozen,
-        attempt=attempt,
-        attempt_artifacts=attempt_artifacts,
-        cross_binding=cross_binding,
-        cross_binding_context=cross_binding_context,
-        cross_binding_attempt=cross_binding_attempt,
-        planned_fold=planned_fold,
-        lanes=lane_bodies,
-        raw=raw_fold.get("provenance"),
-    )
-    entries.update(
-        {f"provenance-{name}": value for name, value in provenance_entries.items()}
-    )
-    replay_receipt = provenance_bodies["attempt_replay_receipt"]
-    stress_method_receipt = replay_receipt.get("stress_method_receipt")
-    horizon_receipt = provenance_bodies["anchor_horizon_decision"]
-    partition_geometry = horizon_receipt.get("partition_geometry")
-    partition_geometry_receipts = horizon_receipt.get(
-        "partition_geometry_receipts"
-    )
-    base_cost_attestation = final.get("numerical_execution_cost_attestation")
-    stress_cost_attestation = stress.get("numerical_execution_cost_attestation")
-    expected_declared_status = (
-        expected_adversity_row.get("expected_adversity_status")
-        if isinstance(expected_adversity_row, Mapping)
-        else None
-    )
-    expected_realized_status = {
-        COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK: (
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-        ),
-        COST_STRESS_ADVERSITY_EXPECTED_STRICT: (
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
-        ),
-    }.get(expected_declared_status)
-    realized_status = (
-        stress_method_receipt.get("realized_adversity_status")
-        if isinstance(stress_method_receipt, Mapping)
-        else None
-    )
-    valid_realized_status = (
-        realized_status == expected_realized_status
-        if expected_realized_status
-        == BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-        else realized_status
-        in {
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
-            BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
-        }
-    )
-    if (
-        not isinstance(expected_adversity_row, Mapping)
-        or not isinstance(stress_method_receipt, Mapping)
-        or type(partition_geometry) is not list
-        or len(partition_geometry) != 3
-        or type(partition_geometry_receipts) is not list
-        or len(partition_geometry_receipts) != 3
-        or not isinstance(partition_geometry[2], Mapping)
-        or not isinstance(base_cost_attestation, Mapping)
-        or not isinstance(stress_cost_attestation, Mapping)
-        or expected_adversity_row.get("attempt_ordinal")
-        != attempt.get("ordinal")
-        or expected_adversity_row.get("horizon_attempt_id")
-        != horizon_receipt.get("horizon_attempt_id")
-        or expected_adversity_row.get("fold_ordinal") != ordinal
-        or expected_adversity_row.get("fold_id") != planned_fold.get("fold_id")
-        or expected_adversity_row.get(
-            "final_partition_geometry_receipt_sha256"
-        )
-        != partition_geometry_receipts[2]
-        or expected_adversity_row.get("final_partition_frame_sha256")
-        != partition_geometry[2].get("frame_sha256")
-        or expected_adversity_row.get("base_cost_attestation_sha256")
-        != base_cost_attestation.get("attestation_sha256")
-        or expected_adversity_row.get("stress_cost_attestation_sha256")
-        != stress_cost_attestation.get("attestation_sha256")
-        or expected_adversity_row.get("base_spread_values_sha256")
-        != base_cost_attestation.get("spread_values_sha256")
-        or expected_adversity_row.get("stress_spread_values_sha256")
-        != stress_cost_attestation.get("spread_values_sha256")
-        or expected_realized_status is None
-        or not valid_realized_status
-    ):
-        _fail("STRESS_ADVERSITY_PRECOMMITMENT_MISMATCH")
-    shared_partition = _shared_oos_partition_receipt(
-        frozen=frozen,
-        planned_fold=planned_fold,
-        source_receipt=provenance_bodies["oos_source_receipt"],
-    )
-    entries["shared-oos-partition"] = _put_ascii_json(
-        sink,
-        f"{prefix}/shared-oos-partition",
-        "winner_shared_oos_partition",
-        shared_partition,
-    )
-    daily_body = {
-        "daily_dates_utc": dates,
-        "daily_net_mtm_r": base_daily,
-        "daily_net_mtm_r_cost_stress": stress_daily,
-    }
-    pbo_trade_body = {
-        "accounting_identity_kind": winner.PINNED_SELECTION_POLICY[
-            "accounting_identity"
-        ],
-        "completed_trade_open_utc": trade_opens,
-        "completed_trade_close_utc": trade_closes,
-        "completed_trade_position_ids": position_ids,
-        "completed_trade_open_event_order": open_orders,
-        "completed_trade_close_event_order": close_orders,
-        "completed_trade_net_mtm_r": base_trade_r,
-        "completed_trade_net_mtm_r_cost_stress": stress_trade_r,
-        "completed_trade_unit": winner.PINNED_SELECTION_POLICY["daily_unit"],
-        "inventory_boundary_kind": winner.PINNED_SELECTION_POLICY["inventory_boundary"],
-        "position_activity_ledger_sha256": entries["position-activity"]["descriptor"][
-            "sha256"
-        ],
-        "risk_unit_contract_sha256": frozen.precommitment["risk_unit_contract_sha256"],
-    }
-    pbo_fold = {
-        **dict(planned_fold),
-        "attempt_replay_receipt_sha256": provenance_hashes["attempt_replay_receipt"],
-        "attempt_oos_source_receipt_sha256": provenance_hashes["oos_source_receipt"],
-        "shared_oos_partition": shared_partition,
-        "position_activity_ledger_sha256": pbo_trade_body[
-            "position_activity_ledger_sha256"
-        ],
-        "cost_contract_sha256": frozen.precommitment["cost_contract_sha256"],
-        "cost_stress_contract_sha256": frozen.precommitment[
-            "cost_stress_contract_sha256"
-        ],
-        "risk_unit_contract_sha256": frozen.precommitment["risk_unit_contract_sha256"],
-        "oos_evidence_accessed_at_utc": evidence_access_completed_at_utc,
-        "fold_evaluated_at_utc": evidence_access_completed_at_utc,
-        "daily_axis_kind": winner.PINNED_SELECTION_POLICY["daily_axis"],
-        "daily_evidence_kind": winner.PINNED_SELECTION_POLICY["daily_evidence"],
-        "daily_unit": winner.PINNED_SELECTION_POLICY["daily_unit"],
-        "completed_trade_unit": winner.PINNED_SELECTION_POLICY["daily_unit"],
-        "accounting_identity_kind": winner.PINNED_SELECTION_POLICY[
-            "accounting_identity"
-        ],
-        "inventory_boundary_kind": winner.PINNED_SELECTION_POLICY["inventory_boundary"],
-        **daily_body,
-        "daily_vector_sha256": _sha_json(daily_body),
-        **pbo_trade_body,
-        "pbo_trade_vector_sha256": _sha_json(pbo_trade_body),
-    }
-    entries["pbo-fold"] = _put_ascii_json(
-        sink,
-        f"{prefix}/pbo-fold",
-        "winner_pbo_evaluated_fold",
-        pbo_fold,
-    )
-    adversity_status = stress_method_receipt.get("realized_adversity_status")
-    terminal = next(
-        (
-            decision
-            for decision in decisions
-            if decision is not None and not decision.passed
-        ),
-        None,
-    )
-    if terminal is not None:
-        status = _power_status(terminal)
-        return _FoldOutcome(
-            status=status,
-            fold=None,
-            pbo_fold=pbo_fold,
-            reason_code=(
-                terminal.reason_codes[0] if terminal.reason_codes else terminal.status
-            ),
-        ), entries
-    if (
-        adversity_status
-        == BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-    ):
-        return _FoldOutcome(
-            status="PROCESS_REJECTED",
-            fold=None,
-            pbo_fold=pbo_fold,
-            reason_code="COST_STRESS_NO_NUMERICAL_SHOCK",
-        ), entries
-    if adversity_status != BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT:
-        _fail("STRESS_METHOD_ADVERSITY_STATUS_INVALID_AFTER_VALIDATION")
-    train_decision, tuning_decision, final_decision = decisions
-    if tuning_decision is None or final_decision is None:
-        _fail("TRADE_POWER_CHAIN_INCOMPLETE")
-    binding = _fold_power_binding(
-        attempt_ledger=frozen.attempt_ledger,
-        train=train_decision,
-        final=final_decision,
-    )
-    trade_body = {**pbo_trade_body, "trade_power_binding": binding}
-    fold = {
-        **pbo_fold,
-        "anchor_selection_receipt_sha256": provenance_hashes[
-            "anchor_selection_receipt"
-        ],
-        "anchor_horizon_decision_sha256": provenance_hashes["anchor_horizon_decision"],
-        "anchor_trial_ledger_sha256": provenance_hashes["anchor_trial_ledger"],
-        "anchor_selected_trial_sha256": provenance_hashes["anchor_selected_trial"],
-        "anchor_refit_receipt_sha256": provenance_hashes["anchor_refit_receipt"],
-        "trade_power_binding": binding,
-        "trade_vector_sha256": _sha_json(trade_body),
-    }
-    entries["winner-fold"] = _put_ascii_json(
-        sink,
-        f"{prefix}/winner-fold",
-        "winner_authenticated_fold",
-        fold,
-    )
-    return _FoldOutcome(
-        status="AUTHENTICATED", fold=fold, pbo_fold=pbo_fold, reason_code=""
-    ), entries
+    shared_partition = _shared_oos_partition_receipt(frozen=frozen, planned_fold=planned_fold,
+        source_receipt=provenance["oos_source_receipt"])
+    entries["shared-oos-partition"] = _put_ascii_json(sink, prefix + "/shared-oos-partition", "winner_shared_oos_partition", shared_partition)
+    tier_evidence = {}
+    dates = None
+    pending = {}
+    for tier in _TIERS:
+        final = lanes["final_lockbox_" + tier.lower()]
+        surface, tier_dates, daily = _validate_daily_surface(final, risk_contract=frozen.risk_unit_contract, planned_fold=planned_fold)
+        if dates is None:
+            dates = tier_dates
+        elif dates != tier_dates:
+            _fail("TIER_DAILY_CALENDAR_GEOMETRY_MISMATCH")
+        strategy = attempt_artifacts["winner_process"]["strategy_id"]
+        trades = _trade_identity_pnl_evidence(final, lane="final_lockbox_" + tier.lower())
+        rebuilt = _canonical_trade_events(trades, namespace="|".join((frozen.symbol.upper(), frozen.timeframe.upper(), strategy)),
+            lane="final_lockbox_" + tier.lower())
+        if _trade_position_reconciliation_evidence(rebuilt, lane=tier) != _trade_position_reconciliation_evidence(final["position_events"], lane=tier):
+            _fail("TIER_TRADE_POSITION_RECONCILIATION_INVALID")
+        opens, closes, ids, open_orders, close_orders, trade_r = _tier_event_vectors(final["position_events"], fold_start=start, fold_end_exclusive=end)
+        if sum((Decimal(str(value)) for value in daily), Decimal(0)) != sum((Decimal(str(value)) for value in trade_r), Decimal(0)):
+            _fail("TIER_DAILY_TRADE_ACCOUNTING_MISMATCH")
+        decisions = _power_chain(attempt_ledger=frozen.attempt_ledger, train=lanes["optimizer_train_" + tier.lower()],
+            tuning=lanes["tuning_validation_" + tier.lower()], final=final, frozen=frozen, tier=tier)
+        for decision in decisions:
+            if decision is not None and not decision.passed and _power_status(decision) == "TECHNICAL_FAILURE":
+                raise WinnerRawEvidenceIncomplete("TIER_TRADE_POWER_TECHNICAL_FAILURE", tier)
+        power = _power_chain_artifact(decisions)
+        entries[tier.lower() + "-trade-power-chain"] = _put_ascii_json(sink, prefix + "/" + tier.lower() + "/trade-power-chain", "winner_trade_power_chain", power)
+        activity = {"schema_version": CURRENT_POSITION_ACTIVITY_SCHEMA, "attempt_id": attempt["attempt_id"],
+            "fold_ordinal": ordinal, "spread_tier": tier, "position_events": final["position_events"]}
+        activity_entry = _put_ascii_json(sink, prefix + "/" + tier.lower() + "/position-activity", "winner_position_activity_ledger", activity)
+        entries[tier.lower() + "-position-activity"] = activity_entry
+        entries[tier.lower() + "-daily-surface"] = _put_ascii_json(sink, prefix + "/" + tier.lower() + "/daily-r-surface", "winner_daily_r_surface", surface)
+        binding = _fold_power_binding(attempt_ledger=frozen.attempt_ledger, train=decisions[0], final=decisions[2]) if all(decision is not None and decision.passed for decision in decisions) else None
+        order_anchor, open_offsets, close_offsets = winner._encode_event_order_offsets(open_orders, close_orders, "TIER_TRADE_EVENT_ORDER_INVALID")
+        level = next(item for item in frozen.frozen_tier_pair_contract["tiers"] if item["tier"] == tier)
+        row = {"spread_tier": tier, "source_contract_sha256": _validated_source_identity(frozen.source_contract_seeds[tier]),
+            "cost_contract_sha256": _sha_json(level["numerical_execution_cost_policy"]),
+            "entry_spread_admission_policy_sha256": _sha_json({"schema_version": ADMISSION_SCHEMA, "entry_admission_policy": ADMISSION_POLICY}),
+            "position_activity_ledger_sha256": activity_entry["descriptor"]["sha256"],
+            "daily_net_mtm_r_e12_i64be_base64": _packed_r_e12_vector(daily, maximum_abs_r=winner.MAX_ABS_DAILY_R, code="TIER_DAILY_R_NOT_EXACT_E12"),
+            "completed_trade_open_offset_seconds": winner._encode_utc_second_offsets(opens, fold_start_utc=start, fold_end_exclusive_utc=end, code="TIER_TRADE_OPEN_INVALID"),
+            "completed_trade_close_offset_seconds": winner._encode_utc_second_offsets(closes, fold_start_utc=start, fold_end_exclusive_utc=end, code="TIER_TRADE_CLOSE_INVALID"),
+            "completed_trade_position_id_digests_base64": winner._encode_position_id_digests(ids, "TIER_POSITION_IDS_INVALID"),
+            "completed_trade_event_order_anchor": order_anchor, "completed_trade_open_event_order_offsets": open_offsets,
+            "completed_trade_close_event_order_offsets": close_offsets,
+            "completed_trade_net_mtm_r_e12_i64be_base64": _packed_r_e12_vector(trade_r, maximum_abs_r=winner.MAX_ABS_TRADE_R, code="TIER_TRADE_R_NOT_EXACT_E12"),
+            "trade_power_binding": binding}
+        pending[tier] = row
+    axis_row = {**dict(planned_fold), "daily_dates_utc": dates, "shared_oos_partition": shared_partition}
+    axis_sha = _sha_json(axis_row)
+    for tier, row in pending.items():
+        row["daily_surface_sha256"] = _sha_json({"shared_fold_axis_row_sha256": axis_sha,
+            **{key: row[key] for key in ("spread_tier", "source_contract_sha256", "cost_contract_sha256", "entry_spread_admission_policy_sha256", "daily_net_mtm_r_e12_i64be_base64")}})
+        row["trade_vector_sha256"] = _sha_json(_current_tier_trade_vector_body(row, axis_sha256=axis_sha, risk_sha256=frozen.precommitment["risk_unit_contract_sha256"]))
+        tier_evidence[tier] = row
+    common_hash_fields = {"anchor_selection_receipt_sha256": "anchor_selection_receipt", "anchor_horizon_decision_sha256": "anchor_horizon_decision",
+        "anchor_trial_ledger_sha256": "anchor_trial_ledger", "anchor_selected_trial_sha256": "anchor_selected_trial", "anchor_refit_receipt_sha256": "anchor_refit_receipt",
+        "attempt_replay_receipt_sha256": "attempt_replay_receipt", "attempt_oos_source_receipt_sha256": "oos_source_receipt"}
+    fold = {"fold_ordinal": ordinal, **{key: hashes[role] for key, role in common_hash_fields.items()}, "tier_evidence": tier_evidence}
+    return _FoldOutcome("AUTHENTICATED", fold, axis_row, ""), entries
 
 
 def _outcome_status(
@@ -3989,29 +4869,23 @@ def _evidence_entry(
     *,
     status: str,
     folds: Sequence[Mapping[str, Any]],
-    pbo_folds: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    if status not in _V11_STATUS_REASONS:
+    if status not in _WINNER_STATUS_REASONS:
         _fail("EVIDENCE_STATUS_INVALID")
     normalized_folds = [
         json.loads(_canonical_bytes(dict(fold)).decode("ascii")) for fold in folds
     ]
-    normalized_pbo_folds = [
-        json.loads(_canonical_bytes(dict(fold)).decode("ascii")) for fold in pbo_folds
-    ]
     role = attempt["precommitted_evidence_role"]
     if role == "PRESEARCH_PROCESS_REJECTED":
-        if status != "PROCESS_REJECTED" or normalized_folds or normalized_pbo_folds:
+        if status != "PROCESS_REJECTED" or normalized_folds:
             _fail("PRESEARCH_REJECTED_ATTEMPT_CARRIES_EVIDENCE")
         status_reason = "PRESEARCH_PROCESS_REJECTED"
-        pbo_evidence_source = "NOT_APPLICABLE_PRESEARCH_REJECTION"
     elif role == "EVALUATION_REQUIRED":
-        if len(normalized_pbo_folds) == 0:
-            _fail("EVALUATION_REQUIRED_PBO_FOLD_ROSTER_INCOMPLETE")
+        if status != "TECHNICAL_FAILURE" and len(normalized_folds) == 0:
+            _fail("EVALUATION_REQUIRED_FOLD_ROSTER_INCOMPLETE")
         status_reason = (
-            None if status == "AUTHENTICATED" else _V11_STATUS_REASONS[status]
+            None if status == "AUTHENTICATED" else _WINNER_STATUS_REASONS[status]
         )
-        pbo_evidence_source = "COMPLETE_EVALUATION_REQUIRED_FOLDS"
     else:
         _fail("PRECOMMITTED_EVIDENCE_ROLE_INVALID")
     return {
@@ -4024,17 +4898,14 @@ def _evidence_entry(
         "refit_recipe_sha256": attempt["refit_recipe_sha256"],
         "source_contract_sha256": attempt["source_contract_sha256"],
         "cost_contract_sha256": attempt["cost_contract_sha256"],
-        "cost_stress_contract_sha256": attempt["cost_stress_contract_sha256"],
+        ("frozen_tier_pair_contract_sha256" if "frozen_tier_pair_contract_sha256" in attempt else "cost_ladder_contract_sha256"):
+            attempt["frozen_tier_pair_contract_sha256" if "frozen_tier_pair_contract_sha256" in attempt else "cost_ladder_contract_sha256"],
         "risk_unit_contract_sha256": attempt["risk_unit_contract_sha256"],
         "evidence_status": status,
         "status_reason": status_reason,
         "fold_count": len(normalized_folds),
         "folds_sha256": _sha_json(normalized_folds),
         "folds": normalized_folds,
-        "pbo_evidence_source": pbo_evidence_source,
-        "pbo_fold_count": len(normalized_pbo_folds),
-        "pbo_folds_sha256": _sha_json(normalized_pbo_folds),
-        "pbo_folds": normalized_pbo_folds,
     }
 
 
@@ -4105,17 +4976,16 @@ def _verified_frozen_attempt_bundle(
     return tuple(verified_bundle)
 
 
-def _reopen_frozen_plan_artifacts(
+def _reopen_current_frozen_plan_artifacts(
     sink: SymbolAuthoritySink,
     *,
     frozen: FrozenWinnerSearchPlan,
     precommitment: Mapping[str, Any],
     attempt_ledger: Mapping[str, Any],
-    source_seed: Mapping[str, Any],
-    base_policy: Mapping[str, Any],
-    stress_policy: Mapping[str, Any],
+    source_seeds: Mapping[str, Any],
+    pair_contract: Mapping[str, Any],
     risk_contract: Mapping[str, Any],
-    adversity_plan: Mapping[str, Any],
+    partition_precommits: Mapping[str, Any],
     horizon_contracts: Sequence[Mapping[str, Any]],
     attempt_artifacts: Sequence[Mapping[str, Mapping[str, Any]]],
     frozen_receipt: Mapping[str, Any],
@@ -4150,14 +5020,10 @@ def _reopen_frozen_plan_artifacts(
     bodies: dict[str, tuple[str, Any]] = {
         "precommitment": ("winner_precommitment", dict(precommitment)),
         "attempt_ledger": ("winner_attempt_ledger", dict(attempt_ledger)),
-        "source_contract_seed": ("winner_source_contract_seed", dict(source_seed)),
-        "base_cost_contract": ("winner_base_cost_contract", dict(base_policy)),
-        "stress_cost_contract": ("winner_stress_cost_contract", dict(stress_policy)),
+        "source_contract_seeds": ("winner_source_contract_seeds", dict(source_seeds)),
+        "frozen_tier_pair_contract": ("winner_frozen_tier_pair_contract", dict(pair_contract)),
         "risk_unit_contract": ("winner_risk_unit_contract", dict(risk_contract)),
-        "cost_stress_adversity_plan": (
-            "winner_cost_stress_adversity_plan",
-            dict(adversity_plan),
-        ),
+        "partition_cost_precommitments": ("winner_partition_cost_precommitments", dict(partition_precommits)),
         "horizon_execution_contracts": (
             "winner_horizon_execution_contracts",
             [dict(contract) for contract in horizon_contracts],
@@ -4190,36 +5056,24 @@ def _reopen_frozen_plan_artifacts(
                 dict(artifacts[name]),
             )
 
-    registries = {
-        "process_registry_sha256": _process_registry(attempts),
-        "horizon_registry_sha256": _horizon_registry(attempts),
-        "trial_registry_sha256": _trial_registry(attempts),
-    }
-    expected_receipt = {
-        "schema_version": FROZEN_PLAN_SCHEMA,
-        "generation_id": sink.context.generation_id,
-        "generation_context_sha256": sink.context.context_sha256,
-        "native_universe_sha256": sink.context.native_universe_sha256,
-        "config_sha256": sink.context.config_sha256,
-        "artifact_namespace": frozen.artifact_namespace,
-        "symbol": frozen.symbol,
-        "timeframe": frozen.timeframe,
-        "regime": frozen.regime,
-        "run_id": precommitment.get("run_id"),
-        "precommitment_sha256": _sha_json(precommitment),
-        "attempt_ledger_sha256": _sha_json(attempt_ledger),
-        "attempts_sha256": _sha_json(attempts),
-        "attempt_count": len(attempts),
-        "fold_plan_sha256": _sha_json(fold_plan),
-        "fold_count": len(fold_plan),
-        "horizon_execution_contracts_sha256": _sha_json(horizon_contracts),
-        "cost_stress_adversity_plan_sha256": _sha_json(adversity_plan),
-        "multiplicity_receipt_sha256": multiplicity.get("receipt_sha256"),
-        **registries,
-        "artifact_roster": {
-            key: entry["descriptor"] for key, entry in sorted(reopened.items())
+    expected_receipt = _build_frozen_winner_search_plan_receipt(
+        context_identity={
+            "generation_id": sink.context.generation_id,
+            "generation_context_sha256": sink.context.context_sha256,
+            "native_universe_sha256": sink.context.native_universe_sha256,
+            "config_sha256": sink.context.config_sha256,
         },
-    }
+        symbol=frozen.symbol,
+        timeframe=frozen.timeframe,
+        regime=frozen.regime,
+        artifact_namespace=frozen.artifact_namespace,
+        precommitment=precommitment,
+        attempt_ledger=attempt_ledger,
+        horizon_execution_contracts=horizon_contracts,
+        partition_cost_precommitments=partition_precommits,
+        artifact_entries=reopened,
+        _generation=frozen.selection_generation,
+    )
 
     # Reopen the receipt before comparing the reconstructed schema.  With the
     # original sink, a changed byte must hit ARTIFACT_ID_CONFLICT; with a fresh
@@ -4237,7 +5091,253 @@ def _reopen_frozen_plan_artifacts(
     return expected_receipt
 
 
-def produce_winner_v11_raw_evidence(
+def _restore_frozen_winner_search_plan(
+    *,
+    context_identity: Mapping[str, str],
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    artifact_namespace: Optional[str],
+    manifest_entries: Sequence[Mapping[str, Any]],
+    body_bytes: Sequence[bytes],
+    _generation=winner.CURRENT_GENERATION,
+) -> FrozenWinnerSearchPlan:
+    """Restore a current plan from caller-authenticated sealed-manifest bodies.
+
+    Entries and bodies are parallel sequences for the complete frozen subtree,
+    including its receipt. This verifies their internal binding, not authority
+    to issue a manifest or trade. No filesystem or sink access occurs.
+    """
+    identity = _restored_frozen_context_identity(context_identity)
+    normalized_symbol = _identity(symbol, "SYMBOL_INVALID", 64)
+    normalized_timeframe = _identity(timeframe, "TIMEFRAME_INVALID", 16).upper()
+    normalized_regime = _identity(regime, "REGIME_INVALID", 32).upper()
+    namespace = _validated_namespace(artifact_namespace)
+    if normalized_timeframe not in winner.TIMEFRAMES or normalized_regime not in winner.REGIMES:
+        _fail("FROZEN_PLAN_RESTORE_CELL_INVALID")
+    if (not isinstance(manifest_entries, (list, tuple))
+            or not isinstance(body_bytes, (list, tuple))
+            or len(manifest_entries) != len(body_bytes)
+            or not 1 <= len(manifest_entries) <= 10 + 4 * winner.MAX_ATTEMPTS):
+        _fail("FROZEN_PLAN_RESTORE_INPUT_ROSTER_INVALID")
+    prefix = _artifact_prefix(namespace, normalized_timeframe, normalized_regime)
+    frozen_prefix = f"{prefix}/frozen/"
+    entries_by_id: dict[str, dict[str, Any]] = {}
+    encoded_by_id: dict[str, bytes] = {}
+    decoded_by_id: dict[str, Any] = {}
+    descriptor_fields = {"schema_version", "relative_path", "sha256", "size_bytes", "format"}
+    for entry, encoded in zip(manifest_entries, body_bytes, strict=True):
+        if type(entry) is not dict or set(entry) != {"artifact_id", "artifact_type", "descriptor"}:
+            _fail("FROZEN_PLAN_RESTORE_ENTRY_INVALID")
+        artifact_id = _identity(entry["artifact_id"], "FROZEN_PLAN_RESTORE_ENTRY_INVALID", 1024)
+        if not artifact_id.startswith(frozen_prefix) or artifact_id in entries_by_id:
+            _fail("FROZEN_PLAN_RESTORE_ENTRY_ROSTER_INVALID")
+        descriptor = entry["descriptor"]
+        if (type(descriptor) is not dict or set(descriptor) != descriptor_fields
+                or descriptor.get("schema_version") != ARTIFACT_DESCRIPTOR_SCHEMA
+                or descriptor.get("format") != ASCII_JSON_FORMAT
+                or type(descriptor.get("size_bytes")) is not int
+                or type(encoded) is not bytes
+                or not 1 <= len(encoded) <= winner.MAX_REQUEST_BYTES):
+            _fail("FROZEN_PLAN_RESTORE_DESCRIPTOR_INVALID")
+        digest = _hex(descriptor.get("sha256"), 64, "FROZEN_PLAN_RESTORE_DESCRIPTOR_INVALID")
+        if (descriptor["size_bytes"] != len(encoded)
+                or hashlib.sha256(encoded).hexdigest() != digest
+                or descriptor["relative_path"] != f"objects/sha256/{digest[:2]}/{digest}.{ASCII_JSON_FORMAT}"):
+            _fail("FROZEN_PLAN_RESTORE_BODY_BINDING_INVALID")
+        try:
+            body = json.loads(encoded.decode("ascii"))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise WinnerRawEvidenceError("FROZEN_PLAN_RESTORE_BODY_INVALID") from exc
+        if type(body) not in (dict, list) or _canonical_bytes(body) != encoded:
+            _fail("FROZEN_PLAN_RESTORE_BODY_INVALID")
+        entries_by_id[artifact_id] = dict(entry)
+        encoded_by_id[artifact_id] = encoded
+        decoded_by_id[artifact_id] = body
+
+    def body_for(name: str, artifact_type: str, body_type: type = dict) -> Any:
+        artifact_id = frozen_prefix + name
+        if artifact_id not in entries_by_id:
+            _fail("FROZEN_PLAN_RESTORE_ENTRY_MISSING", name)
+        if (entries_by_id[artifact_id]["artifact_type"] != artifact_type
+                or type(decoded_by_id[artifact_id]) is not body_type):
+            _fail("FROZEN_PLAN_RESTORE_ARTIFACT_TYPE_INVALID", name)
+        return decoded_by_id[artifact_id]
+
+    receipt = body_for("receipt", "winner_frozen_search_plan_receipt")
+    if (receipt.get("schema_version") != (V16_FROZEN_PLAN_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA)
+            or any(receipt.get(name) != value for name, value in identity.items())
+            or receipt.get("artifact_namespace") != namespace
+            or receipt.get("symbol") != normalized_symbol
+            or receipt.get("timeframe") != normalized_timeframe
+            or receipt.get("regime") != normalized_regime):
+        _fail("FROZEN_PLAN_RESTORE_RECEIPT_CONTEXT_INVALID")
+    precommitment = body_for("precommitment", "winner_precommitment")
+    attempt_ledger = body_for("attempt_ledger", "winner_attempt_ledger")
+    source_seeds = body_for("source_contract_seeds", "winner_source_contract_seeds")
+    pair_contract = body_for("frozen_tier_pair_contract", "winner_frozen_tier_pair_contract")
+    risk_contract = body_for("risk_unit_contract", "winner_risk_unit_contract")
+    partition_precommits = body_for("partition_cost_precommitments", "winner_partition_cost_precommitments")
+    horizon_contracts = body_for("horizon_execution_contracts", "winner_horizon_execution_contracts", list)
+    power_policy = body_for("trade_power_policy", "winner_trade_power_policy")
+    multiplicity = body_for("multiplicity_receipt", "winner_trade_power_multiplicity")
+    attempts = attempt_ledger.get("attempts")
+    if type(attempts) is not list or not 1 <= len(attempts) <= winner.MAX_ATTEMPTS:
+        _fail("FROZEN_PLAN_RESTORE_ATTEMPTS_INVALID")
+    logical_entries = {
+        name: entries_by_id[frozen_prefix + name]
+        for name in ("precommitment", "attempt_ledger", "source_contract_seeds",
+                     "frozen_tier_pair_contract", "risk_unit_contract", "partition_cost_precommitments",
+                     "horizon_execution_contracts", "trade_power_policy", "multiplicity_receipt")
+    }
+    bundle = []
+    for ordinal in range(len(attempts)):
+        artifacts = {}
+        for name in sorted(_ATTEMPT_ARTIFACT_KEYS):
+            relative_id = f"attempt-{ordinal:04d}/{name}"
+            artifacts[name] = body_for(relative_id, f"winner_attempt_{name}")
+            logical_entries[f"attempt-{ordinal:04d}-{name}"] = entries_by_id[frozen_prefix + relative_id]
+        bundle.append(artifacts)
+    expected_ids = {frozen_prefix + "receipt"} | {
+        entry["artifact_id"] for entry in logical_entries.values()
+    }
+    if set(entries_by_id) != expected_ids:
+        _fail("FROZEN_PLAN_RESTORE_ENTRY_ROSTER_INVALID")
+    try:
+        expected_receipt = _build_frozen_winner_search_plan_receipt(
+            context_identity=identity, symbol=normalized_symbol, timeframe=normalized_timeframe,
+            regime=normalized_regime, artifact_namespace=namespace,
+            precommitment=precommitment, attempt_ledger=attempt_ledger,
+            horizon_execution_contracts=horizon_contracts,
+            partition_cost_precommitments=partition_precommits, artifact_entries=logical_entries,
+            _generation=_generation,
+        )
+    except WinnerRawEvidenceError:
+        raise
+    except (ValueError, KeyError, TypeError) as exc:
+        raise WinnerRawEvidenceError("FROZEN_PLAN_RESTORE_RECEIPT_INVALID") from exc
+    if receipt != expected_receipt:
+        _fail("FROZEN_PLAN_RECEIPT_MISMATCH")
+    source_seeds, pair_contract, pair_hashes = _current_pair_inputs(source_seeds, pair_contract)
+    normalized_horizons = _normalized_horizon_execution_contracts(horizon_contracts,
+        expected_count=len(attempts))
+    stored_folds = precommitment.get("causal_fold_plan")
+    if (type(stored_folds) is not list
+            or any(type(fold) is not dict or set(fold) != {
+                "fold_ordinal", "fold_id", "anchor_as_of_utc", "oos_start_date_utc", "oos_end_date_utc"
+            } for fold in stored_folds)):
+        _fail("FROZEN_PLAN_RESTORE_BINDING_INVALID")
+    fold_inputs = [{name: fold[name] for name in (
+        "anchor_as_of_utc", "oos_start_date_utc", "oos_end_date_utc")}
+        for fold in stored_folds]
+    folds, latest_boundary = _normalize_fold_plan(fold_inputs,
+        symbol=normalized_symbol, timeframe=normalized_timeframe, regime=normalized_regime)
+    partition_precommits = _validated_partition_cost_precommitments(partition_precommits,
+        pair=pair_contract, attempts=attempts, folds=folds)
+    common = {
+        "cell_id": winner.compute_cell_id(normalized_symbol, normalized_timeframe, normalized_regime),
+        "symbol": normalized_symbol, "timeframe": normalized_timeframe, "regime": normalized_regime,
+        **pair_hashes, "risk_unit_contract_sha256": _sha_json(risk_contract),
+        **{name: expected_receipt[name] for name in (
+            "process_registry_sha256", "horizon_registry_sha256", "trial_registry_sha256")},
+        "partition_cost_precommitments_sha256": _sha_json(partition_precommits),
+    }
+    if (precommitment.get("contract_version") != _generation.precommitment_version
+            or precommitment.get("selection_policy_sha256") != _generation.policy_sha256
+            or precommitment.get("frozen_tier_pair_contract") != pair_contract
+            or precommitment.get("causal_fold_plan") != folds
+            or precommitment.get("latest_evidence_boundary_utc") != latest_boundary
+            or precommitment.get("planned_attempt_count") != len(attempts)
+            or precommitment.get("planned_fold_count") != len(folds)
+            or precommitment.get("causal_fold_plan_sha256") != _sha_json(folds)
+            or attempt_ledger.get("contract_version") != winner.ATTEMPT_LEDGER_VERSION
+            or attempt_ledger.get("precommitment_payload_sha256") != _sha_json(precommitment)
+            or attempt_ledger.get("attempt_count") != len(attempts)
+            or attempt_ledger.get("attempts_sha256") != _sha_json(attempts)
+            or risk_contract != build_precommitted_risk_unit_contract()
+            or normalized_horizons != horizon_contracts
+            or power_policy != asdict(PRODUCTION_TRADE_POWER_POLICY)
+            or multiplicity != build_trade_power_multiplicity_receipt(attempt_ledger)
+            or any(precommitment.get(name) != value or attempt_ledger.get(name) != value
+                   for name, value in common.items())):
+        _fail("FROZEN_PLAN_RESTORE_BINDING_INVALID")
+    precommitted_at = _utc(precommitment.get("precommitted_at_utc"), "PRECOMMITTED_AT_INVALID")
+    frozen_at = _utc(attempt_ledger.get("frozen_at_utc"), "ATTEMPTS_FROZEN_AT_INVALID")
+    if frozen_at <= precommitted_at:
+        _fail("ATTEMPTS_NOT_FROZEN_AFTER_PRECOMMITMENT")
+    frozen = FrozenWinnerSearchPlan(
+        symbol=normalized_symbol, timeframe=normalized_timeframe, regime=normalized_regime,
+        artifact_namespace=namespace, generation_context_sha256=identity["generation_context_sha256"],
+        precommitment_bytes=encoded_by_id[frozen_prefix + "precommitment"],
+        attempt_ledger_bytes=encoded_by_id[frozen_prefix + "attempt_ledger"],
+        source_contract_seed_bytes=b"", cost_ladder_contract_bytes=b"",
+        risk_unit_contract_bytes=encoded_by_id[frozen_prefix + "risk_unit_contract"],
+        cost_ladder_adversity_plan_bytes=b"",
+        frozen_receipt_bytes=encoded_by_id[frozen_prefix + "receipt"],
+        frozen_receipt_entry_bytes=_canonical_bytes(entries_by_id[frozen_prefix + "receipt"]),
+        horizon_execution_contracts_bytes=encoded_by_id[frozen_prefix + "horizon_execution_contracts"],
+        attempt_artifacts_bundle_bytes=_canonical_bytes(bundle),
+        source_contract_seeds_bytes=encoded_by_id[frozen_prefix + "source_contract_seeds"],
+        frozen_tier_pair_contract_bytes=encoded_by_id[frozen_prefix + "frozen_tier_pair_contract"],
+        partition_cost_precommitments_bytes=encoded_by_id[frozen_prefix + "partition_cost_precommitments"],
+    )
+    verified_bundle = _verified_frozen_attempt_bundle(frozen=frozen,
+        attempt_ledger=attempt_ledger, frozen_receipt=receipt)
+    normalized_attempts, _ = _normalize_attempt_artifacts(verified_bundle,
+        precommitted_evidence_roles=[attempt.get("precommitted_evidence_role") for attempt in attempts],
+        horizon_execution_contracts=normalized_horizons,
+        common_hashes={**pair_hashes, "risk_unit_contract_sha256": _sha_json(risk_contract)},
+        symbol=normalized_symbol, timeframe=normalized_timeframe, regime=normalized_regime)
+    if normalized_attempts != attempts:
+        _fail("FROZEN_PLAN_RESTORE_BINDING_INVALID")
+    return frozen
+
+
+def verify_historical_frozen_winner_cross_binding(
+    encoded: bytes,
+    *,
+    frozen: FrozenWinnerSearchPlan,
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], dict[str, Any]]:
+    """Verify the canonical historical cross binding without a sink or writes."""
+    if not isinstance(frozen, FrozenWinnerSearchPlan):
+        _fail("FROZEN_PLAN_RESTORE_INPUT_INVALID")
+    generation = frozen.selection_generation
+    if type(encoded) is not bytes or not 1 <= len(encoded) <= winner.MAX_REQUEST_BYTES:
+        _fail("PROVENANCE_CROSS_BINDING_BYTES_INVALID")
+    binding = _decode_object(encoded, "PROVENANCE_CROSS_BINDING_BYTES_INVALID")
+    if binding.get("schema_version") in {
+        CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA,
+        CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
+        CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5,
+    }:
+        _fail("HISTORICAL_CROSS_BINDING_CURRENT_PLAN_FORBIDDEN")
+    receipt = _decode_object(frozen.frozen_receipt_bytes, "FROZEN_RECEIPT_INVALID")
+    if (receipt.get("schema_version") != (V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA)
+            or not frozen.frozen_tier_pair_contract_bytes
+            or binding.get("schema_version") != (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+                if generation is winner.V16_GENERATION else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3)):
+        _fail("PROVENANCE_CROSS_BINDING_SCHEMA_INVALID")
+    attempts = _verified_frozen_attempt_bundle(frozen=frozen,
+        attempt_ledger=frozen.attempt_ledger, frozen_receipt=receipt)
+    return _validated_horizon_winner_cross_binding(encoded, sink=None,
+        frozen=frozen, attempt_artifacts=attempts)
+
+
+def _check_cumulative_completed_trades(total, generation):
+    try:
+        winner.check_completed_trade_transport_count(total, generation=generation)
+    except ValueError as exc:
+        _fail(str(exc))
+
+
+def _verify_produced_winner_decision(decision, request, generation):
+    if not winner.verify_historical_cell_winner_decision(decision, request):
+        if generation is winner.V16_GENERATION:
+            _fail("WINNER_V16_DECISION_VERIFICATION_FAILED", ",".join(decision.reason_codes))
+        _fail("WINNER_V15_DECISION_VERIFICATION_FAILED")
+
+
+def _produce_winner_raw_evidence(
     sink: SymbolAuthoritySink,
     *,
     frozen: FrozenWinnerSearchPlan,
@@ -4248,16 +5348,9 @@ def produce_winner_v11_raw_evidence(
     production_cell_search_plan: Any = None,
     production_search_process: Any = None,
     artifact_namespace: Optional[str] = None,
+    _generation=winner.CURRENT_GENERATION,
 ) -> WinnerRawEvidenceProduction:
-    """Consume raw search evidence, run V11 power lineage, and spool authority.
-
-    ``artifact_namespace`` must equal the namespace bound at freeze time;
-    any mismatch (including namespaced-vs-current-lane) fails closed.
-    Legacy/v2 HISTORICAL bindings retain the released anchor semantics.
-    A v2 CURRENT binding additionally requires the genuine sealed production
-    cell plan and frozen search process; both are reopened before the evidence
-    iterator is touched and confer no downstream trading authority.
-    """
+    """Produce current independent P75/P95 candidate evidence; no live authority."""
 
     if type(sink) is not SymbolAuthoritySink or not isinstance(
         frozen, FrozenWinnerSearchPlan
@@ -4272,100 +5365,30 @@ def produce_winner_v11_raw_evidence(
     precommitment = frozen.precommitment
     attempt_ledger = frozen.attempt_ledger
     risk_contract = frozen.risk_unit_contract
-    base_policy = _validated_frozen_cost_policy(
-        frozen.base_cost_policy,
-        lane="BASE",
-        code="FROZEN_BASE_COST_POLICY_INVALID",
-    )
-    stress_policy = _validated_frozen_cost_policy(
-        frozen.stress_cost_policy,
-        lane="STRESS",
-        code="FROZEN_STRESS_COST_POLICY_INVALID",
-    )
-    source_seed = frozen.source_contract_seed
-    _validated_partition_cost_attestation(
-        source_seed.get("numerical_execution_cost_attestation"),
-        policy=base_policy,
-        lane="BASE",
-        code="FROZEN_SOURCE_SEED_COST_ATTESTATION_INVALID",
-    )
-    if (
-        _sha_json(base_policy) != precommitment.get("cost_contract_sha256")
-        or _sha_json(stress_policy) != precommitment.get("cost_stress_contract_sha256")
-        or base_policy["numerical_execution_cost_policy_sha256"]
-        == stress_policy["numerical_execution_cost_policy_sha256"]
-        or _validated_source_identity(source_seed)
-        != precommitment.get("source_contract_sha256")
-    ):
-        _fail("FROZEN_COST_POLICY_BINDING_INVALID")
+    source_seeds, pair_contract, pair_hashes = _current_pair_inputs(frozen.source_contract_seeds, frozen.frozen_tier_pair_contract)
+    if (precommitment.get("contract_version") != _generation.precommitment_version
+            or precommitment.get("selection_policy_sha256") != _generation.policy_sha256
+            or precommitment.get("frozen_tier_pair_contract") != pair_contract
+            or any(precommitment.get(name) != value for name, value in pair_hashes.items())
+            or risk_contract != build_precommitted_risk_unit_contract()):
+        _fail("FROZEN_TIER_PAIR_BINDING_INVALID")
     receipt = _decode_object(frozen.frozen_receipt_bytes, "FROZEN_RECEIPT_INVALID")
-    horizon_contracts = _normalized_horizon_execution_contracts(
-        frozen.horizon_execution_contracts,
-        expected_count=attempt_ledger.get("attempt_count"),
-    )
-    horizon_contracts_sha256 = _sha_json(horizon_contracts)
-    adversity_plan = _normalized_cost_stress_adversity_plan(
-        frozen.cost_stress_adversity_plan,
-        symbol=frozen.symbol,
-        timeframe=frozen.timeframe,
-        regime=frozen.regime,
-        attempts=attempt_ledger.get("attempts"),
-        folds=precommitment.get("causal_fold_plan"),
-    )
-    adversity_plan_sha256 = _sha_json(adversity_plan)
-    adversity_rows_by_key = {
-        (row["attempt_ordinal"], row["fold_ordinal"]): row
-        for row in adversity_plan["rows"]
-    }
-    if len(adversity_rows_by_key) != adversity_plan["row_count"]:
-        _fail("COST_STRESS_ADVERSITY_PLAN_ROSTER_DUPLICATED")
-    frozen_roster = receipt.get("artifact_roster")
-    horizon_contract_descriptor = (
-        frozen_roster.get("horizon_execution_contracts")
-        if isinstance(frozen_roster, Mapping)
-        else None
-    )
-    adversity_plan_descriptor = (
-        frozen_roster.get("cost_stress_adversity_plan")
-        if isinstance(frozen_roster, Mapping)
-        else None
-    )
-    if (
-        receipt.get("precommitment_sha256") != _sha_json(precommitment)
-        or receipt.get("attempt_ledger_sha256") != _sha_json(attempt_ledger)
-        or receipt.get("attempts_sha256") != attempt_ledger.get("attempts_sha256")
-        or receipt.get("fold_plan_sha256")
-        != precommitment.get("causal_fold_plan_sha256")
-        or receipt.get("horizon_execution_contracts_sha256") != horizon_contracts_sha256
-        or receipt.get("cost_stress_adversity_plan_sha256")
-        != adversity_plan_sha256
-        or not isinstance(horizon_contract_descriptor, Mapping)
-        or horizon_contract_descriptor.get("sha256") != horizon_contracts_sha256
-        or not isinstance(adversity_plan_descriptor, Mapping)
-        or adversity_plan_descriptor.get("sha256") != adversity_plan_sha256
-        or "artifact_namespace" not in receipt
-        or receipt["artifact_namespace"] != frozen.artifact_namespace
-    ):
-        _fail("FROZEN_PLAN_RECEIPT_MISMATCH")
-    attempt_bundles = _verified_frozen_attempt_bundle(
-        frozen=frozen,
-        attempt_ledger=attempt_ledger,
-        frozen_receipt=receipt,
-    )
-    receipt = _reopen_frozen_plan_artifacts(
-        sink,
-        frozen=frozen,
-        precommitment=precommitment,
-        attempt_ledger=attempt_ledger,
-        source_seed=source_seed,
-        base_policy=base_policy,
-        stress_policy=stress_policy,
-        risk_contract=risk_contract,
-        adversity_plan=adversity_plan,
-        horizon_contracts=horizon_contracts,
-        attempt_artifacts=attempt_bundles,
-        frozen_receipt=receipt,
-    )
+    horizon_contracts = _normalized_horizon_execution_contracts(frozen.horizon_execution_contracts,
+        expected_count=attempt_ledger.get("attempt_count"))
+    partition_precommits = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
+        pair=pair_contract, attempts=attempt_ledger.get("attempts"), folds=precommitment.get("causal_fold_plan"))
+    partition_sha = _sha_json(partition_precommits)
+    if (precommitment.get("partition_cost_precommitments_sha256") != partition_sha
+            or attempt_ledger.get("partition_cost_precommitments_sha256") != partition_sha
+            or receipt.get("partition_cost_precommitments_sha256") != partition_sha
+            or receipt.get("precommitment_sha256") != _sha_json(precommitment)
+            or receipt.get("attempt_ledger_sha256") != _sha_json(attempt_ledger)):
+        _fail("FROZEN_PARTITION_COST_BINDING_INVALID")
+    attempt_bundles = _verified_frozen_attempt_bundle(frozen=frozen, attempt_ledger=attempt_ledger, frozen_receipt=receipt)
+    receipt = _reopen_current_frozen_plan_artifacts(sink, frozen=frozen, precommitment=precommitment,
+        attempt_ledger=attempt_ledger, source_seeds=source_seeds, pair_contract=pair_contract,
+        risk_contract=risk_contract, partition_precommits=partition_precommits, horizon_contracts=horizon_contracts,
+        attempt_artifacts=attempt_bundles, frozen_receipt=receipt)
     (
         cross_binding,
         cross_binding_attempts,
@@ -4395,6 +5418,10 @@ def produce_winner_v11_raw_evidence(
     raw_iterator = iter(attempt_evidence)
     evidence_entries: list[dict[str, Any]] = []
     spool_entries: dict[str, dict[str, Any]] = {}
+    source_observation_entries: dict[str, dict[str, Any]] = {}
+    provenance_schemas: set[str] = set()
+    shared_fold_axis: Optional[list[dict[str, Any]]] = None
+    total_completed_trades = 0
     for attempt, attempt_artifacts, cross_binding_attempt in zip(
         attempt_ledger["attempts"],
         attempt_bundles,
@@ -4436,7 +5463,7 @@ def produce_winner_v11_raw_evidence(
                     str(outcome.reason_code),
                 )
             evidence_entries.append(
-                _evidence_entry(attempt, status=status, folds=[], pbo_folds=[])
+                _evidence_entry(attempt, status=status, folds=[])
             )
             continue
         if attempt["precommitted_evidence_role"] != "EVALUATION_REQUIRED":
@@ -4448,12 +5475,12 @@ def produce_winner_v11_raw_evidence(
         if type(raw_folds) is not list or len(raw_folds) != len(planned_folds):
             _fail(f"ATTEMPT_{ordinal:04d}_FOLD_ROSTER_INCOMPLETE")
         folds: list[dict[str, Any]] = []
-        pbo_folds: list[dict[str, Any]] = []
+        attempt_shared_axis: list[dict[str, Any]] = []
         attempt_status = "AUTHENTICATED"
-        seen_position_ids: set[str] = set()
+        seen_position_ids = {tier: set() for tier in _TIERS}
         for planned_fold, raw_fold in zip(planned_folds, raw_folds, strict=True):
             try:
-                outcome, fold_entries = _build_authenticated_fold(
+                outcome, fold_entries = _build_evaluated_fold(
                     sink,
                     frozen=frozen,
                     attempt=attempt,
@@ -4462,11 +5489,9 @@ def produce_winner_v11_raw_evidence(
                     cross_binding_context=cross_binding_context,
                     cross_binding_attempt=cross_binding_attempt,
                     planned_fold=planned_fold,
-                    expected_adversity_row=adversity_rows_by_key.get(
-                        (ordinal, planned_fold["fold_ordinal"])
-                    ),
                     raw_fold=raw_fold,
-                    evidence_access_completed_at_utc=completed,
+                    source_observation_entries=source_observation_entries,
+                    provenance_schemas=provenance_schemas,
                 )
             except WinnerRawEvidenceIncomplete:
                 raise
@@ -4483,30 +5508,47 @@ def produce_winner_v11_raw_evidence(
                 raise WinnerRawEvidenceIncomplete(
                     "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE", outcome.reason_code
                 )
-            if outcome.pbo_fold is None:
-                _fail("EVALUATION_REQUIRED_PBO_FOLD_MISSING")
-            pbo_folds.append(outcome.pbo_fold)
+            folds.append(outcome.fold)
+            attempt_shared_axis.append(outcome.shared_fold_axis_row)
             if outcome.status == "PROCESS_REJECTED":
                 attempt_status = "PROCESS_REJECTED"
-                continue
-            if outcome.fold is None:
-                _fail("AUTHENTICATED_FOLD_MISSING")
-            # Mirror V11: one position id may appear in only one fold.
-            fold_positions = set(outcome.fold["completed_trade_position_ids"])
-            if seen_position_ids & fold_positions:
-                _fail(f"ATTEMPT_{ordinal:04d}_POSITION_ID_REUSED_ACROSS_FOLDS")
-            seen_position_ids |= fold_positions
-            folds.append(outcome.fold)
-        if len(pbo_folds) != len(planned_folds):
-            _fail("EVALUATION_REQUIRED_PBO_FOLD_ROSTER_INCOMPLETE")
-        if attempt_status == "PROCESS_REJECTED":
-            folds = []
+            for tier, tier_row in outcome.fold["tier_evidence"].items():
+                count = len(tier_row["completed_trade_open_offset_seconds"])
+                try:
+                    positions = set(winner._decode_position_id_digests(
+                        tier_row["completed_trade_position_id_digests_base64"], count, "COMPLETED_TRADE_POSITION_ID_DIGESTS_INVALID"))
+                except ValueError as exc:
+                    raise WinnerRawEvidenceError(str(exc)) from exc
+                if seen_position_ids[tier] & positions:
+                    _fail(f"ATTEMPT_{ordinal:04d}_{tier}_POSITION_ID_REUSED_ACROSS_FOLDS")
+                seen_position_ids[tier] |= positions
+                total_completed_trades += count
+                _check_cumulative_completed_trades(total_completed_trades, _generation)
+        if len(folds) != len(planned_folds):
+            _fail("EVALUATION_REQUIRED_FOLD_ROSTER_INCOMPLETE")
+        if shared_fold_axis is None:
+            shared_fold_axis = attempt_shared_axis
+        elif shared_fold_axis != attempt_shared_axis:
+            _fail("SHARED_FOLD_AXIS_DRIFT_ACROSS_ATTEMPTS")
+        finalized_folds: list[dict[str, Any]] = []
+        for fold, axis_row in zip(folds, attempt_shared_axis, strict=True):
+            finalized = dict(fold)
+            fold_ordinal = finalized["fold_ordinal"]
+            fold_entry = _put_ascii_json(
+                sink,
+                f"{prefix}/fold-{fold_ordinal:03d}/winner-fold",
+                "winner_evaluated_fold",
+                finalized,
+            )
+            spool_entries[
+                f"attempt-{ordinal:04d}-fold-{fold_ordinal:03d}-winner-fold"
+            ] = fold_entry
+            finalized_folds.append(finalized)
         evidence_entries.append(
             _evidence_entry(
                 attempt,
                 status=attempt_status,
-                folds=folds,
-                pbo_folds=pbo_folds,
+                folds=finalized_folds,
             )
         )
     try:
@@ -4515,6 +5557,19 @@ def produce_winner_v11_raw_evidence(
         pass
     else:
         _fail("ATTEMPT_EVIDENCE_ROSTER_EXTRA")
+    if shared_fold_axis is None or len(shared_fold_axis) != len(
+        precommitment["causal_fold_plan"]
+    ):
+        _fail("SHARED_FOLD_AXIS_UNAVAILABLE")
+    source_prefix = _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    registered_sources = {entry["artifact_id"]: entry for entry in sink.artifact_roster()
+        if entry["artifact_id"].startswith(source_prefix + "/")
+        and (entry["artifact_id"].startswith(source_prefix + "/source-observations/")
+            or entry["artifact_type"] == SOURCE_OBSERVATION_ARTIFACT_TYPE)}
+    if registered_sources != source_observation_entries:
+        _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
+    for entry in source_observation_entries.values():
+        spool_entries[f"source-observation-{entry['descriptor']['sha256']}"] = entry
 
     common_names = (
         "cell_id",
@@ -4523,38 +5578,45 @@ def produce_winner_v11_raw_evidence(
         "regime",
         "source_contract_sha256",
         "cost_contract_sha256",
-        "cost_stress_contract_sha256",
+        "frozen_tier_pair_contract_sha256",
         "risk_unit_contract_sha256",
         "process_registry_sha256",
         "horizon_registry_sha256",
         "trial_registry_sha256",
     )
     evidence_ledger = {
-        "contract_version": winner.EVIDENCE_LEDGER_VERSION,
+        "contract_version": _generation.evidence_version,
         "run_id": precommitment["run_id"],
         "generated_at_utc": completed,
         "evidence_access_started_at_utc": started,
         "evidence_access_completed_at_utc": completed,
         "latest_evidence_boundary_utc": precommitment["latest_evidence_boundary_utc"],
         "precommitment_payload_sha256": _sha_json(precommitment),
+        "partition_cost_precommitments_sha256": partition_sha,
         "attempt_ledger_payload_sha256": _sha_json(attempt_ledger),
         **{name: precommitment[name] for name in common_names},
+        "shared_fold_axis_count": len(shared_fold_axis),
+        "shared_fold_axis_sha256": _sha_json(shared_fold_axis),
+        "shared_fold_axis": shared_fold_axis,
         "attempt_count": len(attempt_ledger["attempts"]),
         "entries_sha256": _sha_json(evidence_entries),
         "entries": evidence_entries,
         "evidence_scope": "PROCESS_LEVEL_ONLY",
         "parameter_evidence_inherited": False,
     }
-    request = winner.create_winner_selection_request(
-        precommitment, attempt_ledger, evidence_ledger
-    )
-    if request is None:
-        _fail("WINNER_V11_REQUEST_REJECTED")
-    if len(_canonical_bytes(request.to_dict())) > winner.MAX_REQUEST_BYTES:
-        _fail("WINNER_V11_REQUEST_BYTE_BOUND_EXCEEDED")
+    request_builder = (winner.create_winner_selection_request_v16 if _generation is winner.V16_GENERATION
+        else winner.create_winner_selection_request)
+    try:
+        request = request_builder(precommitment, attempt_ledger, evidence_ledger)
+    except ValueError as exc:
+        raise WinnerRawEvidenceError(str(exc)) from exc
+    if _generation is not winner.V16_GENERATION:
+        if request is None:
+            _fail("WINNER_V15_REQUEST_REJECTED")
+        if len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes:
+            _fail("WINNER_V15_REQUEST_BYTE_BOUND_EXCEEDED")
     decision = winner.evaluate_historical_cell_winner(request)
-    if not winner.verify_historical_cell_winner_decision(decision, request):
-        _fail("WINNER_V11_DECISION_VERIFICATION_FAILED")
+    _verify_produced_winner_decision(decision, request, _generation)
     marginal = winner.historical_book_marginal_receipt(decision, request)
     prefix = (
         f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}"
@@ -4562,8 +5624,8 @@ def produce_winner_v11_raw_evidence(
     )
     final_bodies = {
         "evidence-ledger": ("winner_evidence_ledger", evidence_ledger),
-        "winner-request": ("winner_v11_request", request.to_dict()),
-        "winner-decision": ("winner_v11_decision", decision.to_dict()),
+        "winner-request": ("winner_v16_request" if _generation is winner.V16_GENERATION else "winner_v15_request", request.to_dict()),
+        "winner-decision": ("winner_v16_decision" if _generation is winner.V16_GENERATION else "winner_v15_decision", decision.to_dict()),
     }
     if marginal is not None:
         final_bodies["book-marginal-receipt"] = (
@@ -4575,7 +5637,7 @@ def produce_winner_v11_raw_evidence(
             sink, f"{prefix}/{name}", artifact_type, body
         )
     production = {
-        "schema_version": PRODUCTION_SCHEMA,
+        "schema_version": V16_PRODUCTION_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_PRODUCTION_SCHEMA,
         "generation_context_sha256": sink.context.context_sha256,
         "run_id": precommitment["run_id"],
         "artifact_namespace": frozen.artifact_namespace,
@@ -4609,24 +5671,97 @@ def produce_winner_v11_raw_evidence(
     )
 
 
+def build_frozen_winner_search_plan_v4_receipt(*, context_identity, symbol, timeframe, regime, artifact_namespace,
+        precommitment, attempt_ledger, horizon_execution_contracts, partition_cost_precommitments, artifact_entries):
+    return _build_frozen_winner_search_plan_receipt(**locals(), _generation=winner.CURRENT_GENERATION)
+
+
+def build_frozen_winner_search_plan_v5_receipt(*, context_identity, symbol, timeframe, regime, artifact_namespace,
+        precommitment, attempt_ledger, horizon_execution_contracts, partition_cost_precommitments, artifact_entries):
+    return _build_frozen_winner_search_plan_receipt(**locals(), _generation=winner.V16_GENERATION)
+
+
+def freeze_winner_search_plan_v4(sink, *, symbol, timeframe, regime, precommitted_at_utc, attempts_frozen_at_utc,
+        fold_plan, attempt_artifacts, precommitted_evidence_roles, horizon_execution_contracts, source_contract_seeds,
+        frozen_tier_pair_contract, risk_unit_contract, partition_cost_precommitments, artifact_namespace=None):
+    return _freeze_winner_search_plan(**locals(), _generation=winner.CURRENT_GENERATION)
+
+
+def freeze_winner_search_plan_v5(sink, *, symbol, timeframe, regime, precommitted_at_utc, attempts_frozen_at_utc,
+        fold_plan, attempt_artifacts, precommitted_evidence_roles, horizon_execution_contracts, source_contract_seeds,
+        frozen_tier_pair_contract, risk_unit_contract, partition_cost_precommitments, artifact_namespace=None):
+    return _freeze_winner_search_plan(**locals(), _generation=winner.V16_GENERATION)
+
+
+def restore_frozen_winner_search_plan_v4(*, context_identity, symbol, timeframe, regime, artifact_namespace,
+        manifest_entries, body_bytes):
+    return _restore_frozen_winner_search_plan(**locals(), _generation=winner.CURRENT_GENERATION)
+
+
+def restore_frozen_winner_search_plan_v5(*, context_identity, symbol, timeframe, regime, artifact_namespace,
+        manifest_entries, body_bytes):
+    return _restore_frozen_winner_search_plan(**locals(), _generation=winner.V16_GENERATION)
+
+
+def produce_winner_v15_raw_evidence(sink, *, frozen, attempt_evidence, evidence_access_started_at_utc,
+        evidence_access_completed_at_utc, provenance_cross_binding_bytes=None, production_cell_search_plan=None,
+        production_search_process=None, artifact_namespace=None):
+    return _produce_winner_raw_evidence(**locals(), _generation=winner.CURRENT_GENERATION)
+
+
+def produce_winner_v16_raw_evidence(sink, *, frozen, attempt_evidence, evidence_access_started_at_utc,
+        evidence_access_completed_at_utc, provenance_cross_binding_bytes=None, production_cell_search_plan=None,
+        production_search_process=None, artifact_namespace=None):
+    return _produce_winner_raw_evidence(**locals(), _generation=winner.V16_GENERATION)
+
+
+def freeze_winner_search_plan_v3(*args: Any, **kwargs: Any) -> FrozenWinnerSearchPlan:
+    _fail("ARCHIVED_WINNER_V14_WRITER_RETIRED_FROZEN_TIER_PAIR_REQUIRED")
+
+
+def produce_winner_v14_raw_evidence(*args: Any, **kwargs: Any) -> WinnerRawEvidenceProduction:
+    _fail("ARCHIVED_WINNER_V14_WRITER_RETIRED_FROZEN_TIER_PAIR_REQUIRED")
+
+
 __all__ = [
+    "V16_FROZEN_PLAN_SCHEMA", "V16_PRODUCTION_SCHEMA",
+    "HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4", "CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5",
+    "build_frozen_winner_search_plan_v5_receipt", "freeze_winner_search_plan_v5",
+    "restore_frozen_winner_search_plan_v5", "produce_winner_v16_raw_evidence",
+    "CURRENT_FROZEN_PLAN_SCHEMA", "CURRENT_RAW_LANE_SCHEMA", "CURRENT_POSITION_ACTIVITY_SCHEMA",
+    "CURRENT_PRODUCTION_SCHEMA", "CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA",
+    "REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA", "SOURCE_OBSERVATION_REFERENCE_SCHEMA",
+    "SOURCE_OBSERVATION_ARTIFACT_TYPE", "publish_source_observation_receipt",
+    "resolve_source_observation_reference", "verify_source_observation_reference_closure",
+    "HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3", "CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4",
+    "COST_LADDER_ADVERSITY_EXPECTED_NO_SHOCK",
+    "COST_LADDER_ADVERSITY_EXPECTED_STRICT",
+    "COST_LADDER_ADVERSITY_PLAN_SCHEMA",
     "CURRENT_CROSS_BINDING_MODE",
     "DAILY_R_SURFACE_SCHEMA",
-    "FROZEN_COST_POLICY_SCHEMA",
+    "FROZEN_COST_LADDER_CONTRACT_SCHEMA",
     "FROZEN_PLAN_SCHEMA",
     "HISTORICAL_CROSS_BINDING_MODE",
-    "HORIZON_WINNER_CROSS_BINDING_SCHEMA",
-    "HORIZON_WINNER_CROSS_BINDING_SCHEMA_V2",
+    "HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA",
+    "CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA",
     "PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS",
     "PRODUCTION_TRADE_POWER_POLICY",
+    "PARTITION_COST_PRECOMMITMENTS_SCHEMA",
+    "PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA",
     "FrozenWinnerSearchPlan",
     "WinnerRawEvidenceError",
     "WinnerRawEvidenceIncomplete",
     "WinnerRawEvidenceProduction",
+    "build_frozen_winner_search_plan_v4_receipt",
+    "restore_frozen_winner_search_plan_v4",
+    "verify_historical_frozen_winner_cross_binding",
     "build_flat_daily_r_surface",
-    "build_frozen_numerical_execution_cost_policy",
     "build_precommitted_risk_unit_contract",
+    "build_partition_cost_precommitments",
+    "expand_partition_cost_precommitment",
     "build_trade_source_contract_from_backtester_result",
     "freeze_winner_search_plan_v3",
-    "produce_winner_v11_raw_evidence",
+    "freeze_winner_search_plan_v4",
+    "produce_winner_v14_raw_evidence",
+    "produce_winner_v15_raw_evidence",
 ]

@@ -66,6 +66,13 @@ from pm_book_multiplicity import (
 )
 
 
+VALIDATED_P75_TOLERANCE = {
+    "level_id": "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+    "single_fill_uplift_percentile": 75,
+    "uniform_entry_half_spread_multiplier_float64_hex": "0x1.a000000000000p+2",
+}
+
+
 def _canonical(value: Any) -> bytes:
     return json.dumps(
         value,
@@ -205,7 +212,7 @@ def _train_support(
 def _winner_fixture_module() -> Any:
     fixture_path = Path(__file__).with_name("test_winner_selection.py")
     spec = importlib.util.spec_from_file_location(
-        "_fxpm_book_winner_v11_fixture", fixture_path
+        "_fxpm_book_winner_v14_fixture", fixture_path
     )
     if spec is None or spec.loader is None:
         raise RuntimeError("WINNER_FIXTURE_IMPORT_FAILED")
@@ -233,6 +240,7 @@ def _source_and_fit(
     timeframe: str,
     availability: str,
     counts: tuple[int, int, int, int] = (4, 3, 2, 1),
+    source_contract_sha256: str | None = None,
 ) -> tuple[Any, RegimeFitDecision]:
     activation_id = f"activation:{symbol}:{timeframe}"
     activation_manifest_sha256 = _sha("activation-manifest")
@@ -255,7 +263,7 @@ def _source_and_fit(
                 else "BROKER_HISTORY_TERMINALLY_UNAVAILABLE"
             )
         ),
-        source_contract_sha256=_sha("source-contract"),
+        source_contract_sha256=(source_contract_sha256 or _sha("source-contract")),
         source_group_evidence_sha256=_sha(
             f"source-group-evidence:{symbol}:{timeframe}:{availability}"
         ),
@@ -333,9 +341,19 @@ def _insufficient_horizon_plan(
     boundary: bool,
     winner_fold_plan: list[dict[str, Any]] | None = None,
     winner_attempts: list[dict[str, Any]] | None = None,
+    current: bool = False,
 ) -> Any:
     fixture = _horizon_fixture_module()
     request = fixture._request()
+    horizon_policy = request["horizon_policy"]
+    request["horizon_policy"] = {
+        "schema_version": horizon_policy["schema_version"],
+        "policy_id": horizon_policy["policy_id"],
+        "policy_release_sha256": horizon_policy["policy_release_sha256"],
+        "evaluator_release_sha256": horizon_policy["evaluator_release_sha256"],
+        "cost_contract_sha256": horizon_policy["cost_contract_sha256"],
+        "cost_ladder_contract_sha256": "c" * 64,
+    }
     source_body = source.to_dict()
     source_body.pop("receipt_sha256")
     request["run_id"] = "sparse-evidence-anchor-run"
@@ -435,6 +453,10 @@ def _insufficient_horizon_plan(
             )
             for ordinal, attempt in enumerate(winner_attempts)
         ]
+    if current:
+        request["schema_version"] = "fxpm.historical-horizon-request.v3"
+        request["horizon_policy"]["schema_version"] = "fxpm.historical-horizon-policy.v3"
+        request["horizon_policy"]["frozen_tier_pair_contract_sha256"] = request["horizon_policy"].pop("cost_ladder_contract_sha256")
     return horizon.build_historical_horizon_plan(request)
 
 
@@ -464,18 +486,19 @@ def _all_process_rejected_request_and_plan(
         entry["evidence_status"] = "PROCESS_REJECTED"
         if attempt["precommitted_evidence_role"] == "EVALUATION_REQUIRED":
             entry["status_reason"] = "EVALUATED_OOS_PROCESS_REJECTED"
+            for fold_index, fold in enumerate(entry["folds"]):
+                fold["trade_power_binding"] = None
+                fixture._rehash_trade_vector(
+                    fold,
+                    raw["evidence_ledger_payload"]["shared_fold_axis"][fold_index],
+                )
         else:
             assert attempt["precommitted_evidence_role"] == (
                 "PRESEARCH_PROCESS_REJECTED"
             )
             entry["status_reason"] = "PRESEARCH_PROCESS_REJECTED"
-            entry["pbo_evidence_source"] = "NOT_APPLICABLE_PRESEARCH_REJECTION"
-            entry["pbo_fold_count"] = 0
-            entry["pbo_folds"] = []
-            entry["pbo_folds_sha256"] = fixture._sha_json([])
-        entry["fold_count"] = 0
-        entry["folds"] = []
-        entry["folds_sha256"] = fixture._sha_json([])
+            entry["folds"] = []
+        fixture._refresh_entry_hashes(entry)
     trial_registry = fixture._trial_registry(attempts)
     process_registry = fixture._process_registry(attempts)
     horizon_registry = fixture._horizon_registry(attempts)
@@ -667,7 +690,9 @@ def _postsearch_authority_bytes(
             "causal_fold_plan_sha256": precommitment["causal_fold_plan_sha256"],
             "source_contract_sha256": precommitment["source_contract_sha256"],
             "cost_contract_sha256": precommitment["cost_contract_sha256"],
-            "cost_stress_contract_sha256": precommitment["cost_stress_contract_sha256"],
+            "cost_ladder_contract_sha256": precommitment[
+                "cost_ladder_contract_sha256"
+            ],
         },
         "mapping_count": len(mapping),
         "mapping_sha256": _sha_json(mapping),
@@ -712,7 +737,9 @@ def _postsearch_authority_bytes(
     return cross_binding_bytes, _canonical(production)
 
 
-def _insufficient_cell(*, postsearch: bool) -> HistoricalBookCellEvidence:
+def _insufficient_cell(*, postsearch: bool, current: bool = False) -> HistoricalBookCellEvidence:
+    if current and postsearch:
+        raise ValueError("CURRENT_POSTSEARCH_FIXTURE_REQUIRES_ITS_ACTUAL_RAW_CHAIN")
     source, fit = _source_and_fit("AUDUSD", "M5", AVAILABLE)
     if postsearch:
         request, decision, plan = _all_process_rejected_request_and_plan(source)
@@ -724,7 +751,7 @@ def _insufficient_cell(*, postsearch: bool) -> HistoricalBookCellEvidence:
     else:
         request = decision = None
         cross_binding_bytes = raw_production_receipt_bytes = None
-        plan = _insufficient_horizon_plan(source, boundary=True)
+        plan = _insufficient_horizon_plan(source, boundary=True, current=current)
         reason = INSUFFICIENT_PRESEARCH_BOUNDARY_REASON
         attempts = 0
     state = create_historical_process_state_decision(
@@ -778,20 +805,20 @@ def _typed_request(
                 )
                 for index in range(63)
             ]
-            fold["daily_net_mtm_r"] = base
-            fold["daily_net_mtm_r_cost_stress"] = [
-                round(value - 0.005, 12) for value in base
-            ]
-            fixture._refresh_fold_accounting(fold)
-        fixture._sync_entry_pbo(entries[0])
-        entries[0]["folds_sha256"] = fixture._sha_json(entries[0]["folds"])
-        for entry in entries[1:]:
-            entry["evidence_status"] = "PROCESS_REJECTED"
-            entry["status_reason"] = "EVALUATED_OOS_PROCESS_REJECTED"
-            entry["fold_count"] = 0
-            entry["folds"] = []
-            entry["folds_sha256"] = fixture._sha_json([])
-        raw["evidence_ledger_payload"]["entries_sha256"] = fixture._sha_json(entries)
+            fixture._set_daily_lanes(
+                fold,
+                base,
+                [round(value - 0.005, 12) for value in base],
+                [round(value - 0.010, 12) for value in base],
+            )
+            fixture._refresh_fold_accounting(
+                fold,
+                raw["evidence_ledger_payload"]["shared_fold_axis"][fold_index],
+            )
+        fixture._refresh_entry_hashes(entries[0])
+        for ordinal in range(1, len(entries)):
+            fixture._reject_evaluated_attempt(raw, ordinal)
+        fixture._refresh_evidence_hashes(raw)
     typed = fixture._typed_request(raw)
     assert type(typed) is winner.WinnerSelectionRequest
     return typed
@@ -802,7 +829,7 @@ def _typed_moderate_winner_request(
     timeframe: str,
     regime: str,
 ) -> winner.WinnerSelectionRequest:
-    """Build a real V13-local winner whose flat-family BY q-value is unresolved."""
+    """Build a real V14-local winner whose flat-family BY q-value is unresolved."""
 
     fixture = _winner_fixture_module()
     raw = fixture._payload_request(symbol, timeframe, regime)
@@ -816,24 +843,25 @@ def _typed_moderate_winner_request(
             )
             for index in range(63)
         ]
-        fold["daily_net_mtm_r"] = base
-        fold["daily_net_mtm_r_cost_stress"] = [
-            round(value - 0.002, 12) for value in base
-        ]
-        fixture._refresh_fold_accounting(fold)
-    fixture._sync_entry_pbo(entries[0])
-    entries[0]["folds_sha256"] = fixture._sha_json(entries[0]["folds"])
-    # Winner v13 requires a genuine multi-column search matrix for CSCV PBO.
+        fixture._set_daily_lanes(
+            fold,
+            base,
+            [round(value - 0.002, 12) for value in base],
+            [round(value - 0.004, 12) for value in base],
+        )
+        fixture._refresh_fold_accounting(
+            fold, evidence["shared_fold_axis"][fold_index]
+        )
+    fixture._refresh_entry_hashes(entries[0])
+    # Winner v14 requires a genuine multi-column search matrix for CSCV PBO.
     # Keep one authenticated losing process candidate so the preferred column
     # wins the precommitted PBO/bootstrap gauntlet without inventing evidence.
-    fixture._make_authenticated_pbo_floor(entries[1])
-    for entry in entries[2:]:
-        entry["evidence_status"] = "PROCESS_REJECTED"
-        entry["status_reason"] = "EVALUATED_OOS_PROCESS_REJECTED"
-        entry["fold_count"] = 0
-        entry["folds"] = []
-        entry["folds_sha256"] = fixture._sha_json([])
-    evidence["entries_sha256"] = fixture._sha_json(entries)
+    fixture._make_authenticated_ladder_floor(
+        entries[1], evidence["shared_fold_axis"]
+    )
+    for ordinal in range(2, len(entries)):
+        fixture._reject_evaluated_attempt(raw, ordinal)
+    fixture._refresh_evidence_hashes(raw)
     typed = fixture._typed_request(raw)
     assert type(typed) is winner.WinnerSelectionRequest
     return typed
@@ -1036,6 +1064,37 @@ def _family(
     return values
 
 
+@lru_cache(maxsize=1)
+def _current_candidate_family() -> tuple[HistoricalBookCellEvidence, ...]:
+    # New synthetic evidence uses the current issuer APIs; retained v14 fixtures stay untouched.
+    fixture = _winner_fixture_module()
+    request = fixture._typed_request(fixture._current_payload_request())
+    decision = winner.evaluate_historical_cell_winner(request)
+    assert decision.status == "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY", decision.reason_codes
+    assert winner.verify_historical_cell_winner_decision(decision, request)
+    source, fit = _source_and_fit(
+        "AUDUSD", "M5", AVAILABLE, (10, 0, 0, 0),
+        source_contract_sha256=request.precommitment.to_dict()["source_contract_sha256"],
+    )
+    first = winner_cell_evidence(decision, request, source, fit)
+    assert first is not None
+    family = list(_terminal_family())
+    family[0] = first
+    for ordinal, regime in enumerate(REGIME_ORDER[1:], start=1):
+        state = create_historical_process_state_decision(
+            symbol="AUDUSD", timeframe="M5", regime=regime,
+            state_kind=REGIME_UNOBSERVED, reason_code=book.REGIME_UNOBSERVED_REASON,
+            source_group_decision=source, regime_fit_decision=fit, attempted_trials_exact=0,
+        )
+        assert state is not None
+        evidence = process_state_cell_evidence(
+            process_state_decision=state, source_group_decision=source, regime_fit_decision=fit,
+        )
+        assert evidence is not None
+        family[ordinal] = evidence
+    return tuple(family)
+
+
 def _insufficient_group(
     *,
     postsearch: bool,
@@ -1115,7 +1174,7 @@ def test_typed_source_regime_and_process_receipts_hash_exact_payloads() -> None:
     assert state_payload["complete"] is False
 
 
-def test_real_winner_v11_is_historical_candidate_even_when_by_is_flat() -> None:
+def test_real_winner_v14_is_historical_candidate_even_when_by_is_flat() -> None:
     family = _family(available_groups=(0,), overrides={0: _verified_moderate_winner()})
     decision = evaluate_historical_book_multiplicity(family)
     assert decision.status == "HISTORICAL_LOCAL_CANDIDATES_AVAILABLE", (
@@ -1136,31 +1195,47 @@ def test_real_winner_v11_is_historical_candidate_even_when_by_is_flat() -> None:
     assert body["individual_family_wide_fdr_claimed"] is False
 
 
-def test_consumer_pins_released_winner_v11_constructible_api() -> None:
+def test_consumer_pins_released_winner_v14_constructible_api() -> None:
+    assert (
+        book.HORIZON_WINNER_CROSS_BINDING_SCHEMA_VERSION
+        == "fxpm.historical-horizon-winner-cross-binding.v2"
+    )
+    assert (
+        book.WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION
+        == "fxpm.winner-raw-evidence-production.v4"
+    )
+    assert SELECTION_RULE == (
+        "WINNER_V14_LOCAL_ADMISSIBILITY_PENDING_WHOLE_PROCESS_CAUSAL_VALIDATION"
+    )
     assert (
         PINNED_WINNER_SELECTION_CONTRACT_VERSION
         == (winner.WINNER_SELECTION_CONTRACT_VERSION)
-        == "fxpm.winner-selection.v13"
+        == "fxpm.winner-selection.v14"
     )
     assert (
         PINNED_WINNER_SELECTION_REQUEST_VERSION
         == (winner.WINNER_SELECTION_REQUEST_VERSION)
-        == "fxpm.winner-selection-request.v1"
+        == "fxpm.winner-selection-request.v2"
+    )
+    assert (
+        book.PINNED_WINNER_BOOK_MARGINAL_CONTRACT_VERSION
+        == winner.WINNER_BOOK_MARGINAL_CONTRACT_VERSION
+        == "fxpm.winner-book-marginal.v1"
     )
     assert (
         PINNED_WINNER_ATTEMPT_LEDGER_VERSION
         == winner.ATTEMPT_LEDGER_VERSION
-        == "fxpm.winner-attempt-ledger.v2"
+        == "fxpm.winner-attempt-ledger.v3"
     )
     assert (
         PINNED_WINNER_EVIDENCE_LEDGER_VERSION
         == winner.EVIDENCE_LEDGER_VERSION
-        == "fxpm.winner-evidence-ledger.v4"
+        == "fxpm.winner-evidence-ledger.v6"
     )
     assert (
         PINNED_WINNER_TRADE_POWER_BINDING_VERSION
         == winner.TRADE_POWER_BINDING_VERSION
-        == "fxpm.winner-trade-power-binding.v1"
+        == "fxpm.winner-trade-power-binding.v2"
     )
     assert tuple(
         inspect.signature(winner.evaluate_historical_cell_winner).parameters
@@ -1191,13 +1266,14 @@ def test_consumer_pins_released_winner_v11_constructible_api() -> None:
     )
 
 
-def test_winner_v11_marginal_and_book_identity_chain_is_exact() -> None:
+def test_winner_v14_marginal_and_book_identity_chain_is_exact() -> None:
     evidence = _verified_winner()
     marginal = winner.historical_book_marginal_receipt(
         evidence.winner_decision, evidence.winner_request
     )
     assert marginal is not None
     assert set(marginal) == {
+        "contract_version",
         "cell_id",
         "effective_trials",
         "evidence_candidate_id",
@@ -1208,11 +1284,18 @@ def test_winner_v11_marginal_and_book_identity_chain_is_exact() -> None:
         "p_value_kind",
         "parameter_evidence_inherited",
         "process_sha256",
+        "selected_cost_ladder_tier",
+        "validated_cost_ladder_tolerance",
         "source_evidence_sha256",
         "upstream_evidence_receipt_sha256",
         "within_cell_attempted_trials_exact",
         "within_cell_multiplicity_adjusted",
     }
+    assert marginal["selected_cost_ladder_tier"] in {
+        "P75_REQUIRED",
+        "P95_PREFERENCE",
+    }
+    assert marginal["validated_cost_ladder_tolerance"] == VALIDATED_P75_TOLERANCE
     book_decision = evaluate_historical_book_multiplicity(
         _family(available_groups=(0,), overrides={0: evidence})
     )
@@ -1229,6 +1312,7 @@ def test_winner_v11_marginal_and_book_identity_chain_is_exact() -> None:
     )
     assert first["local_process_candidate_id"] == marginal["evidence_candidate_id"]
     assert first["local_process_sha256"] == marginal["process_sha256"]
+    assert first["validated_cost_ladder_tolerance"] == VALIDATED_P75_TOLERANCE
     assert (
         first["winner_evidence_ledger_payload_sha256"]
         == marginal["source_evidence_sha256"]
@@ -1238,6 +1322,64 @@ def test_winner_v11_marginal_and_book_identity_chain_is_exact() -> None:
     )
     assert first["historical_book_entry_sha256"]
     assert first["historical_local_candidate_pending_causal"] is True
+
+    identity_exclusions = {
+        "adjusted_q_value",
+        "by_qualified",
+        "historical_local_candidate_pending_causal",
+        "historical_book_entry_sha256",
+    }
+    identity = {
+        key: value for key, value in first.items() if key not in identity_exclusions
+    }
+    assert book._entry_identity(identity) == first["historical_book_entry_sha256"]
+    changed = deepcopy(identity)
+    changed["validated_cost_ladder_tolerance"][
+        "uniform_entry_half_spread_multiplier_float64_hex"
+    ] = "0x1.0000000000000p+0"
+    assert book._entry_identity(changed) != first["historical_book_entry_sha256"]
+    missing = deepcopy(identity)
+    missing.pop("validated_cost_ladder_tolerance")
+    assert book._entry_identity(missing) != first["historical_book_entry_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    (
+        ("missing_version", "CELL_0000_WINNER_REPLAY_REJECTED"),
+        ("predecessor_version", "CELL_0000_MARGINAL_SEMANTICS_INVALID"),
+        ("missing_tolerance", "CELL_0000_WINNER_REPLAY_REJECTED"),
+        ("malformed_tolerance", "CELL_0000_MARGINAL_SEMANTICS_INVALID"),
+    ),
+)
+def test_book_rejects_predecessor_or_malformed_winner_marginal(
+    mutation: str, reason: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence = _verified_winner()
+    original = winner.historical_book_marginal_receipt
+
+    def hostile_marginal(decision: Any, request: Any) -> dict[str, Any] | None:
+        marginal = original(decision, request)
+        if decision is not evidence.winner_decision or marginal is None:
+            return marginal
+        marginal = deepcopy(marginal)
+        if mutation == "missing_version":
+            marginal.pop("contract_version")
+        elif mutation == "predecessor_version":
+            marginal["contract_version"] = "fxpm.winner-book-marginal.v0"
+        elif mutation == "missing_tolerance":
+            marginal.pop("validated_cost_ladder_tolerance")
+        else:
+            marginal["validated_cost_ladder_tolerance"]["extra"] = "forbidden"
+        return marginal
+
+    monkeypatch.setattr(winner, "historical_book_marginal_receipt", hostile_marginal)
+    _assert_rejected(
+        evaluate_historical_book_multiplicity(
+            _family(available_groups=(0,), overrides={0: evidence})
+        ),
+        reason,
+    )
 
 
 def test_candidate_before_causal_has_no_live_order_capital_or_profit_authority() -> (
@@ -1267,6 +1409,9 @@ def test_complete_family_without_local_winner_has_unambiguous_status() -> None:
     body = decision.to_dict()
     assert body["cells"][0]["historical_state"] == "NO_WINNER"
     assert body["cells"][0]["marginal_p_value"] == 1.0
+    assert all(
+        cell["validated_cost_ladder_tolerance"] is None for cell in body["cells"]
+    )
     assert body["historical_local_candidate_count"] == 0
 
 
@@ -1287,6 +1432,7 @@ def test_zero_label_regime_is_complete_p_one_without_winner_leaf() -> None:
     assert absent["winner_decision_sha256"] is None
     assert absent["winner_evidence_ledger_payload_sha256"] is None
     assert absent["local_process_candidate_id"] is None
+    assert absent["validated_cost_ladder_tolerance"] is None
     support_receipt = overrides[2].regime_fit_decision.to_dict()[
         "train_regime_support"
     ]["receipt_sha256"]
@@ -1345,6 +1491,7 @@ def test_presearch_insufficient_evidence_is_complete_p_one_and_does_not_veto_sib
     assert cell["winner_evidence_ledger_payload_sha256"] is None
     assert cell["local_process_candidate_id"] is None
     assert cell["local_process_sha256"] is None
+    assert cell["validated_cost_ladder_tolerance"] is None
     binding = cell["process_state_payload"]["insufficient_evidence_binding"]
     assert binding["terminal_stage"] == "PRE_SEARCH_BOUNDARY"
     assert binding["causal_fold_count"] == 0
@@ -1433,6 +1580,18 @@ def test_postsearch_insufficiency_requires_exact_cross_binding_and_raw_receipt()
         is not None
     )
     assert create_historical_process_state_decision(**common) is None
+    predecessor_production = json.loads(production_bytes.decode("ascii"))
+    predecessor_production["schema_version"] = (
+        "fxpm.winner-raw-evidence-production.v3"
+    )
+    assert (
+        create_historical_process_state_decision(
+            **common,
+            horizon_winner_cross_binding_bytes=cross_bytes,
+            winner_raw_production_receipt_bytes=_canonical(predecessor_production),
+        )
+        is None
+    )
 
     cross = json.loads(cross_bytes.decode("ascii"))
     assert (
@@ -1755,6 +1914,9 @@ def test_terminal_source_decision_is_one_group_fact_for_all_four_regimes() -> No
     body = decision.to_dict()
     siblings = body["cells"][:4]
     assert {cell["historical_state"] for cell in siblings} == {"SOURCE_UNAVAILABLE"}
+    assert all(
+        cell["validated_cost_ladder_tolerance"] is None for cell in siblings
+    )
     assert len({cell["source_group_decision_sha256"] for cell in siblings}) == 1
     assert len({cell["regime_receipt_sha256"] for cell in siblings}) == 1
     assert body["source_group_counts"] == {
@@ -1783,6 +1945,7 @@ def test_technical_or_unsearched_cell_invalidates_candidate_book(kind: str) -> N
     body = decision.to_dict()
     assert body["optimization_run_complete"] is False
     assert body["historical_local_candidate_count"] == 0
+    assert body["cells"][1]["validated_cost_ladder_tolerance"] is None
     assert not any(
         cell["historical_local_candidate_pending_causal"] for cell in body["cells"]
     )
@@ -1813,6 +1976,10 @@ def test_authenticated_terminal_technical_group_is_complete_and_does_not_veto_wi
         TERMINAL_TECHNICAL
     }
     assert all(cell["marginal_p_value"] == 1.0 for cell in body["cells"][4:8])
+    assert all(
+        cell["validated_cost_ladder_tolerance"] is None
+        for cell in body["cells"][4:8]
+    )
     assert all(cell["adjusted_q_value"] == 1.0 for cell in body["cells"][4:8])
     assert all(
         cell["within_cell_attempted_trials_exact"] == 0 for cell in body["cells"][4:8]
@@ -2489,6 +2656,67 @@ def test_rehashed_cell_lineage_tampering_never_verifies(field: str, bad: Any) ->
     assert not verify_historical_book_multiplicity_decision(_forge_book(body))
 
 
+def test_predecessor_book_and_tolerance_field_tampering_never_verify() -> None:
+    genuine = evaluate_historical_book_multiplicity(
+        _family(available_groups=(0,), overrides={0: _verified_winner()})
+    )
+    predecessor = deepcopy(genuine.to_dict())
+    predecessor["contract_version"] = "fxpm.book-multiplicity.v13"
+    missing = deepcopy(genuine.to_dict())
+    missing["cells"][0].pop("validated_cost_ladder_tolerance")
+    changed = deepcopy(genuine.to_dict())
+    changed["cells"][0]["validated_cost_ladder_tolerance"][
+        "uniform_entry_half_spread_multiplier_float64_hex"
+    ] = "0x1.0000000000000p+0"
+
+    for hostile in (predecessor, missing, changed):
+        assert not verify_historical_book_multiplicity_decision(_forge_book(hostile))
+
+
+def test_rehashed_float_alias_for_p75_percentile_fails_closed() -> None:
+    genuine = evaluate_historical_book_multiplicity(
+        _family(available_groups=(0,), overrides={0: _verified_winner()})
+    )
+    body = deepcopy(genuine.to_dict())
+    cell = body["cells"][0]
+    cell["validated_cost_ladder_tolerance"][
+        "single_fill_uplift_percentile"
+    ] = 75.0
+    identity = {
+        key: value
+        for key, value in cell.items()
+        if key
+        not in {
+            "adjusted_q_value",
+            "by_qualified",
+            "historical_local_candidate_pending_causal",
+            "historical_book_entry_sha256",
+        }
+    }
+    cell["historical_book_entry_sha256"] = book._entry_identity(identity)
+    body["book_generation_sha256"] = _sha_json(
+        {
+            "family_precommitment_sha256": (
+                book.PINNED_FAMILY_PRECOMMITMENT_SHA256
+            ),
+            "method": book.MULTIPLICITY_METHOD,
+            "selection_rule": book.SELECTION_RULE,
+            "target_fdr": book.TARGET_FDR,
+            "source_group_receipts": [
+                item["receipt_sha256"] for item in body["source_groups"]
+            ],
+            "regime_fit_receipts": [
+                item["receipt_sha256"] for item in body["regime_fits"]
+            ],
+            "historical_book_entry_sha256": [
+                item["historical_book_entry_sha256"] for item in body["cells"]
+            ],
+        }
+    )
+
+    assert not verify_historical_book_multiplicity_decision(_forge_book(body))
+
+
 def test_by_math_is_exact_ordered_and_diagnostic_only() -> None:
     values = [0.01, 0.04, 0.03, 0.002]
     assert adjust_p_values_by(values) == pytest.approx((1 / 24, 1 / 12, 1 / 12, 1 / 60))
@@ -2569,6 +2797,181 @@ def test_policy_snapshot_is_defensive_and_has_no_live_authority() -> None:
     assert snapshot["profitability_claimed"] is False
     snapshot["symbols"].clear()
     assert len(pinned_policy_snapshot()["symbols"]) == 100
+
+
+def test_book_public_generation_dispatch_preserves_archive_names_and_signatures() -> None:
+    assert BOOK_MULTIPLICITY_CONTRACT_VERSION == "fxpm.book-multiplicity.v14"
+    assert PINNED_WINNER_SELECTION_CONTRACT_VERSION == "fxpm.winner-selection.v14"
+    assert PINNED_WINNER_SELECTION_REQUEST_VERSION == "fxpm.winner-selection-request.v2"
+    assert PINNED_WINNER_EVIDENCE_LEDGER_VERSION == "fxpm.winner-evidence-ledger.v6"
+    assert book.PINNED_WINNER_BOOK_MARGINAL_CONTRACT_VERSION == "fxpm.winner-book-marginal.v1"
+    assert tuple(inspect.signature(evaluate_historical_book_multiplicity).parameters) == ("evidence_family",)
+    assert tuple(inspect.signature(verify_historical_book_multiplicity_decision).parameters) == ("decision", "evidence_family")
+    assert tuple(inspect.signature(pinned_policy_snapshot).parameters) == ()
+    for function in (create_historical_process_state_decision, process_state_cell_evidence):
+        assert "_generation" not in inspect.signature(function).parameters
+    old, current = pinned_policy_snapshot(), book.current_policy_snapshot()
+    assert old["contract_version"] == "fxpm.book-multiplicity.v14"
+    assert current["contract_version"] == "fxpm.book-multiplicity.v15"
+    assert current["winner_selection_request_version"] == "fxpm.winner-selection-request.v3"
+    assert current["winner_evidence_ledger_version"] == "fxpm.winner-evidence-ledger.v7"
+    assert old["family_precommitment_sha256"] == book.PINNED_FAMILY_PRECOMMITMENT_SHA256
+    assert current["family_precommitment_sha256"] == book.CURRENT_FAMILY_PRECOMMITMENT_SHA256
+    current["symbols"].clear()
+    assert len(book.current_policy_snapshot()["symbols"]) == 100
+
+
+def test_all_terminal_book_defaults_archive_but_current_native_entry_is_explicit() -> None:
+    family = _terminal_family()
+    old = evaluate_historical_book_multiplicity(family)
+    current = book.evaluate_frozen_tier_historical_book_multiplicity(family)
+    assert old.to_dict()["contract_version"] == "fxpm.book-multiplicity.v14"
+    assert current.to_dict()["contract_version"] == "fxpm.book-multiplicity.v15"
+    assert old.status == current.status == "NO_LOCAL_WINNERS"
+    assert old.valid is current.valid is True
+    assert old._body_json != current._body_json
+    for result in (old, current):
+        assert verify_historical_book_multiplicity_decision(result, family)
+        assert result.to_dict()["causal_process_validated"] is False
+        assert result.to_dict()["live_authorized"] is False
+        assert result.to_dict()["order_authorized"] is False
+    assert evaluate_historical_book_multiplicity(family)._body_json == old._body_json
+
+
+def test_current_winner_book_uses_actual_pair_and_stays_pending_causal() -> None:
+    family = _current_candidate_family()
+    result = evaluate_historical_book_multiplicity(family)
+    explicit = book.evaluate_frozen_tier_historical_book_multiplicity(family)
+    assert result.valid, result.reason_codes
+    assert result._body_json == explicit._body_json
+    body = result.to_dict()
+    assert body["contract_version"] == "fxpm.book-multiplicity.v15"
+    assert body["status"] == "HISTORICAL_LOCAL_CANDIDATES_AVAILABLE"
+    assert body["historical_local_candidate_count"] == 1
+    assert verify_historical_book_multiplicity_decision(result, family)
+    cost = body["cells"][0]["validated_cost_ladder_tolerance"]
+    assert cost["schema_version"] == "fxpm.winner-frozen-spread-qualification-cost.v1"
+    precommitment = family[0].winner_request.precommitment.to_dict()
+    assert cost["frozen_tier_pair_contract"] == precommitment["frozen_tier_pair_contract"]
+    assert cost["frozen_tier_pair_contract_sha256"] == precommitment["frozen_tier_pair_contract_sha256"]
+    for key in ("causal_process_validated", "live_authorized", "order_authorized",
+                "capital_sizing_authorized", "profitability_claimed", "production_integrated"):
+        assert body[key] is False
+
+
+@pytest.mark.parametrize("mutation", ["old_multiplier", "bad_pair_hash", "wrong_selected_tier"])
+def test_current_book_rejects_wrong_cost_receipt_at_real_winner_boundary(
+    mutation: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    family = _current_candidate_family()
+    actual = winner.historical_book_marginal_receipt
+    def hostile_marginal(decision: Any, request: Any) -> Any:
+        marginal = deepcopy(actual(decision, request))
+        if mutation == "old_multiplier":
+            marginal["validated_cost_ladder_tolerance"] = dict(winner.PINNED_VALIDATED_COST_LADDER_TOLERANCE)
+        elif mutation == "bad_pair_hash":
+            marginal["validated_cost_ladder_tolerance"]["frozen_tier_pair_contract_sha256"] = "0" * 64
+        else:
+            value = marginal["validated_cost_ladder_tolerance"]
+            value["tier"] = "P95" if value["tier"] == "P75" else "P75"
+        return marginal
+    monkeypatch.setattr(winner, "historical_book_marginal_receipt", hostile_marginal)
+    result = evaluate_historical_book_multiplicity(family)
+    expected = ("CELL_0000_MARGINAL_COST_SPLICE" if mutation == "wrong_selected_tier"
+                else "CELL_0000_MARGINAL_SEMANTICS_INVALID")
+    _assert_rejected(result, expected)
+
+
+def test_book_rejects_mixed_generation_without_relabelling_valid_old_cells() -> None:
+    current = _insufficient_cell(postsearch=False, current=True)
+    assert current.process_state_decision.to_dict()["insufficient_evidence_binding"]["schema_version"] == (
+        "fxpm.historical-insufficient-evidence-binding.v3")
+    old_group = _insufficient_group(postsearch=False, sibling_winner=True)
+    original = _family(overrides=old_group)
+    old = evaluate_historical_book_multiplicity(original)
+    assert old.valid, old.reason_codes
+    mixed = list(original)
+    mixed[0] = current
+    _assert_rejected(evaluate_historical_book_multiplicity(mixed), "BOOK_MIXED_GENERATIONS")
+    _assert_rejected(book.evaluate_frozen_tier_historical_book_multiplicity(original), "BOOK_MIXED_GENERATIONS")
+    assert verify_historical_book_multiplicity_decision(old, original)
+    assert not verify_historical_book_multiplicity_decision(old, mixed)
+    assert evaluate_historical_book_multiplicity(original)._body_json == old._body_json
+
+
+@lru_cache(maxsize=1)
+def _transport_candidate_family() -> tuple[HistoricalBookCellEvidence, ...]:
+    """Fresh SYNTHETIC v16 unit evidence; no archived object is rewritten."""
+    from tests.test_winner_transport_capacity import build_v16_payload
+    raw = build_v16_payload()
+    request = winner.create_winner_selection_request_v16(**raw)
+    decision = winner.evaluate_historical_cell_winner(request)
+    source, fit = _source_and_fit("AUDUSD", "M5", AVAILABLE, (10, 0, 0, 0),
+        source_contract_sha256=request.precommitment.to_dict()["source_contract_sha256"])
+    base = list(_terminal_family())
+    replacement = winner_cell_evidence(decision, request, source, fit)
+    assert replacement is not None
+    base[0] = replacement
+    for ordinal, regime in enumerate(REGIME_ORDER[1:], start=1):
+        state = create_historical_process_state_decision(symbol="AUDUSD", timeframe="M5", regime=regime,
+            state_kind=REGIME_UNOBSERVED, reason_code=REGIME_UNOBSERVED_REASON,
+            source_group_decision=source, regime_fit_decision=fit, attempted_trials_exact=0)
+        assert state is not None
+        evidence = process_state_cell_evidence(process_state_decision=state,
+            source_group_decision=source, regime_fit_decision=fit)
+        assert evidence is not None
+        base[ordinal] = evidence
+    return tuple(base)
+
+
+def test_transport_book_is_explicit_and_preserves_legacy_terminal_bytes() -> None:
+    family = _terminal_family()
+    old_before = evaluate_historical_book_multiplicity(family)._body_json
+    current_before = book.evaluate_frozen_tier_historical_book_multiplicity(family)._body_json
+    result = book.evaluate_transport_historical_book_multiplicity(family)
+    assert result.valid, result.reason_codes
+    assert result.to_dict()["contract_version"] == "fxpm.book-multiplicity.v16"
+    assert verify_historical_book_multiplicity_decision(result, family)
+    assert evaluate_historical_book_multiplicity(family)._body_json == old_before
+    assert book.evaluate_frozen_tier_historical_book_multiplicity(family)._body_json == current_before
+    snapshot = book.transport_policy_snapshot()
+    assert snapshot["p_value_contract_sha256"] == book.current_policy_snapshot()["p_value_contract_sha256"]
+    assert snapshot["winner_selection_request_version"] == winner.V16_GENERATION.request_version
+    assert snapshot["horizon_winner_cross_binding_schema_version"] == "fxpm.historical-horizon-winner-cross-binding.v4"
+    assert snapshot["insufficient_evidence_binding_schema_version"] == "fxpm.historical-insufficient-evidence-binding.v4"
+    assert snapshot["profitability_claimed"] is False
+
+
+def test_transport_book_replays_actual_v16_candidate_and_refuses_mixed_family() -> None:
+    family = _transport_candidate_family()
+    result = book.evaluate_transport_historical_book_multiplicity(family)
+    assert result.valid, result.reason_codes
+    assert result.to_dict()["contract_version"] == "fxpm.book-multiplicity.v16"
+    assert evaluate_historical_book_multiplicity(family)._body_json == result._body_json
+    assert verify_historical_book_multiplicity_decision(result, family)
+    _assert_rejected(book.evaluate_frozen_tier_historical_book_multiplicity(family), "BOOK_MIXED_GENERATIONS")
+    mixed = list(family)
+    mixed[0] = _insufficient_cell(postsearch=False, current=True)
+    _assert_rejected(book.evaluate_transport_historical_book_multiplicity(mixed), "BOOK_MIXED_GENERATIONS")
+    assert not verify_historical_book_multiplicity_decision(result, mixed)
+
+
+def test_transport_presearch_state_retains_shared_horizon_and_exact_v4_binding() -> None:
+    legacy = _insufficient_cell(postsearch=False, current=True)
+    plan = legacy.insufficient_horizon_plan
+    state = book.create_transport_historical_process_state_decision(
+        symbol=legacy.symbol, timeframe=legacy.timeframe, regime=legacy.regime,
+        state_kind=INSUFFICIENT_EVIDENCE, reason_code=INSUFFICIENT_PRESEARCH_BOUNDARY_REASON,
+        source_group_decision=legacy.source_group_decision,
+        regime_fit_decision=legacy.regime_fit_decision, attempted_trials_exact=0, horizon_plan=plan)
+    assert state is not None
+    assert state.to_dict()["insufficient_evidence_binding"]["schema_version"] == book.V16_GENERATION.insufficient_schema
+    evidence = process_state_cell_evidence(process_state_decision=state,
+        source_group_decision=legacy.source_group_decision,
+        regime_fit_decision=legacy.regime_fit_decision, horizon_plan=plan)
+    assert evidence is not None
+    assert book._infer_input_generation(horizon_plan=plan, process_state=state) is book.V16_GENERATION
+    assert legacy.process_state_decision.to_dict()["insufficient_evidence_binding"]["schema_version"] == book.CURRENT_GENERATION.insufficient_schema
 
 
 def test_source_contains_no_signer_key_or_legacy_authority_surface() -> None:

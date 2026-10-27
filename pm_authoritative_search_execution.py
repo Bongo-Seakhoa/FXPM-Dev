@@ -1,7 +1,7 @@
 """Genuine native-prefix search execution for historical production authority.
 
 This module owns the decision-time seam between released Horizon plans and the
-raw Winner V11 builder.  It accepts only a byte-reopened activated native
+raw Winner-v15 builder.  It accepts only a byte-reopened activated native
 prefix, derives an anchor-local regime surface, authenticates the complete
 current-refit attempt roster, and calls :class:`pm_core.Backtester` at the true
 optimizer-train, tuning-validation, and final-lockbox sites.  No metric or
@@ -49,16 +49,18 @@ import pm_historical_anchor_orchestration as historical
 import pm_historical_production_adapter as historical_adapter
 import pm_native_prefix_production as native_prefix
 import pm_regime
+import pm_signal_opportunities as signal_opportunities
+import pm_spread_profile as spread_profile
 import pm_trade_power as trade_power
 import pm_winner_raw_evidence as raw_winner
-import pm_winner_selection as winner_v11
+import pm_winner_selection as winner
 from pm_core import (
-    BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
     BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION,
     Backtester,
     FeatureComputer,
     InstrumentSpec,
     PipelineConfig,
+    build_backtest_trade_identity_pnl_evidence,
 )
 from pm_current_refit_parameters import decode_parameter_mapping
 from pm_search_outcomes import (
@@ -71,22 +73,26 @@ from pm_strategies import StrategyRegistry
 
 
 UTC: Final = timezone.utc
-EXECUTION_CONTRACT_VERSION: Final = "fxpm.authoritative-search-execution.v3"
+EXECUTION_CONTRACT_VERSION: Final = "fxpm.authoritative-search-execution.v5"
 REGIME_FIT_POLICY_VERSION: Final = "fxpm.historical-regime-fit-policy.v1"
 REGIME_FIT_EVIDENCE_VERSION: Final = "fxpm.historical-regime-fit-evidence.v1"
 PARTITION_GEOMETRY_VERSION: Final = "fxpm.winner-partition-geometry.v1"
 SIGNAL_VECTOR_VERSION: Final = "fxpm.authoritative-search-signal-vector.v1"
-PROVENANCE_RECEIPT_VERSION: Final = "fxpm.authoritative-search-provenance.v1"
+PROVENANCE_RECEIPT_VERSION: Final = "fxpm.authoritative-search-provenance.v4"
 STATE_CONTEXT_DISPOSITION_SCHEMA: Final = (
     "fxpm.production-trial-state-context-disposition.v1"
 )
 STATE_CONTEXT_BOUNDARY_REASON: Final = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+SIGNAL_DESIGN_REQUEST_SCHEMA: Final = "fxpm.signal-opportunity-design-request.v1"
+SIGNAL_DESIGN_TAPE_SCHEMA: Final = "fxpm.signal-opportunity-train-design-tape.v1"
+SIGNAL_DESIGN_TAPE_FORMAT: Final = "fxpm-signal-opportunity-design-jsonl-v1"
+_SIGNAL_DESIGN_REQUEST_SEAL = object()
 MAX_PREFIX_ROWS: Final = 10_000_000
-MAX_ATTEMPTS: Final = winner_v11.MAX_ATTEMPTS
-MAX_FOLDS: Final = winner_v11.MAX_FOLDS
-MIN_FOLDS: Final = int(winner_v11.PINNED_SELECTION_POLICY["min_causal_folds"])
-MIN_DAYS_PER_FOLD: Final = int(winner_v11.PINNED_SELECTION_POLICY["min_days_per_fold"])
-MAX_DAYS_PER_FOLD: Final = winner_v11.MAX_DAYS_PER_FOLD
+MAX_ATTEMPTS: Final = winner.MAX_ATTEMPTS
+MAX_FOLDS: Final = winner.MAX_FOLDS
+MIN_FOLDS: Final = int(winner.CURRENT_SELECTION_POLICY["min_causal_folds"])
+MIN_DAYS_PER_FOLD: Final = int(winner.CURRENT_SELECTION_POLICY["min_days_per_fold"])
+MAX_DAYS_PER_FOLD: Final = winner.MAX_DAYS_PER_FOLD
 MIN_PARTITION_SCORED_BARS: Final = 2
 MAX_ATTEMPT_EVIDENCE_BYTES: Final = 512 * 1024**2
 MAX_CELL_EVIDENCE_BYTES: Final = 8 * 1024**3
@@ -122,12 +128,15 @@ _ATTEMPT_ARTIFACT_KEYS: Final = frozenset(
     }
 )
 _RAW_LANE_KEYS: Final = (
+    "trade_identity_pnl",
     "position_events",
     "winner_daily_r_surface",
     "trade_power_partition_axis",
     "execution_cost_timing_contract",
     "numerical_execution_cost_attestation",
     "swap_accrual_contract",
+    "spread_model",
+    "spread_admission",
 )
 
 
@@ -149,14 +158,19 @@ class FittedNativeSearchTimeframe:
     source_group_decision: book.HistoricalSourceGroupDecision
     regime_fit_decision: book.RegimeFitDecision
     source_contract_seed: Mapping[str, Any]
-    base_cost_policy: Mapping[str, Any]
-    stress_cost_policy: Mapping[str, Any]
+    cost_ladder_contract: Mapping[str, Any]
     regime_parameters: Mapping[str, Any]
     train_regime_support: Mapping[str, Any]
     instrument_spec: InstrumentSpec
     execution_spec_receipt: Mapping[str, Any]
     frame_sha256: str
     _frame: pd.DataFrame
+    source_contract_seeds: Mapping[str, Any] | None = None
+    frozen_tier_pair_contract: Mapping[str, Any] | None = None
+    _spread_tiers: Mapping[str, spread_profile.FrozenSpreadTier] | None = None
+    _entry_spread_observations: pd.Series | None = None
+    _spread_source_product: native_prefix.NativePrefixProduct | None = None
+    _spread_source_frame: pd.DataFrame | None = None
 
     def frame_copy(self) -> pd.DataFrame:
         """Return an isolated copy; callers cannot mutate the bound surface."""
@@ -309,6 +323,39 @@ class CurrentObservedCellExecution:
     production: raw_winner.WinnerRawEvidenceProduction | None
     cross_binding_bytes: bytes | None
     cross_binding_entry: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True, slots=True)
+class SignalOpportunityDesignRequest:
+    """A separate TRAIN-design grant; not an old planning/validation grant."""
+
+    _body_json: bytes
+    _entry_json: bytes
+    _planning_request: Any
+    _anchor_plan_receipt: Any
+    _causal_precommit_json: bytes
+    _seal: object
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("ascii"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class SignalOpportunityDesignExecution:
+    """Reference to one complete nonauthorising GENERAL research tape."""
+
+    _body_json: bytes
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("ascii"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,26 +536,81 @@ def _source_identity(source_contract: Mapping[str, Any]) -> str:
     )
 
 
-def _cost_policy_from_seed(
-    seed_result: Mapping[str, Any],
-    *,
-    lane: str,
-) -> dict[str, Any]:
-    attestation = seed_result.get("numerical_execution_cost_attestation")
-    if not isinstance(attestation, Mapping):
-        _fail(f"{lane}_COST_ATTESTATION_MISSING")
+def _native_spread_inputs(
+    *, product: native_prefix.NativePrefixProduct, config: PipelineConfig,
+    frame: pd.DataFrame, spec: InstrumentSpec,
+) -> tuple[dict[str, spread_profile.FrozenSpreadTier], pd.Series, native_prefix.NativePrefixProduct, pd.DataFrame]:
+    """Reopen the same sealed generation and its exact prior-fine source."""
+    descriptor = product.prefix_descriptor
+    path = product.prefix_path
+    if not isinstance(descriptor, Mapping) or not isinstance(path, Path):
+        _fail("FROZEN_TIER_TARGET_PREFIX_ROUTE_INVALID")
+    relative = descriptor.get("relative_path")
+    if (type(relative) is not str or not relative or "\\" in relative
+            or relative.startswith("/") or ":" in relative):
+        _fail("FROZEN_TIER_TARGET_PREFIX_ROUTE_INVALID")
+    parts = relative.split("/")
+    if (any(part in {"", ".", ".."} for part in parts) or not path.is_absolute()
+            or tuple(path.parts[-len(parts):]) != tuple(parts)):
+        _fail("FROZEN_TIER_TARGET_PREFIX_ROUTE_INVALID")
+    root = path.parents[len(parts) - 1]
     try:
-        return raw_winner.build_frozen_numerical_execution_cost_policy(
-            lane=lane,
-            use_spread=attestation.get("use_spread"),
-            spread_mode=attestation.get("spread_mode"),
-            instrument_spec_sha256=attestation.get("instrument_spec_sha256"),
+        context = authority_spool.reopen_generation_context(root)
+        replayed = native_prefix.reverify_activated_native_prefix_product(
+            product, context, require_current_activation=True,
         )
-    except raw_winner.WinnerRawEvidenceError as exc:
+        if (replayed.index_sha256 != product.index_sha256
+                or replayed.prefix_path != path
+                or Path(config.data_dir).resolve() != product._data_dir):
+            _fail("FROZEN_TIER_TARGET_PREFIX_CONTEXT_MISMATCH")
+        native = dict(product.native_prefix)
+        profile = spread_profile.load_spread_profile(
+            Path(config.data_dir) / "native" / "terms" / "spread_profile.json"
+        )
+        tiers = {tier: profile.resolve(
+            native["symbol"], native["timeframe"], tier, point=spec.point,
+            source_identity_sha256=native["source_identity_sha256"],
+        ) for tier in ("P75", "P95")}
+        source_timeframe = tiers["P75"].source_timeframe
+        if source_timeframe == native["timeframe"]:
+            fine = replayed
+        else:
+            fine = native_prefix.produce_activated_native_prefix(
+                data_dir=Path(config.data_dir), context=context,
+                symbol=native["symbol"], timeframe=source_timeframe,
+                cutoff_utc=product.index["cutoff_utc"],
+                source_accessed_at_utc=product.index["source_accessed_at_utc"],
+                production_contract_required=product._production_contract_required,
+            )
+        if fine.source_state != native_prefix.AVAILABLE:
+            _fail("FROZEN_TIER_PRIOR_FINE_SOURCE_UNAVAILABLE")
+        source = fine.index["source"]
+        tier = tiers["P75"].descriptor()
+        binding = tier["source_binding"]
+        if (source["bars_sha256"] != binding["bars_sha256"]
+                or source["audit_sidecar_sha256"] != binding["sidecar_sha256"]
+                or source["provenance_sha256"] != binding["provenance_sha256"]
+                or product.index["source"]["bars_sha256"] != binding["target_bars_sha256"]
+                or fine.index["activation"]["activation_id"] != tier["activation"]["id"]
+                or fine.index["activation"]["manifest_sha256"] != tier["activation"]["manifest_sha256"]
+                or source["source_identity_sha256"] != native["source_identity_sha256"]
+                or fine.index["cutoff_utc"] != product.index["cutoff_utc"]
+                or fine.index["source_accessed_at_utc"] != product.index["source_accessed_at_utc"]):
+            _fail("FROZEN_TIER_PROFILE_FINE_SOURCE_BINDING_MISMATCH")
+        fine_spec, _receipt = _freeze_bound_execution_spec(product=fine, config=config)
+        if asdict(fine_spec) != asdict(spec):
+            _fail("FROZEN_TIER_PRIOR_FINE_SPEC_MISMATCH")
+        fine_frame = native_prefix.open_verified_prefix_frame(fine)
+        observations = spread_profile.align_prior_completed_spreads(
+            frame.index, fine_frame, source_timeframe,
+        )
+    except AuthoritativeSearchExecutionError:
+        raise
+    except Exception as exc:
         raise AuthoritativeSearchExecutionError(
-            f"{lane}_COST_POLICY_BUILD_FAILED",
-            (exc.code,),
+            "FROZEN_TIER_SOURCE_REOPEN_FAILED", (type(exc).__name__, str(exc)),
         ) from exc
+    return tiers, observations, fine, fine_frame
 
 
 def _default_regime_parameters(timeframe: str) -> dict[str, Any]:
@@ -606,7 +708,8 @@ def _read_bound_json_file(
     *,
     maximum_bytes: int,
     code: str,
-) -> tuple[dict[str, Any], str, int]:
+    include_raw: bool = False,
+) -> tuple[dict[str, Any], str, int] | tuple[dict[str, Any], str, int, bytes]:
     """Read one regular JSON file through a single identity-checked handle."""
 
     try:
@@ -660,7 +763,8 @@ def _read_bound_json_file(
         raise AuthoritativeSearchExecutionError(f"{code}_READ_FAILED") from exc
     if type(value) is not dict:
         _fail(f"{code}_OBJECT_REQUIRED")
-    return value, hashlib.sha256(raw).hexdigest(), len(raw)
+    result = (value, hashlib.sha256(raw).hexdigest(), len(raw))
+    return (*result, raw) if include_raw else result
 
 
 def _normalized_symbol(value: Any) -> str:
@@ -711,10 +815,11 @@ def _freeze_bound_execution_spec(
     if not config_raw:
         _fail("EXECUTION_SPEC_DEPLOYMENT_CONFIG_UNBOUND")
     config_path = Path(config_raw)
-    config_body, config_sha, config_size = _read_bound_json_file(
+    config_body, config_sha, config_size, config_bytes = _read_bound_json_file(
         config_path,
         maximum_bytes=MAX_DEPLOYMENT_CONFIG_BYTES,
         code="EXECUTION_SPEC_DEPLOYMENT_CONFIG",
+        include_raw=True,
     )
     metadata = config_body.get("_meta")
     if type(metadata) is not dict:
@@ -728,8 +833,69 @@ def _freeze_bound_execution_spec(
     broker_path = Path(broker_raw)
     if not broker_path.is_absolute():
         broker_path = config_path.resolve(strict=True).parent / broker_path
-    broker_body, broker_sha, broker_size = _read_bound_json_file(
+    broker_body, broker_sha, broker_size, broker_bytes = _read_bound_json_file(
         broker_path,
+        maximum_bytes=MAX_BROKER_SPECS_BYTES,
+        code="EXECUTION_SPEC_BROKER_SPECS",
+        include_raw=True,
+    )
+    return _derive_bound_execution_spec(
+        product=product,
+        deployment_config_bytes=config_bytes,
+        broker_specs_bytes=broker_bytes,
+        broker_specs_relative_path=broker_raw,
+    )
+
+
+def _derive_bound_execution_spec(
+    *,
+    product: native_prefix.NativePrefixProduct,
+    deployment_config_bytes: bytes,
+    broker_specs_bytes: bytes,
+    broker_specs_relative_path: str,
+) -> tuple[InstrumentSpec, dict[str, Any]]:
+    """Derive identical economics from captured bytes, without authenticating them."""
+
+    def captured_object(raw: bytes, *, maximum_bytes: int, code: str):
+        if type(raw) is not bytes or not 0 < len(raw) <= maximum_bytes:
+            _fail(f"{code}_FILE_INVALID")
+        try:
+            value = json.loads(
+                raw.decode("utf-8-sig"),
+                object_pairs_hook=_strict_pairs,
+                parse_constant=_reject_json_constant,
+            )
+        except AuthoritativeSearchExecutionError:
+            raise
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise AuthoritativeSearchExecutionError(f"{code}_READ_FAILED") from exc
+        if type(value) is not dict:
+            _fail(f"{code}_OBJECT_REQUIRED")
+        return value, hashlib.sha256(raw).hexdigest(), len(raw)
+
+    native = dict(product.native_prefix)
+    symbol = str(native.get("symbol") or "")
+    instrument = dict(product.instrument_snapshot or {})
+    if instrument != dict(product.index["source"].get("instrument_snapshot") or {}):
+        _fail("EXECUTION_SPEC_NATIVE_INSTRUMENT_BINDING_INVALID")
+    config_body, config_sha, config_size = captured_object(
+        deployment_config_bytes,
+        maximum_bytes=MAX_DEPLOYMENT_CONFIG_BYTES,
+        code="EXECUTION_SPEC_DEPLOYMENT_CONFIG",
+    )
+    metadata = config_body.get("_meta")
+    if type(metadata) is not dict:
+        _fail("EXECUTION_SPEC_DEPLOYMENT_METADATA_INVALID")
+    scope = str(metadata.get("scope") or "")
+    if not scope:
+        _fail("EXECUTION_SPEC_DEPLOYMENT_SCOPE_UNBOUND")
+    broker_raw = config_body.get("broker_specs_path")
+    if type(broker_raw) is not str or not broker_raw.strip():
+        _fail("EXECUTION_SPEC_BROKER_PATH_UNBOUND")
+    if broker_raw != broker_specs_relative_path:
+        _fail("EXECUTION_SPEC_BROKER_PATH_BINDING_INVALID")
+    broker_body, broker_sha, broker_size = captured_object(
+        broker_specs_bytes,
         maximum_bytes=MAX_BROKER_SPECS_BYTES,
         code="EXECUTION_SPEC_BROKER_SPECS",
     )
@@ -905,38 +1071,27 @@ def fit_native_timeframe_for_search(
     )
     if str(config.backtest_spread_mode).lower() != "conservative_max":
         _fail("BASE_SPREAD_POLICY_NOT_PRODUCTION_CONSERVATIVE")
-    stress_mode = str(config.oos_evidence_execution_stress_mode).strip().lower()
-    if stress_mode not in {"stress_p90", "stress_p95", "stress_max"}:
-        _fail("STRESS_SPREAD_POLICY_INVALID")
 
-    base_backtester = Backtester(config)
-    stress_backtester = Backtester(replace(config, backtest_spread_mode=stress_mode))
+    tiers, observations, fine_product, fine_frame = _native_spread_inputs(
+        product=product, config=config, frame=frame, spec=instrument_spec,
+    )
+    probe_backtester = Backtester(config)
     try:
-        base_seed_result = base_backtester.build_evidence_source_seed_result(
-            frame,
-            symbol,
-            spec=instrument_spec,
-            timeframe=timeframe,
+        probes = {tier: probe_backtester.build_evidence_source_seed_result(
+            frame, symbol, spec=instrument_spec, timeframe=timeframe,
+            spread_tier=descriptor, entry_spread_observations=observations,
+        ) for tier, descriptor in tiers.items()}
+        source_seeds = {tier: raw_winner.build_trade_source_contract_from_backtester_result(result)
+                        for tier, result in probes.items()}
+        pair = pm_core.build_backtest_frozen_tier_pair_contract(
+            probes, spec=instrument_spec, use_spread=bool(config.use_spread),
         )
-        stress_seed_result = stress_backtester.build_evidence_source_seed_result(
-            frame,
-            symbol,
-            spec=instrument_spec,
-            timeframe=timeframe,
-        )
-        source_seed = raw_winner.build_trade_source_contract_from_backtester_result(
-            base_seed_result
-        )
+        _seeds, pair, pair_hashes = raw_winner._current_pair_inputs(source_seeds, pair)
+        source_contract_sha256 = pair_hashes["source_contract_sha256"]
     except Exception as exc:
         raise AuthoritativeSearchExecutionError(
-            "SOURCE_CONTRACT_SEED_FAILED",
-            (type(exc).__name__, str(exc)),
+            "SOURCE_CONTRACT_SEED_FAILED", (type(exc).__name__, str(exc)),
         ) from exc
-    source_contract_sha256 = _source_identity(source_seed)
-    base_policy = _cost_policy_from_seed(base_seed_result, lane="BASE")
-    stress_policy = _cost_policy_from_seed(stress_seed_result, lane="STRESS")
-    if _sha256(base_policy) == _sha256(stress_policy):
-        _fail("BASE_STRESS_COST_POLICY_NOT_DISTINCT")
 
     source = book.create_historical_source_group_decision(
         symbol=symbol,
@@ -1036,9 +1191,8 @@ def fit_native_timeframe_for_search(
         product=product,
         source_group_decision=source,
         regime_fit_decision=fit,
-        source_contract_seed=json.loads(_canonical_bytes(source_seed).decode("ascii")),
-        base_cost_policy=json.loads(_canonical_bytes(base_policy).decode("ascii")),
-        stress_cost_policy=json.loads(_canonical_bytes(stress_policy).decode("ascii")),
+        source_contract_seed={},
+        cost_ladder_contract={},
         regime_parameters=json.loads(_canonical_bytes(parameters).decode("ascii")),
         train_regime_support=json.loads(_canonical_bytes(support).decode("ascii")),
         instrument_spec=replace(instrument_spec),
@@ -1047,6 +1201,12 @@ def fit_native_timeframe_for_search(
         ),
         frame_sha256=digest,
         _frame=combined,
+        source_contract_seeds=json.loads(_canonical_bytes(source_seeds).decode("ascii")),
+        frozen_tier_pair_contract=json.loads(_canonical_bytes(pair).decode("ascii")),
+        _spread_tiers=tiers,
+        _entry_spread_observations=observations.copy(deep=True),
+        _spread_source_product=fine_product,
+        _spread_source_frame=fine_frame,
     )
 
 
@@ -1442,14 +1602,20 @@ def _verify_attempt_roster(
 
     prefix = dict(fitted.product.native_prefix)
     policy = plan_body.get("horizon_policy")
-    if (
-        type(policy) is not dict
-        or policy.get("evaluator_release_sha256")
-        != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
-        or policy.get("cost_contract_sha256") != _sha256(fitted.base_cost_policy)
-        or policy.get("cost_stress_contract_sha256")
-        != _sha256(fitted.stress_cost_policy)
-    ):
+    try:
+        pair = pm_core.validate_backtest_frozen_tier_pair_contract(fitted.frozen_tier_pair_contract)
+        pair_hashes = {
+            "cost_contract_sha256": _sha256({level["tier"]: _sha256(level["numerical_execution_cost_policy"])
+                for level in pair["tiers"]}),
+            "frozen_tier_pair_contract_sha256": _sha256(pair),
+        }
+    except Exception as exc:
+        raise AuthoritativeSearchExecutionError("HORIZON_COST_POLICY_BINDING_INVALID") from exc
+    if (type(policy) is not dict
+            or policy.get("schema_version") != "fxpm.historical-horizon-policy.v3"
+            or policy.get("evaluator_release_sha256") != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
+            or policy.get("cost_contract_sha256") != pair_hashes["cost_contract_sha256"]
+            or policy.get("frozen_tier_pair_contract_sha256") != pair_hashes["frozen_tier_pair_contract_sha256"]):
         _fail("HORIZON_COST_POLICY_BINDING_INVALID")
 
     frame_opens = pd.DatetimeIndex(
@@ -1894,280 +2060,190 @@ def _winner_fold_identity(
     return hashlib.sha1(_canonical_bytes(body), usedforsecurity=False).hexdigest()
 
 
-def _partition_cost_attestation(
-    *,
-    backtester: Backtester,
-    frame: pd.DataFrame,
-    spec: InstrumentSpec,
-) -> dict[str, Any]:
-    """Derive the exact execution-cost attestation without running a strategy."""
-
-    try:
-        entry, intrabar, meta = backtester._build_half_spread_arrays(frame, spec)
-        attestation = backtester._numerical_execution_cost_attestation(
-            entry_half_spread=entry,
-            intrabar_half_spread=intrabar,
-            spread_meta=meta,
-            spec=spec,
-        )
-    except Exception as exc:
-        raise AuthoritativeSearchExecutionError(
-            "COST_STRESS_ADVERSITY_PRECOMMIT_FAILED",
-            (type(exc).__name__, str(exc)),
-        ) from exc
-    if not isinstance(attestation, Mapping):
-        _fail("COST_STRESS_ADVERSITY_ATTESTATION_INVALID")
-    normalized = json.loads(_canonical_bytes(dict(attestation)).decode("ascii"))
-    _hex64(
-        normalized.get("attestation_sha256"),
-        "COST_STRESS_ADVERSITY_ATTESTATION_SHA256_INVALID",
-    )
-    _hex64(
-        normalized.get("spread_values_sha256"),
-        "COST_STRESS_ADVERSITY_VECTOR_SHA256_INVALID",
-    )
-    return normalized
+def _source_observation_receipt(fitted: FittedNativeSearchTimeframe,
+        target: pd.Index) -> dict[str, Any]:
+    fine = fitted._spread_source_product
+    frame = fitted._spread_source_frame
+    if (type(fine) is not native_prefix.NativePrefixProduct or not isinstance(frame, pd.DataFrame)
+            or not isinstance(fitted._spread_tiers, Mapping)):
+        _fail("FROZEN_TIER_PRIOR_FINE_SOURCE_UNAVAILABLE")
+    tier = fitted._spread_tiers["P75"]
+    observations, actual_closes = spread_profile.align_prior_completed_spreads(
+        target, frame, tier.source_timeframe, include_matched_closes=True)
+    rows = []
+    for opened, closed, points in zip(target, actual_closes, observations, strict=True):
+        opened_text = _utc(pd.Timestamp(opened).isoformat(), "SPREAD_TARGET_OPEN_INVALID")
+        rows.append({"target_open_utc": opened_text,
+            "expected_prior_fine_close_utc": opened_text,
+            "prior_fine_close_utc": None if pd.isna(closed) else _utc(pd.Timestamp(closed).isoformat(), "SPREAD_SOURCE_CLOSE_INVALID"),
+            "points": None if pd.isna(points) else float(points)})
+    return _receipt("fxpm.original-fine-spread-observations.v1", {
+        "symbol": tier.symbol, "timeframe": tier.timeframe, "source_timeframe": tier.source_timeframe,
+        "source_product": {"data_dir": str(fine._data_dir),
+            "index_descriptor": dict(fine.index_descriptor), "index_sha256": fine.index_sha256,
+            "symbol": fine.index["symbol"], "timeframe": fine.index["timeframe"],
+            "cutoff_utc": fine.index["cutoff_utc"],
+            "activation_manifest_sha256": fine.index["activation"]["manifest_sha256"],
+            "production_contract_required": fine._production_contract_required},
+        "observations": rows,
+        "entry_observations_sha256": hashlib.sha256(
+            pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest(),
+    })
 
 
-def _build_cost_stress_adversity_plan(
-    *,
-    attempts: Sequence[_VerifiedAttempt],
-    fold_plan: Sequence[Mapping[str, Any]],
-    plan_body: Mapping[str, Any],
-    fitted: FittedNativeSearchTimeframe,
+def _partition_cost_precommitments(
+    *, attempts: Sequence[_VerifiedAttempt], fold_plan: Sequence[Mapping[str, Any]],
+    plan_body: Mapping[str, Any], fitted: FittedNativeSearchTimeframe,
     config: PipelineConfig,
+    source_observation_cache: dict[str, tuple[str, bytes]] | None = None,
 ) -> dict[str, Any]:
-    """Freeze expected BASE/STRESS vectors before the first strategy run.
-
-    Final-fold source partitions and their execution-cost vectors do not depend
-    on the strategy parameters.  Cache each distinct partition so a 128-attempt
-    roster hashes the four genuine folds once, while retaining one explicit
-    attempt/fold row in the immutable Winner plan.
-    """
-
-    cell = plan_body.get("cell")
+    """Freeze each real partition's two costs/admissions before any signal outcome."""
     geometry = plan_body.get("derived_dependency_geometry")
-    if not isinstance(cell, Mapping) or not isinstance(geometry, Mapping):
-        _fail("COST_STRESS_ADVERSITY_PLAN_CONTEXT_INVALID")
-    symbol = str(cell.get("symbol") or "")
-    timeframe = str(cell.get("timeframe") or "").upper()
-    regime = str(cell.get("regime") or "").upper()
-    dependency_warmup_bars = geometry.get("warmup_bars")
-    if type(dependency_warmup_bars) is not int or dependency_warmup_bars < 0:
-        _fail("DEPENDENCY_WARMUP_INVALID")
-    stress_mode = str(config.oos_evidence_execution_stress_mode).strip().lower()
-    if stress_mode not in {"stress_p90", "stress_p95", "stress_max"}:
-        _fail("COST_STRESS_MODE_INVALID", stress_mode)
-    base_backtester = Backtester(config)
-    stress_backtester = Backtester(replace(config, backtest_spread_mode=stress_mode))
-    partition_cache: dict[tuple[str, str, str], _PartitionSlice] = {}
-    attestation_cache: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
-    rows: list[dict[str, Any]] = []
-
+    if not isinstance(geometry, Mapping) or type(geometry.get("warmup_bars")) is not int:
+        _fail("PARTITION_COST_PRECOMMIT_CONTEXT_INVALID")
+    if (not isinstance(fitted._spread_tiers, Mapping)
+            or set(fitted._spread_tiers) != {"P75", "P95"}
+            or not isinstance(fitted._entry_spread_observations, pd.Series)
+            or not isinstance(fitted.frozen_tier_pair_contract, Mapping)):
+        _fail("FROZEN_TIER_FITTED_INPUTS_UNAVAILABLE")
+    backtester = Backtester(config)
+    cache: dict[str, dict[str, Any]] = {}
+    source_cache = {} if source_observation_cache is None else source_observation_cache
+    rows = []
     for attempt in attempts:
         if attempt.plan_attempt.get("status") != "PLANNED":
             continue
         causal_folds = _causal_folds(attempt)
         if len(causal_folds) != len(fold_plan):
-            _fail("COST_STRESS_ADVERSITY_FOLD_ROSTER_INVALID", attempt.ordinal)
-        recipe_warmup = int(
-            attempt.artifacts.refit_recipe["data_requirements"]["warmup_bars"]
-        )
-        minimum_warmup = max(recipe_warmup, dependency_warmup_bars)
-        for fold_ordinal, (fold, winner_fold) in enumerate(
-            zip(causal_folds, fold_plan, strict=True)
-        ):
-            validation_start = _utc(
-                fold.get("validation_start_utc"),
-                "FOLD_START_INVALID",
-            )
-            validation_end = _utc(
-                fold.get("validation_end_exclusive_utc"),
-                "FOLD_END_INVALID",
-            )
-            expected_start = _utc(
-                winner_fold.get("anchor_as_of_utc"),
-                "FOLD_ANCHOR_INVALID",
-            )
-            expected_end = _utc(
-                (
-                    datetime.fromisoformat(
-                        f"{winner_fold.get('oos_end_date_utc')}T00:00:00+00:00"
-                    )
-                    + timedelta(days=1)
-                ).isoformat(),
-                "FOLD_END_INVALID",
-            )
-            if validation_start != expected_start or validation_end != expected_end:
-                _fail(
-                    "COST_STRESS_ADVERSITY_FOLD_AXIS_MISMATCH",
-                    attempt.ordinal,
-                    fold_ordinal,
-                )
-            key = (
-                _utc(
-                    fold.get("validation_warmup_start_utc"),
-                    "PARTITION_FRAME_START_INVALID",
-                ),
-                validation_start,
-                validation_end,
-            )
-            final = partition_cache.get(key)
-            if final is None:
-                final = _partition_slice(
-                    fitted._frame,
-                    role="final_lockbox",
-                    frame_start_utc=key[0],
-                    scored_start_utc=key[1],
-                    end_exclusive_utc=key[2],
-                    minimum_warmup_bars=minimum_warmup,
-                )
-                partition_cache[key] = final
-            elif final.warmup_bars < minimum_warmup:
-                _fail(
-                    "PARTITION_AXIS_NOT_EXACTLY_BACKED",
-                    "final_lockbox",
-                    attempt.ordinal,
-                )
-
-            geometry_sha = _hex64(
-                final.geometry_receipt.get("receipt_sha256"),
-                "PARTITION_GEOMETRY_RECEIPT_INVALID",
-            )
-            pair = attestation_cache.get(geometry_sha)
-            if pair is None:
-                pair = (
-                    _partition_cost_attestation(
-                        backtester=base_backtester,
-                        frame=final.frame,
-                        spec=fitted.instrument_spec,
-                    ),
-                    _partition_cost_attestation(
-                        backtester=stress_backtester,
-                        frame=final.frame,
-                        spec=fitted.instrument_spec,
-                    ),
-                )
-                attestation_cache[geometry_sha] = pair
-            base_attestation, stress_attestation = pair
-            base_vector_sha = base_attestation["spread_values_sha256"]
-            stress_vector_sha = stress_attestation["spread_values_sha256"]
-            expected_status = (
-                raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
-                if base_vector_sha == stress_vector_sha
-                else raw_winner.COST_STRESS_ADVERSITY_EXPECTED_STRICT
-            )
-            rows.append(
-                {
-                    "attempt_ordinal": attempt.ordinal,
-                    "horizon_attempt_id": attempt.plan_attempt["attempt_id"],
-                    "fold_ordinal": fold_ordinal,
-                    "fold_id": _winner_fold_identity(
-                        symbol=symbol,
-                        timeframe=timeframe,
-                        regime=regime,
-                        fold_ordinal=fold_ordinal,
-                        fold=winner_fold,
-                    ),
-                    "final_partition_geometry_receipt_sha256": geometry_sha,
-                    "final_partition_frame_sha256": _hex64(
-                        final.geometry_receipt.get("frame_sha256"),
-                        "PARTITION_FRAME_SHA256_INVALID",
-                    ),
-                    "base_cost_attestation_sha256": base_attestation[
-                        "attestation_sha256"
-                    ],
-                    "stress_cost_attestation_sha256": stress_attestation[
-                        "attestation_sha256"
-                    ],
-                    "base_spread_values_sha256": base_vector_sha,
-                    "stress_spread_values_sha256": stress_vector_sha,
-                    "expected_adversity_status": expected_status,
-                }
-            )
-    return {
-        "schema_version": raw_winner.COST_STRESS_ADVERSITY_PLAN_SCHEMA,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "regime": regime,
-        "row_count": len(rows),
-        "rows_sha256": _sha256(rows),
-        "rows": rows,
-    }
+            _fail("PARTITION_COST_PRECOMMIT_FOLD_ROSTER_INVALID", attempt.ordinal)
+        for fold_ordinal, fold in enumerate(causal_folds):
+            partitions = _fold_partitions(frame=fitted._frame, fold=fold, attempt=attempt,
+                dependency_warmup_bars=geometry["warmup_bars"])
+            for partition in partitions:
+                identity = partition.geometry_receipt["receipt_sha256"]
+                tiers = cache.get(identity)
+                if tiers is None:
+                    observations = fitted._entry_spread_observations.loc[partition.frame.index]
+                    probes = {tier: backtester.build_evidence_source_seed_result(
+                        partition.frame, plan_body["cell"]["symbol"],
+                        spec=fitted.instrument_spec, timeframe=plan_body["cell"]["timeframe"],
+                        spread_tier=bound_tier, entry_spread_observations=observations,
+                    ) for tier, bound_tier in fitted._spread_tiers.items()}
+                    pair = pm_core.build_backtest_frozen_tier_pair_contract(
+                        probes, spec=fitted.instrument_spec, use_spread=bool(config.use_spread))
+                    if pair != dict(fitted.frozen_tier_pair_contract):
+                        _fail("PARTITION_FROZEN_TIER_POLICY_DRIFT")
+                    tiers = {tier: {
+                        "numerical_execution_cost_attestation": probe["numerical_execution_cost_attestation"],
+                        "entry_observations_sha256": probe["spread_admission"]["entry_observations_sha256"],
+                        "entry_admission_mask_sha256": probe["spread_admission"]["entry_admission_mask_sha256"],
+                    } for tier, probe in probes.items()}
+                    cache[identity] = tiers
+                source_receipt = source_cache.get(identity)
+                if source_receipt is None:
+                    body = _source_observation_receipt(fitted, partition.frame.index)
+                    source_receipt = (body["receipt_sha256"], _canonical_bytes(body))
+                    source_cache[identity] = source_receipt
+                rows.append({"attempt_ordinal": attempt.ordinal, "fold_ordinal": fold_ordinal,
+                    "partition": partition.role,
+                    "partition_geometry_receipt_sha256": identity,
+                    "partition_frame_sha256": partition.geometry_receipt["frame_sha256"],
+                    "source_observation_receipt_sha256": source_receipt[0],
+                    "tiers": tiers})
+    try:
+        return raw_winner.build_partition_cost_precommitments(rows,
+            pair=fitted.frozen_tier_pair_contract)
+    except raw_winner.WinnerRawEvidenceError as exc:
+        raise AuthoritativeSearchExecutionError(exc.code) from exc
 
 
-def _expected_cost_stress_adversity_row(
-    *,
-    plan: Mapping[str, Any],
-    attempt: _VerifiedAttempt,
-    fold_ordinal: int,
-) -> dict[str, Any]:
-    rows = plan.get("rows") if isinstance(plan, Mapping) else None
-    if type(rows) is not list:
-        _fail("COST_STRESS_ADVERSITY_PLAN_INVALID")
-    matches = [
-        row
-        for row in rows
-        if isinstance(row, Mapping)
-        and row.get("attempt_ordinal") == attempt.ordinal
-        and row.get("fold_ordinal") == fold_ordinal
-    ]
-    if len(matches) != 1:
-        _fail(
-            "COST_STRESS_ADVERSITY_PLAN_ROW_MISSING",
-            attempt.ordinal,
-            fold_ordinal,
-        )
-    return dict(matches[0])
+def _publish_source_observation_references(sink, *, frozen, source_observation_cache):
+    references = {}
+    published = {}
+    while source_observation_cache:
+        geometry = next(iter(source_observation_cache))
+        logical_sha, encoded = source_observation_cache[geometry]
+        physical_sha = hashlib.sha256(encoded).hexdigest()
+        reference = published.get(physical_sha)
+        if reference is None:
+            receipt = json.loads(encoded.decode("ascii"))
+            if receipt.get("receipt_sha256") != logical_sha:
+                _fail("SOURCE_OBSERVATION_CACHE_BINDING_MISMATCH")
+            reference = raw_winner.publish_source_observation_receipt(sink, frozen=frozen, receipt=receipt)
+            published[physical_sha] = reference
+        if (reference.get("source_observation_receipt_sha256") != logical_sha
+                or reference["artifact_entry"]["descriptor"].get("sha256") != physical_sha):
+            _fail("SOURCE_OBSERVATION_REFERENCE_BINDING_MISMATCH")
+        references[geometry] = reference
+        del source_observation_cache[geometry]
+    return references
 
 
-def _verify_realized_cost_stress_adversity(
-    *,
-    expected: Mapping[str, Any],
-    attempt: _VerifiedAttempt,
-    fold_ordinal: int,
-    final: _PartitionSlice,
-    receipt: Mapping[str, Any],
+def _require_source_observation_references(value):
+    if not isinstance(value, Mapping) or not value:
+        _fail("SOURCE_OBSERVATION_REFERENCE_SET_REQUIRED")
+    return value
+
+
+def _partition_source_observation_reference(*, references, precommitments, pair,
+        attempt, fold_ordinal, partition):
+    geometry = partition.geometry_receipt
+    reference = references.get(geometry["receipt_sha256"])
+    rows = precommitments.get("rows")
+    matches = [row for row in rows if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
+        == (attempt.ordinal, fold_ordinal, partition.role)] if type(rows) is list else []
+    if not isinstance(reference, Mapping) or len(matches) != 1:
+        _fail("SOURCE_OBSERVATION_REFERENCE_GEOMETRY_MISMATCH")
+    try:
+        row = raw_winner.expand_partition_cost_precommitment(precommitments, matches[0], pair=pair)
+    except raw_winner.WinnerRawEvidenceError as exc:
+        raise AuthoritativeSearchExecutionError(exc.code) from exc
+    if (row.get("partition_geometry_receipt_sha256") != geometry["receipt_sha256"]
+            or row.get("partition_frame_sha256") != geometry["frame_sha256"]
+            or reference.get("source_observation_receipt_sha256") != row.get("source_observation_receipt_sha256")):
+        _fail("SOURCE_OBSERVATION_REFERENCE_BINDING_MISMATCH")
+    return reference
+
+
+def _verify_partition_precommitment(
+    *, precommitments: Mapping[str, Any], attempt: _VerifiedAttempt,
+    fold_ordinal: int, partition: _PartitionSlice, tier: str,
+    result: Mapping[str, Any], pair: Mapping[str, Any],
 ) -> None:
-    expected_realized_status = (
-        pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-        if expected.get("expected_adversity_status")
-        == raw_winner.COST_STRESS_ADVERSITY_EXPECTED_NO_SHOCK
-        else pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
-    )
-    comparisons = {
-        "attempt_ordinal": attempt.ordinal,
-        "horizon_attempt_id": attempt.plan_attempt.get("attempt_id"),
-        "fold_ordinal": fold_ordinal,
-        "final_partition_geometry_receipt_sha256": (
-            final.geometry_receipt.get("receipt_sha256")
-        ),
-        "final_partition_frame_sha256": final.geometry_receipt.get("frame_sha256"),
-        "base_cost_attestation_sha256": receipt.get("base_cost_attestation_sha256"),
-        "stress_cost_attestation_sha256": receipt.get("stress_cost_attestation_sha256"),
-        "base_spread_values_sha256": receipt.get("base_spread_values_sha256"),
-        "stress_spread_values_sha256": receipt.get("stress_spread_values_sha256"),
-    }
-    realized_status = receipt.get("realized_adversity_status")
-    valid_realized_status = (
-        realized_status == expected_realized_status
-        if expected_realized_status
-        == pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT
-        else realized_status
-        in {
-            pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT,
-            pm_core.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_INSUFFICIENT,
-        }
-    )
-    if (
-        any(expected.get(name) != value for name, value in comparisons.items())
-        or not valid_realized_status
-    ):
-        _fail(
-            "FROZEN_COST_STRESS_ADVERSITY_PLAN_MISMATCH",
-            attempt.ordinal,
-            fold_ordinal,
-        )
+    rows = precommitments.get("rows")
+    matches = [row for row in rows if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
+        == (attempt.ordinal, fold_ordinal, partition.role)] if type(rows) is list else []
+    if len(matches) != 1:
+        _fail("PARTITION_COST_PRECOMMIT_ROW_UNAVAILABLE")
+    try:
+        row = raw_winner.expand_partition_cost_precommitment(precommitments, matches[0], pair=pair)
+    except raw_winner.WinnerRawEvidenceError as exc:
+        raise AuthoritativeSearchExecutionError(exc.code) from exc
+    admission = result.get("spread_admission")
+    expected = row.get("tiers", {}).get(tier)
+    observed = {"numerical_execution_cost_attestation": result.get("numerical_execution_cost_attestation"),
+        "entry_observations_sha256": admission.get("entry_observations_sha256") if isinstance(admission, Mapping) else None,
+        "entry_admission_mask_sha256": admission.get("entry_admission_mask_sha256") if isinstance(admission, Mapping) else None}
+    if (row.get("partition_geometry_receipt_sha256") != partition.geometry_receipt["receipt_sha256"]
+            or row.get("partition_frame_sha256") != partition.geometry_receipt["frame_sha256"]
+            or observed != expected):
+        _fail("PARTITION_COST_PRECOMMIT_RESULT_MISMATCH", attempt.ordinal, fold_ordinal, partition.role, tier)
+
+
+def _independent_tier_execution_receipt(lanes: Mapping[str, Mapping[str, Any]],
+        pair_contract: Mapping[str, Any]) -> dict[str, Any]:
+    rows = {}
+    for name, lane in lanes.items():
+        admission = lane["spread_admission"]
+        rows[name] = {"trade_identity_pnl_sha256": _sha256(raw_winner._trade_identity_pnl_evidence(lane, lane=name)),
+            "position_events_sha256": _sha256(lane["position_events"]),
+            "partition_axis_sha256": _sha256(lane["trade_power_partition_axis"]),
+            "numerical_execution_cost_attestation_sha256": _sha256(lane["numerical_execution_cost_attestation"]),
+            "entry_observations_sha256": admission["entry_observations_sha256"],
+            "entry_admission_mask_sha256": admission["entry_admission_mask_sha256"]}
+    return _receipt("fxpm.independent-frozen-tier-execution.v1", {
+        "frozen_tier_pair_contract_sha256": _sha256(pair_contract), "lanes": rows,
+    })
 
 
 def _runtime_strategy(
@@ -2195,9 +2271,13 @@ def _verify_result_cost_attestation(
     result: Mapping[str, Any],
     features: pd.DataFrame,
     spec: InstrumentSpec,
+    spread_tier: spread_profile.FrozenSpreadTier,
+    timeframe: str,
 ) -> None:
     try:
-        entry, intrabar, meta = backtester._build_half_spread_arrays(features, spec)
+        entry, intrabar, meta = backtester._build_half_spread_arrays(
+            features, spec, spread_tier=spread_tier, timeframe=timeframe,
+        )
         rebuilt = backtester._numerical_execution_cost_attestation(
             entry_half_spread=entry,
             intrabar_half_spread=intrabar,
@@ -2216,15 +2296,30 @@ def _verify_result_cost_attestation(
 def _decision_relevant_result(result: Mapping[str, Any], role: str) -> dict[str, Any]:
     if not isinstance(result, Mapping):
         _fail("BACKTEST_RESULT_INVALID", role)
-    body = {name: result.get(name) for name in _RAW_LANE_KEYS}
+    body = {
+        name: result.get(name)
+        for name in _RAW_LANE_KEYS
+        if name != "trade_identity_pnl"
+    }
+    try:
+        body["trade_identity_pnl"] = build_backtest_trade_identity_pnl_evidence(
+            result.get("trades")
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AuthoritativeSearchExecutionError(
+            "BACKTEST_TRADE_IDENTITY_PNL_INVALID", (role,)
+        ) from exc
     if (
-        type(body["position_events"]) is not list
+        type(body["trade_identity_pnl"]) is not list
+        or type(body["position_events"]) is not list
         or type(body["winner_daily_r_surface"]) is not dict
         or body["winner_daily_r_surface"].get("status") != "AVAILABLE"
         or type(body["trade_power_partition_axis"]) is not dict
         or type(body["execution_cost_timing_contract"]) is not dict
         or type(body["numerical_execution_cost_attestation"]) is not dict
         or type(body["swap_accrual_contract"]) is not dict
+        or type(body["spread_model"]) is not dict
+        or type(body["spread_admission"]) is not dict
     ):
         _fail("BACKTEST_DECISION_RELEVANT_RESULT_INCOMPLETE", role)
     return json.loads(_canonical_bytes(body).decode("ascii"))
@@ -2305,7 +2400,7 @@ def _slice_full_prefix_strategy_surface(
     return features, raw_signals
 
 
-def _run_base_partition(
+def _run_tier_partition(
     *,
     partition: _PartitionSlice,
     full_prefix_surface: _FullPrefixStrategySurface,
@@ -2317,6 +2412,8 @@ def _run_base_partition(
     config: PipelineConfig,
     spec: InstrumentSpec,
     expected_source_contract_sha256: str,
+    spread_tier: spread_profile.FrozenSpreadTier,
+    entry_spread_observations: pd.Series,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.Series, Backtester]:
     try:
         features, raw_signals = _slice_full_prefix_strategy_surface(
@@ -2335,6 +2432,8 @@ def _run_base_partition(
             spec=spec,
             timeframe=timeframe,
             warmup_bars=partition.warmup_bars,
+            spread_tier=spread_tier,
+            entry_spread_observations=entry_spread_observations.loc[features.index],
         )
     except AuthoritativeSearchExecutionError:
         raise
@@ -2347,7 +2446,7 @@ def _run_base_partition(
         backtester=backtester,
         result=result,
         features=features,
-        spec=spec,
+        spec=spec, spread_tier=spread_tier, timeframe=timeframe,
     )
     axis = result.get("trade_power_partition_axis")
     if (
@@ -2384,9 +2483,22 @@ def _fold_provenance(
     partitions: Sequence[_PartitionSlice],
     lanes: Mapping[str, Mapping[str, Any]],
     fitted: FittedNativeSearchTimeframe,
-    stress_method_receipt: Mapping[str, Any],
-    final_signals: pd.Series,
+    independent_tier_execution_receipt: Mapping[str, Any],
+    partition_signals: Mapping[str, pd.Series],
+    source_observation_receipts: Mapping[str, Mapping[str, Any]] | None,
+    source_observation_references: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    if source_observation_references is None:
+        if source_observation_receipts is None:
+            _fail("SOURCE_OBSERVATION_PROVENANCE_MISSING")
+        provenance_version = PROVENANCE_RECEIPT_VERSION
+        observation_transport = {"source_observation_receipts": dict(source_observation_receipts)}
+    else:
+        if (source_observation_receipts is not None
+                or set(source_observation_references) != {partition.role for partition in partitions}):
+            _fail("SOURCE_OBSERVATION_PROVENANCE_MIXED")
+        provenance_version = raw_winner.REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA
+        observation_transport = {"source_observation_references": dict(source_observation_references)}
     artifacts = attempt.artifacts
     lane_hashes = {name: _sha256(dict(value)) for name, value in lanes.items()}
     common = {
@@ -2402,7 +2514,7 @@ def _fold_provenance(
         "confers_final_oos_or_trading_authority": False,
     }
     anchor_selection = _receipt(
-        PROVENANCE_RECEIPT_VERSION,
+        provenance_version,
         {
             **common,
             "receipt_role": "anchor_selection_receipt",
@@ -2414,7 +2526,7 @@ def _fold_provenance(
         },
     )
     horizon_decision = _receipt(
-        PROVENANCE_RECEIPT_VERSION,
+        provenance_version,
         {
             **common,
             "receipt_role": "anchor_horizon_decision",
@@ -2436,7 +2548,7 @@ def _fold_provenance(
         },
     )
     trial_ledger = _receipt(
-        PROVENANCE_RECEIPT_VERSION,
+        provenance_version,
         {
             **common,
             "receipt_role": "anchor_trial_ledger",
@@ -2446,7 +2558,7 @@ def _fold_provenance(
         },
     )
     selected_trial = _receipt(
-        PROVENANCE_RECEIPT_VERSION,
+        provenance_version,
         {
             **common,
             "receipt_role": "anchor_selected_trial",
@@ -2458,7 +2570,7 @@ def _fold_provenance(
         },
     )
     refit_receipt = _receipt(
-        PROVENANCE_RECEIPT_VERSION,
+        provenance_version,
         {
             **common,
             "receipt_role": "anchor_refit_receipt",
@@ -2468,46 +2580,32 @@ def _fold_provenance(
             "post_selection_search": False,
         },
     )
-    if not isinstance(final_signals, pd.Series) or not len(final_signals):
-        _fail("FINAL_SIGNAL_VECTOR_INVALID", attempt.ordinal, fold_ordinal)
-    signal_numeric = pd.to_numeric(final_signals, errors="coerce")
-    if signal_numeric.isna().any() or bool((~signal_numeric.isin([-1, 0, 1])).any()):
-        _fail("FINAL_SIGNAL_VECTOR_INVALID", attempt.ordinal, fold_ordinal)
-    signal_values = signal_numeric.astype(np.int32).tolist()
-    signal_sha256 = hashlib.sha256(
-        np.asarray(signal_values, dtype="<i4").tobytes(order="C")
-    ).hexdigest()
-    if signal_sha256 != stress_method_receipt.get("signal_vector_sha256"):
-        _fail("FINAL_SIGNAL_VECTOR_STRESS_MISMATCH", attempt.ordinal, fold_ordinal)
-    signal_vector_receipt = _receipt(
-        SIGNAL_VECTOR_VERSION,
-        {
-            "encoding": "little-endian-signed-int32",
-            "observation_count": len(signal_values),
-            "values": signal_values,
-            "signal_vector_sha256": signal_sha256,
-        },
-    )
-    replay_receipt = _receipt(
-        PROVENANCE_RECEIPT_VERSION,
-        {
-            **common,
-            "receipt_role": "attempt_replay_receipt",
-            "lane_sha256": lane_hashes,
-            "stress_method_receipt_sha256": stress_method_receipt["receipt_sha256"],
-            # Persist the genuine Backtester-owned method receipt itself, not
-            # only a caller-asserted digest.  The raw Winner seam reconstructs
-            # its self-hash and binds its lane attestations/position rosters.
-            "stress_method_receipt": json.loads(
-                _canonical_bytes(dict(stress_method_receipt)).decode("ascii")
-            ),
-            "signal_vector_receipt": signal_vector_receipt,
-            "position_events_are_genuine_backtester_v2": True,
-        },
-    )
+    signal_vector_receipts = {}
+    for partition, signals in partition_signals.items():
+        if not isinstance(signals, pd.Series) or not len(signals):
+            _fail("PARTITION_SIGNAL_VECTOR_INVALID", attempt.ordinal, fold_ordinal, partition)
+        numeric = pd.to_numeric(signals, errors="coerce")
+        if numeric.isna().any() or bool((~numeric.isin([-1, 0, 1])).any()):
+            _fail("PARTITION_SIGNAL_VECTOR_INVALID", attempt.ordinal, fold_ordinal, partition)
+        values = numeric.astype(np.int32).tolist()
+        digest = hashlib.sha256(np.asarray(values, dtype="<i4").tobytes(order="C")).hexdigest()
+        signal_vector_receipts[partition] = _receipt(SIGNAL_VECTOR_VERSION, {
+            "encoding": "little-endian-signed-int32", "observation_count": len(values),
+            "values": values, "signal_vector_sha256": digest,
+        })
+    if set(signal_vector_receipts) != {"optimizer_train", "tuning_validation", "final_lockbox"}:
+        _fail("PARTITION_SIGNAL_VECTOR_ROSTER_INVALID")
+    replay_receipt = _receipt(provenance_version, {
+        **common, "receipt_role": "attempt_replay_receipt", "lane_sha256": lane_hashes,
+        "independent_tier_execution_receipt_sha256": independent_tier_execution_receipt["receipt_sha256"],
+        "independent_tier_execution_receipt": json.loads(_canonical_bytes(dict(independent_tier_execution_receipt)).decode("ascii")),
+        "signal_vector_receipts": signal_vector_receipts,
+        **observation_transport,
+        "position_events_are_genuine_backtester_v2": True,
+    })
     source_decision = fitted.source_group_decision.to_dict()
     oos_source = _receipt(
-        PROVENANCE_RECEIPT_VERSION,
+        provenance_version,
         {
             **common,
             "receipt_role": "oos_source_receipt",
@@ -2540,163 +2638,70 @@ def _fold_provenance(
 
 
 def _build_planned_attempt_evidence(
-    *,
-    attempt: _VerifiedAttempt,
-    raw_attempt_id: str,
-    plan_body: Mapping[str, Any],
-    plan_receipt_sha256: str,
-    fitted: FittedNativeSearchTimeframe,
-    config: PipelineConfig,
-    cost_stress_adversity_plan: Mapping[str, Any],
+    *, attempt: _VerifiedAttempt, raw_attempt_id: str,
+    plan_body: Mapping[str, Any], plan_receipt_sha256: str,
+    fitted: FittedNativeSearchTimeframe, config: PipelineConfig,
+    partition_cost_precommitments: Mapping[str, Any],
+    source_observation_references: Mapping[str, Mapping[str, Any]] | None,
 ) -> dict[str, Any]:
     strategy, _parameters = _runtime_strategy(attempt)
     frame = fitted._frame
-    symbol = plan_body["cell"]["symbol"]
-    timeframe = plan_body["cell"]["timeframe"]
-    regime = plan_body["cell"]["regime"]
-    source_sha = fitted.source_group_decision.to_dict()["source_contract_sha256"]
-    stress_mode = str(config.oos_evidence_execution_stress_mode).strip().lower()
+    symbol, timeframe, regime = (plan_body["cell"][key] for key in ("symbol", "timeframe", "regime"))
     geometry = plan_body.get("derived_dependency_geometry")
-    if type(geometry) is not dict:
+    if type(geometry) is not dict or type(geometry.get("warmup_bars")) is not int:
         _fail("DEPENDENCY_GEOMETRY_MISSING")
-    dependency_warmup_bars = geometry.get("warmup_bars")
-    if type(dependency_warmup_bars) is not int or dependency_warmup_bars < 0:
-        _fail("DEPENDENCY_WARMUP_INVALID")
+    if (not isinstance(fitted.source_contract_seeds, Mapping)
+            or not isinstance(fitted.frozen_tier_pair_contract, Mapping)
+            or not isinstance(fitted._spread_tiers, Mapping)
+            or set(fitted._spread_tiers) != {"P75", "P95"}
+            or not isinstance(fitted._entry_spread_observations, pd.Series)):
+        _fail("FROZEN_TIER_FITTED_INPUTS_UNAVAILABLE")
     full_prefix_surface = _build_full_prefix_strategy_surface(
-        frame=frame,
-        strategy=strategy,
-        symbol=symbol,
-        timeframe=timeframe,
-    )
-    # Backtester run state is immutable apart from its bounded broker-terms
-    # cache and activation pin.  Reuse one instance across this attempt so the
-    # same authenticated terms contract is not reopened for every partition;
-    # every call still rechecks the active pointer before using the cache.
-    base_backtester = Backtester(config)
-    folds: list[dict[str, Any]] = []
+        frame=frame, strategy=strategy, symbol=symbol, timeframe=timeframe)
+    backtester = Backtester(config)
+    folds = []
     for fold_ordinal, fold in enumerate(_causal_folds(attempt)):
-        train, tuning, final = _fold_partitions(
-            frame=frame,
-            fold=fold,
-            attempt=attempt,
-            dependency_warmup_bars=dependency_warmup_bars,
-        )
-        train_result, _train_features, _train_signals, _train_backtester = (
-            _run_base_partition(
-                partition=train,
-                full_prefix_surface=full_prefix_surface,
-                backtester=base_backtester,
-                strategy=strategy,
-                symbol=symbol,
-                timeframe=timeframe,
-                regime=regime,
-                config=config,
-                spec=fitted.instrument_spec,
-                expected_source_contract_sha256=source_sha,
-            )
-        )
-        tuning_result, _tuning_features, _tuning_signals, _tuning_backtester = (
-            _run_base_partition(
-                partition=tuning,
-                full_prefix_surface=full_prefix_surface,
-                backtester=base_backtester,
-                strategy=strategy,
-                symbol=symbol,
-                timeframe=timeframe,
-                regime=regime,
-                config=config,
-                spec=fitted.instrument_spec,
-                expected_source_contract_sha256=source_sha,
-            )
-        )
-        final_result, final_features, final_signals, final_backtester = (
-            _run_base_partition(
-                partition=final,
-                full_prefix_surface=full_prefix_surface,
-                backtester=base_backtester,
-                strategy=strategy,
-                symbol=symbol,
-                timeframe=timeframe,
-                regime=regime,
-                config=config,
-                spec=fitted.instrument_spec,
-                expected_source_contract_sha256=source_sha,
-            )
-        )
-        try:
-            stress_result = final_backtester.replay_frozen_path_cost_stress(
-                final_features,
-                final_signals,
-                symbol,
-                strategy,
-                final_result,
-                stress_mode=stress_mode,
-                spec=fitted.instrument_spec,
-                timeframe=timeframe,
-                warmup_bars=final.warmup_bars,
-            )
-        except Exception as exc:
-            raise AuthoritativeSearchExecutionError(
-                "FROZEN_PATH_COST_STRESS_FAILED",
-                (str(attempt.ordinal), str(fold_ordinal), type(exc).__name__, str(exc)),
-            ) from exc
-        _verify_realized_cost_stress_adversity(
-            expected=_expected_cost_stress_adversity_row(
-                plan=cost_stress_adversity_plan,
-                attempt=attempt,
-                fold_ordinal=fold_ordinal,
-            ),
-            attempt=attempt,
-            fold_ordinal=fold_ordinal,
-            final=final,
-            receipt=stress_result["cost_stress_frozen_path_receipt"],
-        )
-        for result, producing_backtester, producing_features in (
-            (train_result, _train_backtester, _train_features),
-            (tuning_result, _tuning_backtester, _tuning_features),
-            (final_result, final_backtester, final_features),
-        ):
-            _verify_result_cost_attestation(
-                backtester=producing_backtester,
-                result=result,
-                features=producing_features,
-                spec=fitted.instrument_spec,
-            )
-        stress_relevant = _decision_relevant_result(
-            stress_result,
-            "final_lockbox_stress",
-        )
-        lanes = {
-            "optimizer_train_base": _decision_relevant_result(
-                train_result, "optimizer_train"
-            ),
-            "tuning_validation_base": _decision_relevant_result(
-                tuning_result, "tuning_validation"
-            ),
-            "final_lockbox_base": _decision_relevant_result(
-                final_result, "final_lockbox"
-            ),
-            "final_lockbox_stress": stress_relevant,
-        }
-        provenance = _fold_provenance(
-            plan_body=plan_body,
-            plan_receipt_sha256=plan_receipt_sha256,
-            attempt=attempt,
-            fold=fold,
-            fold_ordinal=fold_ordinal,
-            partitions=(train, tuning, final),
-            lanes=lanes,
-            fitted=fitted,
-            stress_method_receipt=stress_result["cost_stress_frozen_path_receipt"],
-            final_signals=final_signals,
-        )
-        folds.append(
-            {
-                "fold_ordinal": fold_ordinal,
-                "provenance": provenance,
-                "lanes": lanes,
-            }
-        )
+        partitions = _fold_partitions(frame=frame, fold=fold, attempt=attempt,
+            dependency_warmup_bars=geometry["warmup_bars"])
+        lanes, partition_signals = {}, {}
+        for partition in partitions:
+            actual_results = {}
+            for tier in ("P75", "P95"):
+                result, _features, signals, _backtester = _run_tier_partition(
+                    partition=partition, full_prefix_surface=full_prefix_surface,
+                    backtester=backtester, strategy=strategy, symbol=symbol,
+                    timeframe=timeframe, regime=regime, config=config,
+                    spec=fitted.instrument_spec,
+                    expected_source_contract_sha256=_source_identity(fitted.source_contract_seeds[tier]),
+                    spread_tier=fitted._spread_tiers[tier],
+                    entry_spread_observations=fitted._entry_spread_observations,
+                )
+                _verify_partition_precommitment(precommitments=partition_cost_precommitments,
+                    attempt=attempt, fold_ordinal=fold_ordinal, partition=partition,
+                    tier=tier, result=result, pair=fitted.frozen_tier_pair_contract)
+                if partition.role in partition_signals and not partition_signals[partition.role].equals(signals):
+                    _fail("PARTITION_SIGNAL_VECTOR_TIER_MISMATCH")
+                partition_signals[partition.role] = signals
+                name = f"{partition.role}_{tier.lower()}"
+                lanes[name] = _decision_relevant_result(result, name)
+                actual_results[tier] = result
+            pair = pm_core.build_backtest_frozen_tier_pair_contract(
+                actual_results, spec=fitted.instrument_spec, use_spread=bool(config.use_spread))
+            if pair != dict(fitted.frozen_tier_pair_contract):
+                _fail("REALIZED_FROZEN_TIER_POLICY_DRIFT", partition.role)
+        receipt = _independent_tier_execution_receipt(lanes, fitted.frozen_tier_pair_contract)
+        provenance = _fold_provenance(plan_body=plan_body,
+            plan_receipt_sha256=plan_receipt_sha256, attempt=attempt, fold=fold,
+            fold_ordinal=fold_ordinal, partitions=partitions, lanes=lanes, fitted=fitted,
+            independent_tier_execution_receipt=receipt, partition_signals=partition_signals,
+            source_observation_receipts=({partition.role: _source_observation_receipt(fitted, partition.frame.index)
+                for partition in partitions} if source_observation_references is None else None),
+            source_observation_references=({partition.role: _partition_source_observation_reference(
+                references=source_observation_references, precommitments=partition_cost_precommitments,
+                pair=fitted.frozen_tier_pair_contract, attempt=attempt,
+                fold_ordinal=fold_ordinal, partition=partition) for partition in partitions}
+                if source_observation_references is not None else None))
+        folds.append({"fold_ordinal": fold_ordinal, "provenance": provenance, "lanes": lanes})
     return {"attempt_id": raw_attempt_id, "folds": folds}
 
 
@@ -2721,8 +2726,9 @@ def _reverify_fitted_timeframe(
         (source, refreshed.source_group_decision.to_dict()),
         (fitted.regime_fit_decision.to_dict(), refreshed.regime_fit_decision.to_dict()),
         (dict(fitted.source_contract_seed), dict(refreshed.source_contract_seed)),
-        (dict(fitted.base_cost_policy), dict(refreshed.base_cost_policy)),
-        (dict(fitted.stress_cost_policy), dict(refreshed.stress_cost_policy)),
+        (dict(fitted.cost_ladder_contract), dict(refreshed.cost_ladder_contract)),
+        (fitted.source_contract_seeds, refreshed.source_contract_seeds),
+        (fitted.frozen_tier_pair_contract, refreshed.frozen_tier_pair_contract),
         (dict(fitted.regime_parameters), dict(refreshed.regime_parameters)),
         (dict(fitted.train_regime_support), dict(refreshed.train_regime_support)),
         (dict(fitted.execution_spec_receipt), dict(refreshed.execution_spec_receipt)),
@@ -2736,6 +2742,11 @@ def _reverify_fitted_timeframe(
         or _frame_sha256(fitted._frame) != fitted.frame_sha256
     ):
         _fail("FITTED_TIMEFRAME_FRAME_CHANGED")
+    if (not isinstance(fitted._entry_spread_observations, pd.Series)
+            or not fitted._entry_spread_observations.equals(refreshed._entry_spread_observations)
+            or not isinstance(fitted._spread_source_product, native_prefix.NativePrefixProduct)
+            or fitted._spread_source_product.index_sha256 != refreshed._spread_source_product.index_sha256):
+        _fail("FITTED_TIMEFRAME_SPREAD_SOURCE_CHANGED")
     return refreshed
 
 
@@ -3239,8 +3250,8 @@ def _bounded_canary_failure_diagnostic(
         if (
             exc.code
             in {
-                "FROZEN_PATH_COST_STRESS_FAILED",
-                "FROZEN_COST_STRESS_ADVERSITY_PLAN_MISMATCH",
+                "FROZEN_PATH_COST_LADDER_FAILED",
+                "FROZEN_COST_LADDER_ADVERSITY_PLAN_MISMATCH",
             }
             and len(raw_details) >= 2
         ):
@@ -3252,9 +3263,9 @@ def _bounded_canary_failure_diagnostic(
             else:
                 if 0 <= parsed_attempt < attempted_trials_exact:
                     attempt_ordinal = parsed_attempt
-                    if 0 <= parsed_fold < winner_v11.MAX_FOLDS:
+                    if 0 <= parsed_fold < winner.MAX_FOLDS:
                         fold_ordinal = parsed_fold
-            if exc.code == "FROZEN_PATH_COST_STRESS_FAILED" and len(raw_details) >= 3:
+            if exc.code == "FROZEN_PATH_COST_LADDER_FAILED" and len(raw_details) >= 3:
                 candidate_type = raw_details[2].strip()
                 if candidate_type:
                     exception_type = candidate_type
@@ -3369,7 +3380,6 @@ def _verified_current_observed_inputs(
         or receipt.get("regime_fit_decision_sha256")
         != refreshed.regime_fit_decision.receipt_sha256
         or receipt.get("train_regime_support_sha256") != support_receipt
-        or binding.get("train_regime_support_receipt_sha256") != support_receipt
         or binding.get("plan_receipt_sha256") != _sha256(plan_body)
     ):
         _fail("CURRENT_FITTED_PLAN_BINDING_MISMATCH")
@@ -3389,7 +3399,7 @@ def _build_current_cross_binding_bytes(
     horizon_execution_contracts: Sequence[Mapping[str, Any]],
     source_count_receipts: Sequence[Mapping[str, Any]],
 ) -> bytes:
-    """Derive CURRENT v2 from the released Horizon<->Winner bijection."""
+    """Derive CURRENT v4 from the released Horizon<->Winner bijection."""
 
     anchor = plan_body.get("anchor")
     if not isinstance(anchor, Mapping):
@@ -3409,7 +3419,9 @@ def _build_current_cross_binding_bytes(
     )
     if (
         historical_body.get("schema_version")
-        != raw_winner.HORIZON_WINNER_CROSS_BINDING_SCHEMA
+        != (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+            if frozen.selection_generation is winner.V16_GENERATION
+            else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3)
     ):
         _fail("CURRENT_CROSS_BINDING_BASE_INVALID")
     current = dict(historical_body)
@@ -3424,7 +3436,9 @@ def _build_current_cross_binding_bytes(
         current.pop(name)
     current.update(
         {
-            "schema_version": raw_winner.HORIZON_WINNER_CROSS_BINDING_SCHEMA_V2,
+            "schema_version": (raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
+                if frozen.selection_generation is winner.V16_GENERATION
+                else raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4),
             "mode": raw_winner.CURRENT_CROSS_BINDING_MODE,
             "cell_plan_receipt_sha256": cell_plan.receipt_sha256,
             "causal_precommit_receipt_sha256": (
@@ -3466,6 +3480,399 @@ def _persist_current_cross_binding(
     return json.loads(_canonical_bytes(entry).decode("ascii"))
 
 
+def _signal_design_utc(value: Any, code: str) -> pd.Timestamp:
+    try:
+        stamp = pd.Timestamp(value)
+        if pd.isna(stamp) or str(stamp.tz) != "UTC":
+            _fail(code)
+        return stamp.as_unit("ns")
+    except AuthoritativeSearchExecutionError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AuthoritativeSearchExecutionError(code, (type(exc).__name__,)) from exc
+
+
+def _signal_design_frame(frame: pd.DataFrame, cap: pd.Timestamp) -> pd.DataFrame:
+    """Validate native UTC before losslessly changing storage resolution only."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "_BAR_CLOSE_TS" not in frame:
+        _fail("SIGNAL_DESIGN_FRAME_INVALID")
+    try:
+        opens = pd.DatetimeIndex(frame.index)
+        closes = pd.DatetimeIndex(frame["_BAR_CLOSE_TS"])
+        for axis in (opens, closes):
+            if (str(axis.tz) != "UTC" or axis.hasnans
+                    or not axis.is_unique or not axis.is_monotonic_increasing):
+                _fail("SIGNAL_DESIGN_NATIVE_UTC_AXIS_REQUIRED")
+        if (closes <= opens).any() or (closes[:-1] > opens[1:]).any():
+            _fail("SIGNAL_DESIGN_BAR_AXIS_INVALID")
+        if closes[-1] > cap or opens[-1] >= cap:
+            _fail("SIGNAL_DESIGN_TRAIN_CAP_EXCEEDED")
+        normalized_opens, normalized_closes = opens.as_unit("ns"), closes.as_unit("ns")
+        if not (normalized_opens == opens).all() or not (normalized_closes == closes).all():
+            _fail("SIGNAL_DESIGN_NS_NORMALIZATION_LOSS")
+    except AuthoritativeSearchExecutionError:
+        raise
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AuthoritativeSearchExecutionError(
+            "SIGNAL_DESIGN_NS_NORMALIZATION_FAILED", (type(exc).__name__,)
+        ) from exc
+    local = frame.copy(deep=False)
+    local.index = normalized_opens
+    local["_BAR_CLOSE_TS"] = normalized_closes
+    local.attrs = {}
+    return local
+
+
+def _signal_design_window(partition: _PartitionSlice, features: pd.DataFrame,
+        cap: pd.Timestamp) -> tuple[int, pd.Timestamp, pd.Timestamp]:
+    first_entry = max(1, partition.warmup_bars)
+    if first_entry >= len(features):
+        _fail("SIGNAL_DESIGN_SIGNAL_WINDOW_INVALID")
+    cutoff = _signal_design_utc(features["_BAR_CLOSE_TS"].iloc[-1],
+        "SIGNAL_DESIGN_PARTITION_CUTOFF_INVALID")
+    start = _signal_design_utc(features["_BAR_CLOSE_TS"].iloc[first_entry - 1],
+        "SIGNAL_DESIGN_SIGNAL_START_INVALID")
+    if start >= cutoff or cutoff > cap:
+        _fail("SIGNAL_DESIGN_SIGNAL_WINDOW_INVALID")
+    return first_entry, start, cutoff
+
+
+def _signal_design_groups(records) -> list[dict[str, Any]]:
+    """Descriptive denominators/moments; unresolved labels are not zero PnL."""
+    groups: dict[tuple, dict[str, Any]] = {}
+    for record in records:
+        key = (record.entry_regime, record.entry_admission, record.status)
+        row = groups.setdefault(key, {"observation_count": 0, "closed_pips": []})
+        row["observation_count"] += 1
+        if record.status == "CLOSED":
+            row["closed_pips"].append(record.signed_pips)
+    result = []
+    for (regime, admission, status), row in sorted(groups.items(),
+            key=lambda item: tuple("" if value is None else value for value in item[0])):
+        values = row["closed_pips"]
+        try:
+            total = math.fsum(values) if values else None
+            squares = math.fsum(value * value for value in values) if values else None
+            if values and (not math.isfinite(total) or not math.isfinite(squares)):
+                _fail("SIGNAL_DESIGN_GROUP_MOMENTS_INVALID")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise AuthoritativeSearchExecutionError("SIGNAL_DESIGN_GROUP_MOMENTS_INVALID") from exc
+        result.append({"entry_regime": regime, "entry_admission": admission, "status": status,
+            "observation_count": row["observation_count"], "closed_observation_count": len(values),
+            "closed_signed_pip_sum": total, "closed_signed_pip_sum_squares": squares})
+    return result
+
+
+def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receipt,
+        causal_precommit_payload, cell_plan, fitted, frozen_pipeline_config,
+        declared_slot_roster=None):
+    import pm_production_config_binding as config_binding
+    import pm_production_anchor_plan as anchor_authority
+    import pm_production_search_planner as planner
+
+    if declared_slot_roster is not None or getattr(cell_plan, "mode", None) == "DECLARED_SLOT_UNISSUED":
+        _fail("SIGNAL_DESIGN_DECLARED_SLOTS_UNSUPPORTED")
+    if (type(sink) is not authority_spool.SymbolAuthoritySink
+            or sink.manifest_domain != authority_spool.GENERAL_MANIFEST_DOMAIN):
+        _fail("SIGNAL_DESIGN_GENERAL_SINK_REQUIRED")
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("SIGNAL_DESIGN_FROZEN_CONFIG_REQUIRED")
+    config = frozen_pipeline_config.materialize(sink.context)
+    planner.verify_frozen_production_search_process(sink.context, process)
+    metadata = planner._validate_request(planning_request, process=process,
+        context=sink.context, causal_precommit_payload=causal_precommit_payload)
+    if metadata.get("schema_version") != historical.PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA:
+        _fail("SIGNAL_DESIGN_PLANNING_METADATA_REQUIRED")
+    if planner.verify_production_cell_search_plan(sink.context, process=process,
+            sink=sink, plan=cell_plan) is not True:
+        _fail("SIGNAL_DESIGN_CELL_PLAN_INVALID")
+    if (getattr(cell_plan, "mode", None) != "HISTORICAL_ANCHOR"
+            or sink.symbol != cell_plan.symbol
+            or planning_request.symbol_sink(sink.symbol) is not sink
+            or type(fitted) is not FittedNativeSearchTimeframe):
+        _fail("SIGNAL_DESIGN_METADATA_BINDING_INVALID")
+    precommit = json.loads(_canonical_bytes(dict(causal_precommit_payload)).decode("ascii"))
+    verified_anchor_plan = anchor_authority.verify_production_anchor_plan_receipt(
+        Path(config.data_dir), anchor_plan_receipt)
+    anchors = verified_anchor_plan["anchor_plan"]
+    if (_canonical_bytes(precommit["process_definition"]["anchor_plan"]) != _canonical_bytes(anchors)
+            or _sha256(anchors) != verified_anchor_plan["anchor_plan_sha256"]):
+        _fail("SIGNAL_DESIGN_ANCHOR_AUTHORITY_MISMATCH")
+    earliest = min(_signal_design_utc(row["selection_cutoff_utc"],
+        "SIGNAL_DESIGN_JUDGING_CUTOFF_INVALID") for row in anchors)
+    if (not isinstance(fitted._spread_tiers, Mapping)
+            or set(fitted._spread_tiers) != {"P75", "P95"}):
+        _fail("SIGNAL_DESIGN_FROZEN_TIERS_REQUIRED")
+    tier_descriptors = {tier: value.descriptor() for tier, value in fitted._spread_tiers.items()}
+    protected = {_signal_design_utc(row.get("protected_cutoff_utc"),
+        "SIGNAL_DESIGN_PROTECTED_CUTOFF_INVALID") for row in tier_descriptors.values()}
+    profiles = {row.get("profile_sha256") for row in tier_descriptors.values()}
+    if len(protected) != 1 or len(profiles) != 1:
+        _fail("SIGNAL_DESIGN_PROFILE_PAIR_MISMATCH")
+    calibration_cap = next(iter(protected))
+    cap = min(earliest, calibration_cap)
+    native = fitted.product.native_prefix
+    for value in (fitted.product.index.get("cutoff_utc"), native.get("prefix_last_close_utc"),
+                  native.get("prefix_end_exclusive_utc")):
+        if _signal_design_utc(value, "SIGNAL_DESIGN_PREFIX_CUTOFF_INVALID") > cap:
+            _fail("SIGNAL_DESIGN_TRAIN_CAP_EXCEEDED")
+    # Guard the held surface before replay: a future fit is not made safe by
+    # clipping its output after it has already consumed judging observations.
+    _signal_design_frame(fitted._frame, cap)
+    fine = fitted._spread_source_product
+    if type(fine) is not native_prefix.NativePrefixProduct:
+        _fail("SIGNAL_DESIGN_FINE_PREFIX_REQUIRED")
+    for value in (fine.index.get("cutoff_utc"), fine.native_prefix.get("prefix_last_close_utc"),
+                  fine.native_prefix.get("prefix_end_exclusive_utc")):
+        if _signal_design_utc(value, "SIGNAL_DESIGN_FINE_PREFIX_CUTOFF_INVALID") > cap:
+            _fail("SIGNAL_DESIGN_TRAIN_CAP_EXCEEDED")
+    _signal_design_frame(fitted._spread_source_frame, cap)
+    refreshed = _reverify_fitted_timeframe(fitted, config)
+    frame = _signal_design_frame(refreshed._frame, cap)
+    plan_body, attempts = _verify_attempt_roster(plan=cell_plan.horizon_plan,
+        attempt_artifacts=cell_plan.attempt_artifacts(), fitted=refreshed, regime=cell_plan.regime)
+    if len(attempts) != MAX_ATTEMPTS or MAX_ATTEMPTS != 300:
+        _fail("SIGNAL_DESIGN_COMPLETE_300_ROSTER_REQUIRED")
+    anchor = plan_body["anchor"]
+    if (anchor.get("anchor_id") != metadata["anchor"]["anchor_id"]
+            or anchor.get("selection_cutoff_utc") != metadata["anchor"]["selection_cutoff_utc"]
+            or anchor.get("process_precommit_receipt_sha256")
+            != metadata["process_precommit_receipt_sha256"]
+            or _signal_design_utc(anchor["selection_cutoff_utc"],
+                "SIGNAL_DESIGN_ANCHOR_CUTOFF_INVALID") > cap):
+        _fail("SIGNAL_DESIGN_JUDGING_PLAN_MISMATCH")
+    geometry = plan_body.get("derived_dependency_geometry")
+    if type(geometry) is not dict or type(geometry.get("warmup_bars")) is not int:
+        _fail("SIGNAL_DESIGN_DEPENDENCY_GEOMETRY_INVALID")
+    roster = []
+    for attempt in attempts:
+        for fold in (_causal_folds(attempt) if attempt.plan_attempt["status"] == "PLANNED" else ()):
+            for field in ("fit_end_exclusive_utc", "validation_end_exclusive_utc"):
+                if _signal_design_utc(fold[field], "SIGNAL_DESIGN_FOLD_END_INVALID") > cap:
+                    _fail("SIGNAL_DESIGN_TRAIN_CAP_EXCEEDED")
+        roster.append({"ordinal": attempt.ordinal,
+            "horizon_attempt_id": attempt.plan_attempt["attempt_id"],
+            "process_candidate_id": attempt.artifacts.process_candidate_id,
+            "status": attempt.plan_attempt["status"],
+            "reason_code": attempt.plan_attempt.get("reason_code"),
+            "trial_definition_sha256": attempt.artifacts.trial_definition_sha256,
+            "refit_recipe_sha256": attempt.artifacts.refit_recipe_sha256})
+    binding = {"schema_version": SIGNAL_DESIGN_REQUEST_SCHEMA,
+        "authority_scope": "TRAIN_DESIGN_LABELS_ONLY",
+        "judging_scope": "AUTHENTICATED_HISTORICAL_ANCHOR_PLAN_ONLY",
+        "declared_slots_supported": False,
+        "grant_is_separate_from_planning_metadata": True,
+        "validation_evidence": False, "qualification_authority": False,
+        "current_or_trading_authority": False, "score_or_shortlist_authority": False,
+        "generation_context_sha256": sink.context.context_sha256,
+        "search_process_receipt_sha256": process.receipt_sha256,
+        "candidate_domain_sha256": process.to_dict()["candidate_domain_sha256"],
+        "planning_metadata_sha256": _sha256(metadata),
+        "causal_precommit_sha256": _sha256(precommit),
+        "production_anchor_plan_receipt_sha256": anchor_plan_receipt.receipt_sha256,
+        "production_anchor_plan_sha256": verified_anchor_plan["anchor_plan_sha256"],
+        "cell_plan_receipt_sha256": cell_plan.receipt_sha256,
+        "horizon_plan_receipt_sha256": cell_plan.horizon_plan.receipt_sha256,
+        "cell": dict(plan_body["cell"]),
+        "config_sha256": frozen_pipeline_config.config_sha256,
+        "effective_config_sha256": frozen_pipeline_config.effective_config_sha256,
+        "training_label_cap_utc": cap.isoformat().replace("+00:00", "Z"),
+        "earliest_judging_cutoff_utc": earliest.isoformat().replace("+00:00", "Z"),
+        "spread_calibration_cutoff_utc": calibration_cap.isoformat().replace("+00:00", "Z"),
+        "retrospective_frozen_spread_scenario": True,
+        "spread_profile_sha256": next(iter(profiles)),
+        "frozen_tier_pair_contract_sha256": _sha256(refreshed.frozen_tier_pair_contract),
+        "native_prefix_index_sha256": refreshed.product.index_sha256,
+        "native_prefix_content_sha256": native["prefix_content_sha256"],
+        "fit_prefix_extent": {"requested_cutoff_utc": refreshed.product.index["cutoff_utc"],
+            "first_open_utc": native["prefix_first_open_utc"],
+            "last_close_utc": native["prefix_last_close_utc"], "rows": native["prefix_rows"]},
+        "native_fitted_frame_sha256": refreshed.frame_sha256,
+        "normalized_fitted_frame_sha256": _frame_sha256(frame),
+        "execution_spec_receipt_sha256": _sha256(dict(refreshed.execution_spec_receipt)),
+        "regime_fit_decision_sha256": refreshed.regime_fit_decision.receipt_sha256,
+        "train_regime_support_sha256": _sha256(dict(refreshed.train_regime_support)),
+        "source_sha256": {"executor": _file_sha256(Path(__file__)),
+            "labeler": _file_sha256(Path(signal_opportunities.__file__))},
+        "labeler_schema_version": signal_opportunities.SCHEMA_VERSION,
+        "attempt_count": len(roster), "attempt_roster": roster,
+        "attempt_roster_sha256": _sha256(roster)}
+    return binding, refreshed, frame, config, plan_body, attempts
+
+
+def issue_signal_opportunity_design_request(*, process, sink, planning_request,
+        anchor_plan_receipt, causal_precommit_payload, cell_plan, fitted, frozen_pipeline_config,
+        declared_slot_roster=None
+) -> SignalOpportunityDesignRequest:
+    """Issue a distinct descriptive TRAIN grant from verified planning metadata.
+
+    This does not alter that metadata's no-return planning permission, create a
+    causal PASS, or make the resulting labels validation/WFV evidence.
+    """
+    binding, *_ = _signal_design_inputs(process=process, sink=sink,
+        planning_request=planning_request, anchor_plan_receipt=anchor_plan_receipt,
+        causal_precommit_payload=causal_precommit_payload,
+        cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config,
+        declared_slot_roster=declared_slot_roster)
+    encoded = _canonical_bytes(binding)
+    identifier = hashlib.sha256(encoded).hexdigest()
+    entry = sink.put_json("signal-design-request/" + identifier,
+        "signal_opportunity_train_design_request", binding)
+    return SignalOpportunityDesignRequest(encoded, _canonical_bytes(entry), planning_request, anchor_plan_receipt,
+        _canonical_bytes(dict(causal_precommit_payload)), _SIGNAL_DESIGN_REQUEST_SEAL)
+
+
+def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
+        fitted, frozen_pipeline_config) -> SignalOpportunityDesignExecution:
+    """Stream every requested label; never execute an account or select a winner."""
+    if (type(request) is not SignalOpportunityDesignRequest
+            or request._seal is not _SIGNAL_DESIGN_REQUEST_SEAL):
+        _fail("SIGNAL_DESIGN_REQUEST_REQUIRED")
+    binding, refreshed, frame, config, plan_body, attempts = _signal_design_inputs(
+        process=process, sink=sink, planning_request=request._planning_request,
+        anchor_plan_receipt=request._anchor_plan_receipt,
+        causal_precommit_payload=json.loads(request._causal_precommit_json.decode("ascii")),
+        cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config)
+    if _canonical_bytes(binding) != request._body_json:
+        _fail("SIGNAL_DESIGN_REQUEST_BINDING_CHANGED")
+    request_entry = json.loads(request._entry_json.decode("ascii"))
+    authority_spool._verify_artifact_file(sink.context, request_entry["descriptor"])
+    if request_entry["descriptor"]["sha256"] != request.receipt_sha256:
+        _fail("SIGNAL_DESIGN_REQUEST_ARTIFACT_MISMATCH")
+    pricing = Backtester(config)  # Source/cost helpers only; no account simulation.
+    totals = {key: 0 for key in ("roster_count", "presearch_rejected_count", "evaluated_attempt_count",
+        "batch_count", "opportunity_count", "closed_count", "right_censored_count",
+        "no_next_observation_count", "unavailable_regime_count", "source_observation_receipt_count",
+        "source_observation_row_count")}
+    observation_receipts_seen: set[str] = set()
+    cap = _signal_design_utc(binding["training_label_cap_utc"], "SIGNAL_DESIGN_CAP_INVALID")
+
+    def line(value):
+        return _canonical_bytes(value) + b"\n"
+
+    def chunks():
+        yield line({"record_type": "HEADER", "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA,
+            "request_sha256": request.receipt_sha256, "request": binding,
+            "complete_cost_net_profit_available": False,
+            "source_observation_reference_semantics": "EXACT_RECEIPT_EMITTED_ONCE_BEFORE_FIRST_SHA256_REFERENCE",
+            "swap_status": "UNAVAILABLE_PRICE_UNIT_CONVERSION"})
+        for attempt in attempts:
+            totals["roster_count"] += 1
+            yield line({"record_type": "ATTEMPT", **binding["attempt_roster"][attempt.ordinal]})
+            if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
+                totals["presearch_rejected_count"] += 1
+                continue
+            if attempt.plan_attempt["status"] != "PLANNED":
+                _fail("SIGNAL_DESIGN_ATTEMPT_DISPOSITION_INVALID")
+            strategy, _ = _runtime_strategy(attempt)
+            surface = _build_full_prefix_strategy_surface(frame=frame, strategy=strategy,
+                symbol=cell_plan.symbol, timeframe=cell_plan.timeframe)
+            _signal_design_frame(surface.features, cap)
+            totals["evaluated_attempt_count"] += 1
+            config_sha = _sha256({"effective_config_sha256": binding["effective_config_sha256"],
+                "trial_definition_sha256": attempt.artifacts.trial_definition_sha256,
+                "refit_recipe_sha256": attempt.artifacts.refit_recipe_sha256})
+            for fold_ordinal, fold in enumerate(_causal_folds(attempt)):
+                partitions = _fold_partitions(frame=frame, fold=fold, attempt=attempt,
+                    dependency_warmup_bars=plan_body["derived_dependency_geometry"]["warmup_bars"])
+                for partition in partitions:
+                    features, signals = _slice_full_prefix_strategy_surface(
+                        partition=partition, full_prefix_surface=surface)
+                    features = _signal_design_frame(features, cap)
+                    first_entry, start, cutoff = _signal_design_window(partition, features, cap)
+                    values = signals.to_numpy(dtype="<i4", copy=False)
+                    surface_sha = _sha256({"features_sha256": _frame_sha256(features),
+                        "raw_signals_sha256": hashlib.sha256(values.tobytes(order="C")).hexdigest(),
+                        "partition_geometry": dict(partition.geometry_receipt),
+                        "signal_start_utc": start.isoformat(), "cutoff_utc": cutoff.isoformat()})
+                    observations = refreshed._entry_spread_observations.loc[features.index]
+                    observation_receipt = _source_observation_receipt(refreshed, features.index)
+                    observation_sha = _sha256(observation_receipt)
+                    if observation_sha not in observation_receipts_seen:
+                        observation_receipts_seen.add(observation_sha)
+                        totals["source_observation_receipt_count"] += 1
+                        totals["source_observation_row_count"] += len(observation_receipt["observations"])
+                        yield line({"record_type": "SOURCE_OBSERVATIONS", "sha256": observation_sha,
+                            "receipt": observation_receipt})
+                    for tier in ("P75", "P95"):
+                        spread_tier = refreshed._spread_tiers[tier]
+                        entry, exits, spread_meta = pricing._build_half_spread_arrays(features,
+                            refreshed.instrument_spec, spread_tier=spread_tier, timeframe=cell_plan.timeframe)
+                        states, admission = pricing._entry_spread_admission_inputs(features, spread_tier, observations)
+                        cost = pricing._numerical_execution_cost_attestation(entry_half_spread=entry,
+                            intrabar_half_spread=exits, spread_meta=spread_meta, spec=refreshed.instrument_spec)
+                        numerical = {"cost_attestation": cost, "spread_model": spread_meta,
+                            "entry_half_spread_f64le_sha256": hashlib.sha256(
+                                np.asarray(entry, dtype="<f8").tobytes(order="C")).hexdigest(),
+                            "exit_half_spread_f64le_sha256": hashlib.sha256(
+                                np.asarray(exits, dtype="<f8").tobytes(order="C")).hexdigest()}
+                        admission_binding = {**admission,
+                            "all_states_sha256": _sha256(states.tolist()),
+                            "source_observation_receipt_sha256": observation_sha}
+                        provenance = signal_opportunities.OpportunityProvenance(strategy.name,
+                            config_sha, surface_sha, tier, _sha256(numerical), _sha256(admission_binding))
+                        batch = signal_opportunities.label_signal_opportunities(features, signals,
+                            strategy=strategy, spec=refreshed.instrument_spec, symbol=cell_plan.symbol,
+                            timeframe=cell_plan.timeframe, cutoff_utc=cutoff, signal_start_utc=start,
+                            entry_half_spreads=entry, exit_half_spreads=exits,
+                            entry_admission=states, provenance=provenance)
+                        summary = {"record_type": "BATCH", "attempt_ordinal": attempt.ordinal,
+                            "fold_ordinal": fold_ordinal, "partition": partition.role, "tier": tier,
+                            "partition_geometry": dict(partition.geometry_receipt),
+                            "first_entry_bar": first_entry, "signal_start_utc": batch.signal_start_utc,
+                            "cutoff_utc": batch.cutoff_utc, "provenance": asdict(provenance),
+                            "pip_size": batch.pip_size, "numerical_spread_binding": numerical,
+                            "admission_binding": admission_binding,
+                            "raw_nonzero_count": batch.raw_nonzero_count,
+                            "excluded_before_start_count": batch.excluded_before_start_count,
+                            "window_nonzero_count": batch.window_nonzero_count,
+                            "unavailable_regime_count": batch.unavailable_regime_count,
+                            "descriptive_groups": _signal_design_groups(batch.records),
+                            "qualification_authority": False}
+                        totals["batch_count"] += 1
+                        totals["opportunity_count"] += len(batch.records)
+                        totals["unavailable_regime_count"] += batch.unavailable_regime_count
+                        yield line(summary)
+                        for record in batch.records:
+                            totals[{"CLOSED": "closed_count", "RIGHT_CENSORED": "right_censored_count",
+                                "NO_NEXT_OBSERVATION": "no_next_observation_count"}[record.status]] += 1
+                            yield line({"record_type": "OPPORTUNITY", "attempt_ordinal": attempt.ordinal,
+                                "fold_ordinal": fold_ordinal, "partition": partition.role, "tier": tier,
+                                "label": asdict(record)})
+                        del batch
+                del partitions
+            del surface
+        if (totals["roster_count"] != 300 or totals["evaluated_attempt_count"]
+                + totals["presearch_rejected_count"] != 300):
+            _fail("SIGNAL_DESIGN_COMPLETE_ROSTER_MISMATCH")
+        frozen_pipeline_config.verify_current(sink.context)
+        if (_frame_sha256(refreshed._frame) != binding["native_fitted_frame_sha256"]
+                or _file_sha256(Path(__file__)) != binding["source_sha256"]["executor"]
+                or _file_sha256(Path(signal_opportunities.__file__)) != binding["source_sha256"]["labeler"]):
+            _fail("SIGNAL_DESIGN_SOURCE_CHANGED")
+        native_prefix.reverify_activated_native_prefix_product(refreshed.product,
+            sink.context, require_current_activation=True)
+        yield line({"record_type": "COMPLETE", "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA,
+            "request_sha256": request.receipt_sha256, **totals,
+            "validation_evidence": False, "qualification_authority": False,
+            "current_or_trading_authority": False})
+
+    def bounded_chunks():
+        width = sink.context.limits.stream_chunk_bytes
+        for encoded in chunks():
+            for offset in range(0, len(encoded), width):
+                yield encoded[offset:offset + width]
+
+    entry = sink.put_opaque("signal-design-tape/" + request.receipt_sha256,
+        "signal_opportunity_train_design_tape", bounded_chunks(), format=SIGNAL_DESIGN_TAPE_FORMAT)
+    return SignalOpportunityDesignExecution(_canonical_bytes({
+        "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA, "status": "DESCRIPTIVE_COMPLETE",
+        "authority_scope": "TRAIN_DESIGN_LABELS_ONLY", "request_sha256": request.receipt_sha256,
+        "artifact_entry": entry, **totals, "validation_evidence": False,
+        "qualification_authority": False, "current_or_trading_authority": False,
+        "score_or_shortlist_authority": False}))
+
+
 def execute_current_observed_cell(
     *,
     process: Any,
@@ -3474,10 +3881,28 @@ def execute_current_observed_cell(
     fitted: FittedNativeSearchTimeframe,
     config: PipelineConfig,
 ) -> CurrentObservedCellExecution:
+    """Execute the preserved v15 current-search edition."""
+    return _execute_current_observed_cell(process=process, sink=sink, cell_plan=cell_plan,
+        fitted=fitted, config=config, _generation=winner.CURRENT_GENERATION)
+
+
+def execute_transport_current_observed_cell(
+    *, process: Any, sink: authority_spool.SymbolAuthoritySink, cell_plan: Any,
+    fitted: FittedNativeSearchTimeframe, config: PipelineConfig,
+) -> CurrentObservedCellExecution:
+    """Execute v16 transport under the same existing current-search grants."""
+    return _execute_current_observed_cell(process=process, sink=sink, cell_plan=cell_plan,
+        fitted=fitted, config=config, _generation=winner.V16_GENERATION)
+
+
+def _execute_current_observed_cell(
+    *, process: Any, sink: authority_spool.SymbolAuthoritySink, cell_plan: Any,
+    fitted: FittedNativeSearchTimeframe, config: PipelineConfig, _generation: Any,
+) -> CurrentObservedCellExecution:
     """Execute one sealed latest-cutoff observed cell through raw Winner.
 
     The independently fitted native frame is byte-replayed and cross-bound to
-    the sealed current cell plan before any strategy evaluation.  The exact v2
+    the sealed current cell plan before any strategy evaluation.  The exact current
     Horizon/Raw-Winner binding is then persisted before evaluation begins.
     Infrastructure failures raise and abort the current generation; only a
     precommitted source-boundary shortfall can return without raw production.
@@ -3517,7 +3942,7 @@ def execute_current_observed_cell(
                 cross_binding_entry=None,
             )
         fold_plan = _winner_fold_plan(attempts)
-        minimum_folds = int(winner_v11.PINNED_SELECTION_POLICY["min_causal_folds"])
+        minimum_folds = int(winner.CURRENT_SELECTION_POLICY["min_causal_folds"])
         if len(fold_plan) < minimum_folds:
             _fail("WINNER_FOLD_PLAN_BELOW_EVIDENCE_FLOOR")
 
@@ -3532,16 +3957,20 @@ def execute_current_observed_cell(
                 native_prefix_product=refreshed.product,
             )
         )
-        cost_stress_adversity_plan = _build_cost_stress_adversity_plan(
+        source_observation_cache: dict[str, tuple[str, bytes]] = {}
+        partition_cost_precommitments = _partition_cost_precommitments(
             attempts=attempts,
             fold_plan=fold_plan,
             plan_body=plan_body,
             fitted=refreshed,
             config=config,
+            source_observation_cache=source_observation_cache,
         )
         precommitted_at = _now_utc_seconds()
         attempts_frozen_at = _next_observed_utc_second(precommitted_at)
-        frozen = raw_winner.freeze_winner_search_plan_v3(
+        freeze = (raw_winner.freeze_winner_search_plan_v5 if _generation is winner.V16_GENERATION
+                  else raw_winner.freeze_winner_search_plan_v4)
+        frozen = freeze(
             sink,
             symbol=cell_plan.symbol,
             timeframe=cell_plan.timeframe,
@@ -3552,11 +3981,10 @@ def execute_current_observed_cell(
             attempt_artifacts=normalized_attempts,
             precommitted_evidence_roles=_precommitted_evidence_roles(attempts),
             horizon_execution_contracts=execution_contracts,
-            source_contract_seed=refreshed.source_contract_seed,
-            base_cost_contract=refreshed.base_cost_policy,
-            stress_cost_contract=refreshed.stress_cost_policy,
+            source_contract_seeds=refreshed.source_contract_seeds,
+            frozen_tier_pair_contract=refreshed.frozen_tier_pair_contract,
             risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
-            cost_stress_adversity_plan=cost_stress_adversity_plan,
+            partition_cost_precommitments=partition_cost_precommitments,
             artifact_namespace=receipt["artifact_namespace"],
         )
         raw_ids = _raw_attempt_ids(frozen, attempts)
@@ -3585,6 +4013,9 @@ def execute_current_observed_cell(
         if now < datetime.fromisoformat(latest_boundary.replace("Z", "+00:00")):
             _fail("EVIDENCE_BOUNDARY_NOT_CLOSED")
         evidence_started = _next_observed_utc_second(attempts_frozen_at)
+        source_observation_references = _require_source_observation_references(
+            _publish_source_observation_references(
+                sink, frozen=frozen, source_observation_cache=source_observation_cache))
         reservation_scope = authority_spool.reserve_transient_publication(
             sink.context
         )
@@ -3628,7 +4059,8 @@ def execute_current_observed_cell(
                 plan_receipt_sha256=horizon_plan_receipt_sha256,
                 fitted=refreshed,
                 config=config,
-                cost_stress_adversity_plan=frozen.cost_stress_adversity_plan,
+                partition_cost_precommitments=frozen.partition_cost_precommitments,
+                source_observation_references=source_observation_references,
             )
             row = _write_staged_attempt(
                 stage=stage,
@@ -3692,7 +4124,9 @@ def execute_current_observed_cell(
                     _fail("STAGED_ATTEMPT_IDENTITY_CHANGED", attempt.ordinal)
                 yield body
 
-        production = raw_winner.produce_winner_v11_raw_evidence(
+        produce = (raw_winner.produce_winner_v16_raw_evidence if _generation is winner.V16_GENERATION
+                   else raw_winner.produce_winner_v15_raw_evidence)
+        production = produce(
             sink,
             frozen=frozen,
             attempt_evidence=evidence_stream(),
@@ -3788,11 +4222,10 @@ def _verified_historical_cell_plan_inputs(
             "HISTORICAL_CELL_PLAN_VERIFICATION_FAILED",
             (type(exc).__name__, str(exc)),
         ) from exc
-    expected_mode = (
-        "BOUNDED_RAW_WINNER_CANARY"
-        if type(capture) is historical_adapter.BoundedRawWinnerCanaryCapture
-        else "HISTORICAL_ANCHOR"
-    )
+    expected_mode = {
+        historical_adapter.BoundedRawWinnerCanaryCapture: "BOUNDED_RAW_WINNER_CANARY",
+        historical_adapter.DeclaredSlotSearchCapture: "DECLARED_SLOT_UNISSUED",
+    }.get(type(capture), "HISTORICAL_ANCHOR")
     if (
         verified is not True
         or cell_plan.mode != expected_mode
@@ -3809,11 +4242,21 @@ def _verified_historical_cell_plan_inputs(
     return horizon_plan, attempt_artifacts
 
 
+def _record_historical_raw_failure(capture: Any, handle: Any, failure: Any,
+        exc: BaseException, *, attempted_trials_exact: int) -> None:
+    if type(capture) is historical_adapter.HistoricalSymbolSearchCapture:
+        capture.record_raw_evidence_failure(handle, failure)
+    else:
+        capture.record_raw_evidence_failure(handle, failure,
+            **_bounded_canary_failure_diagnostic(exc, attempted_trials_exact=attempted_trials_exact))
+
+
 def execute_historical_observed_cell(
     *,
     capture: (
         historical_adapter.HistoricalSymbolSearchCapture
         | historical_adapter.BoundedRawWinnerCanaryCapture
+        | historical_adapter.DeclaredSlotSearchCapture
     ),
     fitted: FittedNativeSearchTimeframe,
     regime: str,
@@ -3832,6 +4275,7 @@ def execute_historical_observed_cell(
     if type(capture) not in {
         historical_adapter.HistoricalSymbolSearchCapture,
         historical_adapter.BoundedRawWinnerCanaryCapture,
+        historical_adapter.DeclaredSlotSearchCapture,
     }:
         _fail("HISTORICAL_CAPTURE_INVALID")
     if not isinstance(config, PipelineConfig):
@@ -3842,6 +4286,12 @@ def execute_historical_observed_cell(
         or config is not capture.verified_pipeline_config
     ):
         _fail("CANARY_EXECUTION_IDENTITY_SUBSTITUTION")
+    if type(capture) is historical_adapter.DeclaredSlotSearchCapture and (
+        not historical_adapter._verify_declared_slot_capture(capture)
+        or fitted is not capture.verified_fitted_timeframe
+        or config is not capture.verified_pipeline_config
+    ):
+        _fail("DECLARED_SLOT_EXECUTION_IDENTITY_SUBSTITUTION")
     normalized_regime = str(regime or "").strip().upper()
     if normalized_regime not in book.REGIME_ORDER:
         _fail("REGIME_INVALID", normalized_regime)
@@ -3900,15 +4350,17 @@ def execute_historical_observed_cell(
                 failure_code=None,
             )
         fold_plan = _winner_fold_plan(attempts)
-        minimum_folds = int(winner_v11.PINNED_SELECTION_POLICY["min_causal_folds"])
+        minimum_folds = int(winner.CURRENT_SELECTION_POLICY["min_causal_folds"])
         if len(fold_plan) < minimum_folds:
             _fail("WINNER_FOLD_PLAN_BELOW_EVIDENCE_FLOOR")
-        cost_stress_adversity_plan = _build_cost_stress_adversity_plan(
+        source_observation_cache: dict[str, tuple[str, bytes]] = {}
+        partition_cost_precommitments = _partition_cost_precommitments(
             attempts=attempts,
             fold_plan=fold_plan,
             plan_body=plan_body,
             fitted=refreshed,
             config=config,
+            source_observation_cache=source_observation_cache,
         )
         precommitted_at = _now_utc_seconds()
         attempts_frozen_at = _next_observed_utc_second(precommitted_at)
@@ -3920,11 +4372,10 @@ def execute_historical_observed_cell(
             attempts_frozen_at_utc=attempts_frozen_at,
             fold_plan=fold_plan,
             attempt_artifacts=attempt_artifacts,
-            source_contract_seed=refreshed.source_contract_seed,
-            base_cost_contract=refreshed.base_cost_policy,
-            stress_cost_contract=refreshed.stress_cost_policy,
+            source_contract_seeds=refreshed.source_contract_seeds,
+            frozen_tier_pair_contract=refreshed.frozen_tier_pair_contract,
             risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
-            cost_stress_adversity_plan=cost_stress_adversity_plan,
+            partition_cost_precommitments=partition_cost_precommitments,
         )
         raw_ids = _raw_attempt_ids(handle.frozen, attempts)
         latest_boundary = _utc(
@@ -3935,6 +4386,9 @@ def execute_historical_observed_cell(
         if now < datetime.fromisoformat(latest_boundary.replace("Z", "+00:00")):
             _fail("EVIDENCE_BOUNDARY_NOT_CLOSED")
         evidence_started = _next_observed_utc_second(attempts_frozen_at)
+        source_observation_references = _require_source_observation_references(
+            _publish_source_observation_references(
+                capture.sink, frozen=handle.frozen, source_observation_cache=source_observation_cache))
         reservation_scope = authority_spool.reserve_transient_publication(
             capture.context
         )
@@ -3974,7 +4428,8 @@ def execute_historical_observed_cell(
                 plan_receipt_sha256=plan_receipt_sha256,
                 fitted=refreshed,
                 config=config,
-                cost_stress_adversity_plan=handle.frozen.cost_stress_adversity_plan,
+                partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
+                source_observation_references=source_observation_references,
             )
             row = _write_staged_attempt(
                 stage=stage,
@@ -4033,14 +4488,8 @@ def execute_historical_observed_cell(
         primary_error = exc
         if handle is None:
             raise
-        capture.record_raw_evidence_failure(
-            handle,
-            exc,
-            **_bounded_canary_failure_diagnostic(
-                exc,
-                attempted_trials_exact=attempted_exact,
-            ),
-        )
+        _record_historical_raw_failure(capture, handle, exc, exc,
+            attempted_trials_exact=attempted_exact)
         handle = None
         result = HistoricalObservedCellExecution(
             status="TECHNICAL_FAILURE",
@@ -4065,14 +4514,8 @@ def execute_historical_observed_cell(
                 code,
                 type(exc).__name__,
             )
-            capture.record_raw_evidence_failure(
-                handle,
-                failure,
-                **_bounded_canary_failure_diagnostic(
-                    exc,
-                    attempted_trials_exact=attempted_exact,
-                ),
-            )
+            _record_historical_raw_failure(capture, handle, failure, exc,
+                attempted_trials_exact=attempted_exact)
             handle = None
             result = HistoricalObservedCellExecution(
                 status="TECHNICAL_FAILURE",
@@ -4111,6 +4554,14 @@ def execute_historical_observed_cell(
     if result is None:
         _fail("HISTORICAL_CELL_EXECUTION_TERMINAL_STATE_MISSING")
     return result
+
+
+def execute_transport_historical_observed_cell(**kwargs: Any) -> HistoricalObservedCellExecution:
+    """Run the explicit v16 historical capture without changing legacy defaults."""
+    capture = kwargs.get("capture")
+    if getattr(capture, "_winner_generation", None) is not winner.V16_GENERATION:
+        _fail("TRANSPORT_CAPTURE_GENERATION_REQUIRED")
+    return execute_historical_observed_cell(**kwargs)
 
 
 def _make_bounded_raw_winner_canary_executor():
@@ -4466,6 +4917,8 @@ def _make_bounded_raw_winner_canary_executor():
     ) -> historical_adapter.BoundedRawWinnerCanaryReceipt:
         """Run one genuine latest-anchor raw-Winner canary and return its receipt."""
 
+        _fail("RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED")
+
         request_body, request_sink = (
             historical.consume_bounded_raw_winner_canary_request(context, request)
         )
@@ -4698,7 +5151,7 @@ def authoritative_search_execution_contract() -> dict[str, Any]:
         "pm_native_prefix_production": _file_sha256(Path(native_prefix.__file__)),
         "pm_trade_power": _file_sha256(Path(trade_power.__file__)),
         "pm_winner_raw_evidence": _file_sha256(Path(raw_winner.__file__)),
-        "pm_winner_selection": _file_sha256(Path(winner_v11.__file__)),
+        "pm_winner_selection": _file_sha256(Path(winner.__file__)),
     }
     return {
         "schema_version": EXECUTION_CONTRACT_VERSION,
@@ -4712,7 +5165,10 @@ def authoritative_search_execution_contract() -> dict[str, Any]:
         "separate_raw_precommitment_before_strategy_evaluation": True,
         "position_event_source": "pm_core.Backtester.position-events-v2",
         "trade_power_chain": "pm_winner_raw_evidence.PRODUCTION_TRADE_POWER_POLICY",
-        "cost_stress": BACKTEST_FROZEN_PATH_COST_STRESS_SCHEMA_VERSION,
+        "candidate_costs": "fxpm.backtester-frozen-tier-pair-contract.v1",
+        "entry_admission_policy": spread_profile.ADMISSION_POLICY,
+        "independent_cost_accounts_per_partition": ["P75", "P95"],
+        "outer_interval_qualification": "METHOD_UNADOPTED",
         "attempt_evidence_staging": "BOUNDED_CONTENT_ADDRESSED_ATOMIC_FILES",
         "bounded_canary_single_public_executor_facade": True,
         "bounded_canary_accepts_prebuilt_source_or_fit": False,
@@ -4733,6 +5189,8 @@ __all__ = [
     "AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256",
     "AuthoritativeSearchExecutionError",
     "CurrentObservedCellExecution",
+    "SignalOpportunityDesignRequest",
+    "SignalOpportunityDesignExecution",
     "FittedNativeSearchTimeframe",
     "HistoricalObservedCellExecution",
     "TERMINAL_REGIME_FIT_POLICY_SCHEMA",
@@ -4742,6 +5200,10 @@ __all__ = [
     "TerminalNativeTimeframe",
     "authoritative_search_execution_contract",
     "execute_current_observed_cell",
+    "execute_transport_current_observed_cell",
+    "execute_transport_historical_observed_cell",
+    "issue_signal_opportunity_design_request",
+    "describe_signal_opportunity_design",
     "execute_bounded_raw_winner_canary",
     "execute_historical_observed_cell",
     "fit_native_timeframe_for_search",

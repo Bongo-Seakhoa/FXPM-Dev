@@ -1,0 +1,22 @@
+# Keep code-bound evidence and checkpoint identities stable across checkouts.
+*.py text eol=lf
+/pm_strategy_domain_v1.json -text
+/data/native/terms/spread_profile.json -text
+/pm_causal_evidence_producer.py -text
+/pm_historical_anchor_orchestration.py -text
+/tests/native_v5_support.py -text
+/tests/test_native_prefix_production.py -text
+/tests/test_forward_oos_replay_producer.py -text
+/tests/fixtures/declared_feature_footprint/h1_rows.json -text
+/tests/prototype_support.py -text
+/tests/test_frozen_spread_execution.py -text
+/pytest.ini -text
+/pm_winner_raw_evidence.py -text
+/pm_forward_oos_replay_producer.py -text
+/pm_historical_search_producer.py -text
+/pm_core.py -text
+/pm_historical_production_adapter.py -text
+/pm_production_search_planner.py -text
+/tests/test_authoritative_search_execution.py -text
+/tests/test_backtester_winner_daily_r.py -text
+/tests/test_winner_raw_evidence.py -text

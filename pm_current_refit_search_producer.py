@@ -12,7 +12,7 @@ publication authority is accepted.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import gc
 import hashlib
@@ -28,12 +28,10 @@ import pm_causal_process as causal
 import pm_current_refit_artifacts as current_artifacts
 import pm_current_refit_execution as current_execution
 import pm_current_refit_production as current_production
-import pm_forward_oos_replay_producer as forward_replay
 import pm_historical_production_adapter as historical_adapter
 import pm_memory_governor as memory_governor
 import pm_model_lifecycle as lifecycle
 import pm_native_prefix_production as native_prefix
-import pm_portfolio_replay as portfolio
 import pm_production_config_binding as config_binding
 import pm_production_search_planner as planner
 import pm_training_horizon as training_horizon
@@ -1347,7 +1345,10 @@ def _rebuild_winner_request(value: Any, code: str) -> winner.WinnerSelectionRequ
         ):
             _fail(code)
         wrappers.append(wrapper["payload"])
-    request = winner.create_winner_selection_request(*wrappers)
+    try:
+        request = winner.create_winner_selection_request(*wrappers)
+    except ValueError as exc:
+        raise CurrentRefitSearchProducerError(code, (type(exc).__name__, str(exc))) from exc
     if request is None or request.to_dict() != value:
         _fail(code)
     return request
@@ -1362,12 +1363,16 @@ def _rebuild_horizon_plan(value: Any) -> Any:
         _fail("CURRENT_WORKER_HORIZON_PLAN_INVALID")
     body = value["payload"]
     unobserved = "regime_support_binding" in body
+    if body.get("schema_version") == training_horizon._PLAN_SCHEMA:  # noqa: SLF001
+        request_schema = training_horizon._REQUEST_SCHEMA  # noqa: SLF001
+        unobserved_schema = training_horizon._UNOBSERVED_REQUEST_SCHEMA  # noqa: SLF001
+    elif body.get("schema_version") == training_horizon._CURRENT_PLAN_SCHEMA:  # noqa: SLF001
+        request_schema = training_horizon._CURRENT_REQUEST_SCHEMA  # noqa: SLF001
+        unobserved_schema = training_horizon._CURRENT_UNOBSERVED_REQUEST_SCHEMA  # noqa: SLF001
+    else:
+        _fail("CURRENT_WORKER_HORIZON_PLAN_INVALID")
     request = {
-        "schema_version": (
-            training_horizon._UNOBSERVED_REQUEST_SCHEMA  # noqa: SLF001
-            if unobserved
-            else training_horizon._REQUEST_SCHEMA  # noqa: SLF001
-        ),
+        "schema_version": unobserved_schema if unobserved else request_schema,
         "run_id": body.get("run_id"),
         "anchor": body.get("anchor"),
         "cell": body.get("cell"),
@@ -1419,9 +1424,16 @@ def _resolve_raw_artifacts(
         }
     ):
         _fail("CURRENT_WORKER_RAW_ARTIFACT_BINDING_INVALID")
+    request_type = value.get("winner_request", {}).get("artifact_type") if type(value.get("winner_request")) is dict else None
+    edition_types = {
+        "winner_v14_request": "winner_v14_decision",
+        "winner_v16_request": "winner_v16_decision",
+    }
+    if request_type not in edition_types:
+        _fail("CURRENT_WORKER_RAW_ARTIFACT_BINDING_INVALID")
     specifications = {
-        "winner_request": ("winner_v11_request", True),
-        "winner_decision": ("winner_v11_decision", True),
+        "winner_request": (request_type, True),
+        "winner_decision": (edition_types[request_type], True),
         "production_receipt": (
             "winner_raw_evidence_production_receipt",
             True,
@@ -1460,15 +1472,25 @@ def _rebuild_raw_winner_artifacts(
 ]:
     entries = _resolve_raw_artifacts(manifest, bindings, required=True)
     assert entries is not None
-    request_body, _ = _read_spooled_ascii_object(
+    request_body, request_bytes = _read_spooled_ascii_object(
         context,
         entries["winner_request"],
-        maximum=winner.MAX_REQUEST_BYTES,
+        maximum=(winner.MAX_SUPPORTED_WINNER_REQUEST_BYTES
+                 if entries["winner_request"]["artifact_type"] == "winner_v16_request"
+                 else winner.MAX_REQUEST_BYTES),
     )
+    if (request_body.get("contract_version") != winner.V16_GENERATION.request_version
+            and len(request_bytes) > winner.MAX_REQUEST_BYTES):
+        _fail("CURRENT_WORKER_ARTIFACT_DESCRIPTOR_INVALID")
     request = _rebuild_winner_request(
         request_body,
         "CURRENT_WORKER_WINNER_REQUEST_INVALID",
     )
+    generation = winner.winner_generation_for_precommitment(request.precommitment.to_dict())
+    expected_label = "v16" if generation is winner.V16_GENERATION else "v14"
+    if (entries["winner_request"]["artifact_type"] != f"winner_{expected_label}_request"
+            or entries["winner_decision"]["artifact_type"] != f"winner_{expected_label}_decision"):
+        _fail("CURRENT_WORKER_RAW_ARTIFACT_BINDING_INVALID")
     decision = winner.evaluate_historical_cell_winner(request)
     decision_body, _ = _read_spooled_ascii_object(
         context,
@@ -1495,9 +1517,20 @@ def _rebuild_raw_winner_artifacts(
         entries["cross_binding"],
         maximum=MAX_TIMEFRAME_BUNDLE_BYTES,
     )
+    if generation is winner.V16_GENERATION:
+        try:
+            cross_body = json.loads(cross_binding.decode("ascii"))
+        except (UnicodeError, ValueError) as exc:
+            raise CurrentRefitSearchProducerError("CURRENT_WORKER_CROSS_BINDING_INVALID") from exc
+        if (type(cross_body) is not dict
+                or cross_body.get("schema_version") != raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
+                or cross_body.get("mode") != raw_winner.CURRENT_CROSS_BINDING_MODE
+                or _canonical_bytes(cross_body) != cross_binding):
+            _fail("CURRENT_WORKER_CROSS_BINDING_INVALID")
     roster = production_body.get("artifact_roster")
     if (
-        production_body.get("schema_version") != raw_winner.PRODUCTION_SCHEMA
+        production_body.get("schema_version") != (raw_winner.V16_PRODUCTION_SCHEMA
+            if generation is winner.V16_GENERATION else raw_winner.PRODUCTION_SCHEMA)
         or production_body.get("generation_context_sha256")
         != context.context_sha256
         or production_body.get("symbol") != symbol
@@ -1676,7 +1709,10 @@ def _rebuild_timeframe_evidence(
                     timeframe,
                     regime,
                 )
-            process_decision = book.create_historical_process_state_decision(
+            binding_schema = (process_payload.get("insufficient_evidence_binding") or {}).get("schema_version")
+            state_factory = (book.create_transport_historical_process_state_decision
+                if binding_schema == book.V16_GENERATION.insufficient_schema else book.create_historical_process_state_decision)
+            process_decision = state_factory(
                 symbol=process_cell.get("symbol"),
                 timeframe=process_cell.get("timeframe"),
                 regime=process_cell.get("regime"),
@@ -2694,13 +2730,12 @@ def _current_replay_windows(
 
 
 def _management_native_source_contract(identity: Mapping[str, Any]) -> dict[str, Any]:
-    """Project a verifier-sealed native-prefix identity into replay evidence.
+    """Format a legacy native identity for archived replay fixtures.
 
-    ``forward_replay._native_product_identity`` has already reopened the
-    activated product and reverified broker-native provenance, UTC bar-open
-    timestamps, the activation, bars and audit sidecar.  This projection only
-    renames those derived facts into the standalone portfolio verifier's
-    schema; it does not let a caller assert provenance.
+    This formatter does not reopen sources or authenticate its input. Its
+    former production caller performed those checks before projection; that
+    caller is retired. The retained provenance fields are legacy schema
+    values, not an authentication result for new interval evidence.
     """
 
     if not isinstance(identity, Mapping):
@@ -2743,467 +2778,11 @@ def _management_native_source_contract(identity: Mapping[str, Any]) -> dict[str,
     }
 
 
-def _replay_candidates(
-    *,
-    inputs: _ExecutableCurrentRefitInputs,
-    current_book: Mapping[str, Any],
-    materials: Sequence[_SelectedMaterial],
-    current_cutoff: str,
-    current_refit_receipt: Mapping[str, Any],
-) -> tuple[
-    tuple[portfolio.CandidateTrade, ...],
-    list[str],
-    dict[str, Any],
-    dict[str, Any],
-    dict[str, Any],
-]:
-    cutoff = _utc(current_cutoff, "CURRENT_REPLAY_CUTOFF_INVALID")
-    execution_window, management_window = _current_replay_windows(
-        inputs.current_selection_window,
-        current_cutoff=current_cutoff,
-    )
-    anchor_id = f"CURRENT-{cutoff.strftime('%Y%m%dT%H%M%SZ')}"
-    specialists: list[forward_replay._VerifiedSpecialist] = []  # noqa: SLF001
-    for material in materials:
-        cell = material.book_cell
-        group_fit = next(
-            value
-            for value in current_book["regime_fits"]
-            if value["payload"]["symbol"] == cell["symbol"]
-            and value["payload"]["timeframe"] == cell["timeframe"]
-        )
-        record = group_fit["payload"]["regime_detector_record"]
-        parameters = json.loads(record["parameters_canonical_json"])
-        specialists.append(
-            forward_replay._VerifiedSpecialist(  # noqa: SLF001
-                anchor_id=anchor_id,
-                cell_id=cell["cell_id"],
-                symbol=cell["symbol"],
-                timeframe=cell["timeframe"],
-                regime=cell["regime"],
-                strategy_id=material.winner_process["strategy_id"],
-                strategy_class=material.winner_process["strategy_class"],
-                strategy_module=material.winner_process["strategy_module"],
-                parameters=material.trial_definition["parameters"],
-                process_candidate_id=material.winner_process["process_candidate_id"],
-                process_sha256=current_artifacts.canonical_artifact_sha256(
-                    material.winner_process
-                ),
-                priority_score=1.0 - float(cell["adjusted_q_value"]),
-                source_count_receipt=material.search.source_capture[
-                    "selection_prefix_receipt"
-                ],
-                detector_parameters=parameters,
-                detector_parameters_sha256=record["parameters_sha256"],
-                detector_record=record,
-            )
-        )
-    execution_keys = {
-        _native_key(value.symbol, value.timeframe) for value in specialists
-    }
-    valuation_keys = {_native_key(value.symbol, "M5") for value in specialists}
-    scheduler = getattr(inputs, "symbol_scheduler", None)
-    if scheduler is None:
-        replay_products = inputs.native_products
-    else:
-        replay_products: dict[str, native_prefix.NativePrefixProduct] = {}
-        timeframe_order = {
-            timeframe: ordinal
-            for ordinal, timeframe in enumerate(book.TIMEFRAME_ORDER)
-        }
-        for key in sorted(
-            execution_keys | valuation_keys,
-            key=lambda value: (
-                value.split("|", 1)[0],
-                timeframe_order[value.split("|", 1)[1]],
-            ),
-        ):
-            symbol, timeframe = key.split("|", 1)
-            product = native_prefix.produce_activated_native_prefix(
-                data_dir=scheduler.data_dir,
-                context=inputs.context,
-                symbol=symbol,
-                timeframe=timeframe,
-                cutoff_utc=current_cutoff,
-                source_accessed_at_utc=scheduler.source_accessed_at_utc,
-                production_contract_required=True,
-            )
-            if product.source_state != native_prefix.AVAILABLE:
-                _fail("CURRENT_REPLAY_NATIVE_PRODUCT_UNAVAILABLE", key)
-            replay_products[key] = product
-    execution_products = {
-        key: replay_products[key]
-        for key in sorted(execution_keys)
-    }
-    valuation_products = {
-        key: replay_products[key]
-        for key in sorted(valuation_keys)
-    }
-    execution_identities = [
-        forward_replay._native_product_identity(  # noqa: SLF001
-            product,
-            expected_symbol=key.split("|", 1)[0],
-            expected_timeframe=key.split("|", 1)[1],
-            expected_cutoff_utc=current_cutoff,
-            role=f"CURRENT_EXECUTION:{key}",
-        )
-        for key, product in sorted(execution_products.items())
-    ]
-    valuation_identities = [
-        forward_replay._native_product_identity(  # noqa: SLF001
-            product,
-            expected_symbol=key.split("|", 1)[0],
-            expected_timeframe="M5",
-            expected_cutoff_utc=current_cutoff,
-            role=f"CURRENT_VALUATION:{key}",
-        )
-        for key, product in sorted(valuation_products.items())
-    ]
-    if scheduler is not None:
-        execution_identity_by_key = {
-            _native_key(value["symbol"], value["timeframe"]): value
-            for value in execution_identities
-        }
-        for material in materials:
-            key = _native_key(
-                material.book_cell["symbol"],
-                material.book_cell["timeframe"],
-            )
-            identity = execution_identity_by_key.get(key)
-            capture = material.search.source_capture
-            source = capture.get("source_snapshot") if type(capture) is dict else None
-            selection_prefix = (
-                capture.get("selection_prefix_receipt")
-                if type(capture) is dict
-                else None
-            )
-            if (
-                type(identity) is not dict
-                or type(source) is not dict
-                or type(selection_prefix) is not dict
-                or source.get("symbol") != identity["symbol"]
-                or source.get("timeframe") != identity["timeframe"]
-                or source.get("activation_id") != identity["activation_id"]
-                or source.get("activation_manifest_sha256")
-                != identity["activation_manifest_sha256"]
-                or source.get("native_source_sha256")
-                != identity["source_bars_sha256"]
-                or selection_prefix.get("native_prefix_content_sha256")
-                != identity["prefix_content_sha256"]
-            ):
-                _fail("CURRENT_REPLAY_SELECTED_SOURCE_IDENTITY_CHANGED", key)
-    precommit_anchor = {
-        "anchor_id": anchor_id,
-        "forward_end_exclusive_utc": current_cutoff,
-        "capital_phase_windows": {
-            forward_replay.CAPITAL_INNER_SELECTION: execution_window
-        },
-        "execution_products": execution_identities,
-        "valuation_m5_products": valuation_identities,
-        "execution_product_roster_sha256": _sha(execution_identities),
-        "valuation_m5_product_roster_sha256": _sha(valuation_identities),
-        "valuation_products_supplied_separately": True,
-    }
-    anchor = {
-        "anchor_id": anchor_id,
-        "forward_end_date": (cutoff.date() - timedelta(days=1)).isoformat(),
-    }
-    deployment = forward_replay._deployment_config(inputs.pipeline_config)  # noqa: SLF001
-    replayed = forward_replay._execute_anchor_replay(  # noqa: SLF001
-        context=inputs.context,
-        anchor=anchor,
-        specialists=specialists,
-        native_products=execution_products,
-        valuation_products=valuation_products,
-        precommit_anchor=precommit_anchor,
-        capital_phase=forward_replay.CAPITAL_INNER_SELECTION,
-        capital_window=execution_window,
-        config=inputs.pipeline_config,
-        deployment=deployment,
-    )
-    receipt_sha = lifecycle.canonical_receipt_sha256(current_refit_receipt)
-    candidates = tuple(
-        replace(
-            position.candidate,
-            candidate_id="current:"
-            + hashlib.sha256(
-                f"{receipt_sha}|{position.candidate.candidate_id}".encode("ascii")
-            ).hexdigest(),
-            promotion_status="PROCESS_VALIDATED_CURRENT_REFIT",
-        ).normalized()
-        for position in replayed.positions
-    )
-    if not candidates:
-        _fail("CURRENT_SYNCHRONIZED_REPLAY_HAS_NO_POSITIONS")
-    replayed_cell_ids = sorted(material.book_cell["cell_id"] for material in materials)
-    execution_by_source = {
-        f"{value['symbol']}|{value['timeframe']}": value
-        for value in execution_identities
-    }
-    valuation_by_symbol = {value["symbol"]: value for value in valuation_identities}
-    native_sources: dict[str, dict[str, Any]] = {}
-    for material in materials:
-        cell = material.book_cell
-        cell_id = str(cell.get("cell_id") or "").strip()
-        source_id = f"{cell.get('symbol')}|{cell.get('timeframe')}"
-        identity = execution_by_source.get(source_id)
-        if not cell_id or identity is None or cell_id in native_sources:
-            _fail("CURRENT_REPLAY_NATIVE_SOURCE_ROSTER_INVALID", cell_id or source_id)
-        native_sources[cell_id] = _management_native_source_contract(identity)
-    valuation_sources: dict[str, dict[str, Any]] = {}
-    for symbol, identity in sorted(valuation_by_symbol.items()):
-        exact_symbol = str(symbol)
-        if exact_symbol in valuation_sources:
-            _fail("CURRENT_REPLAY_VALUATION_SOURCE_ROSTER_INVALID", exact_symbol)
-        valuation_sources[exact_symbol] = _management_native_source_contract(
-            identity
-        )
-    activation_bindings = {
-        (
-            value["activation_id"],
-            value["activation_manifest_sha256"],
-        )
-        for value in (*native_sources.values(), *valuation_sources.values())
-    }
-    if len(activation_bindings) != 1:
-        _fail("CURRENT_REPLAY_NATIVE_ACTIVATION_MIXED")
-    return (
-        candidates,
-        replayed_cell_ids,
-        management_window,
-        native_sources,
-        valuation_sources,
-    )
-
-
 def _produce(
     inputs: _ExecutableCurrentRefitInputs,
     request: Mapping[str, Any],
 ) -> Any:
-    context = inputs.context
-    process = inputs.search_process
-    if (
-        type(context) is not authority_spool.GenerationSpoolContext
-        or type(process) is not planner.FrozenProductionSearchProcess
-        or type(inputs.pipeline_config) is not PipelineConfig
-    ):
-        _fail("CURRENT_PRODUCTION_INPUTS_INVALID")
-    planner.verify_frozen_production_search_process(context, process)
-    pass_result = verify_causal_process_pass(
-        causal_precommit_payload=request["causal_precommit_payload"],
-        causal_evidence_payload=request["causal_evidence_payload"],
-        causal_reconciliation_payload=request["causal_reconciliation_payload"],
-    )
-    if (
-        pass_result["decision_body"] != request["historical_process_decision"]
-        or pass_result["decision_sha256"]
-        != request["historical_process_decision_sha256"]
-        or causal.canonical_sha256(request["historical_process_decision"])
-        != request["historical_process_decision_sha256"]
-    ):
-        _fail("CURRENT_REQUEST_CAUSAL_DECISION_MISMATCH")
-    current_cutoff = _current_cutoff(inputs)
-    authorization = planner.freeze_current_search_authorization(
-        context,
-        process=process,
-        causal_precommit_payload=request["causal_precommit_payload"],
-        causal_evidence_payload=request["causal_evidence_payload"],
-        causal_reconciliation_payload=request["causal_reconciliation_payload"],
-        current_cutoff_utc=current_cutoff,
-    )
-    started_at = _now()
-    selected_search: dict[str, _SelectedSearch] = {}
-    compact_receipts: dict[str, Any] = {}
-    evidence_stream = (
-        _scheduled_book_evidence_stream(
-            inputs,
-            request=request,
-            authorization=authorization,
-            current_cutoff=current_cutoff,
-            selected=selected_search,
-            compact_receipts=compact_receipts,
-        )
-        if inputs.symbol_scheduler is not None
-        else _book_evidence_stream(
-            inputs,
-            authorization=authorization,
-            selected=selected_search,
-            compact_receipts=compact_receipts,
-        )
-    )
-    current_decision = book.evaluate_historical_book_multiplicity(
-        evidence_stream
-    )
-    if not book.verify_historical_book_multiplicity_decision(current_decision):
-        _fail("CURRENT_BOOK_MULTIPLICITY_REJECTED")
-    current_book = current_decision.to_dict()
-    if (
-        current_book.get("optimization_run_complete") is not True
-        or current_book.get("valid") is not True
-    ):
-        _fail("CURRENT_BOOK_INCOMPLETE")
-    # Resolve the sole evidence-complete, non-promotable terminal before
-    # opening the generation sink. Malformed or contradictory empty Books
-    # remain typed technical failures in _selected_book_cells.
-    selected_cells = _selected_book_cells(current_book, selected_search)
-    generation_sink = authority_spool.open_symbol_sink(
-        context,
-        GENERATION_SYMBOL,
-        manifest_domain=authority_spool.CURRENT_REFIT_MANIFEST_DOMAIN,
-    )
-    materials, source_bundle, horizon_bundle, regime_bundle = _materialize_selected(
-        sink=generation_sink,
-        current_book=current_book,
-        selected_cells=selected_cells,
-        selected_search=selected_search,
-        current_cutoff=current_cutoff,
-    )
-    accepted = _accepted_book_receipt(
-        inputs=inputs,
-        request=request,
-        current_book=current_book,
-        materials=materials,
-        source_bundle=source_bundle,
-        horizon_bundle=horizon_bundle,
-        regime_bundle=regime_bundle,
-        current_cutoff=current_cutoff,
-        started_at=started_at,
-        completed_at=_now(),
-    )
-    refit = _refit_receipt(
-        request=request,
-        accepted_receipt=accepted,
-        materials=materials,
-        source_bundle=source_bundle,
-        horizon_bundle=horizon_bundle,
-        regime_bundle=regime_bundle,
-        current_cutoff=current_cutoff,
-    )
-    accepted_sha = lifecycle.canonical_receipt_sha256(accepted)
-    refit_payload, refit_sha = lifecycle.open_typed_receipt(
-        refit,
-        expected_receipt_type=lifecycle.CURRENT_REFIT_EXECUTION_RECEIPT_TYPE,
-    )
-    _, accepted_raw = _generation_artifact(
-        generation_sink,
-        "current-refit/generation/accepted-book",
-        current_production.ART_ACCEPTED_BOOK,
-        accepted,
-        "fxpm.current-process-book-receipt.v1",
-        semantic_sha256=accepted_sha,
-    )
-    _, source_raw = _generation_artifact(
-        generation_sink,
-        "current-refit/generation/source-bundle",
-        current_production.ART_SOURCE_BUNDLE,
-        source_bundle,
-        SOURCE_BUNDLE_SCHEMA,
-    )
-    _, regime_raw = _generation_artifact(
-        generation_sink,
-        "current-refit/generation/regime-bundle",
-        current_production.ART_REGIME_BUNDLE,
-        regime_bundle,
-        current_execution.CURRENT_REGIME_PARAMS_BUNDLE_VERSION,
-    )
-    _, horizon_raw = _generation_artifact(
-        generation_sink,
-        "current-refit/generation/horizon-bundle",
-        current_production.ART_HORIZON_BUNDLE,
-        horizon_bundle,
-        HORIZON_BUNDLE_SCHEMA,
-    )
-    generation_sink.put_json(
-        "current-refit/generation/current-book",
-        current_production.ART_CURRENT_BOOK,
-        current_book,
-    )
-    generation_sink.put_json(
-        "current-refit/generation/refit-receipt",
-        current_production.ART_REFIT_RECEIPT,
-        refit,
-    )
-    refit_cells = refit_payload["execution"]["cell_executions"]
-    manifest_path = _raw_manifest(
-        output_root=inputs.output_root,
-        current_refit_receipt=refit,
-        bundle_descriptors={
-            "accepted_book_generation": accepted_raw,
-            "source_snapshot_bundle": source_raw,
-            "regime_params_bundle": regime_raw,
-            "horizon_decisions_bundle": horizon_raw,
-        },
-        materials=materials,
-        refit_cells=refit_cells,
-    )
-    verification = current_execution.verify_raw_current_refit_execution(
-        refit,
-        manifest_path,
-        artifact_root=context.root,
-    )
-    if verification.get("verified") is not True or verification.get("errors") != []:
-        _fail("CURRENT_REFIT_RAW_REVERIFY_FAILED", *verification.get("errors", ()))
-    required_valid_until_utc = _required_valid_until_utc(
-        inputs.pipeline_config, refit_payload
-    )
-    derived = current_production.derive_physical_current_refit_ledger(
-        current_book_decision=current_book,
-        accepted_book_generation_receipt=accepted,
-        current_refit_receipt=refit,
-        raw_manifest_path=manifest_path,
-        artifact_root=context.root,
-        output_root=inputs.output_root,
-        required_valid_until_utc=required_valid_until_utc,
-    )
-    candidates, replayed_ids, window, native_sources, valuation_sources = (
-        _replay_candidates(
-            inputs=inputs,
-            current_book=current_book,
-            materials=materials,
-            current_cutoff=current_cutoff,
-            current_refit_receipt=refit,
-        )
-    )
-    current_production.spool_current_refit_replay_capture(
-        generation_sink,
-        staged_ledger_content_sha256=derived.content_sha256,
-        physical_ledger_sha256=derived.physical_ledger_sha256,
-        accepted_book_generation_receipt_sha256=accepted_sha,
-        current_refit_receipt_sha256=refit_sha,
-        current_refit_execution_sha256=refit_payload["execution_sha256"],
-        current_cutoff_utc=current_cutoff,
-        candidates=candidates,
-        replayed_cell_ids=replayed_ids,
-        current_refit_execution_access_id=(
-            "current-refit-execution:" + refit_payload["execution_sha256"]
-        ),
-        window=window,
-        native_sources=native_sources,
-        valuation_sources=valuation_sources,
-    )
-    compact_receipts[GENERATION_SYMBOL] = generation_sink.seal()
-    capture_inputs = current_production.ProductionCaptureInputs(
-        spool_root=context.root,
-        compact_symbol_receipts=compact_receipts,
-        output_root=Path(inputs.output_root),
-        generation_id=context.generation_id,
-        native_universe_sha256=context.native_universe_sha256,
-        config_sha256=context.config_sha256,
-        required_valid_until_utc=required_valid_until_utc,
-    )
-    adapter = current_production.CurrentRefitProductionAdapter(capture_inputs)
-    capture_request = _CaptureRequest(
-        {
-            "schema_version": request["schema_version"],
-            "historical_run_receipt_sha256": request["historical_run_receipt_sha256"],
-            "historical_process_decision_sha256": request[
-                "historical_process_decision_sha256"
-            ],
-            "historical_book_receipt_sha256": request["historical_book_receipt_sha256"],
-            "authority_claimed": False,
-        }
-    )
-    return adapter(capture_request)
+    _fail("RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED")
 
 
 class CurrentRefitSearchProducer:
@@ -3295,30 +2874,7 @@ class CurrentRefitSearchProducer:
         self._used = False
 
     def __call__(self, request: Any) -> Any:
-        with self._lock:
-            if self._used:
-                _fail("CURRENT_REFIT_PRODUCER_ALREADY_CONSUMED")
-            # Consume before re-opening the active configuration or touching
-            # latest-cutoff evidence.  A partially observed current run is
-            # never retried inside the same authority generation.
-            self._used = True
-        try:
-            pipeline_config = self._frozen_config.materialize(self._context)
-        except config_binding.ProductionConfigBindingError as exc:
-            raise CurrentRefitSearchProducerError(
-                "CURRENT_PRODUCTION_CONFIG_REVERIFY_FAILED",
-                (exc.code, *exc.details),
-            ) from exc
-        owned = _ExecutableCurrentRefitInputs(
-            context=self._context,
-            search_process=self._search_process,
-            pipeline_config=pipeline_config,
-            native_products=self._native_products,
-            current_selection_window=self._current_selection_window,
-            output_root=self._output_root,
-            symbol_scheduler=getattr(self, "_symbol_scheduler", None),
-        )
-        return _produce(owned, _request_body(request))
+        _fail("RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED")
 
 
 def build_current_refit_search_producer(

@@ -20,9 +20,9 @@ Usage:
     python pm_main.py --optimize              # Optimize (skip valid configs)
     python pm_main.py --optimize --overwrite  # Force re-optimize all
     python pm_main.py --trade                 # Live trading with existing configs
-    python pm_main.py --trade --paper         # Current-refit demo probation
+    python pm_main.py --trade --mt5-demo      # Authorized broker DEMO trading
     python pm_main.py --preflight             # Readiness checks only, no trading loop
-    python pm_main.py --preflight --paper     # DEMO readiness only, no trading loop
+    python pm_main.py --preflight --mt5-demo  # DEMO readiness only, no trading loop
     python pm_main.py --status                # Show current status
 
 Version: 3.1 (Portfolio Manager with Stateful Optimization)
@@ -40,12 +40,20 @@ import sys
 import time
 import threading
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, Set, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 
 import pandas as pd
 import numpy as np
+
+from pm_spread_profile import (
+    FrozenSpreadTier,
+    align_prior_completed_spreads,
+    load_spread_profile,
+    spread_admission,
+)
 
 ACTIONABLE_SCHEMA_VERSION = "2026-06-18-entry-slippage-v1"
 MARGIN_PROTECTION_STATE_SCHEMA_VERSION = "2026-07-11-margin-protection-v1"
@@ -231,6 +239,74 @@ def _live_file_identity(path: Path) -> tuple[bool, str]:
     if not target.exists():
         return False, hashlib.sha256(b"").hexdigest()
     return True, _stream_sha256(target)
+
+
+def _account_identity_block_reason(
+    account: Any,
+    *,
+    connector_config: Any,
+    is_current_refit_demo: bool = False,
+    baseline_account: Any = None,
+) -> Optional[str]:
+    """Compare identity only; protective management must not require equity."""
+    if account is None:
+        return "fresh account snapshot unavailable"
+    if is_current_refit_demo:
+        from pm_demo_readiness import AUTHORIZED_DEMO_ACCOUNT_IDENTITY
+
+        expected_login = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.login
+        expected_server = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.server
+        expected_currency = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.currency
+    else:
+        if type(connector_config).__module__.startswith("unittest.mock"):
+            connector_config = None
+        try:
+            expected_login = int(getattr(connector_config, "expected_login", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return "configured expected_login is invalid"
+        expected_server = str(
+            getattr(connector_config, "expected_server", "") or ""
+        ).strip()
+        expected_currency = (
+            str(getattr(connector_config, "expected_currency", "") or "")
+            .strip()
+            .upper()
+        )
+    try:
+        fresh_login = int(getattr(account, "login", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return "fresh account login is invalid"
+    if expected_login <= 0:
+        return "MT5 account identity requires a nonzero expected_login pin"
+    if fresh_login != expected_login:
+        return f"fresh account login {fresh_login} != expected {expected_login}"
+    fresh_server = str(getattr(account, "server", "") or "").strip()
+    if expected_server and fresh_server.casefold() != expected_server.casefold():
+        return (
+            f"fresh account server {fresh_server or '<missing>'} != expected {expected_server}"
+        )
+    if not expected_server:
+        return "MT5 account identity requires a nonempty expected_server pin"
+    if not expected_currency:
+        return "MT5 account identity requires a nonempty expected_currency pin"
+    fresh_currency = str(getattr(account, "currency", "") or "").strip().upper()
+    if fresh_currency != expected_currency:
+        return (
+            f"fresh account currency {fresh_currency or '<missing>'} != expected {expected_currency}"
+        )
+    if baseline_account is not None:
+        try:
+            baseline_login = int(getattr(baseline_account, "login", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            baseline_login = 0
+        if baseline_login > 0 and baseline_login != fresh_login:
+            return f"account login changed during decision: {baseline_login} -> {fresh_login}"
+        for attr in ("server", "currency"):
+            before = str(getattr(baseline_account, attr, "") or "").strip().casefold()
+            after = str(getattr(account, attr, "") or "").strip().casefold()
+            if before and after and before != after:
+                return f"account {attr} changed during decision"
+    return None
 
 # Import PM modules
 
@@ -472,8 +548,7 @@ FUNDED_PIPELINE_CONFIG_KEYS = frozenset(
     margin_panic_level margin_recovery_start_level margin_reopen_level
     max_combined_risk_pct max_new_entries_when_total_open_risk_above_pct
     max_factor_group_open_risk_pct max_total_open_risk_pct
-    oos_evidence_execution_stress_mode
-    oos_evidence_export_enabled oos_evidence_include_execution_cost_survival
+    oos_evidence_export_enabled
     oos_evidence_min_periods oos_evidence_periods
     oos_validation_mode open_drawdown_hard_block_pct
     open_risk_action optimization_max_workers optuna_family_size_aware_budget
@@ -708,7 +783,7 @@ def log_resolved_config_summary(
             "            "
             f"spread_filter: enabled={bool(getattr(p, 'execution_spread_filter_enabled', True))} | "
             f"min_edge={getattr(p, 'execution_spread_min_edge_mult', None)}x | "
-            f"spike={getattr(p, 'execution_spread_spike_mult', None)}x | "
+            "admission=validated frozen tier | "
             f"penalty_start={getattr(p, 'execution_spread_penalty_start_mult', None)}"
         )
         logger.info(
@@ -1650,6 +1725,7 @@ class LiveTrader:
         execution_book: str = CHAMPION_EXECUTION_BOOK,
         demo_symbols: Optional[Sequence[str]] = None,
         demo_winner_ledger_path: Optional[str] = None,
+        startup_entry_block_reason: str = "",
     ):
         """
         Initialize live trader.
@@ -1670,6 +1746,7 @@ class LiveTrader:
         self.close_on_opposite_signal = close_on_opposite_signal
         self.pipeline_config = pipeline_config
         self.storage_manager = storage_manager
+        self._startup_entry_block_reason = str(startup_entry_block_reason or "")
         normalized_book = str(execution_book or CHAMPION_EXECUTION_BOOK).strip().upper()
         if normalized_book not in {
             CHAMPION_EXECUTION_BOOK,
@@ -1700,7 +1777,10 @@ class LiveTrader:
             account_reason = self._current_refit_demo_account_block_reason(account_info)
             if account_reason:
                 raise ValueError(account_reason)
-            from pm_demo_readiness import authorize_demo_probation_execution
+            from pm_demo_readiness import (
+                DemoProbationReadinessReport,
+                authorize_demo_probation_execution,
+            )
 
             demo_report, demo_projection = authorize_demo_probation_execution(
                 self.pipeline_config,
@@ -1710,7 +1790,19 @@ class LiveTrader:
                 account_info=account_info,
                 position_config=self.position_config,
             )
-            if not bool(getattr(demo_report, "ok", False)) or not demo_projection:
+            management_only = (
+                isinstance(demo_report, DemoProbationReadinessReport)
+                and demo_report.management_only
+            )
+            if management_only:
+                self._startup_entry_block_reason = (
+                    self._startup_entry_block_reason
+                    or "interval_cell_qualification_policy_unadopted"
+                )
+                demo_projection = demo_report.management_projection
+            if (
+                not bool(getattr(demo_report, "ok", False)) and not management_only
+            ) or not demo_projection:
                 errors = [
                     str(getattr(finding, "code", "demo_authority_failed"))
                     for finding in list(getattr(demo_report, "findings", ()) or ())
@@ -2466,6 +2558,74 @@ class LiveTrader:
         self._record_latest_bar_time(timeframe, bars)
         return bars
 
+    def _resolve_live_spread_tier(
+        self, symbol: str, broker_symbol: str, timeframe: str, spec: Any, cell: Any
+    ) -> FrozenSpreadTier:
+        descriptor = (getattr(cell, "artifact_meta", None) or {}).get(
+            "validated_spread_tier"
+        )
+        if not isinstance(descriptor, dict):
+            raise ValueError("SPREAD_CELL_DESCRIPTOR_UNAVAILABLE")
+        if broker_symbol != symbol:
+            raise ValueError("SPREAD_BROKER_SYMBOL_MISMATCH")
+        try:
+            import pm_mt5
+            from pm_native_request_contract import canonical_source_identity
+            from tools.acquire_native_history import snapshot_read_only_runtime_metadata
+
+            identity = canonical_source_identity(
+                snapshot_read_only_runtime_metadata(self.mt5, terminal_api=pm_mt5.mt5)
+            )
+            identity_sha = identity["identity_sha256"]
+        except Exception as exc:
+            raise ValueError("SPREAD_SOURCE_IDENTITY_UNAVAILABLE") from exc
+        profile = getattr(self, "_frozen_spread_profile", None)
+        if profile is None:
+            profile = load_spread_profile(
+                Path(__file__).resolve().parent / "data/native/terms/spread_profile.json"
+            )
+            self._frozen_spread_profile = profile
+        return profile.from_descriptor(
+            descriptor,
+            symbol=symbol,
+            timeframe=timeframe,
+            point=spec.point,
+            source_identity_sha256=identity_sha,
+        )
+
+    def _live_prior_spread_observation(
+        self, broker_symbol: str, tier: FrozenSpreadTier, target_open: Any
+    ) -> float:
+        source_minutes = DataLoader.TIMEFRAME_MINUTES.get(tier.source_timeframe)
+        target_minutes = DataLoader.TIMEFRAME_MINUTES.get(tier.timeframe)
+        if not source_minutes or not target_minutes:
+            return float("nan")
+        # Bound the native request to one target bar, including a late evaluation.
+        count = max(3, int(target_minutes / source_minutes) + 2)
+        bars = self.mt5.get_bars(broker_symbol, tier.source_timeframe, count=count)
+        if not isinstance(bars, pd.DataFrame) or bars.empty:
+            return float("nan")
+        source = bars.copy()
+        source.index = pd.to_datetime(source.index, utc=True, errors="coerce")
+        if "_BAR_CLOSE_TS" not in source:
+            source["_BAR_CLOSE_TS"] = source.index + pd.Timedelta(minutes=source_minutes)
+        target = pd.DatetimeIndex(pd.to_datetime([target_open], utc=True))
+        observation = float(align_prior_completed_spreads(target, source, tier.source_timeframe).iloc[0])
+        if math.isfinite(observation) and observation != math.floor(observation):
+            raise ValueError("SPREAD_PRIOR_BAR_POINTS_INVALID")
+        return observation
+
+    @staticmethod
+    def _live_tick_spread_admission(tier: FrozenSpreadTier, tick: Any) -> Tuple[str, float]:
+        try:
+            bid, ask = float(tick.bid), float(tick.ask)
+        except (AttributeError, TypeError, ValueError):
+            return "INVALID", float("nan")
+        if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask < bid:
+            return "INVALID", float("nan")
+        points = float((Decimal(str(ask)) - Decimal(str(bid))) / Decimal(str(tier.point)))
+        return spread_admission(tier, points), points
+
     @staticmethod
     def _deadline_expired(deadline: Any, *, grace_minutes: int = 0) -> bool:
         if not isinstance(deadline, datetime):
@@ -2585,6 +2745,8 @@ class LiveTrader:
         self, *, log_rejections: bool = False
     ) -> Dict[str, SymbolConfig]:
         """Return configs for exactly the selected execution book."""
+        if getattr(self, "_startup_entry_block_reason", ""):
+            return {}
         if bool(getattr(self, "_is_current_refit_demo", False)):
             return self._get_current_refit_demo_entry_configs()
         if not self.pm:
@@ -2896,7 +3058,11 @@ class LiveTrader:
                 return False
 
         if account_info is None:
-            account_info = self.mt5.get_account_info()
+            try:
+                account_info = self.mt5.get_account_info()
+            except Exception as exc:
+                self.logger.warning(f"Live account snapshot failed; skipping this iteration: {exc}")
+                return False
         if account_info is None:
             self.logger.warning(
                 "Live account snapshot unavailable; skipping this iteration."
@@ -2911,6 +3077,14 @@ class LiveTrader:
                     f"Current-refit demo session blocked: {demo_account_reason}"
                 )
                 return False
+        identity_reason = _account_identity_block_reason(
+            account_info,
+            connector_config=getattr(self.mt5, "config", None),
+            is_current_refit_demo=bool(getattr(self, "_is_current_refit_demo", False)),
+        )
+        if identity_reason:
+            self.logger.error(f"Live account identity blocked: {identity_reason}")
+            return False
         live_equity = 0.0
         try:
             live_equity = float(getattr(account_info, "equity", 0.0) or 0.0)
@@ -2937,15 +3111,19 @@ class LiveTrader:
                 if refreshed_positions is not None:
                     positions_snapshot = refreshed_positions
                     refreshed_after_margin = True
-                refreshed_account = self.mt5.get_account_info()
-                if refreshed_account is not None:
-                    account_info = refreshed_account
-                    try:
-                        live_equity = float(
-                            getattr(account_info, "equity", live_equity) or live_equity
-                        )
-                    except Exception:
-                        pass
+                refreshed_account, identity_reason = self._fresh_management_account_validation(
+                    account_info
+                )
+                if identity_reason:
+                    self.logger.error(f"Margin protection refresh blocked: {identity_reason}")
+                    return False
+                account_info = refreshed_account
+                try:
+                    live_equity = float(
+                        getattr(account_info, "equity", live_equity) or live_equity
+                    )
+                except Exception:
+                    pass
             except Exception as exc:
                 self.logger.warning(
                     f"Margin protection refresh failed; skipping this iteration: {exc}"
@@ -3827,6 +4005,18 @@ class LiveTrader:
             )
             decision = evaluate_policy(policy_payload, context)
             self._last_governance_bar_times[cache_key] = current_bar_time
+
+            def management_identity_ok() -> bool:
+                _, reason = self._fresh_management_account_validation()
+                if not reason:
+                    return True
+                if last_applied_bar is None:
+                    self._last_governance_bar_times.pop(cache_key, None)
+                else:
+                    self._last_governance_bar_times[cache_key] = last_applied_bar
+                self.logger.error(f"[{symbol}] Governance account identity blocked: {reason}")
+                return False
+
             new_sl = decision.stop_loss
             new_tp = None
             if decision.take_profit is not None:
@@ -3863,6 +4053,8 @@ class LiveTrader:
                 continue
             if decision.partial_close_pct > 0 and not state.get("partial_taken", False):
                 if self.enable_trading and hasattr(self.mt5, "close_position_partial"):
+                    if not management_identity_ok():
+                        return
                     partial_result = self.mt5.close_position_partial(
                         position,
                         percent=decision.partial_close_pct,
@@ -3895,6 +4087,8 @@ class LiveTrader:
                     self._set_order_governance_state(ticket_id, state)
             if decision.exit_now:
                 if self.enable_trading and hasattr(self.mt5, "close_position"):
+                    if not management_identity_ok():
+                        return
                     close_result = self.mt5.close_position(
                         position,
                         comment=f"Governance exit {policy_name}",
@@ -3930,6 +4124,8 @@ class LiveTrader:
                 state["last_bar_time"] = current_bar_time.isoformat()
                 self._set_order_governance_state(ticket_id, state)
                 continue
+            if not management_identity_ok():
+                return
             result = self.mt5.modify_position(position, sl=new_sl, tp=new_tp)
             if getattr(result, "success", False):
                 self.logger.info(
@@ -4625,30 +4821,24 @@ class LiveTrader:
         gate_required = bool(
             getattr(self.pipeline_config, "production_require_promotion_gate", True)
         )
-        gate_mode = (
-            str(
-                getattr(
-                    self.pipeline_config,
-                    "production_promotion_gate_mode",
-                    "ledger_status",
-                )
-                or ""
-            )
-            .strip()
-            .lower()
+        gate_mode = getattr(
+            self.pipeline_config, "production_promotion_gate_mode", None
         )
-        if gate_mode in {"immutable", "authorization", "authorization_exact"}:
-            gate_mode = "immutable_exact"
         funded_execution = bool(
             getattr(self.pipeline_config, "_funded_live_execution", False)
         )
-        if funded_execution and (not gate_required or gate_mode != "immutable_exact"):
+        if funded_execution and not gate_required:
             return (
                 "funded entry requires the immutable_exact promotion gate "
                 f"(required={gate_required}, mode={gate_mode!r})"
             )
-        if not gate_required or gate_mode != "immutable_exact":
+        if not gate_required:
             return None
+        if gate_mode != "immutable_exact":
+            return (
+                "enabled entry requires literal immutable_exact promotion gate "
+                f"(mode={gate_mode!r})"
+            )
         manager = getattr(self, "pm", None)
         checker = getattr(manager, "is_exact_cell_authorized_for_live", None)
         if not callable(checker):
@@ -4710,6 +4900,22 @@ class LiveTrader:
             return f"current-refit demo capital verification failed: {type(exc).__name__}"
         return None
 
+    def _fresh_management_account_validation(
+        self, baseline_account: Any = None
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        """Confirm the pinned account immediately before a management action."""
+        try:
+            fresh = self.mt5.get_account_info()
+            reason = _account_identity_block_reason(
+                fresh,
+                connector_config=getattr(self.mt5, "config", None),
+                is_current_refit_demo=bool(getattr(self, "_is_current_refit_demo", False)),
+                baseline_account=baseline_account,
+            )
+        except Exception as exc:
+            return None, f"fresh account snapshot raised {type(exc).__name__}: {exc}"
+        return (None, reason) if reason else (fresh, None)
+
     def _fresh_entry_account_validation(
         self,
         baseline_account: Any,
@@ -4763,83 +4969,14 @@ class LiveTrader:
                 f"required {minimum_currency}"
             )
 
-        connector_config = getattr(self.mt5, "config", None)
-        if self._looks_like_mock(connector_config):
-            connector_config = None
-        is_current_refit_demo = bool(
-            getattr(self, "_is_current_refit_demo", False)
+        reason = _account_identity_block_reason(
+            fresh,
+            connector_config=getattr(self.mt5, "config", None),
+            is_current_refit_demo=bool(getattr(self, "_is_current_refit_demo", False)),
+            baseline_account=baseline_account,
         )
-        if is_current_refit_demo:
-            from pm_demo_readiness import AUTHORIZED_DEMO_ACCOUNT_IDENTITY
-
-            expected_login = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.login
-            expected_server = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.server
-            expected_currency = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.currency
-        else:
-            expected_login = 0
-            try:
-                expected_login = int(
-                    getattr(connector_config, "expected_login", 0) or 0
-                )
-            except (TypeError, ValueError, OverflowError):
-                return None, "configured expected_login is invalid"
-            expected_server = str(
-                getattr(connector_config, "expected_server", "") or ""
-            ).strip()
-            expected_currency = (
-                str(getattr(connector_config, "expected_currency", "") or "")
-                .strip()
-                .upper()
-            )
-        fresh_login = 0
-        try:
-            fresh_login = int(getattr(fresh, "login", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            return None, "fresh account login is invalid"
-        if expected_login <= 0:
-            return None, "MT5 account identity requires a nonzero expected_login pin"
-        if fresh_login != expected_login:
-            return (
-                None,
-                f"fresh account login {fresh_login} != expected {expected_login}",
-            )
-
-        fresh_server = str(getattr(fresh, "server", "") or "").strip()
-        if expected_server and fresh_server.casefold() != expected_server.casefold():
-            return None, (
-                f"fresh account server {fresh_server or '<missing>'} != expected {expected_server}"
-            )
-        if not expected_server:
-            return None, "MT5 account identity requires a nonempty expected_server pin"
-        if not expected_currency:
-            return (
-                None,
-                "MT5 account identity requires a nonempty expected_currency pin",
-            )
-        if fresh_currency != expected_currency:
-            return None, (
-                f"fresh account currency {fresh_currency or '<missing>'} != "
-                f"expected {expected_currency}"
-            )
-
-        if baseline_account is not None:
-            baseline_login = getattr(baseline_account, "login", 0)
-            try:
-                baseline_login = int(baseline_login or 0)
-            except (TypeError, ValueError, OverflowError):
-                baseline_login = 0
-            if baseline_login > 0 and fresh_login > 0 and baseline_login != fresh_login:
-                return (
-                    None,
-                    f"account login changed during decision: {baseline_login} -> {fresh_login}",
-                )
-            for attr, label in (("server", "server"), ("currency", "currency")):
-                before = (
-                    str(getattr(baseline_account, attr, "") or "").strip().casefold()
-                )
-                after = str(getattr(fresh, attr, "") or "").strip().casefold()
-                if before and after and before != after:
-                    return None, f"account {label} changed during decision"
+        if reason:
+            return None, reason
 
         return fresh, None
 
@@ -6082,12 +6219,21 @@ class LiveTrader:
                 )
             self._margin_state = new_state
 
-        account = (
-            account_info
-            if account_info is not None
-            else (self.mt5.get_account_info() if self.mt5 else None)
-        )
-        if account is None:
+        try:
+            account = (
+                account_info
+                if account_info is not None
+                else (self.mt5.get_account_info() if self.mt5 else None)
+            )
+            identity_reason = _account_identity_block_reason(
+                account,
+                connector_config=getattr(self.mt5, "config", None),
+                is_current_refit_demo=bool(getattr(self, "_is_current_refit_demo", False)),
+            )
+        except Exception as exc:
+            identity_reason = f"account snapshot raised {type(exc).__name__}: {exc}"
+        if identity_reason:
+            self.logger.error(f"Margin protection account identity blocked: {identity_reason}")
             _set_state("BLOCKED", None)
             return False
 
@@ -6164,6 +6310,13 @@ class LiveTrader:
                 break
             attempts += 1
 
+            fresh_account, identity_reason = self._fresh_management_account_validation(account)
+            if identity_reason:
+                self.logger.error(f"MARGIN CLOSE DEFERRED: {identity_reason}")
+                _set_state("BLOCKED", None)
+                break
+            account = fresh_account
+
             # Durably arm both recovery hysteresis and the complete cooldown
             # before asking the broker to close. If the process terminates
             # after MT5 accepts the close but before the post-success update,
@@ -6195,8 +6348,9 @@ class LiveTrader:
                 )
                 positions_changed = True
 
-            account = self.mt5.get_account_info() if self.mt5 else None
-            if account is None:
+            account, identity_reason = self._fresh_management_account_validation(account)
+            if identity_reason:
+                self.logger.error(f"Margin protection post-close account blocked: {identity_reason}")
                 _set_state("BLOCKED", None)
                 break
 
@@ -7659,6 +7813,10 @@ class LiveTrader:
                     payload_context["event_calendar"] = dict(
                         decision_context["event_calendar"]
                     )
+                if isinstance(decision_context.get("spread_profile"), dict):
+                    payload_context["spread_profile"] = copy.deepcopy(
+                        decision_context["spread_profile"]
+                    )
                 if isinstance(context, dict) and context:
                     payload_context.update(dict(context))
                 if payload_context:
@@ -7692,6 +7850,14 @@ class LiveTrader:
             _record_actionable(
                 action="BLOCKED_LIVE_OUTCOME_FEEDBACK",
                 context={"live_outcome_feedback_error": reason},
+            )
+            return
+        startup_block_reason = getattr(self, "_startup_entry_block_reason", "")
+        if startup_block_reason:
+            _record_throttle("BLOCKED_ENTRY_READINESS")
+            _record_actionable(
+                action="BLOCKED_ENTRY_READINESS",
+                context={"entry_readiness_error": startup_block_reason},
             )
             return
         manual_block_reason = self._manual_new_entries_block_reason()
@@ -8038,10 +8204,62 @@ class LiveTrader:
             return
         entry_price = tick.ask if is_long else tick.bid
 
-        # Spread-aware execution overlay
+        try:
+            _spread_tier = self._resolve_live_spread_tier(
+                symbol, broker_symbol, _tf, spec, regime_candidate
+            )
+            _target_open = features.index[-1] if features is not None and len(features) else None
+            _prior_spread = self._live_prior_spread_observation(
+                broker_symbol, _spread_tier, _target_open
+            )
+            _prior_admission = spread_admission(_spread_tier, _prior_spread)
+        except Exception as exc:
+            self.logger.warning(f"[{symbol}] Frozen spread entry check unavailable ({type(exc).__name__})")
+            _record_throttle("BLOCKED_SPREAD_PROFILE")
+            _record_actionable(
+                action="BLOCKED_SPREAD_PROFILE",
+                entry_price_value=entry_price,
+                context={"spread_profile": {"stage": "profile_binding", "reason": str(exc) if isinstance(exc, ValueError) else type(exc).__name__}},
+            )
+            return
+        decision_context["spread_profile"] = {
+            "descriptor": _spread_tier.descriptor(),
+            "target_open": str(_target_open),
+            "prior_completed_points": _prior_spread if math.isfinite(_prior_spread) else None,
+            "prior_admission": _prior_admission,
+        }
+
+        def _spread_tick_allowed(quote: Any, stage: str) -> bool:
+            status, points = self._live_tick_spread_admission(_spread_tier, quote)
+            decision_context["spread_profile"][stage] = {
+                "spread_points": points if math.isfinite(points) else None,
+                "admission": status,
+            }
+            if status == "ADMIT":
+                return True
+            _record_throttle("BLOCKED_SPREAD_FILTER")
+            _record_actionable(
+                action="BLOCKED_SPREAD_FILTER",
+                entry_price_value=entry_price,
+                context={"spread_profile": decision_context["spread_profile"]},
+            )
+            return False
+
+        if _prior_admission != "ADMIT":
+            _record_throttle("BLOCKED_SPREAD_FILTER")
+            _record_actionable(
+                action="BLOCKED_SPREAD_FILTER",
+                entry_price_value=entry_price,
+                context={"spread_profile": decision_context["spread_profile"]},
+            )
+            return
+        if not _spread_tick_allowed(tick, "initial_quote"):
+            return
+
+        # Fixed-profile admission is mandatory; the overlay retains its ATR risk rules.
         _spread_overlay = self._enhancement_seams.execution_quality_overlay
         _execution_risk_mult = 1.0
-        _cycle_spread_degradation_mult = 0.0
+        _cycle_spread_degradation_mult = (tick.ask - tick.bid) / _spread_tier.full_spread_price
         if hasattr(_spread_overlay, "enabled") and _spread_overlay.enabled:
             _pip_size = spec.pip_size if spec.pip_size > 0 else 1e-5
             _spread_pips = (tick.ask - tick.bid) / _pip_size
@@ -8052,41 +8270,12 @@ class LiveTrader:
                 and len(features) > 1
             ):
                 _atr_val = float(features["ATR_14"].iloc[-2]) / _pip_size
-            _rolling_spread_median = float(spec.spread_avg)
-            if (
-                features is not None
-                and "Spread" in features.columns
-                and len(features) > 2
-            ):
-                _spread_window = (
-                    pd.to_numeric(features["Spread"].iloc[:-1], errors="coerce")
-                    .dropna()
-                    .tail(100)
-                )
-                if not _spread_window.empty:
-                    _rolling_window_median = float(
-                        (_spread_window * float(spec.point) / _pip_size).median()
-                    )
-                    # Anchor against the larger of rolling-window median and the
-                    # instrument's baseline spread_avg. Pre-news compression can
-                    # collapse the rolling median and arm the spike blocker on
-                    # routine widenings; post-news persistence can inflate it
-                    # and hide real spikes. Taking max() keeps the spike test
-                    # honest in both regimes.
-                    _rolling_spread_median = max(
-                        _rolling_window_median, float(spec.spread_avg)
-                    )
             _eq_ctx = ExecutionQualityContext(
                 symbol=symbol,
                 timeframe=_tf,
                 spread_pips=_spread_pips,
                 atr_pips=_atr_val,
-                rolling_spread_median=_rolling_spread_median,
             )
-            if _rolling_spread_median > 0:
-                _cycle_spread_degradation_mult = float(_spread_pips) / float(
-                    _rolling_spread_median
-                )
             _eq_decision = _spread_overlay.evaluate(_eq_ctx)
             if not _eq_decision.allow_trade:
                 self.logger.info(
@@ -8868,6 +9057,11 @@ class LiveTrader:
                 context={"stage": "final_quote_refresh"},
             )
             return
+        if not _spread_tick_allowed(final_tick, "final_quote"):
+            return
+        _cycle_spread_degradation_mult = (
+            final_tick.ask - final_tick.bid
+        ) / _spread_tier.full_spread_price
         final_entry_price = self._safe_finite_float(
             final_tick.ask if is_long else final_tick.bid
         )
@@ -10170,6 +10364,10 @@ class LiveTrader:
             self.logger.info(f"[{position.symbol}] [PAPER] Would close position")
             return
 
+        _, identity_reason = self._fresh_management_account_validation()
+        if identity_reason:
+            self.logger.error(f"[{position.symbol}] Signal close account identity blocked: {identity_reason}")
+            return
         result = self.mt5.close_position(
             position=position, deviation=30, comment="PM_SignalExit"
         )
@@ -10889,12 +11087,30 @@ class FXPortfolioManagerApp:
             pass
 
         if self.mt5.connect():
-            self.logger.info("Reconnected successfully")
-            reconnect_state["attempts"] = 0
-            reconnect_state["next_attempt_at"] = probe
-            if self.trader:
-                self.trader.invalidate_runtime_caches()
-            return True
+            try:
+                account = self.mt5.get_account_info()
+                trader = getattr(self, "trader", None)
+                identity_reason = _account_identity_block_reason(
+                    account,
+                    connector_config=getattr(self.mt5, "config", None),
+                    is_current_refit_demo=bool(
+                        getattr(trader, "_is_current_refit_demo", False)
+                    ) if trader is not None else False,
+                )
+            except Exception as exc:
+                identity_reason = f"account snapshot raised {type(exc).__name__}: {exc}"
+            if not identity_reason:
+                self.logger.info("Reconnected successfully")
+                reconnect_state["attempts"] = 0
+                reconnect_state["next_attempt_at"] = probe
+                if trader is not None:
+                    trader.invalidate_runtime_caches()
+                return True
+            self.logger.error(f"Reconnect account identity blocked: {identity_reason}")
+            try:
+                self.mt5.disconnect()
+            except Exception:
+                pass
 
         if attempt_number >= max_attempts:
             self.logger.error(
@@ -10916,6 +11132,7 @@ class FXPortfolioManagerApp:
         enable_trading: bool = True,
         close_on_opposite_signal: bool = False,
         execution_book: str = CHAMPION_EXECUTION_BOOK,
+        startup_entry_block_reason: str = "",
     ):
         """
         Run live trading loop.
@@ -10972,7 +11189,7 @@ class FXPortfolioManagerApp:
             self.logger.debug(f"regime_params fallback summary unavailable: {exc}")
         self.logger.info("=" * 60)
 
-        if is_current_refit_demo:
+        if is_current_refit_demo or startup_entry_block_reason:
             live_eligible_configs = None
         else:
             live_eligible_configs = self.portfolio_manager.get_live_eligible_configs(
@@ -11015,6 +11232,7 @@ class FXPortfolioManagerApp:
                 demo_winner_ledger_path=(
                     self.config_file if is_current_refit_demo else None
                 ),
+                startup_entry_block_reason=startup_entry_block_reason,
             )
         except Exception as exc:
             self.logger.error(
@@ -11851,7 +12069,7 @@ def _production_hard_supervision_required(
         supervised_generation_id is None
         and bool(getattr(args, "optimize", False))
         and not bool(getattr(args, "trade", False))
-        and not bool(getattr(args, "paper", False))
+        and not bool(getattr(args, "mt5_demo", False))
         and not bool(getattr(args, "preflight", False))
         and not bool(getattr(args, "status", False))
         and str(
@@ -11888,8 +12106,14 @@ def main(
         help="Force re-optimization of all symbols (ignore valid configs)",
     )
     parser.add_argument("--trade", action="store_true", help="Start live trading")
-    parser.add_argument(
+    destination = parser.add_mutually_exclusive_group()
+    destination.add_argument(
         "--paper",
+        action="store_true",
+        help="Local-ledger paper trading (currently unavailable; refuses before broker access)",
+    )
+    destination.add_argument(
+        "--mt5-demo",
         action="store_true",
         help=(
             "Execute the authorized current-refit book on a broker-verified "
@@ -11941,18 +12165,28 @@ def main(
         "--preflight",
         action="store_true",
         help=(
-            "Run funded live-readiness checks, or DEMO readiness with --paper, "
+            "Run funded live-readiness checks, or DEMO readiness with --mt5-demo, "
             "and exit without starting the trading loop"
         ),
     )
 
     cli_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(cli_argv)
+    if args.paper:
+        print(
+            "Refusing --paper: local-ledger paper trading is not available. "
+            "No configuration or broker connection was opened. "
+            "Use --mt5-demo only when you intend orders on an authorized MT5 DEMO account."
+        )
+        return 2
+    if args.mt5_demo and not (args.trade or args.preflight):
+        print("Refusing --mt5-demo: use --trade or --preflight to select a DEMO action.")
+        return 2
     supervised_child = _supervised_generation_id is not None
     if supervised_child and (
         not args.optimize
         or args.trade
-        or args.paper
+        or args.mt5_demo
         or args.preflight
         or args.status
     ):
@@ -11968,7 +12202,7 @@ def main(
         )
         return 2
     funded_contract_requested = bool(
-        (args.preflight and not args.paper) or (args.trade and not args.paper)
+        (args.preflight and not args.mt5_demo) or (args.trade and not args.mt5_demo)
     )
     if (
         funded_contract_requested
@@ -12024,14 +12258,14 @@ def main(
                 resolved_config_path,
             )
         )
-    # Runtime-only authority bit used by the final pre-send gate.  Paper and
+    # Runtime-only authority bit used by the final pre-send gate. Broker DEMO and
     # research runs remain usable, while a funded entry can never fall back to
     # a mutable ledger status or the legacy review files.
-    pipeline_config._funded_live_execution = bool(args.trade and not args.paper)
+    pipeline_config._funded_live_execution = bool(args.trade and not args.mt5_demo)
     pipeline_config._optimization_only_entrypoint = bool(
         args.optimize
         and not args.trade
-        and not args.paper
+        and not args.mt5_demo
         and not args.preflight
         and not args.status
     )
@@ -12101,7 +12335,7 @@ def main(
         logger, args.config, config_data, pipeline_config, position_config, mt5_config
     )
 
-    if args.preflight and args.paper:
+    if args.preflight and args.mt5_demo:
         # Keep this before FXPortfolioManagerApp construction. DEMO preflight
         # must be a bounded, order-free identity/readiness probe; it must not
         # initialize PortfolioManager or enter any execution path.
@@ -12320,8 +12554,9 @@ def main(
 
         # Run trading
         if args.trade:
+            startup_entry_block_reason = ""
             if args.close_on_opposite_signal:
-                if args.paper:
+                if args.mt5_demo:
                     logger.error(
                         "Current-refit probation refuses --close-on-opposite-signal because "
                         "it would alter the refit's executable policy and contaminate forward evidence."
@@ -12332,7 +12567,7 @@ def main(
                         "was not part of the frozen lockbox contract."
                     )
                 return 2
-            if not args.paper:
+            if not args.mt5_demo:
                 account_info = None
                 try:
                     if (
@@ -12356,22 +12591,37 @@ def main(
                     position_config=position_config,
                 )
                 log_readiness_report(logger, readiness)
-                if not readiness.ok:
+                readiness_errors = readiness.errors
+                management_only = (
+                    not readiness.ok
+                    and len(readiness_errors) == 1
+                    and readiness_errors[0].code
+                    == "interval_cell_qualification_policy_unadopted"
+                    and readiness_errors[0].scope == "evidence"
+                )
+                if (not readiness.ok or readiness_errors) and not management_only:
                     logger.error(
-                        "Live readiness failed; refusing to start live trading."
+                        "Live readiness failed; refusing to start trading or management."
                     )
                     return 2
+                if management_only:
+                    startup_entry_block_reason = readiness_errors[0].code
+                    logger.warning(
+                        "Entry evidence is unavailable; preserving existing open-position "
+                        "management with new entries blocked: %s",
+                        startup_entry_block_reason,
+                    )
             trading_started = _app_instance.run_trading(
-                # --paper is executable demo forward probation, not a log-only
-                # simulator. Broker-reported ACCOUNT_TRADE_MODE==DEMO remains
+                # --mt5-demo submits broker orders. ACCOUNT_TRADE_MODE==DEMO stays
                 # mandatory at startup, every sweep, and immediately pre-send.
                 enable_trading=True,
                 close_on_opposite_signal=False,
                 execution_book=(
                     CURRENT_REFIT_DEMO_EXECUTION_BOOK
-                    if args.paper
+                    if args.mt5_demo
                     else CHAMPION_EXECUTION_BOOK
                 ),
+                startup_entry_block_reason=startup_entry_block_reason,
             )
             if trading_started is False:
                 return 2
@@ -12386,11 +12636,11 @@ def main(
             print("  python pm_main.py --optimize --overwrite  # Force re-optimize all")
             print("  python pm_main.py --trade                 # Start live trading")
             print(
-                "  python pm_main.py --trade --paper         # Current-refit demo probation"
+                "  python pm_main.py --trade --mt5-demo      # Authorized broker DEMO trading"
             )
             print("  python pm_main.py --preflight             # Readiness checks only")
             print(
-                "  python pm_main.py --preflight --paper     # DEMO readiness only"
+                "  python pm_main.py --preflight --mt5-demo  # DEMO readiness only"
             )
             print(
                 f"  production retrain schedule: {pipeline_config.describe_retrain_schedule()}"

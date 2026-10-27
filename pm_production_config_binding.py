@@ -28,7 +28,7 @@ from pm_core import (
 from pm_position import PositionConfig
 
 
-BINDING_SCHEMA: Final = "fxpm.production-effective-pipeline-config.v2"
+BINDING_SCHEMA: Final = "fxpm.production-effective-pipeline-config.v3"
 FUNDED_SCOPE: Final = "funded_live_v1"
 MAX_CONFIG_BYTES: Final = 16 * 1024 * 1024
 MAX_SNAPSHOT_BYTES: Final = 4 * 1024 * 1024
