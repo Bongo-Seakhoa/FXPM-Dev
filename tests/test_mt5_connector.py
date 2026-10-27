@@ -1,3 +1,4 @@
+"""Synthetic native fixtures migrated under lane190; no real account authority."""
 import unittest
 from unittest.mock import Mock
 import logging
@@ -127,21 +128,50 @@ class _FakeMT5:
         return SimpleNamespace(**values)
 
 
+def _mark_synthetic_session_connected(connector, account=None):
+    """Explicit fake initialized native session; never calls a real terminal."""
+    connector._connected = True
+    pm_mt5._NATIVE_ACTIVE_CONNECTOR = connector
+    if account is not None:
+        connector.config.expected_login = account.login
+        connector.config.expected_server = account.server
+        connector.config.expected_currency = account.currency
+
+
+def _synthetic_session_state(connector):
+    return (connector._connected, pm_mt5._NATIVE_ACTIVE_CONNECTOR is connector,
+            connector.execution_destination, connector.runtime_identity,
+            getattr(pm_mt5._NATIVE_LOCAL, "depth", 0),
+            getattr(pm_mt5._NATIVE_LOCAL, "connector", None))
+
+
 class MT5ConnectorTests(unittest.TestCase):
     def setUp(self):
         self._orig_available = pm_mt5.MT5_AVAILABLE
         self._orig_mt5 = pm_mt5.mt5
+        self._orig_native_active = pm_mt5._NATIVE_ACTIVE_CONNECTOR
         self.fake_mt5 = _FakeMT5()
         pm_mt5.mt5 = self.fake_mt5
         pm_mt5.MT5_AVAILABLE = True
 
     def tearDown(self):
         pm_mt5.mt5 = self._orig_mt5
+        pm_mt5._NATIVE_ACTIVE_CONNECTOR = self._orig_native_active
         pm_mt5.MT5_AVAILABLE = self._orig_available
 
     def test_send_market_order_uses_resolved_broker_symbol_and_preflight(self):
-        connector = MT5Connector(MT5Config())
-        connector._connected = True
+        account = self.fake_mt5.account_info()
+        reference = MT5Connector(MT5Config())
+        _mark_synthetic_session_connected(reference, account)
+        helper_state = _synthetic_session_state(reference)
+        self.assertEqual(helper_state, (True, True, "BROKER", None, 0, None))
+        self.fake_mt5.initialize = Mock(return_value=True)
+        connector = MT5Connector(MT5Config(expected_login=account.login,
+            expected_server=account.server, expected_currency=account.currency))
+        connector._symbol_cache["SYNTHETIC_STALE_CACHE"] = object()
+        self.assertTrue(connector.connect())
+        self.assertEqual(connector._symbol_cache, {})
+        self.assertEqual(_synthetic_session_state(connector), helper_state)
 
         result = connector.send_market_order(
             symbol="EURUSD",
@@ -161,10 +191,12 @@ class MT5ConnectorTests(unittest.TestCase):
             self.fake_mt5.order_send_request["type_filling"],
             self.fake_mt5.ORDER_FILLING_FOK,
         )
+        self.fake_mt5.initialize.assert_called_once_with(timeout=connector.config.timeout)
+        self.assertEqual(_synthetic_session_state(connector), helper_state)
 
     def test_send_market_order_uses_prechecked_price_without_refetching_tick(self):
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         result = connector.send_market_order(
             symbol="EURUSD",
@@ -181,7 +213,7 @@ class MT5ConnectorTests(unittest.TestCase):
 
     def test_order_send_none_is_marked_ambiguous(self):
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         def _none_order_send(request):
             self.fake_mt5.order_send_request = dict(request)
@@ -215,7 +247,7 @@ class MT5ConnectorTests(unittest.TestCase):
 
     def test_invalid_or_subminimum_volume_never_reaches_mt5(self):
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         for requested in (0.0, -0.01, float("nan"), 0.0001):
             with self.subTest(requested=requested):
@@ -279,7 +311,7 @@ class MT5ConnectorTests(unittest.TestCase):
 
     def test_return_fill_is_rejected_for_market_execution(self):
         connector = MT5Connector(MT5Config(preferred_filling_type="return"))
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         symbol_info = SimpleNamespace(
             filling_mode=0,
@@ -292,7 +324,7 @@ class MT5ConnectorTests(unittest.TestCase):
 
     def test_get_symbol_info_preserves_tradability_metadata(self):
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         info = connector.get_symbol_info("EURUSD")
 
@@ -304,7 +336,7 @@ class MT5ConnectorTests(unittest.TestCase):
         from pm_demo_readiness import demo_account_errors
 
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         info = connector.get_account_info()
 
@@ -320,7 +352,7 @@ class MT5ConnectorTests(unittest.TestCase):
         from pm_demo_readiness import demo_account_errors
 
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         self.fake_mt5.account_trade_mode_present = False
         missing = connector.get_account_info()
@@ -335,7 +367,7 @@ class MT5ConnectorTests(unittest.TestCase):
 
     def test_missing_symbol_get_bars_is_not_terminal_noise(self):
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
         records = []
 
         class _ListHandler(logging.Handler):
@@ -361,7 +393,7 @@ class MT5ConnectorTests(unittest.TestCase):
 
     def test_get_bars_range_preserves_spread_and_real_volume(self):
         connector = MT5Connector(MT5Config())
-        connector._connected = True
+        _mark_synthetic_session_connected(connector, self.fake_mt5.account_info())
 
         bars = connector.get_bars_range(
             "EURUSD",
@@ -490,10 +522,12 @@ class HistorySyncTests(unittest.TestCase):
     def setUp(self):
         self._orig_available = pm_mt5.MT5_AVAILABLE
         self._orig_mt5 = pm_mt5.mt5
+        self._orig_native_active = pm_mt5._NATIVE_ACTIVE_CONNECTOR
         pm_mt5.MT5_AVAILABLE = True
 
     def tearDown(self):
         pm_mt5.mt5 = self._orig_mt5
+        pm_mt5._NATIVE_ACTIVE_CONNECTOR = self._orig_native_active
         pm_mt5.MT5_AVAILABLE = self._orig_available
 
     def _connector(self, fake):
@@ -502,12 +536,20 @@ class HistorySyncTests(unittest.TestCase):
         connector = MT5Connector(
             MT5Config(history_sync_max_attempts=6, history_sync_sleep_seconds=0.0)
         )
-        connector._connected = True
+        _mark_synthetic_session_connected(connector)
         return connector
 
     def test_get_bars_forces_history_sync_for_fresh_symbol(self):
         fake = _SyncingMT5(sync_after=2)
-        connector = self._connector(fake)
+        reference = self._connector(fake)
+        helper_state = _synthetic_session_state(reference)
+        self.assertEqual(helper_state, (True, True, "BROKER", None, 0, None))
+        fake.initialize = Mock(return_value=True)
+        connector = MT5Connector(MT5Config(history_sync_max_attempts=6, history_sync_sleep_seconds=0.0))
+        connector._symbol_cache["SYNTHETIC_STALE_CACHE"] = object()
+        self.assertTrue(connector.connect())
+        self.assertEqual(connector._symbol_cache, {})
+        self.assertEqual(_synthetic_session_state(connector), helper_state)
 
         bars = connector.get_bars("PLATINUM", "M5", count=300000)
 
@@ -516,6 +558,8 @@ class HistorySyncTests(unittest.TestCase):
         self.assertIn("Close", bars.columns)
         # The date-anchored copy_rates_from is what actually returned data.
         self.assertGreaterEqual(fake.from_calls, 2)
+        fake.initialize.assert_called_once_with(timeout=connector.config.timeout)
+        self.assertEqual(_synthetic_session_state(connector), helper_state)
 
     def test_get_bars_no_extra_calls_when_cache_ready(self):
         fake = _ImmediateMT5()

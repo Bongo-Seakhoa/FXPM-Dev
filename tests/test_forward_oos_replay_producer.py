@@ -183,101 +183,7 @@ def _bound_native_config(root: Path, data_dir: Path) -> PipelineConfig:
     return config
 
 
-def _sealed_identity_only_product(
-    *, symbol: str, timeframe: str, cutoff_utc: str
-) -> native_prefix.NativePrefixProduct:
-    def descriptor(format_name: str, seed: str, size: int = 10) -> dict:
-        return {
-            "schema_version": authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
-            "relative_path": f"objects/{seed}",
-            "sha256": producer._sha({"seed": seed}),
-            "size_bytes": size,
-            "format": format_name,
-        }
-
-    content = descriptor("csv", "prefix-content", 100)
-    index = {
-        "schema_version": native_prefix.PREFIX_INDEX_SCHEMA,
-        "authority_scope": native_prefix.PREFIX_AUTHORITY_SCOPE,
-        "source_state": native_prefix.AVAILABLE,
-        "source_reason": None,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "cutoff_utc": cutoff_utc,
-        "source_accessed_at_utc": "2026-02-01T00:00:01Z",
-        "activation": {
-            "activation_id": "identity-only-activation",
-            "manifest_relative_path": "activations/identity-only.json",
-            "manifest_sha256": "1" * 64,
-            "entry_sha256": "2" * 64,
-            "run_manifest_relative_path": "runs/identity-only/run.json",
-            "run_manifest_sha256": "3" * 64,
-        },
-        "source": {
-            "bars_relative_path": "runs/identity-only/bars.csv",
-            "bars_sha256": "4" * 64,
-            "bars_bytes": 100,
-            "bars_rows": 2,
-            "audit_sidecar_relative_path": "audits/identity-only.json",
-            "audit_sidecar_sha256": "5" * 64,
-            "audit_sidecar_bytes": 10,
-            "provenance_relative_path": "runs/identity-only/provenance.json",
-            "provenance_sha256": "6" * 64,
-            "provenance_bytes": 10,
-            "request_map_sha256": "7" * 64,
-            "source_identity_sha256": "8" * 64,
-            "source_identity": {"account": "frozen"},
-            "instrument_snapshot": {},
-            "request_start_utc": "2026-01-01T00:00:00Z",
-            "request_end_exclusive_utc": cutoff_utc,
-        },
-        "prefix": {
-            "schema": descriptor("json", "prefix-schema"),
-            "content": content,
-            "segments": descriptor("jsonl", "prefix-segments"),
-            "prefix_rows": 2,
-            "prefix_start_utc": "2026-01-01T00:00:00Z",
-            "prefix_end_exclusive_utc": cutoff_utc,
-            "prefix_first_open_utc": "2026-01-01T00:00:00Z",
-            "prefix_last_open_utc": "2026-01-31T23:55:00Z",
-            "prefix_last_close_utc": cutoff_utc,
-        },
-        "continuity": {
-            "policy": descriptor("json", "continuity-policy"),
-            "receipt": descriptor("json", "continuity-receipt"),
-            "geometry_sha256": "9" * 64,
-            "internal_status": "CONTINUOUS",
-            "boundary_status": "COMPLETE",
-            "unexplained_discontinuity_count": 0,
-            "segment_count": 1,
-            "gap_count": 0,
-            "requires_preserved_segment_ledger": True,
-        },
-        "terminal_receipt": None,
-        "grants_search_authority": False,
-        "grants_trading_authority": False,
-    }
-    raw = producer._canonical_bytes(index)
-    index_sha = producer.hashlib.sha256(raw).hexdigest()
-    index_descriptor = {
-        "schema_version": authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
-        "relative_path": "objects/prefix-index",
-        "sha256": index_sha,
-        "size_bytes": len(raw),
-        "format": authority_spool.CANONICAL_JSON_FORMAT,
-    }
-    return native_prefix.NativePrefixProduct(
-        source_state=native_prefix.AVAILABLE,
-        index=index,
-        index_descriptor=index_descriptor,
-        index_sha256=index_sha,
-        native_prefix=native_prefix._native_prefix_from_index(index, index_sha),
-        instrument_snapshot={},
-        prefix_path=None,
-        prefix_descriptor=content,
-        artifact_descriptors=(index_descriptor, content),
-        _seal=native_prefix._PRODUCT_SEAL,
-    )
+from prototype_support import (_sealed_identity_only_product, _synthetic_profile)
 
 
 def test_synthetic_archived_position_spools_and_reopens_as_causal_activity(
@@ -1141,32 +1047,6 @@ class _FrozenRawStrategy:
         return 100, 100
 
 
-def _synthetic_profile(tmp_path, *, symbol="EURUSD", timeframe="H1", source_timeframe="M5", identity=None):
-    """Invented thresholds for execution conformance, not market estimates."""
-    identity = identity or {"source_identity_sha256": "1" * 64, "source_bars_sha256": "2" * 64,
-        "source_audit_sidecar_sha256": "3" * 64, "source_provenance_sha256": "4" * 64,
-        "activation_id": "synthetic-cost-conformance", "activation_manifest_sha256": "5" * 64}
-    body = {"schema_version": "fxpm.frozen-spread-profile.v1",
-        "status": "COMPLETE_CALIBRATION_WITH_EXPLICIT_UNAVAILABLE_GROUPS",
-        "calculation_policy": "ONE_TIME_OFFLINE_NO_RUNTIME_RECALCULATION",
-        "source_convention": "FINEST_ACTIVATED_CANDIDATE_FIXED_PER_SYMBOL_EXACT_PRIOR_CLOSE_AT_TARGET_OPEN",
-        "production_authority": False, "protected_cutoff_utc": "2026-02-01T00:00:00Z",
-        "activation": {"id": identity["activation_id"], "manifest_sha256": identity["activation_manifest_sha256"]},
-        "cells": [{"symbol": symbol, "timeframe": timeframe, "status": "CALCULATED", "point_price": 0.00001,
-            "source_timeframe": source_timeframe, "source_identity": {"identity_sha256": identity["source_identity_sha256"]},
-            "source_binding": {"bars_relative_path": "synthetic/bars.csv", "bars_sha256": identity["source_bars_sha256"],
-                "sidecar_sha256": identity["source_audit_sidecar_sha256"], "provenance_sha256": identity["source_provenance_sha256"],
-                "target_bars_relative_path": "synthetic/bars.csv", "target_bars_sha256": identity["source_bars_sha256"]},
-            "tiers": {"P75": {"spread_points": 9, "full_spread_price": 9 * 0.00001,
-                              "half_spread_price": 9 * 0.00001 / 2, "usability": "POSITIVE_QUANTILE"},
-                      "P95": {"spread_points": 16, "full_spread_price": 16 * 0.00001,
-                              "half_spread_price": 16 * 0.00001 / 2, "usability": "POSITIVE_QUANTILE"}}}]}
-    path = tmp_path / "synthetic_frozen_profile.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(body), encoding="utf-8")
-    profile = FrozenSpreadProfile(path)
-    return {level: profile.resolve(symbol, timeframe, level, point=0.00001,
-            source_identity_sha256=identity["source_identity_sha256"]) for level in ("P75", "P95")}
 
 
 def _real_frozen_engine_account(tmp_path):

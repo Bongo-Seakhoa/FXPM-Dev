@@ -77,6 +77,15 @@ class ReadinessFinding:
     scope: str = "evidence"
 
 
+def interval_cell_qualification_readiness_finding() -> tuple[str, str]:
+    """Return the current deployment block without config, data or ledger IO."""
+    return (
+        "interval_cell_qualification_policy_unadopted",
+        "new entries require the adopted interval cell qualification policy; "
+        "the previous multiplier cost evidence is retired",
+    )
+
+
 @dataclass
 class ReadinessReport:
     ok: bool
@@ -1205,12 +1214,7 @@ def validate_live_readiness(
         "backtest_spread_mode_not_conservative",
         "funded evidence requires conservative_max spread modeling",
     )
-    add(
-        "error",
-        "interval_cell_qualification_policy_unadopted",
-        "new entries require the adopted interval cell qualification policy; "
-        "the previous multiplier cost evidence is retired",
-    )
+    add("error", *interval_cell_qualification_readiness_finding())
     require(
         str(getattr(config, "live_artifact_drift_policy", "block") or "").lower()
         == "block",

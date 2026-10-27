@@ -377,10 +377,30 @@ def _scan_committed_bytes(root: Path) -> int:
                         continue
                     if not stat.S_ISREG(info.st_mode):
                         _fail("SPOOL_QUOTA_NONREGULAR_ENTRY_FORBIDDEN", path)
-                    inode = (int(info.st_dev), int(info.st_ino))
+                    try:
+                        file_info = os.stat(path, follow_symlinks=False)
+                    except OSError as exc:
+                        raise AuthoritySpoolQuotaError(
+                            "SPOOL_QUOTA_RESCAN_FAILED",
+                            type(exc).__name__,
+                            str(path),
+                        ) from exc
+                    reparse_marker = int(
+                        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
+                    )
+                    file_attributes = int(
+                        getattr(file_info, "st_file_attributes", 0) or 0
+                    )
+                    if not stat.S_ISREG(file_info.st_mode) or (
+                        reparse_marker and file_attributes & reparse_marker
+                    ):
+                        _fail("SPOOL_QUOTA_RESCAN_FAILED", "FILE_TYPE_CHANGED", path)
+                    inode = (int(file_info.st_dev), int(file_info.st_ino))
+                    if inode == (0, 0):
+                        _fail("SPOOL_QUOTA_RESCAN_FAILED", "FILE_IDENTITY_UNAVAILABLE", path)
                     if inode not in inodes:
                         inodes.add(inode)
-                        total += int(info.st_size)
+                        total += int(file_info.st_size)
         except AuthoritySpoolQuotaError:
             raise
         except OSError as exc:

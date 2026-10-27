@@ -39,6 +39,7 @@ import signal
 import sys
 import time
 import threading
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -248,65 +249,13 @@ def _account_identity_block_reason(
     is_current_refit_demo: bool = False,
     baseline_account: Any = None,
 ) -> Optional[str]:
-    """Compare identity only; protective management must not require equity."""
-    if account is None:
-        return "fresh account snapshot unavailable"
-    if is_current_refit_demo:
-        from pm_demo_readiness import AUTHORIZED_DEMO_ACCOUNT_IDENTITY
-
-        expected_login = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.login
-        expected_server = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.server
-        expected_currency = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.currency
-    else:
-        if type(connector_config).__module__.startswith("unittest.mock"):
-            connector_config = None
-        try:
-            expected_login = int(getattr(connector_config, "expected_login", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            return "configured expected_login is invalid"
-        expected_server = str(
-            getattr(connector_config, "expected_server", "") or ""
-        ).strip()
-        expected_currency = (
-            str(getattr(connector_config, "expected_currency", "") or "")
-            .strip()
-            .upper()
-        )
-    try:
-        fresh_login = int(getattr(account, "login", 0) or 0)
-    except (TypeError, ValueError, OverflowError):
-        return "fresh account login is invalid"
-    if expected_login <= 0:
-        return "MT5 account identity requires a nonzero expected_login pin"
-    if fresh_login != expected_login:
-        return f"fresh account login {fresh_login} != expected {expected_login}"
-    fresh_server = str(getattr(account, "server", "") or "").strip()
-    if expected_server and fresh_server.casefold() != expected_server.casefold():
-        return (
-            f"fresh account server {fresh_server or '<missing>'} != expected {expected_server}"
-        )
-    if not expected_server:
-        return "MT5 account identity requires a nonempty expected_server pin"
-    if not expected_currency:
-        return "MT5 account identity requires a nonempty expected_currency pin"
-    fresh_currency = str(getattr(account, "currency", "") or "").strip().upper()
-    if fresh_currency != expected_currency:
-        return (
-            f"fresh account currency {fresh_currency or '<missing>'} != expected {expected_currency}"
-        )
-    if baseline_account is not None:
-        try:
-            baseline_login = int(getattr(baseline_account, "login", 0) or 0)
-        except (TypeError, ValueError, OverflowError):
-            baseline_login = 0
-        if baseline_login > 0 and baseline_login != fresh_login:
-            return f"account login changed during decision: {baseline_login} -> {fresh_login}"
-        for attr in ("server", "currency"):
-            before = str(getattr(baseline_account, attr, "") or "").strip().casefold()
-            after = str(getattr(account, attr, "") or "").strip().casefold()
-            if before and after and before != after:
-                return f"account {attr} changed during decision"
-    return None
+    """Use the same identity boundary as every native submission."""
+    from pm_mt5 import account_identity_block_reason
+    return account_identity_block_reason(
+        account, connector_config=connector_config,
+        is_current_refit_demo=is_current_refit_demo,
+        baseline_account=baseline_account,
+    )
 
 # Import PM modules
 
@@ -870,7 +819,10 @@ from pm_order_governance import (
 )
 from pm_institutional_supervisor import InstitutionalSupervisor, SupervisorContext
 from pm_cycle_drift import CycleDriftContext, CycleDriftMonitor
-from pm_live_outcomes import LiveOutcomeError, LiveOutcomeLedger
+from pm_live_outcomes import (
+    LiveOutcomeError, LiveOutcomeLedger, RuntimeAccountIdentity,
+    runtime_account_identity,
+)
 from pm_model_lifecycle import (
     LOCKBOX_CHAMPION_ROLE,
     PROCESS_VALIDATED_CURRENT_REFIT_ROLE,
@@ -885,6 +837,7 @@ from pm_risk_admission import (
 from pm_event_context import EventCalendar, observe_event_context
 from pm_live_readiness import (
     ReadinessFinding,
+    interval_cell_qualification_readiness_finding,
     log_readiness_report,
     validate_live_readiness,
 )
@@ -895,8 +848,38 @@ from pm_mt5 import (
     MT5Connector,
     MT5OrderResult,
     MT5Position,
+    NativeSessionError,
     OrderType,
+    PaperExecutionConnector,
+    PaperProtectionDataError,
 )
+
+
+def _serialized_runtime_entry(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        identity = getattr(self, "_runtime_account_identity", None)
+        if not isinstance(identity, RuntimeAccountIdentity):
+            return method(self, *args, **kwargs)
+        with self.mt5.native_session():
+            return method(self, *args, **kwargs)
+    return guarded
+
+
+def _runtime_session_lifecycle(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            primary = sys.exc_info()[1]
+            try:
+                self._close_runtime_outcome_ledger()
+            except Exception as exc:
+                if primary is None:
+                    raise
+                self.logger.error("Runtime writer cleanup failed after %s: %s: %s", type(primary).__name__, type(exc).__name__, exc)
+    return guarded
 
 
 # =============================================================================
@@ -905,10 +888,12 @@ from pm_mt5 import (
 
 
 def setup_logging(
-    log_dir: str = "logs", log_level: str = "INFO", console_level: str = "INFO"
+    log_dir: str = "logs", log_level: str = "INFO", console_level: str = "INFO",
+    *, file_logging: bool = True,
 ) -> logging.Logger:
     """Setup logging configuration."""
-    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    if file_logging:
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
 
     log_filename = f"pm_{datetime.now().strftime('%Y%m%d')}.log"
     log_path = os.path.join(log_dir, log_filename)
@@ -920,12 +905,14 @@ def setup_logging(
     logger.handlers.clear()
 
     # File handler
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
-    file_handler.setLevel(getattr(logging, log_level.upper()))
-    file_format = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    file_handler.setFormatter(file_format)
+    file_handler = None
+    if file_logging:
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setLevel(getattr(logging, log_level.upper()))
+        file_format = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        file_handler.setFormatter(file_format)
 
     # Console handler
     console_handler = logging.StreamHandler()
@@ -935,7 +922,8 @@ def setup_logging(
     )
     console_handler.setFormatter(console_format)
 
-    logger.addHandler(file_handler)
+    if file_handler is not None:
+        logger.addHandler(file_handler)
     logger.addHandler(console_handler)
 
     return logger
@@ -1726,6 +1714,9 @@ class LiveTrader:
         demo_symbols: Optional[Sequence[str]] = None,
         demo_winner_ledger_path: Optional[str] = None,
         startup_entry_block_reason: str = "",
+        execution_destination: Optional[str] = None,
+        runtime_identity: Optional[RuntimeAccountIdentity] = None,
+        outcome_ledger: Optional[LiveOutcomeLedger] = None,
     ):
         """
         Initialize live trader.
@@ -1734,7 +1725,7 @@ class LiveTrader:
             mt5_connector: MT5 connection
             portfolio_manager: Portfolio manager with configs
             position_config: Position management configuration
-            enable_trading: Enable actual trade execution
+            enable_trading: Enable new entries; authorised protective management remains active
             close_on_opposite_signal: Close positions on opposite signal (default: False)
             pipeline_config: Pipeline configuration (for regime params, etc.)
             execution_book: Funded champion or current-refit demo book.
@@ -1746,7 +1737,32 @@ class LiveTrader:
         self.close_on_opposite_signal = close_on_opposite_signal
         self.pipeline_config = pipeline_config
         self.storage_manager = storage_manager
+        self.execution_destination = execution_destination
+        self._runtime_account_identity = runtime_identity
+        if execution_destination == "PAPER" and (
+            not isinstance(runtime_identity, RuntimeAccountIdentity)
+            or not isinstance(mt5_connector, PaperExecutionConnector)
+        ):
+            raise LiveOutcomeError("PAPER requires its bound local execution connector")
+        if runtime_identity is not None:
+            if not isinstance(runtime_identity, RuntimeAccountIdentity):
+                raise LiveOutcomeError("invalid runtime account identity")
+            if execution_destination != runtime_identity.destination:
+                raise LiveOutcomeError("runtime execution destination mismatch")
+            if storage_manager is None or storage_manager.runtime_identity != runtime_identity:
+                raise LiveOutcomeError("runtime storage namespace is unavailable")
+            if outcome_ledger is None:
+                raise LiveOutcomeError("bound runtime requires its acquired durable writer")
+            if runtime_account_identity(self.mt5.get_account_info(), execution_destination) != runtime_identity:
+                raise LiveOutcomeError("runtime account changed before trader construction")
+            if outcome_ledger is not None and outcome_ledger.runtime_identity != runtime_identity:
+                raise LiveOutcomeError("runtime outcome ledger namespace mismatch")
+        self._held_owner_contexts: Dict[int, Dict[str, Any]] = {}
+        self._held_owner_errors: Dict[int, str] = {}
+        self._owner_winner_ledger_path = demo_winner_ledger_path or getattr(pipeline_config, "winner_ledger_path", None)
+        self._live_outcome_ledger = outcome_ledger
         self._startup_entry_block_reason = str(startup_entry_block_reason or "")
+        self._paper_protection_entry_block_reason = ""
         normalized_book = str(execution_book or CHAMPION_EXECUTION_BOOK).strip().upper()
         if normalized_book not in {
             CHAMPION_EXECUTION_BOOK,
@@ -1757,117 +1773,143 @@ class LiveTrader:
         self._is_current_refit_demo = (
             normalized_book == CURRENT_REFIT_DEMO_EXECUTION_BOOK
         )
+        if runtime_identity is not None and (execution_destination == "MT5_DEMO") != self._is_current_refit_demo:
+            raise LiveOutcomeError("runtime destination and execution book differ")
         self._demo_management_capsule_id = ""
         self._demo_management_generation_id = ""
         if self._is_current_refit_demo:
-            config_path = str(
-                getattr(self.pipeline_config, "_deployment_config_path", "") or ""
-            ).strip()
-            ledger_path = str(demo_winner_ledger_path or "").strip()
-            requested_symbols = sorted(
-                {
-                    str(symbol or "").strip().upper()
-                    for symbol in (demo_symbols or ())
-                    if str(symbol or "").strip()
-                }
-            )
-            if not config_path or not ledger_path or not requested_symbols:
-                raise ValueError("current-refit demo authority inputs are incomplete")
-            account_info = self.mt5.get_account_info()
-            account_reason = self._current_refit_demo_account_block_reason(account_info)
-            if account_reason:
-                raise ValueError(account_reason)
-            from pm_demo_readiness import (
-                DemoProbationReadinessReport,
-                authorize_demo_probation_execution,
-            )
+            try:
+                config_path = str(
+                    getattr(self.pipeline_config, "_deployment_config_path", "") or ""
+                ).strip()
+                ledger_path = str(demo_winner_ledger_path or "").strip()
+                requested_symbols = sorted(
+                    {
+                        str(symbol or "").strip().upper()
+                        for symbol in (demo_symbols or ())
+                        if str(symbol or "").strip()
+                    }
+                )
+                if not config_path or not ledger_path or not requested_symbols:
+                    raise ValueError("current-refit demo authority inputs are incomplete")
+                account_info = self.mt5.get_account_info()
+                account_reason = self._current_refit_demo_account_block_reason(account_info)
+                if account_reason:
+                    raise ValueError(account_reason)
+                from pm_demo_readiness import (
+                    DemoProbationReadinessReport,
+                    authorize_demo_probation_execution,
+                )
 
-            demo_report, demo_projection = authorize_demo_probation_execution(
-                self.pipeline_config,
-                symbols=requested_symbols,
-                config_path=config_path,
-                winner_ledger_path=ledger_path,
-                account_info=account_info,
-                position_config=self.position_config,
-            )
-            management_only = (
-                isinstance(demo_report, DemoProbationReadinessReport)
-                and demo_report.management_only
-            )
-            if management_only:
-                self._startup_entry_block_reason = (
-                    self._startup_entry_block_reason
-                    or "interval_cell_qualification_policy_unadopted"
+                demo_report, demo_projection = authorize_demo_probation_execution(
+                    self.pipeline_config,
+                    symbols=requested_symbols,
+                    config_path=config_path,
+                    winner_ledger_path=ledger_path,
+                    account_info=account_info,
+                    position_config=self.position_config,
                 )
-                demo_projection = demo_report.management_projection
-            if (
-                not bool(getattr(demo_report, "ok", False)) and not management_only
-            ) or not demo_projection:
-                errors = [
-                    str(getattr(finding, "code", "demo_authority_failed"))
-                    for finding in list(getattr(demo_report, "findings", ()) or ())
-                    if str(getattr(finding, "severity", "")).lower() == "error"
-                ]
-                raise ValueError(
-                    "current-refit demo authority denied: "
-                    + ",".join(errors or ["unknown"])
+                management_only = (
+                    isinstance(demo_report, DemoProbationReadinessReport)
+                    and demo_report.management_only
                 )
-            self.bind_demo_management_authority(
-                str(getattr(demo_report, "management_capsule_id", "") or ""),
-                str(
-                    getattr(demo_report, "management_generation_id", "") or ""
-                ),
-            )
-            capital_sha = getattr(
-                demo_report, "execution_capital_config_sha256", None
-            )
-            capital_envelope = dict(
-                getattr(demo_report, "execution_capital_envelope", {}) or {}
-            )
-            if not isinstance(capital_sha, str) or len(capital_sha) != 64:
-                raise ValueError("current-refit demo capital authority is missing")
-            position_sha = getattr(
-                demo_report, "execution_position_config_sha256", None
-            )
-            if not isinstance(position_sha, str) or len(position_sha) != 64:
-                raise ValueError("current-refit demo position authority is missing")
-            detector_authority_sha = getattr(
-                demo_report, "execution_detector_projection_sha256", None
-            )
-            detector_projection = getattr(
-                demo_report, "execution_detector_projection", None
-            )
-            if not self._plain_sha256(detector_authority_sha) or not isinstance(
-                detector_projection, Mapping
-            ):
-                raise ValueError("current-refit demo detector authority is missing")
-            self._current_refit_demo_capital_config_sha256 = capital_sha
-            self._current_refit_demo_capital_envelope = capital_envelope
-            self._current_refit_demo_position_config_sha256 = position_sha
-            (
-                self._current_refit_demo_configs,
-                self._current_refit_demo_cell_bindings,
-                self._current_refit_demo_cell_fingerprints,
-            ) = self._parse_current_refit_demo_projection(
-                demo_projection
-            )
-            (
-                self._current_refit_demo_detectors,
-                self._current_refit_demo_detector_fingerprint,
-            ) = self._parse_current_refit_demo_detectors(
-                detector_projection,
-                self._current_refit_demo_configs,
-            )
-            self._current_refit_demo_detector_authority_sha256 = (
-                detector_authority_sha
-            )
-            self._current_refit_demo_detector_roster = tuple(
-                sorted(self._current_refit_demo_detectors)
-            )
-            self._current_refit_demo_detector_record_fingerprints = {
-                key: self._canonical_payload_sha256(value)
-                for key, value in self._current_refit_demo_detectors.items()
-            }
+                if management_only:
+                    self._startup_entry_block_reason = (
+                        self._startup_entry_block_reason
+                        or "interval_cell_qualification_policy_unadopted"
+                    )
+                    demo_projection = demo_report.management_projection
+                if (
+                    not bool(getattr(demo_report, "ok", False)) and not management_only
+                ) or not demo_projection:
+                    errors = [
+                        str(getattr(finding, "code", "demo_authority_failed"))
+                        for finding in list(getattr(demo_report, "findings", ()) or ())
+                        if str(getattr(finding, "severity", "")).lower() == "error"
+                    ]
+                    raise ValueError(
+                        "current-refit demo authority denied: "
+                        + ",".join(errors or ["unknown"])
+                    )
+                self.bind_demo_management_authority(
+                    str(getattr(demo_report, "management_capsule_id", "") or ""),
+                    str(
+                        getattr(demo_report, "management_generation_id", "") or ""
+                    ),
+                )
+                capital_sha = getattr(
+                    demo_report, "execution_capital_config_sha256", None
+                )
+                capital_envelope = dict(
+                    getattr(demo_report, "execution_capital_envelope", {}) or {}
+                )
+                if not isinstance(capital_sha, str) or len(capital_sha) != 64:
+                    raise ValueError("current-refit demo capital authority is missing")
+                position_sha = getattr(
+                    demo_report, "execution_position_config_sha256", None
+                )
+                if not isinstance(position_sha, str) or len(position_sha) != 64:
+                    raise ValueError("current-refit demo position authority is missing")
+                detector_authority_sha = getattr(
+                    demo_report, "execution_detector_projection_sha256", None
+                )
+                detector_projection = getattr(
+                    demo_report, "execution_detector_projection", None
+                )
+                if not self._plain_sha256(detector_authority_sha) or not isinstance(
+                    detector_projection, Mapping
+                ):
+                    raise ValueError("current-refit demo detector authority is missing")
+                self._current_refit_demo_capital_config_sha256 = capital_sha
+                self._current_refit_demo_capital_envelope = capital_envelope
+                self._current_refit_demo_position_config_sha256 = position_sha
+                (
+                    self._current_refit_demo_configs,
+                    self._current_refit_demo_cell_bindings,
+                    self._current_refit_demo_cell_fingerprints,
+                ) = self._parse_current_refit_demo_projection(
+                    demo_projection
+                )
+                (
+                    self._current_refit_demo_detectors,
+                    self._current_refit_demo_detector_fingerprint,
+                ) = self._parse_current_refit_demo_detectors(
+                    detector_projection,
+                    self._current_refit_demo_configs,
+                )
+                self._current_refit_demo_detector_authority_sha256 = (
+                    detector_authority_sha
+                )
+                self._current_refit_demo_detector_roster = tuple(
+                    sorted(self._current_refit_demo_detectors)
+                )
+                self._current_refit_demo_detector_record_fingerprints = {
+                    key: self._canonical_payload_sha256(value)
+                    for key, value in self._current_refit_demo_detectors.items()
+                }
+            except Exception as exc:
+                if not isinstance(runtime_identity, RuntimeAccountIdentity):
+                    raise
+                actual = self.mt5.get_account_info()
+                if runtime_account_identity(actual, runtime_identity.destination) != runtime_identity or self._current_refit_demo_account_block_reason(actual):
+                    raise
+                positions = self.mt5.get_positions()
+                if positions is None or (not positions and not outcome_ledger.unresolved_pre_send_intents()):
+                    raise
+                self._startup_entry_block_reason = self._startup_entry_block_reason or f"demo entry authority unavailable: {type(exc).__name__}: {exc}"
+                self._demo_management_capsule_id = ""
+                self._demo_management_generation_id = ""
+                self._current_refit_demo_configs = {}
+                self._current_refit_demo_cell_bindings = {}
+                self._current_refit_demo_cell_fingerprints = {}
+                self._current_refit_demo_capital_config_sha256 = ""
+                self._current_refit_demo_capital_envelope = {}
+                self._current_refit_demo_position_config_sha256 = ""
+                self._current_refit_demo_detectors = {}
+                self._current_refit_demo_detector_fingerprint = ""
+                self._current_refit_demo_detector_authority_sha256 = ""
+                self._current_refit_demo_detector_roster = ()
+                self._current_refit_demo_detector_record_fingerprints = {}
         else:
             if demo_symbols is not None or demo_winner_ledger_path is not None:
                 raise ValueError("funded execution cannot receive demo authority inputs")
@@ -1914,7 +1956,11 @@ class LiveTrader:
                 Path(source_config).resolve().parent if source_config else Path.cwd()
             )
             runtime_state_dir = (runtime_root / runtime_state_dir).resolve()
-        if self._is_current_refit_demo:
+        if runtime_identity is not None:
+            runtime_state_dir = storage_manager.output_dir
+            decision_log_path = runtime_state_dir / "last_trade_log.json"
+            actionable_log_path = runtime_state_dir / "last_actionable_log.json"
+        elif self._is_current_refit_demo:
             runtime_state_dir = runtime_state_dir / "current_refit_demo"
             decision_log_path = runtime_state_dir / "last_trade_log.json"
             actionable_log_path = runtime_state_dir / "last_actionable_log.json"
@@ -1939,6 +1985,7 @@ class LiveTrader:
                     )
                 )
                 or self._is_current_refit_demo
+                or runtime_identity is not None
             )
         )
         self._decision_throttle = DecisionThrottle(log_path=str(decision_log_path))
@@ -1988,7 +2035,7 @@ class LiveTrader:
         self._enhancement_seams = create_default_enhancement_seams(self.pipeline_config)
         supervisor_state_path = None
         drift_state_path = None
-        if self._is_current_refit_demo:
+        if runtime_identity is not None or self._is_current_refit_demo:
             supervisor_state_path = (
                 runtime_state_dir / "institutional_supervisor_state.json"
             )
@@ -2008,16 +2055,17 @@ class LiveTrader:
             self.pipeline_config, PipelineConfig
         )
         self._live_outcome_feedback_error = ""
-        self._live_outcome_ledger: Optional[LiveOutcomeLedger] = None
-        if self._live_outcome_feedback_initialized and bool(
+        self._live_outcome_ledger: Optional[LiveOutcomeLedger] = outcome_ledger
+        if outcome_ledger is None and self._live_outcome_feedback_initialized and bool(
             getattr(self.pipeline_config, "live_outcome_feedback_enabled", True)
         ):
             try:
-                if self._is_current_refit_demo:
+                if runtime_identity is not None or self._is_current_refit_demo:
                     self._live_outcome_ledger = LiveOutcomeLedger(
                         self.pipeline_config,
                         ledger_path=runtime_state_dir / "closed_positions.jsonl",
                         state_path=runtime_state_dir / "closed_positions.state.json",
+                        runtime_identity=runtime_identity,
                     )
                 else:
                     self._live_outcome_ledger = LiveOutcomeLedger(self.pipeline_config)
@@ -2128,6 +2176,230 @@ class LiveTrader:
         self._cache_hits = 0
         self._cache_misses = 0
         self.logger.debug("Cleared live runtime caches")
+
+    def _runtime_risk_positions(self, positions: List[Any]) -> List[Any]:
+        observed = list(positions)
+        if getattr(self, "execution_destination", None) == "PAPER":
+            native = self.mt5.get_observed_broker_positions()
+            if native is None:
+                raise LiveOutcomeError("observed broker positions unavailable for PAPER risk")
+            observed.extend(list(native))
+        return observed
+
+    def _reconcile_runtime_reservations(self, positions: List[Any]) -> None:
+        ledger = getattr(self, "_live_outcome_ledger", None)
+        if ledger is None:
+            return
+        identity = getattr(self, "_runtime_account_identity", None)
+        if isinstance(identity, RuntimeAccountIdentity) and runtime_account_identity(self.mt5.get_account_info(), identity.destination) != identity:
+            raise LiveOutcomeError("account changed before reservation reconciliation")
+        for pending in ledger.unresolved_pre_send_intents():
+            try:
+                if getattr(self, "execution_destination", None) == "PAPER":
+                    fill = ledger.paper_fill_for_reservation(pending["reservation_id"])
+                    if fill is None:
+                        continue
+                    ledger.bind_pre_send_intent(
+                        pending["reservation_id"], position_id=fill["position_id"],
+                        opening_deal_ticket=fill["opening_deal_ticket"],
+                        opening_order_ticket=fill["opening_order_ticket"],
+                        fill_price=fill["price_open"], fill_volume=fill["volume_initial"],
+                        risk_cash=fill["risk_cash"],
+                    )
+                    continue
+                order_ticket = int(pending.get("broker_order_ticket", 0) or 0)
+                if order_ticket <= 0:
+                    continue
+                matches = []
+                for position in positions:
+                    if int(getattr(position, "magic", 0) or 0) != pending["magic"]:
+                        continue
+                    identifier = int(getattr(position, "identifier", 0) or getattr(position, "ticket", 0) or 0)
+                    history = self.mt5.get_position_history(identifier)
+                    if not isinstance(history, dict) or history.get("history_complete") is not True:
+                        continue
+                    entries = [row for row in history.get("deals", ()) if row.get("entry", row.get("entry_kind")) in (0, "IN") and int(row.get("order_ticket", 0) or 0) == order_ticket]
+                    if entries:
+                        matches.append((position, identifier, entries))
+                if len(matches) != 1:
+                    continue
+                position, identifier, entries = matches[0]
+                broker_symbol = self.mt5.find_broker_symbol(pending["symbol"])
+                if getattr(position, "symbol", None) != broker_symbol or any(row.get("symbol") != broker_symbol or int(row.get("magic", 0) or 0) != pending["magic"] for row in entries):
+                    raise LiveOutcomeError("restart fill differs from its durable reservation")
+                volume = sum(float(row["volume"]) for row in entries)
+                price = sum(float(row["volume"]) * float(row["price"]) for row in entries) / volume
+                info = self.mt5.get_symbol_info(broker_symbol)
+                spec = self._symbol_info_to_instrument_spec(pending["symbol"], info)
+                risk, _ = self._estimate_stop_loss_amount(int(position.type), broker_symbol, volume, price, float(pending["initial_stop"]), spec=spec, symbol_info=info)
+                if risk is None or not math.isfinite(risk) or risk <= 0.0:
+                    raise LiveOutcomeError("restart fill stop risk is unavailable")
+                ledger.bind_pre_send_intent(
+                    pending["reservation_id"], position_id=identifier,
+                    opening_deal_ticket=int(entries[0]["ticket"]), opening_order_ticket=order_ticket,
+                    fill_price=price, fill_volume=volume, risk_cash=risk,
+                )
+            except Exception as exc:
+                self.logger.error("Unresolved reservation retained: %s: %s", type(exc).__name__, exc)
+
+    def _bound_position_intent(self, position: Any) -> Optional[Dict[str, Any]]:
+        ledger = getattr(self, "_live_outcome_ledger", None)
+        if ledger is None:
+            return None
+        identifier = int(getattr(position, "identifier", 0) or getattr(position, "ticket", 0) or 0)
+        intent = ledger.lookup_bound_entry_intent(position_id=identifier) if identifier > 0 else None
+        if intent is not None:
+            return intent
+        history = self.mt5.get_position_history(identifier) if identifier > 0 else None
+        if not isinstance(history, dict) or history.get("history_complete") is not True:
+            return None
+        matches = []
+        for deal in history.get("deals", ()):
+            if deal.get("entry", deal.get("entry_kind")) not in (0, "IN"):
+                continue
+            bound = ledger.lookup_bound_entry_intent(
+                opening_deal_ticket=int(deal.get("ticket", 0) or 0),
+                opening_order_ticket=int(deal.get("order_ticket", 0) or 0),
+            )
+            if bound is not None:
+                matches.append(bound)
+        if matches and any(item != matches[0] for item in matches[1:]):
+            raise LiveOutcomeError("held position has conflicting durable owners")
+        return matches[0] if matches else None
+
+    def _owner_context_for_intent(self, intent: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot = intent.get("owner_snapshot")
+        if getattr(self, "execution_destination", None) == "PAPER" and isinstance(snapshot, dict):
+            if snapshot.get("schema_version") != "fxpm.held-owner-data.v1" or snapshot.get("classification") != "MANAGEMENT_DATA_ONLY_NOT_ENTRY_AUTHORITY":
+                raise LiveOutcomeError("held PAPER management data schema is invalid")
+            for name in ("symbol", "timeframe", "regime", "strategy_name", "book_role", "candidate_id"):
+                if snapshot.get(name) != intent.get(name):
+                    raise LiveOutcomeError("held PAPER management data differs from durable intent")
+            if any(snapshot.get(name) is not False for name in ("new_entry_authority", "increase_authority", "stop_widening_authority")):
+                raise LiveOutcomeError("held PAPER management data cannot confer authority")
+            from pm_regime import detector_code_sha256
+            detector = snapshot.get("detector")
+            if not isinstance(detector, dict) or detector.get("detector_code_sha256") != detector_code_sha256():
+                raise LiveOutcomeError("original PAPER detector is unavailable or changed")
+            FeatureComputer._validate_regime_params_override(detector["parameters"], detector["parameters_sha256"])
+            config = SymbolConfig.from_dict({
+                "symbol": snapshot["symbol"],
+                "regime_configs": {snapshot["timeframe"]: {snapshot["regime"]: {
+                    "strategy_name": snapshot["strategy_name"],
+                    "parameters": copy.deepcopy(snapshot["parameters"]),
+                    "governance_policy": copy.deepcopy(snapshot["governance"]),
+                }}},
+            })
+            cell = config.get_regime_config(snapshot["timeframe"], snapshot["regime"])
+            if cell.strategy_name != snapshot["strategy_name"] or cell.governance_policy != snapshot["governance"]:
+                raise LiveOutcomeError("held PAPER management data cannot be migrated or replaced")
+            return {
+                "intent": dict(intent), "config": config,
+                "cell": cell,
+                "detector": detector,
+                "permissions": {"open_new_positions": False, "increase_positions": False, "widen_stops": False, "tighten_stops": True, "reduce_positions": True, "close_positions": True},
+            }
+        if str(intent.get("book_role", "")) != PROCESS_VALIDATED_CURRENT_REFIT_ROLE:
+            raise LiveOutcomeError("original authenticated held-owner capsule is unavailable")
+        capsule_id = str(intent.get("management_capsule_id", ""))
+        generation_id = str(intent.get("management_generation_id", ""))
+        if not self._plain_sha256(capsule_id) or not generation_id:
+            raise LiveOutcomeError("held-owner capsule binding is incomplete")
+        from pm_demo_readiness import demo_management_store_root
+        from pm_demo_management import reverify_demo_management_capsule, MANAGEMENT_ONLY
+        from pm_native_activation import resolve_active_native_universe
+
+        config_path = Path(str(getattr(self.pipeline_config, "_deployment_config_path", ""))).resolve()
+        data_dir = Path(self.pipeline_config.data_dir)
+        if not data_dir.is_absolute():
+            data_dir = config_path.parent / data_dir
+        native = resolve_active_native_universe(
+            data_dir, None,
+            required_timeframes=("M5", "M15", "M30", "H1", "H4", "D1"),
+            production_contract_required=True,
+        )
+        if not native.valid or not native.explicit_contract:
+            raise LiveOutcomeError("original held-owner native authority is unavailable")
+        actual = self.mt5.get_account_info()
+        identity = getattr(self, "_runtime_account_identity", None)
+        if isinstance(identity, RuntimeAccountIdentity) and runtime_account_identity(actual, identity.destination) != identity:
+            raise LiveOutcomeError("held-owner account changed")
+        winner_path = getattr(self, "_owner_winner_ledger_path", None) or getattr(self.pipeline_config, "winner_ledger_path", None)
+        verified = reverify_demo_management_capsule(
+            demo_management_store_root(winner_path), capsule_id,
+            account_info=actual, native_universe=native,
+            validation_time_utc=datetime.now(timezone.utc),
+        )
+        context = verified.get("management_context") if isinstance(verified, dict) else None
+        if verified.get("status") != MANAGEMENT_ONLY or not isinstance(context, dict):
+            raise LiveOutcomeError("original held-owner capsule reverification failed")
+        if context.get("capsule_id") != capsule_id or context.get("generation_id") != generation_id:
+            raise LiveOutcomeError("held-owner capsule identity differs from durable intent")
+        configs, _, _ = self._parse_current_refit_demo_projection(context["execution_projection"])
+        detectors, _ = self._parse_current_refit_demo_detectors(
+            context["detector_projection"]["records"], configs,
+        )
+        symbol, timeframe, regime = (str(intent[name]).upper() for name in ("symbol", "timeframe", "regime"))
+        config = configs.get(symbol)
+        cell = config.get_regime_config(timeframe, regime) if config is not None else None
+        binding = dict((getattr(cell, "artifact_meta", {}) or {}).get("current_refit_binding") or {})
+        if cell is None or cell.strategy_name != intent["strategy_name"] or binding.get("current_refit_cell_id") != intent.get("candidate_id"):
+            raise LiveOutcomeError("original held-owner cell does not match durable intent")
+        return {
+            "intent": dict(intent), "config": config, "cell": cell,
+            "detector": detectors[f"{symbol}|{timeframe}"],
+            "permissions": dict(context["permissions"]),
+        }
+
+    def _refresh_held_owner_contexts(self, positions: List[Any]) -> Dict[str, SymbolConfig]:
+        self._held_owner_contexts = {}
+        self._held_owner_errors = {}
+        configs: Dict[str, SymbolConfig] = {}
+        if not isinstance(getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity):
+            return configs
+        for position in positions:
+            ticket = int(getattr(position, "ticket", 0) or 0)
+            try:
+                intent = self._bound_position_intent(position)
+                if intent is None:
+                    raise LiveOutcomeError("held position has no durable owner binding")
+                owner = self._owner_context_for_intent(intent)
+                self._held_owner_contexts[ticket] = owner
+                configs[str(intent["symbol"]).upper()] = owner["config"]
+            except Exception as exc:
+                self._held_owner_errors[ticket] = f"{type(exc).__name__}: {exc}"
+        return configs
+
+    def _paper_owner_snapshot(
+        self, symbol: str, timeframe: str, regime: str, strategy_name: str,
+        strategy: Any, config: Any, regime_config: Any, candidate: Any,
+        book_role: str, candidate_id: str,
+    ) -> Dict[str, Any]:
+        from pm_regime import detector_code_sha256
+        detector = copy.deepcopy((candidate or {}).get("owner_detector"))
+        if not isinstance(detector, dict):
+            raise LiveOutcomeError("entry-time PAPER detector data is unavailable")
+        detector["detector_code_sha256"] = detector_code_sha256()
+        if not self._plain_sha256(detector["detector_code_sha256"]):
+            raise LiveOutcomeError("entry-time PAPER detector code identity is unavailable")
+        parameters = copy.deepcopy(getattr(regime_config or config, "parameters", {}) or {})
+        governance = copy.deepcopy(getattr(regime_config, "governance_policy", {}) or {})
+        return {
+            "schema_version": "fxpm.held-owner-data.v1",
+            "classification": "MANAGEMENT_DATA_ONLY_NOT_ENTRY_AUTHORITY",
+            "symbol": symbol, "timeframe": timeframe, "regime": regime,
+            "strategy_name": strategy_name,
+            "strategy_module": type(strategy).__module__,
+            "strategy_class": type(strategy).__name__,
+            "parameters": parameters, "governance": governance,
+            "book_role": book_role, "candidate_id": candidate_id,
+            "source_refs": {
+                "parameters_data_sha256": self._canonical_payload_sha256(parameters),
+                "governance_data_sha256": self._canonical_payload_sha256(governance),
+            },
+            "new_entry_authority": False, "increase_authority": False,
+            "stop_widening_authority": False, "detector": detector,
+        }
 
     def _get_pipeline_data_loader(self) -> Optional[DataLoader]:
         """Return the shared portfolio DataLoader when available."""
@@ -2745,7 +3017,8 @@ class LiveTrader:
         self, *, log_rejections: bool = False
     ) -> Dict[str, SymbolConfig]:
         """Return configs for exactly the selected execution book."""
-        if getattr(self, "_startup_entry_block_reason", ""):
+        if (getattr(self, "_startup_entry_block_reason", "")
+                or getattr(self, "_paper_protection_entry_block_reason", "")):
             return {}
         if bool(getattr(self, "_is_current_refit_demo", False)):
             return self._get_current_refit_demo_entry_configs()
@@ -3017,9 +3290,35 @@ class LiveTrader:
     ) -> bool:
         """Process all validated symbols for one live iteration."""
         sweep_started = time.perf_counter()
+        identity = getattr(self, "_runtime_account_identity", None)
+        if isinstance(identity, RuntimeAccountIdentity):
+            try:
+                with self.mt5.native_session():
+                    actual_account = self.mt5.get_account_info()
+                    if runtime_account_identity(actual_account, identity.destination) != identity:
+                        raise LiveOutcomeError("runtime account changed during live loop")
+                    positions_snapshot = self.mt5.get_positions()
+                    if positions_snapshot is None:
+                        raise LiveOutcomeError("live position snapshot unavailable")
+                    after = self.mt5.get_account_info()
+                    if runtime_account_identity(after, identity.destination) != identity:
+                        raise LiveOutcomeError("account changed during live snapshot")
+                    account_info = (
+                        self.mt5.get_risk_account_info(actual_account=after)
+                        if identity.destination == "PAPER" else after
+                    )
+                with self.mt5.native_session():
+                    self._reconcile_runtime_reservations(list(positions_snapshot))
+                held_configs = self._refresh_held_owner_contexts(list(positions_snapshot))
+            except Exception as exc:
+                self.logger.error("Live runtime snapshot refused: %s: %s", type(exc).__name__, exc)
+                return False
+        else:
+            held_configs = {}
         self._sweep_recent_m5_windows.clear()
         entry_configs = self._get_live_configs()
         management_configs = self._get_management_configs()
+        management_configs = {**management_configs, **held_configs}
         active_configs = management_configs or entry_configs
         active_symbols = list(active_configs.keys())
         signal_configs = entry_configs
@@ -3055,7 +3354,10 @@ class LiveTrader:
                 self.logger.error(
                     f"Current-refit demo session blocked: {position_book_reason}"
                 )
-                return False
+                if not isinstance(identity, RuntimeAccountIdentity):
+                    return False
+                self._startup_entry_block_reason = self._startup_entry_block_reason or position_book_reason
+                signal_configs = {}
 
         if account_info is None:
             try:
@@ -3246,6 +3548,16 @@ class LiveTrader:
         from pm_position import TradeTagEncoder
 
         intent = dict(context.get("entry_intent") or {})
+        if isinstance(getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity):
+            try:
+                owner = self._owner_context_for_intent(intent)
+                return {
+                    **{name: intent[name] for name in ("symbol", "timeframe", "regime", "strategy_name", "book_role", "candidate_id")},
+                    "cell_match_status": "EXACT",
+                    "cell_match_reason": "durable intent matched original authenticated held-owner capsule",
+                }
+            except Exception as exc:
+                return {"cell_match_status": "UNAVAILABLE", "cell_match_reason": f"original owner unavailable: {type(exc).__name__}: {exc}"}
         decoded = dict(context.get("decoded_comment") or {})
         broker_symbol = str(context.get("broker_symbol", "") or "")
         symbol = str(intent.get("symbol") or decoded.get("symbol") or "").upper()
@@ -3410,7 +3722,7 @@ class LiveTrader:
             validated = self._get_management_configs()
         else:
             validated = self._get_live_configs()
-        if not validated:
+        if not validated and getattr(self, "_live_outcome_ledger", None) is None:
             return
 
         if recent_deals is None:
@@ -3424,7 +3736,9 @@ class LiveTrader:
         if not isinstance(deals, (list, tuple)):
             return
 
-        if bool(getattr(self, "_is_current_refit_demo", False)):
+        if bool(getattr(self, "_is_current_refit_demo", False)) and not isinstance(
+            getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity
+        ):
             from pm_position import TradeTagEncoder
 
             demo_magics: Set[int] = set()
@@ -3706,7 +4020,14 @@ class LiveTrader:
             return
         storage_manager = getattr(self, "storage_manager", None)
         if storage_manager is not None:
-            storage_manager.set_order_governance_state(ticket_id, state)
+            try:
+                storage_manager.set_order_governance_state(ticket_id, state)
+            except Exception as exc:
+                if isinstance(getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity):
+                    reason = f"required governance persistence failed: {type(exc).__name__}: {exc}"
+                    self._startup_entry_block_reason = getattr(self, "_startup_entry_block_reason", "") or reason
+                    self._live_outcome_feedback_error = reason
+                raise
             return
         self._order_governance_state[ticket_id] = dict(state)
 
@@ -3739,16 +4060,20 @@ class LiveTrader:
         for position in list(positions_snapshot or []):
             ticket_id = int(getattr(position, "ticket", 0) or 0)
             broker_symbol = str(getattr(position, "symbol", "") or "")
-            symbol = self._resolve_symbol_from_broker(broker_symbol, validated_configs)
+            owner = getattr(self, "_held_owner_contexts", {}).get(ticket_id)
+            if isinstance(getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity) and owner is None:
+                self.logger.warning("Strategy management refused for ticket=%s: original owner unavailable", ticket_id)
+                continue
+            symbol = str(owner["intent"]["symbol"]) if owner else self._resolve_symbol_from_broker(broker_symbol, validated_configs)
             if not symbol:
                 continue
-            config = validated_configs.get(symbol)
+            config = owner["config"] if owner else validated_configs.get(symbol)
             if config is None:
                 continue
             magic = int(getattr(position, "magic", 0) or 0)
-            pos_timeframe = self._infer_position_timeframe(symbol, config, position)
+            pos_timeframe = str(owner["intent"]["timeframe"]) if owner else self._infer_position_timeframe(symbol, config, position)
             _, magic_to_regime = self._build_magic_lookup(symbol, config)
-            pos_regime = magic_to_regime.get(
+            pos_regime = str(owner["intent"]["regime"]) if owner else magic_to_regime.get(
                 magic, "LEGACY" if not config.has_regime_configs() else ""
             )
             pos_timeframe, pos_regime, regime_cfg = self._resolve_exact_regime_config(
@@ -3786,7 +4111,10 @@ class LiveTrader:
                 continue
             detector_params = None
             detector_params_sha = None
-            if bool(getattr(self, "_is_current_refit_demo", False)):
+            if owner is not None:
+                detector_params = owner["detector"]["parameters"]
+                detector_params_sha = owner["detector"]["parameters_sha256"]
+            elif bool(getattr(self, "_is_current_refit_demo", False)):
                 try:
                     detector_params, detector_params_sha = (
                         self._current_refit_demo_detector(symbol, pos_timeframe)
@@ -4025,6 +4353,14 @@ class LiveTrader:
                     if math.isinf(float(decision.take_profit))
                     else float(decision.take_profit)
                 )
+            if owner is not None and new_sl is not None:
+                stop = self._safe_finite_float(new_sl)
+                if stop is None or stop <= 0.0 or (
+                    current_stop_loss > 0.0
+                    and ((is_long and stop < current_stop_loss) or (not is_long and stop > current_stop_loss))
+                ):
+                    self.logger.error("Held-owner management refused stop widening for ticket=%s", ticket_id)
+                    continue
             if mode == "shadow":
                 if (
                     new_sl is not None
@@ -4055,16 +4391,18 @@ class LiveTrader:
                 if self.enable_trading and hasattr(self.mt5, "close_position_partial"):
                     if not management_identity_ok():
                         return
-                    partial_result = self.mt5.close_position_partial(
-                        position,
-                        percent=decision.partial_close_pct,
-                        comment=f"Governance partial {policy_name}",
-                    )
+                    partial_options = {
+                        "percent": decision.partial_close_pct,
+                        "comment": f"Governance partial {policy_name}",
+                    }
+                    if getattr(self.mt5, "execution_destination", None) == "PAPER":
+                        partial_options["operation_id"] = f"governance-partial:{ticket_id}"
+                    partial_result = self.mt5.close_position_partial(position, **partial_options)
                     if getattr(partial_result, "success", False):
                         state["partial_taken"] = True
                         state["last_policy_name"] = policy_name
                         state["last_bar_time"] = current_bar_time.isoformat()
-                        state["last_partial_close_at"] = datetime.now().isoformat()
+                        state["last_partial_close_at"] = datetime.now(timezone.utc).isoformat()
                         self._set_order_governance_state(ticket_id, state)
                         self.logger.info(
                             f"[{symbol}] Governance {policy_name} partial close "
@@ -4505,13 +4843,7 @@ class LiveTrader:
         allow_d1_plus_lower: bool,
         open_position_count: int,
     ) -> List[Dict[str, Any]]:
-        """Return every distinct specialist cell in deterministic rank order.
-
-        ``allow_d1_plus_lower`` and ``open_position_count`` remain accepted for
-        compatibility but have no admission authority.  Topology is one open
-        position per authenticated ``symbol|timeframe|regime`` cell; aggregate
-        exposure is governed later by the signed Capital envelope.
-        """
+        """Rank at most one D1 and one lower-timeframe live admission."""
         _ = allow_d1_plus_lower, open_position_count
         ranked = sorted(
             list(candidates or []),
@@ -4519,22 +4851,19 @@ class LiveTrader:
             reverse=True,
         )
         admitted: List[Dict[str, Any]] = []
-        identity_by_slot: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
+        identity_by_slot: Dict[str, Tuple[str, str, str]] = {}
         for candidate in ranked:
             timeframe = str(candidate.get("timeframe", "") or "").upper()
             regime = str(candidate.get("regime", "") or "").upper()
             strategy = str(candidate.get("strategy_name", "") or "")
             if not timeframe or not regime or not strategy:
                 raise ValueError("SPECIALIST_CELL_IDENTITY_INVALID")
-            slot = (timeframe, regime)
+            if timeframe not in {"M5", "M15", "M30", "H1", "H4", "D1"}:
+                raise ValueError("LIVE_SLOT_TIMEFRAME_INVALID")
+            slot = "D1" if timeframe == "D1" else "LOWER"
             identity = (timeframe, regime, strategy)
             existing = identity_by_slot.get(slot)
             if existing is not None:
-                if existing != identity:
-                    raise ValueError(
-                        "SPECIALIST_CELL_SLOT_IDENTITY_COLLISION:"
-                        f"{timeframe}|{regime}"
-                    )
                 continue
             identity_by_slot[slot] = identity
             admitted.append(candidate)
@@ -4649,6 +4978,10 @@ class LiveTrader:
                         return f"demo magic collision: {symbol}|{timeframe}|{regime}"
                     allowed[key] = identity
         for position in list(positions or []):
+            if isinstance(getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity):
+                owner = getattr(self, "_held_owner_contexts", {}).get(int(getattr(position, "ticket", 0) or 0))
+                if owner is not None:
+                    continue
             magic = int(getattr(position, "magic", 0) or 0)
             comment = str(getattr(position, "comment", "") or "")
             decoded = TradeTagEncoder.decode_comment(comment) if comment else None
@@ -4697,8 +5030,9 @@ class LiveTrader:
         account_info: Any,
         *,
         candidate_magic: Optional[int],
+        candidate_timeframe: Optional[str] = None,
     ) -> Optional[Tuple[str, str]]:
-        """Validate exact-cell uniqueness and hedging attribution."""
+        """Enforce the shared live D1/lower slots before adding risk."""
 
         if positions is None:
             return (
@@ -4706,6 +5040,54 @@ class LiveTrader:
                 "same-symbol position snapshot unavailable",
             )
         observed = list(positions or [])
+        if candidate_timeframe is None and candidate_magic is not None:
+            candidate_timeframe = self._build_magic_lookup(symbol, config)[0].get(int(candidate_magic))
+        candidate_tf = str(candidate_timeframe or "").upper()
+        if candidate_tf not in {"M5", "M15", "M30", "H1", "H4", "D1"}:
+            return "BLOCKED_POSITION_TIMEFRAME_UNKNOWN", "candidate live slot is unknown"
+        occupied: Set[str] = set()
+        occupied_counts = {"D1": 0, "LOWER": 0}
+        runtime_bound = isinstance(getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity)
+        for position in observed:
+            if runtime_bound and getattr(self, "execution_destination", None) == "PAPER" and (
+                getattr(position, "destination", None) != "PAPER"
+                or getattr(position, "runtime_namespace", None) != self._runtime_account_identity.namespace
+            ):
+                return "BLOCKED_POSITION_OWNER_UNKNOWN", "observed broker or foreign PAPER position has no local owner"
+            ticket = int(getattr(position, "ticket", 0) or 0)
+            if runtime_bound and ticket not in getattr(self, "_held_owner_contexts", {}):
+                try:
+                    if getattr(self, "execution_destination", None) == "PAPER" and getattr(position, "destination", None) != "PAPER":
+                        raise LiveOutcomeError("observed native position has no PAPER owner")
+                    intent = self._bound_position_intent(position)
+                    if intent is not None:
+                        self._held_owner_contexts[ticket] = self._owner_context_for_intent(intent)
+                except Exception as exc:
+                    self._held_owner_errors[ticket] = f"{type(exc).__name__}: {exc}"
+            if runtime_bound and ticket not in getattr(self, "_held_owner_contexts", {}):
+                return "BLOCKED_POSITION_OWNER_UNKNOWN", "same-symbol held owner is not authenticated"
+            owner = getattr(self, "_held_owner_contexts", {}).get(ticket)
+            timeframe = str(owner["intent"]["timeframe"] if owner else self._infer_position_timeframe(symbol, config, position) or "").upper()
+            if timeframe not in {"M5", "M15", "M30", "H1", "H4", "D1"}:
+                return "BLOCKED_POSITION_TIMEFRAME_UNKNOWN", "same-symbol held slot is unknown"
+            slot = "D1" if timeframe == "D1" else "LOWER"
+            occupied.add(slot)
+            occupied_counts[slot] += 1
+        ledger = getattr(self, "_live_outcome_ledger", None)
+        if ledger is not None:
+            for pending in ledger.unresolved_pre_send_intents():
+                if str(pending.get("symbol", "")).upper() != str(symbol).upper():
+                    continue
+                timeframe = str(pending.get("timeframe", "")).upper()
+                if timeframe not in {"M5", "M15", "M30", "H1", "H4", "D1"}:
+                    return "BLOCKED_PENDING_SLOT_UNKNOWN", "unresolved reservation has an unknown live slot"
+                slot = "D1" if timeframe == "D1" else "LOWER"
+                occupied.add(slot)
+                occupied_counts[slot] += 1
+        if any(count > 1 for count in occupied_counts.values()):
+            return "BLOCKED_LIVE_SLOT_CONFLICT", "account/symbol already has multiple held or pending positions in one live slot"
+        if ("D1" if candidate_tf == "D1" else "LOWER") in occupied:
+            return "BLOCKED_LIVE_SLOT_OCCUPIED", "account/symbol D1 or lower slot is already held or reserved"
         if candidate_magic is not None and any(
             int(getattr(position, "magic", 0) or 0) == int(candidate_magic)
             for position in observed
@@ -4914,7 +5296,18 @@ class LiveTrader:
             )
         except Exception as exc:
             return None, f"fresh account snapshot raised {type(exc).__name__}: {exc}"
-        return (None, reason) if reason else (fresh, None)
+        if reason:
+            return None, reason
+        identity = getattr(self, "_runtime_account_identity", None)
+        if isinstance(identity, RuntimeAccountIdentity):
+            try:
+                if runtime_account_identity(fresh, identity.destination) != identity:
+                    return None, "runtime account namespace changed"
+                if identity.destination == "PAPER":
+                    fresh = self.mt5.get_risk_account_info(actual_account=fresh)
+            except Exception as exc:
+                return None, f"runtime account validation failed: {type(exc).__name__}: {exc}"
+        return fresh, None
 
     def _fresh_entry_account_validation(
         self,
@@ -4927,6 +5320,15 @@ class LiveTrader:
             return None, f"fresh account snapshot raised {type(exc).__name__}: {exc}"
         if fresh is None:
             return None, "fresh account snapshot unavailable"
+        identity = getattr(self, "_runtime_account_identity", None)
+        if isinstance(identity, RuntimeAccountIdentity):
+            try:
+                if runtime_account_identity(fresh, identity.destination) != identity:
+                    return None, "runtime account namespace changed"
+                if identity.destination == "PAPER":
+                    fresh = self.mt5.get_risk_account_info(actual_account=fresh)
+            except Exception as exc:
+                return None, f"runtime risk account unavailable: {type(exc).__name__}: {exc}"
 
         if bool(getattr(self, "_is_current_refit_demo", False)):
             demo_mode_reason = self._current_refit_demo_account_block_reason(fresh)
@@ -4977,7 +5379,6 @@ class LiveTrader:
         )
         if reason:
             return None, reason
-
         return fresh, None
 
     def _estimate_stop_pnl_amount(
@@ -6981,6 +7382,10 @@ class LiveTrader:
                     self.logger.error(f"[{symbol}] [{tf}] {exc}")
                     self._last_bar_times[cache_key] = current_bar_time
                     continue
+            elif getattr(self, "execution_destination", None) == "PAPER":
+                from pm_regime import load_regime_params, regime_params_sha256
+                detector_params = load_regime_params(symbol, tf, regime_params_file).to_dict()
+                detector_params_sha = regime_params_sha256(detector_params)
             feature_cache_key = (
                 f"{symbol}_{tf}_{current_bar_time}_{detector_params_sha or 'file'}"
             )
@@ -7315,6 +7720,10 @@ class LiveTrader:
                     "features": features,
                     "regime_config": regime_config,
                     "eligibility_report": eligibility_report,
+                    "owner_detector": {
+                        "parameters": copy.deepcopy(detector_params),
+                        "parameters_sha256": detector_params_sha,
+                    } if detector_params is not None else None,
                     "promotion_status": str(
                         getattr(regime_config, "promotion_status", "BLOCKED")
                         or "BLOCKED"
@@ -7558,6 +7967,7 @@ class LiveTrader:
             }
         ]
 
+    @_serialized_runtime_entry
     def _execute_entry(
         self,
         symbol: str,
@@ -7771,6 +8181,9 @@ class LiveTrader:
             """Persist actionable outcomes for dashboard consumption."""
             if not decision_key:
                 return
+            durable_signal_required = bool(
+                getattr(self, "_live_outcome_feedback_initialized", False)
+            ) or bool(getattr(self, "_is_current_refit_demo", False))
             try:
                 payload = {
                     "symbol": symbol,
@@ -7783,7 +8196,7 @@ class LiveTrader:
                     "direction": direction_label,
                     "action": action,
                     "actionable_schema_version": ACTIONABLE_SCHEMA_VERSION,
-                    "action_time": datetime.now().isoformat(),
+                    "action_time": datetime.now(timezone.utc).isoformat(),
                     "entry_price": entry_price_value,
                     "stop_loss_price": sl_value,
                     "take_profit_price": tp_value,
@@ -7821,12 +8234,30 @@ class LiveTrader:
                     payload_context.update(dict(context))
                 if payload_context:
                     payload["context"] = payload_context
-                self._actionable_log.record(symbol, payload)
+                try:
+                    self._actionable_log.record(symbol, payload)
+                except Exception as exc:
+                    self.logger.debug(f"[{symbol}] Actionable cache failed: {exc}")
                 storage_manager = getattr(self, "storage_manager", None)
-                if storage_manager is not None:
+                if durable_signal_required:
+                    if storage_manager is None:
+                        raise LiveOutcomeError("required signal ledger unavailable")
+                    storage_manager.record_actionable(payload, required=True)
+                elif storage_manager is not None:
                     storage_manager.record_actionable(payload)
             except Exception as exc:
-                self.logger.debug(f"[{symbol}] Actionable log failed: {exc}")
+                if durable_signal_required:
+                    reason = (
+                        "required actionable-signal persistence failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    self._live_outcome_feedback_error = reason
+                    self._startup_entry_block_reason = (
+                        getattr(self, "_startup_entry_block_reason", "") or reason
+                    )
+                    self.logger.error(f"[{symbol}] {reason}")
+                else:
+                    self.logger.debug(f"[{symbol}] Actionable log failed: {exc}")
 
         storage_manager = getattr(self, "storage_manager", None)
         if (
@@ -7852,7 +8283,8 @@ class LiveTrader:
                 context={"live_outcome_feedback_error": reason},
             )
             return
-        startup_block_reason = getattr(self, "_startup_entry_block_reason", "")
+        startup_block_reason = (getattr(self, "_startup_entry_block_reason", "")
+                                or getattr(self, "_paper_protection_entry_block_reason", ""))
         if startup_block_reason:
             _record_throttle("BLOCKED_ENTRY_READINESS")
             _record_actionable(
@@ -8002,6 +8434,7 @@ class LiveTrader:
                 fresh_symbol_positions,
                 account_info,
                 candidate_magic=magic,
+                candidate_timeframe=_tf,
             )
             if fresh_position_block:
                 _block_fresh_position_state(*fresh_position_block)
@@ -9455,9 +9888,9 @@ class LiveTrader:
             f"vol_raw={volume_raw:.4f} | vol={volume:.4f} | entry={entry_price:.5f} | sl={sl_price:.5f} | tp={tp_price:.5f}"
         )
 
-        if not self.enable_trading:
+        if not self.enable_trading and getattr(self, "execution_destination", None) != "PAPER":
             self.logger.info(
-                f"[{symbol}] [PAPER] Would execute {direction}: "
+                f"[{symbol}] [ENTRY PREVIEW] Would execute {direction}: "
                 f"{volume:.4f} lots @ {entry_price:.5f} | SL={sl_price:.5f} | TP={tp_price:.5f}"
             )
             self._log_trade(
@@ -9581,6 +10014,8 @@ class LiveTrader:
 
         try:
             fresh_pre_send_positions = self.mt5.get_positions()
+            if fresh_pre_send_positions is not None:
+                fresh_pre_send_positions = self._runtime_risk_positions(list(fresh_pre_send_positions))
         except Exception as exc:
             fresh_pre_send_positions = None
             fresh_positions_error = f"{type(exc).__name__}: {exc}"
@@ -9618,6 +10053,7 @@ class LiveTrader:
             final_symbol_positions,
             fresh_account,
             candidate_magic=magic,
+            candidate_timeframe=_tf,
         )
         if final_position_block:
             _block_pre_send(*final_position_block)
@@ -9994,6 +10430,12 @@ class LiveTrader:
             try:
                 if not reservation_id:
                     raise LiveOutcomeError("pre-send reservation is missing")
+                if getattr(self, "execution_destination", None) == "PAPER":
+                    history = self.mt5.get_position_history(position_id) if position_id > 0 else None
+                    local_risk = self._safe_finite_float(history.get("risk_cash")) if isinstance(history, dict) and history.get("history_complete") is True else None
+                    if local_risk is None or local_risk <= 0.0:
+                        raise LiveOutcomeError("actual durable PAPER fill risk is unavailable")
+                    risk_cash = local_risk
                 ledger.bind_pre_send_intent(
                     reservation_id,
                     position_id=position_id,
@@ -10064,6 +10506,11 @@ class LiveTrader:
         durable_feedback_required = bool(
             getattr(self, "_live_outcome_feedback_initialized", False)
         ) or bool(getattr(self, "_is_current_refit_demo", False))
+        startup_block_reason = (getattr(self, "_startup_entry_block_reason", "")
+                                or getattr(self, "_paper_protection_entry_block_reason", ""))
+        if startup_block_reason:
+            _block_pre_send("BLOCKED_ENTRY_READINESS", str(startup_block_reason))
+            return
         if outcome_ledger is None and durable_feedback_required:
             _block_pre_send(
                 "BLOCKED_PRE_SEND_RESERVATION",
@@ -10072,6 +10519,13 @@ class LiveTrader:
             return
         if outcome_ledger is not None:
             try:
+                owner_data = {}
+                if getattr(self, "execution_destination", None) == "PAPER":
+                    owner_data["owner_snapshot"] = self._paper_owner_snapshot(
+                        symbol, _tf, _regime, _strat_name, strategy, config,
+                        regime_candidate, best_candidate, execution_book_role,
+                        execution_candidate_id,
+                    )
                 reservation = outcome_ledger.reserve_pre_send_intent(
                     symbol=symbol,
                     timeframe=_tf,
@@ -10086,6 +10540,7 @@ class LiveTrader:
                     candidate_id=execution_candidate_id,
                     management_capsule_id=management_capsule_id,
                     management_generation_id=management_generation_id,
+                    **owner_data,
                 )
                 reservation_id = str(reservation.get("reservation_id") or "")
                 if (
@@ -10103,6 +10558,7 @@ class LiveTrader:
                 return
 
         try:
+            paper_send = {"reservation_id": reservation_id} if getattr(self, "execution_destination", None) == "PAPER" else {}
             result = self.mt5.send_market_order(
                 symbol=broker_symbol,
                 order_type=order_type,
@@ -10114,6 +10570,7 @@ class LiveTrader:
                 comment=trade_comment,
                 price=entry_price,
                 symbol_info=symbol_info,
+                **paper_send,
             )
         except Exception as exc:
             self.logger.error(
@@ -10140,14 +10597,14 @@ class LiveTrader:
                 sl_price,
                 tp_price,
                 magic,
-                "EXECUTED",
+                "PAPER" if getattr(self, "execution_destination", None) == "PAPER" else "EXECUTED",
                 candidate_id=execution_candidate_id,
             )
             # Record order time for rate limiting
             order_time = datetime.now()
             self._last_order_times[rate_limit_key] = order_time
             self._last_order_times[symbol] = order_time  # diagnostic summary
-            _record_throttle("EXECUTED")
+            _record_throttle("PAPER" if getattr(self, "execution_destination", None) == "PAPER" else "EXECUTED")
             actual_risk_pct_exec = actual_risk_pct
             risk_exec: Optional[float] = None
             try:
@@ -10164,7 +10621,20 @@ class LiveTrader:
                     actual_risk_pct_exec = (risk_exec / basis_value) * 100.0
             except Exception:
                 pass
+            if getattr(self, "execution_destination", None) == "PAPER":
+                try:
+                    history = self.mt5.get_position_history(int(getattr(result, "position_id", 0) or 0))
+                    risk_exec = self._safe_finite_float(history.get("risk_cash")) if isinstance(history, dict) and history.get("history_complete") is True else None
+                    if risk_exec is None or risk_exec <= 0.0:
+                        raise LiveOutcomeError("actual durable PAPER fill risk is unavailable")
+                    actual_risk_pct_exec = risk_exec / basis_value * 100.0
+                except Exception as exc:
+                    _retain_ambiguous_reservation("local PAPER fill requires durable reconciliation")
+                    _set_live_outcome_error("PAPER fill binding failed", exc)
+                    _record_actionable(action="PAPER_UNBOUND", context={"reason": str(exc)})
+                    return
             _bind_live_entry_intent(
+                position_id=int(getattr(result, "position_id", 0) or 0) if getattr(self, "execution_destination", None) == "PAPER" else 0,
                 deal_ticket=int(getattr(result, "deal", 0) or 0),
                 order_ticket=int(getattr(result, "order", 0) or 0),
                 fill_price=float(result.price),
@@ -10172,7 +10642,7 @@ class LiveTrader:
                 risk_cash=risk_exec,
             )
             _record_actionable(
-                action="EXECUTED",
+                action="PAPER" if getattr(self, "execution_destination", None) == "PAPER" else "EXECUTED",
                 entry_price_value=result.price,
                 sl_value=sl_price,
                 tp_value=tp_price,
@@ -10397,7 +10867,7 @@ class LiveTrader:
         """Log trade to history."""
         self.trade_log.append(
             {
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": symbol,
                 "direction": direction,
                 "volume": volume,
@@ -10406,6 +10876,11 @@ class LiveTrader:
                 "tp": tp,
                 "magic": magic,
                 "status": status,
+                "destination": getattr(self, "execution_destination", None),
+                "runtime_account_identity": (
+                    self._runtime_account_identity.to_dict()
+                    if isinstance(getattr(self, "_runtime_account_identity", None), RuntimeAccountIdentity) else None
+                ),
                 "execution_book": str(
                     getattr(self, "execution_book", CHAMPION_EXECUTION_BOOK)
                 ),
@@ -10489,6 +10964,7 @@ class FXPortfolioManagerApp:
         data_dir: Optional[str] = None,
         output_dir: Optional[str] = None,
         config_file: Optional[str] = None,
+        execution_destination: Optional[str] = None,
     ):
         """
         Initialize application.
@@ -10514,6 +10990,10 @@ class FXPortfolioManagerApp:
             data_dir=Path(data_dir or "./data"),
             output_dir=Path(output_dir or "./pm_outputs"),
         )
+        if execution_destination is not None:
+            if execution_destination not in {"PAPER", "MT5_DEMO", "FUNDED"}:
+                raise ValueError("invalid runtime execution destination")
+            self.pipeline_config._live_execution_destination = execution_destination
         if data_dir is not None:
             self.pipeline_config.data_dir = Path(data_dir)
             self.pipeline_config.data_dir.mkdir(parents=True, exist_ok=True)
@@ -10549,7 +11029,9 @@ class FXPortfolioManagerApp:
         self.mt5: Optional[MT5Connector] = None
         self.portfolio_manager: Optional[PortfolioManager] = None
         self.trader: Optional[LiveTrader] = None
-        self.storage_manager = StorageManager(
+        self._runtime_outcome_ledger: Optional[LiveOutcomeLedger] = None
+        self._runtime_writer_thread: Optional[int] = None
+        self.storage_manager = None if getattr(self.pipeline_config, "_live_execution_destination", None) else StorageManager(
             pipeline_config=self.pipeline_config,
             data_dir=self.data_dir,
             output_dir=self.output_dir,
@@ -11127,12 +11609,23 @@ class FXPortfolioManagerApp:
             )
         return False
 
+    def _close_runtime_outcome_ledger(self) -> None:
+        ledger = getattr(self, "_runtime_outcome_ledger", None)
+        if ledger is None:
+            return
+        if threading.get_ident() != self._runtime_writer_thread:
+            raise LiveOutcomeError("runtime writer must be closed by its owning thread")
+        ledger.close()
+        self._runtime_outcome_ledger = None
+
+    @_runtime_session_lifecycle
     def run_trading(
         self,
         enable_trading: bool = True,
         close_on_opposite_signal: bool = False,
         execution_book: str = CHAMPION_EXECUTION_BOOK,
         startup_entry_block_reason: str = "",
+        execution_destination: Optional[str] = None,
     ):
         """
         Run live trading loop.
@@ -11152,6 +11645,65 @@ class FXPortfolioManagerApp:
         is_current_refit_demo = (
             normalized_book == CURRENT_REFIT_DEMO_EXECUTION_BOOK
         )
+        configured_destination = getattr(self.pipeline_config, "_live_execution_destination", None)
+        destination = execution_destination or configured_destination or ("MT5_DEMO" if is_current_refit_demo else "FUNDED")
+        if configured_destination is not None and destination != configured_destination:
+            self.logger.error("Runtime execution destination cannot be rebound")
+            return False
+        if destination not in {"PAPER", "MT5_DEMO", "FUNDED"} or (destination == "MT5_DEMO") != is_current_refit_demo:
+            self.logger.error("Execution destination/book mismatch")
+            return False
+        try:
+            with self.mt5.native_session():
+                self.mt5.set_execution_destination(destination)
+                actual = self.mt5.get_account_info()
+                identity_reason = _account_identity_block_reason(
+                    actual, connector_config=getattr(self.mt5, "config", None),
+                    is_current_refit_demo=is_current_refit_demo,
+                )
+                if identity_reason:
+                    raise LiveOutcomeError(identity_reason)
+                identity = runtime_account_identity(actual, destination)
+                self.mt5.set_runtime_identity(identity)
+                if self.storage_manager is not None:
+                    raise LiveOutcomeError("live runtime storage must be deferred until account binding")
+                self.storage_manager = StorageManager(
+                    pipeline_config=self.pipeline_config, data_dir=self.data_dir,
+                    output_dir=self.output_dir, log_dir=self.log_dir,
+                    logger=self.logger, active_servers=[identity.server],
+                    active_symbols=self.symbols, runtime_identity=identity,
+                )
+                outcome_ledger = LiveOutcomeLedger(
+                    self.pipeline_config,
+                    ledger_path=self.storage_manager.output_dir / "closed_positions.jsonl",
+                    state_path=self.storage_manager.output_dir / "closed_positions.state.json",
+                    runtime_identity=identity,
+                )
+                self._runtime_outcome_ledger = outcome_ledger
+                self._runtime_writer_thread = threading.get_ident()
+                if destination == "PAPER":
+                    incident = outcome_ledger.paper_binding_incident()
+                    if incident is not None:
+                        self.logger.warning(
+                            "Historical PAPER binding incident; current identity verified: first=%s last=%s count=%s observed=%s bound=%s reason=%s",
+                            incident["first_seen_utc"], incident["last_seen_utc"], incident["count"],
+                            incident["observed_identity"], incident["bound_identity"], incident["reason"],
+                        )
+                    self.mt5 = PaperExecutionConnector(self.mt5, outcome_ledger, identity)
+                    enable_trading = True
+                    policy_code, policy_message = interval_cell_qualification_readiness_finding()
+                    startup_entry_block_reason = startup_entry_block_reason or policy_code
+                    self.logger.warning(
+                        "PAPER entry qualification unavailable; starting management-only: %s: %s",
+                        policy_code, policy_message,
+                    )
+            setup_logging(
+                log_dir=str(self.storage_manager.log_dir),
+                log_level=str(getattr(self.pipeline_config, "_runtime_log_level", "INFO")),
+            )
+        except Exception as exc:
+            self.logger.error("Runtime account/destination binding refused: %s: %s", type(exc).__name__, exc)
+            return False
         self.logger.info(
             "STARTING CURRENT-REFIT DEMO PROBATION"
             if is_current_refit_demo
@@ -11203,7 +11755,12 @@ class FXPortfolioManagerApp:
                 self.logger.debug(
                     f"Open-position check unavailable during live startup: {exc}"
                 )
-            if open_positions:
+            if destination == "PAPER" and startup_entry_block_reason and open_positions is not None:
+                self.logger.warning(
+                    "PAPER new entries blocked; preserving protective management with the current position snapshot: %s",
+                    startup_entry_block_reason,
+                )
+            elif open_positions or outcome_ledger.unresolved_pre_send_intents():
                 self.logger.warning(
                     "No live-eligible configurations for new entries, but open positions exist. "
                     "Starting in management-only mode until live eligibility is restored."
@@ -11233,6 +11790,9 @@ class FXPortfolioManagerApp:
                     self.config_file if is_current_refit_demo else None
                 ),
                 startup_entry_block_reason=startup_entry_block_reason,
+                execution_destination=destination,
+                runtime_identity=identity,
+                outcome_ledger=outcome_ledger,
             )
         except Exception as exc:
             self.logger.error(
@@ -11242,7 +11802,14 @@ class FXPortfolioManagerApp:
             return False
         if is_current_refit_demo:
             live_eligible_configs = self.trader._get_live_configs()
-            startup_positions = self.mt5.get_positions()
+            try:
+                startup_positions = self.mt5.get_positions()
+            except NativeSessionError as exc:
+                self.logger.error("MT5 startup position snapshot unavailable; runtime not started: %s", exc)
+                self.trader = None
+                return False
+            if startup_positions is not None:
+                self.trader._refresh_held_owner_contexts(list(startup_positions))
             startup_position_reason = (
                 self.trader._current_refit_demo_position_block_reason(
                     startup_positions,
@@ -11253,8 +11820,7 @@ class FXPortfolioManagerApp:
                 self.logger.error(
                     f"Refusing current-refit demo: {startup_position_reason}"
                 )
-                self.trader = None
-                return False
+                self.trader._startup_entry_block_reason = self.trader._startup_entry_block_reason or startup_position_reason
             if not live_eligible_configs:
                 if startup_positions:
                     self.logger.warning(
@@ -11353,7 +11919,21 @@ class FXPortfolioManagerApp:
                         datetime.now() + retrain_check_interval
                     )
                 if not self.mt5.is_connected():
-                    self._attempt_reconnect(reconnect_state, now=now)
+                    binding_failure = getattr(self.mt5, "binding_failure_reason", "")
+                    if isinstance(binding_failure, str) and binding_failure:
+                        if getattr(self, "_last_binding_failure_notice", "") != binding_failure:
+                            self.logger.error("Account identity/destination mismatch; entries and broker management blocked: %s", binding_failure)
+                            self._last_binding_failure_notice = binding_failure
+                        self._wait_for_next_due(shutdown_event, now + timedelta(seconds=5), now=now)
+                        continue
+                    try:
+                        self._attempt_reconnect(reconnect_state, now=now)
+                    except NativeSessionError as exc:
+                        self.logger.warning("Native account/lease unavailable during reconnect: %s", exc)
+                        retry_seconds = max(1, int(getattr(
+                            self.pipeline_config, "reconnect_attempt_interval_seconds", 5
+                        ) or 5))
+                        reconnect_state["next_attempt_at"] = now + timedelta(seconds=retry_seconds)
                     self._wait_for_next_due(
                         shutdown_event,
                         reconnect_state.get(
@@ -11363,8 +11943,34 @@ class FXPortfolioManagerApp:
                     )
                     continue
 
+                self._last_binding_failure_notice = ""
                 reconnect_state["attempts"] = 0
                 reconnect_state["next_attempt_at"] = now
+
+                if isinstance(self.mt5, PaperExecutionConnector):
+                    try:
+                        # Protective execution follows the market-data poll, even
+                        # when no strategy bar changed. Marking waits for risk sampling.
+                        self.mt5.poll_paper_positions(protection_only=True)
+                    except PaperProtectionDataError:
+                        pass  # Per-symbol diagnostics persist; incomplete equity refuses new risk.
+                    except NativeSessionError as exc:
+                        self.logger.debug("PAPER source unavailable; awaiting native recovery: %s", exc)
+                        self._wait_for_next_due(shutdown_event, now + timedelta(seconds=1), now=now)
+                        continue
+                    except (LiveOutcomeError, OSError, ValueError) as exc:
+                        reason = f"PAPER_PROTECTION_DURABILITY_UNAVAILABLE:{type(exc).__name__}"
+                        self._paper_protection_entry_block_reason = reason
+                        self.trader._paper_protection_entry_block_reason = reason
+                        self.logger.error("PAPER protection durability failure; new entries blocked until protection recovers: %s: %s",
+                                          type(exc).__name__, exc)
+                        self._wait_for_next_due(shutdown_event, now + timedelta(seconds=1), now=now)
+                        continue
+                    else:
+                        if getattr(self.trader, "_paper_protection_entry_block_reason", ""):
+                            self.logger.info("PAPER protection recovered after a successful durable poll")
+                        self._paper_protection_entry_block_reason = ""
+                        self.trader._paper_protection_entry_block_reason = ""
 
                 if (
                     not is_current_refit_demo
@@ -11854,10 +12460,15 @@ class FXPortfolioManagerApp:
 
         if self.trader:
             self.trader.stop()
+        if getattr(self, "_runtime_outcome_ledger", None) is not None and threading.get_ident() != self._runtime_writer_thread:
+            self.logger.info("Runtime shutdown requested; writer cleanup remains on the trading thread")
+            return
+
+        if self.trader:
 
             # Save trade log
-            trade_log_dir = self.output_dir
-            if bool(getattr(self.trader, "_is_current_refit_demo", False)):
+            trade_log_dir = getattr(self.trader, "_runtime_state_dir", self.output_dir)
+            if not isinstance(getattr(self.trader, "_runtime_account_identity", None), RuntimeAccountIdentity) and bool(getattr(self.trader, "_is_current_refit_demo", False)):
                 trade_log_dir = trade_log_dir / "current_refit_demo"
             log_path = (
                 trade_log_dir
@@ -12110,7 +12721,7 @@ def main(
     destination.add_argument(
         "--paper",
         action="store_true",
-        help="Local-ledger paper trading (currently unavailable; refuses before broker access)",
+        help="Live-market PAPER with durable local positions and no broker order/close submission",
     )
     destination.add_argument(
         "--mt5-demo",
@@ -12172,12 +12783,8 @@ def main(
 
     cli_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(cli_argv)
-    if args.paper:
-        print(
-            "Refusing --paper: local-ledger paper trading is not available. "
-            "No configuration or broker connection was opened. "
-            "Use --mt5-demo only when you intend orders on an authorized MT5 DEMO account."
-        )
+    if args.paper and not args.trade:
+        print("Refusing --paper: use --trade to start live-market local-ledger PAPER.")
         return 2
     if args.mt5_demo and not (args.trade or args.preflight):
         print("Refusing --mt5-demo: use --trade or --preflight to select a DEMO action.")
@@ -12187,6 +12794,7 @@ def main(
         not args.optimize
         or args.trade
         or args.mt5_demo
+        or args.paper
         or args.preflight
         or args.status
     ):
@@ -12202,7 +12810,7 @@ def main(
         )
         return 2
     funded_contract_requested = bool(
-        (args.preflight and not args.mt5_demo) or (args.trade and not args.mt5_demo)
+        (args.preflight and not args.mt5_demo) or (args.trade and not args.mt5_demo and not args.paper)
     )
     if (
         funded_contract_requested
@@ -12261,7 +12869,11 @@ def main(
     # Runtime-only authority bit used by the final pre-send gate. Broker DEMO and
     # research runs remain usable, while a funded entry can never fall back to
     # a mutable ledger status or the legacy review files.
-    pipeline_config._funded_live_execution = bool(args.trade and not args.mt5_demo)
+    pipeline_config._funded_live_execution = bool(args.trade and not args.mt5_demo and not args.paper)
+    pipeline_config._live_execution_destination = (
+        "PAPER" if args.paper else "MT5_DEMO" if args.mt5_demo else "FUNDED"
+    ) if args.trade else None
+    pipeline_config._runtime_log_level = args.log_level
     pipeline_config._optimization_only_entrypoint = bool(
         args.optimize
         and not args.trade
@@ -12297,7 +12909,7 @@ def main(
         pipeline_config.winner_ledger_path = args.winner_ledger
 
     # Setup logging after config resolution so log_dir is config-driven.
-    setup_logging(log_dir=str(pipeline_config.log_dir), log_level=args.log_level)
+    setup_logging(log_dir=str(pipeline_config.log_dir), log_level=args.log_level, file_logging=not args.trade)
     logger = logging.getLogger(__name__)
 
     # Setup signal handlers
@@ -12567,7 +13179,7 @@ def main(
                         "was not part of the frozen lockbox contract."
                     )
                 return 2
-            if not args.mt5_demo:
+            if not args.mt5_demo and not args.paper:
                 account_info = None
                 try:
                     if (
@@ -12622,6 +13234,7 @@ def main(
                     else CHAMPION_EXECUTION_BOOK
                 ),
                 startup_entry_block_reason=startup_entry_block_reason,
+                execution_destination=("PAPER" if args.paper else "MT5_DEMO" if args.mt5_demo else "FUNDED"),
             )
             if trading_started is False:
                 return 2

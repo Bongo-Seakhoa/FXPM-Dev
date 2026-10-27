@@ -23,6 +23,11 @@ from typing import Dict, List, Mapping, Optional, Any, Tuple
 from enum import Enum
 import time
 import math
+import os
+import threading
+from contextlib import contextmanager
+from functools import wraps
+from types import SimpleNamespace
 
 import pandas as pd
 import numpy as np
@@ -136,6 +141,7 @@ class MT5SymbolInfo:
     trade_freeze_level: int = 0
     path: str = ""
     asset_class: str = "unknown"
+    chart_mode: Optional[int] = None
 
     # Calculated values
     pip_size: float = 0.0
@@ -247,6 +253,46 @@ class MT5Tick:
     ask: float
     last: float
     volume: int
+    time_msc: Optional[int] = None
+
+
+@dataclass(frozen=True, slots=True)
+class MT5QuoteTick:
+    """One validated native row; equal-millisecond rows retain native order."""
+
+    time: datetime
+    time_msc: int
+    same_msc_ordinal: int
+    raw_ordinal: int
+    bid: float
+    ask: float
+    last: float
+    flags: int
+    volume: int
+    volume_real: float
+
+
+@dataclass(frozen=True, slots=True)
+class MT5QuoteTickPage:
+    requested_symbol: Optional[str]
+    broker_symbol: Optional[str]
+    start_msc: Optional[int]
+    end_msc: Optional[int]
+    query_from_utc: Optional[datetime]
+    query_to_utc: Optional[datetime]
+    ticks: Tuple[MT5QuoteTick, ...]
+    raw_count: int
+    complete: bool
+    status: str
+    native_error_code: Optional[int]
+    native_error_message: Optional[str]
+
+    @property
+    def diagnostics(self) -> Dict[str, Any]:
+        return {name: getattr(self, name) for name in (
+            "requested_symbol", "broker_symbol", "start_msc", "end_msc",
+            "query_from_utc", "query_to_utc", "raw_count", "complete", "status",
+            "native_error_code", "native_error_message")}
 
 
 @dataclass
@@ -271,6 +317,9 @@ class MT5Position:
         0  # POSITION_REASON (0=CLIENT, 1=MOBILE, 2=WEB, 3=EXPERT, 4=SL, 5=TP, 6=SO)
     )
     time_update: Optional[datetime] = None  # Last modification time
+    destination: str = "BROKER"
+    runtime_namespace: str = ""
+    paper_position_id: str = ""
 
 
 @dataclass
@@ -286,6 +335,197 @@ class MT5OrderResult:
     price: float = 0.0
     error_message: str = ""
     ambiguous: bool = False
+    position_id: int = 0
+    paper_position_id: str = ""
+    destination: str = "BROKER"
+
+
+def account_identity_block_reason(
+    account: Any, *, connector_config: Any,
+    is_current_refit_demo: bool = False, baseline_account: Any = None,
+) -> Optional[str]:
+    """Compare identity only; protective management must not require equity."""
+    if account is None:
+        return "fresh account snapshot unavailable"
+    if is_current_refit_demo:
+        from pm_demo_readiness import AUTHORIZED_DEMO_ACCOUNT_IDENTITY
+        expected_login = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.login
+        expected_server = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.server
+        expected_currency = AUTHORIZED_DEMO_ACCOUNT_IDENTITY.currency
+    else:
+        if type(connector_config).__module__.startswith("unittest.mock"):
+            connector_config = None
+        try:
+            expected_login = int(getattr(connector_config, "expected_login", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return "configured expected_login is invalid"
+        expected_server = str(getattr(connector_config, "expected_server", "") or "").strip()
+        expected_currency = str(getattr(connector_config, "expected_currency", "") or "").strip().upper()
+    try:
+        fresh_login = int(getattr(account, "login", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return "fresh account login is invalid"
+    if expected_login <= 0:
+        return "MT5 account identity requires a nonzero expected_login pin"
+    if fresh_login != expected_login:
+        return f"fresh account login {fresh_login} != expected {expected_login}"
+    fresh_server = str(getattr(account, "server", "") or "").strip()
+    if expected_server and fresh_server.casefold() != expected_server.casefold():
+        return f"fresh account server {fresh_server or '<missing>'} != expected {expected_server}"
+    if not expected_server:
+        return "MT5 account identity requires a nonempty expected_server pin"
+    if not expected_currency:
+        return "MT5 account identity requires a nonempty expected_currency pin"
+    fresh_currency = str(getattr(account, "currency", "") or "").strip().upper()
+    if fresh_currency != expected_currency:
+        return f"fresh account currency {fresh_currency or '<missing>'} != expected {expected_currency}"
+    if baseline_account is not None:
+        try:
+            baseline_login = int(getattr(baseline_account, "login", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            baseline_login = 0
+        if baseline_login > 0 and baseline_login != fresh_login:
+            return f"account login changed during decision: {baseline_login} -> {fresh_login}"
+        for attr in ("server", "currency"):
+            before = str(getattr(baseline_account, attr, "") or "").strip().casefold()
+            after = str(getattr(account, attr, "") or "").strip().casefold()
+            if before and after and before != after:
+                return f"account {attr} changed during decision"
+    return None
+
+
+class NativeSessionError(RuntimeError):
+    """Native binding or exclusion failed; no alternative account is authority."""
+
+
+class MT5QuoteTickPageError(NativeSessionError):
+    """Incomplete acquisition; validated records alone confer no coverage."""
+
+    def __init__(self, code: str, page: MT5QuoteTickPage):
+        self.code = code
+        self.page = page
+        self.partial_ticks = page.ticks
+        self.diagnostics = page.diagnostics
+        super().__init__(code)
+
+
+class PaperProtectionDataError(NativeSessionError):
+    """Other positions were protected, but this is not a complete risk snapshot."""
+
+    def __init__(self, symbol_errors, partial_positions):
+        self.symbol_errors = {symbol: list(errors) for symbol, errors in symbol_errors.items()}
+        self.partial_positions = tuple(partial_positions)
+        super().__init__("PAPER_PROTECTION_DATA_UNAVAILABLE:" + ",".join(sorted(symbol_errors)))
+
+
+class NativeAccountBindingError(NativeSessionError):
+    """Observed identity/destination differs from the immutable account binding."""
+
+
+_NATIVE_API_LOCK = threading.RLock()
+_NATIVE_LOCAL = threading.local()
+_NATIVE_ACTIVE_CONNECTOR = None
+_NATIVE_MUTEX_NAME = "Local\\FXPM.NativeTerminalWriter.v1"
+_NATIVE_MUTATORS = frozenset({
+    "send_market_order", "close_position", "close_position_partial", "modify_position",
+})
+
+
+@contextmanager
+def _native_terminal_lease():
+    with _NATIVE_API_LOCK:
+        depth = int(getattr(_NATIVE_LOCAL, "depth", 0))
+        handle = None
+        api = None
+        acquired = False
+        abandoned = False
+        if depth == 0 and os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            api = ctypes.WinDLL("kernel32", use_last_error=True)
+            api.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+            api.CreateMutexW.restype = wintypes.HANDLE
+            api.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            api.WaitForSingleObject.restype = wintypes.DWORD
+            api.ReleaseMutex.argtypes = [wintypes.HANDLE]
+            api.CloseHandle.argtypes = [wintypes.HANDLE]
+            handle = api.CreateMutexW(None, False, _NATIVE_MUTEX_NAME)
+            if not handle:
+                raise NativeSessionError("NATIVE_TERMINAL_LEASE_UNAVAILABLE")
+            result = api.WaitForSingleObject(handle, 60000)
+            acquired = result in (0, 0x80)
+            abandoned = result == 0x80
+            if not acquired:
+                api.CloseHandle(handle)
+                raise NativeSessionError("NATIVE_TERMINAL_LEASE_BUSY_OR_FAILED")
+        _NATIVE_LOCAL.depth = depth + 1
+        try:
+            yield abandoned
+        finally:
+            _NATIVE_LOCAL.depth = depth
+            if acquired:
+                api.ReleaseMutex(handle)
+                api.CloseHandle(handle)
+
+
+def _serialize_native_connector(cls):
+    skip = {"native_session", "set_execution_destination", "set_runtime_identity",
+            "normalize_volume", "get_last_history_range_diagnostics"}
+    for name, method in tuple(vars(cls).items()):
+        if name.startswith("_") or name in skip or not callable(method):
+            continue
+
+        def wrap(function, method_name):
+            @wraps(function)
+            def call(self, *args, **kwargs):
+                global _NATIVE_ACTIVE_CONNECTOR
+                mutation = method_name in _NATIVE_MUTATORS
+                if mutation and self.execution_destination == "PAPER":
+                    return MT5OrderResult(False, 10017, "PAPER_NATIVE_MUTATION_REFUSED", destination="PAPER")
+                if mutation and method_name != "send_market_order" and self.runtime_identity is not None:
+                    position = args[0] if args else kwargs.get("position")
+                    if (getattr(position, "runtime_namespace", None) != self.runtime_identity.namespace
+                            or getattr(position, "destination", None) != self.execution_destination):
+                        return MT5OrderResult(False, 10017, "NATIVE_POSITION_NAMESPACE_MISMATCH")
+                if mutation and method_name == "send_market_order" and self._native_entry_block_reason:
+                    return MT5OrderResult(False, 10017, self._native_entry_block_reason)
+                try:
+                    with self.native_session(
+                        require_identity=(mutation or (
+                            self.runtime_identity is not None
+                            and method_name not in {"connect", "disconnect", "get_account_info"}
+                        )),
+                        _activate=method_name not in {"connect", "disconnect"},
+                    ):
+                        if method_name == "disconnect" and _NATIVE_ACTIVE_CONNECTOR is not self:
+                            self._connected = False
+                            self._symbol_cache.clear()
+                            return None
+                        if mutation:
+                            self._last_native_send_uncertain = False
+                        result = function(self, *args, **kwargs)
+                        if method_name == "connect":
+                            _NATIVE_ACTIVE_CONNECTOR = self if result is True else None
+                            if result is not True:
+                                self._connected = False
+                        elif method_name == "disconnect":
+                            _NATIVE_ACTIVE_CONNECTOR = None
+                        if mutation and self._last_native_send_uncertain:
+                            result.success = False
+                            result.retcode = 10012
+                            result.retcode_description = self._native_entry_block_reason
+                            result.error_message = self._native_entry_block_reason
+                            result.ambiguous = True
+                        return result
+                except NativeSessionError as exc:
+                    if method_name == "is_connected":
+                        return False
+                    if mutation:
+                        return MT5OrderResult(False, 10017, str(exc), error_message=str(exc))
+                    raise
+            return call
+        setattr(cls, name, wrap(method, name))
+    return cls
 
 
 # Return code descriptions
@@ -339,6 +579,7 @@ RETCODE_DESCRIPTIONS = {
 # =============================================================================
 
 
+@_serialize_native_connector
 class MT5Connector:
     """
     MetaTrader 5 connection and trading class.
@@ -377,6 +618,138 @@ class MT5Connector:
         self._symbol_cache: Dict[str, MT5SymbolInfo] = {}
         self._broker_symbol_cache: Dict[str, str] = {}
         self._last_history_range_diagnostics: Dict[str, Any] = {}
+        self.execution_destination = "BROKER"
+        self.runtime_identity = None
+        self._native_entry_block_reason = ""
+        self._native_binding_failure_reason = ""
+        self._native_binding_observed_identity = None
+        self._native_binding_observation_sequence = 0
+        self._native_binding_failure_observation = None
+        self._last_native_send_uncertain = False
+        self._last_tick_error = None
+
+    def set_execution_destination(self, destination: str) -> None:
+        if destination not in {"BROKER", "PAPER", "MT5_DEMO", "FUNDED"}:
+            raise NativeSessionError("EXECUTION_DESTINATION_INVALID")
+        if self.execution_destination == "PAPER" and destination != "PAPER":
+            raise NativeSessionError("PAPER_DESTINATION_CANNOT_BECOME_BROKER")
+        if self.runtime_identity is not None and self.runtime_identity.destination != destination:
+            raise NativeSessionError("EXECUTION_DESTINATION_ALREADY_BOUND")
+        self.execution_destination = destination
+
+    def set_runtime_identity(self, identity) -> None:
+        from pm_live_outcomes import RuntimeAccountIdentity, runtime_account_identity
+        if type(identity) is not RuntimeAccountIdentity or identity.destination != self.execution_destination:
+            raise NativeSessionError("RUNTIME_IDENTITY_INVALID")
+        if self.runtime_identity is not None and self.runtime_identity != identity:
+            raise NativeSessionError("RUNTIME_IDENTITY_ALREADY_BOUND")
+        with self.native_session():
+            actual = mt5.account_info()
+            if runtime_account_identity(actual, self.execution_destination) != identity:
+                raise NativeSessionError("RUNTIME_IDENTITY_ACCOUNT_MISMATCH")
+            self.runtime_identity = identity
+
+    def _observe_native_binding_failure(self, reason, observed_identity):
+        self._native_binding_failure_reason = str(reason)
+        self._native_binding_observed_identity = (dict(observed_identity) if observed_identity is not None else None)
+        self._native_binding_observation_sequence += 1
+        sequence = self._native_binding_observation_sequence
+        self._native_binding_failure_observation = {
+            "sequence": sequence, "reason": str(reason),
+            "observed_identity": (dict(observed_identity) if observed_identity is not None else None),
+            "observed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        error = NativeAccountBindingError(str(reason))
+        error.native_binding_observation_sequence = sequence
+        return error
+
+    @property
+    def binding_failure_observation(self):
+        value = self._native_binding_failure_observation
+        if value is None:
+            return None
+        return {**value, "observed_identity": (dict(value["observed_identity"])
+                                             if value["observed_identity"] is not None else None)}
+
+    def _assert_native_account(self) -> None:
+        if not MT5_AVAILABLE or not self._connected:
+            self._native_binding_failure_reason = ""
+            raise NativeSessionError("NATIVE_ACCOUNT_UNAVAILABLE")
+        actual = mt5.account_info()
+        if actual is None:
+            self._native_binding_failure_reason = ""
+            raise NativeSessionError("NATIVE_ACCOUNT_UNAVAILABLE")
+        login, server, currency = (getattr(actual, name, None) for name in ("login", "server", "currency"))
+        observed_identity = (
+            {"login": login, "server": server.strip(), "currency": currency.strip().upper()}
+            if type(login) is int and login > 0 and isinstance(server, str) and server.strip()
+            and isinstance(currency, str) and currency.strip() else None
+        )
+        reason = account_identity_block_reason(actual, connector_config=self.config)
+        if reason:
+            raise self._observe_native_binding_failure(reason, observed_identity)
+        if self.runtime_identity is not None:
+            from pm_live_outcomes import LiveOutcomeError, runtime_account_identity
+            try:
+                fresh = runtime_account_identity(actual, self.execution_destination)
+            except (ValueError, LiveOutcomeError) as exc:
+                raise self._observe_native_binding_failure("NATIVE_ACCOUNT_DESTINATION_MISMATCH", observed_identity) from exc
+            if fresh != self.runtime_identity:
+                raise self._observe_native_binding_failure("NATIVE_ACCOUNT_NAMESPACE_MISMATCH", observed_identity)
+        self._native_binding_failure_reason = ""
+
+    @property
+    def binding_failure_reason(self):
+        return self._native_binding_failure_reason
+
+    @property
+    def binding_failure_observed_identity(self):
+        value = self._native_binding_observed_identity
+        return dict(value) if value is not None else None
+
+    @contextmanager
+    def native_session(self, *, require_identity: bool = True, _activate: bool = True):
+        global _NATIVE_ACTIVE_CONNECTOR
+        with _native_terminal_lease() as abandoned:
+            owner = getattr(_NATIVE_LOCAL, "connector", None)
+            if owner is not None and owner is not self:
+                raise NativeSessionError("NESTED_NATIVE_ACCOUNT_SWITCH_REFUSED")
+            first = owner is None
+            if first:
+                _NATIVE_LOCAL.connector = self
+            try:
+                if abandoned:
+                    self._native_entry_block_reason = "NATIVE_LEASE_ABANDONED_PENDING_RECONCILIATION"
+                if first and _activate and self._connected and _NATIVE_ACTIVE_CONNECTOR is not self:
+                    if not self.connect():
+                        raise NativeSessionError("NATIVE_ACCOUNT_REBIND_FAILED")
+                if require_identity:
+                    self._assert_native_account()
+                yield
+            finally:
+                if first:
+                    _NATIVE_LOCAL.connector = None
+
+    def _send_native_order(self, request):
+        if self.execution_destination == "PAPER":
+            raise NativeSessionError("PAPER_NATIVE_MUTATION_REFUSED")
+        with self.native_session():
+            self._assert_native_account()
+            try:
+                result = mt5.order_send(request)
+            except Exception:
+                self._last_native_send_uncertain = True
+                self._native_entry_block_reason = "NATIVE_SEND_EXCEPTION_PENDING_RECONCILIATION"
+                return None
+            if result is None:
+                self._last_native_send_uncertain = True
+                self._native_entry_block_reason = "NATIVE_SEND_UNKNOWN_PENDING_RECONCILIATION"
+            try:
+                self._assert_native_account()
+            except Exception:
+                self._last_native_send_uncertain = True
+                self._native_entry_block_reason = "NATIVE_POST_SEND_IDENTITY_MISMATCH_PENDING_RECONCILIATION"
+            return result
 
     def get_last_history_range_diagnostics(self) -> Dict[str, Any]:
         """Return a copy of the most recent range-fetch synchronization facts."""
@@ -619,6 +992,7 @@ class MT5Connector:
             filling_mode=int(getattr(info, "filling_mode", 0) or 0),
             trade_exemode=int(getattr(info, "trade_exemode", 0) or 0),
             trade_freeze_level=int(getattr(info, "trade_freeze_level", 0) or 0),
+            chart_mode=getattr(info, "chart_mode", None),
             path=str(getattr(info, "path", "") or ""),
             asset_class=infer_asset_class(
                 getattr(info, "name", resolved_symbol),
@@ -685,6 +1059,7 @@ class MT5Connector:
 
     def get_tick(self, symbol: str) -> Optional[MT5Tick]:
         """Get current tick for symbol."""
+        self._last_tick_error = None
         if not self._check_connection():
             return None
 
@@ -694,15 +1069,167 @@ class MT5Connector:
 
         tick = mt5.symbol_info_tick(resolved_symbol)
         if tick is None:
+            try:
+                diagnostic = mt5.last_error()  # Capture before any later native call.
+                if (isinstance(diagnostic, (tuple, list)) and len(diagnostic) == 2
+                        and isinstance(diagnostic[0], (int, np.integer))
+                        and not isinstance(diagnostic[0], (bool, np.bool_))
+                        and type(diagnostic[1]) is str):
+                    self._last_tick_error = (int(diagnostic[0]), diagnostic[1])
+            except Exception:
+                self._last_tick_error = None
             return None
 
+        raw_msc = getattr(tick, "time_msc", None)
+        if not hasattr(tick, "time_msc"):
+            if (not isinstance(tick.time, (int, np.integer))
+                    or isinstance(tick.time, (bool, np.bool_))):
+                raise NativeSessionError("NATIVE_TICK_TIME_INVALID")
+            raw_msc = int(tick.time) * 1000
+        if (not isinstance(raw_msc, (int, np.integer))
+                or isinstance(raw_msc, (bool, np.bool_)) or int(raw_msc) <= 0):
+            raise NativeSessionError("NATIVE_TICK_TIME_INVALID")
         return MT5Tick(
-            time=datetime.fromtimestamp(tick.time),
+            time=datetime.fromtimestamp(tick.time, timezone.utc),
             bid=tick.bid,
             ask=tick.ask,
             last=tick.last,
             volume=tick.volume,
+            time_msc=int(raw_msc),
         )
+
+
+    @property
+    def last_tick_error(self):
+        return self._last_tick_error
+
+    def get_quote_tick_page(self, symbol: str, start_msc: int, end_msc: int) -> MT5QuoteTickPage:
+        """Fetch the inclusive millisecond interval, at most 60 seconds, without a count cap."""
+        selected = []
+        broker_symbol = query_from = query_to = None
+        error_code = error_message = None
+        raw_count = 0
+
+        def integer(value):
+            return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_))
+
+        safe_symbol = (symbol if type(symbol) is str and 0 < len(symbol) <= 128
+            and symbol == symbol.strip() and all(32 <= ord(char) < 127 for char in symbol) else None)
+        safe_start = int(start_msc) if integer(start_msc) else None
+        safe_end = int(end_msc) if integer(end_msc) else None
+
+        def page(complete, status):
+            return MT5QuoteTickPage(safe_symbol, broker_symbol, safe_start, safe_end,
+                query_from, query_to, tuple(selected), raw_count, complete, status,
+                error_code, error_message)
+
+        def fail(code, cause=None):
+            error = MT5QuoteTickPageError(code, page(False, code))
+            if cause is not None:
+                raise error from cause
+            raise error
+
+        if safe_symbol is None:
+            fail("QUOTE_TICK_PAGE_SYMBOL_INVALID")
+        if (safe_start is None or safe_end is None or safe_start < 0
+                or safe_end < safe_start or safe_end - safe_start > 60000):
+            fail("QUOTE_TICK_PAGE_BOUNDS_INVALID")
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        try:
+            query_from = epoch + timedelta(seconds=safe_start // 1000)
+            query_to = epoch + timedelta(seconds=(safe_end + 999) // 1000)
+        except (OverflowError, ValueError) as exc:
+            fail("QUOTE_TICK_PAGE_BOUNDS_INVALID", exc)
+        if not self._check_connection():
+            fail("QUOTE_TICK_PAGE_DISCONNECTED")
+        try:
+            resolved = self._resolve_symbol(symbol)
+        except NativeSessionError:
+            raise
+        except Exception as exc:
+            fail("QUOTE_TICK_PAGE_SYMBOL_UNAVAILABLE", exc)
+        if (type(resolved) is not str or not 0 < len(resolved) <= 128
+                or any(not 32 <= ord(char) < 127 for char in resolved)):
+            fail("QUOTE_TICK_PAGE_SYMBOL_UNAVAILABLE")
+        broker_symbol = resolved
+
+        native_exception = None
+        try:
+            raw_ticks = mt5.copy_ticks_range(broker_symbol, query_from, query_to, mt5.COPY_TICKS_ALL)
+        except Exception as exc:
+            raw_ticks, native_exception = None, exc
+        # Capture immediately: even a non-null result can carry a partial-copy error.
+        diagnostic_error = None
+        try:
+            native_error = mt5.last_error()
+            if (not isinstance(native_error, (tuple, list)) or len(native_error) != 2
+                    or not integer(native_error[0]) or type(native_error[1]) is not str):
+                diagnostic_error = "QUOTE_TICK_PAGE_ERROR_DIAGNOSTIC_INVALID"
+            else:
+                error_code, error_message = int(native_error[0]), native_error[1]
+        except Exception as exc:
+            diagnostic_error = "QUOTE_TICK_PAGE_ERROR_DIAGNOSTIC_UNAVAILABLE"
+            if native_exception is None:
+                native_exception = exc
+        if raw_ticks is None:
+            fail("QUOTE_TICK_PAGE_NATIVE_CALL_FAILED", native_exception)
+        if (not isinstance(raw_ticks, (list, tuple, np.ndarray))
+                or isinstance(raw_ticks, np.ndarray) and raw_ticks.ndim != 1):
+            fail("QUOTE_TICK_PAGE_RESPONSE_INVALID")
+        raw_count = len(raw_ticks)
+        previous_msc, same_msc_ordinal = None, -1
+        for raw_ordinal, row in enumerate(raw_ticks):
+            try:
+                values = {name: row[name] for name in (
+                    "time", "time_msc", "bid", "ask", "last", "flags", "volume", "volume_real")}
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                fail("QUOTE_TICK_PAGE_RECORD_INVALID", exc)
+            if (not integer(values["time"]) or not integer(values["time_msc"])
+                    or not integer(values["flags"]) or not integer(values["volume"])):
+                fail("QUOTE_TICK_PAGE_RECORD_INVALID")
+            seconds, milliseconds = int(values["time"]), int(values["time_msc"])
+            flags, volume = int(values["flags"]), int(values["volume"])
+            if (milliseconds <= 0 or seconds != milliseconds // 1000
+                    or not 0 <= flags <= 2**32 - 1 or not 0 <= volume <= 2**64 - 1):
+                fail("QUOTE_TICK_PAGE_RECORD_INVALID")
+            prices = []
+            for name in ("bid", "ask", "last", "volume_real"):
+                value = values[name]
+                if (not isinstance(value, (int, float, np.integer, np.floating))
+                        or isinstance(value, (bool, np.bool_))):
+                    fail("QUOTE_TICK_PAGE_RECORD_INVALID")
+                try:
+                    numeric = float(value)
+                except (OverflowError, ValueError, TypeError) as exc:
+                    fail("QUOTE_TICK_PAGE_RECORD_INVALID", exc)
+                if not math.isfinite(numeric) or numeric < 0:
+                    fail("QUOTE_TICK_PAGE_RECORD_INVALID")
+                prices.append(numeric)
+            bid, ask, last, volume_real = prices
+            if bid == 0 or ask == 0:
+                fail("QUOTE_TICK_PAGE_ZERO_QUOTE")
+            if bid > ask:
+                fail("QUOTE_TICK_PAGE_CROSSED_QUOTE")
+            if previous_msc is not None and milliseconds < previous_msc:
+                fail("QUOTE_TICK_PAGE_ORDER_INVALID")
+            same_msc_ordinal = same_msc_ordinal + 1 if milliseconds == previous_msc else 0
+            previous_msc = milliseconds
+            try:
+                when = epoch + timedelta(seconds=seconds,
+                    microseconds=(milliseconds % 1000) * 1000)
+            except (OverflowError, ValueError) as exc:
+                fail("QUOTE_TICK_PAGE_RECORD_INVALID", exc)
+            if safe_start <= milliseconds <= safe_end:
+                selected.append(MT5QuoteTick(when, milliseconds, same_msc_ordinal,
+                    raw_ordinal, bid, ask, last, flags, volume, volume_real))
+        if diagnostic_error is not None:
+            fail(diagnostic_error, native_exception)
+        success_code = getattr(mt5, "RES_S_OK", 1)
+        if not integer(success_code) or error_code != int(success_code):
+            fail("QUOTE_TICK_PAGE_NATIVE_ERROR", native_exception)
+        if native_exception is not None:
+            fail("QUOTE_TICK_PAGE_NATIVE_CALL_FAILED", native_exception)
+        return page(True, "COMPLETE" if selected else "EMPTY")
 
     # =========================================================================
     # Historical Data
@@ -1806,7 +2333,7 @@ class MT5Connector:
             return preflight
 
         # Send order
-        result = mt5.order_send(request)
+        result = self._send_native_order(request)
 
         if result is None:
             error = mt5.last_error()
@@ -1885,7 +2412,7 @@ class MT5Connector:
         if preflight is not None:
             return preflight
 
-        result = mt5.order_send(request)
+        result = self._send_native_order(request)
 
         if result is None:
             error = mt5.last_error()
@@ -2000,7 +2527,7 @@ class MT5Connector:
         if preflight is not None:
             return preflight
 
-        result = mt5.order_send(request)
+        result = self._send_native_order(request)
         if result is None:
             error = mt5.last_error()
             return MT5OrderResult(False, error[0], str(error[1]), ambiguous=True)
@@ -2102,7 +2629,7 @@ class MT5Connector:
         if preflight is not None:
             return preflight
 
-        result = mt5.order_send(request)
+        result = self._send_native_order(request)
 
         if result is None:
             error = mt5.last_error()
@@ -2163,12 +2690,14 @@ class MT5Connector:
                     profit=pos.profit,
                     magic=pos.magic,
                     comment=pos.comment,
-                    time=datetime.fromtimestamp(pos.time),
+                    time=datetime.fromtimestamp(pos.time, timezone.utc),
                     identifier=int(getattr(pos, "identifier", 0) or 0),
                     reason=int(getattr(pos, "reason", 0) or 0),
-                    time_update=datetime.fromtimestamp(time_update_raw)
+                    time_update=datetime.fromtimestamp(time_update_raw, timezone.utc)
                     if time_update_raw
                     else None,
+                    destination=("BROKER" if self.execution_destination == "PAPER" else self.execution_destination),
+                    runtime_namespace=(self.runtime_identity.namespace if self.runtime_identity is not None else ""),
                 )
             )
 
@@ -2555,6 +3084,8 @@ class MT5Connector:
         self, request: Dict[str, Any]
     ) -> Optional[MT5OrderResult]:
         """Validate an MT5 trade request with order_check when available."""
+        if self.execution_destination == "PAPER":
+            return MT5OrderResult(False, 10017, "PAPER_NATIVE_MUTATION_REFUSED", destination="PAPER")
         if not MT5_AVAILABLE or not hasattr(mt5, "order_check"):
             return None
         try:
@@ -2742,6 +3273,1054 @@ __all__ = [
     "MT5Connection",
     "RETCODE_DESCRIPTIONS",
 ]
+
+
+class PaperExecutionConnector:
+    """Observed MT5 data with local execution in the existing outcome ledger."""
+
+    _READ_METHODS = frozenset({
+        "connect", "disconnect", "is_connected", "get_last_error", "get_symbol_info",
+        "find_broker_symbol", "get_tick", "get_symbol_tick", "get_bars", "get_bars_range",
+        "get_last_history_range_diagnostics", "normalize_volume", "order_calc_profit",
+        "calc_loss_amount", "calc_margin_required", "save_broker_specs_to_json", "get_quote_tick_page",
+    })
+
+    def __init__(self, data_connector, outcome_ledger, runtime_identity):
+        from pm_live_outcomes import RuntimeAccountIdentity
+        if (type(runtime_identity) is not RuntimeAccountIdentity
+                or runtime_identity.destination != "PAPER"
+                or outcome_ledger.runtime_identity != runtime_identity):
+            raise NativeSessionError("PAPER_RUNTIME_IDENTITY_INVALID")
+        data_connector.set_execution_destination("PAPER")
+        data_connector.set_runtime_identity(runtime_identity)
+        self._data = data_connector
+        self._ledger = outcome_ledger
+        self.runtime_identity = runtime_identity
+        self.execution_destination = "PAPER"
+        self.config = data_connector.config
+        self._paper_entry_block_reason = ""
+        self._paper_symbol_errors = {}
+        self._paper_poll_cache = None
+        self._quote_audit_capture = {}
+        self._m1_mismatch_observed = {}
+
+        self._paper_binding_ack_sequence = 0
+        self._paper_pending_binding_incident = None
+        try:
+            with self._data.native_session():
+                pass
+        except NativeAccountBindingError:
+            self._consume_native_binding_observation()
+            raise
+        observation = getattr(self._data, "binding_failure_observation", None)
+        if isinstance(observation, dict) and type(observation.get("sequence")) is int:
+            self._paper_binding_ack_sequence = observation["sequence"]
+
+    def __getattr__(self, name):
+        if name in self._READ_METHODS:
+            method = getattr(self._data, name)
+            if name in {"connect", "disconnect", "get_last_error", "get_last_history_range_diagnostics", "normalize_volume"}:
+                return method
+            @wraps(method)
+            def observed_read(*args, **kwargs):
+                with self.native_session():
+                    return method(*args, **kwargs)
+            return observed_read
+        raise AttributeError(name)
+
+    @property
+    def binding_failure_reason(self):
+        self._consume_native_binding_observation()
+        reason = self._data.binding_failure_reason
+        if reason:
+            self._paper_entry_block_reason = "PAPER_ACCOUNT_IDENTITY_MISMATCH"
+        return reason
+
+    def is_connected(self):
+        self._consume_native_binding_observation()
+        connected = self._data.is_connected()
+        self._consume_native_binding_observation()
+        if self._data.binding_failure_reason:
+            self._paper_entry_block_reason = "PAPER_ACCOUNT_IDENTITY_MISMATCH"
+        return connected
+
+    def _consume_native_binding_observation(self):
+        from pm_live_outcomes import LiveOutcomeError
+        # At most a previously failed save and the newest native observation.
+        for _ in range(2):
+            pending = self._paper_pending_binding_incident
+            if pending is None:
+                observation = getattr(self._data, "binding_failure_observation", None)
+                if (not isinstance(observation, dict) or type(observation.get("sequence")) is not int
+                        or observation["sequence"] <= self._paper_binding_ack_sequence):
+                    return
+                pending = dict(observation)
+                self._paper_pending_binding_incident = pending
+            self._paper_entry_block_reason = "PAPER_ACCOUNT_IDENTITY_MISMATCH"
+            try:
+                self._ledger.record_paper_binding_incident(
+                    observed_identity=pending["observed_identity"],
+                    bound_identity={name: getattr(self.runtime_identity, name)
+                                    for name in ("login", "server", "currency", "destination")},
+                    reason=pending["reason"], observed_at_utc=pending["observed_at_utc"])
+            except (LiveOutcomeError, OSError, ValueError, TypeError):
+                logging.getLogger("fxpm.paper").exception(
+                    "PAPER identity incident could not be persisted; entries remain blocked")
+                return
+            if pending["sequence"] is not None:
+                self._paper_binding_ack_sequence = pending["sequence"]
+            self._paper_pending_binding_incident = None
+
+    def _latch_binding_failure(self, reason):
+        self._paper_entry_block_reason = "PAPER_ACCOUNT_IDENTITY_MISMATCH"
+        if self._paper_pending_binding_incident is None:
+            self._paper_pending_binding_incident = {
+                "sequence": None, "reason": str(reason), "observed_identity": None,
+                "observed_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
+        self._consume_native_binding_observation()
+
+    @contextmanager
+    def native_session(self):
+        self._consume_native_binding_observation()
+        try:
+            with self._data.native_session():
+                yield
+        except NativeAccountBindingError as exc:
+            self._paper_entry_block_reason = "PAPER_ACCOUNT_IDENTITY_MISMATCH"
+            self._consume_native_binding_observation()
+            if (getattr(exc, "native_binding_observation_sequence", None) is None
+                    and not getattr(exc, "paper_binding_incident_observed", False)):
+                exc.paper_binding_incident_observed = True
+                self._latch_binding_failure(exc)
+            raise
+        finally:
+            self._consume_native_binding_observation()
+
+    @staticmethod
+    def _utc(value):
+        if not isinstance(value, datetime):
+            raise NativeSessionError("PAPER_QUOTE_TIME_INVALID")
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        if value.utcoffset() != timedelta(0):
+            raise NativeSessionError("PAPER_NON_UTC_SOURCE_TIME_REFUSED")
+        return value
+
+    @staticmethod
+    def _number(value, name, *, positive=False):
+        if isinstance(value, bool):
+            raise NativeSessionError("PAPER_INVALID_" + name)
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise NativeSessionError("PAPER_INVALID_" + name) from exc
+        if not math.isfinite(result) or (positive and result <= 0):
+            raise NativeSessionError("PAPER_INVALID_" + name)
+        return result
+
+    def _tick_unavailable_error(self, code):
+        error = NativeSessionError(code)
+        diagnostic = getattr(self._data, "last_tick_error", None)
+        if diagnostic is not None:
+            error.native_error_code, error.native_error_message = diagnostic
+        return error
+
+    def _retain_unknown_upper_failure(self, row, error):
+        audit = row.get("quote_audit")
+        if (getattr(error, "native_error_code", None) == -4 and audit is not None
+                and audit["pending_minute_msc"] is not None):
+            code = getattr(error, "code", None) or str(error).split(":", 1)[0]
+            self._audit_failure(row, audit["pending_minute_msc"], code, "RETRYABLE",
+                                overdue=audit["overdue"])
+
+    def _quote(self, symbol):
+        cache = self._paper_poll_cache
+        if cache is not None and symbol in cache["quotes"]:
+            info, tick, _ = cache["quotes"][symbol]
+        else:
+            info = self._data.get_symbol_info(symbol)
+            tick = self._data.get_tick(symbol)
+        if tick is None:
+            raise self._tick_unavailable_error("PAPER_OBSERVED_QUOTE_UNAVAILABLE")
+        if info is None:
+            raise NativeSessionError("PAPER_OBSERVED_QUOTE_UNAVAILABLE")
+        bid = self._number(tick.bid, "BID", positive=True)
+        ask = self._number(tick.ask, "ASK", positive=True)
+        if ask < bid:
+            raise NativeSessionError("PAPER_CROSSED_QUOTE_REFUSED")
+        return info, tick, bid, ask, self._utc(tick.time)
+
+    @contextmanager
+    def _poll_snapshot(self):
+        previous = self._paper_poll_cache
+        self._paper_poll_cache = {"quotes": {}, "pages": {}, "m1": {}}
+        try:
+            yield
+        finally:
+            self._paper_poll_cache = previous
+
+    def _tick_page(self, symbol, start_msc, end_msc):
+        cache = self._paper_poll_cache
+        key = symbol, start_msc, end_msc
+        if cache is not None and key in cache["pages"]:
+            return cache["pages"][key]
+        page = self._data.get_quote_tick_page(symbol, start_msc, end_msc)
+        if not page.complete or page.native_error_code != 1:
+            raise MT5QuoteTickPageError("PAPER_TICK_HISTORY_INCOMPLETE", page)
+        if cache is not None:
+            cache["pages"][key] = page
+        return page
+
+    @staticmethod
+    def _minute_signature(ticks, count=None):
+        import hashlib
+        import json
+        if count is None:
+            count = len(ticks)
+        if count > len(ticks):
+            raise NativeSessionError("PAPER_TICK_HISTORY_CURSOR_UNAVAILABLE")
+        digest = hashlib.sha256()
+        for tick in ticks[:count]:
+            value = {name: getattr(tick, name) for name in (
+                "time_msc", "same_msc_ordinal", "bid", "ask", "last", "flags", "volume", "volume_real")}
+            digest.update(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n")
+        return count, digest.hexdigest()
+
+    def _initial_quote_audit(self, symbol):
+        from pm_live_outcomes import PAPER_QUOTE_AUDIT_SCHEMA
+        minute, count, digest = self._quote_audit_capture[symbol]
+        return {"schema_version": PAPER_QUOTE_AUDIT_SCHEMA,
+                "pending_minute_msc": minute, "processed_count": count, "prefix_sha256": digest,
+                "corroborated_minute_count": 0, "last_corroborated_minute_msc": None,
+                "first_failure_minute_msc": None, "first_failure_code": None, "first_failure_status": None,
+                "status": "PENDING", "overdue": False,
+                "terminal_failure_minute_msc": None, "terminal_failure_code": None}
+
+    @staticmethod
+    def _tick_cursor_records(ticks):
+        """Hash each same-ms native prefix; query-relative raw ordinals are excluded."""
+        import hashlib
+        import json
+        previous_ms, digest = None, None
+        for tick in ticks:
+            if tick.time_msc != previous_ms:
+                digest = hashlib.sha256()
+                previous_ms = tick.time_msc
+            value = {name: getattr(tick, name) for name in (
+                "time_msc", "same_msc_ordinal", "bid", "ask", "last", "flags", "volume", "volume_real")}
+            digest.update(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n")
+            yield tick, {"time_msc": tick.time_msc, "same_msc_ordinal": tick.same_msc_ordinal,
+                         "prefix_sha256": digest.hexdigest()}
+
+    @staticmethod
+    def _execution_evidence(tick, event):
+        from pm_live_outcomes import PAPER_FILL_POLICY_ID
+        return {"model_id": PAPER_FILL_POLICY_ID, "bid": tick.bid, "ask": tick.ask,
+                "ask_source": "NATIVE", "event": event}
+
+    def _quote_record(self, symbol):
+        """Capture one actual native history record, including its duplicate-ms rank."""
+        cache = self._paper_poll_cache
+        if cache is not None and symbol in cache["quotes"]:
+            return cache["quotes"][symbol]
+        info, latest, _, _, _ = self._quote(symbol)
+        if type(getattr(info, "chart_mode", None)) is not int or info.chart_mode != 0:
+            raise NativeSessionError("PAPER_TRIGGER_BASIS_UNSUPPORTED")
+        milliseconds = getattr(latest, "time_msc", None)
+        if type(milliseconds) is not int or milliseconds < 100_000_000_000:
+            raise NativeSessionError("PAPER_NATIVE_TICK_MILLISECONDS_UNAVAILABLE")
+        page = self._tick_page(symbol, (milliseconds // 60000) * 60000, milliseconds)
+        if not page.complete or not page.ticks or page.ticks[-1].time_msc != milliseconds:
+            raise NativeSessionError("PAPER_ENTRY_TICK_RECORD_UNAVAILABLE")
+        # The page record, not an earlier symbol_info_tick snapshot, is the fill
+        # observation. Later same-ms appends are consumed on the inclusive resume.
+        tick, cursor = list(self._tick_cursor_records(page.ticks))[-1]
+        count, digest = self._minute_signature(page.ticks)
+        self._quote_audit_capture[symbol] = (milliseconds // 60000 * 60000, count, digest)
+        result = info, tick, cursor
+        if cache is not None:
+            cache["quotes"][symbol] = result
+        return result
+
+    def _paper_row(self, identifier):
+        return next((row for row in self._ledger.paper_positions()
+                     if int(row["position_id"]) == int(identifier)), None)
+
+    def get_account_info(self):
+        with self.native_session():
+            actual = self._data.get_account_info()
+        reason = account_identity_block_reason(actual, connector_config=self.config)
+        if reason:
+            self._latch_binding_failure(reason)
+            raise NativeAccountBindingError(reason)
+        identity = self.runtime_identity
+        if (int(actual.login) != identity.login
+                or str(actual.server).strip().casefold() != identity.server.casefold()
+                or str(actual.currency).strip().upper() != identity.currency):
+            self._latch_binding_failure("PAPER_ACCOUNT_NAMESPACE_MISMATCH")
+            raise NativeAccountBindingError("PAPER_ACCOUNT_NAMESPACE_MISMATCH")
+        return actual
+
+    def get_observed_broker_positions(self, symbol=None, magic=None):
+        with self.native_session():
+            result = self._data.get_positions(symbol=symbol, magic=magic)
+            if result is None:
+                raise NativeSessionError("PAPER_OBSERVED_POSITIONS_UNAVAILABLE")
+            for position in result:
+                if getattr(position, "destination", "BROKER") == "PAPER":
+                    raise NativeSessionError("PAPER_BROKER_POSITION_ALIAS_REFUSED")
+            return result
+
+    def _terms_for_entry(self, symbol, info, when):
+        import hashlib
+        import json
+        provider = getattr(self._data, "paper_funding_terms_provider", None)
+        terms = provider(symbol, observed_at_utc=when) if callable(provider) else None
+        mode = getattr(info, "swap_mode", -1)
+        long_rate = self._number(getattr(info, "swap_long", None), "SWAP_LONG")
+        short_rate = self._number(getattr(info, "swap_short", None), "SWAP_SHORT")
+        if terms is None and (mode == 0 or (type(mode) is int and mode in range(1, 9)
+                                          and long_rate == 0 and short_rate == 0)):
+            public = {"symbol": symbol, "swap_mode": int(mode),
+                      "swap_long": long_rate, "swap_short": short_rate}
+            digest = hashlib.sha256(json.dumps(public, sort_keys=True).encode()).hexdigest()
+            terms = {
+                "schema_version": "fxpm.paper-funding-terms.v1", **public,
+                "currency": self.runtime_identity.currency, "rollover_timezone": "UTC",
+                "source_ref": "OBSERVED_MT5_DISABLED_OR_ZERO_SWAP",
+                "observed_at": when.isoformat().replace("+00:00", "Z"), "provenance_sha256": digest,
+            }
+        if not isinstance(terms, Mapping):
+            raise NativeSessionError("PAPER_FUNDING_TERMS_UNAVAILABLE")
+        if (terms.get("schema_version") != "fxpm.paper-funding-terms.v1"
+                or terms.get("rollover_timezone") != "UTC"
+                or not terms.get("source_ref") or not terms.get("provenance_sha256")
+                or str(terms.get("currency", "")).upper() != self.runtime_identity.currency):
+            raise NativeSessionError("PAPER_FUNDING_TERMS_INVALID")
+        packed = json.loads(json.dumps(dict(terms), allow_nan=False))
+        self._funding_cash({"funding_terms": packed, "time_msc": int(when.timestamp() * 1000),
+                            "type": 0, "volume": 1.0, "symbol": symbol}, when, float(info.point))
+        return packed
+
+    def _funding_cash(self, row, when, point):
+        from pm_broker_terms import project_session_events
+        terms = row.get("funding_terms")
+        if not isinstance(terms, Mapping):
+            raise NativeSessionError("PAPER_FUNDING_TERMS_UNAVAILABLE")
+        mode = terms.get("swap_mode")
+        long_rate = self._number(terms.get("swap_long"), "SWAP_LONG")
+        short_rate = self._number(terms.get("swap_short"), "SWAP_SHORT")
+        if mode == 0 or (long_rate == 0 and short_rate == 0):
+            return 0.0
+        if mode not in (1, 4):
+            raise NativeSessionError("PAPER_FUNDING_MODE_UNSUPPORTED")
+        try:
+            start = datetime.fromisoformat(str(terms["coverage_start_utc"]).replace("Z", "+00:00"))
+            end = datetime.fromisoformat(str(terms["coverage_end_utc"]).replace("Z", "+00:00"))
+            entry = datetime.fromtimestamp(int(row["time_msc"]) / 1000, timezone.utc)
+            if (start.utcoffset() != timedelta(0) or end.utcoffset() != timedelta(0)
+                    or not start <= entry <= when <= end
+                    or not isinstance(terms["rollover_schedule"], list)):
+                raise ValueError("coverage")
+            if when <= entry:
+                return 0.0
+            frame = pd.DataFrame({"_BAR_CLOSE_TS": [when]}, index=pd.DatetimeIndex([entry]))
+            projected = project_session_events(terms["rollover_schedule"], frame)
+            units = int(projected.pre_open_units.sum() + projected.at_close_units.sum())
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NativeSessionError("PAPER_FUNDING_COVERAGE_UNAVAILABLE") from exc
+        if units == 0:
+            return 0.0
+        rate = long_rate if int(row["type"]) == 0 else short_rate
+        cash_per_lot = rate
+        if mode == 1:
+            price = float(row.get("price_open", 1.0))
+            value = self._data.order_calc_profit(0, row["symbol"], 1.0, price, price + point)
+            cash_per_lot *= abs(self._number(value, "SWAP_POINT_VALUE", positive=True))
+        return units * float(row["volume"]) * cash_per_lot
+
+    def _mark(self, row):
+        info, tick, bid, ask, when = self._quote(row["symbol"])
+        price = bid if int(row["type"]) == 0 else ask
+        value = self._data.order_calc_profit(
+            int(row["type"]), row["symbol"], float(row["volume"]), float(row["price_open"]), price,
+        )
+        gross = self._number(value, "NATIVE_PROFIT")
+        swap = self._funding_cash(row, when, float(info.point))
+        return info, when, price, gross, swap
+
+    def _position(self, row, mark):
+        _, when, price, gross, swap = mark
+        return MT5Position(
+            ticket=int(row["ticket"]), identifier=int(row["position_id"]),
+            symbol=str(row["symbol"]), type=int(row["type"]), volume=float(row["volume"]),
+            price_open=float(row["price_open"]), price_current=price,
+            sl=float(row["sl"]), tp=float(row["tp"]), swap=swap, profit=gross,
+            magic=int(row["magic"]), comment=str(row["comment"]),
+            time=datetime.fromtimestamp(int(row["time_msc"]) / 1000, timezone.utc),
+            time_update=when, destination="PAPER", runtime_namespace=self.runtime_identity.namespace,
+            paper_position_id=str(row["paper_position_id"]),
+        )
+
+    @staticmethod
+    def _cursor_order(cursor):
+        return cursor["time_msc"], cursor["same_msc_ordinal"]
+
+    def _completed_m1(self, symbol, start_msc, end_msc):
+        """Corroborate closed bid bars; this does not attest complete tick history."""
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        start, end = (start_msc // 60000) * 60000, (end_msc // 60000) * 60000
+        if end <= start:
+            return {}
+        cache = self._paper_poll_cache
+        if cache is not None:
+            missing = [minute for minute in range(start, end, 60000) if (symbol, minute) not in cache["m1"]]
+            if not missing:
+                return {minute: cache["m1"][(symbol, minute)] for minute in range(start, end, 60000)
+                        if cache["m1"][(symbol, minute)] is not None}
+            fetch_start, fetch_end = min(missing), max(missing) + 60000
+        else:
+            fetch_start, fetch_end = start, end
+        frame = self._data.get_bars_range(symbol, "M1", epoch + timedelta(milliseconds=fetch_start),
+                                           epoch + timedelta(milliseconds=fetch_end))
+        diagnostics = self._data.get_last_history_range_diagnostics()
+        captured = diagnostics.get("last_error") if isinstance(diagnostics, dict) else None
+        if ((isinstance(diagnostics, dict) and diagnostics.get("hard_failure"))
+                or (isinstance(captured, dict) and captured.get("code") == -4)):
+            error = NativeSessionError("PAPER_M1_SOURCE_UNAVAILABLE")
+            if isinstance(captured, dict):
+                error.native_error_code = captured.get("code")
+                error.native_error_message = captured.get("message")
+            raise error
+        result = {}
+        if frame is None:
+            if cache is not None:
+                for minute in range(fetch_start, fetch_end, 60000):
+                    cache["m1"][(symbol, minute)] = None
+                return {minute: cache["m1"][(symbol, minute)] for minute in range(start, end, 60000)
+                        if cache["m1"][(symbol, minute)] is not None}
+            return result
+        if not isinstance(frame, pd.DataFrame) or not {"Open", "High", "Low", "Close"}.issubset(frame):
+            raise NativeSessionError("PAPER_M1_SOURCE_UNAVAILABLE")
+        for index, bar in frame.iterrows():
+            when = self._utc(index.to_pydatetime() if isinstance(index, pd.Timestamp) else index)
+            delta = when - epoch
+            milliseconds = (delta.days * 86400 + delta.seconds) * 1000 + delta.microseconds // 1000
+            if milliseconds % 60000 or milliseconds in result or not start <= milliseconds < end:
+                raise NativeSessionError("PAPER_M1_SOURCE_UNAVAILABLE")
+            result[milliseconds] = tuple(self._number(bar[name], "M1_" + name.upper(), positive=True)
+                                         for name in ("Open", "High", "Low", "Close"))
+        if cache is not None:
+            for minute in range(fetch_start, fetch_end, 60000):
+                cache["m1"][(symbol, minute)] = result.get(minute)
+            return {minute: cache["m1"][(symbol, minute)] for minute in range(start, end, 60000)
+                    if cache["m1"][(symbol, minute)] is not None}
+        return result
+
+    def _verify_m1_page(self, page, minute, upper_msc, observed, point):
+        if minute + 60000 > (upper_msc // 60000) * 60000:
+            return  # Current minute is explicitly provisional native-response data.
+        bar = observed.get(minute)
+        if not page.ticks:
+            if bar is not None:
+                raise NativeSessionError("PAPER_M1_TICK_MISMATCH")
+            return
+        if bar is None:
+            raise NativeSessionError("PAPER_M1_SOURCE_UNAVAILABLE")
+        prices = [tick.bid for tick in page.ticks]
+        actual = (prices[0], max(prices), min(prices), prices[-1])
+        if any(abs(left - right) > max(float(point) / 2, 1e-12) for left, right in zip(actual, bar)):
+            raise NativeSessionError("PAPER_M1_TICK_MISMATCH")
+
+    def _audit_failure(self, row, minute, code, status, *, overdue=True):
+        audit = row.get("quote_audit")
+        if audit is None or audit["status"] in {"DIVERGENT", "UNAVAILABLE"}:
+            return row
+        proposed = dict(audit)
+        proposed["overdue"] = overdue
+        if proposed["first_failure_minute_msc"] is None:
+            proposed.update(first_failure_minute_msc=minute, first_failure_code=code,
+                            first_failure_status=status)
+        if status in {"DIVERGENT", "UNAVAILABLE"}:
+            proposed.update(status=status, terminal_failure_minute_msc=minute, terminal_failure_code=code)
+        else:
+            proposed["status"] = "PENDING"
+        return self._ledger.paper_update_quote_audit(int(row["position_id"]),
+                    expected_audit=audit, quote_audit=proposed)
+
+    def _audit_prefix(self, row, upper_tick):
+        audit = row.get("quote_audit")
+        if audit is None:
+            raise NativeSessionError("PAPER_QUOTE_AUDIT_MISSING")
+        if audit["status"] in {"DIVERGENT", "UNAVAILABLE"}:
+            raise NativeSessionError("PAPER_QUOTE_AUDIT_" + audit["status"])
+        minute = audit["pending_minute_msc"]
+        if minute is None:
+            return row
+        if upper_tick.time_msc < minute:
+            raise NativeSessionError("PAPER_TICK_HISTORY_TIME_REVERSED")
+        page = None
+        try:
+            page = self._tick_page(row["symbol"], minute, min(minute + 59999, upper_tick.time_msc))
+            if len(page.ticks) < audit["processed_count"]:
+                raise NativeSessionError("PAPER_REQUIRED_PREFIX_UNAVAILABLE")
+            _, prefix = self._minute_signature(page.ticks, audit["processed_count"])
+            if prefix != audit["prefix_sha256"]:
+                raise NativeSessionError("PAPER_MINUTE_PREFIX_CHANGED")
+            count, digest = self._minute_signature(page.ticks)
+            proposed = {**audit, "processed_count": count, "prefix_sha256": digest}
+            row = self._ledger.paper_update_quote_audit(int(row["position_id"]),
+                        expected_audit=audit, quote_audit=proposed)
+            if minute + 60000 <= upper_tick.time_msc // 60000 * 60000:
+                observed = self._completed_m1(row["symbol"], minute, upper_tick.time_msc)
+                info = self._data.get_symbol_info(row["symbol"])
+                if info is None:
+                    raise NativeSessionError("PAPER_SYMBOL_INFO_UNAVAILABLE")
+                self._verify_m1_page(page, minute, upper_tick.time_msc, observed, info.point)
+            return row
+        except NativeAccountBindingError:
+            raise
+        except NativeSessionError as exc:
+            if getattr(exc, "page", None) is None and page is not None:
+                exc.page = page
+            self._audit_observed_error(row, minute, upper_tick.time_msc, exc)
+            raise
+
+    def _audit_observed_error(self, row, minute, upper_msc, error):
+        code = getattr(error, "code", None) or str(error).split(":", 1)[0]
+        if not code.startswith(("PAPER_", "QUOTE_TICK_PAGE_")):
+            return
+        status = "RETRYABLE"
+        native_page = getattr(error, "page", None)
+        native_code = getattr(error, "native_error_code", None)
+        if native_code is None and native_page is not None:
+            native_code = native_page.native_error_code
+        complete_ok = (isinstance(native_page, MT5QuoteTickPage) and native_page.complete
+                       and native_page.native_error_code == 1)
+        if native_code == -4:
+            status = "RETRYABLE"  # An API absence/error does not prove permanent history loss.
+        elif complete_ok and code in {"PAPER_MINUTE_PREFIX_CHANGED", "PAPER_TICK_HISTORY_PREFIX_CHANGED"}:
+            status = "DIVERGENT"
+        elif complete_ok and code in {"PAPER_REQUIRED_PREFIX_UNAVAILABLE", "PAPER_TICK_HISTORY_CURSOR_UNAVAILABLE"}:
+            status = "UNAVAILABLE"
+        elif code == "PAPER_M1_TICK_MISMATCH":
+            key = int(row["position_id"]), minute
+            first_seen = self._m1_mismatch_observed.setdefault(key, upper_msc // 60000 * 60000)
+            if upper_msc // 60000 * 60000 >= first_seen + 60000:
+                status = "DIVERGENT"
+        self._audit_failure(row, minute, code, status, overdue=upper_msc // 60000 * 60000 > minute)
+
+    def _audit_complete(self, row, upper_tick):
+        """Corroborate only the position's actual span; never infer a trade from bar extrema."""
+        audit = row.get("quote_audit")
+        if audit is None:
+            raise NativeSessionError("PAPER_QUOTE_AUDIT_MISSING")
+        if audit["status"] in {"DIVERGENT", "UNAVAILABLE"}:
+            raise NativeSessionError("PAPER_QUOTE_AUDIT_" + audit["status"])
+        frozen = row["status"] == "CLOSED" or row["last_execution_evidence"]["event"] in {"SL", "TP"}
+        end = row["quote_cursor"]["time_msc"] if frozen else upper_tick.time_msc
+        final_minute = end // 60000 * 60000
+        first_minute = row["time_msc"] // 60000 * 60000
+        minute = first_minute + audit["corroborated_minute_count"] * 60000
+        proposed = dict(audit)
+        observed = self._completed_m1(row["symbol"], minute, upper_tick.time_msc)
+        info = self._data.get_symbol_info(row["symbol"])
+        if info is None:
+            raise NativeSessionError("PAPER_SYMBOL_INFO_UNAVAILABLE")
+        while minute <= final_minute:
+            page = None
+            try:
+                page = self._tick_page(row["symbol"], minute, min(minute + 59999, upper_tick.time_msc))
+                if minute == audit["pending_minute_msc"]:
+                    if len(page.ticks) < audit["processed_count"]:
+                        raise NativeSessionError("PAPER_REQUIRED_PREFIX_UNAVAILABLE")
+                    if self._minute_signature(page.ticks, audit["processed_count"])[1] != audit["prefix_sha256"]:
+                        raise NativeSessionError("PAPER_MINUTE_PREFIX_CHANGED")
+                if minute + 60000 > upper_tick.time_msc // 60000 * 60000:
+                    count, digest = self._minute_signature(page.ticks)
+                    proposed.update(pending_minute_msc=minute, processed_count=count, prefix_sha256=digest,
+                                    status="PENDING", overdue=False)
+                    break
+                self._verify_m1_page(page, minute, upper_tick.time_msc, observed, info.point)
+                proposed.update(corroborated_minute_count=proposed["corroborated_minute_count"] + 1,
+                                last_corroborated_minute_msc=minute, pending_minute_msc=None,
+                                processed_count=0, prefix_sha256=None, overdue=False)
+                self._m1_mismatch_observed.pop((int(row["position_id"]), minute), None)
+                minute += 60000
+            except NativeAccountBindingError:
+                raise
+            except NativeSessionError as exc:
+                if getattr(exc, "page", None) is None and page is not None:
+                    exc.page = page
+                # Retain the verified contiguous prefix in one bounded state update.
+                if proposed["pending_minute_msc"] != minute:
+                    import hashlib
+                    proposed.update(pending_minute_msc=minute, processed_count=0,
+                                    prefix_sha256=hashlib.sha256(b"").hexdigest())
+                row = self._ledger.paper_update_quote_audit(int(row["position_id"]),
+                            expected_audit=audit, quote_audit=proposed)
+                self._audit_observed_error(row, minute, upper_tick.time_msc, exc)
+                raise
+        else:
+            proposed.update(pending_minute_msc=None, processed_count=0, prefix_sha256=None,
+                            status="CLEAN" if row["status"] == "CLOSED" else "PENDING", overdue=False)
+        return self._ledger.paper_update_quote_audit(int(row["position_id"]),
+                    expected_audit=audit, quote_audit=proposed)
+
+    def _close_row(self, row, volume, price, when, *, operation_id="", quote_cursor=None,
+                   execution_evidence=None, observed_time_msc=None):
+        gross = self._number(self._data.order_calc_profit(
+            int(row["type"]), row["symbol"], volume, float(row["price_open"]), price,
+        ), "NATIVE_PROFIT")
+        info = self._data.get_symbol_info(row["symbol"])
+        if info is None:
+            raise NativeSessionError("PAPER_SYMBOL_INFO_UNAVAILABLE")
+        swap = self._funding_cash({**row, "volume": volume}, when, float(info.point))
+        kwargs = {}
+        if quote_cursor is not None or execution_evidence is not None:
+            kwargs = {"expected_cursor": row["quote_cursor"], "quote_cursor": quote_cursor,
+                      "execution_evidence": execution_evidence}
+        return self._ledger.paper_close_position(
+            int(row["position_id"]), volume, price, gross, swap,
+            (quote_cursor["time_msc"] if quote_cursor is not None else observed_time_msc
+             if observed_time_msc is not None else int(when.timestamp() * 1000)),
+            operation_id=operation_id, **kwargs,
+        )
+
+    def _close_trigger(self, row):
+        cursor, evidence = row["quote_cursor"], row["last_execution_evidence"]
+        side_quote = evidence["bid"] if int(row["type"]) == 0 else evidence["ask"]
+        price = side_quote if evidence["event"] == "SL" else float(row["tp"])
+        when = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=cursor["time_msc"])
+        self._close_row(row, float(row["volume"]), price, when, quote_cursor=cursor,
+                        execution_evidence=evidence,
+                        operation_id=f"protective:{row['position_id']}:{evidence['event']}:{cursor['time_msc']}:{cursor['same_msc_ordinal']}")
+
+    def _drain_row(self, row, upper_tick, upper_cursor):
+        try:
+            return self._drain_row_observed(row, upper_tick, upper_cursor)
+        except NativeAccountBindingError:
+            raise
+        except NativeSessionError as exc:
+            code = getattr(exc, "code", None) or str(exc).split(":", 1)[0]
+            if code.startswith(("PAPER_TICK_", "PAPER_M1_", "QUOTE_TICK_PAGE_")):
+                retained = self._ledger.paper_fill_for_reservation(row["reservation_id"])
+                if retained is not None:
+                    minute = getattr(exc, "paper_failure_minute_msc", None)
+                    if minute is None:
+                        minute = retained["quote_cursor"]["time_msc"] // 60000 * 60000
+                    self._audit_observed_error(retained, minute, upper_tick.time_msc, exc)
+            raise
+
+    def _drain_row_observed(self, row, upper_tick, upper_cursor):
+        from pm_live_outcomes import PAPER_FILL_POLICY_ID
+        cursor = row.get("quote_cursor")
+        if cursor is None or row.get("fill_policy_id") != PAPER_FILL_POLICY_ID:
+            raise NativeSessionError("PAPER_UNTRACKED_PROTECTION_REFUSED")
+        if row["last_execution_evidence"]["event"] in {"SL", "TP"}:
+            self._close_trigger(row)  # Known touch survives funding failure/history expiry.
+            return None
+        if self._cursor_order(upper_cursor) < self._cursor_order(cursor):
+            raise NativeSessionError("PAPER_TICK_HISTORY_TIME_REVERSED")
+        if cursor == upper_cursor:
+            return row
+        info = self._data.get_symbol_info(row["symbol"])
+        if info is None:
+            raise NativeSessionError("PAPER_SYMBOL_INFO_UNAVAILABLE")
+        observed = self._completed_m1(row["symbol"], cursor["time_msc"], upper_tick.time_msc)
+        minute = (cursor["time_msc"] // 60000) * 60000
+        first = True
+        while minute <= upper_tick.time_msc:
+            page = None
+            try:
+                end = min(minute + 59999, upper_tick.time_msc)
+                page = self._tick_page(row["symbol"], minute, end)
+                if not page.complete:
+                    raise NativeSessionError("PAPER_TICK_HISTORY_INCOMPLETE")
+                pairs = list(self._tick_cursor_records(page.ticks))
+                if first:
+                    prior = next((seen for _, seen in pairs if self._cursor_order(seen) == self._cursor_order(cursor)), None)
+                    if prior is None:
+                        raise NativeSessionError("PAPER_TICK_HISTORY_CURSOR_UNAVAILABLE")
+                    if prior != cursor:
+                        raise NativeSessionError("PAPER_TICK_HISTORY_PREFIX_CHANGED")
+                    first = False
+                if end == upper_tick.time_msc:
+                    boundary = next((seen for _, seen in pairs if self._cursor_order(seen) == self._cursor_order(upper_cursor)), None)
+                    if boundary != upper_cursor:
+                        raise NativeSessionError("PAPER_TICK_HISTORY_BOUNDARY_CHANGED")
+                self._verify_m1_page(page, minute, upper_tick.time_msc, observed, info.point)
+                last = None
+                for tick, seen in pairs:
+                    if self._cursor_order(seen) <= self._cursor_order(cursor):
+                        continue
+                    if self._cursor_order(seen) > self._cursor_order(upper_cursor):
+                        break
+                    long = int(row["type"]) == 0
+                    price, sl, tp = (tick.bid if long else tick.ask), float(row["sl"]), float(row["tp"])
+                    stop = sl > 0 and (price <= sl if long else price >= sl)
+                    take = tp > 0 and (price >= tp if long else price <= tp)
+                    if stop or take:
+                        # Latch only observed evidence, then book cash/close atomically.
+                        # A failed valuation cannot skip or reinterpret this first touch.
+                        evidence = self._execution_evidence(tick, "SL" if stop else "TP")
+                        row = self._ledger.paper_advance_quote_cursor(int(row["position_id"]),
+                            expected_cursor=row["quote_cursor"], quote_cursor=seen, execution_evidence=evidence)
+                        self._close_trigger(row)
+                        return None
+                    last = tick, seen
+                if last is not None:
+                    row = self._ledger.paper_advance_quote_cursor(int(row["position_id"]),
+                        expected_cursor=row["quote_cursor"], quote_cursor=last[1],
+                        execution_evidence=self._execution_evidence(last[0], "ADVANCE"))
+                    cursor = row["quote_cursor"]
+            except NativeSessionError as exc:
+                if getattr(exc, "page", None) is None and page is not None:
+                    exc.page = page
+                exc.paper_failure_minute_msc = minute
+                raise
+            minute += 60000
+        return row
+
+    def paper_protection_diagnostics(self):
+        return {symbol: list(errors) for symbol, errors in self._paper_symbol_errors.items()}
+
+    def poll_paper_positions(self, symbol=None, magic=None, *, position_id=None, protection_only=False):
+        with self.native_session(), self._poll_snapshot():
+            touched = set(self._paper_symbol_errors) if symbol is None and magic is None and position_id is None else set()
+            result, errors, closed_errors, settled = [], {}, {}, set()
+            audit_pending = [row for row in self._ledger.paper_quote_audit_positions()
+                             if row["status"] == "CLOSED" or (row.get("last_execution_evidence") or {}).get("event") in {"SL", "TP"}]
+            for row in self._ledger.paper_positions():
+                if ((symbol is not None and row["symbol"] != symbol)
+                        or (magic is not None and row["magic"] != magic)
+                        or (position_id is not None and row["position_id"] != position_id)):
+                    continue
+                origin = row
+                touched.add(row["symbol"])
+                try:
+                    if (row.get("last_execution_evidence") or {}).get("event") in {"SL", "TP"}:
+                        self._close_trigger(row)
+                        settled.add(int(row["position_id"]))
+                        continue
+                    _, tick, cursor = self._quote_record(row["symbol"])
+                    row = self._audit_prefix(row, tick)
+                    retained = row
+                    row = self._drain_row(row, tick, cursor)
+                    if row is None:
+                        row_closed = self._ledger.paper_fill_for_reservation(retained["reservation_id"])
+                        self._audit_complete(row_closed, tick)
+                    else:
+                        row = self._audit_complete(row, tick)
+                    if row is not None and not protection_only:
+                        result.append(self._position(row, self._mark(row)))
+                except NativeAccountBindingError:
+                    raise
+                except NativeSessionError as exc:
+                    if (not str(exc).startswith(("PAPER_", "QUOTE_TICK_PAGE_"))
+                            or "ACCOUNT" in str(exc) or not self._data.is_connected()):
+                        raise
+                    retained_row = self._ledger.paper_fill_for_reservation(origin["reservation_id"])
+                    if retained_row is not None:
+                        self._retain_unknown_upper_failure(retained_row, exc)
+                    target_errors = closed_errors if retained_row is not None and retained_row["status"] == "CLOSED" else errors
+                    target_errors.setdefault(origin["symbol"], []).append(str(exc))
+            for closed in audit_pending:
+                if int(closed["position_id"]) in settled:
+                    continue  # Price settlement does not depend on rediscovering received evidence.
+                closed = self._ledger.paper_fill_for_reservation(closed["reservation_id"])
+                if ((symbol is not None and closed["symbol"] != symbol)
+                        or (magic is not None and closed["magic"] != magic)
+                        or (position_id is not None and closed["position_id"] != position_id)):
+                    continue
+                touched.add(closed["symbol"])
+                try:
+                    tick = self._data.get_tick(closed["symbol"])
+                    if tick is None:
+                        raise self._tick_unavailable_error("PAPER_AUDIT_SOURCE_TIME_UNAVAILABLE")
+                    if type(getattr(tick, "time_msc", None)) is not int:
+                        raise NativeSessionError("PAPER_AUDIT_SOURCE_TIME_UNAVAILABLE")
+                    closed = self._audit_prefix(closed, tick)
+                    self._audit_complete(closed, tick)
+                except NativeAccountBindingError:
+                    raise
+                except NativeSessionError as exc:
+                    if (not str(exc).startswith(("PAPER_", "QUOTE_TICK_PAGE_"))
+                            or "ACCOUNT" in str(exc) or not self._data.is_connected()):
+                        raise
+                    latest = self._ledger.paper_fill_for_reservation(closed["reservation_id"])
+                    if latest is not None:
+                        self._retain_unknown_upper_failure(latest, exc)
+                    audit_errors = errors if closed["status"] == "OPEN" else closed_errors
+                    audit_errors.setdefault(closed["symbol"], []).append(str(exc))
+            visible_errors = {name: errors.get(name, []) + closed_errors.get(name, [])
+                              for name in errors.keys() | closed_errors.keys()}
+            for name in touched:
+                if name not in visible_errors:
+                    self._paper_symbol_errors.pop(name, None)
+            for name, issues in visible_errors.items():
+                if self._paper_symbol_errors.get(name) != issues:
+                    logging.getLogger("fxpm.paper").error("PAPER protection/valuation unavailable for %s: %s", name, issues)
+                self._paper_symbol_errors[name] = issues
+            if errors:
+                raise PaperProtectionDataError(errors, result)
+            return result
+
+    def get_positions(self, symbol=None, magic=None):
+        return self.poll_paper_positions(symbol, magic)
+
+    def get_position_by_ticket(self, ticket):
+        return next(iter(self.poll_paper_positions(position_id=int(ticket))), None)
+
+    def get_position_by_symbol_magic(self, symbol, magic):
+        positions = self.get_positions(symbol=symbol, magic=magic)
+        if len(positions) > 1:
+            raise NativeSessionError("PAPER_POSITION_MATCH_AMBIGUOUS")
+        return positions[0] if positions else None
+
+    def count_positions(self, symbol=None, magic=None):
+        return len(self.get_positions(symbol, magic))
+
+    def get_position_history(self, position_id, **kwargs):
+        return self._ledger.paper_history(int(position_id))
+
+    def _require_local_position(self, position):
+        identifier = int(getattr(position, "identifier", 0) or getattr(position, "ticket", 0))
+        expected = f"paper:{self.runtime_identity.namespace}:{identifier}"
+        if (getattr(position, "destination", None) != "PAPER"
+                or getattr(position, "runtime_namespace", None) != self.runtime_identity.namespace
+                or getattr(position, "paper_position_id", None) != expected):
+            raise NativeSessionError("PAPER_FOREIGN_POSITION_MUTATION_REFUSED")
+        return identifier
+
+    def get_position_opening_metadata(self, position_id, **kwargs):
+        history = self.get_position_history(position_id)
+        if history is None:
+            return None
+        return next((dict(deal) for deal in history["deals"] if deal["entry_kind"] == "IN"), None)
+
+    def get_recent_closing_deals(self, lookback_hours=48):
+        cutoff = int((datetime.now(timezone.utc) - timedelta(hours=max(1, int(lookback_hours)))).timestamp())
+        return [dict(deal) for deal in self._ledger.paper_deals()
+                if deal["entry_kind"] in {"OUT", "OUT_BY"} and int(deal["time_msc"]) >= cutoff * 1000]
+
+    def get_risk_account_info(self, actual_account=None):
+        with self.native_session():
+            actual = actual_account if actual_account is not None else self.get_account_info()
+            if account_identity_block_reason(actual, connector_config=self.config):
+                raise NativeSessionError("PAPER_RISK_ACCOUNT_IDENTITY_MISMATCH")
+            positions = self.poll_paper_positions()
+            cash = self._ledger.paper_cash_adjustment()
+            floating = sum(p.profit + p.swap for p in positions)
+            margin = self._number(actual.margin, "BROKER_MARGIN")
+            if margin < 0:
+                raise NativeSessionError("PAPER_NEGATIVE_BROKER_MARGIN")
+            for position in positions:
+                needed = self._data.calc_margin_required(
+                    position.type, position.symbol, position.volume, position.price_current,
+                )
+                needed = self._number(needed, "NATIVE_MARGIN")
+                if needed < 0:
+                    raise NativeSessionError("PAPER_NEGATIVE_NATIVE_MARGIN")
+                margin += needed
+            broker_equity = self._number(actual.equity, "BROKER_EQUITY")
+            broker_balance = self._number(actual.balance, "BROKER_BALANCE")
+            equity = broker_equity + cash + floating
+            fields = dict(vars(actual))
+            fields.update(balance=broker_balance + cash, equity=equity, margin=margin,
+                          margin_free=equity - margin, margin_level=100 * equity / margin if margin > 0 else 0.0,
+                          sampled_broker_balance=broker_balance, sampled_broker_equity=broker_equity,
+                          paper_cash_adjustment=cash, paper_floating_adjustment=floating,
+                          destination="PAPER", runtime_namespace=self.runtime_identity.namespace)
+            return SimpleNamespace(**fields)
+
+    def get_equity(self):
+        return self.get_risk_account_info().equity
+
+    def get_balance(self):
+        return self.get_risk_account_info().balance
+
+    @staticmethod
+    def _stops_valid(side, price, sl, tp, minimum):
+        if any(not math.isfinite(float(v)) or float(v) < 0 for v in (sl, tp)):
+            return False
+        if side == 0:
+            return ((sl == 0 or sl < price) and (tp == 0 or tp > price)
+                    and (sl == 0 or price - sl >= minimum) and (tp == 0 or tp - price >= minimum))
+        return ((sl == 0 or sl > price) and (tp == 0 or tp < price)
+                and (sl == 0 or sl - price >= minimum) and (tp == 0 or price - tp >= minimum))
+
+    def send_market_order(self, symbol, order_type, volume, sl=0.0, tp=0.0, deviation=30,
+                          magic=0, comment="", price=None, symbol_info=None, *, reservation_id=""):
+        from pm_live_outcomes import LiveOutcomeError
+        with self.native_session():
+            if self._paper_entry_block_reason:
+                return MT5OrderResult(False, 10017, self._paper_entry_block_reason, destination="PAPER")
+            if not reservation_id:
+                return MT5OrderResult(False, 10017, "PAPER_DURABLE_RESERVATION_REQUIRED", destination="PAPER")
+            try:
+                existing = self._ledger.paper_fill_for_reservation(reservation_id)
+                if existing is not None:
+                    return self._filled_result(existing)
+                self.get_account_info()
+                info, tick, cursor = self._quote_record(symbol)
+                bid, ask, when = tick.bid, tick.ask, tick.time
+                for held in self._ledger.paper_positions():
+                    if held["symbol"] == info.symbol:
+                        held = self._audit_prefix(held, tick)
+                        original_reservation = held["reservation_id"]
+                        held = self._drain_row(held, tick, cursor)
+                        self._audit_complete(held or self._ledger.paper_fill_for_reservation(original_reservation), tick)
+                for closed in self._ledger.paper_quote_audit_positions():
+                    if closed["symbol"] == info.symbol and closed["status"] == "CLOSED":
+                        closed = self._audit_prefix(closed, tick)
+                        self._audit_complete(closed, tick)
+                side = order_type.value if isinstance(order_type, OrderType) else int(order_type)
+                if side not in (0, 1):
+                    raise NativeSessionError("PAPER_MARKET_ORDER_TYPE_INVALID")
+                normalized = self._data.normalize_volume(volume, info)
+                if normalized is None:
+                    return MT5OrderResult(False, 10014, "PAPER_VOLUME_OUTSIDE_RISK_CEILING", destination="PAPER")
+                fill = ask if side == 0 else bid
+                if price is not None and abs(fill - float(price)) > max(0, int(deviation)) * float(info.point):
+                    return MT5OrderResult(False, 10020, "PAPER_OBSERVED_PRICE_CHANGED", destination="PAPER")
+                if not self._stops_valid(side, bid if side == 0 else ask, float(sl), float(tp),
+                                         float(info.trade_stops_level) * float(info.point)) or float(sl) <= 0:
+                    return MT5OrderResult(False, 10016, "PAPER_INVALID_INITIAL_STOPS", destination="PAPER")
+                risk = self._number(self._data.calc_loss_amount(side, symbol, normalized, fill, float(sl)),
+                                    "ACTUAL_STOP_RISK", positive=True)
+                terms = self._terms_for_entry(symbol, info, when)
+            except (NativeSessionError, LiveOutcomeError, OSError, ValueError, TypeError) as exc:
+                return MT5OrderResult(False, 10017, str(exc), error_message=str(exc), destination="PAPER")
+            try:
+                row = self._ledger.paper_open_position(reservation_id, {
+                    "broker_symbol": info.symbol, "magic": int(magic), "type": side,
+                    "volume": normalized, "price": fill, "sl": float(sl), "tp": float(tp),
+                    "comment": str(comment), "risk_cash": risk,
+                    "time_msc": tick.time_msc, "funding_terms": terms,
+                    "quote_cursor": cursor, "fill_policy_id": self._execution_evidence(tick, "ENTRY")["model_id"],
+                    "execution_evidence": self._execution_evidence(tick, "ENTRY"),
+                    "quote_audit": self._initial_quote_audit(symbol),
+                })
+                return self._filled_result(row)
+            except Exception:
+                self._paper_entry_block_reason = "PAPER_FILL_PERSISTENCE_UNKNOWN_PENDING_RECONCILIATION"
+                return MT5OrderResult(False, 10012, self._paper_entry_block_reason,
+                                      ambiguous=True, destination="PAPER")
+
+    @staticmethod
+    def _filled_result(row):
+        return MT5OrderResult(
+            True, 10009, "PAPER_LOCAL_FILL", deal=int(row["opening_deal_ticket"]),
+            order=int(row["opening_order_ticket"]), volume=float(row["volume_initial"]),
+            price=float(row["price_open"]), position_id=int(row["position_id"]),
+            paper_position_id=str(row["paper_position_id"]), destination="PAPER",
+        )
+
+    def close_position(self, position, deviation=30, magic=0, comment="", *, operation_id="", manual_recovery=False):
+        return self.close_position_partial(position, percent=100.0, deviation=deviation,
+                                           magic=magic, comment=comment, operation_id=operation_id,
+                                           manual_recovery=manual_recovery)
+
+    def _drain_for_mutation(self, identifier):
+        row = self._paper_row(identifier)
+        if row is None:
+            raise NativeSessionError("PAPER_POSITION_UNAVAILABLE")
+        if (row.get("last_execution_evidence") or {}).get("event") in {"SL", "TP"}:
+            self._close_trigger(row)
+            raise NativeSessionError("PAPER_POSITION_ALREADY_PROTECTED")
+        info, tick, cursor = self._quote_record(row["symbol"])
+        row = self._audit_prefix(row, tick)
+        if self._drain_row(row, tick, cursor) is None:
+            raise NativeSessionError("PAPER_POSITION_ALREADY_PROTECTED")
+        row = self._paper_row(identifier)
+        if row is None:
+            raise NativeSessionError("PAPER_POSITION_UNAVAILABLE")
+        return row, info, tick, cursor
+
+    def close_position_partial(self, position, percent=50.0, deviation=30, magic=0, comment="", *, operation_id="", manual_recovery=False):
+        from pm_live_outcomes import LiveOutcomeError
+        with self.native_session():
+            try:
+                if type(manual_recovery) is not bool:
+                    raise NativeSessionError("PAPER_MANUAL_RECOVERY_FLAG_INVALID")
+                if manual_recovery and (not isinstance(operation_id, str) or not operation_id.strip()
+                        or self._number(percent, "PARTIAL_PERCENT", positive=True) != 100.0):
+                    raise NativeSessionError("PAPER_MANUAL_RECOVERY_REQUIRES_FULL_VOLUME_AND_OPERATION_ID")
+                identifier = self._require_local_position(position)
+                if operation_id:
+                    previous = self._ledger.paper_close_operation(identifier, operation_id)
+                    if previous is not None:
+                        if manual_recovery != ((previous.get("execution_evidence") or {}).get("event") == "MANUAL_RECOVERY_CLOSE"):
+                            raise NativeSessionError("PAPER_RECOVERY_OPERATION_KIND_MISMATCH")
+                        return MT5OrderResult(
+                            True, 10009, "PAPER_REPLAYED_LOCAL_CLOSE", deal=int(previous["ticket"]),
+                            order=int(previous["order_ticket"]), volume=float(previous["volume"]),
+                            price=float(previous["price"]), position_id=identifier,
+                            paper_position_id=str(previous["paper_position_id"]), destination="PAPER",
+                        )
+                if manual_recovery:
+                    row = self._paper_row(identifier)
+                    if row is None:
+                        raise NativeSessionError("PAPER_POSITION_UNAVAILABLE")
+                    audit = row.get("quote_audit") or {}
+                    if (audit.get("status") not in {"DIVERGENT", "UNAVAILABLE"}
+                            or not audit.get("terminal_failure_code")
+                            or (row.get("last_execution_evidence") or {}).get("event") in {"SL", "TP"}):
+                        raise NativeSessionError("PAPER_MANUAL_RECOVERY_REQUIRES_TERMINAL_UNLATCHED_ROW")
+                    # This explicit operator action does not reconstruct the gap,
+                    # advance verified history or reinterpret an earlier touch.
+                    _, tick, _ = self._quote_record(row["symbol"])
+                    price = tick.bid if int(row["type"]) == 0 else tick.ask
+                    evidence = {**self._execution_evidence(tick, "MANUAL_RECOVERY_CLOSE"),
+                                "terminal_audit_status": audit["status"],
+                                "terminal_audit_code": audit["terminal_failure_code"]}
+                    deal = self._close_row(row, float(row["volume"]), price, tick.time,
+                        operation_id=operation_id, execution_evidence=evidence,
+                        observed_time_msc=tick.time_msc)
+                else:
+                    row, info, tick, cursor = self._drain_for_mutation(identifier)
+                    pct = self._number(percent, "PARTIAL_PERCENT", positive=True)
+                    if pct > 100:
+                        raise NativeSessionError("PAPER_PARTIAL_PERCENT_INVALID")
+                    volume = self._data.normalize_volume(float(row["volume"]) * pct / 100, info)
+                    if volume is None:
+                        return MT5OrderResult(False, 10014, "PAPER_PARTIAL_VOLUME_INVALID", destination="PAPER")
+                    price = tick.bid if int(row["type"]) == 0 else tick.ask
+                    deal = self._close_row(row, volume, price, tick.time, operation_id=operation_id,
+                        quote_cursor=cursor,
+                        execution_evidence=self._execution_evidence(tick, "MANUAL_CLOSE" if pct == 100 else "PARTIAL_CLOSE"))
+                return MT5OrderResult(True, 10009, "PAPER_LOCAL_CLOSE", deal=int(deal["ticket"]),
+                                      order=int(deal["order_ticket"]), volume=float(deal["volume"]),
+                                      price=float(deal["price"]), position_id=int(row["position_id"]),
+                                      paper_position_id=str(row["paper_position_id"]), destination="PAPER")
+            except (ValueError, TypeError, OSError, NativeSessionError, LiveOutcomeError) as exc:
+                return MT5OrderResult(False, 10017, str(exc), error_message=str(exc), destination="PAPER")
+
+    def modify_position(self, position, sl=None, tp=None):
+        from pm_live_outcomes import LiveOutcomeError
+        with self.native_session():
+            try:
+                identifier = self._require_local_position(position)
+                row, info, tick, cursor = self._drain_for_mutation(identifier)
+                long = int(row["type"]) == 0
+                next_sl = float(row["sl"] if sl is None else sl)
+                next_tp = float(row["tp"] if tp is None else tp)
+                if sl is not None and float(row["sl"]) > 0 and (
+                    next_sl == 0 or (next_sl < row["sl"] if long else next_sl > row["sl"])
+                ):
+                    raise NativeSessionError("PAPER_STOP_WIDENING_REFUSED")
+                if not self._stops_valid(int(row["type"]), tick.bid if long else tick.ask, next_sl, next_tp,
+                                         max(info.trade_stops_level, info.trade_freeze_level) * float(info.point)):
+                    raise NativeSessionError("PAPER_MODIFICATION_STOPS_INVALID")
+                if next_sl != row["sl"] or next_tp != row["tp"]:
+                    self._ledger.paper_modify_position(identifier, sl=sl, tp=tp,
+                        expected_cursor=row["quote_cursor"], quote_cursor=cursor,
+                        execution_evidence=self._execution_evidence(tick, "LEVEL_CHANGE"))
+                return MT5OrderResult(True, 10009, "PAPER_LOCAL_MODIFICATION", position_id=identifier,
+                                      paper_position_id=str(row["paper_position_id"]), destination="PAPER")
+            except (ValueError, TypeError, NativeSessionError, LiveOutcomeError) as exc:
+                return MT5OrderResult(False, 10017, str(exc), error_message=str(exc), destination="PAPER")
 
 
 if __name__ == "__main__":

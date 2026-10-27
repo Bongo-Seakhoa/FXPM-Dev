@@ -19,13 +19,25 @@ from pm_core import PipelineConfig
 UTC = timezone.utc
 
 
+@pytest.fixture(scope="function")
+def synthetic_future_interval_policy_adoption(monkeypatch):
+    """Assume future adoption ONLY to retain isolated later-stage unit coverage.
+
+    This test-only assumption grants no qualification or deployment authority.
+    Real default-policy refusal cases do not request this fixture.
+    """
+    import pm_live_readiness as readiness
+
+    monkeypatch.setattr(readiness, "interval_cell_qualification_readiness_finding", lambda: None)
+
+
 def _sha(value: bytes | str) -> str:
     raw = value if type(value) is bytes else str(value).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
 
 def _request(
-    tmp_path: Path, *, generation_id: str
+    tmp_path: Path, *, generation_id: str, synthetic_budget: bool = False
 ) -> runner.ProductionOptimizationRequest:
     data_dir = tmp_path / "data"
     data_dir.mkdir(exist_ok=True)
@@ -40,6 +52,20 @@ def _request(
         timeframes=list(book.TIMEFRAME_ORDER),
     )
     config._deployment_config_path = str(config_path)  # noqa: SLF001
+    spool_limits = None
+    if synthetic_budget:
+        # These isolated JSON-only chains declare their own small study budget;
+        # the real configured-reserve/live-free clamp still runs unchanged.
+        config.storage_critical_free_gb = 0.25
+        spool_limits = runner.authority_spool.SpoolLimits(
+            max_artifact_bytes=32 * 1024**2,
+            max_symbol_bytes=64 * 1024**2,
+            max_manifest_bytes=4 * 1024**2,
+            max_json_bytes=4 * 1024**2,
+            stream_chunk_bytes=1024**2,
+            max_generation_bytes=128 * 1024**2,
+            min_free_bytes=256 * 1024**2,
+        )
     return runner.ProductionOptimizationRequest(
         active_config_path=config_path,
         config=config,
@@ -50,6 +76,7 @@ def _request(
             activation_manifest_sha256=_sha("activation"),
         ),
         generation_id=generation_id,
+        spool_limits=spool_limits,
     )
 
 
@@ -363,6 +390,7 @@ def _install_success_chain(
     return state
 
 
+@pytest.mark.usefixtures("synthetic_future_interval_policy_adoption")
 def test_runner_orders_full_chain_and_returns_exact_pre_cas_bytes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -372,7 +400,7 @@ def test_runner_orders_full_chain_and_returns_exact_pre_cas_bytes(
     last_good = tmp_path / "pm_configs.json"
     last_good.write_bytes(b'{"last":"good"}')
 
-    request = _request(tmp_path, generation_id="generation-success")
+    request = _request(tmp_path, generation_id='generation-success', synthetic_budget=True)
     result = runner.run_production_optimization(request)
 
     assert state["coordinator_calls"] == 1
@@ -414,7 +442,7 @@ def test_runner_orders_full_chain_and_returns_exact_pre_cas_bytes(
         match="AUTHORITY_TARGET_ALREADY_EXISTS",
     ):
         runner.run_production_optimization(
-            _request(tmp_path, generation_id="generation-success")
+            _request(tmp_path, generation_id='generation-success', synthetic_budget=True)
         )
     assert result.run_root.is_dir()
     assert result.authority_assembly_path.is_dir()
@@ -500,6 +528,7 @@ def test_runner_orders_full_chain_and_returns_exact_pre_cas_bytes(
     assert not result.authority_assembly_path.exists()
 
 
+@pytest.mark.usefixtures("synthetic_future_interval_policy_adoption")
 def test_exact_empty_current_refit_is_typed_and_cleans_owned_roots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -533,7 +562,7 @@ def test_exact_empty_current_refit_is_typed_and_cleans_owned_roots(
         coordinate,
     )
 
-    request = _request(tmp_path, generation_id="generation-not-promotable")
+    request = _request(tmp_path, generation_id='generation-not-promotable', synthetic_budget=True)
     original_config = request.active_config_path.read_bytes()
     with pytest.raises(runner.ProductionOptimizationNotPromotable) as caught:
         runner.run_production_optimization(request)
@@ -627,6 +656,7 @@ def test_spool_budget_uses_live_free_space_and_cannot_weaken_configured_reserve(
         )
 
 
+@pytest.mark.usefixtures("synthetic_future_interval_policy_adoption")
 def test_runner_does_not_sleep_or_access_evidence_before_not_before(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -660,7 +690,7 @@ def test_runner_does_not_sleep_or_access_evidence_before_not_before(
             match="EVIDENCE_ACCESS_WINDOW_NOT_OPEN",
         ):
             runner.run_production_optimization(
-                _request(tmp_path, generation_id=f"generation-future-{ordinal}")
+                _request(tmp_path, generation_id=f'generation-future-{ordinal}', synthetic_budget=True)
             )
 
     assert "capital-bootstrap" in events
@@ -672,6 +702,7 @@ def test_runner_does_not_sleep_or_access_evidence_before_not_before(
     assert list(tmp_path.glob("fxpm-authority-*")) == []
 
 
+@pytest.mark.usefixtures("synthetic_future_interval_policy_adoption")
 def test_runner_rejects_coordinator_ledger_byte_substitution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -686,7 +717,7 @@ def test_runner_rejects_coordinator_ledger_byte_substitution(
         match="COORDINATOR_STAGED_LEDGER_HASH_MISMATCH",
     ):
         runner.run_production_optimization(
-            _request(tmp_path, generation_id="generation-substitution")
+            _request(tmp_path, generation_id='generation-substitution', synthetic_budget=True)
         )
 
     assert last_good.read_bytes() == b'{"last":"good"}'

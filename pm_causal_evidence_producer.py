@@ -1984,6 +1984,122 @@ def read_declared_cell_account_artifact(
         raise CausalEvidenceProductionError("DECLARED_CELL_RAW_ACCOUNT_INVALID") from exc
 
 
+_DECLARED_CELL_DISPOSITION_SCHEMA = "fxpm.declared-cell-interval-disposition.v1"
+_DECLARED_CELL_DISPOSITION_MAX_BYTES = 4096
+_DECLARED_CELL_DISPOSITION_IDENTITIES = (
+    "raw_account_descriptor_sha256", "generation_context_sha256",
+    "declared_precommit_sha256", "search_process_receipt_sha256",
+    "config_sha256", "effective_config_sha256",
+)
+_DECLARED_CELL_DISPOSITION_FALSE_FIELDS = (
+    "interval_policy_adopted", "book_admissible", "qualification_authority",
+    "capital_authority", "live_authority", "order_authority",
+)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class DeclaredCellAccountInputs:
+    """Opaque references to one already-produced declared account."""
+
+    context: authority_spool.GenerationSpoolContext
+    artifact: DeclaredCellRawAccountArtifact
+    process: Any
+    frozen_pipeline_config: Any
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class DeclaredCellIntervalDisposition:
+    """Bound nonqualification result with no account values or authority."""
+
+    _body_json: bytes
+
+    def __post_init__(self) -> None:
+        if (type(self._body_json) is not bytes
+                or len(self._body_json) > _DECLARED_CELL_DISPOSITION_MAX_BYTES):
+            _fail("DECLARED_CELL_DISPOSITION_INVALID")
+        try:
+            body = json.loads(self._body_json.decode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise CausalEvidenceProductionError("DECLARED_CELL_DISPOSITION_INVALID") from exc
+        fields = {"schema_version", "status", "reason_code", "cell_id",
+                  *_DECLARED_CELL_DISPOSITION_IDENTITIES,
+                  *_DECLARED_CELL_DISPOSITION_FALSE_FIELDS}
+        _exact_dict(body, fields, "DECLARED_CELL_DISPOSITION_INVALID")
+        if (body["schema_version"] != _DECLARED_CELL_DISPOSITION_SCHEMA
+                or body["status"] != "NOT_QUALIFIED"
+                or body["reason_code"] != "NO_ADOPTED_INTERVAL_POLICY"
+                or any(body[name] is not False
+                       for name in _DECLARED_CELL_DISPOSITION_FALSE_FIELDS)
+                or _canonical_bytes(body, _DECLARED_CELL_DISPOSITION_MAX_BYTES) != self._body_json):
+            _fail("DECLARED_CELL_DISPOSITION_INVALID")
+        _safe_id(body["cell_id"], "DECLARED_CELL_DISPOSITION_INVALID")
+        for name in _DECLARED_CELL_DISPOSITION_IDENTITIES:
+            _hex64(body[name], "DECLARED_CELL_DISPOSITION_INVALID")
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("utf-8"))
+
+    @property
+    def status(self) -> str:
+        return "NOT_QUALIFIED"
+
+    @property
+    def reason_code(self) -> str:
+        return "NO_ADOPTED_INTERVAL_POLICY"
+
+
+def evaluate_declared_cell_interval_admission(
+    inputs: DeclaredCellAccountInputs,
+) -> DeclaredCellIntervalDisposition:
+    """Reverify a complete account and record the absent interval policy."""
+    import pm_production_config_binding as config_binding
+    import pm_production_search_planner as search_planner
+
+    if (type(inputs) is not DeclaredCellAccountInputs
+            or type(inputs.context) is not authority_spool.GenerationSpoolContext
+            or type(inputs.artifact) is not DeclaredCellRawAccountArtifact
+            or type(inputs.process) is not search_planner.FrozenProductionSearchProcess
+            or type(inputs.frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig):
+        _fail("DECLARED_CELL_ADMISSION_INPUTS_INVALID")
+    projection = read_declared_cell_account_artifact(
+        inputs.context, inputs.artifact, process=inputs.process,
+        frozen_pipeline_config=inputs.frozen_pipeline_config)
+    body = projection.verified_body
+    progress = body.get("progress_status")
+    if progress == "STOP":
+        _fail("DECLARED_CELL_ACCOUNT_STOP")
+    if progress == "INCOMPLETE":
+        _fail("DECLARED_CELL_ACCOUNT_INCOMPLETE")
+    if (progress != "COMPLETE" or type(body.get("account")) is not dict
+            or body.get("reason_code") is not None):
+        _fail("DECLARED_CELL_ACCOUNT_PROGRESS_INVALID")
+    binding = body["pipeline_config_binding"]
+    config = inputs.frozen_pipeline_config
+    if (body["generation_context_sha256"] != inputs.context.context_sha256
+            or body["search_process_receipt_sha256"] != inputs.process.receipt_sha256
+            or binding["config_sha256"] != config.config_sha256
+            or binding["effective_config_sha256"] != config.effective_config_sha256
+            or config.config_sha256 != inputs.context.config_sha256
+            or any(body[name] is not False for name in
+                   ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_CELL_ADMISSION_BINDING_INVALID")
+    result = {
+        "schema_version": _DECLARED_CELL_DISPOSITION_SCHEMA,
+        "status": "NOT_QUALIFIED",
+        "reason_code": "NO_ADOPTED_INTERVAL_POLICY",
+        "cell_id": body["cell"]["cell_id"],
+        "raw_account_descriptor_sha256": projection.descriptor_sha256,
+        "generation_context_sha256": inputs.context.context_sha256,
+        "declared_precommit_sha256": body["declared_precommit_sha256"],
+        "search_process_receipt_sha256": inputs.process.receipt_sha256,
+        "config_sha256": config.config_sha256,
+        "effective_config_sha256": config.effective_config_sha256,
+        **{name: False for name in _DECLARED_CELL_DISPOSITION_FALSE_FIELDS},
+    }
+    return DeclaredCellIntervalDisposition(
+        _canonical_bytes(result, _DECLARED_CELL_DISPOSITION_MAX_BYTES))
+
+
 def _load_replay_ledgers(
     context: authority_spool.GenerationSpoolContext,
     descriptors: AnchorReplayArtifactDescriptors | DeclaredCellRawAccountArtifact,
@@ -3680,6 +3796,8 @@ __all__ = [
     "COST_LEDGER_SCHEMA",
     "CONTROLLER_EVENT_SCHEMA",
     "CausalEvidenceProductionError",
+    "DeclaredCellAccountInputs",
+    "DeclaredCellIntervalDisposition",
     "DeclaredCellRawAccountArtifact",
     "DeclaredCellRawAccountProjection",
     "EVENT_LEDGER_SCHEMA",
@@ -3694,5 +3812,6 @@ __all__ = [
     "ORDER_EVENT_SCHEMA",
     "SPECIALIST_SCHEMA",
     "freeze_causal_process_precommit_v10",
+    "evaluate_declared_cell_interval_admission",
     "read_declared_cell_account_artifact",
 ]

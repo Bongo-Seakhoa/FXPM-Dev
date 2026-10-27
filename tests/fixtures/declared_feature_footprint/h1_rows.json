@@ -1,0 +1,22 @@
+{
+  "classification": "PINNED_TIMESTAMP_ONLY_FOOTPRINT_INPUT_NOT_MARKET_OR_AUTHORITY_EVIDENCE",
+  "price_or_outcome_fields_parsed": false,
+  "provenance": {
+    "original_classification": "FIXED_SYNTHETIC_ENGINEERING_CONTROL_NO_TRADING_AUTHORITY",
+    "original_receipt_bytes": 2276,
+    "original_receipt_path": "audit_reports/fxpm_workshop_20261007/declared_slot_owner_v2_control/results/capture_002/current-control/exact-run-end-timestamps.json",
+    "original_receipt_sha256": "1941430215456c7469950a7848746d51c88679190790127158da39f0c97ecde2",
+    "original_schema_version": "fxpm.synthetic-exact-run-end-timestamps.v1",
+    "original_scope": "TIMESTAMP_AND_CUSTODY_SUPPORT_ONLY_NOT_ACTIVATION_AUTHORITY",
+    "parsed_value_path": "sources.H1.source_rows",
+    "protected_end_exclusive_utc": "2024-07-14T08:05:00Z",
+    "run_end_utc": "2024-06-22T00:00:00Z"
+  },
+  "qualification_authority": false,
+  "schema_version": "fxpm.test-h1-row-count-excerpt.v1",
+  "sources": {
+    "H1": {
+      "source_rows": 34950
+    }
+  }
+}

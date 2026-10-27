@@ -9,7 +9,7 @@ compare-and-swap.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -58,11 +58,20 @@ class ProductionOptimizationRunnerError(RuntimeError):
 
 
 class ProductionOptimizationNotPromotable(RuntimeError):
-    """Evidence-complete generation that must preserve the last-good ledger."""
+    """Verified nonpromotion that must preserve the last-good ledger."""
 
-    def __init__(self, code: str, details: Sequence[Any] = ()) -> None:
+    def __init__(
+        self, code: str, details: Sequence[Any] = (), *,
+        interval_disposition: causal_evidence.DeclaredCellIntervalDisposition | None = None,
+    ) -> None:
+        if (
+            interval_disposition is not None
+            and type(interval_disposition) is not causal_evidence.DeclaredCellIntervalDisposition
+        ):
+            raise ProductionOptimizationRunnerError("DECLARED_INTERVAL_DISPOSITION_INVALID")
         self.code = str(code)
         self.details = tuple(str(value) for value in details)
+        self.interval_disposition = interval_disposition
         suffix = ":" + ":".join(self.details) if self.details else ""
         super().__init__(self.code + suffix)
 
@@ -268,6 +277,9 @@ class ProductionOptimizationRequest:
     authorization_scope: str = capital_bootstrap.DEMO_PROBATION_SCOPE
     funded_boundary: capital_bootstrap.FundedAuthorityBoundary | None = None
     spool_limits: authority_spool.SpoolLimits | None = None
+    declared_account_inputs: causal_evidence.DeclaredCellAccountInputs | None = field(
+        default=None, repr=False, compare=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -673,6 +685,27 @@ def _run_production_optimization_once(
 ) -> ProductionOptimizationResult:
     """Run the complete evidence chain exactly once, stopping before CAS."""
 
+    if (
+        type(request) is ProductionOptimizationRequest
+        and request.declared_account_inputs is not None
+    ):
+        try:
+            coordinator.coordinate_production_authority(
+                declared_account_inputs=request.declared_account_inputs,
+            )
+        except coordinator.ProductionAuthorityNotQualified as exc:
+            raise ProductionOptimizationNotPromotable(
+                "DECLARED_CELL_INTERVAL_NOT_QUALIFIED", exc.details,
+                interval_disposition=exc.disposition,
+            ) from exc
+        except coordinator.ProductionAuthorityBlocked as exc:
+            raise ProductionOptimizationRunnerError(exc.code, exc.details) from exc
+        except Exception as exc:
+            raise ProductionOptimizationRunnerError(
+                "DECLARED_CELL_INTERVAL_ADMISSION_FAILED", (type(exc).__name__,),
+            ) from exc
+        _fail("DECLARED_CELL_INTERVAL_ADMISSION_UNEXPECTED_RETURN")
+
     (
         config_path,
         deployment_root,
@@ -681,6 +714,18 @@ def _run_production_optimization_once(
         requested_symbols,
         generation_id,
     ) = _validate_request(request)
+    # The retired cost producer cannot qualify a current cell rule. Refuse
+    # before any search/work-root side effects, preserving the typed account
+    # dispatch above and the pipeline's last-good-ledger transaction boundary.
+    from pm_live_readiness import interval_cell_qualification_readiness_finding
+
+    interval_block = interval_cell_qualification_readiness_finding()
+    if interval_block is not None:
+        policy_code, policy_message = interval_block
+        raise ProductionOptimizationNotPromotable(
+            "INTERVAL_CELL_QUALIFICATION_POLICY_UNADOPTED",
+            (policy_code, policy_message, str(request.authorization_scope)),
+        )
     spool_limits = _effective_spool_limits(
         config=config,
         deployment_root=deployment_root,

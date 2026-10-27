@@ -2197,6 +2197,8 @@ def _make_declared_slot_source_authority():
                 search_process=process, cell_plan=plan, config=config)
             return finish(capture.completion)
         except Exception as exc:
+            if authority_spool.is_resource_capacity_error(exc):
+                raise
             if capture is not None and capture._completion is not None:
                 raise _DeclaredSlotPostCompletionFailure(capture.completion, _declared_failure_details(exc)) from exc
             # A handled technical stop, never an economic abstention. Hard process
@@ -2566,29 +2568,31 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
             attempt_id = "attempt-" + secrets.token_hex(16)
             request = historical.declared_slot_producer_request(context, precommit=precommit, process=process,
                 cell_id=cell_id, slot_id=slot["slot_id"], attempt_id=attempt_id, sink=sink)
-            attempt_body = {"schema_version": "fxpm.declared-slot-attempt-start.v1", "request_sha256": request.receipt_sha256,
-                "slot_id": slot["slot_id"], "started_at_utc": _now_utc_seconds(), "pid": os.getpid(),
-                "meaning": "START_ONLY_NOT_A_COMPLETION_OR_FUTURE_OUTCOME",
-                "prior_uncommitted_attempts": _declared_prior_attempt_starts(context, precommit, cell_id, slot)}
-            authority_spool._publish_exact_json(context,
-                f"declared-slots/{precommit.receipt_sha256}/{cell_id}/attempts/{slot['slot_id']}/{attempt_id}.json",
-                attempt_body, context.limits.max_json_bytes)
-            post_completion_failure = None
             try:
-                completion = execute_declared_slot_owner_search(context, request=request, process=process,
-                    frozen_pipeline_config=frozen_pipeline_config)
-            except _DeclaredSlotPostCompletionFailure as exc:
-                completion, post_completion_failure = exc.completion, exc.failure
-            namespace = request.to_dict()["artifact_namespace"] + "/"
-            roster = [dict(sink._artifacts[k]) for k in sorted(sink._artifacts) if k.startswith(namespace)]
-            summary, descriptor = _commit_declared_slot_completion(context, precommit=precommit, process=process,
-                cell_id=cell_id, slot=slot, completion=completion, artifact_roster=roster,
-                previous_commit_sha256=previous, frozen_pipeline_config=frozen_pipeline_config,
-                post_completion_failure=post_completion_failure)
-            previous = descriptor["sha256"]
-            completed.append(summary)
-            commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
-            historical._release_declared_slot_producer_request(request, context)
+                attempt_body = {"schema_version": "fxpm.declared-slot-attempt-start.v1", "request_sha256": request.receipt_sha256,
+                    "slot_id": slot["slot_id"], "started_at_utc": _now_utc_seconds(), "pid": os.getpid(),
+                    "meaning": "START_ONLY_NOT_A_COMPLETION_OR_FUTURE_OUTCOME",
+                    "prior_uncommitted_attempts": _declared_prior_attempt_starts(context, precommit, cell_id, slot)}
+                authority_spool._publish_exact_json(context,
+                    f"declared-slots/{precommit.receipt_sha256}/{cell_id}/attempts/{slot['slot_id']}/{attempt_id}.json",
+                    attempt_body, context.limits.max_json_bytes)
+                post_completion_failure = None
+                try:
+                    completion = execute_declared_slot_owner_search(context, request=request, process=process,
+                        frozen_pipeline_config=frozen_pipeline_config)
+                except _DeclaredSlotPostCompletionFailure as exc:
+                    completion, post_completion_failure = exc.completion, exc.failure
+                namespace = request.to_dict()["artifact_namespace"] + "/"
+                roster = [dict(sink._artifacts[k]) for k in sorted(sink._artifacts) if k.startswith(namespace)]
+                summary, descriptor = _commit_declared_slot_completion(context, precommit=precommit, process=process,
+                    cell_id=cell_id, slot=slot, completion=completion, artifact_roster=roster,
+                    previous_commit_sha256=previous, frozen_pipeline_config=frozen_pipeline_config,
+                    post_completion_failure=post_completion_failure)
+                previous = descriptor["sha256"]
+                completed.append(summary)
+                commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
+            finally:
+                historical._release_declared_slot_producer_request(request, context)
             del sink, roster, request
             if post_completion_failure is not None:
                 committed = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"]))

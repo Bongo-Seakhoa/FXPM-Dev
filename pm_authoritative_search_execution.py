@@ -96,6 +96,8 @@ MAX_DAYS_PER_FOLD: Final = winner.MAX_DAYS_PER_FOLD
 MIN_PARTITION_SCORED_BARS: Final = 2
 MAX_ATTEMPT_EVIDENCE_BYTES: Final = 512 * 1024**2
 MAX_CELL_EVIDENCE_BYTES: Final = 8 * 1024**3
+MAX_CAPACITY_CUSTODY_BYTES: Final = 128 * 1024
+CAPACITY_CUSTODY_SCHEMA: Final = "fxpm.authoritative-search-capacity-custody.v1"
 MAX_DEPLOYMENT_CONFIG_BYTES: Final = 32 * 1024**2
 MAX_BROKER_SPECS_BYTES: Final = 64 * 1024**2
 EXECUTION_SPEC_RECEIPT_SCHEMA: Final = "fxpm.execution-instrument-spec-receipt.v2"
@@ -392,6 +394,15 @@ class _StagedAttemptEvidence:
     path: Path | None
     size_bytes: int
     sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StageCapacityCustody:
+    root: Path
+    stage_identity: tuple[int, int]
+    receipt_identity: tuple[int, int]
+    receipt: _StagedAttemptEvidence
+    binding: Mapping[str, Any]
 
 
 def _fail(code: str, *details: Any) -> None:
@@ -3200,6 +3211,159 @@ def _close_reserved_stage(
         raise close_error
 
 
+def _capacity_custody_bytes(binding: Mapping[str, Any], **facts: Any) -> bytes:
+    body = {
+        **binding, **facts,
+        "schema_version": CAPACITY_CUSTODY_SCHEMA,
+        "classification": "TECHNICAL_CUSTODY_NOT_EVIDENCE",
+        "meaning": "NOT_EVIDENCE_NO_REUSE_OR_RESUME_AUTHORITY",
+        "reuse_authority": False, "resume_authority": False,
+        "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False,
+        "retirement": "EXPLICIT_OWNER_OR_QA_ACTION_ONLY",
+    }
+    encoded = _canonical_bytes(body)
+    if len(encoded) > MAX_CAPACITY_CUSTODY_BYTES:
+        _fail("CAPACITY_CUSTODY_BOUND_EXCEEDED")
+    return encoded + b" " * (MAX_CAPACITY_CUSTODY_BYTES - len(encoded))
+
+
+def _write_custody_descriptor(descriptor: int, encoded: bytes) -> None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    remaining = memoryview(encoded)
+    while remaining:
+        written = os.write(descriptor, remaining)
+        if written <= 0:
+            raise OSError("capacity custody short write")
+        remaining = remaining[written:]
+    os.fsync(descriptor)
+
+
+def _create_stage_capacity_custody(
+    *, root: Path, stage: Path, binding: Mapping[str, Any], reservation: Any,
+) -> _StageCapacityCustody:
+    root = root.resolve(strict=True)
+    info = stage.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or _is_reparse(info)
+            or stage.resolve(strict=True).parent != root):
+        _fail("CAPACITY_CUSTODY_PATH_INVALID")
+    path = stage / "capacity-custody.json"
+    original = {**binding, "original_stage_directory": stage.name,
+                "custody_allocated_bytes": MAX_CAPACITY_CUSTODY_BYTES}
+    encoded = _capacity_custody_bytes(original,
+        custody_state="PREALLOCATED_NONACTIVATING", observed_capacity_failure=None,
+        accounting="ACTIVE_EXISTING_TRANSIENT_RESERVATION")
+    reservation.consume(len(encoded))
+    descriptor = -1
+    complete = False
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        _write_custody_descriptor(descriptor, encoded)
+        opened, current = os.fstat(descriptor), path.lstat()
+        if (not stat.S_ISREG(current.st_mode) or _is_reparse(current)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+                or current.st_size != len(encoded)):
+            _fail("CAPACITY_CUSTODY_FILE_INVALID")
+        reservation.materialize(len(encoded))
+        result = _StageCapacityCustody(root, (info.st_dev, info.st_ino),
+            (opened.st_dev, opened.st_ino),
+            _StagedAttemptEvidence(-1, "CUSTODY_METADATA", path, len(encoded),
+                                  hashlib.sha256(encoded).hexdigest()), original)
+        complete = True
+        return result
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not complete:
+            path.unlink(missing_ok=True)
+
+
+def _retire_capacity_stage_path(stage: Path, target: Path, custody: _StageCapacityCustody) -> None:
+    # Resolve and pin both endpoints before the same-parent directory rename.
+    root = custody.root.resolve(strict=True)
+    root_info = custody.root.lstat()
+    before = stage.lstat()
+    if (root != custody.root or not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_ISLNK(root_info.st_mode) or _is_reparse(root_info)
+            or stage.resolve(strict=True).parent != root or target.parent.resolve(strict=True) != root
+            or target.resolve(strict=False).parent != root or target.exists()
+            or not stat.S_ISDIR(before.st_mode) or stat.S_ISLNK(before.st_mode) or _is_reparse(before)
+            or (before.st_dev, before.st_ino) != custody.stage_identity):
+        _fail("CAPACITY_CUSTODY_PATH_INVALID")
+    os.rename(stage, target)
+    after = target.lstat()
+    if (not stat.S_ISDIR(after.st_mode) or stat.S_ISLNK(after.st_mode) or _is_reparse(after)
+            or target.resolve(strict=True).parent != root
+            or (after.st_dev, after.st_ino) != custody.stage_identity):
+        _fail("CAPACITY_CUSTODY_PATH_INVALID")
+
+
+def _refresh_capacity_custody(path: Path, custody: _StageCapacityCustody, encoded: bytes) -> None:
+    current = path.lstat()
+    if (not stat.S_ISREG(current.st_mode) or stat.S_ISLNK(current.st_mode) or _is_reparse(current)
+            or (current.st_dev, current.st_ino) != custody.receipt_identity
+            or current.st_size != MAX_CAPACITY_CUSTODY_BYTES
+            or path.parent.resolve(strict=True).parent != custody.root):
+        _fail("CAPACITY_CUSTODY_FILE_INVALID")
+    descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_size != MAX_CAPACITY_CUSTODY_BYTES
+                or (opened.st_dev, opened.st_ino) != custody.receipt_identity):
+            _fail("CAPACITY_CUSTODY_FILE_INVALID")
+        _write_custody_descriptor(descriptor, encoded)
+    finally:
+        os.close(descriptor)
+
+
+def _close_historical_reserved_stage(
+    *, stage: Path | None, rows: Sequence[_StagedAttemptEvidence], reservation: Any,
+    reservation_scope: Any, primary_error: BaseException | None,
+    custody: _StageCapacityCustody | None, evidence_started: str | None,
+    evidence_completed: str | None,
+) -> None:
+    if custody is None or not authority_spool.is_resource_capacity_error(primary_error):
+        cleanup_rows = list(rows) + ([] if custody is None else [custody.receipt])
+        return _close_reserved_stage(stage=stage, rows=cleanup_rows,
+            reservation=reservation, reservation_scope=reservation_scope, primary_error=primary_error)
+    assert primary_error is not None and stage is not None
+    retained = custody.root / (".fxpm-capacity-custody-" + secrets.token_hex(8))
+    try:
+        _retire_capacity_stage_path(stage, retained, custody)
+        _fsync_directory(custody.root)
+        primary_error.add_note("CAPACITY_STAGE_RETAINED:" + retained.name)
+    except Exception as exc:
+        primary_error.add_note("CAPACITY_STAGE_RETIREMENT_FAILED:" + type(exc).__name__)
+        if stage.exists():
+            retained = stage
+    abandoned = reservation_scope is None
+    if reservation_scope is not None:
+        try:
+            # Leave the unfinished record for the existing abandoned-guard rescan.
+            # cancel_after_cleanup is forbidden while these bytes remain.
+            reservation_scope.__exit__(None, None, None)
+            abandoned = True
+        except Exception as exc:
+            primary_error.add_note("CAPACITY_RESERVATION_EXIT_FAILED:" + type(exc).__name__)
+    try:
+        metadata = [{"ordinal": row.ordinal, "kind": row.kind, "sha256": row.sha256,
+                     "size_bytes": row.size_bytes,
+                     "file": None if row.path is None else row.path.name} for row in rows]
+        valid_bytes = sum(row.size_bytes for row in rows if row.path is not None)
+        encoded = _capacity_custody_bytes(custody.binding,
+            custody_state="CAPACITY_RETAINED_NONACTIVATING", retained_directory=retained.name,
+            observed_capacity_failure="SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
+            observed_at_utc=_now_utc_seconds(), evidence_access_started_at_utc=evidence_started,
+            evidence_access_completed_at_utc=evidence_completed, completed_row_metadata=metadata,
+            completed_row_count=len(rows), known_completed_row_bytes=valid_bytes,
+            known_retained_bytes=valid_bytes + MAX_CAPACITY_CUSTODY_BYTES,
+            accounting="UNFINISHED_GUARD_CLOSED_RESCAN_REQUIRED" if abandoned else "SCOPE_EXIT_FAILED_NO_CANCEL")
+        _refresh_capacity_custody(retained / custody.receipt.path.name, custody, encoded)
+    except Exception as exc:
+        # Retain the original refusal and rows even if diagnostic I/O also fails.
+        primary_error.add_note("CAPACITY_CUSTODY_REFRESH_FAILED:" + type(exc).__name__)
+
+
 def _infrastructure_failure(
     *,
     code: str,
@@ -4322,6 +4486,9 @@ def execute_historical_observed_cell(
     stage_reservation_scope: Any = None
     result: HistoricalObservedCellExecution | None = None
     primary_error: BaseException | None = None
+    stage_custody: _StageCapacityCustody | None = None
+    evidence_started: str | None = None
+    evidence_completed: str | None = None
     try:
         refreshed = _reverify_fitted_timeframe(fitted, config)
         _reverify_cell_state_error_envelope(cell_plan=cell_plan, fitted=refreshed)
@@ -4395,6 +4562,19 @@ def execute_historical_observed_cell(
         stage_reservation = reservation_scope.__enter__()
         stage_reservation_scope = reservation_scope
         stage = _stage_directory(capture, handle)
+        request_body = capture.request.to_dict()
+        stage_custody = _create_stage_capacity_custody(root=capture.context.root,
+            stage=stage, reservation=stage_reservation,
+            binding={"generation_context_sha256": capture.context.context_sha256,
+                "producer_request_sha256": capture.request.receipt_sha256,
+                "precommit_sha256": request_body.get("precommit_sha256"),
+                "process_receipt_sha256": request_body.get("search_process_receipt_sha256"),
+                "attempt_id": request_body.get("attempt_id"),
+                "cell_id": request_body.get("cell_id"), "slot_id": request_body.get("slot_id"),
+                "artifact_namespace": request_body.get("artifact_namespace"),
+                "source_access_window_utc": request_body.get("source_access_window_utc"),
+                "cell": [handle.symbol, handle.timeframe, handle.regime],
+                "frozen_receipt_descriptor": dict(handle.frozen_receipt_descriptor)})
         total_bytes = 0
         plan_receipt_sha256 = _sha256(plan_body)
         for attempt, raw_id in zip(attempts, raw_ids, strict=True):
@@ -4486,6 +4666,8 @@ def execute_historical_observed_cell(
         )
     except raw_winner.WinnerRawEvidenceIncomplete as exc:
         primary_error = exc
+        if authority_spool.is_resource_capacity_error(exc):
+            raise
         if handle is None:
             raise
         _record_historical_raw_failure(capture, handle, exc, exc,
@@ -4499,6 +4681,8 @@ def execute_historical_observed_cell(
         )
     except Exception as exc:
         primary_error = exc
+        if authority_spool.is_resource_capacity_error(exc):
+            raise
         code = _technical_failure_code(
             exc.code
             if isinstance(exc, AuthoritativeSearchExecutionError)
@@ -4544,12 +4728,15 @@ def execute_historical_observed_cell(
                 failure_code=code,
             )
     finally:
-        _close_reserved_stage(
+        _close_historical_reserved_stage(
             stage=stage,
             rows=staged,
             reservation=stage_reservation,
             reservation_scope=stage_reservation_scope,
             primary_error=primary_error,
+            custody=stage_custody,
+            evidence_started=evidence_started,
+            evidence_completed=evidence_completed,
         )
     if result is None:
         _fail("HISTORICAL_CELL_EXECUTION_TERMINAL_STATE_MISSING")

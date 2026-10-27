@@ -17,9 +17,11 @@ import shutil
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
+
+from pm_live_outcomes import LiveOutcomeError, RuntimeAccountIdentity
 
 
 _PROCESS_FILE_LOCK = threading.RLock()
@@ -281,15 +283,34 @@ class StorageManager:
         logger: Optional[logging.Logger] = None,
         active_servers: Optional[Sequence[str]] = None,
         active_symbols: Optional[Sequence[str]] = None,
+        runtime_identity: Optional[RuntimeAccountIdentity] = None,
     ) -> None:
         self.config = pipeline_config
+        if runtime_identity is not None and not isinstance(runtime_identity, RuntimeAccountIdentity):
+            raise LiveOutcomeError("storage runtime account identity is invalid")
+        self.runtime_identity = runtime_identity
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.log_dir = Path(log_dir)
+        if runtime_identity is not None:
+            config_path = str(getattr(self.config, "_deployment_config_path", "") or "").strip()
+            root = Path(config_path).resolve().parent if config_path else Path.cwd()
+            if not self.output_dir.is_absolute():
+                self.output_dir = root / self.output_dir
+            if not self.log_dir.is_absolute():
+                self.log_dir = root / self.log_dir
+            self.output_dir = self.output_dir / "production_live" / runtime_identity.namespace
+            self.log_dir = self.log_dir / "production_live" / runtime_identity.namespace
         self.logger = logger or logging.getLogger(__name__)
         state_filename = str(getattr(self.config, "state_filename", "storage_state.json") or "storage_state.json").strip()
         manifest_filename = str(getattr(self.config, "manifest_filename", "storage_manifest.jsonl") or "storage_manifest.jsonl").strip()
         ledger_filename = str(getattr(self.config, "ledger_filename", "signal_ledger.jsonl") or "signal_ledger.jsonl").strip()
+        if runtime_identity is not None and any(
+            not name or Path(name).name != name or name in {".", ".."}
+            or "/" in name or "\\" in name or ":" in name
+            for name in (state_filename, manifest_filename, ledger_filename)
+        ):
+            raise LiveOutcomeError("runtime storage filenames must stay in the account namespace")
         self.state_path = self.output_dir / state_filename
         self.manifest_path = self.output_dir / manifest_filename
         self._manifest_lock_path = self.manifest_path.with_name(
@@ -318,15 +339,30 @@ class StorageManager:
         self._state: Dict[str, Any] = self._load_state()
         self._last_pressure_level = str(self._state.get("pressure_level") or "normal").lower()
 
-    def record_actionable(self, record: Dict[str, Any], now: Optional[datetime] = None) -> None:
+    def record_actionable(
+        self, record: Dict[str, Any], now: Optional[datetime] = None,
+        *, required: bool = False,
+    ) -> None:
         if not isinstance(record, dict):
             return
+        if self.runtime_identity is not None:
+            if now is None:
+                now = datetime.now(timezone.utc)
+            record = dict(record)
+            identity = self.runtime_identity.to_dict()
+            if record.get("runtime_account_identity", identity) != identity:
+                raise LiveOutcomeError("signal ledger account namespace mismatch")
+            record["runtime_account_identity"] = identity
         action = str(record.get("action") or "").strip().upper()
         if not action or action.startswith("NO_ACTIONABLE"):
             return
         try:
-            self.signal_ledger.append(record, when=now)
+            path = self.signal_ledger.append(record, when=now)
+            if required and path is None:
+                raise RuntimeError("required signal ledger append unavailable")
         except Exception as exc:
+            if required:
+                raise
             self.logger.debug(f"Signal ledger append failed: {exc}")
 
     def _order_governance_bucket(self) -> Dict[str, Any]:
@@ -634,10 +670,16 @@ class StorageManager:
             with open(self.state_path, "r", encoding="utf-8") as handle:
                 payload = json.load(handle)
             if isinstance(payload, dict):
+                if self.runtime_identity is not None and payload.get("runtime_account_identity") != self.runtime_identity.to_dict():
+                    raise LiveOutcomeError("storage state account namespace mismatch")
                 return payload
+            if self.runtime_identity is not None:
+                raise LiveOutcomeError("runtime storage state is not an object")
         except FileNotFoundError:
             pass
         except Exception as exc:
+            if self.runtime_identity is not None:
+                raise LiveOutcomeError(f"runtime storage state load failed: {exc}") from exc
             self.logger.debug(f"Storage state load failed: {exc}")
         return {}
 
@@ -678,9 +720,13 @@ class StorageManager:
         try:
             now = _now()
             self._state["state_updated_at"] = now.isoformat()
+            if self.runtime_identity is not None:
+                self._state["runtime_account_identity"] = self.runtime_identity.to_dict()
             self._state["freshness"] = self._state_freshness_context(now)
             _atomic_write_json(self.state_path, self._state)
         except Exception as exc:
+            if self.runtime_identity is not None:
+                raise LiveOutcomeError(f"runtime storage state save failed: {exc}") from exc
             self.logger.debug(f"Storage state save failed: {exc}")
 
     # Non-terminal journal results may repeat every sweep in observe-only

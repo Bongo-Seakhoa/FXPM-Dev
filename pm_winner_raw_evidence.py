@@ -1677,6 +1677,45 @@ def _validated_partition_cost_precommitments(value: Any, *, pair: Mapping[str, A
     return json.loads(_canonical_bytes(dict(value)))
 
 
+@dataclass(frozen=True)
+class _PartitionCostIndex:
+    frozen: FrozenWinnerSearchPlan
+    partition_bytes: bytes
+    precommitments: Mapping[str, Any]
+    rows_by_fold: Mapping[tuple[int, int], list[Mapping[str, Any]]]
+
+
+def _index_partition_cost_precommitments(
+    frozen: FrozenWinnerSearchPlan, validated: Mapping[str, Any],
+) -> _PartitionCostIndex:
+    rows_by_fold: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+    for row in validated["rows"]:
+        rows_by_fold.setdefault((row["attempt_ordinal"], row["fold_ordinal"]), []).append(row)
+    return _PartitionCostIndex(
+        frozen, frozen.partition_cost_precommitments_bytes, validated, rows_by_fold)
+
+
+def _selected_partition_cost_precommitments(
+    *, frozen: FrozenWinnerSearchPlan, attempt: Mapping[str, Any], planned_fold: Mapping[str, Any],
+    partition_cost_index: Optional[_PartitionCostIndex] = None,
+) -> list[dict[str, Any]]:
+    if partition_cost_index is None:
+        precommitments = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
+            pair=frozen.frozen_tier_pair_contract, attempts=frozen.attempt_ledger["attempts"],
+            folds=frozen.precommitment["causal_fold_plan"])
+        rows = [row for row in precommitments["rows"] if row["attempt_ordinal"] == attempt["ordinal"]
+            and row["fold_ordinal"] == planned_fold["fold_ordinal"]]
+    else:
+        if (type(partition_cost_index) is not _PartitionCostIndex
+                or partition_cost_index.frozen is not frozen
+                or partition_cost_index.partition_bytes != frozen.partition_cost_precommitments_bytes):
+            _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
+        precommitments = partition_cost_index.precommitments
+        rows = partition_cost_index.rows_by_fold.get((attempt["ordinal"], planned_fold["fold_ordinal"]), [])
+    return [expand_partition_cost_precommitment(precommitments, row, pair=frozen.frozen_tier_pair_contract)
+            for row in rows]
+
+
 def _restored_frozen_context_identity(context_identity: Any) -> dict[str, str]:
     identity_fields = {"generation_id", "generation_context_sha256",
                        "native_universe_sha256", "config_sha256"}
@@ -4268,6 +4307,7 @@ def _validated_provenance(
     sink: Optional[SymbolAuthoritySink] = None,
     source_observation_entries: Optional[dict[str, dict[str, Any]]] = None,
     provenance_schemas: Optional[set[str]] = None,
+    partition_cost_index: Optional[_PartitionCostIndex] = None,
 ) -> dict[str, dict[str, Any]]:
     current = bool(frozen.frozen_tier_pair_contract_bytes)
     if not isinstance(raw, Mapping) or set(raw) != set(_PROVENANCE_KEYS):
@@ -4444,12 +4484,8 @@ def _validated_provenance(
                 or not isinstance(signals, Mapping) or set(signals) != set(_PARTITIONS)
                 or not isinstance(observation_receipts, Mapping) or set(observation_receipts) != set(_PARTITIONS)):
             _fail("ATTEMPT_REPLAY_PROVENANCE_SPLICE")
-        all_precommits = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
-            pair=frozen.frozen_tier_pair_contract, attempts=frozen.attempt_ledger["attempts"],
-            folds=frozen.precommitment["causal_fold_plan"])
-        selected = [expand_partition_cost_precommitment(all_precommits, row, pair=frozen.frozen_tier_pair_contract)
-            for row in all_precommits["rows"] if row["attempt_ordinal"] == attempt["ordinal"]
-            and row["fold_ordinal"] == planned_fold["fold_ordinal"]]
+        selected = _selected_partition_cost_precommitments(frozen=frozen, attempt=attempt,
+            planned_fold=planned_fold, partition_cost_index=partition_cost_index)
         if [row["partition"] for row in selected] != list(_PARTITIONS):
             _fail("PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID")
         raw_spec = receipts["oos_source_receipt"].get("execution_spec_receipt", {}).get("instrument_spec")
@@ -4579,6 +4615,7 @@ def _provenance_artifacts(
     raw: Any,
     source_observation_entries: Optional[dict[str, dict[str, Any]]] = None,
     provenance_schemas: Optional[set[str]] = None,
+    partition_cost_index: Optional[_PartitionCostIndex] = None,
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
     validated = _validated_provenance(
         frozen=frozen,
@@ -4593,6 +4630,7 @@ def _provenance_artifacts(
         sink=sink,
         source_observation_entries=source_observation_entries,
         provenance_schemas=provenance_schemas,
+        partition_cost_index=partition_cost_index,
     )
     hashes: dict[str, str] = {}
     entries: dict[str, dict[str, Any]] = {}
@@ -4751,6 +4789,7 @@ def _build_evaluated_fold(
     planned_fold: Mapping[str, Any], raw_fold: Mapping[str, Any],
     source_observation_entries: Optional[dict[str, dict[str, Any]]] = None,
     provenance_schemas: Optional[set[str]] = None,
+    partition_cost_index: Optional[_PartitionCostIndex] = None,
 ) -> tuple[_FoldOutcome, dict[str, dict[str, Any]]]:
     ordinal = planned_fold["fold_ordinal"]
     if (not isinstance(raw_fold, Mapping) or set(raw_fold) != {"fold_ordinal", "provenance", "lanes"}
@@ -4763,7 +4802,8 @@ def _build_evaluated_fold(
     hashes, provenance_entries, provenance = _provenance_artifacts(sink, prefix=prefix, frozen=frozen, attempt=attempt,
         attempt_artifacts=attempt_artifacts, cross_binding=cross_binding, cross_binding_context=cross_binding_context,
         cross_binding_attempt=cross_binding_attempt, planned_fold=planned_fold, lanes=lanes, raw=raw_fold["provenance"],
-        source_observation_entries=source_observation_entries, provenance_schemas=provenance_schemas)
+        source_observation_entries=source_observation_entries, provenance_schemas=provenance_schemas,
+        partition_cost_index=partition_cost_index)
     entries.update({"provenance-" + key: value for key, value in provenance_entries.items()})
     start = datetime.combine(_day(planned_fold["oos_start_date_utc"], "FOLD_START_INVALID"), datetime.min.time(), tzinfo=timezone.utc)
     end = datetime.combine(_day(planned_fold["oos_end_date_utc"], "FOLD_END_INVALID") + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
@@ -5384,6 +5424,7 @@ def _produce_winner_raw_evidence(
             or receipt.get("precommitment_sha256") != _sha_json(precommitment)
             or receipt.get("attempt_ledger_sha256") != _sha_json(attempt_ledger)):
         _fail("FROZEN_PARTITION_COST_BINDING_INVALID")
+    partition_cost_index = _index_partition_cost_precommitments(frozen, partition_precommits)
     attempt_bundles = _verified_frozen_attempt_bundle(frozen=frozen, attempt_ledger=attempt_ledger, frozen_receipt=receipt)
     receipt = _reopen_current_frozen_plan_artifacts(sink, frozen=frozen, precommitment=precommitment,
         attempt_ledger=attempt_ledger, source_seeds=source_seeds, pair_contract=pair_contract,
@@ -5492,6 +5533,7 @@ def _produce_winner_raw_evidence(
                     raw_fold=raw_fold,
                     source_observation_entries=source_observation_entries,
                     provenance_schemas=provenance_schemas,
+                    partition_cost_index=partition_cost_index,
                 )
             except WinnerRawEvidenceIncomplete:
                 raise

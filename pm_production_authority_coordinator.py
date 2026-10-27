@@ -92,6 +92,18 @@ class ProductionAuthorityBlocked(RuntimeError):
         super().__init__(f"{self.code}{suffix}")
 
 
+class ProductionAuthorityNotQualified(RuntimeError):
+    def __init__(self, disposition: Any) -> None:
+        import pm_causal_evidence_producer as causal_producer
+
+        if type(disposition) is not causal_producer.DeclaredCellIntervalDisposition:
+            raise ProductionAuthorityBlocked("DECLARED_CELL_DISPOSITION_INVALID")
+        self.disposition = disposition
+        self.code = disposition.status
+        self.details = (disposition.reason_code,)
+        super().__init__(f"{self.code}:{disposition.reason_code}")
+
+
 @dataclass(frozen=True, slots=True)
 class HistoricalEvidenceRequest:
     _body: bytes
@@ -1944,10 +1956,11 @@ def _sample_post_current_validation_time() -> str:
 
 def coordinate_production_authority(
     *,
-    historical_inputs: HistoricalAuthorityInputs,
-    current_refit_factory: CurrentRefitProducer,
-    capital_factory: CapitalAuthorityFactory,
-    assembly_inputs: AssemblyInputs,
+    historical_inputs: HistoricalAuthorityInputs | None = None,
+    current_refit_factory: CurrentRefitProducer | None = None,
+    capital_factory: CapitalAuthorityFactory | None = None,
+    assembly_inputs: AssemblyInputs | None = None,
+    declared_account_inputs: Any = None,
 ) -> ProductionAuthorityRun:
     """Recompute the full chain and publish a verified pre-CAS assembly.
 
@@ -1955,6 +1968,19 @@ def coordinate_production_authority(
     returned directory contains ``authority_assembly.json``, seven authority
     indexes, and a chain receipt; it is not an active ledger generation.
     """
+
+    if declared_account_inputs is not None:
+        if any(value is not None for value in (
+                historical_inputs, current_refit_factory, capital_factory, assembly_inputs)):
+            raise ProductionAuthorityBlocked("DECLARED_CELL_AUTHORITY_INPUTS_AMBIGUOUS")
+        import pm_causal_evidence_producer as causal_producer
+
+        try:
+            disposition = causal_producer.evaluate_declared_cell_interval_admission(
+                declared_account_inputs)
+        except causal_producer.CausalEvidenceProductionError as exc:
+            raise ProductionAuthorityBlocked(exc.code) from exc
+        raise ProductionAuthorityNotQualified(disposition)
 
     if type(assembly_inputs) is not AssemblyInputs:
         raise ProductionAuthorityBlocked("ASSEMBLY_INPUTS_INVALID")
@@ -2176,6 +2202,7 @@ __all__ = [
     "HistoricalAuthorityInputs",
     "PortfolioEvidenceRequest",
     "ProductionAuthorityBlocked",
+    "ProductionAuthorityNotQualified",
     "ProductionAuthorityRun",
     "coordinate_production_authority",
     "derive_current_capital_lineage",

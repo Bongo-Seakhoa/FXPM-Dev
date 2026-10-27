@@ -106,6 +106,23 @@ class AuthoritySpoolError(ValueError):
     """Fail-closed spool error."""
 
 
+def is_resource_capacity_error(error: BaseException) -> bool:
+    """Recognize only the preserved typed disk-reserve failure, without I/O."""
+    current = error
+    seen = set()
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, spool_quota.AuthoritySpoolQuotaError):
+            return current.code == "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED"
+        cause = current.__cause__
+        if isinstance(current, AuthoritySpoolError):
+            if (not isinstance(cause, spool_quota.AuthoritySpoolQuotaError)
+                    or str(current) != str(cause)):
+                return False
+        current = cause
+    return False
+
+
 @dataclass(frozen=True)
 class SpoolLimits:
     max_artifact_bytes: int = 64 * 1024**3
@@ -1407,6 +1424,7 @@ __all__ = [
     "SpoolLimits",
     "SymbolAuthoritySink",
     "freeze_generation_context",
+    "is_resource_capacity_error",
     "open_symbol_sink",
     "reopen_generation_context",
     "reserve_transient_publication",

@@ -3137,6 +3137,283 @@ def _declared_json(value: Any) -> bytes:
                       separators=(",", ":")).encode("ascii")
 
 
+DECLARED_SLOT_SOURCE_ACCESS_RENEWAL_SCHEMA = "fxpm.declared-slot-source-access-renewal.v1"
+_DECLARED_RENEWAL_MAX_BYTES = 16 * 1024
+_DECLARED_RENEWAL_AUTHORITY_REF = "E-00003232"
+
+
+@dataclass(frozen=True, repr=False)
+class DeclaredSlotSourceAccessRenewal:
+    _body_json: bytes
+    _seal: object
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self._body_json.decode("ascii"))
+
+    @property
+    def receipt_sha256(self) -> str:
+        return hashlib.sha256(self._body_json).hexdigest()
+
+
+def _declared_renewal_directory(precommit):
+    return f"declared-slots/{precommit.receipt_sha256}/source-access-renewal"
+
+
+def _declared_renewal_precommit(context, precommit, receipt_sha256):
+    if (precommit is None) == (receipt_sha256 is None):
+        _fail("DECLARED_SLOT_RENEWAL_PRECOMMIT_INPUTS_INVALID")
+    if receipt_sha256 is None:
+        return precommit
+    digest = _hex(receipt_sha256, "DECLARED_SLOT_RENEWAL_PRECOMMIT_INVALID")
+    try:
+        observed, _, encoded = authority_spool._stream_file(context.root,
+            f"declared-slots/{digest}/precommit.json", maximum_bytes=_MAX_PRECOMMIT_BYTES, collect=True)
+        body = authority_spool._strict_json_bytes(encoded, _MAX_PRECOMMIT_BYTES)
+    except (OSError, authority_spool.AuthoritySpoolError) as exc:
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_RENEWAL_PRECOMMIT_INVALID") from exc
+    if observed != digest or _declared_json(body) != encoded:
+        _fail("DECLARED_SLOT_RENEWAL_PRECOMMIT_INVALID")
+    result = DeclaredSlotRunPrecommit(encoded, _DECLARED_SLOT_SEAL)
+    _register_declared_precommit(result, context)
+    return result
+
+
+def _declared_renewal_parent(context, precommit, process=None):
+    if type(precommit) is not DeclaredSlotRunPrecommit or precommit._seal is not _DECLARED_SLOT_SEAL:
+        _fail("DECLARED_SLOT_RENEWAL_PRECOMMIT_INVALID")
+    _verify_declared_precommit_identity(precommit, context)
+    parent = precommit.to_dict()
+    _validate_declared_precommit_body(context, parent)
+    _verify_declared_issued_bytes(context,
+        f"declared-slots/{precommit.receipt_sha256}/precommit.json", precommit._body_json)
+    if (parent["schema_version"] != DECLARED_SLOT_PRECOMMIT_SCHEMA_V2
+            or _declared_json(parent) != precommit._body_json
+            or any(parent.get(key) != getattr(context, attr) for key, attr in (
+                ("generation_id", "generation_id"),
+                ("generation_context_sha256", "context_sha256"),
+                ("native_universe_sha256", "native_universe_sha256"),
+                ("config_sha256", "config_sha256")))
+            or parent["slot_roster_sha256"] != hashlib.sha256(_declared_json(parent["slot_roster"])).hexdigest()
+            or any(parent[key] is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_SLOT_RENEWAL_PRECOMMIT_INVALID")
+    if process is not None:
+        import pm_production_search_planner as planner
+        planner.verify_frozen_production_search_process(context, process)
+        planner._require_current_process(process)
+        if parent["search_process_receipt_sha256"] != process.receipt_sha256:
+            _fail("DECLARED_SLOT_PROCESS_BINDING_MISMATCH")
+    return parent
+
+
+def _declared_renewal_first_commit(context, precommit, parent):
+    import pm_historical_search_producer as producer
+
+    cell, slot = parent["cells"][0], parent["slot_roster"]["slots"][0]
+    item = producer._read_declared_commit(context,
+        producer._declared_commit_path(precommit, cell["cell_id"], 1))
+    if item is None:
+        _fail("DECLARED_SLOT_RENEWAL_PREFIX_INVALID")
+    body, digest, _ = item
+    fields = {"schema_version", "precommit_sha256", "generation_context_sha256",
+        "cell_id", "slot_id", "ordinal", "previous_commit_sha256", "completion", "artifact_roster"}
+    if (type(body) is not dict or set(body) != fields
+            or body["schema_version"] != producer.DECLARED_SLOT_COMMIT_SCHEMA
+            or body["precommit_sha256"] != precommit.receipt_sha256
+            or body["generation_context_sha256"] != context.context_sha256
+            or body["cell_id"] != cell["cell_id"] or body["slot_id"] != slot["slot_id"]
+            or type(body["ordinal"]) is not int or body["ordinal"] != 1
+            or body["previous_commit_sha256"] is not None
+            or type(body["completion"]) is not dict or type(body["artifact_roster"]) is not list):
+        _fail("DECLARED_SLOT_RENEWAL_PREFIX_INVALID")
+    completion = body["completion"]
+    request = completion.get("request_body")
+    if (completion.get("status") not in ("OWNER", "NO_TRADE") or type(request) is not dict
+            or completion.get("precommit_sha256") != precommit.receipt_sha256
+            or completion.get("cell_id") != cell["cell_id"] or completion.get("slot_id") != slot["slot_id"]
+            or completion.get("request_sha256") != hashlib.sha256(_declared_json(request)).hexdigest()
+            or request.get("precommit_sha256") != precommit.receipt_sha256
+            or request.get("generation_context_sha256") != context.context_sha256
+            or request.get("search_process_receipt_sha256") != parent["search_process_receipt_sha256"]
+            or request.get("config_sha256") != parent["config_sha256"]
+            or request.get("effective_config_sha256") != parent["effective_config_sha256"]
+            or request.get("cell_id") != cell["cell_id"] or request.get("slot_id") != slot["slot_id"]
+            or request.get("source_access_window_utc") != parent["source_access_window_utc"]
+            or request.get("spread_profile_identity") != parent["spread_profile_identity"]
+            or "source_access_renewal_sha256" in request
+            or any(completion.get(key) is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_SLOT_RENEWAL_PREFIX_INVALID")
+    _verify_declared_issued_bytes(context, _declared_request_path(request), _declared_json(request))
+    return digest
+
+
+def _validate_declared_source_access_renewal(context, precommit, parent, body, live_source):
+    fields = {"schema_version", "precommit_sha256", "generation_context_sha256", "cell_id",
+        "commit01_body_sha256", "old_source_access_window_utc", "source_access_window_utc",
+        "original_source_identity", "renewed_source_identity", "authority_ref", "issued_at_utc",
+        "qualification_authority", "capital_authority", "live_authority", "order_authority"}
+    if type(body) is not dict or set(body) != fields:
+        _fail("DECLARED_SLOT_RENEWAL_INVALID")
+    if (body["schema_version"] != DECLARED_SLOT_SOURCE_ACCESS_RENEWAL_SCHEMA
+            or parent["schema_version"] != DECLARED_SLOT_PRECOMMIT_SCHEMA_V2
+            or body["precommit_sha256"] != precommit.receipt_sha256
+            or body["generation_context_sha256"] != context.context_sha256
+            or body["cell_id"] != parent["cells"][0]["cell_id"]
+            or body["authority_ref"] != _DECLARED_RENEWAL_AUTHORITY_REF
+            or body["old_source_access_window_utc"] != parent["source_access_window_utc"]
+            or body["original_source_identity"] != parent["source_identity"]
+            or body["renewed_source_identity"] != live_source
+            or any(body[key] is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_SLOT_RENEWAL_BINDING_MISMATCH")
+    for identity in (body["original_source_identity"], body["renewed_source_identity"]):
+        if type(identity) is not dict or set(identity) != set(_DECLARED_SOURCE_FILES):
+            _fail("DECLARED_SLOT_RENEWAL_SOURCE_INVALID")
+        for digest in identity.values():
+            _hex(digest, "DECLARED_SLOT_RENEWAL_SOURCE_INVALID")
+    changed = [name for name in _DECLARED_SOURCE_FILES
+               if body["original_source_identity"][name] != body["renewed_source_identity"][name]]
+    if changed != ["pm_historical_anchor_orchestration.py"]:
+        _fail("DECLARED_SLOT_RENEWAL_SOURCE_INVALID")
+    window = body["source_access_window_utc"]
+    if type(window) is not dict or set(window) != {"start_utc", "end_exclusive_utc"}:
+        _fail("DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    start = _utc(window["start_utc"], "DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    end = _utc(window["end_exclusive_utc"], "DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    issued = _utc(body["issued_at_utc"], "DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    old_start = _utc(parent["source_access_window_utc"]["start_utc"],
+        "DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    old_end = _utc(parent["source_access_window_utc"]["end_exclusive_utc"],
+        "DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    if not max(old_start, issued) <= start < end or end <= max(old_end, issued):
+        _fail("DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    _hex(body["commit01_body_sha256"], "DECLARED_SLOT_RENEWAL_PREFIX_INVALID")
+    if body["commit01_body_sha256"] != _declared_renewal_first_commit(context, precommit, parent):
+        _fail("DECLARED_SLOT_RENEWAL_PREFIX_INVALID")
+
+
+def _read_declared_slot_source_access_renewal(context, precommit, parent, live_source=None):
+    relative_dir = _declared_renewal_directory(precommit)
+    directory = authority_spool._local_path(context.root, relative_dir)
+    try:
+        authority_spool._reject_reparse_chain(directory)
+        entries = tuple(directory.iterdir())
+    except FileNotFoundError:
+        return None
+    except (OSError, authority_spool.AuthoritySpoolError) as exc:
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_RENEWAL_INVALID") from exc
+    if len(entries) != 1:
+        _fail("DECLARED_SLOT_RENEWAL_MIXED_OR_PARTIAL")
+    path = entries[0]
+    if path.suffix != ".json" or _HEX64.fullmatch(path.stem) is None:
+        _fail("DECLARED_SLOT_RENEWAL_INVALID")
+    try:
+        authority_spool._reject_reparse_chain(path)
+        if not path.is_file():
+            _fail("DECLARED_SLOT_RENEWAL_INVALID")
+        digest, _, encoded = authority_spool._stream_file(context.root,
+            relative_dir + "/" + path.name, maximum_bytes=_DECLARED_RENEWAL_MAX_BYTES, collect=True)
+        body = authority_spool._strict_json_bytes(encoded, _DECLARED_RENEWAL_MAX_BYTES)
+    except (OSError, authority_spool.AuthoritySpoolError) as exc:
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_RENEWAL_INVALID") from exc
+    if digest != path.stem or _declared_json(body) != encoded:
+        _fail("DECLARED_SLOT_RENEWAL_INVALID")
+    _validate_declared_source_access_renewal(context, precommit, parent, body,
+        _declared_source_identity() if live_source is None else live_source)
+    return DeclaredSlotSourceAccessRenewal(encoded, _DECLARED_SLOT_SEAL)
+
+
+def verify_declared_slot_source_access_renewal(context, *, precommit, process=None):
+    """Reopen the one immutable renewal without checking a current access clock."""
+    parent = _declared_renewal_parent(context, precommit, process)
+    renewal = _read_declared_slot_source_access_renewal(context, precommit, parent)
+    if renewal is None:
+        _fail("DECLARED_SLOT_RENEWAL_MISSING")
+    return renewal
+
+
+def issue_declared_slot_source_access_renewal(context, *, precommit=None,
+        precommit_receipt_sha256=None, process, frozen_pipeline_config,
+        source_access_window_utc, authority_ref=_DECLARED_RENEWAL_AUTHORITY_REF):
+    """Bind one verified prefix to a new access window; never execute its suffix."""
+    if type(context) is not authority_spool.GenerationSpoolContext or context.writable is not True:
+        _fail("DECLARED_SLOT_RENEWAL_READ_ONLY")
+    precommit = _declared_renewal_precommit(context, precommit, precommit_receipt_sha256)
+    parent = _declared_renewal_parent(context, precommit, process)
+    import pm_production_config_binding as config_binding
+    import pm_historical_search_producer as producer
+    import pm_spread_profile as spread_profile
+
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    config = frozen_pipeline_config.materialize(context)
+    if (frozen_pipeline_config.config_sha256 != parent["config_sha256"]
+            or frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]
+            or config.discovery_risk_per_trade_pct != 1.0):
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    profile = spread_profile.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
+    if profile.sha256 != parent["spread_profile_identity"]["profile_sha256"]:
+        _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    cell_id = parent["cells"][0]["cell_id"]
+    for slot in parent["slot_roster"]["slots"][1:]:
+        if authority_spool._local_path(context.root,
+                producer._declared_commit_path(precommit, cell_id, slot["ordinal"])).exists():
+            _fail("DECLARED_SLOT_RENEWAL_PREFIX_INVALID")
+    for relative_path in (producer._declared_terminal_path(precommit, cell_id),
+                          producer._declared_run_path(precommit, cell_id)):
+        if authority_spool._local_path(context.root, relative_path).exists():
+            _fail("DECLARED_SLOT_RENEWAL_PREFIX_INVALID")
+    if (type(source_access_window_utc) is not dict
+            or set(source_access_window_utc) != {"start_utc", "end_exclusive_utc"}):
+        _fail("DECLARED_SLOT_RENEWAL_WINDOW_INVALID")
+    body = {"schema_version": DECLARED_SLOT_SOURCE_ACCESS_RENEWAL_SCHEMA,
+        "precommit_sha256": precommit.receipt_sha256,
+        "generation_context_sha256": context.context_sha256, "cell_id": cell_id,
+        "commit01_body_sha256": _declared_renewal_first_commit(context, precommit, parent),
+        "old_source_access_window_utc": parent["source_access_window_utc"],
+        "source_access_window_utc": dict(source_access_window_utc),
+        "original_source_identity": parent["source_identity"],
+        "renewed_source_identity": _declared_source_identity(),
+        "authority_ref": authority_ref, "issued_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False}
+    _validate_declared_source_access_renewal(context, precommit, parent, body, body["renewed_source_identity"])
+    encoded = _declared_json(body)
+    if len(encoded) > _DECLARED_RENEWAL_MAX_BYTES:
+        _fail("DECLARED_SLOT_RENEWAL_INVALID")
+    relative_dir = _declared_renewal_directory(precommit)
+    directory = authority_spool._local_path(context.root, relative_dir)
+    try:
+        authority_spool._reject_reparse_chain(directory)
+        directory.mkdir(mode=0o700)
+    except FileExistsError as exc:
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_RENEWAL_ALREADY_ISSUED") from exc
+    except (OSError, authority_spool.AuthoritySpoolError) as exc:
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_RENEWAL_PUBLICATION_FAILED") from exc
+    digest = hashlib.sha256(encoded).hexdigest()
+    try:
+        authority_spool._publish_exact_json(context, relative_dir + "/" + digest + ".json",
+            body, _DECLARED_RENEWAL_MAX_BYTES)
+    except (OSError, authority_spool.AuthoritySpoolError) as exc:
+        try:
+            authority_spool._reject_reparse_chain(directory)
+            directory.rmdir()
+        except (OSError, authority_spool.AuthoritySpoolError):
+            pass
+        raise HistoricalAnchorOrchestrationError("DECLARED_SLOT_RENEWAL_PUBLICATION_FAILED") from exc
+    return verify_declared_slot_source_access_renewal(context, precommit=precommit, process=process)
+
+
+def _declared_slot_effective_access(context, precommit, parent, slot):
+    if slot["ordinal"] == 1:
+        return parent["source_access_window_utc"], None
+    renewal = _read_declared_slot_source_access_renewal(context, precommit, parent)
+    if renewal is None:
+        return parent["source_access_window_utc"], None
+    return renewal.to_dict()["source_access_window_utc"], renewal.receipt_sha256
+
+
 def declared_slot_transport_edition(body: Mapping[str, Any]) -> str:
     """Decode a declared edition; this does not authenticate the supplied body."""
     if type(body) is not dict:
@@ -3283,7 +3560,10 @@ def verify_declared_slot_owner_run_precommit(context, precommit, *, process=None
     _verify_declared_issued_bytes(context, f"declared-slots/{precommit.receipt_sha256}/precommit.json", precommit._body_json)
     source_identity = _declared_source_identity()
     original_source = False
-    if body.get("source_identity") != source_identity:
+    renewal = _read_declared_slot_source_access_renewal(context, precommit, body, source_identity)
+    if renewal is not None:
+        source_identity = renewal.to_dict()["original_source_identity"]
+    elif body.get("source_identity") != source_identity:
         from pm_current_refit_parameters import load_retained_strategy_domain_v1
         retained_source = load_retained_strategy_domain_v1()["declared_source_identity"]
         if body.get("source_identity") == retained_source:
@@ -3322,6 +3602,7 @@ def declared_slot_producer_request(context, *, precommit, process, cell_id, slot
     if len(matches) != 1 or len(slots) != 1:
         _fail("DECLARED_SLOT_CELL_INVALID" if len(matches) != 1 else "DECLARED_SLOT_SLOT_INVALID")
     cell, slot = matches[0], slots[0]
+    access_window, renewal_sha256 = _declared_slot_effective_access(context, precommit, body, slot)
     _safe_id(attempt_id, "DECLARED_SLOT_REQUEST_INVALID")
     if (type(sink) is not authority_spool.SymbolAuthoritySink or sink.context is not context
             or sink.symbol != cell["symbol"]):
@@ -3341,11 +3622,13 @@ def declared_slot_producer_request(context, *, precommit, process, cell_id, slot
         "cell_id": cell_id, "slot_id": slot_id, "cell": cell, **{k:cell[k] for k in ("symbol", "timeframe", "regime")},
         "attempt_id": attempt_id, "anchor": anchor,
         "artifact_namespace": f"declared-slot/{body['run_id']}/{cell_id}/{slot_id}/{attempt_id}",
-        "source_access_window_utc": body["source_access_window_utc"],
+        "source_access_window_utc": access_window,
         "spread_profile_identity": body["spread_profile_identity"],
         "confers_causal_or_current_authority": False}
     if edition == DECLARED_WINNER_TRANSPORT_V16:
         request_body["winner_transport_edition"] = edition
+    if renewal_sha256 is not None:
+        request_body["source_access_renewal_sha256"] = renewal_sha256
     result = DeclaredSlotProducerRequest(_declared_json(request_body), precommit, sink, _DECLARED_SLOT_SEAL)
     authority_spool._publish_exact_json(context, _declared_request_path(request_body), request_body, _MAX_PRECOMMIT_BYTES)
     _register_declared_request(result, context, live=True)
@@ -3364,12 +3647,17 @@ def verify_declared_slot_producer_request(context, request, *, precommit=None, p
     fields = {"schema_version", "precommit_sha256", "run_id", "generation_context_sha256", "config_sha256", "effective_config_sha256", "search_process_receipt_sha256", "process_precommit_receipt_sha256", "cell_id", "slot_id", "cell", "symbol", "timeframe", "regime", "attempt_id", "anchor", "artifact_namespace", "source_access_window_utc", "spread_profile_identity", "confers_causal_or_current_authority"}
     if edition == DECLARED_WINNER_TRANSPORT_V16:
         fields.add("winner_transport_edition")
+    if "source_access_renewal_sha256" in body:
+        fields.add("source_access_renewal_sha256")
     if set(body) != fields:
         _fail("DECLARED_SLOT_REQUEST_INVALID")
     if declared_slot_transport_edition(body) != edition:
         _fail("DECLARED_SLOT_REQUEST_BINDING_MISMATCH")
     cell = next((x for x in parent["cells"] if x["cell_id"] == body.get("cell_id")), None)
     slot = next((x for x in parent["slot_roster"]["slots"] if x["slot_id"] == body.get("slot_id")), None)
+    if cell is None or slot is None:
+        _fail("DECLARED_SLOT_REQUEST_BINDING_MISMATCH")
+    access_window, renewal_sha256 = _declared_slot_effective_access(context, committed, parent, slot)
     if (cell is None or slot is None or _declared_json(body) != request._body_json
             or body.get("schema_version") != (DECLARED_SLOT_REQUEST_SCHEMA_V2
                 if edition == DECLARED_WINNER_TRANSPORT_V16 else DECLARED_SLOT_REQUEST_SCHEMA)
@@ -3384,7 +3672,9 @@ def verify_declared_slot_producer_request(context, request, *, precommit=None, p
             or body.get("anchor") != {"anchor_id": slot["slot_id"], "ordinal": slot["ordinal"],
                 "selection_cutoff_utc": slot["native_cutoff_utc"], "forward_start_utc": slot["activation_utc"],
                 "forward_end_exclusive_utc": slot["end_exclusive_utc"], "process_precommit_receipt_sha256": committed.receipt_sha256}
-            or body.get("source_access_window_utc") != parent["source_access_window_utc"]
+            or body.get("source_access_window_utc") != access_window
+            or ("source_access_renewal_sha256" in body) != (renewal_sha256 is not None)
+            or body.get("source_access_renewal_sha256") != renewal_sha256
             or body.get("spread_profile_identity") != parent["spread_profile_identity"]
             or body.get("artifact_namespace") != f"declared-slot/{parent['run_id']}/{cell['cell_id']}/{slot['slot_id']}/{body.get('attempt_id')}"
             or body.get("confers_causal_or_current_authority") is not False
@@ -3403,7 +3693,9 @@ __all__ += ["DeclaredSlotRunPrecommit", "DeclaredSlotProducerRequest",
     "declared_slot_transport_edition", "precommit_declared_slot_owner_run_v2",
     "declared_slot_owner_id", "precommit_declared_slot_owner_run",
     "verify_declared_slot_owner_run_precommit", "declared_slot_producer_request",
-    "verify_declared_slot_producer_request"]
+    "verify_declared_slot_producer_request", "DeclaredSlotSourceAccessRenewal",
+    "DECLARED_SLOT_SOURCE_ACCESS_RENEWAL_SCHEMA", "issue_declared_slot_source_access_renewal",
+    "verify_declared_slot_source_access_renewal"]
 
 
 def _declared_request_path(body):

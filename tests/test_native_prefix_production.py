@@ -35,8 +35,7 @@ ACTIVATION_ID = "native-activation-prefix-test"
 SOURCE_ACCESSED = "2026-01-10T00:00:00Z"
 
 
-def _sha(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
+from prototype_support import (_sha, _write_json, _execution_config)
 
 
 def _canonical(value: object) -> bytes:
@@ -82,11 +81,6 @@ def _iso(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _write_json(path: Path, value: object) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    path.write_bytes(raw)
-    return _sha(raw)
 
 
 def _write_activation(
@@ -1144,45 +1138,6 @@ def test_open_frame_binding_drives_backtester_terms_overlay(tmp_path, monkeypatc
         backtester._resolve_broker_swap_projection(hostile, spec, "M5")
 
 
-def _execution_config(
-    tmp_path: Path,
-    *,
-    symbol: str = SYMBOL,
-    tick_size: float = 0.00001,
-    broker_overrides: dict[str, object] | None = None,
-) -> Path:
-    broker = {
-        symbol: {
-            "symbol": symbol,
-            "broker_symbol": symbol,
-            "asset_class": "fx",
-            "path": f"Forex\\Main\\{symbol}",
-            "digits": 5,
-            "point": 0.00001,
-            "tick_size": tick_size,
-            "tick_value": 1.25,
-            "contract_size": 100_000.0,
-            "volume_min": 0.01,
-            "volume_max": 500.0,
-            "volume_step": 0.01,
-            "spread": 25,
-            "swap_long": -3.0,
-            "swap_short": 1.0,
-            "swap_mode": 1,
-            "swap_rollover3days": 3,
-            "stops_level": 0,
-            "pip_size": 0.0001,
-        }
-    }
-    broker[symbol].update(broker_overrides or {})
-    _write_json(tmp_path / "broker_specs.json", broker)
-    config = {
-        "_meta": {"scope": "funded_live_v1"},
-        "broker_specs_path": "broker_specs.json",
-    }
-    path = tmp_path / "config.json"
-    _write_json(path, config)
-    return path
 
 
 def test_execution_spec_is_derived_from_frozen_native_config_and_broker_bytes(

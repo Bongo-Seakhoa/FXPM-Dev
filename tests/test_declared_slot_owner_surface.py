@@ -18,9 +18,7 @@ import pm_production_anchor_plan as anchor_plan
 import pm_production_search_planner as planner
 
 
-CELL_ID = "8a8d94e173d45705d415b48e6cafe39d068988884ad769401534cf19868fed38"
-LAUNCH = "2023-03-05T00:01:00Z"
-PROTECTED_END = "2024-07-14T08:05:00Z"
+from prototype_support import (CELL_ID, LAUNCH, PROTECTED_END, _roster_arguments, _DeclaredClock, _declared_environment)
 PROCESS_SHA = "2" * 64
 WINNER_SHA = "1" * 64  # Invented mathematical value, never Winner evidence.
 SLOT_IDS = (
@@ -40,20 +38,6 @@ SLOT_DATES = (
 )
 
 
-def _roster_arguments(config_sha="a" * 64, effective_sha="b" * 64):
-    return {
-        "launch_activation_utc": LAUNCH,
-        "frozen_refit_clock": {
-            "anchor_activation_utc": "2026-03-29T00:01:00Z",
-            "interval_calendar_days": 28,
-        },
-        "config_identity_refs": {
-            "config_sha256": config_sha,
-            "effective_config_sha256": effective_sha,
-        },
-        "extend_frozen_clock_backward": True,
-        "protected_end_exclusive_utc": PROTECTED_END,
-    }
 
 
 def _canonical(value):
@@ -156,68 +140,8 @@ def test_real_executor_preserves_actual_process_receipt_early_refusal(monkeypatc
     assert request._body_json == original_request_bytes
 
 
-class _DeclaredClock(datetime):
-    value = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
-
-    @classmethod
-    def now(cls, tz=None):
-        assert tz is timezone.utc
-        return cls.value
 
 
-def _declared_environment(tmp_path, monkeypatch, *, candidate_risk=1.0, issue=True, native_snapshot=None):
-    """Real metadata issuers on invented config; no native bars or Winner."""
-    import pm_production_config_binding as binding
-    import pm_authority_spool as spool
-    from test_production_config_binding import _context, _payload, _write
-
-    payload = _payload(tmp_path)
-    payload["symbols"] = ["AUDUSD"]
-    payload["pipeline"].update(
-        research_mode=True, initial_capital=10000.0,
-        discovery_risk_per_trade_pct=candidate_risk, risk_per_trade_pct=0.25,
-    )
-    path = tmp_path / "declared-synthetic-config.json"
-    _write(path, payload)
-    owned, effective = binding.load_effective_pipeline_config(path)
-    if native_snapshot is None:
-        context = _context(tmp_path, payload)
-    else:
-        import pm_portfolio_replay as portfolio_replay
-        context = spool.freeze_generation_context(
-            (tmp_path / "spool").resolve(), generation_id="production-config-binding-test",
-            native_universe_sha256=portfolio_replay.canonical_json_sha256(native_snapshot),
-            config_sha256=portfolio_replay.canonical_json_sha256(payload),
-        )
-    frozen = binding.freeze_production_pipeline_config(
-        context, active_config_path=path, config_payload=owned,
-        supplied_config=effective,
-    )
-    run_id = "declared-slot-qa-run"
-    process = planner.freeze_production_search_process(context, run_id=run_id)
-    roster = anchor_plan.derive_declared_owner_slot_roster(**_roster_arguments(
-        context.config_sha256, frozen.effective_config_sha256,
-    ))
-    monkeypatch.setattr(_DeclaredClock, "value", datetime(2026, 10, 22, 12, tzinfo=timezone.utc))
-    monkeypatch.setattr(orchestration, "datetime", _DeclaredClock)
-    monkeypatch.setattr(producer, "datetime", _DeclaredClock)
-    arguments = {
-        "run_id": run_id, "process": process, "slot_roster": roster,
-        "launch_activation_utc": LAUNCH,
-        "cell_roster": [{"cell_id": CELL_ID, "symbol": "AUDUSD", "timeframe": "H1", "regime": "TREND"}],
-        "frozen_pipeline_config": frozen,
-        "spread_profile_identity": {"profile_sha256": "e" * 64},
-        "source_access_window_utc": {
-            "start_utc": "2026-10-22T11:00:00Z",
-            "end_exclusive_utc": "2026-10-22T13:00:00Z",
-        },
-    }
-    precommit = orchestration.precommit_declared_slot_owner_run(context, **arguments) if issue else None
-    return SimpleNamespace(
-        context=context, process=process, frozen=frozen, roster=roster,
-        precommit=precommit, arguments=arguments, config_path=path,
-        sink=spool.open_symbol_sink(context, "AUDUSD"),
-    )
 
 
 @pytest.fixture
