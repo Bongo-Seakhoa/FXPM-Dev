@@ -19,6 +19,7 @@ import re
 import shutil
 import sys
 import time
+import traceback
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -182,6 +183,24 @@ def _iso_now(now: Optional[datetime] = None) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _audit_progress_marker(event: str, *, ordinal: int, total: int, symbol: str) -> None:
+    print(
+        json.dumps(
+            {
+                "schema_version": "fxpm.native-audit-progress.v1",
+                "at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "event": event,
+                "symbol_ordinal": ordinal,
+                "symbol_count": total,
+                "symbol": symbol,
+            },
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _json(path: Path) -> Dict[str, Any]:
@@ -2908,15 +2927,29 @@ def _v5_authenticated_tolerance(source: Mapping[str, Any]) -> Optional[float]:
     return value if math.isfinite(value) and value > 0.0 else None
 
 
+def _v5_log_frame_failure(reason: str, path: Any, *, include_traceback: bool = False) -> None:
+    """Best-effort stderr diagnostics; never alter the existing loader result."""
+    try:
+        print(f"NATIVE_FRAME_REOPEN:{reason}:{path}", file=sys.stderr, flush=True)
+        if include_traceback:
+            traceback.print_exc(file=sys.stderr)
+            sys.stderr.flush()
+    except Exception:
+        pass
+
+
 def _v5_load_frame(source: Mapping[str, Any]) -> Optional[pd.DataFrame]:
     path = source.get("bars_path")
     if str(source.get("availability_class") or "") != "success":
+        _v5_log_frame_failure("AVAILABILITY_GUARD_REFUSED", path)
         return None
     if not isinstance(path, Path) or not path.is_file():
+        _v5_log_frame_failure("PATH_GUARD_REFUSED", path)
         return None
     try:
         return _read_bars(path)
     except Exception:
+        _v5_log_frame_failure("READER_EXCEPTION", path, include_traceback=True)
         return None
 
 
@@ -4091,7 +4124,7 @@ def audit_and_activate(
         )
         for symbol in canonical_symbols
     }
-    for symbol in canonical_symbols:
+    for symbol_ordinal, symbol in enumerate(canonical_symbols, 1):
         entries[symbol] = {}
         audited_sufficiency_cells[symbol] = {}
         availability = availability_decisions[symbol]
@@ -4099,6 +4132,9 @@ def audit_and_activate(
         if availability_status == "invalid":
             activation_blocking_statuses.append("FAIL")
         if v5_consensus_mode:
+            _audit_progress_marker(
+                "START", ordinal=symbol_ordinal, total=len(canonical_symbols), symbol=symbol
+            )
             (
                 entries[symbol],
                 audited_sufficiency_cells[symbol],
@@ -4125,6 +4161,9 @@ def audit_and_activate(
             )
             activation_blocking_statuses.extend(v5_blocking)
             declared_coverage_methods.add(NATIVE_SESSION_COVERAGE_METHOD)
+            _audit_progress_marker(
+                "COMPLETE", ordinal=symbol_ordinal, total=len(canonical_symbols), symbol=symbol
+            )
             continue
         sources = {
             timeframe: _source_leaf(

@@ -1507,3 +1507,194 @@ def test_v5_runtime_derivation_keeps_semantic_failure_with_pass_witness_candidat
         )
         == NATIVE_EVIDENCE_CANDIDATE
     )
+
+
+# Synthetic loader-boundary inputs only; no native CSV or audit is opened.
+class _V5FrameLoggingPath(type(Path())):
+    __slots__ = ("file_result", "file_checks")
+
+    def is_file(self):
+        self.file_checks += 1
+        return self.file_result
+
+
+def _v5_frame_logging_path(tmp_path, *, file_result=True):
+    path = _V5FrameLoggingPath(tmp_path / "synthetic-unopened-bars.csv")
+    path.file_result = file_result
+    path.file_checks = 0
+    return path
+
+
+def test_v5_frame_reopen_logging_preserves_success_and_single_read(monkeypatch, tmp_path, capsys):
+    path = _v5_frame_logging_path(tmp_path)
+    expected = pd.DataFrame({"synthetic_loader_result": [1]})
+    reads = []
+
+    def reader(observed_path):
+        reads.append(observed_path)
+        return expected
+
+    monkeypatch.setattr(activation_tool, "_read_bars", reader)
+
+    result = activation_tool._v5_load_frame(
+        {"availability_class": "success", "bars_path": path}
+    )
+
+    assert result is expected
+    assert len(reads) == 1 and reads[0] is path
+    assert path.file_checks == 1
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
+
+
+def test_v5_frame_reopen_logging_availability_refusal_keeps_path_unprobed(monkeypatch, tmp_path, capsys):
+    path = _v5_frame_logging_path(tmp_path)
+    reads = []
+    monkeypatch.setattr(activation_tool, "_read_bars", lambda value: reads.append(value))
+
+    result = activation_tool._v5_load_frame(
+        {"availability_class": "source_unavailable", "bars_path": path}
+    )
+
+    assert result is None
+    assert reads == []
+    assert path.file_checks == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"NATIVE_FRAME_REOPEN:AVAILABILITY_GUARD_REFUSED:{path}" in captured.err
+
+
+def test_v5_frame_reopen_logging_non_path_refusal_short_circuits_probe(monkeypatch, capsys):
+    class NonPath:
+        file_checks = 0
+
+        def is_file(self):
+            self.file_checks += 1
+            raise AssertionError("The original Path type guard must short-circuit.")
+
+        def __str__(self):
+            return "SYNTHETIC_NON_PATH"
+
+    path = NonPath()
+    reads = []
+    monkeypatch.setattr(activation_tool, "_read_bars", lambda value: reads.append(value))
+
+    result = activation_tool._v5_load_frame(
+        {"availability_class": "success", "bars_path": path}
+    )
+
+    assert result is None
+    assert reads == []
+    assert path.file_checks == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "NATIVE_FRAME_REOPEN:PATH_GUARD_REFUSED:SYNTHETIC_NON_PATH" in captured.err
+
+
+def test_v5_frame_reopen_logging_missing_path_checks_only_once(monkeypatch, tmp_path, capsys):
+    path = _v5_frame_logging_path(tmp_path, file_result=False)
+    reads = []
+    monkeypatch.setattr(activation_tool, "_read_bars", lambda value: reads.append(value))
+
+    result = activation_tool._v5_load_frame(
+        {"availability_class": "success", "bars_path": path}
+    )
+
+    assert result is None
+    assert reads == []
+    assert path.file_checks == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"NATIVE_FRAME_REOPEN:PATH_GUARD_REFUSED:{path}" in captured.err
+
+
+def test_v5_frame_reopen_logging_reader_exception_preserves_none_and_traceback(monkeypatch, tmp_path, capsys):
+    path = _v5_frame_logging_path(tmp_path)
+    reads = []
+    failure = ValueError("SYNTHETIC_FRAME_READER_FAILURE")
+
+    def reader_failure(observed_path):
+        reads.append(observed_path)
+        raise failure
+
+    monkeypatch.setattr(activation_tool, "_read_bars", reader_failure)
+
+    result = activation_tool._v5_load_frame(
+        {"availability_class": "success", "bars_path": path}
+    )
+
+    assert result is None
+    assert len(reads) == 1 and reads[0] is path
+    assert path.file_checks == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert f"NATIVE_FRAME_REOPEN:READER_EXCEPTION:{path}" in captured.err
+    assert "Traceback (most recent call last)" in captured.err
+    assert "reader_failure" in captured.err
+    assert "ValueError: SYNTHETIC_FRAME_READER_FAILURE" in captured.err
+
+
+@pytest.mark.parametrize("broken_operation", ["write", "flush"])
+def test_v5_frame_reopen_logging_broken_stderr_preserves_none(monkeypatch, tmp_path, capsys, broken_operation):
+    class BrokenStderr:
+        write_calls = 0
+        flush_calls = 0
+
+        def write(self, text):
+            self.write_calls += 1
+            if broken_operation == "write":
+                raise OSError("SYNTHETIC_STDERR_WRITE_FAILURE")
+            return len(text)
+
+        def flush(self):
+            self.flush_calls += 1
+            if broken_operation == "flush":
+                raise OSError("SYNTHETIC_STDERR_FLUSH_FAILURE")
+
+    path = _v5_frame_logging_path(tmp_path)
+    reads = []
+
+    def reader_failure(observed_path):
+        reads.append(observed_path)
+        raise ValueError("SYNTHETIC_FRAME_READER_FAILURE")
+
+    monkeypatch.setattr(activation_tool, "_read_bars", reader_failure)
+    sink = BrokenStderr()
+    with monkeypatch.context() as diagnostic_transport:
+        diagnostic_transport.setattr(activation_tool.sys, "stderr", sink)
+        result = activation_tool._v5_load_frame(
+            {"availability_class": "success", "bars_path": path}
+        )
+
+    assert result is None
+    assert len(reads) == 1 and reads[0] is path
+    assert path.file_checks == 1
+    assert sink.write_calls >= 1
+    assert sink.flush_calls == (1 if broken_operation == "flush" else 0)
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize(
+    "exception_type", [KeyboardInterrupt, SystemExit], ids=["keyboard_interrupt", "system_exit"]
+)
+def test_v5_frame_reopen_logging_preserves_reader_baseexception(monkeypatch, tmp_path, capsys, exception_type):
+    path = _v5_frame_logging_path(tmp_path)
+    reads = []
+    failure = exception_type("SYNTHETIC_READER_BASEEXCEPTION")
+
+    def reader_failure(observed_path):
+        reads.append(observed_path)
+        raise failure
+
+    monkeypatch.setattr(activation_tool, "_read_bars", reader_failure)
+
+    with pytest.raises(exception_type) as raised:
+        activation_tool._v5_load_frame(
+            {"availability_class": "success", "bars_path": path}
+        )
+
+    assert raised.value is failure
+    assert len(reads) == 1 and reads[0] is path
+    assert path.file_checks == 1
+    captured = capsys.readouterr()
+    assert captured.out == captured.err == ""
