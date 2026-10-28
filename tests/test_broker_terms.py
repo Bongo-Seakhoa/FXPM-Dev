@@ -421,7 +421,9 @@ def _promote_price_fixture(
     pointer_path.write_text(json.dumps(pointer), encoding="utf-8")
 
 
-def _move_compact_price_to_receipt_identity(native: Path) -> None:
+def _move_compact_price_to_receipt_identity(
+    native: Path, *, activation_id: str = "price-a2"
+) -> None:
     """Move the compact test price to a distinct receipt-bearing identity."""
 
     pointer_path = native / "ACTIVE.json"
@@ -429,15 +431,15 @@ def _move_compact_price_to_receipt_identity(native: Path) -> None:
     pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
     predecessor_path = native / pointer["manifest_relative_path"]
     manifest = json.loads(predecessor_path.read_text(encoding="utf-8"))
-    manifest["activation_id"] = "price-a2"
+    manifest["activation_id"] = activation_id
     manifest["previous_active_pointer_sha256"] = predecessor_pointer_sha256
-    manifest["semantic_receipt_relative_path"] = "semantic_receipts/price-a2.json"
+    manifest["semantic_receipt_relative_path"] = f"semantic_receipts/{activation_id}.json"
     manifest["semantic_receipt_sha256"] = "e" * 64
-    successor_path = native / "activations" / "price-a2.json"
+    successor_path = native / "activations" / f"{activation_id}.json"
     successor_path.write_text(json.dumps(manifest), encoding="utf-8")
     pointer.update(
         {
-            "activation_id": "price-a2",
+            "activation_id": activation_id,
             "manifest_relative_path": successor_path.relative_to(native).as_posix(),
             "manifest_sha256": _sha(successor_path),
         }
@@ -2491,3 +2493,343 @@ def test_retention_preserves_active_and_referenced_and_enforces_hard_bound(tmp_p
     assert (native / "terms" / "ACTIVE.json").exists()
     with pytest.raises(terms.TermsStorageBoundError):
         terms.prune_terms_store(native, max_snapshots=1, max_total_bytes=1)
+
+
+def _seal_receipt_fixture_manifest(native, manifest, *, real_receipt=False):
+    """Full authority uses the issuer; refusal units use labelled metadata only."""
+    manifest = json.loads(json.dumps(manifest))
+    manifest.pop("semantic_receipt_relative_path", None)
+    manifest.pop("semantic_receipt_sha256", None)
+    activation_id = manifest["activation_id"]
+    receipt_path = native / "semantic_receipts" / f"{activation_id}.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    if real_receipt:
+        from pm_native_activation import build_native_semantic_receipt
+        receipt = build_native_semantic_receipt(manifest)
+    else:
+        receipt = {"classification": "COMPACT_REFUSAL_UNIT_NOT_RECEIPT_ASSURANCE",
+                   "verification_mode": "FORCE_RAW", "activation_id": activation_id}
+    receipt_path.write_bytes(
+        (json.dumps(receipt, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    manifest["semantic_receipt_relative_path"] = receipt_path.relative_to(native).as_posix()
+    manifest["semantic_receipt_sha256"] = _sha(receipt_path)
+    manifest_path = native / "activations" / f"{activation_id}.json"
+    manifest_path.write_bytes((json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    pointer = json.loads((native / "ACTIVE.json").read_text(encoding="utf-8"))
+    pointer.update(activation_id=activation_id,
+        manifest_relative_path=manifest_path.relative_to(native).as_posix(),
+        manifest_sha256=_sha(manifest_path))
+    (native / "ACTIVE.json").write_bytes(
+        (json.dumps(pointer, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    return manifest
+
+
+def _same_history_receipt_fixture_successor(native, mutate=None, *, real_receipt=False):
+    pointer_path = native / "ACTIVE.json"
+    predecessor_pointer_sha = _sha(pointer_path)
+    pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+    manifest = json.loads((native / pointer["manifest_relative_path"]).read_text(encoding="utf-8"))
+    manifest["activation_id"] = "same-history-reverified-price"
+    manifest["previous_active_pointer_sha256"] = predecessor_pointer_sha
+    if mutate is not None:
+        mutate(manifest)
+    return _seal_receipt_fixture_manifest(native, manifest, real_receipt=real_receipt)
+
+
+def _compact_receipt_migration_case(tmp_path, monkeypatch):
+    """Tiny refusal fixture; its scope double is not real receipt assurance."""
+    native, d1_path, m5_path = _write_price_fixture(tmp_path)
+    _promote_price_fixture(native)
+    run_manifest_path = native / "runs" / "r1" / "run_manifest.json"
+    run_manifest_path.write_text(
+        json.dumps({"run_id": "r1", "classification": "COMPACT_SYNTHETIC_TERMS_REFUSAL_UNIT"}),
+        encoding="utf-8")
+    pointer = json.loads((native / "ACTIVE.json").read_text(encoding="utf-8"))
+    manifest_path = native / pointer["manifest_relative_path"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(run_id="r1", run_manifest_relative_path="runs/r1/run_manifest.json",
+                    run_manifest_sha256=_sha(run_manifest_path))
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    pointer["manifest_sha256"] = _sha(manifest_path)
+    (native / "ACTIVE.json").write_text(json.dumps(pointer), encoding="utf-8")
+    _move_compact_price_to_receipt_identity(native, activation_id="receipt-price-predecessor")
+    pointer = json.loads((native / "ACTIVE.json").read_text(encoding="utf-8"))
+    manifest = json.loads((native / pointer["manifest_relative_path"]).read_text(encoding="utf-8"))
+    _seal_receipt_fixture_manifest(native, manifest)
+
+    @contextmanager
+    def compact_current_scope(root):
+        # Explicitly labelled metadata seam for refusal units only. The
+        # same-history success test below restores the real public verifier.
+        price = terms.load_current_price_activation(root)
+        receipt_path = Path(root) / price["manifest"]["semantic_receipt_relative_path"]
+        price["semantic_receipt"] = json.loads(receipt_path.read_text(encoding="utf-8"))
+        price["semantic_receipt_sha256"] = _sha(receipt_path)
+
+        def revalidate():
+            current = terms.load_current_price_activation(root)
+            if not terms._same_price_identity(price, current):
+                raise terms.BrokerTermsError("receipt-backed native price authority changed")
+
+        yield price, revalidate
+
+    monkeypatch.setattr(terms, "_receipt_backed_price_authority_scope", compact_current_scope)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _parse_snapshot(tmp_path, now=now)
+    snapshot["symbols"]["EURUSD"]["d1_anchors"] = [{"open_epoch": 1775433600, "server_weekday": 1}]
+    snapshot.pop("content_sha256")
+    snapshot["content_sha256"] = terms.canonical_sha256(snapshot)
+    original = terms.activate_broker_terms(
+        native, snapshot, activation_id="same-history-original-terms", now_utc=now)
+    pin = terms.build_price_receipt_migration_pin(native, prepared_at_utc=now)
+    assert pin["schema_version"] == terms.TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA
+    return {"native": native, "snapshot": snapshot, "now": now,
+            "later": now + timedelta(days=30), "original": original, "pin": pin,
+            "terms_pointer": native / "terms" / "ACTIVE.json",
+            "terms_pointer_bytes": (native / "terms" / "ACTIVE.json").read_bytes(),
+            "d1_path": d1_path, "m5_path": m5_path, "run_manifest_path": run_manifest_path}
+
+
+def _assert_same_history_refusal(case, *, activation_id):
+    with pytest.raises(terms.BrokerTermsError, match="same-history") as refused:
+        terms.activate_broker_terms(
+            case["native"], case["snapshot"], activation_id=activation_id,
+            now_utc=case["later"], price_receipt_migration_pin=case["pin"])
+    assert case["terms_pointer"].read_bytes() == case["terms_pointer_bytes"]
+    return refused.value
+
+
+def test_receipt_to_receipt_same_history_uses_real_authority_and_preserves_snapshot_and_events(
+    tmp_path, monkeypatch,
+):
+    from tests.native_v5_support import write_receipt_backed_v5_authority
+    native = tmp_path / "native"
+    original_price = write_receipt_backed_v5_authority(native, current_schedule_surface=True)
+    now = datetime(2026, 4, 13, 12, tzinfo=UTC)
+    snapshot = _full_receipt_terms_snapshot(now)
+    monkeypatch.setattr(terms, "_receipt_backed_price_authority_scope", _REAL_RECEIPT_BACKED_SCOPE)
+    original = terms.activate_broker_terms(
+        native, snapshot, activation_id="real-receipt-original-terms", now_utc=now)
+    snapshot_path = native / original["terms_snapshot_relative_path"]
+    original_snapshot_bytes = snapshot_path.read_bytes()
+    old_schedules = {symbol: json.loads((native / record["schedule_relative_path"]).read_text())
+                     for symbol, record in original["symbols"].items()}
+
+    def no_predecessor_current_build_validation(*args, **kwargs):
+        pytest.fail("Migration preparation revalidated predecessor receipt against the current build")
+
+    with monkeypatch.context() as preparation:
+        preparation.setattr(terms, "_receipt_backed_price_authority_scope",
+                            no_predecessor_current_build_validation)
+        pin = terms.build_price_receipt_migration_pin(native, prepared_at_utc=now)
+    assert pin["schema_version"] == terms.TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA
+    assert pin["predecessor_price_semantic_receipt_sha256"] == _sha(original_price["receipt_path"])
+    _same_history_receipt_fixture_successor(native, real_receipt=True)
+    # This is the real receipt loader, not the compact autouse scope.
+    with _REAL_RECEIPT_BACKED_SCOPE(native) as (verified, revalidate):
+        assert verified["semantic_receipt"]["verification_mode"] == "FORCE_RAW"
+        revalidate()
+    before_pointer = (native / "terms" / "ACTIVE.json").read_bytes()
+    later = now + timedelta(days=30)
+    staged = terms.activate_broker_terms(
+        native, snapshot, activation_id="real-receipt-rehearsal-terms",
+        now_utc=later, update_pointer=False, price_receipt_migration_pin=pin)
+    assert staged["pointer_updated"] is False
+    assert (native / "terms" / "ACTIVE.json").read_bytes() == before_pointer
+    staged_bytes = Path(staged["manifest_path"]).read_bytes()
+    rebound = terms.activate_broker_terms(
+        native, snapshot, activation_id="real-receipt-rebound-terms",
+        now_utc=later + timedelta(minutes=5),
+        price_receipt_migration_pin=pin)
+    assert Path(staged["manifest_path"]).read_bytes() == staged_bytes
+    assert rebound["activation_id"] != staged["activation_id"]
+    assert (native / "terms" / "ACTIVE.json").read_bytes() != before_pointer
+    assert rebound["price_activation_id"] == "same-history-reverified-price"
+    assert rebound["terms_snapshot_relative_path"] == original["terms_snapshot_relative_path"]
+    assert rebound["terms_snapshot_sha256"] == original["terms_snapshot_sha256"]
+    assert snapshot_path.read_bytes() == original_snapshot_bytes
+    assert json.loads(original_snapshot_bytes) == snapshot
+    for field in ("provenance_status", "schedule_source_policy", "projection_contract",
+                  "active_symbols", "active_target_binding_count", "schedule_axis_bindings",
+                  "unscheduled_candidate_cells"):
+        assert rebound.get(field) == original.get(field)
+    for symbol, old_record in original["symbols"].items():
+        record = rebound["symbols"][symbol]
+        assert record["terms_record_sha256"] == old_record["terms_record_sha256"]
+        for field in ("status", "reason", "price_symbol", "broker_symbol", "schedule_source_timeframe",
+                      "schedule_derivation_contract", "schedule_derivation_metadata", "event_count",
+                      "schedule_source_selection_receipt"):
+            assert record.get(field) == old_record.get(field)
+        assert set(record["target_bindings"]) == set(old_record["target_bindings"])
+        for timeframe, binding in old_record["target_bindings"].items():
+            assert {k: v for k, v in record["target_bindings"][timeframe].items() if k.startswith("bars_")} == {
+                k: v for k, v in binding.items() if k.startswith("bars_")}
+        schedule = json.loads((native / record["schedule_relative_path"]).read_text())
+        assert schedule["events"] == old_schedules[symbol]["events"]
+    resolved = terms.resolve_active_swap_contract(native, "EURUSD", "D1")
+    assert resolved["price_activation_id"] == "same-history-reverified-price"
+
+
+@pytest.mark.parametrize("field", ["bars_sha256", "bars_relative_path"])
+def test_receipt_to_receipt_refuses_changed_cell_bars_even_with_same_time_axis(tmp_path, monkeypatch, field):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+    before = pd.read_csv(case["d1_path"])
+    if field == "bars_sha256":
+        changed = before.copy()
+        changed[["Open", "High", "Low", "Close"]] += .001
+        changed.to_csv(case["d1_path"], index=False)
+        assert pd.read_csv(case["d1_path"])[["time", "_BAR_CLOSE_TS"]].equals(before[["time", "_BAR_CLOSE_TS"]])
+
+    def mutate(manifest):
+        manifest["entries"]["EURUSD"]["D1"][field] = (
+            _sha(case["d1_path"]) if field == "bars_sha256" else
+            "runs/r1/EURUSD/M5.csv")
+
+    _same_history_receipt_fixture_successor(case["native"], mutate)
+    _assert_same_history_refusal(case, activation_id="changed-bars-refused")
+
+
+@pytest.mark.parametrize("field", ["status", "universe_eligibility_status", "cell_statuses",
+                                  "evidence_candidate_timeframes_by_symbol"])
+def test_receipt_to_receipt_refuses_changed_cell_status_or_universe_maps(tmp_path, monkeypatch, field):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+
+    def mutate(manifest):
+        if field in ("status", "universe_eligibility_status"):
+            manifest["entries"]["EURUSD"]["D1"][field] = "technical_error"
+        elif field == "cell_statuses":
+            manifest["universe_eligibility"][field]["EURUSD"]["D1"] = "technical_error"
+        else:
+            manifest["universe_eligibility"][field]["EURUSD"] = ["M5"]
+
+    _same_history_receipt_fixture_successor(case["native"], mutate)
+    _assert_same_history_refusal(case, activation_id="changed-status-refused")
+
+
+@pytest.mark.parametrize("mutation", ["add_symbol", "remove_symbol", "add_timeframe", "remove_timeframe"])
+def test_receipt_to_receipt_refuses_changed_symbol_or_timeframe_roster(tmp_path, monkeypatch, mutation):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+
+    def mutate(manifest):
+        universe = manifest["universe_eligibility"]
+        if mutation == "add_symbol":
+            manifest["entries"]["GBPUSD"] = json.loads(json.dumps(manifest["entries"]["EURUSD"]))
+            for record in manifest["entries"]["GBPUSD"].values():
+                record["symbol"] = "GBPUSD"
+            universe["cell_statuses"]["GBPUSD"] = dict(universe["cell_statuses"]["EURUSD"])
+            universe["evidence_candidate_timeframes_by_symbol"]["GBPUSD"] = ["D1", "M5"]
+        elif mutation == "remove_symbol":
+            del manifest["entries"]["EURUSD"]
+            del universe["cell_statuses"]["EURUSD"]
+            del universe["evidence_candidate_timeframes_by_symbol"]["EURUSD"]
+        elif mutation == "add_timeframe":
+            extra = dict(manifest["entries"]["EURUSD"]["M5"], timeframe="M15")
+            manifest["entries"]["EURUSD"]["M15"] = extra
+            universe["cell_statuses"]["EURUSD"]["M15"] = "evidence_candidate"
+            universe["evidence_candidate_timeframes_by_symbol"]["EURUSD"].append("M15")
+        else:
+            del manifest["entries"]["EURUSD"]["M5"]
+            del universe["cell_statuses"]["EURUSD"]["M5"]
+            universe["evidence_candidate_timeframes_by_symbol"]["EURUSD"] = ["D1"]
+
+    _same_history_receipt_fixture_successor(case["native"], mutate)
+    _assert_same_history_refusal(case, activation_id="changed-roster-refused")
+
+
+@pytest.mark.parametrize("field", ["run_id", "run_manifest_sha256"])
+def test_receipt_to_receipt_refuses_changed_run_identity(tmp_path, monkeypatch, field):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+
+    def mutate(manifest):
+        manifest[field] = "different-run" if field == "run_id" else "0" * 64
+
+    _same_history_receipt_fixture_successor(case["native"], mutate)
+    _assert_same_history_refusal(case, activation_id="changed-run-refused")
+
+
+@pytest.mark.parametrize("damage", ["missing", "sha_mismatch"])
+def test_receipt_to_receipt_refuses_missing_or_tampered_predecessor_manifest(tmp_path, monkeypatch, damage):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+    predecessor = case["native"] / case["pin"]["predecessor_price_manifest_relative_path"]
+    _same_history_receipt_fixture_successor(case["native"])
+    if damage == "missing":
+        predecessor.unlink()
+    else:
+        predecessor.write_bytes(predecessor.read_bytes() + b"\n")
+    _assert_same_history_refusal(case, activation_id="damaged-predecessor-refused")
+
+
+def test_receipt_to_receipt_refuses_non_direct_successor(tmp_path, monkeypatch):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+    _same_history_receipt_fixture_successor(case["native"],
+        lambda manifest: manifest.update(previous_active_pointer_sha256="f" * 64))
+    with pytest.raises(terms.BrokerTermsError, match="direct receipt-backed"):
+        terms.activate_broker_terms(case["native"], case["snapshot"], activation_id="unrelated-receipt-refused",
+            now_utc=case["later"], price_receipt_migration_pin=case["pin"])
+    assert case["terms_pointer"].read_bytes() == case["terms_pointer_bytes"]
+
+
+def test_receipt_to_receipt_refuses_pin_reuse(tmp_path, monkeypatch):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+    _same_history_receipt_fixture_successor(case["native"])
+    terms.activate_broker_terms(case["native"], case["snapshot"], activation_id="first-same-history-rebind",
+        now_utc=case["later"], price_receipt_migration_pin=case["pin"])
+    after_first = case["terms_pointer"].read_bytes()
+    with pytest.raises(terms.BrokerTermsError, match="source pin mismatch"):
+        terms.activate_broker_terms(case["native"], case["snapshot"], activation_id="reused-pin-refused",
+            now_utc=case["later"], price_receipt_migration_pin=case["pin"])
+    assert case["terms_pointer"].read_bytes() == after_first
+
+
+@pytest.mark.parametrize("update_pointer", [True, False])
+def test_receipt_to_receipt_refuses_derived_content_difference_before_terms_cas(
+    tmp_path, monkeypatch, update_pointer,
+):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+    _same_history_receipt_fixture_successor(case["native"])
+    real_derive = terms._derive_d1_session_events_hashed
+    calls = []
+
+    def changed_factor(*args, **kwargs):
+        events, digest = real_derive(*args, **kwargs)
+        events = json.loads(json.dumps(events))
+        assert events
+        events[0]["factor"] += 1
+        calls.append(digest)
+        return events, digest
+
+    monkeypatch.setattr(terms, "_derive_d1_session_events_hashed", changed_factor)
+    with pytest.raises(terms.BrokerTermsError, match="same-history content comparison refused") as refused:
+        terms.activate_broker_terms(
+            case["native"], case["snapshot"], activation_id="changed-events-refused",
+            now_utc=case["later"], update_pointer=update_pointer,
+            price_receipt_migration_pin=case["pin"])
+    assert calls
+    assert case["terms_pointer"].read_bytes() == case["terms_pointer_bytes"]
+    assert refused.value.orphan_files
+    assert all((case["native"] / path).is_file() for path in refused.value.orphan_files)
+    assert any(note.startswith("MIGRATION_ORPHAN_FILES:") for note in refused.value.__notes__)
+
+
+def test_receipt_to_receipt_does_not_waive_ordinary_snapshot_freshness(tmp_path, monkeypatch):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+    _same_history_receipt_fixture_successor(case["native"])
+    with pytest.raises(terms.BrokerTermsError, match="snapshot is not fresh"):
+        terms.activate_broker_terms(case["native"], case["snapshot"], activation_id="ordinary-stale-refused",
+            now_utc=case["later"])
+    assert case["terms_pointer"].read_bytes() == case["terms_pointer_bytes"]
+
+
+def test_capture_cli_prepares_versioned_pin_for_receipt_backed_predecessor(
+    tmp_path, monkeypatch, capsys,
+):
+    case = _compact_receipt_migration_case(tmp_path, monkeypatch)
+    pin_path = tmp_path / "receipt-to-receipt-migration.pin.json"
+    assert capture_main(["--native-root", str(case["native"]),
+                         "--prepare-price-receipt-migration-pin", str(pin_path)]) == 0
+    prepared = json.loads(capsys.readouterr().out)
+    assert prepared["status"] == "MIGRATION_PIN_PREPARED"
+    pin = json.loads(pin_path.read_text())
+    assert pin["schema_version"] == terms.TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA
+    assert prepared["sha256"] == _sha(pin_path)
+    assert pin["source_terms_active_pointer_sha256"] == _sha(case["terms_pointer"])

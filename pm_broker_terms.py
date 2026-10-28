@@ -45,6 +45,7 @@ _SCHEDULE_SOURCE_PREFERENCE = ("D1", "H4", "H1", "M30", "M15", "M5")
 SCHEDULE_SOURCE_POLICY = "d1-preferred-coarsest-intraday-fallback-v1"
 SCHEDULE_SOURCE_SELECTION_SCHEMA = "fxpm-schedule-source-selection-v1"
 TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA = "fxpm-terms-price-receipt-migration-pin-v1"
+TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA = "fxpm-terms-price-receipt-migration-pin-v2"
 _TERMS_PRICE_RECEIPT_MIGRATION_PIN_FIELDS = frozenset(
     {
         "schema_version",
@@ -59,6 +60,14 @@ _TERMS_PRICE_RECEIPT_MIGRATION_PIN_FIELDS = frozenset(
         "predecessor_price_activation_id",
         "predecessor_price_manifest_sha256",
     }
+)
+_TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_FIELDS = (
+    _TERMS_PRICE_RECEIPT_MIGRATION_PIN_FIELDS | frozenset({
+        "predecessor_price_manifest_relative_path",
+        "predecessor_price_semantic_receipt_relative_path",
+        "predecessor_price_semantic_receipt_sha256",
+        "predecessor_source_set_sha256",
+    })
 )
 
 _DIRECT_SNAPSHOT_KEYS = frozenset({
@@ -1944,24 +1953,149 @@ def _validated_active_terms_repair_source(
     }
 
 
+def _same_history_price_projection(manifest: Mapping[str, Any]) -> Dict[str, Any]:
+    def owned_json(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {key: owned_json(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [owned_json(item) for item in value]
+        return value
+
+    entries = manifest.get("entries")
+    universe = manifest.get("universe_eligibility")
+    if (not isinstance(entries, Mapping) or not entries
+            or not isinstance(universe, Mapping)
+            or not str(manifest.get("run_id") or "")
+            or not _is_sha256(manifest.get("run_manifest_sha256"))):
+        raise BrokerTermsError("price receipt same-history source set is invalid")
+    cells = []
+    for symbol in sorted(entries):
+        timeframes = entries[symbol]
+        if not isinstance(symbol, str) or not isinstance(timeframes, Mapping) or not timeframes:
+            raise BrokerTermsError("price receipt same-history source set is invalid")
+        for timeframe in sorted(timeframes):
+            cell = timeframes[timeframe]
+            if not isinstance(timeframe, str) or not isinstance(cell, Mapping):
+                raise BrokerTermsError("price receipt same-history source set is invalid")
+            cells.append({"symbol": symbol, "timeframe": timeframe,
+                **{key: cell.get(key) for key in (
+                    "bars_relative_path", "bars_sha256", "status",
+                    "universe_eligibility_status")}})
+    return {"run_id": manifest["run_id"],
+        "run_manifest_sha256": manifest["run_manifest_sha256"], "cells": cells,
+        "cell_statuses": owned_json(universe.get("cell_statuses")),
+        "evidence_candidate_timeframes_by_symbol": owned_json(universe.get(
+            "evidence_candidate_timeframes_by_symbol"))}
+
+
+def _same_history_predecessor(native_root: Path, pin: Mapping[str, Any]) -> Dict[str, Any]:
+    path = _safe_relative(native_root, pin.get("predecessor_price_manifest_relative_path"))
+    try:
+        manifest, digest, _ = _load_json_bounded_hashed(path)
+    except BrokerTermsError as exc:
+        raise BrokerTermsError("price receipt same-history predecessor is unavailable") from exc
+    if (digest != pin.get("predecessor_price_manifest_sha256")
+            or manifest.get("activation_id") != pin.get("predecessor_price_activation_id")
+            or manifest.get("schema_version") != "fxpm-native-activation-v1"
+            or manifest.get("status") != "active"
+            or manifest.get("semantic_receipt_relative_path")
+            != pin.get("predecessor_price_semantic_receipt_relative_path")
+            or manifest.get("semantic_receipt_sha256")
+            != pin.get("predecessor_price_semantic_receipt_sha256")):
+        raise BrokerTermsError("price receipt same-history predecessor binding mismatch")
+    # Authenticate retained receipt bytes, never its obsolete verifier build.
+    _verify_exact_artifact(_safe_relative(native_root,
+        pin["predecessor_price_semantic_receipt_relative_path"]),
+        pin["predecessor_price_semantic_receipt_sha256"], "predecessor native receipt")
+    if canonical_sha256(_same_history_price_projection(manifest)) != pin.get(
+            "predecessor_source_set_sha256"):
+        raise BrokerTermsError("price receipt same-history predecessor source set mismatch")
+    return manifest
+
+
+def _same_history_terms_projection(
+    value: Any, *, manifest: bool = False, schedule: bool = False,
+) -> Any:
+    # Only verified price/audit lineage changes; economic and axis fields stay.
+    omitted = {"sidecar_relative_path", "sidecar_sha256",
+        "d1_sidecar_relative_path", "d1_sidecar_sha256"}
+    if manifest:
+        omitted |= {"activation_id", "created_at_utc", "price_activation_id",
+            "price_activation_manifest_sha256", "price_active_pointer_sha256_at_creation",
+            "repair_source_terms_activation_id", "repair_source_terms_manifest_sha256",
+            "repair_source_terms_pointer_sha256", "price_receipt_migration"}
+    else:
+        omitted |= {"price_activation_id", "price_activation_manifest_sha256"}
+        if not schedule:
+            omitted |= {"schedule_relative_path", "schedule_sha256"}
+    if isinstance(value, Mapping):
+        result = {}
+        for key, item in value.items():
+            if key in omitted:
+                continue
+            if manifest and key == "symbols":
+                result[key] = {symbol: _same_history_terms_projection(record)
+                    for symbol, record in item.items()}
+            else:
+                result[key] = _same_history_terms_projection(item, schedule=schedule)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_same_history_terms_projection(item, schedule=schedule) for item in value]
+    return value
+
+
+def _require_same_history_terms_content(
+    native_root: Path, *, source: Mapping[str, Any], snapshot: Mapping[str, Any],
+    price: Mapping[str, Any], manifest: Mapping[str, Any], orphan_paths: Sequence[Path],
+) -> None:
+    if source.get("_same_history_pin") is None:
+        return
+    try:
+        pin = source["_same_history_pin"]
+        original = _validated_price_receipt_migration_source(
+            native_root, pin=pin, snapshot=snapshot, price=price)["_same_history_original"]
+        if _canonical_bytes(_same_history_terms_projection(original, manifest=True)) != (
+                _canonical_bytes(_same_history_terms_projection(manifest, manifest=True))):
+            raise BrokerTermsError("price receipt same-history content mismatch")
+        for symbol, old_record in original["symbols"].items():
+            new_record = manifest["symbols"][symbol]
+            old_relative = old_record.get("schedule_relative_path")
+            new_relative = new_record.get("schedule_relative_path")
+            if old_relative is None and new_relative is None:
+                continue
+            old, old_sha, _ = _load_json_bounded_hashed(_safe_relative(native_root, old_relative))
+            new, new_sha, _ = _load_json_bounded_hashed(_safe_relative(native_root, new_relative))
+            if (old_sha != old_record.get("schedule_sha256")
+                    or new_sha != new_record.get("schedule_sha256")
+                    or _canonical_bytes(_same_history_terms_projection(old, schedule=True))
+                    != _canonical_bytes(_same_history_terms_projection(new, schedule=True))):
+                raise BrokerTermsError("price receipt same-history schedule content mismatch")
+    except (BrokerTermsError, KeyError, TypeError) as exc:
+        error = BrokerTermsError("price receipt same-history content comparison refused")
+        error.orphan_files = tuple(str(Path(path).relative_to(native_root)) for path in orphan_paths)
+        error.add_note("MIGRATION_ORPHAN_FILES:" + json.dumps(error.orphan_files))
+        raise error from exc
+
+
 def build_price_receipt_migration_pin(
     native_root: Path,
     *,
     prepared_at_utc: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Pin the exact active legacy TERMS overlay before the price migration."""
+    """Pin active TERMS for the actual legacy or same-history price predecessor."""
 
     native_root = Path(native_root).resolve()
     with _terms_pointer_lock(native_root):
         with _native_price_pointer_lock(native_root):
             price = load_current_price_activation(native_root)
-            if (
-                price["manifest"].get("semantic_receipt_relative_path") is not None
-                or price["manifest"].get("semantic_receipt_sha256") is not None
-            ):
-                raise BrokerTermsError(
-                    "price receipt migration predecessor is already receipt-backed"
-                )
+            predecessor_receipt = price["manifest"].get("semantic_receipt_relative_path")
+            predecessor_receipt_sha = price["manifest"].get("semantic_receipt_sha256")
+            receipt_backed = predecessor_receipt is not None or predecessor_receipt_sha is not None
+            if receipt_backed:
+                if not predecessor_receipt or not _is_sha256(predecessor_receipt_sha):
+                    raise BrokerTermsError("price receipt same-history predecessor receipt is invalid")
+                _verify_exact_artifact(_safe_relative(native_root, predecessor_receipt),
+                    predecessor_receipt_sha, "predecessor native receipt")
             source = _load_active_terms_source(native_root)
             pointer = source["pointer"]
             manifest = source["manifest"]
@@ -1995,7 +2129,7 @@ def build_price_receipt_migration_pin(
                     "broker terms authority changed while preparing migration pin"
                 )
             prepared = (prepared_at_utc or _utc_now()).astimezone(timezone.utc)
-            return {
+            pin = {
                 "schema_version": TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA,
                 "prepared_at_utc": _iso(prepared),
                 "source_terms_active_pointer_sha256": source["pointer_sha256"],
@@ -2014,6 +2148,14 @@ def build_price_receipt_migration_pin(
                 "predecessor_price_activation_id": price["activation_id"],
                 "predecessor_price_manifest_sha256": price["manifest_sha256"],
             }
+            if receipt_backed:
+                pin.update({"schema_version": TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA,
+                    "predecessor_price_manifest_relative_path": price["manifest_path"].relative_to(native_root).as_posix(),
+                    "predecessor_price_semantic_receipt_relative_path": predecessor_receipt,
+                    "predecessor_price_semantic_receipt_sha256": predecessor_receipt_sha,
+                    "predecessor_source_set_sha256": canonical_sha256(
+                        _same_history_price_projection(price["manifest"]))})
+            return pin
 
 
 def _validated_price_receipt_migration_source(
@@ -2025,12 +2167,18 @@ def _validated_price_receipt_migration_source(
 ) -> Dict[str, Any]:
     """Authenticate one exact prepared TERMS source after price ACTIVE moved."""
 
+    same_history = (isinstance(pin, Mapping) and pin.get("schema_version")
+        == TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA)
+    expected_fields = (_TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_FIELDS if same_history
+        else _TERMS_PRICE_RECEIPT_MIGRATION_PIN_FIELDS)
     if (
         not isinstance(pin, Mapping)
-        or set(pin) != _TERMS_PRICE_RECEIPT_MIGRATION_PIN_FIELDS
-        or pin.get("schema_version") != TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA
+        or set(pin) != expected_fields
+        or pin.get("schema_version") != (TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA
+            if same_history else TERMS_PRICE_RECEIPT_MIGRATION_PIN_SCHEMA)
     ):
-        raise BrokerTermsError("price receipt migration pin is invalid")
+        raise BrokerTermsError("price receipt same-history pin is invalid" if same_history
+            else "price receipt migration pin is invalid")
     _aware_utc(pin.get("prepared_at_utc"), "migration_pin.prepared_at_utc")
     for field in (
         "source_terms_active_pointer_sha256",
@@ -2041,6 +2189,10 @@ def _validated_price_receipt_migration_source(
     ):
         if not _is_sha256(pin.get(field)):
             raise BrokerTermsError("price receipt migration pin digest is invalid")
+    if same_history:
+        if (not _is_sha256(pin.get("predecessor_price_semantic_receipt_sha256"))
+                or not _is_sha256(pin.get("predecessor_source_set_sha256"))):
+            raise BrokerTermsError("price receipt same-history pin digest is invalid")
     if (
         not _is_sha256(price.get("semantic_receipt_sha256"))
         or price.get("pointer_sha256")
@@ -2053,6 +2205,8 @@ def _validated_price_receipt_migration_source(
         != pin.get("predecessor_price_active_pointer_sha256")
     ):
         raise BrokerTermsError(
+            "price receipt same-history requires the direct receipt-backed price successor"
+            if same_history else
             "price receipt migration requires the direct receipt-backed price successor"
         )
     native_root = Path(native_root).resolve()
@@ -2080,9 +2234,10 @@ def _validated_price_receipt_migration_source(
         or str(manifest.get("price_active_pointer_sha256_at_creation") or "").lower()
         != pin.get("predecessor_price_active_pointer_sha256")
     ):
-        raise BrokerTermsError("price receipt migration source pin mismatch")
+        raise BrokerTermsError("price receipt same-history source pin mismatch" if same_history
+            else "price receipt migration source pin mismatch")
     _validate_terms_snapshot(persisted_snapshot)
-    return {
+    result = {
         "activation_id": str(manifest.get("activation_id") or ""),
         "manifest_sha256": source["manifest_sha256"],
         "pointer_sha256": source["pointer_sha256"],
@@ -2093,6 +2248,21 @@ def _validated_price_receipt_migration_source(
             "predecessor_price_active_pointer_sha256"
         ],
     }
+    if same_history:
+        receipt = price.get("semantic_receipt")
+        if (not isinstance(receipt, Mapping)
+                or receipt.get("verification_mode") != "FORCE_RAW"
+                or price["manifest"].get("semantic_receipt_sha256")
+                != price.get("semantic_receipt_sha256")):
+            raise BrokerTermsError("price receipt same-history current receipt is invalid")
+        predecessor = _same_history_predecessor(native_root, pin)
+        if _canonical_bytes(_same_history_price_projection(predecessor)) != (
+                _canonical_bytes(_same_history_price_projection(price["manifest"]))):
+            raise BrokerTermsError("price receipt same-history source set mismatch")
+        result.update({"_same_history_pin": json.loads(_canonical_bytes(pin)),
+            "_same_history_original": manifest,
+            "same_history_pin_sha256": canonical_sha256(pin)})
+    return result
 
 
 def _activate_broker_terms_with_price_authority(
@@ -2616,6 +2786,14 @@ def _activate_broker_terms_with_price_authority(
                 "predecessor_price_pointer_sha256"
             ],
         }
+        if migration_source.get("_same_history_pin") is not None:
+            manifest["price_receipt_migration"].update({
+                "schema_version": TERMS_PRICE_RECEIPT_MIGRATION_PIN_V2_SCHEMA,
+                "same_history_pin_sha256": migration_source["same_history_pin_sha256"],
+            })
+            _require_same_history_terms_content(native_root, source=migration_source,
+                snapshot=snapshot, price=price, manifest=manifest,
+                orphan_paths=[path for path, _ in staged_schedule_pins])
     manifest_path = terms_root / "activations" / f"{activation_id}.json"
     if staged_manifest_created_at_utc is not None and not manifest_path.is_file():
         raise BrokerTermsError(
@@ -2673,6 +2851,10 @@ def _activate_broker_terms_with_price_authority(
                         native_root,
                         schedule_axis_bindings,
                     )
+                    if migration_source is not None:
+                        _require_same_history_terms_content(native_root, source=migration_source,
+                            snapshot=snapshot, price=price, manifest=persisted_manifest,
+                            orphan_paths=[path for path, _ in staged_schedule_pins] + [manifest_path])
                     if repair_source is None and migration_source is None:
                         replace_now = now + timedelta(
                             seconds=max(
@@ -2716,6 +2898,10 @@ def _activate_broker_terms_with_price_authority(
                     native_root,
                     schedule_axis_bindings,
                 )
+                if migration_source is not None:
+                    _require_same_history_terms_content(native_root, source=migration_source,
+                        snapshot=snapshot, price=price, manifest=persisted_manifest,
+                        orphan_paths=[path for path, _ in staged_schedule_pins] + [manifest_path])
                 staged_now = now + timedelta(
                     seconds=max(0.0, time.monotonic() - activation_started_monotonic)
                 )
