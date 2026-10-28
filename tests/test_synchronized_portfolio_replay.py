@@ -164,7 +164,7 @@ def test_funded_cost_contract_uses_code_owned_defaults_when_json_omits_switches(
 def test_funded_cost_contract_rejects_retired_execution_keys(
     retired_key: str,
 ) -> None:
-    with pytest.raises(ValueError, match="retired scoring config keys"):
+    with pytest.raises(ValueError, match="retired pipeline config keys"):
         portfolio_cost_contract({"pipeline": {retired_key: True}})
 
 

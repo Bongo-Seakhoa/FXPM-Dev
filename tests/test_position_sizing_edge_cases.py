@@ -14,6 +14,7 @@ from pm_core import InstrumentSpec, PipelineConfig
 from pm_main import LiveTrader, classify_lot_normalization_drift
 from pm_position import PositionCalculator, PositionConfig
 from pm_risk_admission import StopRiskExposure
+from tests.test_config_source_of_truth import _execute_with_frozen_spread_fixture
 
 
 class PositionSizingEdgeCaseTests(unittest.TestCase):
@@ -226,7 +227,7 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
         for actual in (3.5, 24.67):
             with self.subTest(actual=actual):
                 trader = self._trader(actual)
-                trader._execute_entry(
+                _execute_with_frozen_spread_fixture(trader,
                     symbol="XAUUSD",
                     broker_symbol="XAUUSD",
                     signal=1,
@@ -262,6 +263,7 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
         trader = self._trader(0.25)
         trader.pipeline_config = PipelineConfig(
             manual_new_entries_enabled=True,
+            production_require_promotion_gate=False,
             max_total_open_risk_pct=8.0,
             max_factor_group_open_risk_pct=2.0,
             max_new_entries_when_total_open_risk_above_pct=0.0,
@@ -302,7 +304,7 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
                 "Close": [1.0, 1.0],
             }
         )
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="GBPUSD",
             broker_symbol="GBPUSD",
             signal=1,
@@ -344,7 +346,7 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
         fresh_account.margin_level = fresh_account.equity / fresh_account.margin * 100.0
         fresh_account.margin_free = 5_100.0
         trader.mt5.calc_margin_required.return_value = 200.0
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="GBPUSD",
             broker_symbol="GBPUSD",
             signal=1,
@@ -411,7 +413,7 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
             retcode_description="test terminal rejection after sizing",
             error_message="",
         )
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="GBPUSD",
             broker_symbol="GBPUSD",
             signal=1,
@@ -500,7 +502,7 @@ class LiveOrderRiskEnvelopeTests(unittest.TestCase):
             }
         )
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="GBPUSD",
             broker_symbol="GBPUSD",
             signal=1,

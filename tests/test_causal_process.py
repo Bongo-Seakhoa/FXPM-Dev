@@ -162,19 +162,24 @@ def test_forward_oos_lineage_replays_nonlexicographic_anchor_order_and_exact_rol
         process._validate_forward_oos_replay_lineage(attacked, plans, precommit_sha)
 
 
-def test_v9_process_and_v3_cumulative_cost_policy_are_exact() -> None:
-    assert process.PROCESS_AUTHORITY_VERSION == "fxpm-offline-process-validation-v9"
-    assert process.PRECOMMIT_SCHEMA == "fxpm-historical-process-precommit-v9"
-    assert process.EVIDENCE_SCHEMA == "fxpm-historical-process-evidence-v9"
-    assert process.RECONCILIATION_SCHEMA == "fxpm-historical-process-reconciliation-v9"
-    assert process.DECISION_SCHEMA == "fxpm-offline-process-validation-decision-v9"
+def test_v10_process_and_v4_cumulative_cost_policy_are_exact() -> None:
+    assert process.PROCESS_AUTHORITY_VERSION == "fxpm-offline-process-validation-v10"
+    assert process.PRECOMMIT_SCHEMA == "fxpm-historical-process-precommit-v10"
+    assert process.EVIDENCE_SCHEMA == "fxpm-historical-process-evidence-v10"
+    assert process.RECONCILIATION_SCHEMA == "fxpm-historical-process-reconciliation-v10"
+    assert process.DECISION_SCHEMA == "fxpm-offline-process-validation-decision-v10"
     assert process.PINNED_FORWARD_OOS_PRODUCTION_CONTRACT_VERSION == (
-        "fxpm.forward-oos-replay-producer.v4"
+        "fxpm.forward-oos-replay-producer.v5"
     )
+    assert (
+        process._ACTIVITY_FILL_LEDGER_SCHEMA
+        == "fxpm-anchor-entry-exit-fill-ledger-v3"
+    )
+    assert process._ACTIVITY_COST_LEDGER_SCHEMA == "fxpm-anchor-economic-cost-ledger-v3"
     assert process._FROZEN_COST_POLICY == {
-        "schema": "fxpm-historical-process-cost-policy-v3",
+        "schema": "fxpm-historical-process-cost-policy-v4",
         "base_lane": "GROSS_MTM_PLUS_OBSERVED_EXECUTION_COST_DEBITS",
-        "stress_lane": (
+        "p75_lane": (
             "SAME_EVENTS_WITH_PER_POSITION_AND_AGGREGATE_CUMULATIVE_COST_PREFIX_"
             "NON_IMPROVEMENT_AND_COMPONENT_DAY_REBOUND_ALLOWED"
         ),
@@ -182,7 +187,7 @@ def test_v9_process_and_v3_cumulative_cost_policy_are_exact() -> None:
         "require_daily_gross_cost_decomposition": True,
     }
     assert _sha(process._FROZEN_COST_POLICY) == (
-        "2c6cd01d8141449f0bfb50b9920ea8cb8128731175c9f7ae5f436c95c3b4fdb4"
+        "435d729993461442fad99e3a8549c19bd0a9ada4d498fb4f2fb526bbff7b6a24"
     )
 
 
@@ -230,9 +235,9 @@ def _risk_policy() -> dict:
 
 def _cost_policy() -> dict:
     return {
-        "schema": "fxpm-historical-process-cost-policy-v3",
+        "schema": "fxpm-historical-process-cost-policy-v4",
         "base_lane": "GROSS_MTM_PLUS_OBSERVED_EXECUTION_COST_DEBITS",
-        "stress_lane": (
+        "p75_lane": (
             "SAME_EVENTS_WITH_PER_POSITION_AND_AGGREGATE_CUMULATIVE_COST_PREFIX_"
             "NON_IMPROVEMENT_AND_COMPONENT_DAY_REBOUND_ALLOWED"
         ),
@@ -743,11 +748,11 @@ def _refresh_anchor_hashes(anchor: dict, *, derive_activity: bool = True) -> Non
             "daily_values": anchor["daily_base_cost_returns"],
         }
     )
-    anchor["stress_cost_vector_sha256"] = _sha(
+    anchor["p75_cost_vector_sha256"] = _sha(
         {
-            "lane": "STRESS_COST_DEBIT",
+            "lane": "P75_COST_DEBIT",
             "dates": anchor["calendar_dates"],
-            "daily_values": anchor["daily_stress_cost_returns"],
+            "daily_values": anchor["daily_p75_cost_returns"],
         }
     )
     anchor["base_vector_sha256"] = _sha(
@@ -757,17 +762,17 @@ def _refresh_anchor_hashes(anchor: dict, *, derive_activity: bool = True) -> Non
             "daily_values": anchor["daily_base_net_mtm_returns"],
         }
     )
-    anchor["stress_vector_sha256"] = _sha(
+    anchor["p75_vector_sha256"] = _sha(
         {
-            "lane": "STRESS",
+            "lane": "P75",
             "dates": anchor["calendar_dates"],
-            "daily_values": anchor["daily_stress_net_mtm_returns"],
+            "daily_values": anchor["daily_p75_net_mtm_returns"],
         }
     )
     if derive_activity:
         gross = [Decimal(value) for value in anchor["daily_gross_mtm_returns"]]
         base_cost = [Decimal(value) for value in anchor["daily_base_cost_returns"]]
-        stress_cost = [Decimal(value) for value in anchor["daily_stress_cost_returns"]]
+        p75_cost = [Decimal(value) for value in anchor["daily_p75_cost_returns"]]
         (
             completed_outcomes,
             observed_holding,
@@ -779,7 +784,7 @@ def _refresh_anchor_hashes(anchor: dict, *, derive_activity: bool = True) -> Non
             anchor["calendar_dates"],
             gross,
             base_cost,
-            stress_cost,
+            p75_cost,
         )
         anchor["activity_ledger_sha256"] = activity_sha256
         anchor["completed_trade_count"] = len(completed_outcomes)
@@ -825,9 +830,9 @@ def _refresh_anchor_hashes(anchor: dict, *, derive_activity: bool = True) -> Non
             "cost_ledger_sha256": ledgers["cost_ledger_sha256"],
             "gross_vector_sha256": anchor["gross_vector_sha256"],
             "base_cost_vector_sha256": anchor["base_cost_vector_sha256"],
-            "stress_cost_vector_sha256": anchor["stress_cost_vector_sha256"],
+            "p75_cost_vector_sha256": anchor["p75_cost_vector_sha256"],
             "base_vector_sha256": anchor["base_vector_sha256"],
-            "stress_vector_sha256": anchor["stress_vector_sha256"],
+            "p75_vector_sha256": anchor["p75_vector_sha256"],
         }
     )
     replay_output = _sha(
@@ -843,7 +848,7 @@ def _refresh_anchor_hashes(anchor: dict, *, derive_activity: bool = True) -> Non
             "fill_ledger_sha256": ledgers["fill_ledger_sha256"],
             "gross_vector_sha256": anchor["gross_vector_sha256"],
             "base_vector_sha256": anchor["base_vector_sha256"],
-            "stress_vector_sha256": anchor["stress_vector_sha256"],
+            "p75_vector_sha256": anchor["p75_vector_sha256"],
         }
     )
     outputs["risk_execution_sha256"] = risk_output
@@ -866,30 +871,30 @@ def _refresh_anchor_hashes(anchor: dict, *, derive_activity: bool = True) -> Non
     )
 
 
-def _set_net_vectors(anchor: dict, base: list[str], stress: list[str]) -> None:
-    if len(base) != len(stress):
-        raise AssertionError("base and stress fixtures must have equal length")
+def _set_net_vectors(anchor: dict, base: list[str], p75: list[str]) -> None:
+    if len(base) != len(p75):
+        raise AssertionError("base and p75 fixtures must have equal length")
     gross: list[str] = []
     base_cost: list[str] = []
-    stress_cost: list[str] = []
+    p75_cost: list[str] = []
     normalized_base: list[str] = []
-    normalized_stress: list[str] = []
-    for base_text, stress_text in zip(base, stress, strict=True):
+    normalized_p75: list[str] = []
+    for base_text, p75_text in zip(base, p75, strict=True):
         base_value = Decimal(base_text)
-        stress_value = Decimal(stress_text)
-        if stress_value > base_value:
-            raise AssertionError("stress fixture cannot exceed base")
+        p75_value = Decimal(p75_text)
+        if p75_value > base_value:
+            raise AssertionError("p75 fixture cannot exceed base")
         gross_value = base_value + Decimal("0.0002")
         gross.append(format(gross_value, ".12f"))
         base_cost.append("-0.000200000000")
-        stress_cost.append(format(stress_value - gross_value, ".12f"))
+        p75_cost.append(format(p75_value - gross_value, ".12f"))
         normalized_base.append(format(base_value, ".12f"))
-        normalized_stress.append(format(stress_value, ".12f"))
+        normalized_p75.append(format(p75_value, ".12f"))
     anchor["daily_gross_mtm_returns"] = gross
     anchor["daily_base_cost_returns"] = base_cost
-    anchor["daily_stress_cost_returns"] = stress_cost
+    anchor["daily_p75_cost_returns"] = p75_cost
     anchor["daily_base_net_mtm_returns"] = normalized_base
-    anchor["daily_stress_net_mtm_returns"] = normalized_stress
+    anchor["daily_p75_net_mtm_returns"] = normalized_p75
     _set_activity_ledger_from_vectors(anchor)
 
 
@@ -909,7 +914,7 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     )
     closing_primitive_keys = (
         "position_id",
@@ -919,7 +924,7 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     )
     equity = Decimal("1000")
     opening_mid = Decimal("100")
@@ -927,9 +932,9 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
     for index, date_text in enumerate(anchor["calendar_dates"]):
         position_id = f"{anchor['anchor_id']}:position:{index:04d}"
         base_cost_cash = -Decimal(anchor["daily_base_cost_returns"][index]) * equity
-        stress_cost_cash = -Decimal(anchor["daily_stress_cost_returns"][index]) * equity
+        p75_cost_cash = -Decimal(anchor["daily_p75_cost_returns"][index]) * equity
         base_half_cost = base_cost_cash / Decimal(2)
-        stress_half_cost = stress_cost_cash / Decimal(2)
+        p75_half_cost = p75_cost_cash / Decimal(2)
         mark_price = (
             opening_mid + Decimal(anchor["daily_gross_mtm_returns"][index]) * equity
         )
@@ -947,7 +952,7 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
             "reference_bid_price": format(opening_mid - Decimal("0.01"), ".12f"),
             "reference_ask_price": format(opening_mid + Decimal("0.01"), ".12f"),
             "base_fill_price": format(opening_mid + base_half_cost, ".12f"),
-            "stress_fill_price": format(opening_mid + stress_half_cost, ".12f"),
+            "p75_fill_price": format(opening_mid + p75_half_cost, ".12f"),
         }
         entry["opening_fill_payload_sha256"] = _sha(
             {
@@ -964,7 +969,7 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
             "mark_bid_price": format(mark_price - Decimal("0.01"), ".12f"),
             "mark_ask_price": format(mark_price + Decimal("0.01"), ".12f"),
             "base_financing_cash": "0",
-            "stress_financing_cash": "0",
+            "p75_financing_cash": "0",
         }
         mark["market_mark_payload_sha256"] = _sha(
             {
@@ -987,7 +992,7 @@ def _set_activity_ledger_from_vectors(anchor: dict) -> None:
             "reference_bid_price": mark["mark_bid_price"],
             "reference_ask_price": mark["mark_ask_price"],
             "base_fill_price": format(mark_price - base_half_cost, ".12f"),
-            "stress_fill_price": format(mark_price - stress_half_cost, ".12f"),
+            "p75_fill_price": format(mark_price - p75_half_cost, ".12f"),
         }
         exit_fill["closing_fill_payload_sha256"] = _sha(
             {
@@ -1030,7 +1035,7 @@ def _refresh_opening_fill_payload(anchor: dict, fill: dict) -> None:
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     )
     fill["opening_fill_payload_sha256"] = _sha(
         {
@@ -1050,7 +1055,7 @@ def _refresh_closing_fill_payload(anchor: dict, fill: dict) -> None:
         "reference_bid_price",
         "reference_ask_price",
         "base_fill_price",
-        "stress_fill_price",
+        "p75_fill_price",
     )
     fill["closing_fill_payload_sha256"] = _sha(
         {
@@ -1071,7 +1076,7 @@ def _anchor(plan: dict, index: int, forward_lineage: dict) -> dict:
         0.0012 + index * 0.00002,
         0.003,
     )
-    stress = [format(Decimal(value) - Decimal("0.00015"), ".12f") for value in base]
+    p75 = [format(Decimal(value) - Decimal("0.00015"), ".12f") for value in base]
     cells = [
         _cell(anchor_id, cutoff, cell_index) for cell_index in range(process.CELL_COUNT)
     ]
@@ -1118,12 +1123,12 @@ def _anchor(plan: dict, index: int, forward_lineage: dict) -> dict:
         "gross_vector_sha256": "",
         "daily_base_cost_returns": [],
         "base_cost_vector_sha256": "",
-        "daily_stress_cost_returns": [],
-        "stress_cost_vector_sha256": "",
+        "daily_p75_cost_returns": [],
+        "p75_cost_vector_sha256": "",
         "daily_base_net_mtm_returns": [],
         "base_vector_sha256": "",
-        "daily_stress_net_mtm_returns": [],
-        "stress_vector_sha256": "",
+        "daily_p75_net_mtm_returns": [],
+        "p75_vector_sha256": "",
         "activity_ledger": {},
         "activity_ledger_sha256": "",
         "completed_trade_count": 0,
@@ -1147,7 +1152,7 @@ def _anchor(plan: dict, index: int, forward_lineage: dict) -> dict:
             key: _h(f"{anchor_id}:ledger:{key}") for key in process.LEDGER_IDENTITY_KEYS
         },
     }
-    _set_net_vectors(anchor, base, stress)
+    _set_net_vectors(anchor, base, p75)
     _refresh_anchor_hashes(anchor)
     return anchor
 
@@ -1164,21 +1169,21 @@ def _reconciliation_anchor(anchor: dict) -> dict:
         "calendar_dates": copy.deepcopy(anchor["calendar_dates"]),
         "daily_gross_mtm_returns": copy.deepcopy(anchor["daily_gross_mtm_returns"]),
         "daily_base_cost_returns": copy.deepcopy(anchor["daily_base_cost_returns"]),
-        "daily_stress_cost_returns": copy.deepcopy(anchor["daily_stress_cost_returns"]),
+        "daily_p75_cost_returns": copy.deepcopy(anchor["daily_p75_cost_returns"]),
         "daily_base_net_mtm_returns": copy.deepcopy(
             anchor["daily_base_net_mtm_returns"]
         ),
-        "daily_stress_net_mtm_returns": copy.deepcopy(
-            anchor["daily_stress_net_mtm_returns"]
+        "daily_p75_net_mtm_returns": copy.deepcopy(
+            anchor["daily_p75_net_mtm_returns"]
         ),
         "activity_ledger": copy.deepcopy(anchor["activity_ledger"]),
         "activity_ledger_sha256": anchor["activity_ledger_sha256"],
         "calendar_sha256": anchor["calendar_sha256"],
         "gross_vector_sha256": anchor["gross_vector_sha256"],
         "base_cost_vector_sha256": anchor["base_cost_vector_sha256"],
-        "stress_cost_vector_sha256": anchor["stress_cost_vector_sha256"],
+        "p75_cost_vector_sha256": anchor["p75_cost_vector_sha256"],
         "base_vector_sha256": anchor["base_vector_sha256"],
-        "stress_vector_sha256": anchor["stress_vector_sha256"],
+        "p75_vector_sha256": anchor["p75_vector_sha256"],
         "completed_trade_count": anchor["completed_trade_count"],
         "completed_trade_outcomes": copy.deepcopy(anchor["completed_trade_outcomes"]),
         "trade_vector_sha256": anchor["trade_vector_sha256"],
@@ -1252,7 +1257,7 @@ def _build_corpus() -> Corpus:
         },
     ]
     definition = {
-        "schema": "fxpm-frozen-historical-institution-process-v9",
+        "schema": "fxpm-frozen-historical-institution-process-v10",
         "symbols": list(process.SYMBOLS),
         "timeframes": list(process.TIMEFRAMES),
         "regimes": list(process.REGIMES),
@@ -1402,11 +1407,11 @@ def test_plain_exported_payloads_construct_and_2026_clocks_govern_old_cutoffs(
     assert body["evaluated_at_utc"].startswith("2026-")
     policy = process.pinned_process_policy()
     assert policy["book_multiplicity_contract_version"] == (
-        "fxpm.book-multiplicity.v13"
+        "fxpm.book-multiplicity.v14"
     )
-    assert policy["winner_selection_contract_version"] == ("fxpm.winner-selection.v13")
+    assert policy["winner_selection_contract_version"] == ("fxpm.winner-selection.v14")
     assert policy["winner_evidence_ledger_version"] == (
-        "fxpm.winner-evidence-ledger.v4"
+        "fxpm.winner-evidence-ledger.v6"
     )
     assert policy["regime_fit_contract_version"] == "fxpm.historical-regime-fit.v4"
     assert policy["regime_detector_record_schema_version"] == (
@@ -1436,12 +1441,12 @@ def test_plain_exported_payloads_construct_and_2026_clocks_govern_old_cutoffs(
     assert float(body["metrics"]["pooled_base_log_growth_mean_diagnostic"]) > 0
     assert body["confirmatory_inference_status"] == "PASS"
     variance_candidates = [
-        Decimal(body["metrics"]["stress_log_growth_primary_hac_variance"]),
-        Decimal(body["metrics"]["stress_log_growth_sensitivity_hac_variance"]),
-        Decimal(body["metrics"]["stress_log_growth_anchor_cluster_variance"]),
-        Decimal(body["metrics"]["stress_log_growth_daily_ips_variance"]),
+        Decimal(body["metrics"]["p75_log_growth_primary_hac_variance"]),
+        Decimal(body["metrics"]["p75_log_growth_sensitivity_hac_variance"]),
+        Decimal(body["metrics"]["p75_log_growth_anchor_cluster_variance"]),
+        Decimal(body["metrics"]["p75_log_growth_daily_ips_variance"]),
     ]
-    selected_variance = Decimal(body["metrics"]["stress_log_growth_selected_variance"])
+    selected_variance = Decimal(body["metrics"]["p75_log_growth_selected_variance"])
     assert selected_variance == max(variance_candidates)
     assert selected_variance < sum(variance_candidates, Decimal(0))
     assert process.verify_historical_process_decision(
@@ -2570,9 +2575,9 @@ def test_omitted_calendar_day_and_scalar_only_evidence_are_rejected(
     anchor["calendar_dates"].pop(100)
     anchor["daily_gross_mtm_returns"].pop(100)
     anchor["daily_base_cost_returns"].pop(100)
-    anchor["daily_stress_cost_returns"].pop(100)
+    anchor["daily_p75_cost_returns"].pop(100)
     anchor["daily_base_net_mtm_returns"].pop(100)
-    anchor["daily_stress_net_mtm_returns"].pop(100)
+    anchor["daily_p75_net_mtm_returns"].pop(100)
     _refresh_anchor_hashes(anchor, derive_activity=False)
     omitted.refresh_reconciliation()
     with pytest.raises(process.ProcessVerificationError, match="omits"):
@@ -2649,14 +2654,14 @@ def test_zero_completed_positions_cannot_supply_nonzero_mtm_evidence(
     zeros = ["0.000000000000"] * count
     anchor["daily_gross_mtm_returns"] = list(zeros)
     anchor["daily_base_cost_returns"] = list(zeros)
-    anchor["daily_stress_cost_returns"] = list(zeros)
+    anchor["daily_p75_cost_returns"] = list(zeros)
     anchor["daily_base_net_mtm_returns"] = list(zeros)
-    anchor["daily_stress_net_mtm_returns"] = list(zeros)
+    anchor["daily_p75_net_mtm_returns"] = list(zeros)
     anchor["daily_gross_mtm_returns"][-1] = "0.001200000000"
     anchor["daily_base_cost_returns"][-1] = "-0.000200000000"
-    anchor["daily_stress_cost_returns"][-1] = "-0.000300000000"
+    anchor["daily_p75_cost_returns"][-1] = "-0.000300000000"
     anchor["daily_base_net_mtm_returns"][-1] = "0.001000000000"
-    anchor["daily_stress_net_mtm_returns"][-1] = "0.000900000000"
+    anchor["daily_p75_net_mtm_returns"][-1] = "0.000900000000"
     _set_activity_ledger_from_vectors(anchor)
     for day in anchor["activity_ledger"]["days"][:-1]:
         day["entries"] = []
@@ -2665,7 +2670,7 @@ def test_zero_completed_positions_cannot_supply_nonzero_mtm_evidence(
     final_day = anchor["activity_ledger"]["days"][-1]
     entry = final_day["entries"][0]
     entry["base_fill_price"] = "100.200000000000"
-    entry["stress_fill_price"] = "100.300000000000"
+    entry["p75_fill_price"] = "100.300000000000"
     _refresh_opening_fill_payload(anchor, entry)
     final_day["exits"] = []
     _refresh_anchor_hashes(anchor)
@@ -2710,9 +2715,9 @@ def test_carried_position_and_risk_cost_evidence_must_replay_from_activity(
     mark_price = Decimal(first_day["position_marks"][0]["mark_price"])
     exit_fill = first_day["exits"][0]
     base_cost_cash = -Decimal(anchor["daily_base_cost_returns"][0]) * equity
-    stress_cost_cash = -Decimal(anchor["daily_stress_cost_returns"][0]) * equity
+    p75_cost_cash = -Decimal(anchor["daily_p75_cost_returns"][0]) * equity
     exit_fill["base_fill_price"] = format(mark_price - base_cost_cash, ".12f")
-    exit_fill["stress_fill_price"] = format(mark_price - stress_cost_cash, ".12f")
+    exit_fill["p75_fill_price"] = format(mark_price - p75_cost_cash, ".12f")
     _refresh_closing_fill_payload(anchor, exit_fill)
     _refresh_anchor_hashes(anchor)
     carried.refresh_reconciliation()
@@ -2755,7 +2760,7 @@ def test_carried_position_and_risk_cost_evidence_must_replay_from_activity(
         anchor["calendar_dates"],
         [Decimal(value) for value in anchor["daily_gross_mtm_returns"]],
         [Decimal(value) for value in anchor["daily_base_cost_returns"]],
-        [Decimal(value) for value in anchor["daily_stress_cost_returns"]],
+        [Decimal(value) for value in anchor["daily_p75_cost_returns"]],
     )
     anchor["activity_ledger_sha256"] = activity_sha
     anchor["ledger_identities"] = ledgers
@@ -2905,7 +2910,7 @@ def test_negative_newest_anchor_mean_rejects_without_per_anchor_lcb_conjunction(
     body = _evaluate(corpus).body()
     assert body["decision"] == "OFFLINE_PROCESS_VALIDATION_FAIL"
     assert body["failure_reasons"] == [
-        "newest_anchor_stress_log_growth_mean_above_zero"
+        "newest_anchor_p75_log_growth_mean_above_zero"
     ]
     assert process.pinned_process_policy()["per_anchor_hac_lcb_gate"] is False
 
@@ -2919,16 +2924,16 @@ def test_equal_numeric_vectors_with_unique_evidence_are_statistically_evaluated(
         base = [
             "0.011" if (index // 35) % 2 == 0 else "-0.009" for index in range(count)
         ]
-        stress = [format(Decimal(value) - Decimal("0.0002"), ".12f") for value in base]
-        _set_net_vectors(anchor, base, stress)
+        p75 = [format(Decimal(value) - Decimal("0.0002"), ".12f") for value in base]
+        _set_net_vectors(anchor, base, p75)
         _refresh_anchor_hashes(anchor)
     corpus.refresh_reconciliation()
     body = _evaluate(corpus).body()
     assert body["decision"] == "OFFLINE_PROCESS_VALIDATION_FAIL"
     assert body["gates"]["base_between_anchor_log_growth_variation"] is False
-    assert body["gates"]["stress_between_anchor_log_growth_variation"] is False
+    assert body["gates"]["p75_between_anchor_log_growth_variation"] is False
     assert body["gates"]["base_distinct_anchor_log_growth_means"] is False
-    assert body["gates"]["stress_distinct_anchor_log_growth_means"] is False
+    assert body["gates"]["p75_distinct_anchor_log_growth_means"] is False
 
 
 def test_precommitted_fixed_hac_bandwidths_feed_one_max_variance_gate(
@@ -2940,8 +2945,8 @@ def test_precommitted_fixed_hac_bandwidths_feed_one_max_variance_gate(
         base = _centered_block_pattern(
             count, block=20, mean=0.0005 + anchor_index * 0.000001, sigma=0.01
         )
-        stress = [format(Decimal(value) - Decimal("0.00015"), ".12f") for value in base]
-        _set_net_vectors(anchor, base, stress)
+        p75 = [format(Decimal(value) - Decimal("0.00015"), ".12f") for value in base]
+        _set_net_vectors(anchor, base, p75)
         _refresh_anchor_hashes(anchor)
     corpus.refresh_reconciliation()
     body = _evaluate(corpus).body()
@@ -2949,12 +2954,12 @@ def test_precommitted_fixed_hac_bandwidths_feed_one_max_variance_gate(
     assert body["metrics"]["sensitivity_hac_bandwidth_calendar_days"] == 68
     metrics = body["metrics"]
     assert (
-        metrics["stress_log_growth_primary_hac_variance"]
-        != metrics["stress_log_growth_sensitivity_hac_variance"]
+        metrics["p75_log_growth_primary_hac_variance"]
+        != metrics["p75_log_growth_sensitivity_hac_variance"]
     )
-    selected = Decimal(metrics["stress_log_growth_selected_variance"])
-    assert selected >= Decimal(metrics["stress_log_growth_primary_hac_variance"])
-    assert selected >= Decimal(metrics["stress_log_growth_sensitivity_hac_variance"])
+    selected = Decimal(metrics["p75_log_growth_selected_variance"])
+    assert selected >= Decimal(metrics["p75_log_growth_primary_hac_variance"])
+    assert selected >= Decimal(metrics["p75_log_growth_sensitivity_hac_variance"])
     assert metrics["fixed_hac_role"] == (
         "VARIANCE_CANDIDATES_AND_DIAGNOSTICS_NOT_SEPARATE_TESTS"
     )
@@ -2975,15 +2980,15 @@ def test_180_day_dependence_cannot_bypass_the_max_variance_estimator(
             mean=Decimal("0.002") + Decimal(anchor_index) * Decimal("0.000001"),
             amplitude=Decimal("0.005"),
         )
-        stress = [format(Decimal(value) - Decimal("0.0001"), ".12f") for value in base]
-        _set_net_vectors(anchor, base, stress)
+        p75 = [format(Decimal(value) - Decimal("0.0001"), ".12f") for value in base]
+        _set_net_vectors(anchor, base, p75)
         _refresh_anchor_hashes(anchor)
     corpus.refresh_reconciliation()
     body = _evaluate(corpus).body()
     metrics = body["metrics"]
-    selected = Decimal(metrics["stress_log_growth_selected_variance"])
-    primary = Decimal(metrics["stress_log_growth_primary_hac_variance"])
-    sensitivity = Decimal(metrics["stress_log_growth_sensitivity_hac_variance"])
+    selected = Decimal(metrics["p75_log_growth_selected_variance"])
+    primary = Decimal(metrics["p75_log_growth_primary_hac_variance"])
+    sensitivity = Decimal(metrics["p75_log_growth_sensitivity_hac_variance"])
     assert sensitivity > primary
     assert selected >= sensitivity
     assert body["decision"] != "OFFLINE_PROCESS_VALIDATION_PASS"
@@ -3006,7 +3011,7 @@ def test_one_profitable_day_per_anchor_cannot_create_process_evidence(
     body = _evaluate(corpus).body()
     assert body["decision"] == "OFFLINE_PROCESS_VALIDATION_FAIL"
     assert body["confirmatory_inference_status"] == "FAIL"
-    assert "stress_log_growth_confirmatory_lcb_above_zero" in body["failure_reasons"]
+    assert "p75_log_growth_confirmatory_lcb_above_zero" in body["failure_reasons"]
     assert (
         Decimal(
             body["metrics"][
@@ -3029,18 +3034,18 @@ def test_positive_arithmetic_mean_cannot_authorize_compounding_loss(
             format(gain if index % 2 == 0 else loss, ".12f") for index in range(count)
         ]
         random.Random(900 + anchor_index).shuffle(base)
-        stress = [format(Decimal(value) - Decimal("0.0001"), ".12f") for value in base]
-        _set_net_vectors(anchor, base, stress)
+        p75 = [format(Decimal(value) - Decimal("0.0001"), ".12f") for value in base]
+        _set_net_vectors(anchor, base, p75)
         _refresh_anchor_hashes(anchor)
     corpus.refresh_reconciliation()
 
     body = _evaluate(corpus).body()
     metrics = body["metrics"]
-    assert Decimal(metrics["pooled_stress_arithmetic_return_mean_diagnostic"]) > 0
-    assert Decimal(metrics["pooled_stress_log_growth_mean"]) < 0
+    assert Decimal(metrics["pooled_p75_arithmetic_return_mean_diagnostic"]) > 0
+    assert Decimal(metrics["pooled_p75_log_growth_mean"]) < 0
     assert body["confirmatory_inference_status"] == "FAIL"
     assert body["decision"] == "OFFLINE_PROCESS_VALIDATION_FAIL"
-    assert "stress_log_growth_confirmatory_lcb_above_zero" in body["failure_reasons"]
+    assert "p75_log_growth_confirmatory_lcb_above_zero" in body["failure_reasons"]
 
 
 def test_v4_calibration_retains_power_without_null_false_passes() -> None:
@@ -3065,7 +3070,7 @@ def test_v4_calibration_retains_power_without_null_false_passes() -> None:
             reconciliation_time=datetime(2026, 7, 13),
             anchors=[{"completed_trade_count": 1} for _ in range(4)],
             base_vectors=vectors,
-            stress_vectors=vectors,
+            p75_vectors=vectors,
         )["decision"]
 
     strong_edge_passes = sum(
@@ -3173,9 +3178,9 @@ def test_empty_anchor_evidence_cannot_create_a_process_pass(valid_corpus) -> Non
     zeros = ["0.000000000000"] * count
     anchor["daily_gross_mtm_returns"] = list(zeros)
     anchor["daily_base_cost_returns"] = list(zeros)
-    anchor["daily_stress_cost_returns"] = list(zeros)
+    anchor["daily_p75_cost_returns"] = list(zeros)
     anchor["daily_base_net_mtm_returns"] = list(zeros)
-    anchor["daily_stress_net_mtm_returns"] = list(zeros)
+    anchor["daily_p75_net_mtm_returns"] = list(zeros)
     anchor["activity_ledger"] = {
         "schema": "fxpm-anchor-economic-position-activity-ledger-v3",
         "initial_positions": [],
@@ -3197,10 +3202,10 @@ def test_empty_anchor_evidence_cannot_create_a_process_pass(valid_corpus) -> Non
     body = _evaluate(corpus).body()
     assert body["decision"] == "OFFLINE_PROCESS_VALIDATION_FAIL"
     assert body["gates"]["base_positive_within_anchor_log_growth_variance"] is False
-    assert body["gates"]["stress_positive_within_anchor_log_growth_variance"] is False
+    assert body["gates"]["p75_positive_within_anchor_log_growth_variance"] is False
     assert "base_positive_within_anchor_log_growth_variance" in body["failure_reasons"]
     assert (
-        "stress_positive_within_anchor_log_growth_variance" in body["failure_reasons"]
+        "p75_positive_within_anchor_log_growth_variance" in body["failure_reasons"]
     )
 
 
@@ -3360,14 +3365,14 @@ def test_four_anchor_cluster_variance_rejects_z_false_positive(valid_corpus) -> 
             )
             for index in range(count)
         ]
-        stress = [format(Decimal(value) - Decimal("0.00001"), ".12f") for value in base]
-        _set_net_vectors(anchor, base, stress)
+        p75 = [format(Decimal(value) - Decimal("0.00001"), ".12f") for value in base]
+        _set_net_vectors(anchor, base, p75)
         _refresh_anchor_hashes(anchor)
     corpus.refresh_reconciliation()
     body = _evaluate(corpus).body()
     assert body["decision"] == "OFFLINE_PROCESS_VALIDATION_FAIL"
-    assert Decimal(body["metrics"]["stress_log_growth_confirmatory_lcb"]) < 0
-    assert "stress_log_growth_confirmatory_lcb_above_zero" in body["failure_reasons"]
+    assert Decimal(body["metrics"]["p75_log_growth_confirmatory_lcb"]) < 0
+    assert "p75_log_growth_confirmatory_lcb_above_zero" in body["failure_reasons"]
     assert body["metrics"]["small_cluster_degrees_of_freedom"] == 3
     assert body["metrics"]["small_cluster_one_sided_critical_value"].startswith(
         "2.353363"
@@ -3477,15 +3482,15 @@ def test_long_memory_phase_variants_do_not_manufacture_process_power(
             else format(Decimal("-0.001") + level_shift, ".12f")
             for index in range(count)
         ]
-        stress = [format(Decimal(value) - Decimal("0.0001"), ".12f") for value in base]
-        _set_net_vectors(anchor, base, stress)
+        p75 = [format(Decimal(value) - Decimal("0.0001"), ".12f") for value in base]
+        _set_net_vectors(anchor, base, p75)
         _refresh_anchor_hashes(anchor)
     corpus.refresh_reconciliation()
     body = _evaluate(corpus).body()
     assert body["decision"] == "OFFLINE_PROCESS_VALIDATION_DEPENDENCE_INSUFFICIENT"
     assert body["confirmatory_inference_status"] == "DEPENDENCE_INSUFFICIENT"
     assert body["insufficiency_reasons"] == [
-        "stress_log_growth_ips_positive_sequence_unresolved_through_lag_67"
+        "p75_log_growth_ips_positive_sequence_unresolved_through_lag_67"
     ]
 
 
@@ -3503,15 +3508,15 @@ def test_risk_cost_and_cell_lineage_are_executable_not_opaque(valid_corpus) -> N
     cost = _owned(valid_corpus)
     anchor = cost.evidence_payload["anchors"][0]
     gross = Decimal(anchor["daily_gross_mtm_returns"][0])
-    anchor["daily_stress_cost_returns"][0] = "-0.000100000000"
-    anchor["daily_stress_net_mtm_returns"][0] = format(
+    anchor["daily_p75_cost_returns"][0] = "-0.000100000000"
+    anchor["daily_p75_net_mtm_returns"][0] = format(
         gross - Decimal("0.0001"), ".12f"
     )
     _refresh_anchor_hashes(anchor, derive_activity=False)
     cost.refresh_reconciliation()
     with pytest.raises(
         process.ProcessVerificationError,
-        match="stress cumulative cost prefix improves on base",
+        match="p75 cumulative cost prefix improves on base",
     ):
         _evaluate(cost)
 

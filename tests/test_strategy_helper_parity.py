@@ -1,7 +1,11 @@
+import importlib.util
 import unittest
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from pm_strategies import (
     AroonTrendStrategy,
@@ -59,6 +63,79 @@ def _naive_kaufman_ama(close: np.ndarray, er_period: int, fast_period: int, slow
         sc = (er * (fast_sc - slow_sc) + slow_sc) ** 2
         ama[i] = ama[i - 1] + sc * (close[i] - ama[i - 1])
     return ama
+
+
+@lru_cache(maxsize=1)
+def _stage_a_oracle():
+    path = (Path(__file__).resolve().parents[1] / "audit_reports/fxpm_workshop_20261007"
+            / "coupled_strategy_domain_trim_verification/stage_a_oracle.py")
+    spec = importlib.util.spec_from_file_location("fxpm_stage_a_oracle", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("index_kind", ["utc", "range", "nonmonotonic"])
+@pytest.mark.parametrize("case", [
+    "finite", "flat", "missing-open", "missing-close", "missing-both",
+    "nan-high-low", "numeric-strings", "nullable", "empty",
+])
+def test_candle_parts_matches_original_outputs_and_preserves_input(case, index_kind):
+    oracle = _stage_a_oracle()
+    oracle.assert_candle_equal(oracle.candle_frame(case, index_kind))
+
+
+@pytest.mark.parametrize("ordinal", range(33))
+def test_candle_callers_preserve_original_default_and_variant_signals(ordinal):
+    oracle = _stage_a_oracle()
+    name, parameters = oracle.candle_parameter_cases()[ordinal]
+    oracle.assert_signal_equal(name, parameters, oracle.market_frame(),
+                               label=f"original roster {ordinal}:{name}")
+
+
+@pytest.mark.parametrize("inside", [1, 2, 3])
+@pytest.mark.parametrize("age", [5, 10, 20, 40])
+def test_inside_bar_matches_original_for_every_entry_domain_pair(inside, age):
+    oracle = _stage_a_oracle()
+    for label, frame in oracle.inside_edge_frames(inside, age):
+        oracle.assert_signal_equal("InsideBarBreakoutStrategy", {
+            "min_inside_bars": inside, "setup_max_age_bars": age,
+        }, frame, label=f"inside={inside},age={age}:{label}")
+
+
+@pytest.mark.parametrize("channel", [10, 15, 20, 25])
+@pytest.mark.parametrize("window", [1, 2, 3])
+def test_turtle_soup_matches_original_for_every_entry_domain_pair(channel, window):
+    oracle = _stage_a_oracle()
+    for label, frame in oracle.turtle_edge_frames(channel, window):
+        oracle.assert_signal_equal("TurtleSoupReversalStrategy", {
+            "channel_period": channel, "reclaim_window": window,
+        }, frame, label=f"channel={channel},window={window}:{label}")
+
+
+@pytest.mark.parametrize("copy_on_write", [False, True])
+@pytest.mark.parametrize("name", ["InsideBarBreakoutStrategy", "TurtleSoupReversalStrategy"])
+def test_structure_signal_arrays_preserve_copy_on_write_and_nullable_errors(name, copy_on_write):
+    oracle = _stage_a_oracle()
+    with pd.option_context("mode.copy_on_write", copy_on_write):
+        oracle.assert_signal_equal(name, {}, oracle.market_frame(),
+                                   label=f"{name}:copy_on_write={copy_on_write}")
+        frame = oracle.market_frame(80)
+        for column in ("Open", "High", "Low", "Close"):
+            frame[column] = frame[column].astype("Float64")
+        if name == "InsideBarBreakoutStrategy":
+            frame.loc[frame.index[1], "High"] = pd.NA
+        else:
+            frame.loc[frame.index[30], "Close"] = pd.NA
+        strategy = getattr(oracle.pm_strategies, name)()
+        original_input, current_input = frame.copy(deep=True), frame.copy(deep=True)
+        with pytest.raises(TypeError) as original_error:
+            oracle.original_functions()[name](strategy, original_input, "TEST")
+        with pytest.raises(type(original_error.value)) as current_error:
+            strategy.generate_signals(current_input, "TEST")
+        assert str(current_error.value) == str(original_error.value)
+        pd.testing.assert_frame_equal(original_input, frame, check_exact=True)
+        pd.testing.assert_frame_equal(current_input, frame, check_exact=True)
 
 
 class StrategyHelperParityTests(unittest.TestCase):

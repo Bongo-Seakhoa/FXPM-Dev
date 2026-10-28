@@ -184,7 +184,13 @@ def test_manual_request_consumption_burns_real_executor_facade(
     context, process, causal_precommit, request = _issued_request(tmp_path, monkeypatch)
     orchestration.consume_bounded_raw_winner_canary_request(context, request)
 
-    with pytest.raises(Exception, match="CANARY_REQUEST_ALREADY_CONSUMED"):
+    with pytest.raises(
+        orchestration.HistoricalAnchorOrchestrationError,
+        match="^CANARY_REQUEST_ALREADY_CONSUMED$",
+    ):
+        orchestration.consume_bounded_raw_winner_canary_request(context, request)
+
+    with pytest.raises(search_execution.AuthoritativeSearchExecutionError) as caught:
         search_execution.execute_bounded_raw_winner_canary(
             context=context,
             request=request,
@@ -192,6 +198,10 @@ def test_manual_request_consumption_burns_real_executor_facade(
             causal_precommit_payload=causal_precommit.to_dict(),
             frozen_pipeline_config=object(),
         )
+
+    assert caught.value.code == (
+        "RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED"
+    )
 
 
 def test_request_consumption_is_atomic_under_concurrency(
@@ -376,7 +386,7 @@ def _mock_cli_dependencies(
     causal = SimpleNamespace(to_dict=lambda: {})
     monkeypatch.setattr(
         causal_producer,
-        "freeze_causal_process_precommit_v9",
+        "freeze_causal_process_precommit_v10",
         lambda **_kwargs: causal,
     )
     request = object()

@@ -127,7 +127,7 @@ class ResampleCacheTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_resample_cache_invalidates_old_schema_without_spread_p95(self):
+    def test_resample_cache_invalidates_retired_schema_v3(self):
         tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_resample_cache_schema")
         shutil.rmtree(tmp, ignore_errors=True)
         tmp.mkdir(parents=True, exist_ok=True)
@@ -142,19 +142,30 @@ class ResampleCacheTests(unittest.TestCase):
                 loader = DataLoader(tmp)
                 first = loader.get_data("EURUSD", "H1")
                 self.assertIsNotNone(first)
-                self.assertIn("SpreadP95", first.columns)
+                self.assertEqual(
+                    sorted(
+                        column for column in first.columns
+                        if column.startswith("Spread")
+                    ),
+                    ["Spread", "SpreadMax", "SpreadOpen"],
+                )
 
                 cache_file = tmp / ".cache" / "EURUSD_H1.pkl"
                 payload = pd.read_pickle(cache_file)
-                payload["meta"].pop("schema_version", None)
-                payload["data"] = payload["data"].drop(columns=["SpreadP95"], errors="ignore")
+                payload["meta"]["schema_version"] = 3
                 pd.to_pickle(payload, cache_file)
 
                 loader2 = DataLoader(tmp)
                 second = loader2.get_data("EURUSD", "H1")
                 stats = loader2.get_resample_cache_stats()
                 self.assertIsNotNone(second)
-                self.assertIn("SpreadP95", second.columns)
+                self.assertEqual(
+                    sorted(
+                        column for column in second.columns
+                        if column.startswith("Spread")
+                    ),
+                    ["Spread", "SpreadMax", "SpreadOpen"],
+                )
                 self.assertEqual(stats["invalidations"], 1)
                 self.assertEqual(stats["disk_hits"], 0)
             finally:

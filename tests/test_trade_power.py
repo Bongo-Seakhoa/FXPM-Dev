@@ -258,13 +258,14 @@ def _source_contract(
     numerical_cost_inputs = {
         "use_spread": True,
         "spread_mode": "conservative_max",
-        "spread_values_sha256": "a" * 64,
+        "entry_half_spread_values_sha256": "a" * 64,
+        "intrabar_half_spread_values_sha256": "b" * 64,
         "instrument_spec_sha256": "c" * 64,
     }
     numerical_cost_inputs.update(dict(cost_overrides or {}))
     numerical_cost = build_numerical_execution_cost_attestation(**numerical_cost_inputs)
     return {
-        "schema_version": "fxpm-trade-evidence-source-v4",
+        "schema_version": "fxpm-trade-evidence-source-v5",
         "source_binding": source_binding,
         "trade_record_schema_version": "2026-07-14-position-events-v2",
         "execution_cost_timing_contract": {
@@ -287,7 +288,7 @@ def _attempt_ledger(count: int):
         ).encode("utf-8")
     ).hexdigest()
     return {
-        "contract_version": "fxpm.winner-attempt-ledger.v2",
+        "contract_version": "fxpm.winner-attempt-ledger.v3",
         "attempt_count": count,
         "attempts_sha256": attempts_sha,
         "attempts": attempts,
@@ -323,6 +324,26 @@ def _lineage(count: int):
         prior_partition_contract_sha256=tuning["contract_sha256"],
     )
     return multiplicity, train, tuning, final
+
+
+def test_multiplicity_accepts_only_winner_attempt_ledger_v3():
+    ledger = _attempt_ledger(3)
+    receipt = build_trade_power_multiplicity_receipt(ledger)
+
+    assert receipt["attempted_trials_exact"] == 3
+    assert receipt["attempt_ledger_payload_sha256"] == hashlib.sha256(
+        json.dumps(
+            ledger,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    stale = {**ledger, "contract_version": "fxpm.winner-attempt-ledger.v2"}
+    with pytest.raises(ValueError, match="contract is missing or stale"):
+        build_trade_power_multiplicity_receipt(stale)
 
 
 def _ar1(count, phi, seed=19):
@@ -510,7 +531,7 @@ def test_source_bindings_and_every_nonempty_trade_schema_are_verified():
         "target_sidecar_sha256",
     ],
 )
-def test_v4_requires_the_complete_authenticated_artifact_graph(binding_name):
+def test_v5_requires_the_complete_authenticated_artifact_graph(binding_name):
     records = _trade_records(np.linspace(-1.0, 1.0, 20))
     evidence = build_trade_sample_evidence(
         records,
@@ -521,7 +542,7 @@ def test_v4_requires_the_complete_authenticated_artifact_graph(binding_name):
     assert evidence.reason_codes == ("SOURCE_CONTRACT_BINDING_INVALID",)
 
 
-def test_v4_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
+def test_v5_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
     records = _trade_records(np.linspace(-1.0, 1.0, 20))
     missing_contract = _source_contract()
     missing_contract.pop("numerical_execution_cost_attestation")
@@ -529,7 +550,7 @@ def test_v4_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
 
     tampered_contract = _source_contract()
     tampered_contract["numerical_execution_cost_attestation"][
-        "spread_values_sha256"
+        "entry_half_spread_values_sha256"
     ] = "d" * 64
     tampered = build_trade_sample_evidence(
         records,
@@ -555,7 +576,7 @@ def test_v4_rejects_missing_tampered_or_disabled_numerical_cost_evidence():
         ("projection_sha256", "not-a-hash"),
     ],
 )
-def test_v4_requires_an_exact_slice_projection_attestation(field, value):
+def test_v5_requires_an_exact_slice_projection_attestation(field, value):
     records = _trade_records(np.linspace(-1.0, 1.0, 20))
     source = _source_contract()
     source["swap_accrual_contract"][field] = value
@@ -668,7 +689,7 @@ def test_train_calibration_freezes_sigma_multiplicity_and_all_partition_threshol
     assert len(requirement.calibration_source_contract_sha256) == 64
     assert len(requirement.calibration_partition_source_contract_sha256) == 64
     assert requirement.source_contract_schema_version == (
-        "fxpm-trade-evidence-source-v4"
+        "fxpm-trade-evidence-source-v5"
     )
     assert requirement.target_bars_sha256 == "8" * 64
     assert requirement.target_sidecar_sha256 == "9" * 64
@@ -753,7 +774,7 @@ def test_validation_half_open_partitions_reject_exit_at_end_boundary(
         prior_partition_contract=prior,
         source_contract=_source_contract(
             projection_sha256=projection_sha256,
-            cost_overrides={"spread_values_sha256": spread_sha256},
+            cost_overrides={"entry_half_spread_values_sha256": spread_sha256},
         ),
     )
 
@@ -788,7 +809,7 @@ def test_validation_window_and_event_axis_must_be_disjoint_from_train():
         prior_partition_contract=train_contract,
         source_contract=_source_contract(
             projection_sha256="d" * 64,
-            cost_overrides={"spread_values_sha256": "d" * 64},
+            cost_overrides={"entry_half_spread_values_sha256": "d" * 64},
         ),
     )
 
@@ -840,7 +861,7 @@ def test_tuning_and_lockbox_can_only_consume_not_recalibrate_frozen_requirement(
         prior_partition_contract=train_contract,
         source_contract=_source_contract(
             projection_sha256="d" * 64,
-            cost_overrides={"spread_values_sha256": "d" * 64},
+            cost_overrides={"entry_half_spread_values_sha256": "d" * 64},
         ),
     )
     lockbox = evaluate_trade_power_partition(
@@ -854,7 +875,7 @@ def test_tuning_and_lockbox_can_only_consume_not_recalibrate_frozen_requirement(
         prior_partition_contract=tuning_contract,
         source_contract=_source_contract(
             projection_sha256="e" * 64,
-            cost_overrides={"spread_values_sha256": "e" * 64},
+            cost_overrides={"entry_half_spread_values_sha256": "e" * 64},
         ),
     )
 
@@ -917,7 +938,7 @@ def test_partition_projection_digests_may_differ_on_one_frozen_artifact():
         partition_contract=train_contract,
         source_contract=_source_contract(
             projection_sha256="7" * 64,
-            cost_overrides={"spread_values_sha256": "a" * 64},
+            cost_overrides={"entry_half_spread_values_sha256": "a" * 64},
         ),
     )
     tuning = evaluate_trade_power_partition(
@@ -928,7 +949,7 @@ def test_partition_projection_digests_may_differ_on_one_frozen_artifact():
         prior_partition_contract=train_contract,
         source_contract=_source_contract(
             projection_sha256="d" * 64,
-            cost_overrides={"spread_values_sha256": "d" * 64},
+            cost_overrides={"entry_half_spread_values_sha256": "d" * 64},
         ),
     )
     final = evaluate_trade_power_partition(
@@ -939,7 +960,7 @@ def test_partition_projection_digests_may_differ_on_one_frozen_artifact():
         prior_partition_contract=tuning_contract,
         source_contract=_source_contract(
             projection_sha256="e" * 64,
-            cost_overrides={"spread_values_sha256": "e" * 64},
+            cost_overrides={"entry_half_spread_values_sha256": "e" * 64},
         ),
     )
 
@@ -1043,7 +1064,7 @@ def test_overlapping_holds_can_fail_power_despite_large_raw_trade_count():
         prior_partition_contract=train_contract,
         source_contract=_source_contract(
             projection_sha256="d" * 64,
-            cost_overrides={"spread_values_sha256": "d" * 64},
+            cost_overrides={"entry_half_spread_values_sha256": "d" * 64},
         ),
     )
 

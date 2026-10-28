@@ -12,6 +12,15 @@ import pm_core
 from pm_core import Backtester, InstrumentSpec, PipelineConfig, StrategyCategory
 from pm_strategies import BaseStrategy
 from pm_trade_power import build_numerical_execution_cost_attestation
+from pm_spread_profile import load_spread_profile
+
+
+def _frozen_daily_tier():
+    # Persisted cost values on synthetic frames; no price or profit evidence.
+    return load_spread_profile().resolve(
+        "EURUSD", "D1", "P75", point=0.00001,
+        source_identity_sha256="0be6d0831806c1a62ab723193a87a362772a14d8bf4ccbe2d3a8774962eefe09",
+    )
 
 
 class _OneShotAtrStrategy(BaseStrategy):
@@ -67,6 +76,21 @@ def _flat_daily_frame(rows: int = 3) -> pd.DataFrame:
         },
         index=index,
     )
+
+
+@pytest.mark.parametrize(
+    "mutated_mode",
+    ["stress_p90", "stress_p95", "stress_max", "wishful"],
+)
+def test_runtime_mutated_spread_mode_fails_before_spread_early_returns(mutated_mode):
+    config = PipelineConfig(use_spread=False)
+    config.backtest_spread_mode = mutated_mode
+
+    with pytest.raises(ValueError, match="invalid backtest_spread_mode at execution"):
+        Backtester(config)._build_half_spread_arrays(
+            pd.DataFrame(),
+            _fx_spec(),
+        )
 
 
 def _gap_frame() -> pd.DataFrame:
@@ -201,14 +225,18 @@ def test_empty_frame_returns_attested_result_without_entering_kernel(monkeypatch
         assert result["swap_accrual_contract"]["execution_state_compounding"] is False
         attestation = result["numerical_execution_cost_attestation"]
         assert attestation["schema_version"] == (
-            "fxpm-numerical-execution-cost-v2"
+            "fxpm-numerical-execution-cost-v3"
         )
         assert len(attestation["policy_sha256"]) == 64
         assert len(attestation["attestation_sha256"]) == 64
-        assert attestation["spread_values_sha256"] == (
-            Backtester._spread_arrays_sha256(
-                np.empty(0, dtype=np.float64),
-                np.empty(0, dtype=np.float64),
+        assert attestation["entry_half_spread_values_sha256"] == (
+            Backtester._spread_array_sha256(
+                "entry_half_spread", np.empty(0, dtype=np.float64)
+            )
+        )
+        assert attestation["intrabar_half_spread_values_sha256"] == (
+            Backtester._spread_array_sha256(
+                "intrabar_half_spread", np.empty(0, dtype=np.float64)
             )
         )
         results.append(result)
@@ -220,8 +248,8 @@ def test_empty_frame_returns_attested_result_without_entering_kernel(monkeypatch
 def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
     monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
     frame = _flat_daily_frame(rows=4)
-    frame["SpreadOpen"] = [2.0, 3.0, 4.0, 5.0]
-    frame["SpreadMax"] = [4.0, 5.0, 6.0, 7.0]
+    frame["SpreadOpen"] = [22.0, 23.0, 24.0, 25.0]
+    frame["SpreadMax"] = [24.0, 25.0, 26.0, 27.0]
     strategy = _OneShotAtrStrategy(1)
     config = PipelineConfig(
         research_mode=True,
@@ -230,20 +258,24 @@ def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
         swap_model_enabled=False,
     )
     spec = _fx_spec(
+        symbol="EURUSD",
         spread_avg=1.0,
-        point=0.0001,
+        point=0.00001,
     )
     backtester = Backtester(config)
     result = backtester.run(
         frame,
-        strategy.generate_signals(frame, "ZZZUSD"),
-        "ZZZUSD",
+        strategy.generate_signals(frame, "EURUSD"),
+        "EURUSD",
         strategy,
         spec=spec,
         timeframe="D1",
+        spread_tier=_frozen_daily_tier(),
     )
     entry_half_spread, intrabar_half_spread, _ = (
-        backtester._build_half_spread_arrays(frame, spec)
+        backtester._build_half_spread_arrays(
+            frame, spec, spread_tier=_frozen_daily_tier(), timeframe="D1"
+        )
     )
     attestation = result["numerical_execution_cost_attestation"]
 
@@ -252,15 +284,20 @@ def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
         "schema_version",
         "use_spread",
         "spread_mode",
-        "spread_values_sha256",
+        "entry_half_spread_values_sha256",
+        "intrabar_half_spread_values_sha256",
         "instrument_spec_sha256",
         "policy_sha256",
         "attestation_sha256",
     }
-    assert attestation["spread_values_sha256"] == (
-        Backtester._spread_arrays_sha256(
-            entry_half_spread,
-            intrabar_half_spread,
+    assert attestation["entry_half_spread_values_sha256"] == (
+        Backtester._spread_array_sha256(
+            "entry_half_spread", entry_half_spread
+        )
+    )
+    assert attestation["intrabar_half_spread_values_sha256"] == (
+        Backtester._spread_array_sha256(
+            "intrabar_half_spread", intrabar_half_spread
         )
     )
     spread_policy = json.loads(attestation["spread_mode"])
@@ -270,7 +307,12 @@ def test_backtester_seals_exact_spread_arrays_and_cost_inputs(monkeypatch):
     expected = build_numerical_execution_cost_attestation(
         use_spread=True,
         spread_mode=attestation["spread_mode"],
-        spread_values_sha256=attestation["spread_values_sha256"],
+        entry_half_spread_values_sha256=attestation[
+            "entry_half_spread_values_sha256"
+        ],
+        intrabar_half_spread_values_sha256=attestation[
+            "intrabar_half_spread_values_sha256"
+        ],
         instrument_spec_sha256=attestation["instrument_spec_sha256"],
     )
     assert attestation == expected
@@ -281,31 +323,37 @@ def test_cost_policy_is_stable_but_exact_spread_attestation_is_slice_local(
 ):
     monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
     frame = _flat_daily_frame(rows=8)
-    frame["SpreadOpen"] = np.arange(1.0, 9.0)
-    frame["SpreadMax"] = np.arange(2.0, 10.0)
+    frame["SpreadOpen"] = np.arange(22.0, 30.0)
+    frame["SpreadMax"] = np.arange(23.0, 31.0)
     config = PipelineConfig(
         research_mode=True,
         use_spread=True,
         backtest_spread_mode="conservative_max",
         swap_model_enabled=False,
     )
-    spec = _fx_spec(spread_avg=1.0)
+    spec = _fx_spec(symbol="EURUSD", spread_avg=1.0, point=0.00001)
     attestations = []
     for subset in (frame.iloc[:4].copy(), frame.iloc[4:].copy()):
         strategy = _OneShotAtrStrategy(1)
         result = Backtester(config).run(
             subset,
-            strategy.generate_signals(subset, "ZZZUSD"),
-            "ZZZUSD",
+            strategy.generate_signals(subset, "EURUSD"),
+            "EURUSD",
             strategy,
             spec=spec,
             timeframe="D1",
+            spread_tier=_frozen_daily_tier(),
         )
         attestations.append(result["numerical_execution_cost_attestation"])
 
     first, second = attestations
     assert first["policy_sha256"] == second["policy_sha256"]
-    assert first["spread_values_sha256"] != second["spread_values_sha256"]
+    assert first["entry_half_spread_values_sha256"] != second[
+        "entry_half_spread_values_sha256"
+    ]
+    assert first["intrabar_half_spread_values_sha256"] != second[
+        "intrabar_half_spread_values_sha256"
+    ]
     assert first["attestation_sha256"] != second["attestation_sha256"]
 
 
@@ -661,11 +709,51 @@ def test_rollover_event_is_classified_as_pre_open_across_a_session_gap():
     assert close_units.tolist() == [0, 0]
 
 
+@pytest.mark.parametrize("use_numba", [False, True])
+@pytest.mark.parametrize("direction", [1, -1])
+@pytest.mark.parametrize("exit_kind", ["stop", "target"])
+def test_intrabar_incumbent_exit_cannot_admit_earlier_open_replacement(
+    monkeypatch, use_numba, direction, exit_kind,
+):
+    if use_numba and not pm_core.NUMBA_AVAILABLE:
+        pytest.skip("Numba unavailable")
+    monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", use_numba)
+    index = pd.date_range("2026-05-11", periods=4, freq="1h", tz="UTC")
+    frame = pd.DataFrame(
+        {
+            "Open": np.ones(4), "High": np.full(4, 1.0002),
+            "Low": np.full(4, 0.9998), "Close": np.ones(4),
+            "ATR_14": np.full(4, 0.001),
+            "_BAR_CLOSE_TS": index + pd.Timedelta(hours=1),
+        }, index=index,
+    )
+    if (direction == 1) == (exit_kind == "stop"):
+        frame.loc[index[2], "Low"] = 0.9970
+    else:
+        frame.loc[index[2], "High"] = 1.0030
+    strategy = _ScheduledAtrStrategy([direction, -direction, direction, 0])
+    result = Backtester(PipelineConfig(
+        research_mode=True, use_spread=True, swap_model_enabled=False,
+        discovery_risk_per_trade_pct=1.0,
+    )).run(frame, strategy.generate_signals(frame, "ZZZUSD"), "ZZZUSD",
+           strategy, spec=_fx_spec(spread_avg=2.0), timeframe="H1")
+    assert [trade["entry_bar"] for trade in result["trades"]] == [1, 3]
+    incumbent, replacement = result["trades"]
+    assert incumbent["exit_bar"] == 2
+    assert incumbent["exit_reason"] == ("closed_sl" if exit_kind == "stop" else "closed_tp")
+    assert replacement["signal_bar"] == 2
+    assert replacement["risk_amount"] == pytest.approx(
+        (10_000.0 + incumbent["pnl_dollars"]) * 0.01,
+    )
+
+
 def test_gap_carry_precedes_exit_and_replacement_sizing_in_both_engines(
     monkeypatch,
 ):
     frame = _gap_frame()
-    frame.loc[frame.index[2], "High"] = 1.0030
+    frame.loc[frame.index[2], ["Open", "High", "Low", "Close"]] = [
+        0.9970, 0.9972, 0.9968, 0.9970,
+    ]
     strategy = _ScheduledAtrStrategy([1, 1, 0])
     config = PipelineConfig(
         research_mode=True,
@@ -699,11 +787,14 @@ def test_gap_carry_precedes_exit_and_replacement_sizing_in_both_engines(
         assert carried["position_size"] == pytest.approx(0.500)
         assert carried["swap_rollover_units"] == 3
         assert carried["swap_dollars"] == pytest.approx(-15.0)
-        assert carried["gross_pnl_dollars"] == pytest.approx(100.0)
-        # Carry is booked before the old trade exits: 10,000 - 15 + 100.
-        # The same-bar replacement therefore risks 1% of 10,085, not 10,100.
-        assert replacement["risk_amount"] == pytest.approx(100.85)
-        assert replacement["position_size"] == pytest.approx(0.504)
+        assert carried["exit_reason"] == "closed_sl"
+        assert carried["exit_price"] == pytest.approx(frame["Open"].iat[2])
+        assert carried["gross_pnl_dollars"] == pytest.approx(-150.0)
+        # The known gap-open stop settles after carry: 10,000 - 15 - 150.
+        assert replacement["entry_bar"] == carried["exit_bar"] == 2
+        assert replacement["entry_price"] == pytest.approx(frame["Open"].iat[2])
+        assert replacement["risk_amount"] == pytest.approx(98.35)
+        assert replacement["position_size"] == pytest.approx(0.491)
         assert replacement["swap_rollover_units"] == 0
         results[use_numba] = result
 
@@ -712,6 +803,101 @@ def test_gap_carry_precedes_exit_and_replacement_sizing_in_both_engines(
         assert results[False]["equity_curve"] == pytest.approx(
             results[True]["equity_curve"]
         )
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+@pytest.mark.parametrize("scenario", ["gap_stop", "non_deferral", "tp_gap", "partial_then_stop"])
+def test_open_entry_ownership_and_exact_backend_path(monkeypatch, direction, scenario):
+    """Pin short gap eligibility (core1586/9997) and intrabar intent ownership."""
+    index = pd.date_range("2026-05-11", periods=4, freq="1h", tz="UTC")
+    frame = pd.DataFrame({
+        "Open": np.ones(4), "High": np.full(4, 1.0002),
+        "Low": np.full(4, 0.9998), "Close": np.ones(4),
+        "ATR_14": np.full(4, 0.001),
+        "_BAR_CLOSE_TS": index + pd.Timedelta(hours=1),
+    }, index=index)
+    policy = None
+    if scenario == "gap_stop":
+        price = 1.0 - direction * 0.003
+        frame.loc[index[2], ["Open", "High", "Low", "Close"]] = [price, price + .0002, price - .0002, price]
+    elif scenario == "tp_gap":
+        price = 1.0 + direction * .003
+        frame.loc[index[2], ["Open", "High", "Low", "Close"]] = [price, price + .0002, price - .0002, price]
+    else:
+        frame.loc[index[2], "Low" if direction == 1 else "High"] = 1.0 - direction * .003
+        if scenario == "partial_then_stop":
+            # Prior-close profit causes an Open partial; the remainder stops later.
+            frame.loc[index[1], "Close"] = 1.0 + direction * .0011
+            frame.loc[index[1], "High" if direction == 1 else "Low"] = 1.0 + direction * .0012
+            frame.loc[index[2], "Open"] = 1.0 + direction * .001
+            policy = {"name": "partial_tp_runner", "partial_at_r": .5,
+                      "partial_close_pct": 50., "trail_atr_mult": 100.,
+                      "release_tp_after_r": 100.}
+    # No fresh signal after the suppressed intent: it must never be deferred.
+    strategy = _ScheduledAtrStrategy([direction, -direction, 0, 0])
+    config = PipelineConfig(research_mode=True, use_spread=False,
+                            swap_model_enabled=False, discovery_risk_per_trade_pct=1.)
+    modes = [False, True] if pm_core.NUMBA_AVAILABLE else [False]
+    results = []
+    for mode in modes:
+        monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", mode)
+        result = Backtester(config).run(
+            frame, strategy.generate_signals(frame, "ZZZUSD"), "ZZZUSD", strategy,
+            spec=_fx_spec(), timeframe="H1", governance_policy=policy)
+        trades = result["trades"]
+        if scenario == "gap_stop":
+            assert [trade["entry_bar"] for trade in trades] == [1, 2]
+            assert trades[0]["exit_price"] == frame["Open"].iat[2]
+        elif scenario == "partial_then_stop":
+            assert [trade["entry_bar"] for trade in trades] == [1, 1]
+            assert [trade["exit_reason"] for trade in trades] == ["governance_partial", "closed_sl"]
+            assert all(trade["exit_bar"] == 2 for trade in trades)
+        else:
+            assert len(trades) == 1
+            assert trades[0]["entry_bar"] == 1
+            assert trades[0]["exit_bar"] == 2
+            assert trades[0]["exit_reason"] == ("closed_tp" if scenario == "tp_gap" else "closed_sl")
+            if scenario == "tp_gap":
+                assert trades[0]["exit_price"] == pytest.approx(1.0 + direction * .002)
+        results.append(result)
+    if len(results) == 2:
+        assert results[0]["trades"] == results[1]["trades"]
+        assert results[0]["equity_curve"] == results[1]["equity_curve"]
+        assert results[0]["equity_growth"] == results[1]["equity_growth"]
+
+
+@pytest.mark.parametrize("direction", [1, -1])
+def test_prior_bar_governance_open_exit_can_admit_open_replacement(
+    monkeypatch, direction,
+):
+    monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", False)
+    index = pd.date_range("2026-05-11", periods=4, freq="1h", tz="UTC")
+    frame = pd.DataFrame({
+        "Open": [1.0, 1.0, 1.0 + direction * 0.0005, 1.0],
+        "High": [1.0002, 1.0002, 1.0008, 1.0002],
+        "Low": [0.9998, 0.9998, 0.9992, 0.9998],
+        "Close": np.ones(4), "ATR_14": np.full(4, 0.001),
+        "_BAR_CLOSE_TS": index + pd.Timedelta(hours=1),
+    }, index=index)
+    strategy = _ScheduledAtrStrategy([direction, direction, 0, 0])
+    result = Backtester(PipelineConfig(
+        research_mode=True, use_spread=True, swap_model_enabled=False,
+        discovery_risk_per_trade_pct=1.0,
+    )).run(frame, strategy.generate_signals(frame, "ZZZUSD"), "ZZZUSD",
+           strategy, spec=_fx_spec(spread_avg=2.0), timeframe="H1",
+           governance_policy={
+               "name": "time_decay_exit", "max_bars_held": 1,
+               "time_decay_min_favorable_r": 0.25,
+           })
+    assert [trade["entry_bar"] for trade in result["trades"]] == [1, 2]
+    incumbent, replacement = result["trades"]
+    assert incumbent["exit_reason"] == "governance_exit"
+    assert incumbent["exit_bar"] == replacement["entry_bar"] == 2
+    assert incumbent["exit_price"] == pytest.approx(1.0 + direction * 0.0004)
+    assert replacement["signal_bar"] == 1
+    assert replacement["risk_amount"] == pytest.approx(
+        (10_000.0 + incumbent["pnl_dollars"]) * 0.01,
+    )
 
 
 def test_activation_bound_stress_projection_is_promotion_admissible(monkeypatch):
@@ -1028,3 +1214,353 @@ def test_stop_risk_sizing_is_price_only(
         assert results[False]["equity_curve"] == pytest.approx(
             results[True]["equity_curve"]
         )
+
+
+def _continuous_timing_semantic_bits(value):
+    if isinstance(value, (float, np.floating)):
+        return ("float64", float(value).hex())
+    if isinstance(value, np.ndarray):
+        return (
+            "array", value.dtype.str, value.shape,
+            tuple(_continuous_timing_semantic_bits(x) for x in value.flat),
+        )
+    if isinstance(value, dict):
+        return tuple(
+            (key, _continuous_timing_semantic_bits(value[key]))
+            for key in sorted(value)
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_continuous_timing_semantic_bits(x) for x in value)
+    return value
+
+
+@pytest.mark.parametrize("case_id", [
+    "N16_PREOPEN_SWAP_THEN_OLD_GAP_EXIT_THEN_NEW_SIZE",
+    "N17_CAUSAL_SWAP_OWNER_CHANGE_AND_WEEKEND",
+    "N18_NEW_BOUNDARY_ENTRY_NOT_CHARGED_PREOPEN_HISTORY",
+])
+def test_continuous_account_causal_carry_goldens(monkeypatch, case_id):
+    from test_frozen_spread_execution import (
+        _assert_continuous_expected,
+        _continuous_case,
+    )
+
+    assert pm_core.NUMBA_AVAILABLE, "Both execution backends are required"
+    results = []
+    for compiled in (False, True):
+        backtester, kwargs, expected = _continuous_case(case_id, compiled=compiled)
+        monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", compiled)
+        result = backtester.run(**kwargs)
+        _assert_continuous_expected(result, expected)
+        terminal = result["terminal"]
+        assert float(result["final_equity"]).hex() == float(
+            terminal["cash"] + terminal["unrealized_gross"]
+        ).hex()
+        assert float(result["equity_curve"][-1]).hex() == float(
+            result["final_equity"]
+        ).hex()
+        position = terminal["open_position"]
+        assert position is not None
+        if case_id.startswith("N16_"):
+            assert position["lots"] == 1.5
+            assert position["posted_swap_cash"] == 0.0
+            assert position["posted_swap_units"] == 0
+        elif case_id.startswith("N17_"):
+            assert position["posted_swap_cash"] == -5.0
+            assert position["posted_swap_units"] == 2
+            assert position["latched_rate_per_lot"] == -1.0
+        else:
+            assert position["entry_bar"] == 2
+            assert position["posted_swap_cash"] == 0.0
+            assert position["posted_swap_units"] == 0
+        results.append(result)
+    assert _continuous_timing_semantic_bits(results[0]) == (
+        _continuous_timing_semantic_bits(results[1])
+    )
+
+
+def _continuous_flat_consumer(kind):
+    unit_spec = _fx_spec(
+        pip_position=0, pip_value=1.0, point=1.0, tick_size=1.0,
+        tick_value=1.0, min_lot=0.5, volume_step=0.5,
+    )
+    empty = np.zeros(0, dtype=np.float64)
+    if kind == "equity_growth":
+        return lambda **kwargs: pm_core.build_backtest_equity_growth(
+            pd.DataFrame(), [], initial_equity=10000.0, **kwargs,
+        )
+    if kind == "daily_r":
+        return lambda **kwargs: pm_core.build_backtest_winner_daily_r_surface(
+            pd.DataFrame(), [], [], namespace="synthetic-continuous-refusal",
+            spec=unit_spec, half_spread_arr=empty, use_spread=True,
+            swap_model_enabled=False, causal_swap_enabled=False,
+            pre_open_rollover_units_arr=empty, rollover_units_arr=empty,
+            swap_long_per_lot_arr=empty, swap_short_per_lot_arr=empty,
+            **kwargs,
+        )
+    if kind == "position_events":
+        return lambda **kwargs: pm_core.build_backtest_position_events(
+            [], namespace="synthetic-continuous-refusal", **kwargs,
+        )
+    assert kind == "cost_attestation"
+    backtester = Backtester(PipelineConfig(
+        initial_capital=10000.0, research_mode=True,
+        use_spread=True, swap_model_enabled=False,
+    ))
+    return lambda **kwargs: backtester._numerical_execution_cost_attestation(
+        entry_half_spread=empty, intrabar_half_spread=empty,
+        spread_meta={"mode": "fixed_spec", "source": "synthetic"},
+        spec=unit_spec, **kwargs,
+    )
+
+
+@pytest.mark.parametrize("kind", [
+    "equity_growth", "daily_r", "position_events", "cost_attestation",
+])
+def test_continuous_account_flat_consumers_refuse_mark_open_and_keep_defaults(kind):
+    consume = _continuous_flat_consumer(kind)
+    omitted = consume()
+    explicit = consume(terminal_policy="LIQUIDATE")
+    assert json.dumps(omitted, sort_keys=True, allow_nan=False).encode("ascii") == (
+        json.dumps(explicit, sort_keys=True, allow_nan=False).encode("ascii")
+    )
+    with pytest.raises(pm_core.ContinuousAccountExecutionError) as caught:
+        consume(terminal_policy="MARK_OPEN")
+    assert caught.value.code == "CONTINUOUS_ACCOUNT_TERMINAL_SCHEMA_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_continuous_account_never_calls_flat_only_builders(monkeypatch, compiled):
+    from test_frozen_spread_execution import (
+        _assert_continuous_expected,
+        _continuous_case,
+    )
+
+    assert pm_core.NUMBA_AVAILABLE, "Both execution backends are required"
+    backtester, kwargs, expected = _continuous_case(
+        "N01_P75_LONG_OPEN_ONLY", compiled=compiled,
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("MARK_OPEN called a flat-to-flat evidence builder")
+
+    for name in (
+        "build_backtest_equity_growth",
+        "build_backtest_winner_daily_r_surface",
+        "build_backtest_position_events",
+        "build_numerical_execution_cost_attestation",
+    ):
+        monkeypatch.setattr(pm_core, name, forbidden)
+    monkeypatch.setattr(Backtester, "_numerical_execution_cost_attestation", forbidden)
+    monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", compiled)
+    result = backtester.run(**kwargs)
+    _assert_continuous_expected(result, expected)
+    for name in (
+        "equity_growth", "winner_daily_r_surface", "position_events",
+        "numerical_execution_cost_attestation",
+    ):
+        assert name not in result
+
+
+def test_continuous_R01_closed_tp_then_open_matches_legacy_path(monkeypatch):
+    from test_frozen_spread_execution import _continuous_case
+
+    assert pm_core.NUMBA_AVAILABLE, "Both execution backends are required"
+    common_results = []
+    for compiled in (False, True):
+        template, kwargs, _ = _continuous_case("N01_P75_LONG_OPEN_ONLY")
+        features = kwargs["features"].copy()
+        features.loc[features.index[2], "High"] = 112.0
+        signals = pd.Series([1, 0, 1, 0, 0], index=features.index, dtype=np.int32)
+        original = kwargs["entry_schedule"].owners[0]
+        owner = pm_core.ContinuousEntryOwner(
+            "R01-owner", original.strategy, features.copy(), signals,
+            original.spread_tier,
+        )
+        slot = pm_core.ContinuousEntrySlot(
+            "R01-slot", features.index[1], features["_BAR_CLOSE_TS"].iat[-1],
+            owner.owner_id,
+        )
+        kwargs.update(
+            features=features,
+            entry_schedule=pm_core.ContinuousEntrySchedule((owner,), (slot,)),
+        )
+        monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", compiled)
+        scheduled = Backtester(template.config).run(**kwargs)
+        legacy_kwargs = dict(kwargs)
+        legacy_kwargs.update(
+            signals=signals, strategy=owner.strategy,
+            spread_tier=owner.spread_tier,
+        )
+        legacy_kwargs.pop("entry_schedule")
+        legacy_kwargs.pop("terminal_policy")
+        legacy = Backtester(template.config).run(**legacy_kwargs)
+
+        expected_curve = [10000.0, 9995.0, 10025.0, 10020.0, 10020.0]
+        assert _continuous_timing_semantic_bits(scheduled["equity_curve"]) == (
+            _continuous_timing_semantic_bits(expected_curve)
+        )
+        assert _continuous_timing_semantic_bits(scheduled["equity_curve"]) == (
+            _continuous_timing_semantic_bits(legacy["equity_curve"])
+        )
+        assert len(legacy["trades"]) == 2
+        assert legacy["trades"][0]["exit_reason"] == pm_core.TradeStatus.CLOSED_TP.value
+        eod = legacy["trades"][-1]
+        assert eod["exit_reason"] == pm_core.TradeStatus.CLOSED_EOD.value
+        assert eod["exit_bar"] == len(features) - 1
+        assert len(scheduled["trades"]) == 1
+        legacy_trade = legacy["trades"][0]
+        scheduled_trade = scheduled["trades"][0]
+        common_trade_fields = {
+            "signal_bar", "entry_bar", "exit_bar", "signal_time", "entry_time",
+            "exit_time", "direction", "entry_price", "exit_price", "stop_loss",
+            "take_profit", "position_size", "pnl_pips", "gross_pnl_dollars",
+            "swap_rollover_units", "swap_dollars", "pnl_dollars", "exit_reason",
+            "risk_amount", "r_multiple", "trade_record_schema_version",
+            "mae_pips", "mfe_pips", "mae_r", "mfe_r", "time_to_mae_bars",
+            "time_to_mfe_bars", "time_underwater_bars", "entry_to_stop_pips",
+            "entry_to_target_pips", "governance_policy", "tp_released",
+        }
+        # E2148 leaves admission provenance to v4; these schemas differ only
+        # by the legacy admission stamp and the continuous owner/slot/tier.
+        assert set(legacy_trade) == common_trade_fields | {"entry_spread_admission"}
+        assert set(scheduled_trade) == common_trade_fields | {
+            "owner_id", "slot_id", "frozen_spread_tier",
+        }
+        assert legacy_trade["entry_spread_admission"] == "ADMIT"
+        assert scheduled_trade["owner_id"] == owner.owner_id
+        assert scheduled_trade["slot_id"] == slot.slot_id
+        assert scheduled_trade["frozen_spread_tier"] == owner.spread_tier.descriptor()
+        for key in sorted(common_trade_fields):
+            assert _continuous_timing_semantic_bits(scheduled_trade[key]) == (
+                _continuous_timing_semantic_bits(legacy_trade[key])
+            )
+        terminal = scheduled["terminal"]
+        position = terminal["open_position"]
+        assert position is not None and position["direction"] == 1
+        assert position["entry_bar"] == 3 and position["lots"] == 2.5
+        assert position["entry_price"] == 101.0
+        assert terminal["bid"] == 99.0 and terminal["ask"] == 101.0
+        assert eod["entry_bar"] == position["entry_bar"]
+        assert eod["position_size"] == position["lots"]
+        assert eod["entry_price"] == position["entry_price"]
+        assert eod["exit_price"] == terminal["bid"]
+        assert eod["gross_pnl_dollars"] == -5.0
+        assert terminal["cash"] == 10025.0
+        assert terminal["unrealized_gross"] == -5.0
+        assert scheduled["final_equity"] == legacy["final_equity"] == 10020.0
+        assert legacy["final_equity"] - eod["pnl_dollars"] == terminal["cash"]
+        assert terminal["cash"] + terminal["unrealized_gross"] == scheduled["final_equity"]
+        assert not any(
+            trade["exit_reason"] == pm_core.TradeStatus.CLOSED_EOD.value
+            for trade in scheduled["trades"]
+        )
+        common_results.append(scheduled)
+    assert _continuous_timing_semantic_bits(common_results[0]) == (
+        _continuous_timing_semantic_bits(common_results[1])
+    )
+
+
+def test_continuous_real_calendar_carry_precedes_gap_and_new_entry(monkeypatch):
+    from dataclasses import replace
+    from test_frozen_spread_execution import _continuous_case
+
+    assert pm_core.NUMBA_AVAILABLE, "Both execution backends are required"
+
+    def native_terms_forbidden(*args, **kwargs):
+        raise AssertionError("Synthetic calendar case accessed native financing")
+
+    monkeypatch.setattr(pm_core, "resolve_active_swap_contract", native_terms_forbidden)
+    monkeypatch.setattr(pm_core, "broker_terms_sha256_file", native_terms_forbidden)
+    results = []
+    for compiled in (False, True):
+        template, kwargs, _ = _continuous_case(
+            "N16_PREOPEN_SWAP_THEN_OLD_GAP_EXIT_THEN_NEW_SIZE",
+        )
+        index = pd.DatetimeIndex([
+            pd.Timestamp("2026-04-08T19:00:00Z"),
+            pd.Timestamp("2026-04-08T20:00:00Z"),
+            pd.Timestamp("2026-04-09T02:00:00Z"),
+            pd.Timestamp("2026-04-09T03:00:00Z"),
+            pd.Timestamp("2026-04-09T04:00:00Z"),
+        ])
+        features = kwargs["features"].copy()
+        features.index = index
+        features["_BAR_CLOSE_TS"] = index + pd.Timedelta(hours=1)
+        assert features.attrs == {}
+        owners = tuple(
+            pm_core.ContinuousEntryOwner(
+                owner.owner_id, owner.strategy, features.copy(),
+                pd.Series(owner.signals.to_numpy(copy=True), index=index, dtype=np.int32),
+                owner.spread_tier,
+            )
+            for owner in kwargs["entry_schedule"].owners
+        )
+        slots = (
+            pm_core.ContinuousEntrySlot("calendar-S1", index[1], index[2], "A"),
+            pm_core.ContinuousEntrySlot(
+                "calendar-S2", index[2], features["_BAR_CLOSE_TS"].iat[-1], "B",
+            ),
+        )
+        kwargs.update(
+            features=features,
+            entry_schedule=pm_core.ContinuousEntrySchedule(owners, slots),
+            entry_spread_observations=pd.Series(2.0, index=index),
+            spec=replace(
+                kwargs["spec"], swap_long=-1.0, swap_short=-1.0,
+                swap_mode=-1, swap_rollover3days=3,
+            ),
+        )
+        config = replace(template.config, swap_model_min_holding_hours=0.0)
+        # Rebuilding drops the factory's instance-only synthetic projection.
+        backtester = Backtester(config)
+        assert backtester._build_causal_swap_inputs.__func__ is Backtester._build_causal_swap_inputs
+        assert backtester._research_swap_context is None
+        assert backtester._swap_contract_cache == {}
+        monkeypatch.setattr(pm_core, "NUMBA_AVAILABLE", compiled)
+        result = backtester.run(**kwargs)
+        contract = result["swap_accrual_contract"]
+        assert contract["status"] == "UNAVAILABLE"
+        assert contract["mode"] == "legacy_calendar_diagnostic_only"
+        assert contract["provenance_status"] == "LEGACY_UNTRUSTED"
+        assert contract["source_provenance_authenticated"] is False
+        assert contract["execution_state_compounding"] is True
+        assert contract["pre_open_rollover_event_bars"] == 2
+        assert contract["close_rollover_event_bars"] == 0
+        assert contract["rollover_units_on_axis"] == 4
+        assert backtester._swap_contract_cache == {}
+
+        # Warmup's Tuesday unit is unheld; Wednesday's three units charge A
+        # before the gap stop, then B sizes from 10000-7.5-30=9962.5.
+        assert len(result["trades"]) == 1
+        closed = result["trades"][0]
+        assert closed["swap_rollover_units"] == 3
+        assert closed["swap_dollars"] == -7.5
+        assert closed["gross_pnl_dollars"] == -30.0
+        assert closed["pnl_dollars"] == -37.5
+        assert closed["exit_price"] == 89.0
+        terminal = result["terminal"]
+        position = terminal["open_position"]
+        assert position is not None and position["owner_id"] == "B"
+        assert position["direction"] == -1
+        assert position["entry_bar"] == closed["exit_bar"] == 2
+        assert position["entry_price"] == 88.0
+        assert position["requested_risk_amount"] == 24.90625
+        assert position["lots"] == 1.5
+        assert position["posted_swap_cash"] == 0.0
+        assert position["posted_swap_units"] == 0
+        assert position["latched_rate_per_lot"] == -1.0
+        assert terminal["cash"] == 9962.5
+        assert terminal["unrealized_gross"] == -6.0
+        assert result["final_equity"] == 9956.5
+        assert terminal["cash"] + terminal["unrealized_gross"] == result["final_equity"]
+        assert _continuous_timing_semantic_bits(result["equity_curve"]) == (
+            _continuous_timing_semantic_bits([
+                10000.0, 9995.0, 9956.5, 9956.5, 9956.5,
+            ])
+        )
+        assert result["qualification_authority"] is False
+        results.append(result)
+    assert _continuous_timing_semantic_bits(results[0]) == (
+        _continuous_timing_semantic_bits(results[1])
+    )

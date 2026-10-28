@@ -12,6 +12,7 @@ from pm_pipeline import (
     OptimizationPipeline,
     PortfolioManager,
     RegimeConfig,
+    RegimeOptimizer,
     SymbolConfig,
     artifact_contract_matches,
     build_artifact_meta,
@@ -20,6 +21,30 @@ from pm_regime import materialize_regime_params_for_cells
 
 
 class PipelineArtifactTests(unittest.TestCase):
+    def test_search_multiplicity_receipt_uses_current_attempt_ledger_contract(self):
+        pipeline = RegimeOptimizer(
+            PipelineConfig(
+                research_mode=True,
+                regime_enable_hyperparam_tuning=False,
+            )
+        )
+
+        receipt = pipeline._search_multiplicity_receipt(
+            effective_trials=3,
+            symbol="EURUSD",
+            timeframe="H1",
+            regime="trend",
+            strategy_family="breakout",
+        )
+
+        self.assertEqual(receipt["attempted_trials_exact"], 3)
+        self.assertEqual(
+            receipt["schema_version"],
+            "fxpm-trade-power-multiplicity-v1",
+        )
+        self.assertEqual(len(receipt["attempts_sha256"]), 64)
+        self.assertEqual(len(receipt["attempt_ledger_payload_sha256"]), 64)
+
     def test_ledger_invalidates_when_artifact_fingerprint_changes(self):
         tmp = Path("artifact/fxpm_runtime/.tmp_pytest/test_pipeline_artifacts")
         shutil.rmtree(tmp, ignore_errors=True)
@@ -112,7 +137,7 @@ class PipelineArtifactTests(unittest.TestCase):
         self.assertTrue(artifact_contract_matches(stored, current))
         self.assertEqual(
             current["artifact_version"],
-            "2026-08-24-spread-swap-execution-v8",
+            "2026-08-25-winner-v14-cost-ladder-v9",
         )
 
         legacy = dict(current)
@@ -343,7 +368,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 "EURUSD",
                 [
                     {
-                        "format_version": "oos_candidate_returns_v4",
+                        "format_version": "oos_candidate_returns_v5",
                         "candidate_id": "abc",
                         "symbol": "EURUSD",
                         "timeframe": "H1",
@@ -359,11 +384,6 @@ class PipelineArtifactTests(unittest.TestCase):
                             "status": "available",
                             "capital_preservation_blocks": [1.0, 0.99],
                         },
-                        "execution_cost_survival": {
-                            "status": "available",
-                            "stress_mode": "stress_p95",
-                            "stress_return_pct": 1.0,
-                        },
                         "parameter_stability_evidence": {
                             "status": "available",
                             "nearest_neighbor_median_score_ratio": 0.9,
@@ -377,14 +397,14 @@ class PipelineArtifactTests(unittest.TestCase):
             path = pointer["path"]
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
             self.assertEqual(payload["format_version"], "oos_candidate_matrix_v1")
-            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v4_one_touch_evidence")
+            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v5_one_touch_evidence")
             self.assertEqual(payload["record_count"], 1)
             self.assertEqual(pointer["record_count"], payload["record_count"])
             self.assertEqual(payload["records"][0]["candidate_id"], "abc")
             self.assertNotIn("period_returns", payload["records"][0])
             self.assertEqual(payload["records"][0]["trade_path_evidence"]["status"], "available")
             self.assertEqual(payload["records"][0]["equity_path_evidence"]["status"], "available")
-            self.assertEqual(payload["records"][0]["execution_cost_survival"]["stress_mode"], "stress_p95")
+            self.assertNotIn("execution_cost_survival", payload["records"][0])
             self.assertAlmostEqual(
                 payload["records"][0]["parameter_stability_evidence"]["nearest_neighbor_median_score_ratio"],
                 0.9,
@@ -422,7 +442,7 @@ class PipelineArtifactTests(unittest.TestCase):
             self.assertEqual(pointer["completion_status"], "NO_CANDIDATE_RECORDS")
             payload = json.loads(Path(pointer["path"]).read_text(encoding="utf-8"))
             self.assertEqual(payload["format_version"], "oos_candidate_matrix_v1")
-            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v4_one_touch_evidence")
+            self.assertEqual(payload["record_schema"], "oos_candidate_returns_v5_one_touch_evidence")
             self.assertEqual(payload["record_count"], 0)
             self.assertEqual(payload["completion_status"], "NO_CANDIDATE_RECORDS")
             self.assertEqual(payload["records"], [])
@@ -448,7 +468,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 "EURUSD",
                 [
                     {
-                        "format_version": "oos_candidate_returns_v4",
+                        "format_version": "oos_candidate_returns_v5",
                         "candidate_id": "abc",
                         "symbol": "EURUSD",
                         "timeframe": "H1",
@@ -499,6 +519,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
                 live_artifact_drift_policy="block",
+                production_require_promotion_gate=False,
                 production_split_mode="bleeding_edge",
             )
             artifact_meta = build_artifact_meta(cfg)
@@ -552,6 +573,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
                 live_artifact_drift_policy="warn",
+                production_require_promotion_gate=False,
                 production_split_mode="bleeding_edge",
             )
             artifact_meta = build_artifact_meta(cfg)
@@ -587,6 +609,7 @@ class PipelineArtifactTests(unittest.TestCase):
                 data_dir=tmp / "data",
                 output_dir=tmp / "out",
                 oos_evidence_export_enabled=False,
+                production_require_promotion_gate=False,
             )
             artifact_meta = build_artifact_meta(cfg)
             manager = PortfolioManager(cfg, ["EURUSD"], config_file=str(tmp / "pm_configs.json"))

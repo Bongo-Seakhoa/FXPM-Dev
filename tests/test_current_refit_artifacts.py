@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import pm_current_refit_artifacts as refit_artifacts
 import pm_pipeline as pipeline
 import pm_authority_spool as spool
 from pm_current_refit_artifacts import (
@@ -17,6 +18,11 @@ from pm_current_refit_artifacts import (
     verify_current_refit_search_artifacts_bytes_v2,
 )
 from pm_strategies import StrategyRegistry
+from pm_current_refit_parameters import (
+    RETAINED_STRATEGY_SOURCE_V1_SHA256,
+    load_retained_strategy_domain_v1,
+    decode_retained_parameter_metadata,
+)
 
 
 STRATEGY_ID = "EMACrossoverStrategy"
@@ -89,6 +95,77 @@ def _verify(artifacts, **overrides):
     }
     values.update(overrides)
     return verify_current_refit_search_artifacts_bytes_v2(**values)
+
+
+def _retained_macd_metadata_chain():
+    # Metadata-only reconstruction of the pinned original edition; no strategy evaluation.
+    table = load_retained_strategy_domain_v1()
+    record = next(row for row in table["strategies"] if row["strategy_id"] == "MACDHistogramMomentumStrategy")
+    parameters = decode_retained_parameter_metadata(record["typed_metadata"]["defaults"])
+    parameters["macd_fast"] = 10  # Legal v1 marginal, deliberately removed from the current domain.
+    return refit_artifacts._retained_search_artifacts_v1(
+        strategy_id=record["strategy_id"], trial={"parameters": parameters},
+        symbol="EURUSD", timeframe="H1", regime="TREND", lookback_kind="NATIVE_OBSERVATIONS",
+        lookback_value=1000, fit_start_utc="2021-01-01T00:00:00Z",
+        fit_end_utc="2026-01-02T00:00:00Z", latest_closed_bar_utc="2026-01-01T23:00:00Z",
+        source_snapshot_sha256="a" * 64, source_bar_count=1000, seed=20260714)
+
+
+def test_retained_v1_chain_verifies_removed_parameter_without_current_reissue():
+    artifacts = _retained_macd_metadata_chain()
+    assert artifacts.winner_process["strategy_code_sha256"] == RETAINED_STRATEGY_SOURCE_V1_SHA256
+    assert _verify(artifacts) == artifacts
+    with pytest.raises(CurrentRefitArtifactError, match="PARAMETER_VALUE_OUTSIDE_PROCESS"):
+        _build(strategy_id="MACDHistogramMomentumStrategy", parameters=artifacts.trial_definition["parameters"])
+    process, process_sha = pipeline._current_refit_validate_process(
+        artifacts.winner_process, strategy_id="MACDHistogramMomentumStrategy")
+    trial, parameters = pipeline._current_refit_validate_trial(
+        artifacts.trial_definition, strategy_id="MACDHistogramMomentumStrategy", process_sha256=process_sha,
+        horizon_sha256=artifacts.horizon_process_sha256,
+        process_source_sha256=process["strategy_code_sha256"])
+    assert parameters["macd_fast"] == 10
+    recipe, _ = pipeline._current_refit_validate_recipe(
+        artifacts.refit_recipe, strategy_id="MACDHistogramMomentumStrategy", process_sha256=process_sha,
+        horizon_sha256=artifacts.horizon_process_sha256, trial_sha256=canonical_artifact_sha256(trial),
+        source_bar_count=1000, process_source_sha256=process["strategy_code_sha256"])
+    assert recipe == artifacts.refit_recipe
+
+
+@pytest.mark.parametrize("mutation", ["unknown_source", "entry_rule", "old_recipe", "caller_strategy"])
+def test_retained_v1_chain_rejects_source_rule_recipe_and_caller_splices(mutation):
+    artifacts = _retained_macd_metadata_chain()
+    changes = {}
+    if mutation in ("unknown_source", "entry_rule"):
+        process = copy.deepcopy(artifacts.winner_process)
+        process["strategy_code_sha256" if mutation == "unknown_source" else "entry_rule_identity_sha256"] = "f" * 64
+        changes["winner_process_bytes"] = canonical_artifact_bytes(process)
+    elif mutation == "old_recipe":
+        recipe = copy.deepcopy(artifacts.refit_recipe)
+        recipe["version_pins"]["pm_strategies_sha256"] = "f" * 64
+        changes["refit_recipe_bytes"] = canonical_artifact_bytes(recipe)
+    else:
+        changes["strategy_id"] = STRATEGY_ID
+    with pytest.raises(CurrentRefitArtifactError):
+        _verify(artifacts, **changes)
+
+
+def test_retained_v1_refuses_changed_metadata_callable(monkeypatch):
+    strategy_class = type(StrategyRegistry.get("MACDHistogramMomentumStrategy"))
+    original = strategy_class.get_default_params
+    def changed_defaults(self):
+        return original(self)
+    monkeypatch.setattr(strategy_class, "get_default_params", changed_defaults)
+    with pytest.raises(CurrentRefitArtifactError, match="RETAINED_STRATEGY_METADATA_CHANGED"):
+        refit_artifacts.retained_strategy_metadata_v1("MACDHistogramMomentumStrategy")
+
+
+def test_retained_v1_refuses_unapproved_successor_source(monkeypatch):
+    strategy_class = type(StrategyRegistry.get("MACDHistogramMomentumStrategy"))
+    original = refit_artifacts._source_file_sha256
+    monkeypatch.setattr(refit_artifacts, "_source_file_sha256",
+        lambda value: "f" * 64 if value is strategy_class else original(value))
+    with pytest.raises(CurrentRefitArtifactError, match="RETAINED_STRATEGY_SUCCESSOR_CHANGED"):
+        refit_artifacts.retained_strategy_metadata_v1("MACDHistogramMomentumStrategy")
 
 
 def test_v2_artifacts_are_byte_identical_to_raw_executor_contract() -> None:

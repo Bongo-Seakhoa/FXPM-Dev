@@ -42,7 +42,8 @@ def _with_authenticated_trade_evidence(payload, *, start_utc="2024-01-01"):
         build_numerical_execution_cost_attestation(
             use_spread=True,
             spread_mode="conservative_max",
-            spread_values_sha256="7" * 64,
+            entry_half_spread_values_sha256="7" * 64,
+            intrabar_half_spread_values_sha256="7" * 64,
             instrument_spec_sha256="9" * 64,
         )
     )
@@ -233,6 +234,9 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             def get_params(self):
                 return {"p": self.p}
 
+            def get_param_couplings(self):
+                return ()
+
             def generate_signals(self, features, symbol):
                 return pd.Series(1, index=features.index, dtype=int)
 
@@ -311,6 +315,9 @@ class RegimeGatedSelectionTests(unittest.TestCase):
 
             def get_params(self):
                 return {"p": self.p}
+
+            def get_param_couplings(self):
+                return ()
 
             def generate_signals(self, features, symbol):
                 return pd.Series(1, index=features.index, dtype=int)
@@ -397,6 +404,9 @@ class RegimeGatedSelectionTests(unittest.TestCase):
             def get_params(self):
                 return {"p": self.p}
 
+            def get_param_couplings(self):
+                return ()
+
             def generate_signals(self, features, symbol):
                 return pd.Series(1, index=features.index, dtype=int)
 
@@ -468,6 +478,9 @@ class RegimeGatedSelectionTests(unittest.TestCase):
 
             def get_params(self):
                 return {"p": self.p}
+
+            def get_param_couplings(self):
+                return ()
 
             def get_param_grid(self):
                 return {"p": [0, 1]}

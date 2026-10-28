@@ -15,7 +15,6 @@ from pm_core import (
 )
 from tools import (
     build_postlockbox_edge_challenger,
-    build_production_live_book,
     issue_promotion_authorization,
     precompute_feature_cache,
     seal_prelockbox_roster,
@@ -60,7 +59,6 @@ def test_authority_and_authoring_loaders_reject_retired_model() -> None:
     (
         lambda path, payload: seal_prelockbox_roster._pipeline_config(path, payload),
         lambda path, payload: build_postlockbox_edge_challenger._pipeline_config(path, payload),
-        lambda _path, payload: build_production_live_book._config_from_live_payload(payload),
         lambda _path, payload: precompute_feature_cache._pipeline_config(payload),
     ),
 )
@@ -123,7 +121,6 @@ def test_active_replay_loaders_reject_retired_model(
         "agent_audit/performance/scripts/run_synchronized_portfolio_replay.py",
         "tools/benchmark.py",
         "tools/build_postlockbox_edge_challenger.py",
-        "tools/build_production_live_book.py",
         "tools/governance_eval_common.py",
         "tools/issue_promotion_authorization.py",
         "tools/precompute_feature_cache.py",

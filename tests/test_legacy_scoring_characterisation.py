@@ -1,4 +1,4 @@
-"""Pin the exact outputs of FXPM's one canonical production scorer."""
+"""Pin retained legacy/research scalar-scoring behavior; not production authority."""
 
 import unittest
 

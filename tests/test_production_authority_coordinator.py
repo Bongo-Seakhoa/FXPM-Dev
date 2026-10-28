@@ -725,7 +725,7 @@ def test_environment_authority_derives_exact_native_broker_and_margin_terms(
         coordinator.PRODUCTION_MARGIN_MODEL
     )
     assert environment["margin_contract"]["forward_replay_contract_version"] == (
-        "fxpm.forward-oos-replay-producer.v4"
+        "fxpm.forward-oos-replay-producer.v5"
     )
 
 

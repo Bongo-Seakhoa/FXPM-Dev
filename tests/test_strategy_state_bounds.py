@@ -5,6 +5,9 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+import importlib.util
+from functools import lru_cache
+from pathlib import Path
 
 from pm_strategies import (
     FractalChannelBreakoutStrategy,
@@ -15,6 +18,16 @@ from pm_strategies import (
 
 
 TEST_SYMBOL = "EURUSD"
+
+
+@lru_cache(maxsize=1)
+def _stage_a_oracle():
+    path = (Path(__file__).resolve().parents[1] / "audit_reports/fxpm_workshop_20261007"
+            / "coupled_strategy_domain_trim_verification/stage_a_oracle.py")
+    spec = importlib.util.spec_from_file_location("fxpm_stage_a_state_oracle", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _flat_features(n: int) -> pd.DataFrame:
@@ -199,6 +212,22 @@ def test_inside_bar_full_and_sufficient_prefix_outputs_match() -> None:
 
     pd.testing.assert_series_equal(full.iloc[30:], prefixed.loc[features.index[30:]])
     assert full.iloc[30] == 1
+
+
+@pytest.mark.parametrize("inside", [1, 2, 3])
+@pytest.mark.parametrize("age", [5, 10, 20, 40])
+def test_inside_bar_original_domain_preserves_sufficient_prefix(inside, age):
+    _stage_a_oracle().assert_prefix_equal("InsideBarBreakoutStrategy", {
+        "min_inside_bars": inside, "setup_max_age_bars": age,
+    })
+
+
+@pytest.mark.parametrize("channel", [10, 15, 20, 25])
+@pytest.mark.parametrize("window", [1, 2, 3])
+def test_turtle_soup_original_domain_preserves_sufficient_prefix(channel, window):
+    _stage_a_oracle().assert_prefix_equal("TurtleSoupReversalStrategy", {
+        "channel_period": channel, "reclaim_window": window,
+    })
 
 
 def test_fractal_full_and_sufficient_prefix_outputs_match() -> None:

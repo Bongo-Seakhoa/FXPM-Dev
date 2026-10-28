@@ -652,7 +652,7 @@ def _install_optimization_main_harness(
         "--overwrite",
     ]
     if trade:
-        argv.extend(["--trade", "--paper"])
+        argv.extend(["--trade", "--mt5-demo"])
     monkeypatch.setattr(sys, "argv", argv)
     return events, observed, scope
 
@@ -679,6 +679,9 @@ def test_calendar_optimize_requires_exact_closed_scope_and_trades_after_exit(
     assert events.index("scope_exit") < events.index("scope_stats")
     assert events.index("scope_stats") < events.index("trade")
     assert events.index("trade") < events.index("shutdown")
+    assert observed["trade"]["enable_trading"] is True
+    assert observed["trade"]["execution_book"] == pm_main.CURRENT_REFIT_DEMO_EXECUTION_BOOK
+    assert observed["init"]["pipeline_config"]._funded_live_execution is False
     expected = json.dumps(
         {**stats, "closed": True},
         sort_keys=True,
@@ -690,6 +693,75 @@ def test_calendar_optimize_requires_exact_closed_scope_and_trades_after_exit(
         "PRODUCTION_NATIVE_AUTHORITY_VERIFICATION_SCOPE_STATS " + expected
         in caplog.messages
     )
+
+
+@pytest.mark.parametrize("mt5_demo", [True, False])
+def test_trade_cli_destination_preserves_book_authority_and_funded_bit(
+    tmp_path, monkeypatch, mt5_demo,
+):
+    """Route through real main; application and evidence authority are stubbed."""
+    events, observed, _scope = _install_optimization_main_harness(tmp_path, monkeypatch)
+    arguments = ["--config", str(tmp_path / "config.json"), "--trade"]
+    if mt5_demo:
+        arguments.append("--mt5-demo")
+    checks = []
+
+    def funded_schema(config):
+        checks.append(("funded_schema", config))
+
+    def funded_readiness(*args, **kwargs):
+        checks.append(("funded_readiness", args, kwargs))
+        return SimpleNamespace(ok=True, errors=[])
+
+    monkeypatch.setattr(pm_main, "_validate_funded_config_schema", funded_schema)
+    monkeypatch.setattr(pm_main, "validate_live_readiness", funded_readiness)
+    monkeypatch.setattr(pm_main, "log_readiness_report", lambda *_args: None)
+    assert pm_main.main(arguments) == 0
+    pipeline = observed["init"]["pipeline_config"]
+    assert pipeline._funded_live_execution is (not mt5_demo)
+    assert observed["trade"] == {
+        "enable_trading": True, "close_on_opposite_signal": False,
+        "execution_book": (pm_main.CURRENT_REFIT_DEMO_EXECUTION_BOOK
+                           if mt5_demo else pm_main.CHAMPION_EXECUTION_BOOK),
+        "startup_entry_block_reason": "",
+    }
+    assert events == ["initialize", "trade", "shutdown"]
+    assert [check[0] for check in checks] == (
+        [] if mt5_demo else ["funded_schema", "funded_readiness"])
+
+
+@pytest.mark.parametrize("mt5_demo,hard_supervision", [(False, True), (True, False)])
+def test_production_optimize_supervision_distinguishes_mt5_demo_destination(
+    mt5_demo, hard_supervision,
+):
+    args = SimpleNamespace(
+        optimize=True, trade=False, paper=False, mt5_demo=mt5_demo,
+        preflight=False, status=False,
+    )
+    pipeline = SimpleNamespace(production_split_mode="calendar_lockbox_v2")
+    assert pm_main._production_hard_supervision_required(
+        args, pipeline, supervised_generation_id=None,
+    ) is hard_supervision
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--mt5-demo"],
+    ["--optimize", "--mt5-demo"],
+    ["--status", "--mt5-demo"],
+])
+def test_mt5_demo_without_action_refuses_before_configuration_application_or_broker(
+    monkeypatch, capsys, arguments,
+):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("A missing DEMO action must refuse before any runtime access")
+
+    for name in ("load_config_json", "FXPortfolioManagerApp", "MT5Connector"):
+        monkeypatch.setattr(pm_main, name, forbidden)
+    monkeypatch.setattr(pm_main, "MT5_AVAILABLE", True)
+    assert pm_main.main(arguments) == 2
+    message = capsys.readouterr().out
+    assert "Refusing --mt5-demo" in message
+    assert "--trade or --preflight" in message
 
 
 def test_optimize_only_calendar_initialization_never_connects_unused_mt5(

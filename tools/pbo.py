@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO / "tools"))
 
 from pm_core import DataLoader, FeatureComputer, Backtester, get_instrument_spec
 from pm_strategies import StrategyRegistry
+from pm_current_refit_parameters import build_parameter_domain, parameter_domain_point
 from benchmark import build_config, _git_head
 
 
@@ -182,12 +183,12 @@ def load_oos_manifest_matrix(manifest_path):
 
 
 def build_returns_matrix(cfg, loader, strategy_name, symbol, tf, samples, seed):
-    grid = StrategyRegistry.get(strategy_name).get_param_grid()
-    keys = list(grid.keys())
-    combos = list(itertools.product(*[grid[k] for k in keys]))
+    template = StrategyRegistry.get(strategy_name)
+    domain = build_parameter_domain(template.get_default_params(), template.get_param_grid(),
+        coupled_groups=template.get_param_couplings())
     rng = np.random.RandomState(seed)
-    if len(combos) > samples:
-        combos = [combos[i] for i in rng.choice(len(combos), samples, replace=False)]
+    count = domain["point_count"]
+    ordinals = range(count) if count <= samples else rng.choice(count, samples, replace=False)
     base = loader.load_symbol(symbol)
     df = loader.resample(base, tf)
     feats = FeatureComputer.compute_for_strategy(
@@ -196,8 +197,8 @@ def build_returns_matrix(cfg, loader, strategy_name, symbol, tf, samples, seed):
     spec = get_instrument_spec(symbol)
     bt = Backtester(cfg)
     cols = []
-    for combo in combos:
-        params = dict(zip(keys, combo))
+    for ordinal in ordinals:
+        params = parameter_domain_point(domain, int(ordinal))
         strat = StrategyRegistry.get(strategy_name, **params)
         sig = strat.generate_signals(feats, symbol)
         if not hasattr(sig, "abs") or sig.abs().sum() == 0:

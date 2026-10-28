@@ -28,9 +28,11 @@ from pm_strategies import (
 def _make_ohlc(n: int = 300) -> pd.DataFrame:
     rng = np.random.default_rng(0)
     close = 100.0 + np.cumsum(rng.normal(0.0, 0.3, size=n))
-    high = close + np.abs(rng.normal(0.2, 0.1, size=n))
-    low = close - np.abs(rng.normal(0.2, 0.1, size=n))
+    upper_wick = np.abs(rng.normal(0.2, 0.1, size=n))
+    lower_wick = np.abs(rng.normal(0.2, 0.1, size=n))
     open_ = close + rng.normal(0.0, 0.05, size=n)
+    high = np.maximum(open_, close) + upper_wick
+    low = np.minimum(open_, close) - lower_wick
     return pd.DataFrame(
         {
             "Open": open_,

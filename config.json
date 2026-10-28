@@ -125,8 +125,6 @@
     "oos_evidence_export_enabled": true,
     "oos_evidence_periods": 64,
     "oos_evidence_min_periods": 8,
-    "oos_evidence_include_execution_cost_survival": true,
-    "oos_evidence_execution_stress_mode": "stress_p95",
     "probation_enabled": true,
     "probation_days": 14,
     "probation_risk_multiplier": 0.5,

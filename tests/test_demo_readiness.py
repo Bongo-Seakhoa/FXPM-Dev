@@ -592,7 +592,8 @@ def test_missing_raw_verifier_blocks_demo(tmp_path, monkeypatch):
     assert "DEMO_RAW_AUTHORITY_VERIFIER_UNAVAILABLE" in errors
 
 
-def test_end_to_end_demo_readiness_accepts_only_demo_account(tmp_path, monkeypatch):
+@pytest.mark.parametrize("spread_mode", ["conservative_max", "fixed_spec"])
+def test_demo_entry_policy_block_preserves_verified_management_for_demo_only(tmp_path, monkeypatch, spread_mode):
     from pm_pipeline import SymbolConfig
 
     config_path = tmp_path / "config.json"
@@ -639,6 +640,7 @@ def test_end_to_end_demo_readiness_accepts_only_demo_account(tmp_path, monkeypat
         ),
     )
     config = _full_config(tmp_path, ledger_path)
+    config.backtest_spread_mode = spread_mode
     config.live_require_tuned_regime_params = True
     config.regime_params_file = str(tmp_path / "retired-regime-params.json")
     account = _demo_account()
@@ -649,7 +651,23 @@ def test_end_to_end_demo_readiness_accepts_only_demo_account(tmp_path, monkeypat
         account_info=account,
         position_config=_position_config(),
     )
-    assert report.ok
+    assert not report.ok
+    if spread_mode != "conservative_max":
+        assert [(item.code, item.scope) for item in report.errors] == [
+            ("demo_cost_contract_invalid", "evidence"),
+            ("interval_cell_qualification_policy_unadopted", "evidence"),
+        ]
+        assert projection is None
+        assert not report.management_only
+        assert report.management_projection == {}
+        assert report.management_context == {}
+        assert management_calls == []
+        return
+    assert [(item.code, item.scope) for item in report.errors] == [
+        ("interval_cell_qualification_policy_unadopted", "evidence")
+    ]
+    assert projection is None
+    assert report.management_only
     assert [name for name, _kwargs in management_calls] == ["create", "reverify"]
     assert report.management_capsule_id == "b" * 64
     assert report.management_generation_id == "generation-test"
@@ -662,7 +680,7 @@ def test_end_to_end_demo_readiness_accepts_only_demo_account(tmp_path, monkeypat
     context_copy.clear()
     assert report.management_context["status"] == "MANAGEMENT_ONLY"
     assert report.execution_ledger_sha256 is not None
-    assert projection is not None
+    projection = report.management_projection
     assert set(projection) == {"EURUSD"}
     assert set(projection["EURUSD"]["regime_configs"]) == {"H1"}
     assert set(projection["EURUSD"]["regime_configs"]["H1"]) == {"TREND"}
@@ -686,6 +704,7 @@ def test_end_to_end_demo_readiness_accepts_only_demo_account(tmp_path, monkeypat
     assert report.execution_detector_projection_sha256 is not None
     projection["EURUSD"]["regime_configs"].clear()
     detector_projection.clear()
+    assert set(report.management_projection["EURUSD"]["regime_configs"]) == {"H1"}
     assert report.execution_ledger_sha256 == ledger_sha
     assert report.execution_selected_cell_ids == selected_ids
     assert set(report.execution_detector_projection) == {"EURUSD|H1"}
@@ -1036,3 +1055,72 @@ def test_empty_projection_is_never_authorized(tmp_path, monkeypatch):
     assert any(
         "DEMO_EXECUTION_PROJECTION_EMPTY" in item.message for item in report.errors
     )
+
+
+@pytest.mark.parametrize("extra,expected", [
+    ((), True),
+    ((("warning", "unrelated_warning", "evidence"),), True),
+    ((("error", "runtime_account_invalid", "runtime"),), False),
+    ((("error", "unrelated_evidence_error", "evidence"),), False),
+    ((("error", "interval_cell_qualification_policy_unadopted", "evidence"),), False),
+    ((("error", "interval_cell_qualification_policy_unadopted", "runtime"),), False),
+], ids=("only-entry-policy", "warning-does-not-grant-entry", "runtime-error",
+         "other-evidence-error", "duplicate-policy-error", "wrong-scope-policy-error"))
+def test_management_exception_requires_exact_single_entry_policy_error(
+    extra, expected, monkeypatch,
+):
+    policy = live.ReadinessFinding(
+        "error", "interval_cell_qualification_policy_unadopted",
+        "Synthetic entry-policy block", "evidence",
+    )
+    findings = [policy, *(
+        live.ReadinessFinding(severity, code, "Synthetic additional finding", scope)
+        for severity, code, scope in extra
+    )]
+    report = demo.DemoProbationReadinessReport(
+        ok=False, findings=findings, _execution_binding=object(),
+    )
+    assert demo._only_interval_entry_policy_block(findings) is expected
+    assert demo._demo_management_binding_checks_pass(report) is expected
+    assert not report.ok
+    # Eligibility alone cannot produce a verified management context or projection.
+    assert not report.management_only
+    assert report.management_projection == {}
+    if not expected:
+        monkeypatch.setattr(
+            demo, "validate_demo_probation_readiness", lambda *_args, **_kwargs: report,
+        )
+        monkeypatch.setattr(
+            demo, "_capture_demo_management_authority",
+            lambda **_kwargs: pytest.fail("invalid exception reached capsule capture"),
+        )
+        returned, projection = demo.authorize_demo_probation_execution(
+            _config(), symbols=["EURUSD"], position_config=_position_config(),
+        )
+        assert returned is report
+        assert not returned.ok
+        assert projection is None
+
+
+def test_management_exception_rejects_policy_code_in_runtime_scope():
+    findings = [live.ReadinessFinding(
+        "error", "interval_cell_qualification_policy_unadopted",
+        "Synthetic runtime-scope impostor", "runtime",
+    )]
+    report = demo.DemoProbationReadinessReport(
+        ok=False, findings=findings, _execution_binding=object(),
+    )
+    assert not demo._only_interval_entry_policy_block(findings)
+    assert not demo._demo_management_binding_checks_pass(report)
+
+
+def test_management_exception_requires_reverified_execution_binding():
+    report = demo.DemoProbationReadinessReport(
+        ok=False, findings=[live.ReadinessFinding(
+            "error", "interval_cell_qualification_policy_unadopted",
+            "Synthetic entry-policy block", "evidence",
+        )],
+    )
+    assert not demo._demo_management_binding_checks_pass(report)
+    assert not report.management_only
+    assert report.management_projection == {}

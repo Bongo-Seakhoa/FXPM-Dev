@@ -207,7 +207,7 @@ def _request() -> dict[str, object]:
         ),
     ]
     return {
-        "schema_version": "fxpm.historical-horizon-request.v1",
+        "schema_version": "fxpm.historical-horizon-request.v2",
         "run_id": "anchor-run-001",
         "anchor": {
             "anchor_id": "anchor-2020-01",
@@ -266,11 +266,11 @@ def _request() -> dict[str, object]:
             "payload": dependency_payload,
         },
         "horizon_policy": {
-            "schema_version": "fxpm.historical-horizon-policy.v1",
+            "schema_version": "fxpm.historical-horizon-policy.v2",
             "policy_id": "historical-horizon-policy-001",
             "policy_release_sha256": "a" * 64,
             "cost_contract_sha256": "b" * 64,
-            "cost_stress_contract_sha256": "c" * 64,
+            "cost_ladder_contract_sha256": "c" * 64,
             "evaluator_release_sha256": "d" * 64,
         },
         "candidates": candidates,
@@ -283,7 +283,7 @@ def _request() -> dict[str, object]:
 
 def _unobserved_request() -> dict[str, object]:
     request = _request()
-    request["schema_version"] = "fxpm.historical-horizon-unobserved-request.v1"
+    request["schema_version"] = "fxpm.historical-horizon-unobserved-request.v2"
     request["candidates"] = []
     request["trials"] = []
     counts = {"TREND": 0, "RANGE": 8_000, "BREAKOUT": 4_000, "CHOP": 3_000}
@@ -357,9 +357,12 @@ def _shards(plan: object) -> list[dict[str, object]]:
         if terminal:
             dates: list[str] = []
             daily: list[str] = []
-            stress: list[str] = []
+            daily_p75: list[str] = []
+            daily_p95: list[str] = []
             closes: list[str] = []
             trades: list[str] = []
+            trades_p75: list[str] = []
+            trades_p95: list[str] = []
             status = "PROCESS_REJECTED"
             reason = expected["expected_reason_code"]
         else:
@@ -367,14 +370,17 @@ def _shards(plan: object) -> list[dict[str, object]]:
             observation_time = validation_start + timedelta(days=1)
             dates = [observation_time.strftime("%Y-%m-%d")]
             daily = ["0.1"]
-            stress = ["-0.2"]
+            daily_p75 = ["-0.1"]
+            daily_p95 = ["-0.2"]
             closes = [observation_time.strftime("%Y-%m-%dT%H:%M:%SZ")]
             trades = ["0.05"]
+            trades_p75 = ["0.02"]
+            trades_p95 = ["-0.01"]
             status = "AUTHENTICATED"
             reason = None
         result.append(
             {
-                "schema_version": "fxpm.historical-horizon-evidence-shard.v1",
+                "schema_version": "fxpm.historical-horizon-evidence-shard.v2",
                 "attempt_id": expected["attempt_id"],
                 "fold_id": expected["fold_id"],
                 "context_sha256": expected["context_sha256"],
@@ -385,19 +391,156 @@ def _shards(plan: object) -> list[dict[str, object]]:
                     "evaluator_release_sha256"
                 ],
                 "cost_contract_sha256": body["horizon_policy"]["cost_contract_sha256"],
-                "cost_stress_contract_sha256": body["horizon_policy"][
-                    "cost_stress_contract_sha256"
+                "cost_ladder_contract_sha256": body["horizon_policy"][
+                    "cost_ladder_contract_sha256"
                 ],
                 "evidence_role": expected["role"],
                 "final_oos_authority": False,
                 "daily_dates_utc": dates,
                 "daily_net_mtm_r": daily,
-                "daily_net_mtm_r_cost_stress": stress,
+                "daily_net_mtm_r_p75": daily_p75,
+                "daily_net_mtm_r_p95": daily_p95,
                 "completed_trade_close_utc": closes,
                 "completed_trade_net_mtm_r": trades,
+                "completed_trade_net_mtm_r_p75": trades_p75,
+                "completed_trade_net_mtm_r_p95": trades_p95,
             }
         )
     return result
+
+
+def _current_request() -> dict[str, object]:
+    request = _request()
+    request["schema_version"] = "fxpm.historical-horizon-request.v3"
+    policy = request["horizon_policy"]
+    policy["schema_version"] = "fxpm.historical-horizon-policy.v3"
+    policy["frozen_tier_pair_contract_sha256"] = policy.pop("cost_ladder_contract_sha256")
+    return request
+
+
+def _current_shards(plan: object) -> list[dict[str, object]]:
+    # Synthetic mechanical transport; these lineage labels confer no source authority.
+    body = plan.to_dict()
+    result = []
+    for expected in body["expected_evaluations"]:
+        terminal = expected["expected_status"] == "PROCESS_REJECTED"
+        tier_evidence = {}
+        if not terminal:
+            day = (_utc(expected["validation_start_utc"]) + timedelta(days=1))
+            for name in ("P75", "P95"):
+                closes = [day.strftime("%Y-%m-%dT%H:%M:%SZ")] if name == "P75" else []
+                daily = ["-0.1"] if name == "P75" else ["0.2"]
+                trades = ["-0.05"] if name == "P75" else []
+                tier_evidence[name] = {
+                    "spread_tier": name,
+                    "source_contract_sha256": _hash({"synthetic_source": name}),
+                    "cost_contract_sha256": _hash({"synthetic_cost": name}),
+                    "entry_spread_admission_policy_sha256": _hash({"synthetic_admission": name}),
+                    "position_activity_ledger_sha256": _hash({"synthetic_activity": name}),
+                    "daily_dates_utc": [day.strftime("%Y-%m-%d")],
+                    "daily_net_mtm_r": daily,
+                    "daily_surface_sha256": _hash({"synthetic_daily": daily}),
+                    "completed_trade_close_utc": closes,
+                    "completed_trade_net_mtm_r": trades,
+                    "trade_vector_sha256": _hash({"synthetic_trades": trades}),
+                    "trade_power_binding": ({"synthetic_transport_only": True}
+                                            if name == "P75" else None),
+                }
+        result.append({
+            "schema_version": "fxpm.historical-horizon-evidence-shard.v3",
+            "attempt_id": expected["attempt_id"], "fold_id": expected["fold_id"],
+            "context_sha256": expected["context_sha256"],
+            "status": "PROCESS_REJECTED" if terminal else "AUTHENTICATED",
+            "reason_code": expected["expected_reason_code"] if terminal else None,
+            "source_prefix_sha256": body["source_prefix_receipt_sha256"],
+            "evaluator_release_sha256": body["horizon_policy"]["evaluator_release_sha256"],
+            "cost_contract_sha256": body["horizon_policy"]["cost_contract_sha256"],
+            "frozen_tier_pair_contract_sha256": body["horizon_policy"]["frozen_tier_pair_contract_sha256"],
+            "evidence_role": expected["role"], "final_oos_authority": False,
+            "tier_evidence": tier_evidence,
+        })
+    return result
+
+
+def test_current_horizon_preserves_independent_tier_accounts_and_failed_power() -> None:
+    plan = horizon.build_historical_horizon_plan(_current_request())
+    shards = _current_shards(plan)
+    evidence = horizon.evaluate_historical_horizon_plan(plan, shards)
+    assert plan.to_dict()["schema_version"] == "fxpm.historical-horizon-plan.v3"
+    assert evidence.to_dict()["schema_version"] == "fxpm.historical-horizon-evidence.v3"
+    assert horizon.verify_historical_horizon_evidence(plan, evidence)
+    actual = evidence.to_dict()["shards"]
+    assert actual == shards
+    tier = next(item["tier_evidence"] for item in actual if item["status"] == "AUTHENTICATED")
+    assert len(tier["P75"]["completed_trade_net_mtm_r"]) == 1
+    assert tier["P95"]["completed_trade_net_mtm_r"] == []
+    assert tier["P95"]["trade_power_binding"] is None
+    assert float(tier["P95"]["daily_net_mtm_r"][0]) > float(tier["P75"]["daily_net_mtm_r"][0])
+    assert evidence.to_dict()["confers_trading_or_capital_authority"] is False
+
+
+@pytest.mark.parametrize("mutation", ["missing_tier", "wrong_tier", "misaligned_trade", "reordered_daily",
+                                      "outside_close", "missing_lineage", "mixed_old_field", "wrong_pair"])
+def test_current_horizon_rejects_incomplete_or_mixed_tier_transport(mutation: str) -> None:
+    plan = horizon.build_historical_horizon_plan(_current_request())
+    shards = _current_shards(plan)
+    shard = next(item for item in shards if item["status"] == "AUTHENTICATED")
+    p75 = shard["tier_evidence"]["P75"]
+    if mutation == "missing_tier":
+        del shard["tier_evidence"]["P95"]
+    elif mutation == "wrong_tier":
+        p75["spread_tier"] = "P95"
+    elif mutation == "misaligned_trade":
+        p75["completed_trade_net_mtm_r"] = []
+    elif mutation == "reordered_daily":
+        p75["daily_dates_utc"] *= 2
+        p75["daily_net_mtm_r"] *= 2
+    elif mutation == "outside_close":
+        p75["completed_trade_close_utc"] = ["2099-01-01T00:00:00Z"]
+    elif mutation == "missing_lineage":
+        p75["source_contract_sha256"] = None
+    elif mutation == "mixed_old_field":
+        shard["daily_net_mtm_r_p75"] = ["0"]
+    else:
+        shard["frozen_tier_pair_contract_sha256"] = "0" * 64
+    with pytest.raises(ValueError):
+        horizon.evaluate_historical_horizon_plan(plan, shards)
+
+
+def test_current_terminal_horizon_has_no_invented_tier_lineage() -> None:
+    plan = horizon.build_historical_horizon_plan(_current_request())
+    shards = _current_shards(plan)
+    evaluated = next(item for item in shards if item["status"] == "AUTHENTICATED")
+    evaluated.update(status="TECHNICAL_FAILURE", reason_code="EVALUATOR_OOM", tier_evidence={})
+    evidence = horizon.evaluate_historical_horizon_plan(plan, shards)
+    assert horizon.verify_historical_horizon_evidence(plan, evidence)
+    assert evidence.to_dict()["evidence_status"] == "HISTORICAL_EVIDENCE_TECHNICAL_INCOMPLETE"
+    evaluated["tier_evidence"] = {"P75": {}}
+    with pytest.raises(ValueError, match="cannot carry tier evidence"):
+        horizon.evaluate_historical_horizon_plan(plan, shards)
+
+
+def test_horizon_generation_dispatch_preserves_v2_and_refuses_mixing() -> None:
+    assert horizon._REQUEST_SCHEMA == "fxpm.historical-horizon-request.v2"
+    assert horizon._UNOBSERVED_REQUEST_SCHEMA == "fxpm.historical-horizon-unobserved-request.v2"
+    assert horizon._PLAN_SCHEMA == "fxpm.historical-horizon-plan.v2"
+    assert horizon._CURRENT_REQUEST_SCHEMA == "fxpm.historical-horizon-request.v3"
+    assert horizon._CURRENT_UNOBSERVED_REQUEST_SCHEMA == "fxpm.historical-horizon-unobserved-request.v3"
+    assert horizon._CURRENT_PLAN_SCHEMA == "fxpm.historical-horizon-plan.v3"
+    old = horizon.build_historical_horizon_plan(_request())
+    old_evidence = horizon.evaluate_historical_horizon_plan(old, _shards(old))
+    assert old.to_dict()["schema_version"] == "fxpm.historical-horizon-plan.v2"
+    assert old_evidence.to_dict()["schema_version"] == "fxpm.historical-horizon-evidence.v2"
+    assert horizon.verify_historical_horizon_evidence(old, old_evidence)
+    assert horizon.build_historical_horizon_plan(_request()).receipt_sha256 == old.receipt_sha256
+    mixed = _current_request()
+    mixed["horizon_policy"] = _request()["horizon_policy"]
+    with pytest.raises(ValueError, match="generations differ"):
+        horizon.build_historical_horizon_plan(mixed)
+    new = horizon.build_historical_horizon_plan(_current_request())
+    with pytest.raises(ValueError):
+        horizon.evaluate_historical_horizon_plan(new, _shards(old))
+    assert not horizon.verify_historical_horizon_evidence(new, old_evidence)
 
 
 @pytest.fixture(scope="module")
@@ -996,7 +1139,7 @@ def test_authenticated_unobserved_regime_has_exact_zero_work_roster() -> None:
     request = _unobserved_request()
     plan = horizon.build_historical_horizon_plan(request)
     body = plan.to_dict()
-    assert body["schema_version"] == "fxpm.historical-horizon-plan.v1"
+    assert body["schema_version"] == "fxpm.historical-horizon-plan.v2"
     assert body["plan_status"] == "HISTORICAL_REGIME_UNOBSERVED"
     assert body["native_prefix"]["source_state"] == "AVAILABLE"
     assert body["source_prefix_receipt_sha256"] is not None
@@ -1251,9 +1394,12 @@ def test_technical_shard_remains_technical_incomplete(
     for key in (
         "daily_dates_utc",
         "daily_net_mtm_r",
-        "daily_net_mtm_r_cost_stress",
+        "daily_net_mtm_r_p75",
+        "daily_net_mtm_r_p95",
         "completed_trade_close_utc",
         "completed_trade_net_mtm_r",
+        "completed_trade_net_mtm_r_p75",
+        "completed_trade_net_mtm_r_p95",
     ):
         shard[key] = []
     evidence = horizon.evaluate_historical_horizon_plan(valid_plan, shards)
@@ -1286,9 +1432,12 @@ def test_zero_declared_rows_and_empty_authenticated_vectors_fail_closed(
         for key in (
             "daily_dates_utc",
             "daily_net_mtm_r",
-            "daily_net_mtm_r_cost_stress",
+            "daily_net_mtm_r_p75",
+            "daily_net_mtm_r_p95",
             "completed_trade_close_utc",
             "completed_trade_net_mtm_r",
+            "completed_trade_net_mtm_r_p75",
+            "completed_trade_net_mtm_r_p95",
         ):
             shard[key] = []
     with pytest.raises(ValueError, match="nonempty daily MTM"):
@@ -1304,6 +1453,8 @@ def test_same_second_trade_closes_remain_lossless(
     close = shard["completed_trade_close_utc"][0]
     shard["completed_trade_close_utc"] = [close, close]
     shard["completed_trade_net_mtm_r"] = ["0.05", "-0.01"]
+    shard["completed_trade_net_mtm_r_p75"] = ["0.02", "-0.02"]
+    shard["completed_trade_net_mtm_r_p95"] = ["-0.01", "-0.03"]
     evidence = horizon.evaluate_historical_horizon_plan(valid_plan, shards)
     stored = next(
         item
@@ -1313,6 +1464,59 @@ def test_same_second_trade_closes_remain_lossless(
     )
     assert stored["completed_trade_close_utc"] == [close, close]
     assert stored["completed_trade_net_mtm_r"] == ["0.05", "-0.01"]
+    assert stored["completed_trade_net_mtm_r_p75"] == ["0.02", "-0.02"]
+    assert stored["completed_trade_net_mtm_r_p95"] == ["-0.01", "-0.03"]
+
+
+def test_daily_cost_ladder_allows_component_improvement_when_prefixes_do_not(
+    valid_plan: object,
+    valid_shards: list[dict[str, object]],
+) -> None:
+    shards = copy.deepcopy(valid_shards)
+    shard = next(item for item in shards if item["status"] == "AUTHENTICATED")
+    first_day = datetime.strptime(shard["daily_dates_utc"][0], "%Y-%m-%d").replace(
+        tzinfo=timezone.utc
+    )
+    shard["daily_dates_utc"] = [
+        first_day.strftime("%Y-%m-%d"),
+        (first_day + timedelta(days=1)).strftime("%Y-%m-%d"),
+    ]
+    shard["daily_net_mtm_r"] = ["0", "-2"]
+    shard["daily_net_mtm_r_p75"] = ["-1", "-1.5"]
+    shard["daily_net_mtm_r_p95"] = ["-2", "-1"]
+
+    evidence = horizon.evaluate_historical_horizon_plan(valid_plan, shards)
+    stored = next(
+        item
+        for item in evidence.to_dict()["shards"]
+        if item["attempt_id"] == shard["attempt_id"]
+        and item["fold_id"] == shard["fold_id"]
+    )
+    assert stored["daily_net_mtm_r_p75"] == ["-1", "-1.5"]
+    assert stored["daily_net_mtm_r_p95"] == ["-2", "-1"]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("daily_net_mtm_r_p75", "0.2", "cumulative daily prefix"),
+        ("daily_net_mtm_r_p95", "0.03", "cumulative daily prefix"),
+        ("completed_trade_net_mtm_r_p75", "0.06", "completed trade"),
+        ("completed_trade_net_mtm_r_p95", "0.03", "completed trade"),
+    ],
+)
+def test_cost_ladder_rejects_each_adjacent_improvement(
+    valid_plan: object,
+    valid_shards: list[dict[str, object]],
+    field: str,
+    replacement: str,
+    message: str,
+) -> None:
+    shards = copy.deepcopy(valid_shards)
+    shard = next(item for item in shards if item["status"] == "AUTHENTICATED")
+    shard[field][0] = replacement
+    with pytest.raises(ValueError, match=message):
+        horizon.evaluate_historical_horizon_plan(valid_plan, shards)
 
 
 def test_roles_survive_exact_evidence_without_interior_authority(

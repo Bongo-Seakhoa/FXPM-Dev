@@ -446,7 +446,7 @@ def test_no_trade_placeholders_are_not_physical_regime_evidence() -> None:
     )
 
 
-def test_book_and_runtime_pin_same_winner_v13() -> None:
+def test_book_and_runtime_pin_same_winner_v14() -> None:
     import pm_book_multiplicity as book
     import pm_winner_selection as winner
 
@@ -455,9 +455,9 @@ def test_book_and_runtime_pin_same_winner_v13() -> None:
     )
 
     assert book.PINNED_WINNER_SELECTION_CONTRACT_VERSION == (
-        "fxpm.winner-selection.v13"
+        "fxpm.winner-selection.v14"
     )
-    assert winner.WINNER_SELECTION_CONTRACT_VERSION == "fxpm.winner-selection.v13"
+    assert winner.WINNER_SELECTION_CONTRACT_VERSION == "fxpm.winner-selection.v14"
     assert errors == ["BOOK_DECISION_INVALID_OR_FORGED"]
     assert accounting["possible_cell_count"] == 0
 

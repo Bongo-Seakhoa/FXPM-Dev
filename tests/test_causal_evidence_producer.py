@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import copy
-import csv
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
-import math
 from pathlib import Path
-import struct
+import shutil
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,19 +20,16 @@ import pm_causal_process as causal
 import pm_forward_oos_replay_producer as forward
 import pm_historical_anchor_orchestration as historical
 import pm_historical_production_adapter as historical_adapter
-import pm_native_prefix_production as native_prefix
 import pm_training_horizon as training_horizon
 import pm_portfolio_replay as portfolio
-import pm_production_capital_bootstrap as capital_bootstrap
 import pm_production_authority_coordinator as coordinator
 import pm_production_search_planner as search_planner
 from tests import test_book_multiplicity as book_fixture
 from tests import test_causal_process as causal_fixture
 from tests import test_forward_oos_replay_producer as forward_fixture
 from tests import test_historical_production_adapter as adapter_fixture
-from tests import test_native_prefix_production as native_prefix_fixture
-from tests import test_production_capital_bootstrap as capital_fixture
-from pm_native_request_contract import PRODUCTION_ARTIFACT_COLUMNS, TIMEFRAME_SECONDS
+
+completed_raw_transport = forward_fixture.completed_raw_transport
 
 
 def _canonical(value: Any) -> bytes:
@@ -55,260 +50,14 @@ def _tag_sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _capital_specialist(
-    *, anchor_id: str, symbol: str, timeframe: str, cell_id: str
-) -> forward._VerifiedSpecialist:
-    return forward._VerifiedSpecialist(
-        anchor_id=anchor_id,
-        cell_id=cell_id,
-        symbol=symbol,
-        timeframe=timeframe,
-        regime="TREND",
-        strategy_id="causal-fixture-strategy",
-        strategy_class="CausalFixtureStrategy",
-        strategy_module="tests.test_causal_evidence_producer",
-        parameters={"fixture_parameter": 1},
-        process_candidate_id=f"{anchor_id}:causal-fixture-candidate",
-        process_sha256=_tag_sha(f"{anchor_id}:process"),
-        priority_score=1.0,
-        source_count_receipt={"fixture": "source-count"},
-        detector_parameters={"fixture": "detector"},
-        detector_parameters_sha256=_tag_sha(f"{anchor_id}:detector-parameters"),
-        detector_record={"record_sha256": _tag_sha(f"{anchor_id}:detector")},
-    )
-
-
-def _capital_candidate(
-    *,
-    phase_id: str,
-    cell_id: str,
-    symbol: str,
-    timeframe: str,
-    window: dict[str, str],
-) -> portfolio.CandidateTrade:
-    entry = datetime.fromisoformat(window["start_date"]) + timedelta(hours=1)
-    mark = entry + timedelta(minutes=30)
-    exit_time = entry + timedelta(hours=1)
-    return portfolio.CandidateTrade(
-        candidate_id=f"{phase_id}:candidate",
-        cell_id=cell_id,
-        symbol=symbol,
-        timeframe=timeframe,
-        regime="TREND",
-        strategy_name="CausalFixtureStrategy",
-        promotion_status="HISTORICAL_OOS_REPLAY",
-        asset_class="fx",
-        risk_groups=("FX",),
-        entry_time=entry,
-        direction=1,
-        stop_risk_per_lot=100.0,
-        margin_per_lot=1000.0,
-        volume_min=0.01,
-        volume_max=1.0,
-        volume_step=0.01,
-        priority_score=1.0,
-        legs=(
-            portfolio.ExitLeg(
-                exit_time=exit_time,
-                fraction=1.0,
-                net_pnl_per_entry_lot=10.0,
-                price_pnl_per_entry_lot=17.0,
-                exit_reason="fixture-exit",
-            ),
-        ),
-        marks=(portfolio.MarkPoint(mark, 4.0),),
-        source_schema=forward.POSITION_SOURCE_SCHEMA,
-        margin_model=forward.MARGIN_MODEL,
-    ).normalized()
-
-
-def _anchor_native_prefixes(
-    root: Path,
-    anchors: list[dict[str, Any]],
-    *,
-    symbol: str,
-) -> dict[str, native_prefix.NativePrefixProduct]:
-    """Create one activated D1 history and genuine cutoff-local products."""
-
-    data_dir = root / "native-data"
-    # Pass symbol= explicitly. _write_activation declares `symbol: str = SYMBOL`,
-    # and that default is bound at function-definition time, so reassigning the
-    # module global native_prefix_fixture.SYMBOL never reaches it - the fixture
-    # would write EURUSD's tree and then this file reads `symbol`'s
-    # provenance.json, which never existed. Same defect previously fixed in
-    # test_historical_production_adapter.py.
-    facts = native_prefix_fixture._write_activation(
-        data_dir, adapter_fixture.OBSERVED_TIMEFRAME, symbol=symbol
-    )
-
-    start = datetime(2016, 1, 1, tzinfo=timezone.utc)
-    last_cutoff = max(
-        datetime.fromisoformat(anchor["selection_cutoff_utc"].replace("Z", "+00:00"))
-        for anchor in anchors
-    )
-    cadence = TIMEFRAME_SECONDS[adapter_fixture.OBSERVED_TIMEFRAME]
-    row_count = int((last_cutoff - start).total_seconds() // cadence) + 1
-    rows: list[list[str]] = []
-    for ordinal in range(row_count):
-        opened = start + timedelta(seconds=ordinal * cadence)
-        closed = opened + timedelta(seconds=cadence)
-        price = 1.1 + ordinal * 0.00001
-        rows.append(
-            [
-                opened.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                f"{price:.6f}",
-                f"{price + 0.002:.6f}",
-                f"{price - 0.002:.6f}",
-                f"{price + 0.001:.6f}",
-                "100",
-                "12",
-                "80",
-                opened.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                opened.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                closed.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            ]
-        )
-    bars_path = Path(facts["bars_path"])
-    with bars_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle, lineterminator="\n")
-        writer.writerow(("time", *PRODUCTION_ARTIFACT_COLUMNS))
-        writer.writerows(rows)
-    bars_raw = bars_path.read_bytes()
-    bars_sha256 = hashlib.sha256(bars_raw).hexdigest()
-    request_end = start + timedelta(seconds=row_count * cadence)
-    request_end_utc = request_end.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    native_root = data_dir / "native"
-    provenance_path = (
-        native_root
-        / "runs"
-        / "run-prefix"
-        / symbol
-        / adapter_fixture.OBSERVED_TIMEFRAME
-        / "provenance.json"
-    )
-    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
-    provenance["artifact"].update(
-        {"sha256": bars_sha256, "bytes": len(bars_raw), "rows": row_count}
-    )
-    provenance.update(
-        {
-            "sha256": bars_sha256,
-            "rows": row_count,
-            "start_ts": rows[0][0],
-            "end_ts": rows[-1][0],
-        }
-    )
-    provenance["request"]["source_request_interval"] = {
-        "start_utc": rows[0][0],
-        "end_exclusive_utc": request_end_utc,
-    }
-    provenance_sha256 = native_prefix_fixture._write_json(provenance_path, provenance)
-
-    sidecar_path = (
-        native_root
-        / "audits"
-        / native_prefix_fixture.ACTIVATION_ID
-        / symbol
-        / adapter_fixture.OBSERVED_TIMEFRAME
-        / "sidecar.json"
-    )
-    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
-    sidecar["source_provenance_sha256"] = provenance_sha256
-    sidecar_sha256 = native_prefix_fixture._write_json(sidecar_path, sidecar)
-
-    run_manifest_path = native_root / "runs" / "run-prefix" / "run_manifest.json"
-    run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
-    run_manifest["results"][0].update({"rows": row_count, "sha256": bars_sha256})
-    run_manifest_sha256 = native_prefix_fixture._write_json(
-        run_manifest_path, run_manifest
-    )
-    activation_path = (
-        native_root / "activations" / f"{native_prefix_fixture.ACTIVATION_ID}.json"
-    )
-    activation = json.loads(activation_path.read_text(encoding="utf-8"))
-    activation["run_manifest_sha256"] = run_manifest_sha256
-    activation["entries"][symbol][adapter_fixture.OBSERVED_TIMEFRAME].update(
-        {"bars_sha256": bars_sha256, "sidecar_sha256": sidecar_sha256}
-    )
-    activation_sha256 = native_prefix_fixture._write_json(activation_path, activation)
-    active_path = native_root / "ACTIVE.json"
-    active = json.loads(active_path.read_text(encoding="utf-8"))
-    active["manifest_sha256"] = activation_sha256
-    native_prefix_fixture._write_json(active_path, active)
-
-    native_context_root = root / "native-context"
-    native_context_root.mkdir(parents=True, exist_ok=True)
-    native_context = native_prefix_fixture._context(native_context_root)
-    products: dict[str, native_prefix.NativePrefixProduct] = {}
-    for anchor in anchors:
-        product = native_prefix.produce_activated_native_prefix(
-            data_dir=data_dir,
-            context=native_context,
-            symbol=symbol,
-            timeframe=adapter_fixture.OBSERVED_TIMEFRAME,
-            cutoff_utc=anchor["selection_cutoff_utc"],
-            source_accessed_at_utc="2024-12-31T00:00:00Z",
-            production_contract_required=False,
-        )
-        assert product.source_state == native_prefix.AVAILABLE
-        products[anchor["anchor_id"]] = product
-    return products
-
-
 def _verified_pbo_winner(
     symbol: str,
     timeframe: str,
     regime: str,
 ) -> book.HistoricalBookCellEvidence:
-    """Build a genuine local winner with the minimum two-column CSCV matrix."""
+    """Reuse the genuine Winner-v14 local-winner fixture."""
 
-    fixture = book_fixture._winner_fixture_module()
-    raw = fixture._payload_request(symbol, timeframe, regime)
-    entries = raw["evidence_ledger_payload"]["entries"]
-    for candidate_index, daily_mean in enumerate((0.20, 0.08)):
-        entry = entries[candidate_index]
-        entry["evidence_status"] = "AUTHENTICATED"
-        entry["status_reason"] = None
-        for fold_index, fold in enumerate(entry["folds"]):
-            base = [
-                round(
-                    daily_mean + 0.04 * math.sin((fold_index * 63 + day_index) * 1.70),
-                    12,
-                )
-                for day_index in range(63)
-            ]
-            fold["daily_net_mtm_r"] = base
-            fold["daily_net_mtm_r_cost_stress"] = [
-                round(value - 0.02, 12) for value in base
-            ]
-            fixture._refresh_fold_accounting(fold)
-        entry["fold_count"] = len(entry["folds"])
-        entry["folds_sha256"] = fixture._sha_json(entry["folds"])
-        entry["pbo_folds"] = [fixture._pbo_projection(fold) for fold in entry["folds"]]
-        entry["pbo_fold_count"] = len(entry["pbo_folds"])
-        entry["pbo_folds_sha256"] = fixture._sha_json(entry["pbo_folds"])
-    for entry in entries[2:]:
-        entry["evidence_status"] = "PROCESS_REJECTED"
-        entry["status_reason"] = "EVALUATED_OOS_PROCESS_REJECTED"
-        entry["fold_count"] = 0
-        entry["folds"] = []
-        entry["folds_sha256"] = fixture._sha_json([])
-    raw["evidence_ledger_payload"]["entries_sha256"] = fixture._sha_json(entries)
-    request = fixture._typed_request(raw)
-    decision = book_fixture.winner.evaluate_historical_cell_winner(request)
-    assert decision.status == "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY", (
-        decision.reason_codes
-    )
-    assert book_fixture.winner.verify_historical_cell_winner_decision(decision, request)
-    source, fit = book_fixture._source_and_fit(
-        symbol,
-        timeframe,
-        book.AVAILABLE,
-    )
-    evidence = book.winner_cell_evidence(decision, request, source, fit)
-    assert evidence is not None
-    return evidence
+    return book_fixture._verified_winner(symbol, timeframe, regime)
 
 
 def _support(
@@ -362,323 +111,6 @@ def _support(
     }
     body["receipt_sha256"] = _sha(body)
     return body
-
-
-def _adapter_available_authority(
-    *,
-    anchor: dict[str, Any],
-    symbol: str,
-    source_contract_sha256: str,
-    native_product: native_prefix.NativePrefixProduct,
-) -> tuple[book.HistoricalSourceGroupDecision, book.RegimeFitDecision]:
-    timeframe = adapter_fixture.OBSERVED_TIMEFRAME
-    prefix = native_product.native_prefix
-    tag = f"{anchor['anchor_id']}:{symbol}:{timeframe}:adapter"
-    source = book.create_historical_source_group_decision(
-        symbol=symbol,
-        timeframe=timeframe,
-        availability=book.AVAILABLE,
-        reason_code="AUTHENTICATED_NATIVE_SOURCE",
-        source_contract_sha256=source_contract_sha256,
-        source_group_evidence_sha256=_tag_sha(f"{tag}:source-evidence"),
-        activation_id=prefix["activation_id"],
-        activation_manifest_sha256=prefix["activation_manifest_sha256"],
-        native_source_sha256=prefix["artifact_sha256"],
-        acquisition_attempts_exact=1,
-    )
-    assert source is not None
-    parameters = causal_fixture._detector_parameters()
-    detector_code = _tag_sha(f"{tag}:detector-code")
-    detector = book.create_regime_detector_record(
-        source_group_decision=source,
-        fit_cutoff_utc=datetime.fromisoformat(
-            anchor["selection_cutoff_utc"].replace("Z", "+00:00")
-        ).isoformat(),
-        detector_version="fxpm.market-regime-detector/v1",
-        detector_code_sha256=detector_code,
-        parameters=parameters,
-    )
-    assert detector is not None
-    counts = {regime: 0 for regime in book.REGIME_ORDER}
-    counts["TREND"] = 100
-    support = {
-        "schema_version": book.REGIME_TRAIN_SUPPORT_SCHEMA_VERSION,
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "surface": "REGIME_LIVE",
-        "warmup_policy": book.REGIME_TRAIN_SUPPORT_WARMUP_POLICY,
-        "label_order": list(book.REGIME_ORDER),
-        "eligible_rows": 100,
-        "counts": counts,
-        "observed_regimes": ["TREND"],
-        "unobserved_regimes": list(book.REGIME_ORDER[1:]),
-        "support_state_by_regime": {
-            regime: ("EMPIRICALLY_OBSERVED" if count else "UNOBSERVED")
-            for regime, count in counts.items()
-        },
-        "first_ts": prefix["prefix_first_open_utc"].replace("Z", "+00:00"),
-        "last_ts": prefix["prefix_last_open_utc"].replace("Z", "+00:00"),
-        "vector_encoding": book.REGIME_TRAIN_SUPPORT_VECTOR_ENCODING,
-        "vector_sha256": _tag_sha(f"{tag}:regime-vector"),
-        "bindings": {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "activation_id": prefix["activation_id"],
-            "activation_manifest_sha256": prefix["activation_manifest_sha256"],
-            "source_sha256": prefix["artifact_sha256"],
-            "train_window_sha256": _tag_sha(f"{tag}:train-window"),
-            "params_sha256": detector["parameters_sha256"],
-            "detector_code_sha256": detector_code,
-        },
-    }
-    support["receipt_sha256"] = _sha(support)
-    fit = book.create_regime_fit_decision(
-        source_group_decision=source,
-        fit_state=book.REGIME_FITTED,
-        reason_code="ANCHOR_LOCAL_SHARED_REGIME_FIT_COMPLETE",
-        regime_fit_policy_sha256=_tag_sha(f"{tag}:regime-fit-policy"),
-        detector_process_sha256=detector_code,
-        regime_fit_evidence_sha256=_tag_sha(f"{tag}:regime-fit-evidence"),
-        four_regime_mapping_sha256=_tag_sha(f"{tag}:four-regime-map"),
-        regime_params_sha256=detector["parameters_sha256"],
-        regime_detector_record=detector,
-        train_regime_support=support,
-    )
-    assert fit is not None
-    return source, fit
-
-
-def _adapter_raw_fold_for_attempt(
-    *,
-    handle: historical_adapter.FrozenHistoricalCell,
-    attempt_ordinal: int,
-    fold_ordinal: int,
-    planned: dict[str, Any],
-    process_precommit_receipt_sha256: str,
-) -> dict[str, Any]:
-    """Bind genuine Backtester lane bodies to one frozen adapter attempt."""
-
-    raw = adapter_fixture._raw_fold(fold_ordinal, planned)
-    lanes = raw["lanes"]
-    # The historical adapter fixture's compact 12-trade sample intentionally
-    # clusters every close at the start of the 63-day fold.  That is useful for
-    # adapter mechanics, but the resulting zero-padded return vector has only
-    # about 27 HAC-effective days and therefore cannot be a genuine Winner v13
-    # candidate (the frozen floor is 126 across the four folds).  Exercise this
-    # production-shaped causal fixture with a complete daily position-events-v2
-    # path instead.  Values remain deterministic, are materially distinct by
-    # precommitted attempt, and are passed through the real Backtester surface,
-    # cost-stress, TradePower, bootstrap, PBO, and Winner verifier chain.
-    final_start = date.fromisoformat(planned["oos_start_date_utc"])
-    final_end = date.fromisoformat(planned["oos_end_date_utc"])
-    observation_count = (final_end - final_start).days + 1
-    daily_values: list[float] = []
-    centre = 0.32 if attempt_ordinal == 0 else 0.18
-    for day_ordinal in range(observation_count):
-        digest = hashlib.sha256(
-            (
-                "causal-genuine-daily-position-v1:"
-                f"{attempt_ordinal}:{fold_ordinal}:{day_ordinal}"
-            ).encode("ascii")
-        ).digest()
-        unit = int.from_bytes(digest[:8], "big") / float((1 << 64) - 1)
-        daily_values.append(centre + 0.12 * (unit - 0.5))
-    namespace = f"fold-{fold_ordinal}:final"
-    final = adapter_fixture._result(
-        final_start,
-        final_end,
-        namespace,
-        values=daily_values,
-    )
-    stress = adapter_fixture._result(
-        final_start,
-        final_end,
-        namespace,
-        cost=adapter_fixture.STRESS_COST,
-        # A distinct cost namespace makes stress_spread_values_sha256 differ from
-        # the base. Without it the receipt claimed strict adversity while
-        # presenting an UNCHANGED spread vector, which is exactly what
-        # STRESS_METHOD_VECTOR_ADVERSITY_INCONSISTENT exists to catch.
-        cost_namespace=f"{namespace}:stress",
-        values=[value - 0.02 for value in daily_values],
-    )
-    lanes["final_lockbox_base"] = final
-    lanes["final_lockbox_stress"] = stress
-    frozen = handle.frozen
-    attempt = frozen.attempt_ledger["attempts"][attempt_ordinal]
-    artifacts = frozen.attempt_artifacts_bundle[attempt_ordinal]
-    cross = json.loads(handle._cross_binding_bytes.decode("ascii"))
-    mapped = cross["mapping"][attempt_ordinal]
-    mapped_fold = mapped["fold_mapping"][fold_ordinal]
-    geometry = adapter_fixture._partition_geometry(fold_ordinal, lanes)
-    final_axis = final["trade_power_partition_axis"]
-    signal_values = [0] * (final_axis["warmup_bars"] + final_axis["scored_bars"])
-    signal_sha256 = hashlib.sha256(
-        b"".join(struct.pack("<i", value) for value in signal_values)
-    ).hexdigest()
-    signal_body = {
-        "schema_version": "fxpm.authoritative-search-signal-vector.v1",
-        "encoding": "little-endian-signed-int32",
-        "observation_count": len(signal_values),
-        "values": signal_values,
-        "signal_vector_sha256": signal_sha256,
-    }
-    signal_receipt = {
-        **signal_body,
-        "receipt_sha256": adapter_fixture._sha(signal_body),
-    }
-    common = {
-        "authority_scope": "PRECOMMITTED_HISTORICAL_INNER_FOLD_ONLY",
-        "anchor_id": cross["anchor_id"],
-        "symbol": frozen.symbol,
-        "timeframe": frozen.timeframe,
-        "regime": frozen.regime,
-        "attempt_ordinal": attempt_ordinal,
-        "horizon_attempt_id": mapped["horizon_attempt_id"],
-        "fold_ordinal": fold_ordinal,
-        "fold_id": mapped_fold["horizon_fold_id"],
-        "confers_final_oos_or_trading_authority": False,
-    }
-    stress_body = {
-        # Was pinned to a hardcoded v1 string. Track the module constant so this
-        # fixture cannot silently fall behind the contract again - it did, and
-        # every test in this file stopped running as a result.
-        "schema_version": adapter_fixture.raw_winner.FROZEN_PATH_COST_STRESS_SCHEMA,
-        "symbol": frozen.symbol,
-        "timeframe": frozen.timeframe,
-        "strategy_name": artifacts["winner_process"]["strategy_id"],
-        "stress_mode": "stress_p95",
-        "warmup_bars": final_axis["warmup_bars"],
-        "partition_axis_sha256": final_axis["horizon_receipt_sha256"],
-        "signal_vector_sha256": signal_sha256,
-        "base_cost_attestation_sha256": final["numerical_execution_cost_attestation"][
-            "attestation_sha256"
-        ],
-        "stress_cost_attestation_sha256": stress[
-            "numerical_execution_cost_attestation"
-        ]["attestation_sha256"],
-        "base_spread_values_sha256": final["numerical_execution_cost_attestation"][
-            "spread_values_sha256"
-        ],
-        "stress_spread_values_sha256": stress[
-            "numerical_execution_cost_attestation"
-        ]["spread_values_sha256"],
-        "base_position_roster_sha256": (
-            adapter_fixture.Backtester._cost_attestation_json_sha256(
-                {"position_events": final["position_events"]}
-            )
-        ),
-        "stress_position_roster_sha256": (
-            adapter_fixture.Backtester._cost_attestation_json_sha256(
-                {"position_events": stress["position_events"]}
-            )
-        ),
-        "position_count": len(stress["position_events"]),
-        "daily_observation_count": len(
-            stress["winner_daily_r_surface"]["daily_net_mtm_r"]
-        ),
-        "path_identity_preserved": True,
-        "stress_never_improves": True,
-        "strictly_worse_trade_count": len(stress["position_events"]),
-        "strictly_worse_daily_observation_count": sum(
-            right < left
-            for left, right in zip(
-                final["winner_daily_r_surface"]["daily_net_mtm_r"],
-                stress["winner_daily_r_surface"]["daily_net_mtm_r"],
-                strict=True,
-            )
-        ),
-        "realized_adversity_status": (
-            adapter_fixture.raw_winner.BACKTEST_FROZEN_PATH_COST_STRESS_ADVERSITY_STRICT
-        ),
-    }
-    stress_receipt = {
-        **stress_body,
-        "receipt_sha256": adapter_fixture._sha(stress_body),
-    }
-    final_start = date.fromisoformat(planned["oos_start_date_utc"])
-    train_start = final_start - timedelta(days=300)
-    source_binding = frozen.source_contract_seed["source_binding"]
-    provenance = {
-        "anchor_selection_receipt": adapter_fixture._provenance_receipt(
-            "anchor_selection_receipt",
-            common,
-            process_precommit_receipt_sha256=(process_precommit_receipt_sha256),
-            horizon_plan_receipt_sha256=cross["horizon_roster"]["plan_receipt_sha256"],
-            selection_cutoff_utc=cross["selection_cutoff_utc"],
-        ),
-        "anchor_horizon_decision": adapter_fixture._provenance_receipt(
-            "anchor_horizon_decision",
-            common,
-            candidate_id=mapped["horizon_candidate_id"],
-            candidate_definition_sha256=mapped["horizon_candidate_definition_sha256"],
-            horizon_process_sha256=attempt["horizon_process_sha256"],
-            fold_definition_sha256=mapped_fold["horizon_fold_definition_sha256"],
-            partition_geometry=geometry,
-            partition_geometry_receipts=[item["receipt_sha256"] for item in geometry],
-        ),
-        "anchor_trial_ledger": adapter_fixture._provenance_receipt(
-            "anchor_trial_ledger",
-            common,
-            trial_registry_sha256=cross["horizon_roster"]["trial_registry_sha256"],
-            attempt_roster_sha256=cross["horizon_roster"]["attempt_roster_sha256"],
-            attempted_trials_exact=frozen.attempt_ledger["attempt_count"],
-        ),
-        "anchor_selected_trial": adapter_fixture._provenance_receipt(
-            "anchor_selected_trial",
-            common,
-            selection_scope="PRECOMMITTED_ATTEMPT_NOT_POSTHOC_WINNER",
-            trial_id=mapped["horizon_trial_id"],
-            trial_definition_sha256=mapped["horizon_trial_definition_sha256"],
-            winner_process_sha256=attempt["process_sha256"],
-            executable_trial_sha256=attempt["trial_definition_sha256"],
-        ),
-        "anchor_refit_receipt": adapter_fixture._provenance_receipt(
-            "anchor_refit_receipt",
-            common,
-            refit_recipe_sha256=attempt["refit_recipe_sha256"],
-            fit_start_utc=f"{train_start.isoformat()}T00:00:00Z",
-            fit_end_exclusive_utc=(
-                f"{(final_start - timedelta(days=1)).isoformat()}T00:00:00Z"
-            ),
-            post_selection_search=False,
-        ),
-        "attempt_replay_receipt": adapter_fixture._provenance_receipt(
-            "attempt_replay_receipt",
-            common,
-            lane_sha256={
-                name: adapter_fixture._sha(value) for name, value in lanes.items()
-            },
-            stress_method_receipt_sha256=stress_receipt["receipt_sha256"],
-            stress_method_receipt=stress_receipt,
-            signal_vector_receipt=signal_receipt,
-            position_events_are_genuine_backtester_v2=True,
-        ),
-        "oos_source_receipt": adapter_fixture._provenance_receipt(
-            "oos_source_receipt",
-            common,
-            native_prefix_index_sha256=cross["native_prefix_index_sha256"],
-            native_prefix_content_sha256=artifacts["horizon_process"][
-                "source_snapshot_sha256"
-            ],
-            source_contract_sha256=frozen.precommitment["source_contract_sha256"],
-            native_source_sha256=source_binding["target_bars_sha256"],
-            activation_manifest_sha256=source_binding[
-                "price_activation_manifest_sha256"
-            ],
-            source_group_decision_sha256=cross["source_group_decision_sha256"],
-            regime_fit_decision_sha256=cross["regime_fit_decision_sha256"],
-            execution_spec_receipt=adapter_fixture._execution_spec_receipt(
-                frozen, cross
-            ),
-            partition_frame_sha256=[item["frame_sha256"] for item in geometry],
-        ),
-    }
-    return {
-        "fold_ordinal": fold_ordinal,
-        "provenance": provenance,
-        "lanes": lanes,
-    }
 
 
 def _available_group(
@@ -941,7 +373,7 @@ def _decompose_activity(
                             "reference_bid_price",
                             "reference_ask_price",
                             "base_fill_price",
-                            "stress_fill_price",
+                            "p75_fill_price",
                         )
                     },
                 }
@@ -981,7 +413,7 @@ def _decompose_activity(
                 {
                     "event_id": event_id,
                     "base_financing_cash": raw["base_financing_cash"],
-                    "stress_financing_cash": raw["stress_financing_cash"],
+                    "p75_financing_cash": raw["p75_financing_cash"],
                 }
             )
             opening = next(
@@ -1013,7 +445,7 @@ def _decompose_activity(
                             "reference_bid_price",
                             "reference_ask_price",
                             "base_fill_price",
-                            "stress_fill_price",
+                            "p75_fill_price",
                         )
                     },
                 }
@@ -1164,31 +596,169 @@ def _event_record(
 
 @dataclass(frozen=True)
 class Corpus:
+    """Owned clone of retained archive inputs; no issued forward capability."""
+
     context: spool.GenerationSpoolContext
-    precommit_payload: dict[str, Any]
+    scratch_root: Path
+    causal_precommit_sha256: str
     historical_precommit: historical.HistoricalAnchorPrecommit
     run_receipt: historical.HistoricalAnchorRunReceipt
+    anchor_plans: tuple[dict[str, Any], ...]
+    historical_artifacts: Any
     replay_sets: dict[str, producer.AnchorReplayArtifactDescriptors]
     replay_bodies: dict[str, dict[str, dict[str, Any]]]
-    forward_product: forward.ForwardOOSReplayProduct
     request: coordinator.HistoricalEvidenceRequest
-    callback: producer.BoundedCausalEvidenceProducer
 
 
-def test_causal_v9_raw_cost_contract_is_financing_only_and_exact() -> None:
-    assert producer.COST_LEDGER_SCHEMA == "fxpm.anchor-raw-cost-ledger.v2"
+_RETAINED_WORKSHOP_ROOT = Path(r"C:\Users\Bongo\OneDrive\Desktop\FxPM-Dev\audit_reports\fxpm_workshop_20261007")
+_RETAINED_CAUSAL_ROOT = _RETAINED_WORKSHOP_ROOT / "frozen_tier_raw_account_verification/attempt_010_pytest_tmp/causal-producer0"
+_RETAINED_CAUSAL_SPOOL = _RETAINED_CAUSAL_ROOT / "spool"
+_RETAINED_NATIVE_SPOOL = _RETAINED_CAUSAL_ROOT / "historical-native/native-context/spool"
+_PROTECTED_RETAINED_ROOTS = (
+    _RETAINED_WORKSHOP_ROOT / "frozen_tier_raw_account_verification/attempt_009_pytest_tmp",
+    _RETAINED_WORKSHOP_ROOT / "frozen_tier_raw_account_verification/attempt_010_pytest_tmp",
+    _RETAINED_WORKSHOP_ROOT / "frozen_spread_missing_observation_verification/attempt_001_pytest_tmp",
+    _RETAINED_WORKSHOP_ROOT / "bound_midnight_selected_owner_capture",
+    _RETAINED_WORKSHOP_ROOT / "selected_owner_fixture_verification",
+    _RETAINED_WORKSHOP_ROOT / "selected_owner_bound_context_preflight",
+    _RETAINED_WORKSHOP_ROOT / "descriptor_raw_transport_verification/runtime/current_inputs_004",
+)
+_OWNED_MUTATION_PROTECTED_ROOTS = (*_PROTECTED_RETAINED_ROOTS,
+    _RETAINED_WORKSHOP_ROOT / "descriptor_raw_transport_verification/runtime/current_transport_001",
+)
+_OWNED_TEST_SPOOL_ROOTS: set[Path] = set()
+
+
+def _owned_spool_root(context) -> Path:
+    root = Path(context.root).resolve(strict=True)
+    assert root in _OWNED_TEST_SPOOL_ROOTS, "test mutation requires its registered scratch clone"
+    assert not any(root.is_relative_to(path.resolve()) for path in _OWNED_MUTATION_PROTECTED_ROOTS)
+    return root
+
+
+def _owned_corpus_path(corpus: Corpus, relative: str) -> Path:
+    root = _owned_spool_root(corpus.context)
+    target = (root / relative).resolve()
+    assert target.is_relative_to(root) and target.is_relative_to(corpus.scratch_root)
+    return target
+
+
+def _retained_json(context, digest: str):
+    root = _owned_spool_root(context)
+    relative = f"objects/sha256/{digest[:2]}/{digest}.canonical-json"
+    path = (root / relative).resolve(strict=True)
+    assert path.is_relative_to(root)
+    raw = path.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == digest, "retained original object changed"
+    descriptor = {"schema_version": "fxpm.authority-spool-artifact-descriptor.v1",
+        "format": "canonical-json", "relative_path": relative,
+        "sha256": digest, "size_bytes": len(raw)}
+    body = producer._read_descriptor_json(context, descriptor, code="RETAINED_ORIGINAL_OBJECT")
+    return body, raw, descriptor
+
+
+def test_causal_v10_raw_fill_and_cost_contracts_are_exact() -> None:
+    assert producer.FILL_LEDGER_SCHEMA == "fxpm.anchor-raw-fill-ledger.v2"
+    assert producer.COST_LEDGER_SCHEMA == "fxpm.anchor-raw-cost-ledger.v3"
+    assert producer._RAW_OPEN_FIELDS == frozenset(
+        {
+            "event_id",
+            "position_id",
+            "cell_id",
+            "opened_at_utc",
+            "side",
+            "quantity",
+            "contract_multiplier",
+            "stop_price",
+            "broker_fill_id",
+            "reference_mid_price",
+            "reference_bid_price",
+            "reference_ask_price",
+            "base_fill_price",
+            "p75_fill_price",
+        }
+    )
+    assert producer._RAW_CLOSE_FIELDS == frozenset(
+        {
+            "event_id",
+            "position_id",
+            "closed_at_utc",
+            "broker_fill_id",
+            "reference_mid_price",
+            "reference_bid_price",
+            "reference_ask_price",
+            "base_fill_price",
+            "p75_fill_price",
+        }
+    )
     assert producer._DAY_COST_FIELDS == frozenset({"date", "marks"})
     assert producer._MARK_COST_FIELDS == frozenset(
-        {"event_id", "base_financing_cash", "stress_financing_cash"}
+        {"event_id", "base_financing_cash", "p75_financing_cash"}
     )
     assert not hasattr(producer, "_OPEN_COST_FIELDS")
     assert {
         "base_commission_cash",
-        "stress_commission_cash",
+        "p75_commission_cash",
         "commission_per_entry_lot",
         "full_round_trip_commission_in_every_candidate_mark",
         "stop_risk_includes_adverse_configured_stop_slippage",
     }.isdisjoint(producer._FORWARD_PRODUCER_RECEIPT_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("retired_schema", "current_schema", "outer_fields", "day_fields", "extra"),
+    (
+        (
+            "fxpm.anchor-raw-fill-ledger.v1",
+            producer.FILL_LEDGER_SCHEMA,
+            producer._FILL_LEDGER_FIELDS,
+            producer._DAY_FILL_FIELDS,
+            {"initial_positions": []},
+        ),
+        (
+            "fxpm.anchor-raw-cost-ledger.v2",
+            producer.COST_LEDGER_SCHEMA,
+            producer._COMMON_LEDGER_FIELDS,
+            producer._DAY_COST_FIELDS,
+            {},
+        ),
+    ),
+)
+def test_retired_raw_lane_schema_cannot_claim_current_p75_shape(
+    retired_schema: str,
+    current_schema: str,
+    outer_fields: frozenset[str],
+    day_fields: frozenset[str],
+    extra: dict[str, Any],
+) -> None:
+    anchor = {
+        "anchor_id": "anchor-schema-test",
+        "forward_start_date": "2020-01-01",
+        "forward_end_date": "2020-01-01",
+    }
+    retired = {
+        "schema_version": retired_schema,
+        **anchor,
+        **extra,
+        "days": [
+            {
+                "date": "2020-01-01",
+                **({"entries": [], "exits": []} if "entries" in day_fields else {}),
+                **({"marks": []} if "marks" in day_fields else {}),
+            }
+        ],
+    }
+    with pytest.raises(
+        producer.CausalEvidenceProductionError,
+        match="RAW_LEDGER_ANCHOR_BINDING_MISMATCH",
+    ):
+        producer._validate_common_ledger(
+            retired,
+            schema=current_schema,
+            anchor=anchor,
+            day_fields=day_fields,
+            outer_fields=outer_fields,
+        )
 
 
 def test_production_precommit_freezes_real_code_policy_and_geometry(
@@ -1210,10 +780,10 @@ def test_production_precommit_freezes_real_code_policy_and_geometry(
         context,
         run_id="causal-precommit-run",
     )
-    frozen = producer.freeze_causal_process_precommit_v9(
+    frozen = producer.freeze_causal_process_precommit_v10(
         context=context,
         search_process=search_process,
-        process_id="production-causal-process-v9",
+        process_id="production-causal-process-v10",
         anchors=plans,
         evidence_access_window_seconds=3 * 24 * 60 * 60,
     )
@@ -1245,20 +815,20 @@ def test_production_precommit_freezes_real_code_policy_and_geometry(
         producer.CausalEvidenceProductionError,
         match="SEARCH_PROCESS_REVERIFY_FAILED",
     ):
-        producer.freeze_causal_process_precommit_v9(
+        producer.freeze_causal_process_precommit_v10(
             context=wrong_context,
             search_process=search_process,
-            process_id="production-causal-process-v9",
+            process_id="production-causal-process-v10",
             anchors=plans,
         )
     with pytest.raises(
         producer.CausalEvidenceProductionError,
         match="SEARCH_PROCESS_REVERIFY_FAILED",
     ):
-        producer.freeze_causal_process_precommit_v9(
+        producer.freeze_causal_process_precommit_v10(
             context=context,
             search_process=search_process.receipt_sha256,
-            process_id="production-causal-process-v9",
+            process_id="production-causal-process-v10",
             anchors=plans,
         )
 
@@ -1977,703 +1547,153 @@ def test_anchor_evidence_binds_exact_2400_cell_book_component() -> None:
 
 @pytest.fixture(scope="module")
 def valid_corpus(tmp_path_factory: pytest.TempPathFactory) -> Corpus:
-    tmp_path = tmp_path_factory.mktemp("causal-producer")
-    causal_corpus = causal_fixture._build_corpus()
-    precommit_payload = copy.deepcopy(causal_corpus.precommit_payload)
-    replay_component_manifest = {
-        "schema": "fxpm.causal-component-source-roster.v1",
-        "component_identity_key": "synchronized_replay_code_sha256",
-        "files": [
-            forward._source_file_identity("pm_portfolio_replay.py"),
-            forward._source_file_identity("pm_causal_evidence_producer.py"),
-            forward._source_file_identity("pm_forward_oos_replay_producer.py"),
-        ],
-    }
-    precommit_payload["process_definition"]["component_identities"][
-        "synchronized_replay_code_sha256"
-    ] = _sha(replay_component_manifest)
-    precommit_payload["process_definition_sha256"] = _sha(
-        precommit_payload["process_definition"]
-    )
-    process_sha = causal.canonical_sha256(precommit_payload)
-    capital_config = capital_fixture._config()
-    context = spool.freeze_generation_context(
-        tmp_path / "spool",
-        generation_id="causal-evidence-generation-v1",
-        native_universe_sha256="c" * 64,
-        config_sha256=_sha(capital_config),
-    )
-    with pytest.MonkeyPatch.context() as patcher:
-        patcher.setattr(
-            capital_bootstrap,
-            "_utc_now",
-            lambda: datetime(2026, 7, 13, 10, 0, 30, tzinfo=timezone.utc),
-        )
-        capital_authority = capital_bootstrap.bootstrap_production_capital_authority(
-            bootstrap_root=(tmp_path / "capital-bootstrap").resolve(),
-            output_root=(tmp_path / "capital-output").resolve(),
-            authorization_scope=capital_bootstrap.DEMO_PROBATION_SCOPE,
-            generation_context=context,
-            config_payload=capital_config,
-            native_source_identity=capital_fixture._native_identity(),
-            process_precommitment_payload=precommit_payload,
-            inner_selection_windows_by_anchor=capital_fixture._inner_windows(),
-            current_selection_window={
-                "start_date": "2025-02-05",
-                "end_date": "2026-01-01",
-            },
-            contract_lineage=capital_fixture._contract(),
-            margin_terms_sha256=_sha({"margin": "CURRENT"}),
-            broker_terms_sha256=_sha({"broker": "CURRENT"}),
-            replay_output_loader=lambda _request: capital_fixture._dummy_output(),
-        )
-    capital_binding_body = capital_bootstrap.verify_capital_forward_phase_binding(
-        context,
-        capital_authority.forward_phase_binding,
-    )
-    anchor_plan = precommit_payload["process_definition"]["anchor_plan"]
-    winner_symbol = book.PINNED_SYMBOL_ORDER[0]
-    winner_symbols = [winner_symbol] * len(anchor_plan)
-    native_products = _anchor_native_prefixes(
-        tmp_path / "historical-native",
-        anchor_plan,
-        symbol=winner_symbol,
-    )
-    anchors = []
-    plans_by_anchor: dict[str, dict[str, dict[str, tuple[Any, ...]]]] = {}
-    observed_by_anchor: dict[str, dict[str, Any]] = {}
-    original_process_precommit = adapter_fixture.PROCESS_PRECOMMIT
-    adapter_fixture.PROCESS_PRECOMMIT = process_sha
-    try:
-        for plan in anchor_plan:
-            anchor_id = plan["anchor_id"]
-            cutoff = datetime.fromisoformat(
-                plan["selection_cutoff_utc"].replace("Z", "+00:00")
-            ).date()
-            first_fold_start = cutoff - timedelta(days=4 * 63)
-            fold_plan = [
-                {
-                    "anchor_as_of_utc": (
-                        f"{(first_fold_start + timedelta(days=63 * ordinal)).isoformat()}"
-                        "T00:00:00+00:00"
-                    ),
-                    "oos_start_date_utc": (
-                        first_fold_start + timedelta(days=63 * ordinal)
-                    ).isoformat(),
-                    "oos_end_date_utc": (
-                        first_fold_start + timedelta(days=63 * ordinal + 62)
-                    ).isoformat(),
-                }
-                for ordinal in range(4)
-            ]
-            seed_result = adapter_fixture._raw_fold(0, fold_plan[0])["lanes"][
-                "optimizer_train_base"
-            ]
-            source_seed = adapter_fixture.raw_winner.build_trade_source_contract_from_backtester_result(
-                seed_result
-            )
-            sample = adapter_fixture.build_trade_sample_evidence(
-                [],
-                source_contract=source_seed,
-                minimum_observations=8,
-            )
-            assert sample.source_contract is not None
-            native_product = native_products[anchor_id]
-            source, fit = _adapter_available_authority(
-                anchor=plan,
-                symbol=winner_symbol,
-                source_contract_sha256=(sample.source_contract.source_contract_sha256),
-                native_product=native_product,
-            )
-            attempts = (
-                adapter_fixture._attempt_artifact(
-                    winner_symbol,
-                    native_prefix_product=native_product,
-                    lookback_value=50,
-                ),
-                adapter_fixture._attempt_artifact(
-                    winner_symbol,
-                    native_prefix_product=native_product,
-                    lookback_value=60,
-                ),
-            )
-            per_symbol: dict[str, dict[str, tuple[Any, ...]]] = {}
-            bindings: list[dict[str, Any]] = []
-            for symbol in book.PINNED_SYMBOL_ORDER:
-                per_timeframe: dict[str, tuple[Any, ...]] = {}
-                for timeframe in book.TIMEFRAME_ORDER:
-                    if (
-                        symbol == winner_symbol
-                        and timeframe == adapter_fixture.OBSERVED_TIMEFRAME
-                    ):
-                        values = [
-                            adapter_fixture._real_horizon_plan(
-                                plan,
-                                symbol,
-                                "TREND",
-                                native_prefix_product=native_product,
-                                attempt_artifact=attempts[0],
-                                additional_attempt_artifacts=(attempts[1],),
-                                fold_plan=fold_plan,
-                            ),
-                            *(
-                                adapter_fixture._real_unobserved_horizon_plan(
-                                    plan,
-                                    symbol,
-                                    timeframe,
-                                    regime,
-                                    native_prefix_body=native_product.native_prefix,
-                                    source_decision=source,
-                                    fit_decision=fit,
-                                )
-                                for regime in book.REGIME_ORDER[1:]
-                            ),
-                        ]
-                    else:
-                        values = adapter_fixture._plans(
-                            plan,
-                            symbol,
-                            timeframe,
-                            source_available=False,
-                        )
-                    per_timeframe[timeframe] = tuple(values)
-                    bindings.extend(
-                        historical.historical_horizon_plan_binding(value)
-                        for value in values
-                    )
-                per_symbol[symbol] = per_timeframe
-            assert len(bindings) == book.FAMILY_SIZE
-            plans_by_anchor[anchor_id] = per_symbol
-            observed_by_anchor[anchor_id] = {
-                "native_product": native_product,
-                "source": source,
-                "fit": fit,
-                "fold_plan": fold_plan,
-                "attempts": attempts,
-                "source_seed": source_seed,
-            }
-            anchors.append(
-                {
-                    **plan,
-                    "horizon_binding_count": book.FAMILY_SIZE,
-                    "horizon_binding_roster_sha256": (
-                        historical.historical_horizon_binding_roster_sha256(bindings)
-                    ),
-                }
-            )
-    finally:
-        adapter_fixture.PROCESS_PRECOMMIT = original_process_precommit
-    historical_precommit = historical.precommit_historical_anchor_run(
-        context,
-        run_id="historical-run-001",
-        process_precommit_receipt_sha256=process_sha,
-        optimizer_producer_release_sha256=(
-            historical_adapter.HISTORICAL_PRODUCER_RELEASE_SHA256
-        ),
-        anchors=anchors,
-    )
-    callbacks = {}
-    for plan in anchor_plan:
-        anchor_id = plan["anchor_id"]
-        symbol_plans = plans_by_anchor[anchor_id]
-        observed = observed_by_anchor[anchor_id]
-
-        def callback(
-            request: historical.AnchorProducerRequest,
-            *,
-            plan: dict[str, Any] = plan,
-            anchor_id: str = anchor_id,
-            symbol_plans: dict[str, dict[str, tuple[Any, ...]]] = symbol_plans,
-            observed: dict[str, Any] = observed,
-        ):
-            for symbol in book.PINNED_SYMBOL_ORDER:
-                capture = historical_adapter.open_historical_symbol_capture(
-                    context,
-                    request,
-                    symbol,
-                )
-                for timeframe in book.TIMEFRAME_ORDER:
-                    if (
-                        symbol == winner_symbol
-                        and timeframe == adapter_fixture.OBSERVED_TIMEFRAME
-                    ):
-                        source = observed["source"]
-                        fit = observed["fit"]
-                    else:
-                        source, fit = adapter_fixture._terminal_authority(
-                            anchor_id,
-                            symbol,
-                            timeframe,
-                        )
-                    capture.bind_timeframe(
-                        timeframe,
-                        horizon_plans=symbol_plans[symbol][timeframe],
-                        source_group_decision=source,
-                        regime_fit_decision=fit,
-                    )
-                if symbol == winner_symbol:
-                    handle = capture.freeze_observed_cell(
-                        adapter_fixture.OBSERVED_TIMEFRAME,
-                        "TREND",
-                        native_prefix_product=observed["native_product"],
-                        precommitted_at_utc="2026-07-13T09:01:00Z",
-                        attempts_frozen_at_utc="2026-07-13T09:01:01Z",
-                        fold_plan=observed["fold_plan"],
-                        attempt_artifacts=observed["attempts"],
-                        source_contract_seed=observed["source_seed"],
-                        base_cost_contract=adapter_fixture.BASE_COST_POLICY,
-                        stress_cost_contract=adapter_fixture.STRESS_COST_POLICY,
-                        # freeze_observed_cell gained this required argument when
-                        # cost-stress v2 landed; this file was not updated, so
-                        # every test below errored at setup and stopped running.
-                        cost_stress_adversity_plan=(
-                            adapter_fixture._cost_stress_adversity_plan(
-                                horizon_plan=symbol_plans[symbol][
-                                    adapter_fixture.OBSERVED_TIMEFRAME
-                                ][0],
-                                fold_plan=observed["fold_plan"],
-                                symbol=symbol,
-                            )
-                        ),
-                        risk_unit_contract=adapter_fixture.RISK_CONTRACT,
-                    )
-                    capture.complete_observed_cell(
-                        handle,
-                        attempt_evidence=[
-                            {
-                                "attempt_id": handle.frozen.attempt_ledger["attempts"][
-                                    attempt_ordinal
-                                ]["attempt_id"],
-                                "folds": [
-                                    _adapter_raw_fold_for_attempt(
-                                        handle=handle,
-                                        attempt_ordinal=attempt_ordinal,
-                                        fold_ordinal=fold_ordinal,
-                                        planned=planned,
-                                        process_precommit_receipt_sha256=(process_sha),
-                                    )
-                                    for fold_ordinal, planned in enumerate(
-                                        observed["fold_plan"]
-                                    )
-                                ],
-                            }
-                            for attempt_ordinal in range(len(observed["attempts"]))
-                        ],
-                        evidence_access_started_at_utc=("2026-07-13T09:01:02Z"),
-                        evidence_access_completed_at_utc=("2026-07-13T09:01:03Z"),
-                    )
-                yield capture.finish()
-
-        callbacks[anchor_id] = callback
-    run_receipt = historical.execute_historical_anchor_run(
-        context,
-        historical_precommit,
-        callbacks,
-    )
-    assert historical.verify_historical_anchor_run_receipt(
-        context, historical_precommit, run_receipt
-    )
-
-    clocks = (
-        "2026-07-13T10:02:00Z",
-        "2026-07-13T10:03:00Z",
-        "2026-07-13T10:20:00Z",
-        "2026-07-13T10:22:00Z",
-    )
-    replay_sets = {}
-    replay_bodies = {}
-    run_body = run_receipt.to_dict()
-    for index, (plan, source_anchor, winner_symbol) in enumerate(
-        zip(
-            precommit_payload["process_definition"]["anchor_plan"],
-            causal_corpus.evidence_payload["anchors"],
-            winner_symbols,
-            strict=True,
-        )
-    ):
-        cell_id = book.compute_cell_id(
-            winner_symbol,
-            adapter_fixture.OBSERVED_TIMEFRAME,
-            "TREND",
-        )
-        assert cell_id is not None
-        bodies = _decompose_activity(
-            source_anchor,
-            book_cell_id=cell_id,
-            regime="TREND",
-            strategy_ordinal=index,
-            clocks=clocks,
-        )
-        descriptors = {
-            role: spool.write_canonical_json_artifact(context, body)
-            for role, body in bodies.items()
-        }
-        replay_bodies[plan["anchor_id"]] = bodies
-        replay_sets[plan["anchor_id"]] = producer.AnchorReplayArtifactDescriptors(
-            event_ledger=descriptors["EVENT_LEDGER"],
-            fill_ledger=descriptors["FILL_LEDGER"],
-            mtm_ledger=descriptors["MTM_LEDGER"],
-            cost_ledger=descriptors["COST_LEDGER"],
-            exposure_ledger=descriptors["EXPOSURE_LEDGER"],
-            margin_ledger=descriptors["MARGIN_LEDGER"],
-        )
-    anchor_ids = [
-        plan["anchor_id"]
-        for plan in precommit_payload["process_definition"]["anchor_plan"]
-    ]
-    code_identity = forward._replay_code_identity(precommit_payload)
-    pipeline_identity = {
-        "schema_version": "fxpm.forward-oos-pipeline-config-identity.v1",
-        "deployment_config_path": "config.json",
-        "full_dataclass_surface": {},
-        "backtester_cost_surface": {},
-    }
-    deployment_binding = {
-        "deployment_config_path": "config.json",
-        "deployment_config_sha256": context.config_sha256,
-        "deployment_config_size_bytes": 1,
-        "broker_specs_path": "broker_specs.json",
-        "broker_specs_relative_path": "broker_specs.json",
-        "broker_specs_sha256": "e" * 64,
-        "broker_specs_size_bytes": 1,
-        "pipeline_config_identity": pipeline_identity,
-        "pipeline_config_identity_sha256": _sha(pipeline_identity),
-    }
-    capital_windows = forward._binding_windows(capital_binding_body)
-    required_rosters = {
-        anchor_id: {
-            "execution_product_keys": [
-                f"{winner_symbol}|{adapter_fixture.OBSERVED_TIMEFRAME}"
-            ],
-            "valuation_m5_product_keys": [f"{winner_symbol}|M5"],
-        }
-        for anchor_id, winner_symbol in zip(anchor_ids, winner_symbols, strict=True)
-    }
-    product_identities = []
-    for plan, winner_symbol in zip(
-        precommit_payload["process_definition"]["anchor_plan"],
-        winner_symbols,
-        strict=True,
-    ):
-        anchor_id = plan["anchor_id"]
-        shared_activation = {
-            "activation_id": f"activation:{anchor_id}",
-            "activation_manifest_sha256": _tag_sha(f"{anchor_id}:activation"),
-        }
-        execution_identity = {
-            "symbol": winner_symbol,
-            "timeframe": adapter_fixture.OBSERVED_TIMEFRAME,
-            **shared_activation,
-            "source_bars_sha256": _tag_sha(f"{anchor_id}:D1:bars"),
-            "source_audit_sidecar_sha256": _tag_sha(f"{anchor_id}:D1:sidecar"),
-            "index_sha256": _tag_sha(f"{anchor_id}:D1:index"),
-        }
-        valuation_identity = {
-            "symbol": winner_symbol,
-            "timeframe": "M5",
-            **shared_activation,
-            "source_bars_sha256": _tag_sha(f"{anchor_id}:M5:bars"),
-            "source_audit_sidecar_sha256": _tag_sha(f"{anchor_id}:M5:sidecar"),
-            "index_sha256": _tag_sha(f"{anchor_id}:M5:index"),
-        }
-        execution_products = [execution_identity]
-        valuation_products = [valuation_identity]
-        product_identities.append(
-            {
-                "anchor_id": anchor_id,
-                "forward_end_exclusive_utc": (
-                    datetime.fromisoformat(plan["forward_end_date"]) + timedelta(days=1)
-                )
-                .date()
-                .isoformat()
-                + "T00:00:00Z",
-                "execution_products": execution_products,
-                "valuation_m5_products": valuation_products,
-                "execution_product_roster_sha256": _sha(execution_products),
-                "valuation_m5_product_roster_sha256": _sha(valuation_products),
-                "valuation_products_supplied_separately": True,
-                "capital_phase_windows": capital_windows[anchor_id],
-            }
-        )
-    forward_precommit_body = {
-        "schema_version": forward.REPLAY_PRECOMMIT_SCHEMA,
-        "generation_id": context.generation_id,
-        "generation_context_sha256": context.context_sha256,
-        "native_universe_sha256": context.native_universe_sha256,
-        "config_sha256": context.config_sha256,
-        "historical_precommit_receipt_sha256": historical_precommit.receipt_sha256,
-        "historical_run_receipt_sha256": run_receipt.receipt_sha256,
-        "historical_run_payload_sha256": _sha(run_body),
-        "causal_precommit_payload_sha256": process_sha,
-        "created_at_utc": "2026-07-13T10:01:30.000000Z",
-        "created_before_first_forward_oos_frame_access": True,
-        "all_native_source_access_times_not_after_precommit": True,
-        "required_rosters": required_rosters,
-        "anchor_product_identities": product_identities,
-        "anchor_product_identities_sha256": _sha(product_identities),
-        "capital_phase_windows_by_anchor": capital_windows,
-        "capital_phase_windows_sha256": _sha(capital_windows),
-        "capital_forward_phase_binding": capital_binding_body,
-        "capital_forward_phase_binding_sha256": _sha(capital_binding_body),
-        "capital_bootstrap_identity_sha256": capital_binding_body[
-            "bootstrap_identity_sha256"
-        ],
-        "capital_precommitment_body_sha256": capital_binding_body[
-            "capital_precommitment_body_sha256"
-        ],
-        "capital_contract_lineage_sha256": _sha(
-            capital_binding_body["contract_lineage"]
-        ),
-        "capital_margin_terms_sha256": capital_binding_body["margin_terms_sha256"],
-        "capital_broker_terms_sha256": capital_binding_body["broker_terms_sha256"],
-        "deployment_binding": deployment_binding,
-        "code_identity": code_identity,
-        "valuation_contract": forward.VALUATION_CONTRACT,
-        "product_cutoff_contract": "EXACT_FORWARD_END_EXCLUSIVE_NO_LATER_ROWS",
-        "confers_causal_current_refit_capital_publication_or_trading_authority": False,
-    }
-    forward_precommit_descriptor = spool.write_canonical_json_artifact(
-        context, forward_precommit_body
-    )
-    forward_precommit_raw = _canonical(forward_precommit_body)
-    precommit_issuer = forward.precommit_forward_oos_replay_products.__kwdefaults__[
-        "_issue_precommit"
-    ]
-    replay_precommit = forward.ForwardOOSReplayPrecommit(
-        forward_precommit_raw,
-        forward_precommit_descriptor,
-        precommit_issuer(forward_precommit_raw, forward_precommit_descriptor),
-    )
-    run_anchors = {value["anchor_id"]: value for value in run_body["anchors"]}
-    precommit_anchors = {value["anchor_id"]: value for value in product_identities}
-    phase_manifests: dict[str, dict[str, Any]] = {}
-    for plan, winner_symbol in zip(
-        precommit_payload["process_definition"]["anchor_plan"],
-        winner_symbols,
-        strict=True,
-    ):
-        anchor_id = plan["anchor_id"]
-        cell_id = book.compute_cell_id(
-            winner_symbol,
-            adapter_fixture.OBSERVED_TIMEFRAME,
-            "TREND",
-        )
-        assert cell_id is not None
-        specialist = _capital_specialist(
-            anchor_id=anchor_id,
-            symbol=winner_symbol,
-            timeframe=adapter_fixture.OBSERVED_TIMEFRAME,
-            cell_id=cell_id,
-        )
-        for phase in forward.CAPITAL_PHASES:
-            phase_id = forward._capital_phase_id(anchor_id, phase)
-            window = capital_windows[anchor_id][phase]
-            candidate = _capital_candidate(
-                phase_id=phase_id,
-                cell_id=cell_id,
-                symbol=winner_symbol,
-                timeframe=adapter_fixture.OBSERVED_TIMEFRAME,
-                window=window,
-            )
-            replay = forward._AnchorRawReplay(
-                anchor=plan,
-                specialists=(specialist,),
-                positions=(SimpleNamespace(candidate=candidate),),
-                accepted_volume_by_position_id={},
-                production_metadata={
-                    "capital_phase_id": phase_id,
-                    "capital_phase": phase,
-                    "capital_window": window,
-                },
-            )
-            manifest_descriptor, _ = forward._persist_capital_phase_evidence(
-                context=context,
-                replay=replay,
-                run_anchor=run_anchors[anchor_id],
-                replay_precommit=replay_precommit,
-                replay_precommit_body=forward_precommit_body,
-                precommit_anchor=precommit_anchors[anchor_id],
-            )
-            phase_manifests[phase_id] = manifest_descriptor
-    receipt_body = {
-        "schema_version": forward.PRODUCER_RECEIPT_SCHEMA,
-        "production_contract_version": forward.PRODUCTION_CONTRACT_VERSION,
-        "generation_id": context.generation_id,
-        "generation_context_sha256": context.context_sha256,
-        "native_universe_sha256": context.native_universe_sha256,
-        "config_sha256": context.config_sha256,
-        "historical_precommit_receipt_sha256": historical_precommit.receipt_sha256,
-        "historical_run_receipt_sha256": run_receipt.receipt_sha256,
-        "causal_precommit_payload_sha256": process_sha,
-        "forward_replay_precommit_receipt_sha256": forward_precommit_descriptor[
-            "sha256"
-        ],
-        "forward_replay_precommit_descriptor": forward_precommit_descriptor,
-        "capital_bootstrap_identity_sha256": capital_binding_body[
-            "bootstrap_identity_sha256"
-        ],
-        "capital_precommitment_body_sha256": capital_binding_body[
-            "capital_precommitment_body_sha256"
-        ],
-        "capital_contract_lineage_sha256": _sha(
-            capital_binding_body["contract_lineage"]
-        ),
-        "capital_margin_terms_sha256": capital_binding_body["margin_terms_sha256"],
-        "capital_broker_terms_sha256": capital_binding_body["broker_terms_sha256"],
-        "evidence_access_started_at_utc": clocks[0],
-        "execution_started_at_utc": clocks[1],
-        "execution_completed_at_utc": clocks[2],
-        "reconciled_at_utc": clocks[3],
-        "deployment_binding": deployment_binding,
-        "code_identity": code_identity,
-        "anchor_ledger_descriptors": {
-            anchor_id: {
-                role: dict(value)
-                for role, value in replay_sets[anchor_id].descriptors()
-            }
-            for anchor_id in anchor_ids
-        },
-        "anchor_production_metadata": {
-            anchor_id: {
-                "schema": "fxpm.test-forward-anchor-production-metadata.v1",
-                "anchor_id": anchor_id,
-            }
-            for anchor_id in anchor_ids
-        },
-        "ordered_anchor_ids": anchor_ids,
-        "capital_phase_manifest_descriptors": phase_manifests,
-        "ordered_capital_phase_ids": list(phase_manifests),
-        "capital_candidate_records_complete_pre_policy": True,
-        "capital_phase_window_contract": (
-            "SIGNED_BOOTSTRAP_INNER_AND_CAUSAL_OUTER_HALF_OPEN_V1"
-        ),
-        "valuation_contract": forward.VALUATION_CONTRACT,
-        "valuation_event_order": "close_existing_then_mark_existing_then_admit",
-        "candidate_marks_thinned_or_sampled": False,
-        "causal_consumer_reopened_and_verified": False,
-        "causal_binding_followup_required": True,
-        "confers_causal_process_current_refit_capital_readiness_publication_or_trading_authority": False,
-    }
-    receipt_descriptor = spool.write_canonical_json_artifact(context, receipt_body)
-    anchor_rows = tuple((anchor_id, replay_sets[anchor_id]) for anchor_id in anchor_ids)
-    receipt_raw = _canonical(receipt_body)
-    # White-box fixture only: production callers receive products solely from
-    # produce_forward_oos_replay_artifacts.  Hostile forward tests prove that
-    # direct construction and dataclasses.replace cannot mint a valid tag.
-    issuer = forward.produce_forward_oos_replay_artifacts.__kwdefaults__[
-        "_issue_product"
-    ]
-    forward_product = forward.ForwardOOSReplayProduct(
-        anchor_rows,
-        receipt_raw,
-        receipt_descriptor,
-        issuer(anchor_rows, receipt_raw, receipt_descriptor),
-    )
-    forward.verify_forward_oos_replay_product(context, forward_product)
+    """Read original QA75 bytes; no old writer, issuer or new economic evidence."""
+    retained = _RETAINED_CAUSAL_SPOOL.resolve(strict=True)
+    assert _RETAINED_NATIVE_SPOOL.is_dir(), "retained original native context is missing"
+    scratch = tmp_path_factory.mktemp("retained-causal-raw").resolve(strict=True)
+    destination = (scratch / "spool").resolve()
+    assert destination.is_relative_to(scratch) and not destination.is_relative_to(retained)
+    assert not retained.is_relative_to(destination)
+    shutil.copytree(retained, destination)
+    context = spool.reopen_generation_context(destination,
+        expected_generation_id="causal-evidence-generation-v1",
+        expected_native_universe_sha256="c" * 64,
+        expected_config_sha256="1b29cfd39e0af9a6ade7927a288fbcbb6418e23d519379240c79dd4e59c2b573")
+    assert context.context_sha256 == "6568fd19d5388995ccd14acbc61930207856050573393e72813510aa1f85d622"
+    _OWNED_TEST_SPOOL_ROOTS.add(destination)
+    receipt_body, _, _ = _retained_json(context,
+        "086028f05ae191a919933a03d390ab5ce6689b36cb6a23296134089ef07e6405")
+    precommit_body, precommit_raw, precommit_descriptor = _retained_json(context,
+        "de28367e5ffd39e1323236f623d5d8b1f1f21a4b49a95b2cab9ed277eb2551fe")
+    run_body, run_raw, run_descriptor = _retained_json(context,
+        "6a8698cf17ccb0a0a3d628bd0fdedc0501e36dd0a02e15e19f8baa271d85258a")
+    forward_precommit, _, _ = _retained_json(context,
+        "85885c5d04e212e2eede692d6e94b628cbf545dbbe194218d36c34ef4281b8b6")
+    assert receipt_body["forward_replay_precommit_descriptor"]["sha256"] == (
+        "85885c5d04e212e2eede692d6e94b628cbf545dbbe194218d36c34ef4281b8b6")
+    causal_sha = "50fffedf2aa720fb7a8cf3d331c19e15d8ebb0fc4964486f3e22a3e504b2e87b"
+    assert receipt_body["causal_precommit_payload_sha256"] == causal_sha
+    assert forward_precommit["causal_precommit_payload_sha256"] == causal_sha
+    historical_precommit = historical.HistoricalAnchorPrecommit(precommit_raw, _canonical(precommit_descriptor))
+    run_receipt = historical.HistoricalAnchorRunReceipt(run_raw, _canonical(run_descriptor))
+    assert receipt_body["historical_precommit_receipt_sha256"] == historical_precommit.receipt_sha256
+    assert receipt_body["historical_run_receipt_sha256"] == run_receipt.receipt_sha256
+    assert run_body["precommit_receipt_sha256"] == historical_precommit.receipt_sha256
     request_body = {
         "schema_version": coordinator.COORDINATOR_SCHEMA,
         "historical_run_receipt_sha256": run_receipt.receipt_sha256,
         "anchor_book_receipt_sha256_by_id": {
-            item["anchor_id"]: item["book_decision_sha256"]
-            for item in run_body["anchors"]
-        },
-        "causal_precommit_payload_sha256": process_sha,
+            row["anchor_id"]: row["book_decision_sha256"] for row in run_body["anchors"]},
+        "causal_precommit_payload_sha256": causal_sha,
         "authority_claimed": False,
     }
     request = coordinator.HistoricalEvidenceRequest(_canonical(request_body))
-    callback = producer.BoundedCausalEvidenceProducer(
-        context=context,
-        historical_precommit=historical_precommit,
-        historical_run_receipt=run_receipt,
-        causal_precommit_payload=precommit_payload,
-        forward_replay_product=forward_product,
-    )
-    return Corpus(
-        context,
-        precommit_payload,
-        historical_precommit,
-        run_receipt,
-        replay_sets,
-        replay_bodies,
-        forward_product,
-        request,
-        callback,
-    )
+    artifacts = producer._reopen_historical_artifacts(context, historical_precommit,
+        run_receipt, request_body, causal_sha)
+    anchors = tuple(precommit_body["anchors"])
+    assert [row["anchor_id"] for row in anchors] == receipt_body["ordered_anchor_ids"]
+    assert len(anchors) == 4
+    replay_sets, replay_bodies = {}, {}
+    for anchor in anchors:
+        anchor_id = anchor["anchor_id"]
+        rows = receipt_body["anchor_ledger_descriptors"][anchor_id]
+        assert set(rows) == {"EVENT_LEDGER", "FILL_LEDGER", "MTM_LEDGER", "COST_LEDGER", "EXPOSURE_LEDGER", "MARGIN_LEDGER"}
+        descriptors = producer.AnchorReplayArtifactDescriptors(
+            event_ledger=rows["EVENT_LEDGER"], fill_ledger=rows["FILL_LEDGER"],
+            mtm_ledger=rows["MTM_LEDGER"], cost_ledger=rows["COST_LEDGER"],
+            exposure_ledger=rows["EXPOSURE_LEDGER"], margin_ledger=rows["MARGIN_LEDGER"])
+        replay_sets[anchor_id] = descriptors
+        replay_bodies[anchor_id], _ = producer._load_replay_ledgers(context, descriptors, anchor)
+    return Corpus(context, scratch, causal_sha, historical_precommit, run_receipt,
+        anchors, artifacts, replay_sets, replay_bodies, request)
 
 
-def test_valid_four_anchor_genuine_replay_produces_verified_product(
-    valid_corpus: Corpus,
-) -> None:
-    product = valid_corpus.callback(valid_corpus.request)
 
-    assert type(product) is coordinator.CausalEvidenceProduct
-    decision = causal.evaluate_historical_process(
-        valid_corpus.precommit_payload,
-        dict(product.evidence_payload),
-        dict(product.reconciliation_payload),
-    )
-    assert causal.verify_historical_process_decision(
-        decision,
-        valid_corpus.precommit_payload,
-        dict(product.evidence_payload),
-        dict(product.reconciliation_payload),
-    )
-    assert decision.body()["decision"] == "OFFLINE_PROCESS_VALIDATION_PASS"
-    assert len(product.evidence_payload["anchors"]) == 4
-    assert all(
-        len(anchor["book_cells"]) == causal.CELL_COUNT
-        for anchor in product.evidence_payload["anchors"]
-    )
+def test_retained_four_anchor_raw_reconstruction_preserves_original_activity(valid_corpus: Corpus) -> None:
+    # Coverage is archived raw/anchor reconstruction, not issued Forward/Capital or global causal PASS.
+    assert len(valid_corpus.anchor_plans) == 4
+    for anchor in valid_corpus.anchor_plans:
+        anchor_id = anchor["anchor_id"]
+        ledgers, hashes = producer._load_replay_ledgers(valid_corpus.context,
+            valid_corpus.replay_sets[anchor_id], anchor)
+        book_body = valid_corpus.historical_artifacts.book_by_anchor[anchor_id]
+        specialists = producer._specialists(ledgers["EVENT_LEDGER"], book_body,
+            anchor["selection_cutoff_utc"])
+        cells, supports, detectors, _ = producer._causal_book_projection(
+            anchor=anchor, book_body=book_body,
+            horizon_bindings=valid_corpus.historical_artifacts.horizon_by_anchor[anchor_id],
+            specialists=specialists)
+        assert len(cells) == causal.CELL_COUNT
+        assert len(supports) == len(detectors) == len(causal.SYMBOLS) * len(causal.TIMEFRAMES)
+        assert [(cell["symbol"], cell["timeframe"], cell["regime"]) for cell in cells] == list(
+            causal.expected_cell_roster()
+        )
+        identities = causal._EvidenceIdentityRegistry()
+        book_sha = causal._validate_cell_book(cells, supports, detectors,
+            anchor["selection_cutoff_utc"], anchor_id, identities)
+        assert book_sha == causal.canonical_sha256({
+            "cells": cells, "train_regime_supports": supports,
+            "regime_detector_records": detectors,
+        })
+        activity, gross, base_cost, p75_cost = producer._assemble_activity(
+            anchor=anchor, ledgers=ledgers, descriptor_hashes=hashes,
+            projected_cells=cells, book_cells=book_body["cells"])
+        dates = producer._expected_dates(anchor["forward_start_date"], anchor["forward_end_date"])
+        completed, _, ledger_ids, _, activity_sha = causal._validate_activity_ledger(
+            {"anchor_id": anchor_id, "book_cells": cells, "activity_ledger": activity},
+            dates, gross, base_cost, p75_cost, identity_registry=identities)
+        assert len(gross) == len(base_cost) == len(p75_cost) == len(dates)
+        assert completed
+        assert activity_sha == causal.canonical_sha256(activity)
+        assert ledger_ids["event_ledger_sha256"] == activity_sha
+        assert all(len(value) == 64 for value in ledger_ids.values())
 
 
-def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
-    (
-        frame,
-        config,
-        spec,
-        strategy,
-        base,
-        stress,
-        source_position,
-        valuation_tape,
-    ) = forward_fixture._genuine_position_evidence(
-        mode6_short=True,
-        return_tape=True,
-    )
-    valuation_frame = valuation_tape.frame.copy()
-    valuation_frame.loc[valuation_frame.index[-1], "Open"] = float(
-        source_position.exit_mid
-    )
-    valuation_half_spread = valuation_tape.entry_half_spread.copy()
-    valuation_half_spread[-1] = float(
-        source_position.exit_ask - source_position.exit_mid
-    )
-    valuation_tape = replace(
-        valuation_tape,
-        frame=valuation_frame,
-        entry_half_spread=valuation_half_spread,
-    )
+
+def test_synthetic_archived_mode6_short_rebound_passes_causal_v10_prefix_rules() -> None:
+    """Invented MODE6 archive-format payload; no current engine replay or authority."""
+    prototype = forward_fixture._synthetic_archived_position()
     specialist = forward_fixture._specialist()
-    position = forward._position_evidence(
-        specialist=specialist,
-        capital_phase=forward.CAPITAL_OUTER_EVALUATION,
-        strategy=strategy,
-        features=frame,
-        spec=spec,
-        config=config,
-        base_result=base,
-        stress_result=stress,
-        valuation_tape=valuation_tape,
-        resource_budget=forward._ResourceBudget(),
-    )[0]
+    multiplier = prototype.contract_multiplier
+    base_entry, p75_entry = Decimal("0.9999"), Decimal("0.99935")
+    exit_fill = Decimal("1.0021")
+    # MODE6 short financing uses the entry price: 36% annual / 360 days.
+    base_finance = multiplier * base_entry * Decimal("0.36") / 360
+    p75_finance = multiplier * p75_entry * Decimal("0.36") / 360
+    marks = tuple(
+        replace(mark, base_financing_per_lot=base_finance,
+                p75_financing_per_lot=p75_finance,
+                candidate_net_pnl_per_lot=float(
+                    (base_entry - mark.ask_price) * multiplier - base_finance * (index + 1)))
+        for index, mark in enumerate(prototype.marks)
+    )
+    base_net = (base_entry - exit_fill) * multiplier - base_finance * len(marks)
+    p75_net = (p75_entry - exit_fill) * multiplier - p75_finance * len(marks)
+    candidate = replace(
+        prototype.candidate, candidate_id="synthetic-archived-mode6-short",
+        strategy_name="synthetic-archived-mode6-short", direction=-1,
+        margin_per_lot=99990.,
+        legs=(portfolio.ExitLeg(
+            prototype.candidate.legs[-1].exit_time, 1., float(base_net),
+            price_pnl_per_entry_lot=float((base_entry - exit_fill) * multiplier)),),
+        marks=(portfolio.MarkPoint(
+            prototype.candidate.marks[0].time, marks[0].candidate_net_pnl_per_lot),),
+    ).normalized()
+    position = replace(
+        prototype, candidate=candidate, position_id=candidate.candidate_id,
+        side="SHORT", stop_price=Decimal("1.01"),
+        base_entry_fill=base_entry, p75_entry_fill=p75_entry,
+        base_exit_fill=exit_fill, p75_exit_fill=exit_fill,
+        margin_per_lot=Decimal("99990"), marks=marks,
+    )
     volume = Decimal("0.01")
-    replay = forward._AnchorRawReplay(
+    replay = forward_fixture._ArchivedAnchorRawReplay(
         anchor=forward_fixture._anchor_for(position),
         specialists=(specialist,),
         positions=(position,),
         accepted_volume_by_position_id={position.position_id: volume},
     )
-    ledgers = forward._ledger_bodies(replay, starting_balance=Decimal("10000"))
+    ledgers = forward_fixture._legacy_archive_ledger_bodies(replay, starting_balance=Decimal("10000"))
     cell_sha = _tag_sha("mode6-causal-cell")
     projected_cell = {
         "cell_id": specialist.cell_id,
@@ -2697,7 +1717,7 @@ def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
         )
     }
 
-    activity, gross, base_cost, stress_cost = producer._assemble_activity(
+    activity, gross, base_cost, p75_cost = producer._assemble_activity(
         anchor=replay.anchor,
         ledgers=ledgers,
         descriptor_hashes=descriptor_hashes,
@@ -2705,23 +1725,29 @@ def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
         book_cells=[raw_cell],
     )
     marks = [mark for day in activity["days"] for mark in day["position_marks"]]
-    assert forward.REPLAY_PRECOMMIT_SCHEMA == "fxpm.forward-oos-replay-precommit.v4"
-    assert causal.PROCESS_AUTHORITY_VERSION == "fxpm-offline-process-validation-v9"
-    assert spec.swap_mode == 6
+    assert forward.REPLAY_PRECOMMIT_SCHEMA == "fxpm.forward-oos-replay-precommit.v5"
+    assert causal.PROCESS_AUTHORITY_VERSION == "fxpm-offline-process-validation-v10"
+    assert (base_finance, p75_finance) == (Decimal("99.99"), Decimal("99.935"))
     assert position.side == "SHORT"
     assert any(
-        Decimal(mark["stress_financing_cash"])
+        Decimal(mark["p75_financing_cash"])
         < Decimal(mark["base_financing_cash"])
         for mark in marks
     )
-    assert stress_cost[1] > base_cost[1]
-    assert stress["trades"][0]["pnl_dollars"] < base["trades"][0]["pnl_dollars"]
+    assert p75_cost[1] > base_cost[1]
+    assert p75_net < base_net
+    for costs, expected_net in ((base_cost, base_net), (p75_cost, p75_net)):
+        # Reconcile the produced ledger cash, allowing only return quantization.
+        realized = sum((gross_value + cost_value) * Decimal(day["equity_basis_cash"])
+                       for gross_value, cost_value, day in zip(gross, costs, activity["days"], strict=True))
+        tolerance = sum(Decimal(day["equity_basis_cash"]) for day in activity["days"]) * causal._RETURN_QUANTUM
+        assert abs(realized - expected_net * volume) <= tolerance
     cumulative_base = Decimal(0)
-    cumulative_stress = Decimal(0)
-    for base_value, stress_value in zip(base_cost, stress_cost, strict=True):
+    cumulative_p75 = Decimal(0)
+    for base_value, p75_value in zip(base_cost, p75_cost, strict=True):
         cumulative_base += base_value
-        cumulative_stress += stress_value
-        assert cumulative_stress <= cumulative_base + causal._RETURN_QUANTUM
+        cumulative_p75 += p75_value
+        assert cumulative_p75 <= cumulative_base + causal._RETURN_QUANTUM
 
     verifier_anchor = {
         "anchor_id": replay.anchor["anchor_id"],
@@ -2733,24 +1759,24 @@ def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
         [day["date"] for day in activity["days"]],
         gross,
         base_cost,
-        stress_cost,
+        p75_cost,
     )
     assert len(completed) == 1
 
     tampered_activity = copy.deepcopy(activity)
     tampered_activity["days"][0]["position_marks"][0][
-        "stress_financing_cash"
+        "p75_financing_cash"
     ] = "0"
     with pytest.raises(
         causal.ProcessVerificationError,
-        match="stress cumulative cost prefix improves on base",
+        match="p75 cumulative cost prefix improves on base",
     ):
         causal._validate_activity_ledger(
             {**verifier_anchor, "activity_ledger": tampered_activity},
             [day["date"] for day in tampered_activity["days"]],
             gross,
             base_cost,
-            stress_cost,
+            p75_cost,
         )
 
     masked_position = replace(
@@ -2766,7 +1792,7 @@ def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
             masked_position.position_id: volume,
         },
     )
-    masked_ledgers = forward._ledger_bodies(
+    masked_ledgers = forward_fixture._legacy_archive_ledger_bodies(
         masked_replay, starting_balance=Decimal("10000")
     )
     first_mtm_marks = masked_ledgers["MTM_LEDGER"]["days"][0]["position_marks"]
@@ -2778,24 +1804,24 @@ def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
         for mark in masked_ledgers["COST_LEDGER"]["days"][0]["marks"]
     }
     first_cost_marks[event_id_by_position[position.position_id]][
-        "stress_financing_cash"
+        "p75_financing_cash"
     ] = "0"
     first_cost_marks[event_id_by_position[masked_position.position_id]][
-        "stress_financing_cash"
+        "p75_financing_cash"
     ] = "10"
     opening_entry = activity["days"][0]["entries"][0]
-    base_open = producer._opening_execution_cost(opening_entry, stress=False)
-    stress_open = producer._opening_execution_cost(opening_entry, stress=True)
+    base_open = producer._opening_execution_cost(opening_entry, p75=False)
+    p75_open = producer._opening_execution_cost(opening_entry, p75=True)
     aggregate_base_prefix = base_open * 2 + sum(
         Decimal(mark["base_financing_cash"]) for mark in first_cost_marks.values()
     )
-    aggregate_stress_prefix = stress_open * 2 + sum(
-        Decimal(mark["stress_financing_cash"]) for mark in first_cost_marks.values()
+    aggregate_p75_prefix = p75_open * 2 + sum(
+        Decimal(mark["p75_financing_cash"]) for mark in first_cost_marks.values()
     )
-    assert aggregate_stress_prefix > aggregate_base_prefix
+    assert aggregate_p75_prefix > aggregate_base_prefix
     with pytest.raises(
         producer.CausalEvidenceProductionError,
-        match="STRESS_POSITION_COST_PREFIX_IMPROVEMENT",
+        match="P75_POSITION_COST_PREFIX_IMPROVEMENT",
     ):
         producer._assemble_activity(
             anchor=masked_replay.anchor,
@@ -2809,33 +1835,22 @@ def test_forward_v4_mode6_short_rebound_passes_causal_v9_prefix_rules() -> None:
 def test_bare_replay_descriptors_cannot_bypass_issued_forward_product(
     valid_corpus: Corpus,
 ) -> None:
-    callback = replace(
-        valid_corpus.callback,
-        forward_replay_product=valid_corpus.replay_sets,
-    )
     with pytest.raises(
         producer.CausalEvidenceProductionError,
         match="FORWARD_OOS_REPLAY_PRODUCT_REVERIFY_FAILED",
-    ):
-        callback(valid_corpus.request)
+    ) as caught:
+        producer._forward_oos_replay_lineage(
+            context=valid_corpus.context,
+            product=valid_corpus.replay_sets,
+            historical_precommit=valid_corpus.historical_precommit,
+            historical_run_receipt=valid_corpus.run_receipt,
+            causal_precommit_payload={},
+        )
+    assert isinstance(caught.value.__cause__, forward.ForwardOOSReplayProductionError)
+    assert caught.value.__cause__.code == "FORWARD_OOS_REPLAY_PRODUCT_NOT_ISSUED"
 
 
-def _callback_with(
-    corpus: Corpus,
-    anchor_id: str,
-    replacement: producer.AnchorReplayArtifactDescriptors,
-) -> producer.BoundedCausalEvidenceProducer:
-    rows = tuple(
-        (observed_id, replacement if observed_id == anchor_id else descriptors)
-        for observed_id, descriptors in corpus.forward_product._anchor_rows
-    )
-    forged = replace(corpus.forward_product, _anchor_rows=rows)
-    return replace(corpus.callback, forward_replay_product=forged)
-
-
-def test_missing_raw_cost_ledger_fails_typed(
-    valid_corpus: Corpus, tmp_path: Path
-) -> None:
+def test_missing_raw_cost_ledger_fails_typed(valid_corpus: Corpus) -> None:
     anchor_id = next(iter(valid_corpus.replay_sets))
     original = valid_corpus.replay_sets[anchor_id]
     missing = dict(original.cost_ledger)
@@ -2844,9 +1859,10 @@ def test_missing_raw_cost_ledger_fails_typed(
 
     with pytest.raises(
         producer.CausalEvidenceProductionError,
-        match="FORWARD_OOS_REPLAY_PRODUCT_REVERIFY_FAILED",
+        match="COST_LEDGER_ARTIFACT_UNAVAILABLE",
     ):
-        _callback_with(valid_corpus, anchor_id, replacement)(valid_corpus.request)
+        producer._load_replay_ledgers(valid_corpus.context, replacement,
+            valid_corpus.anchor_plans[0])
 
 
 def test_descriptor_bound_cost_tamper_fails_before_returns(
@@ -2855,9 +1871,9 @@ def test_descriptor_bound_cost_tamper_fails_before_returns(
     anchor_id = next(iter(valid_corpus.replay_sets))
     original = valid_corpus.replay_sets[anchor_id]
     descriptor = dict(original.cost_ledger)
-    root = Path(valid_corpus.context.root)
-    source = root / Path(descriptor["relative_path"])
-    target = root / "tampered" / "cost-ledger.json"
+    root = _owned_spool_root(valid_corpus.context)
+    source = _owned_corpus_path(valid_corpus, descriptor["relative_path"])
+    target = _owned_corpus_path(valid_corpus, "tampered/cost-ledger.json")
     target.parent.mkdir(parents=True, exist_ok=True)
     raw = source.read_bytes()
     target.write_bytes(raw[:-1] + (b" " if raw[-1:] != b" " else b"\n"))
@@ -2866,9 +1882,10 @@ def test_descriptor_bound_cost_tamper_fails_before_returns(
 
     with pytest.raises(
         producer.CausalEvidenceProductionError,
-        match="FORWARD_OOS_REPLAY_PRODUCT_REVERIFY_FAILED",
+        match="COST_LEDGER_ARTIFACT_INTEGRITY_MISMATCH",
     ):
-        _callback_with(valid_corpus, anchor_id, replacement)(valid_corpus.request)
+        producer._load_replay_ledgers(valid_corpus.context, replacement,
+            valid_corpus.anchor_plans[0])
 
 
 def test_future_refit_leakage_is_rejected_from_raw_specialist(
@@ -2878,14 +1895,19 @@ def test_future_refit_leakage_is_rejected_from_raw_specialist(
     original = valid_corpus.replay_sets[anchor_id]
     event = copy.deepcopy(valid_corpus.replay_bodies[anchor_id]["EVENT_LEDGER"])
     event["specialists"][0]["refit_market_data_end_utc"] = "2099-01-01T00:00:00Z"
+    _owned_spool_root(valid_corpus.context)
     descriptor = spool.write_canonical_json_artifact(valid_corpus.context, event)
     replacement = replace(original, event_ledger=descriptor)
 
     with pytest.raises(
         producer.CausalEvidenceProductionError,
-        match="FORWARD_OOS_REPLAY_PRODUCT_REVERIFY_FAILED",
+        match="SPECIALIST_REFIT_FUTURE_LEAKAGE",
     ):
-        _callback_with(valid_corpus, anchor_id, replacement)(valid_corpus.request)
+        ledgers, _ = producer._load_replay_ledgers(valid_corpus.context, replacement,
+            valid_corpus.anchor_plans[0])
+        producer._specialists(ledgers["EVENT_LEDGER"],
+            valid_corpus.historical_artifacts.book_by_anchor[anchor_id],
+            valid_corpus.anchor_plans[0]["selection_cutoff_utc"])
 
 
 def test_caller_return_vector_and_hash_fields_are_not_accepted(
@@ -2896,14 +1918,16 @@ def test_caller_return_vector_and_hash_fields_are_not_accepted(
     mtm = copy.deepcopy(valid_corpus.replay_bodies[anchor_id]["MTM_LEDGER"])
     mtm["caller_daily_returns"] = ["0.99"]
     mtm["caller_return_sha256"] = "f" * 64
+    _owned_spool_root(valid_corpus.context)
     descriptor = spool.write_canonical_json_artifact(valid_corpus.context, mtm)
     replacement = replace(original, mtm_ledger=descriptor)
 
     with pytest.raises(
         producer.CausalEvidenceProductionError,
-        match="FORWARD_OOS_REPLAY_PRODUCT_REVERIFY_FAILED",
+        match="RAW_LEDGER_FIELDS_INVALID",
     ):
-        _callback_with(valid_corpus, anchor_id, replacement)(valid_corpus.request)
+        producer._load_replay_ledgers(valid_corpus.context, replacement,
+            valid_corpus.anchor_plans[0])
 
 
 def test_coordinator_request_cannot_relabel_historical_book(
@@ -2912,10 +1936,671 @@ def test_coordinator_request_cannot_relabel_historical_book(
     body = valid_corpus.request.to_dict()
     first = next(iter(body["anchor_book_receipt_sha256_by_id"]))
     body["anchor_book_receipt_sha256_by_id"][first] = "0" * 64
-    request = coordinator.HistoricalEvidenceRequest(_canonical(body))
-
     with pytest.raises(
         producer.CausalEvidenceProductionError,
         match="COORDINATOR_BOOK_ROSTER_MISMATCH",
     ):
-        valid_corpus.callback(request)
+        producer._reopen_historical_artifacts(valid_corpus.context,
+            valid_corpus.historical_precommit, valid_corpus.run_receipt,
+            body, valid_corpus.causal_precommit_sha256)
+
+
+@pytest.fixture
+def frozen_raw_transport(completed_raw_transport, pytestconfig):
+    state = getattr(pytestconfig, "_fxpm_lane127_completed_transport")
+    assert state["transport"] is completed_raw_transport
+    runtime_guard = state["runtime_guard"]
+    assert callable(runtime_guard)
+    root = Path(completed_raw_transport[0].root).resolve(strict=True)
+    assert not any(root.is_relative_to(path.resolve()) for path in _OWNED_MUTATION_PROTECTED_ROOTS)
+    _OWNED_TEST_SPOOL_ROOTS.add(root)
+    try:
+        with runtime_guard(completed_raw_transport):
+            yield completed_raw_transport[:4]
+    finally:
+        _OWNED_TEST_SPOOL_ROOTS.discard(root)
+
+
+def _reseal_frozen_raw(context, body):
+    import pm_forward_oos_replay_producer as forward
+    _owned_spool_root(context)
+    descriptor = forward._write_raw_ledger(context, body, role="FROZEN_TIER_RAW_ACCOUNTS")
+    return producer.FrozenTierRawAccountsArtifact(descriptor)
+
+
+def _replace_synthetic_profile_source_binding(context, body):
+    _owned_spool_root(context)
+    descriptor = body["frozen_profile_descriptor"]
+    profile = json.loads((Path(context.root) / descriptor["relative_path"]).read_bytes())
+    tier = body["accounts"]["P75"]["tier"]
+    cells = [cell for cell in profile["cells"]
+             if (cell["symbol"], cell["timeframe"]) == (tier["symbol"], tier["timeframe"])]
+    assert len(cells) == 1, "profile mutation requires the actual unique account cell"
+    cell = cells[0]
+    assert all(account["tier"]["source_binding"] == cell["source_binding"]
+               and (account["tier"]["symbol"], account["tier"]["timeframe"])
+               == (tier["symbol"], tier["timeframe"]) for account in body["accounts"].values())
+    assert cell["source_binding"]["sidecar_sha256"] != "0" * 64
+    cell["source_binding"]["sidecar_sha256"] = "0" * 64
+    replacement = spool.write_opaque_artifact(context, (_canonical(profile),), format="json-profile")
+    body["frozen_profile_descriptor"] = replacement
+    for account in body["accounts"].values():
+        account["tier"]["profile_sha256"] = replacement["sha256"]
+        account["tier"]["source_binding"] = copy.deepcopy(cell["source_binding"])
+
+
+def _malformed_synthetic_original_roster(context, body):
+    # A malformed non-authorising input carrier, not an issued release receipt.
+    _owned_spool_root(context)
+    original = body["original_precommit_anchor"]
+    original["execution_product_roster_sha256"] = "0" * 64
+    global_body = forward._read_descriptor_json(context, body["original_global_precommit_descriptor"],
+        code="SYNTHETIC_ORIGINAL_PRECOMMIT")
+    global_body["anchor_product_identities"] = [copy.deepcopy(original)]
+    global_body["anchor_product_identities_sha256"] = forward._sha(global_body["anchor_product_identities"])
+    body["original_global_precommit_descriptor"] = forward._write_raw_ledger(
+        context, global_body, role="SYNTHETIC_MALFORMED_ORIGINAL_ROSTER")
+
+
+_LANE127_UNAVAILABLE_CAUSAL_WITNESSES = {
+    "m5_bid": "v3 omits inline m5_marks; current one-bar capture has no held M5 mark witness",
+    "m5_cash_offset": "v3 omits inline m5_marks; current one-bar capture has no held M5 cash/equity witness",
+    "source_fine_row": "v3 omits inline spread_source_rows; no equivalent authenticated native-content mutation is scoped",
+    "m5_drop_row": "v3 omits inline valuation_rows; no equivalent authenticated native-row deletion is scoped",
+    "filled_entry_bar": "original entry-bar corruption requires a genuine captured missing-fine-close entry witness",
+    "filled_lots": "precise BACKTEST_POSITION_CASH_RECONCILIATION_FAILED target remains unproved for the current capture",
+    "filled_financing_posting": "current one-bar capture has no SWAP transaction witness",
+    "holding_m5_mark": "v3 omits inline m5_marks and current one-bar capture has no held M5 inventory witness",
+    "source_observation": "v3 omits inline source_observations; no equivalent authenticated source-value mutation is scoped",
+    "account_observation_axis": "v3 omits inline source_rows; no equivalent authenticated execution-axis mutation is scoped",
+    "execution_source_row": "v3 omits inline source_rows; no equivalent authenticated native-price mutation is scoped",
+    "missing_mask_admitted": "original integration obligation requires a genuine missing-observation admission witness",
+    "actual_close_invented": "v3 omits inline source_observations; original missing-observation timestamp witness is absent",
+    "expected_close_changed": "v3 omits inline source_observations; no equivalent expected-close mutation is scoped",
+    "missing_points_invented": "v3 omits inline source_observations; original missing-observation points witness is absent",
+}
+
+
+def _lane127_causal_case(mutation, expected):
+    reason = _LANE127_UNAVAILABLE_CAUSAL_WITNESSES[mutation]
+    return pytest.param(mutation, expected, marks=forward_fixture._lane127_blocked(reason))
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("interior_cash_offset", "FROZEN_TIER_DERIVED_STATE_CHANGED"),
+    ("interior_engine_offset", "FROZEN_TIER_INTERIOR_EQUITY_RECONCILIATION_FAILED"),
+    _lane127_causal_case("m5_bid", "FROZEN_TIER_M5_EXECUTABLE_MARK_CHANGED"),
+    _lane127_causal_case("m5_cash_offset", "FROZEN_TIER_M5_EXECUTABLE_MARK_CHANGED"),
+    _lane127_causal_case("source_fine_row", "FROZEN_TIER_FINE_SOURCE_ROWS_CHANGED"),
+    ("profile_tier_width", "FROZEN_TIER_RAW_ACCOUNT_INVALID"),
+    ("genesis_carry", "FROZEN_TIER_ACCOUNT_GENESIS_OR_TERMS_SPLICE"),
+    ("book_binding", "FROZEN_TIER_ORIGINAL_BOOK_BINDING_INVALID"),
+    ("caller_authentication", "FROZEN_TIER_ACCOUNT_GENESIS_OR_TERMS_SPLICE"),
+    ("release_authority", "FROZEN_TIER_RAW_BINDING_INVALID"),
+    ("window", "FROZEN_TIER_ORIGINAL_WINDOW_BINDING_CHANGED"),
+    ("phase", "FROZEN_TIER_ORIGINAL_WINDOW_BINDING_CHANGED"),
+    ("warmup", "FROZEN_TIER_RETAINED_WINDOW_OR_WARMUP_CHANGED"),
+    ("execution_roster", "FROZEN_TIER_USED_SOURCE_PRECOMMIT_SPLICE"),
+    ("fine_roster", "FROZEN_TIER_USED_SOURCE_PRECOMMIT_SPLICE"),
+    ("m5_roster", "FROZEN_TIER_USED_M5_SOURCE_PRECOMMIT_SPLICE"),
+    _lane127_causal_case("m5_drop_row", "FROZEN_TIER_M5_RETAINED_SOURCE_ROWS_CHANGED"),
+    ("m5_cost_metadata", "FROZEN_TIER_M5_COST_SURFACE_CHANGED"),
+    ("parameters", "FROZEN_TIER_ORIGINAL_OWNER_PROVENANCE_CHANGED"),
+    ("source_count", "FROZEN_TIER_ORIGINAL_OWNER_PROVENANCE_CHANGED"),
+    ("detector", "FROZEN_TIER_ORIGINAL_OWNER_PROVENANCE_CHANGED"),
+    ("financing_contract", "FROZEN_TIER_ORIGINAL_FINANCING_MODEL_CHANGED"),
+    ("execution_spread_model", "FROZEN_TIER_EXECUTION_SPREAD_MODEL_CHANGED"),
+    ("entry_admission_mask", "FROZEN_TIER_ENTRY_ADMISSION_BINDING_CHANGED"),
+    ("null_engine_equity", "FROZEN_TIER_ENGINE_EQUITY_MARK_UNAVAILABLE"),
+    ("filled_position_event", "EVENTS_V2_RAW_REVERIFY_FAILED"),
+    # Feb5 entry moved to Feb6 hits the captured fine-close gap before financing.
+    _lane127_causal_case("filled_entry_bar", "FROZEN_TIER_TRADE_ADMISSION_RECONCILIATION_FAILED"),
+    _lane127_causal_case("filled_lots", "BACKTEST_POSITION_CASH_RECONCILIATION_FAILED"),
+    ("filled_margin", "FROZEN_TIER_DERIVED_STATE_CHANGED"),
+    ("filled_stop_risk", "FROZEN_TIER_DERIVED_STATE_CHANGED"),
+    _lane127_causal_case("filled_financing_posting", "FROZEN_TIER_DERIVED_STATE_CHANGED"),
+    _lane127_causal_case("holding_m5_mark", "FROZEN_TIER_M5_EXECUTABLE_MARK_CHANGED"),
+    ("original_config", "FROZEN_TIER_ORIGINAL_PIPELINE_CONFIG_CHANGED"),
+    ("deployment_source", "FROZEN_TIER_DEPLOYMENT_SOURCE_PRECOMMIT_SPLICE"),
+    ("original_source_roster", "FROZEN_TIER_ORIGINAL_SOURCE_ROSTER_CHANGED"),
+    # Descriptor verification refuses this corruption before the later
+    # PROFILE_ARTIFACT_CHANGED cross-read guard, without an invented IO race.
+    ("profile_artifact_identity", "FROZEN_TIER_RAW_ACCOUNT_INVALID"),
+    ("profile_source_binding", "FROZEN_TIER_PROFILE_SOURCE_BINDING_MISMATCH"),
+    ("profile_pair", "FROZEN_TIER_PROFILE_PAIR_SPLICE"),
+    ("execution_spec_receipt", "FROZEN_TIER_EXECUTION_SPEC_RECEIPT_CHANGED"),
+    ("m5_execution_spec_receipt", "FROZEN_TIER_M5_EXECUTION_SPEC_RECEIPT_CHANGED"),
+    ("m5_target_terms", "FROZEN_TIER_M5_TARGET_CELL_OR_TERMS_SPLICE"),
+    ("book_owner", "FROZEN_TIER_ORIGINAL_BOOK_OWNER_MISMATCH"),
+    _lane127_causal_case("source_observation", "FROZEN_TIER_SOURCE_OBSERVATIONS_CHANGED"),
+    _lane127_causal_case("account_observation_axis", "FROZEN_TIER_ACCOUNT_OBSERVATION_AXIS_SPLICE"),
+    ("trade_admission", "FROZEN_TIER_TRADE_ADMISSION_RECONCILIATION_FAILED"),
+    _lane127_causal_case("execution_source_row", "FROZEN_TIER_EXECUTION_SOURCE_ROWS_CHANGED"),
+    ("unknown_raw_version", "FROZEN_TIER_RAW_SCHEMA_UNSUPPORTED"),
+    pytest.param("current_packet_relabelled_v1", "FROZEN_TIER_RAW_FIELDS_INVALID",
+                 id="current_packet_relabelled_v1-FROZEN_TIER_SOURCE_OBSERVATIONS_CHANGED"),
+    ("old_admission_in_v2", "FROZEN_TIER_ADMISSION_VERSION_MISMATCH"),
+    ("old_model_in_v2", "FROZEN_TIER_EXECUTION_SPREAD_MODEL_CHANGED"),
+    ("missing_executed_leg", "FROZEN_TIER_ADMISSION_COUNTS_INVALID"),
+    ("missing_refusal_counter", "FROZEN_TIER_ADMISSION_COUNTS_INVALID"),
+    ("all_opportunity_counts_zero", "FROZEN_TIER_ADMISSION_COUNTS_INVALID"),
+    ("rebalanced_opportunity_counts", "FROZEN_TIER_ADMISSION_COUNTS_INVALID"),
+    _lane127_causal_case("missing_mask_admitted", "FROZEN_TIER_ENTRY_ADMISSION_BINDING_CHANGED"),
+    _lane127_causal_case("actual_close_invented", "FROZEN_TIER_SOURCE_OBSERVATIONS_CHANGED"),
+    _lane127_causal_case("expected_close_changed", "FROZEN_TIER_SOURCE_OBSERVATIONS_CHANGED"),
+    _lane127_causal_case("missing_points_invented", "FROZEN_TIER_SOURCE_OBSERVATIONS_CHANGED"),
+])
+def test_frozen_raw_reopened_account_rejects_resealed_tamper(frozen_raw_transport, mutation, expected):
+    import copy
+    reason = _LANE127_UNAVAILABLE_CAUSAL_WITNESSES.get(mutation)
+    if reason is not None:
+        raise forward_fixture._Lane127WitnessUnavailable(reason)
+    context, anchor, original, _ = frozen_raw_transport
+    _owned_spool_root(context)
+    body = copy.deepcopy(original)
+    account = body["accounts"]["P95"]
+    terminal = copy.deepcopy(account["derived"]["cash_inventory"][-1])
+    if mutation == "interior_cash_offset":
+        account["derived"]["cash_inventory"][0]["cash"] += 25
+        account["derived"]["cash_inventory"][0]["derived_equity"] += 25
+        assert account["derived"]["cash_inventory"][-1] == terminal
+    elif mutation == "interior_engine_offset":
+        account["engine_equity"][account["warmup_bars"]] += 25
+        account["derived"]["cash_inventory"][0]["cash"] += 25
+        account["derived"]["cash_inventory"][0]["derived_equity"] += 25
+        assert account["derived"]["cash_inventory"][-1] == terminal
+    elif mutation == "m5_bid":
+        account["m5_marks"][0]["bid"] += 0.0001
+    elif mutation == "m5_cash_offset":
+        account["m5_marks"][0]["cash"] += 25
+        account["m5_marks"][0]["equity"] += 25
+    elif mutation == "source_fine_row":
+        body["spread_source_rows"].pop()
+    elif mutation == "profile_tier_width":
+        account["tier"]["spread_points"] += 1
+        account["tier"]["full_spread_price"] = account["tier"]["spread_points"] * account["tier"]["point_price"]
+    elif mutation == "genesis_carry":
+        body["genesis"]["initial_inventory"] = [{"lots": 1}]
+    elif mutation == "book_binding":
+        body["original_precommit_anchor"]["full_book_sha256"] = "0" * 64
+    elif mutation == "caller_authentication":
+        account["engine_spread_admission"]["input_provenance_authenticated"] = True
+    elif mutation == "release_authority":
+        body["release_authority_status"] = "AUTHENTICATED_RELEASE"
+    elif mutation == "window":
+        body["capital_window"]["end_date"] = (date.fromisoformat(body["capital_window"]["end_date"]) + timedelta(days=1)).isoformat()
+    elif mutation == "phase":
+        body["capital_phase"] = "INNER_SELECTION"
+    elif mutation == "warmup":
+        account["warmup_bars"] += 1
+    elif mutation == "execution_roster":
+        body["execution_source"]["role"] += "-substituted"
+    elif mutation == "fine_roster":
+        body["spread_source"]["source_audit_sidecar_sha256"] = "0" * 64
+    elif mutation == "m5_roster":
+        account["valuation_source"]["native_product_identity"]["role"] += "-substituted"
+    elif mutation == "m5_drop_row":
+        account["valuation_rows"].pop()
+    elif mutation == "m5_cost_metadata":
+        account["valuation_source"]["spread_and_cost_surface"]["valuation_price_field"] = "Close"
+    elif mutation == "parameters":
+        parameters = body["owner_provenance"]["parameters"]
+        parameters["sl_atr_mult"] = parameters.get("sl_atr_mult", 0.0) + 1.0
+    elif mutation == "source_count":
+        body["owner_provenance"]["source_count_receipt"]["source_bar_count"] += 1
+    elif mutation == "detector":
+        body["owner_provenance"]["detector_parameters_sha256"] = "0" * 64
+    elif mutation == "financing_contract":
+        account["financing_model"]["contract"]["reason"] = "substituted metadata"
+    elif mutation == "execution_spread_model":
+        account["engine_spread_model"]["entry_observations_sha256"] = "0" * 64
+    elif mutation == "entry_admission_mask":
+        account["engine_spread_admission"]["entry_admission_mask_sha256"] = "0" * 64
+    elif mutation == "null_engine_equity":
+        account["engine_equity"][0] = None
+    elif mutation == "filled_position_event":
+        assert account["trades"] and account["position_events"]
+        before = copy.deepcopy(account["position_events"])
+        account["position_events"][0]["risk_amount"] += 1
+        assert sum(left != right for left, right in zip(before, account["position_events"], strict=True)) == 1
+    elif mutation == "filled_entry_bar":
+        assert len(account["trades"]) == 1
+        account["trades"][0]["entry_bar"] += 1
+    elif mutation == "filled_lots":
+        assert len(account["trades"]) == 1
+        account["trades"][0]["position_size"] += account["instrument_spec"]["volume_step"]
+    elif mutation == "filled_margin":
+        positions = account["derived"]["positions"]
+        assert positions
+        before = copy.deepcopy(positions)
+        positions[0]["margin_amount"] /= 100
+        assert sum(left != right for left, right in zip(before, positions, strict=True)) == 1
+    elif mutation == "filled_stop_risk":
+        positions = account["derived"]["positions"]
+        assert positions
+        before = copy.deepcopy(positions)
+        positions[0]["gross_stop_risk_per_lot"] += 1
+        assert sum(left != right for left, right in zip(before, positions, strict=True)) == 1
+    elif mutation == "filled_financing_posting":
+        posting = next(row for row in account["derived"]["transactions"] if row["kind"] == "SWAP")
+        posting["cash"] += 1
+    elif mutation == "holding_m5_mark":
+        mark = next(row for row in account["m5_marks"] if row["state"] == "AVAILABLE" and row["inventory"])
+        mark["inventory"][0]["lots"] += account["instrument_spec"]["volume_step"]
+    elif mutation == "original_config":
+        body["pipeline_config_binding"]["effective_config_sha256"] = "0" * 64
+    elif mutation == "deployment_source":
+        descriptor = body["deployment_source_descriptors"]["broker"]
+        raw = (Path(context.root) / descriptor["relative_path"]).read_bytes()
+        body["deployment_source_descriptors"]["broker"] = spool.write_opaque_artifact(
+            context, (raw + b"\n",), format="json-broker")
+    elif mutation == "original_source_roster":
+        _malformed_synthetic_original_roster(context, body)
+    elif mutation == "profile_artifact_identity":
+        body["frozen_profile_descriptor"]["sha256"] = "0" * 64
+    elif mutation == "profile_source_binding":
+        _replace_synthetic_profile_source_binding(context, body)
+    elif mutation == "profile_pair":
+        account["tier"]["profile_sha256"] = "0" * 64
+    elif mutation == "execution_spec_receipt":
+        body["execution_spec_receipt"]["receipt_sha256"] = "0" * 64
+    elif mutation == "m5_execution_spec_receipt":
+        account["valuation_source"]["execution_spec_receipt"]["receipt_sha256"] = "0" * 64
+    elif mutation == "m5_target_terms":
+        account["valuation_source"]["execution_spec_receipt"]["instrument_spec"]["point"] *= 2
+    elif mutation == "book_owner":
+        body["cell_projection"]["process_sha256"] = "0" * 64
+    elif mutation == "source_observation":
+        next(row for row in body["source_observations"] if row["points"] is not None)["points"] += 1
+    elif mutation == "account_observation_axis":
+        account["source_rows"][0]["open_utc"] = account["source_rows"][1]["open_utc"]
+    elif mutation == "trade_admission":
+        assert account["trades"]
+        before = copy.deepcopy(account["trades"])
+        assert account["trades"][0]["entry_spread_admission"] == "ADMIT"
+        account["trades"][0]["entry_spread_admission"] = "MISSING"
+        assert sum(left != right for left, right in zip(before, account["trades"], strict=True)) == 1
+    elif mutation == "execution_source_row":
+        account["source_rows"][account["warmup_bars"]]["open"] += 0.00001
+    elif mutation == "unknown_raw_version":
+        body["schema_version"] = "fxpm.frozen-tier-raw-accounts.v99"
+    elif mutation == "current_packet_relabelled_v1":
+        body["schema_version"] = forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA
+    elif mutation == "old_admission_in_v2":
+        admission = account["engine_spread_admission"]
+        admission.pop("schema_version")
+        admission.pop("entry_admission_policy")
+        admission["untested_missing_observation_opportunities"] = admission.pop("missing_refused_opportunities")
+        admission["untested_executed_legs"] = admission.pop("missing_executed_legs")
+    elif mutation == "old_model_in_v2":
+        account["engine_spread_model"].pop("entry_admission_schema")
+        account["engine_spread_model"]["entry_admission_policy"] = "EXACT_PRIOR_FINE_CLOSE_CAP_MISSING_UNTESTED"
+    elif mutation == "missing_executed_leg":
+        account["engine_spread_admission"]["missing_executed_legs"] = 1
+    elif mutation == "missing_refusal_counter":
+        account["engine_spread_admission"]["missing_refused_opportunities"] += 1
+    elif mutation == "all_opportunity_counts_zero":
+        for field in ("signal_opportunities", "known_cap_pass_opportunities", "known_cap_refused_opportunities", "missing_refused_opportunities"):
+            account["engine_spread_admission"][field] = 0
+    elif mutation == "rebalanced_opportunity_counts":
+        admission = account["engine_spread_admission"]
+        assert admission["known_cap_pass_opportunities"] > 0
+        fields = ("known_cap_pass_opportunities", "known_cap_refused_opportunities", "missing_refused_opportunities")
+        total = sum(admission[field] for field in fields)
+        admission["known_cap_pass_opportunities"] -= 1
+        admission["missing_refused_opportunities"] += 1
+        assert sum(admission[field] for field in fields) == total
+    elif mutation == "missing_mask_admitted":
+        import numpy as np
+        points = [float("nan") if row["points"] is None else row["points"] for row in body["source_observations"]]
+        old_allowed = np.array([not value > account["tier"]["spread_points"] for value in points], dtype=np.uint8)
+        account["engine_spread_admission"]["entry_admission_mask_sha256"] = hashlib.sha256(old_allowed.tobytes()).hexdigest()
+    elif mutation == "actual_close_invented":
+        body["source_observations"][0]["prior_fine_close_utc"] = body["source_observations"][0]["target_open_utc"]
+    elif mutation == "expected_close_changed":
+        body["source_observations"][-1]["expected_prior_fine_close_utc"] = body["source_observations"][-2]["target_open_utc"]
+    elif mutation == "missing_points_invented":
+        body["source_observations"][-1]["points"] = 12.0
+    else:
+        raise AssertionError(f"unhandled controlled mutation: {mutation}")
+    assert _sha(body) != _sha(original), "controlled mutation must change the canonical packet"
+    artifact = _reseal_frozen_raw(context, body)
+    expected_code = {"filled_position_event": "BACKTEST_POSITION_EVENTS_V2_RAW_REVERIFY_FAILED"}.get(mutation, expected)
+    with pytest.raises(producer.CausalEvidenceProductionError) as caught:
+        producer._read_frozen_tier_raw_accounts(context, artifact, anchor)
+    assert caught.value.code == expected_code
+
+
+def _archived_frozen_v1_admission_snapshot():
+    """Immutable synthetic attempt009 metadata, not output from a current run.
+
+    Original raw packet 77ec9522a0dc84d7b321bfb21f98fb6ae303957107124f29ddcc42a11a89512b,
+    frozen_tier_raw_account_verification/attempt_009, P75. This bounded snapshot
+    tests archive interpretation; the retained original run proves its full graph.
+    """
+    import numpy as np
+    import pandas as pd
+    axis = pd.date_range("2018-01-01T00:00:00Z", "2020-02-07T00:00:00Z", freq="D", inclusive="left")
+    values = np.full(767, np.nan)
+    values[-2:] = 12.0
+    observations = pd.Series(values, index=axis, name="EntrySpreadPoints")
+    account = {"warmup_bars": 765,
+        "engine_spread_model": {"entry_admission_policy": "EXACT_PRIOR_FINE_CLOSE_CAP_MISSING_UNTESTED"},
+        "engine_spread_admission": {
+            "entry_admission_mask_sha256": "a7d557d3f055585e25404d99094725149dedf302f3a75c567a44ea5a4545695a",
+            "entry_observations_sha256": "c6770ca7dcc4ab1fe8557babbe2552d5c9dc1bc3e5e073ef17826f23a7251b68",
+            "input_provenance_authenticated": False, "qualification_authority": False,
+            "signal_opportunities": 1, "known_cap_pass_opportunities": 0,
+            "known_cap_refused_opportunities": 1, "untested_executed_legs": 0,
+            "untested_missing_observation_opportunities": 0}}
+    return account, observations, SimpleNamespace(spread_points=9)
+
+
+def test_archived_raw_v1_admission_snapshot_keeps_original_hashes_and_fields():
+    account, observations, tier = _archived_frozen_v1_admission_snapshot()
+    before = copy.deepcopy(account)
+    producer._verify_frozen_spread_admission(schema=forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+        account=account, observations=observations, tier=tier)
+    assert account == before
+    assert "entry_admission_schema" not in account["engine_spread_model"]
+    assert "schema_version" not in account["engine_spread_admission"]
+    assert account["engine_spread_admission"]["untested_executed_legs"] == 0
+
+
+def test_archived_raw_v1_still_refuses_a_missing_scored_observation():
+    import numpy as np
+    import pandas as pd
+    account, observations, tier = _archived_frozen_v1_admission_snapshot()
+    observations.iloc[-1] = np.nan
+    admission = account["engine_spread_admission"]
+    admission["entry_observations_sha256"] = hashlib.sha256(
+        pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest()
+    admission["entry_admission_mask_sha256"] = hashlib.sha256(
+        np.array([not value > 9 for value in observations], dtype=np.uint8).tobytes()).hexdigest()
+    with pytest.raises(producer.CausalEvidenceProductionError, match="FROZEN_TIER_PRIOR_FINE_ROW_UNAVAILABLE"):
+        producer._verify_frozen_spread_admission(schema=forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+            account=account, observations=observations, tier=tier)
+
+
+@pytest.mark.parametrize("schema", ["fxpm.frozen-tier-raw-accounts.v99", "fxpm.frozen-tier-raw-accounts.v2"])
+def test_archived_raw_v1_snapshot_cannot_claim_unknown_or_current_admission(schema):
+    account, observations, tier = _archived_frozen_v1_admission_snapshot()
+    code = "FROZEN_TIER_RAW_SCHEMA_UNSUPPORTED" if schema.endswith("v99") else "FROZEN_TIER_ADMISSION_VERSION_MISMATCH"
+    with pytest.raises(producer.CausalEvidenceProductionError, match=code):
+        producer._verify_frozen_spread_admission(schema=schema, account=account, observations=observations, tier=tier)
+
+
+def test_frozen_raw_projection_cannot_enter_legacy_daily_qualifier(frozen_raw_transport, monkeypatch):
+    context, anchor, _, artifact = frozen_raw_transport
+    def forbidden(*args, **kwargs):
+        pytest.fail("new raw accounts entered the retired daily qualification path")
+    monkeypatch.setattr(producer, "_validate_common_ledger", forbidden)
+    with pytest.raises(producer.CausalEvidenceProductionError,
+                       match="FROZEN_TIER_INTERVAL_QUALIFICATION_NOT_IMPLEMENTED"):
+        producer._load_replay_ledgers(context, artifact, anchor)
+
+
+@pytest.mark.parametrize("live_state", ["denied", "missing"])
+def test_frozen_reader_reconstructs_original_config_and_specs_from_spooled_bytes(frozen_raw_transport, live_state, monkeypatch):
+    context, anchor, body, artifact = frozen_raw_transport
+    original = forward._read_descriptor_json(context, body["original_global_precommit_descriptor"],
+        code="SYNTHETIC_ORIGINAL_PRECOMMIT")
+    protected = {Path(original["deployment_binding"][field]).resolve()
+        for field in ("deployment_config_path", "broker_specs_path")}
+    opened = []
+    original_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path.resolve() in protected:
+            opened.append(path.resolve())
+            if live_state == "denied":
+                raise PermissionError("retained original live path is protected")
+            raise FileNotFoundError("retained original live path is unavailable")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+    projection = producer._read_frozen_tier_raw_accounts(context, artifact, anchor)
+    assert opened == []
+    assert projection.accounts["P95"]["trades"] == body["accounts"]["P95"]["trades"]
+    assert len(projection.accounts["P95"]["trades"]) == len(body["accounts"]["P95"]["trades"]) > 0
+    assert projection.qualification_authority is False
+
+
+def _mechanical_compact_source_case():
+    """Invented row reconstruction only; no authenticated native or engine output."""
+    import numpy as np
+    import pandas as pd
+
+    index = pd.date_range("2026-01-05T00:00:00Z", periods=2, freq="h")
+    frame = pd.DataFrame({"Open": [1.0, 1.01], "High": [1.02, 1.03], "Low": [0.99, 1.0],
+        "Close": [1.01, 1.02], "SpreadOpen": [np.nan, 0.0], "SpreadBar": [3.0, 4.0],
+        "_BAR_CLOSE_TS": index + pd.Timedelta(hours=1)}, index=index)
+    rich = forward_fixture._mechanical_compact_rich_account()
+    return rich, frame, np.array([0.0001, 0.0002]), np.array([0.0002, 0.0003]), {
+        "entry_column": "SpreadOpen", "bar_column": "SpreadBar"}
+
+
+def test_mechanical_current_compact_account_roundtrip_restores_source_rows(monkeypatch):
+    """Exercise writer/reader shape mechanics, without a native-positive claim."""
+    rich, frame, entry_half, intrabar_half, spread_meta = _mechanical_compact_source_case()
+    compact = forward._compact_tier_account(rich)
+    before = copy.deepcopy(compact)
+    frame_before = frame.copy(deep=True)
+    def no_engine(*args, **kwargs):
+        pytest.fail("mechanical compact row reconstruction reached an engine")
+    monkeypatch.setattr(forward.Backtester, "run", no_engine)
+    hydrated = producer._materialize_tier_source_rows(compact, frame, entry_half, intrabar_half, spread_meta)
+    assert compact == before
+    assert frame.equals(frame_before)
+    assert hydrated == {key: value for key, value in rich.items() if key not in {"valuation_rows", "m5_marks"}}
+    assert "engine_equity" not in hydrated
+    assert hydrated["source_rows"][0]["recorded_entry_points"] is None
+    assert hydrated["source_rows"][1]["recorded_entry_points"] == 0.0
+    assert hydrated["source_rows"][1]["engine_equity"] == 9999.123456789
+
+
+@pytest.mark.parametrize("mutation", ["source_rows", "valuation_rows", "m5_marks", "missing_metadata"])
+def test_mechanical_current_compact_account_rejects_mixed_field_sets(mutation):
+    rich, frame, entry_half, intrabar_half, spread_meta = _mechanical_compact_source_case()
+    compact = forward._compact_tier_account(rich)
+    if mutation == "missing_metadata":
+        compact.pop("valuation_source")
+    else:
+        compact[mutation] = []
+    with pytest.raises(producer.CausalEvidenceProductionError, match="^FROZEN_TIER_ACCOUNT_FIELDS_INVALID$"):
+        producer._materialize_tier_source_rows(compact, frame, entry_half, intrabar_half, spread_meta)
+
+
+@pytest.mark.parametrize("vector", [None, [10000.0], [10000.0, 10000.0, 10000.0]],
+    ids=["not-list", "short", "long"])
+def test_mechanical_current_compact_account_requires_every_engine_axis_value(vector):
+    rich, frame, entry_half, intrabar_half, spread_meta = _mechanical_compact_source_case()
+    compact = forward._compact_tier_account(rich)
+    compact["engine_equity"] = vector
+    with pytest.raises(producer.CausalEvidenceProductionError,
+                       match="^FROZEN_TIER_ENGINE_EQUITY_AXIS_MISSING$"):
+        producer._materialize_tier_source_rows(compact, frame, entry_half, intrabar_half, spread_meta)
+
+
+@pytest.mark.parametrize("value", [None, True, float("nan"), float("inf"), "10000"],
+    ids=["null", "bool", "nan", "infinite", "string"])
+def test_mechanical_current_compact_account_refuses_unobserved_engine_values(value):
+    rich, frame, entry_half, intrabar_half, spread_meta = _mechanical_compact_source_case()
+    compact = forward._compact_tier_account(rich)
+    compact["engine_equity"][0] = value
+    with pytest.raises(producer.CausalEvidenceProductionError,
+                       match="^FROZEN_TIER_ENGINE_EQUITY_MARK_UNAVAILABLE$"):
+        producer._materialize_tier_source_rows(compact, frame, entry_half, intrabar_half, spread_meta)
+
+
+def _mechanical_modern_admission_case():
+    """Declared synthetic missing/pass/refusal states, never observed quote evidence."""
+    import numpy as np
+    import pandas as pd
+
+    observations = pd.Series([np.nan, 5.0, 12.0, np.nan],
+        index=pd.date_range("2026-01-05T00:00:00Z", periods=4, freq="h"), name="EntrySpreadPoints")
+    opportunities = np.array([False, True, True, True], dtype=bool)
+    model = {"entry_admission_schema": forward.spread_profile.ADMISSION_SCHEMA,
+        "entry_admission_policy": forward.spread_profile.ADMISSION_POLICY}
+    admission = {"schema_version": forward.spread_profile.ADMISSION_SCHEMA,
+        "entry_admission_policy": forward.spread_profile.ADMISSION_POLICY,
+        "signal_opportunities": 3, "known_cap_pass_opportunities": 1,
+        "known_cap_refused_opportunities": 1, "missing_refused_opportunities": 1,
+        "missing_executed_legs": 0, "input_provenance_authenticated": False,
+        "qualification_authority": False,
+        "entry_observations_sha256": hashlib.sha256(
+            pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest(),
+        "entry_admission_mask_sha256": hashlib.sha256(np.array([0, 1, 0, 0], dtype=np.uint8).tobytes()).hexdigest()}
+    return {"warmup_bars": 1, "engine_spread_model": model, "engine_spread_admission": admission}, (
+        observations, opportunities, SimpleNamespace(spread_points=9))
+
+
+@pytest.mark.parametrize("schema", ["current", "retained-v2"])
+def test_mechanical_current_and_retained_v2_keep_modern_missing_refusal_semantics(schema):
+    account, (observations, opportunities, tier) = _mechanical_modern_admission_case()
+    before = copy.deepcopy(account)
+    version = forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA if schema == "current" else forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA
+    producer._verify_frozen_spread_admission(schema=version, account=account,
+        observations=observations, tier=tier, opportunities=opportunities)
+    assert account == before
+
+
+@pytest.mark.parametrize("schema", ["current", "retained-v2"])
+@pytest.mark.parametrize("mutation,expected", [
+    ("missing_mask_admitted", "FROZEN_TIER_ENTRY_ADMISSION_BINDING_CHANGED"),
+    ("rebalanced_counts", "FROZEN_TIER_ADMISSION_COUNTS_INVALID"),
+    ("no_opportunities", "FROZEN_TIER_ORIGINAL_SIGNAL_OPPORTUNITIES_UNAVAILABLE"),
+])
+def test_mechanical_modern_admission_cannot_launder_missing_states(schema, mutation, expected):
+    import numpy as np
+
+    account, (observations, opportunities, tier) = _mechanical_modern_admission_case()
+    admission = account["engine_spread_admission"]
+    if mutation == "missing_mask_admitted":
+        admission["entry_admission_mask_sha256"] = hashlib.sha256(
+            np.array([1, 1, 0, 1], dtype=np.uint8).tobytes()).hexdigest()
+    elif mutation == "rebalanced_counts":
+        admission["known_cap_pass_opportunities"] = 0
+        admission["missing_refused_opportunities"] = 2
+    else:
+        opportunities = None
+    version = forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA if schema == "current" else forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA
+    with pytest.raises(producer.CausalEvidenceProductionError, match=f"^{expected}$"):
+        producer._verify_frozen_spread_admission(schema=version, account=account,
+            observations=observations, tier=tier, opportunities=opportunities)
+
+
+@pytest.mark.parametrize("protected_root", _PROTECTED_RETAINED_ROOTS, ids=(
+    "retained-009", "retained-010", "missing-observation-001",
+    "bound-002", "native-qa90", "config-109", "prepared-004",
+))
+@pytest.mark.parametrize("location", ("root", "descendant"))
+def test_mechanical_custody_refuses_registered_protected_roots(monkeypatch, protected_root, location):
+    """Invented context proves the path guard only; retained inputs are never written."""
+    root = protected_root.resolve(strict=True)
+    assert root.is_dir()
+    if location == "descendant":
+        children = sorted(path for path in root.iterdir() if path.is_dir())
+        assert children, "protected-root mechanical case requires an existing child directory"
+        root = children[0].resolve(strict=True)
+    monkeypatch.setitem(globals(), "_OWNED_TEST_SPOOL_ROOTS", {root})
+    context = SimpleNamespace(root=root)
+    with pytest.raises(AssertionError):
+        _owned_spool_root(context)
+
+
+def test_mechanical_custody_accepts_registered_owned_scratch(monkeypatch, tmp_path):
+    """An invented context can resolve an owned target without creating it."""
+    root = tmp_path.resolve(strict=True)
+    monkeypatch.setitem(globals(), "_OWNED_TEST_SPOOL_ROOTS", {root})
+    context = SimpleNamespace(root=root)
+    corpus = SimpleNamespace(context=context, scratch_root=root)
+    target = _owned_corpus_path(corpus, "mechanical-unwritten.json")
+    assert _owned_spool_root(context) == root
+    assert target == root / "mechanical-unwritten.json"
+    assert not target.exists()
+
+
+def test_mechanical_custody_refuses_unregistered_scratch(monkeypatch, tmp_path):
+    """Registry ownership is required even for an otherwise usable scratch directory."""
+    monkeypatch.setitem(globals(), "_OWNED_TEST_SPOOL_ROOTS", set())
+    context = SimpleNamespace(root=tmp_path.resolve(strict=True))
+    with pytest.raises(AssertionError, match="registered scratch clone"):
+        _owned_spool_root(context)
+
+
+def _mechanical_execution_model_binding_case():
+    """Declared four-state format case; no native source or engine output."""
+    import pandas as pd
+
+    account, (observations, opportunities, tier) = _mechanical_modern_admission_case()
+    derived = {**account["engine_spread_model"], "entry_column": "SpreadOpen", "bar_column": "Spread"}
+    old_model = {**derived, "entry_observations_sha256": account["engine_spread_admission"]["entry_observations_sha256"]}
+    # MISSING, ADMIT, REFUSE, MISSING: independently declared expected mask.
+    current_model = {**old_model, "entry_admission_mask_sha256": hashlib.sha256(bytes((0, 1, 0, 0))).hexdigest()}
+    return derived, old_model, current_model, pd.DataFrame(index=observations.index), account, observations, opportunities, tier
+
+
+def test_mechanical_v3_execution_model_rebuilds_full_admission_binding(monkeypatch):
+    derived, _, expected, frame, _, observations, _, tier = _mechanical_execution_model_binding_case()
+    before = copy.deepcopy((derived, expected, observations))
+    monkeypatch.setattr(forward.Backtester, "run", lambda *_a, **_k: pytest.fail("model verifier reached an engine"))
+    actual = producer._verify_frozen_execution_spread_model(derived, expected,
+        forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA, features=frame, tier=tier, observations=observations)
+    assert actual == expected
+    assert "entry_admission_mask_sha256" not in derived
+    assert derived == before[0] and expected == before[1]
+    assert observations.equals(before[2])
+
+
+@pytest.mark.parametrize("mutation", ("missing_mask", "wrong_mask", "wrong_observations_hash"))
+def test_mechanical_v3_execution_model_refuses_missing_or_tampered_bindings(mutation):
+    derived, _, stored, frame, _, observations, _, tier = _mechanical_execution_model_binding_case()
+    if mutation == "missing_mask":
+        stored.pop("entry_admission_mask_sha256")
+    else:
+        field = "entry_admission_mask_sha256" if mutation == "wrong_mask" else "entry_observations_sha256"
+        stored[field] = "0" * 64
+    before = copy.deepcopy(stored)
+    with pytest.raises(producer.CausalEvidenceProductionError,
+                       match="^FROZEN_TIER_EXECUTION_SPREAD_MODEL_CHANGED$"):
+        producer._verify_frozen_execution_spread_model(derived, stored,
+            forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA, features=frame, tier=tier, observations=observations)
+    assert stored == before
+
+
+def test_mechanical_v3_separate_admission_mask_still_requires_independent_verification():
+    derived, _, stored, frame, account, observations, opportunities, tier = _mechanical_execution_model_binding_case()
+    account["engine_spread_model"] = stored
+    account["engine_spread_admission"]["entry_admission_mask_sha256"] = "0" * 64
+    assert producer._verify_frozen_execution_spread_model(derived, stored,
+        forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA, features=frame, tier=tier, observations=observations) == stored
+    with pytest.raises(producer.CausalEvidenceProductionError,
+                       match="^FROZEN_TIER_ENTRY_ADMISSION_BINDING_CHANGED$"):
+        producer._verify_frozen_spread_admission(schema=forward.FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+            account=account, observations=observations, tier=tier, opportunities=opportunities)
+
+
+@pytest.mark.parametrize("schema", (forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA,
+                                   forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA))
+def test_mechanical_retained_execution_models_keep_observation_only_binding(monkeypatch, schema):
+    derived, old_model, _, frame, _, observations, _, tier = _mechanical_execution_model_binding_case()
+    if schema == forward.ARCHIVED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA:
+        old_model.pop("entry_admission_schema")
+        old_model["entry_admission_policy"] = "EXACT_PRIOR_FINE_CLOSE_CAP_MISSING_UNTESTED"
+    before = copy.deepcopy((derived, old_model))
+    monkeypatch.setattr(forward.Backtester, "_entry_spread_admission_inputs",
+        lambda *_a, **_k: pytest.fail("retained/archive model reached current admission reconstruction"))
+    actual = producer._verify_frozen_execution_spread_model(derived, old_model, schema,
+        features=frame, tier=tier, observations=observations)
+    assert actual == old_model and "entry_admission_mask_sha256" not in actual
+    assert (derived, old_model) == before
+
+
+def test_mechanical_retained_v2_execution_model_refuses_added_current_mask():
+    derived, _, stored, frame, _, observations, _, tier = _mechanical_execution_model_binding_case()
+    with pytest.raises(producer.CausalEvidenceProductionError,
+                       match="^FROZEN_TIER_EXECUTION_SPREAD_MODEL_CHANGED$"):
+        producer._verify_frozen_execution_spread_model(derived, stored,
+            forward.RETAINED_FROZEN_TIER_RAW_ACCOUNTS_SCHEMA, features=frame, tier=tier, observations=observations)

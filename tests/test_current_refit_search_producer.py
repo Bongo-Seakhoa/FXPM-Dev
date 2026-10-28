@@ -65,6 +65,125 @@ def _request_body() -> dict:
     }
 
 
+def test_current_worker_rebuilds_explicit_v16_request_without_reviving_producer():
+    """Fresh SYNTHETIC request transport, with current production still retired."""
+    from tests.test_winner_transport_capacity import build_v16_payload
+    typed = producer.winner.create_winner_selection_request_v16(**build_v16_payload())
+    restored = producer._rebuild_winner_request(typed.to_dict(), "SYNTHETIC_REQUEST_INVALID")
+    assert restored.to_dict() == typed.to_dict()
+    assert restored.request_sha256 == typed.request_sha256
+    assert producer.winner.MAX_REQUEST_BYTES == 16 * 1024 * 1024
+    value = object.__new__(producer.CurrentRefitSearchProducer)
+    value._used = False
+    with pytest.raises(CurrentRefitSearchProducerError) as caught:
+        value(object())
+    assert caught.value.code == "RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED"
+
+
+@pytest.mark.parametrize("decision_type", ["winner_v16_decision", "winner_v15_decision"])
+def test_current_worker_manifest_requires_homogeneous_v16_artifact_labels(decision_type):
+    """SYNTHETIC manifest-shape witness; no authority or market evidence."""
+    entries = []
+    bindings = {}
+    types = {"winner_request": "winner_v16_request", "winner_decision": decision_type,
+        "production_receipt": "winner_raw_evidence_production_receipt",
+        "cross_binding": "current_horizon_winner_cross_binding"}
+    for ordinal, (name, kind) in enumerate(types.items()):
+        descriptor = {"sha256": str(ordinal + 1) * 64, "size_bytes": ordinal + 1}
+        entry = {"artifact_id": f"SYNTHETIC/{name}", "artifact_type": kind, "descriptor": descriptor}
+        entries.append(entry)
+        bindings[name] = producer._artifact_binding(entry)
+    manifest = {"artifacts": entries}
+    if decision_type == "winner_v15_decision":
+        with pytest.raises(CurrentRefitSearchProducerError) as caught:
+            producer._resolve_raw_artifacts(manifest, bindings, required=True)
+        assert caught.value.code == "CURRENT_WORKER_ARTIFACT_BINDING_INVALID"
+    else:
+        actual = producer._resolve_raw_artifacts(manifest, bindings, required=True)
+        assert actual == dict(zip(types, entries, strict=True))
+
+
+@pytest.mark.parametrize("edition,mutation", [
+    ("v16", "none"), ("v16", "old_production"), ("v16", "old_cross"),
+    ("v14", "none"), ("v15", "none"), ("v15", "v15_labels"),
+])
+def test_current_worker_v16_cold_transport_tuple(tmp_path, edition, mutation):
+    """SYNTHETIC metadata/selector custody only, not a complete raw engine proof."""
+    from tests import test_winner_selection as fixtures
+    from tests.test_winner_transport_capacity import build_v16_payload, synthetic_pair
+    context = producer.authority_spool.freeze_generation_context(tmp_path / "synthetic-v16",
+        generation_id="synthetic-current-v16", native_universe_sha256="a" * 64, config_sha256="b" * 64)
+    sink = producer.authority_spool.open_symbol_sink(context, "AUDUSD")
+    payload = (build_v16_payload() if edition == "v16" else fixtures._current_payload_request(
+        pair_contract=synthetic_pair()) if edition == "v15" else fixtures._payload_request())
+    request = producer.winner.create_winner_selection_request(**payload)
+    assert request is not None
+    decision = producer.winner.evaluate_historical_cell_winner(request)
+    entries = {}
+
+    def put(name, kind, body):
+        entry = sink.put_opaque(f"SYNTHETIC/{name}", kind, (_canonical(body),),
+            format=producer.raw_winner.ASCII_JSON_FORMAT)
+        entries[name] = entry
+        return entry
+
+    # The retained current reader used v14 labels/raw4 even for a v15 body.
+    # Preserve that old admission/refusal behavior; do not bless a new writer.
+    labels = "v16" if edition == "v16" else "v15" if mutation == "v15_labels" else "v14"
+    req = put("winner_request", f"winner_{labels}_request", request.to_dict())
+    dec = put("winner_decision", f"winner_{labels}_decision", decision.to_dict())
+    cross = {"schema_version": (producer.raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+        if mutation == "old_cross" else producer.raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5),
+        "mode": producer.raw_winner.CURRENT_CROSS_BINDING_MODE, "fixture_provenance": "SYNTHETIC_METADATA_ONLY"}
+    cross_entry = put("cross_binding", "current_horizon_winner_cross_binding", cross)
+    production = {"schema_version": (producer.raw_winner.CURRENT_PRODUCTION_SCHEMA
+        if mutation == "old_production" else producer.raw_winner.V16_PRODUCTION_SCHEMA if edition == "v16"
+        else producer.raw_winner.PRODUCTION_SCHEMA),
+        "generation_context_sha256": context.context_sha256, "symbol": "AUDUSD", "timeframe": "M5", "regime": "TREND",
+        "request_sha256": request.request_sha256, "decision_receipt_sha256": decision.receipt_sha256,
+        "provenance_cross_binding_sha256": cross_entry["descriptor"]["sha256"],
+        "artifact_roster": {"winner-request": req["descriptor"], "winner-decision": dec["descriptor"]}}
+    put("production_receipt", "winner_raw_evidence_production_receipt", production)
+    receipt = sink.seal()
+    manifest = producer.authority_spool.verify_symbol_receipt(context.root, receipt,
+        expected_generation_id=context.generation_id, expected_symbol="AUDUSD",
+        expected_native_universe_sha256=context.native_universe_sha256, expected_config_sha256=context.config_sha256)
+    args = dict(context=context, manifest=manifest,
+        bindings={name: producer._artifact_binding(entry) for name, entry in entries.items()},
+        symbol="AUDUSD", timeframe="M5", regime="TREND", expected_decision_sha256=decision.receipt_sha256)
+    if mutation != "none":
+        with pytest.raises(CurrentRefitSearchProducerError) as caught:
+            producer._rebuild_raw_winner_artifacts(**args)
+        assert caught.value.code == ("CURRENT_WORKER_RAW_ARTIFACT_BINDING_INVALID" if mutation == "v15_labels"
+                                     else "CURRENT_WORKER_CROSS_BINDING_INVALID" if mutation == "old_cross"
+                                     else "CURRENT_WORKER_PRODUCTION_RECEIPT_SPLICE")
+    else:
+        actual_request, actual_decision, cross_bytes, production_bytes = producer._rebuild_raw_winner_artifacts(**args)
+        assert actual_request.to_dict() == request.to_dict()
+        assert actual_decision.to_dict() == decision.to_dict()
+        assert cross_bytes == _canonical(cross)
+        assert production_bytes == _canonical(production)
+
+
+def test_current_worker_wraps_v16_builder_value_error():
+    """Deliberately malformed deep V16 payload retains a typed consumer error."""
+    from tests.test_winner_transport_capacity import build_v16_payload
+    payload = build_v16_payload()
+    nested = 0
+    for _ in range(producer.winner.MAX_JSON_DEPTH + 1):
+        nested = [nested]
+    payload["precommitment_payload"]["SYNTHETIC_INVALID_DEPTH"] = nested
+    body = {"contract_version": producer.winner.V16_GENERATION.request_version}
+    for name in ("precommitment", "attempt_ledger", "evidence_ledger"):
+        value = payload[name + "_payload"]
+        body[name] = {"payload": value, "payload_sha256": _sha(value)}
+    with pytest.raises(CurrentRefitSearchProducerError) as caught:
+        producer._rebuild_winner_request(body, "CURRENT_WORKER_WINNER_REQUEST_INVALID")
+    assert caught.value.code == "CURRENT_WORKER_WINNER_REQUEST_INVALID"
+    assert caught.value.details == ("_ContractError", "INPUT_STRUCTURE_LIMIT_EXCEEDED")
+    assert isinstance(caught.value.__cause__, ValueError)
+
+
 def test_causal_gate_requires_rederived_pass(monkeypatch) -> None:
     observed = {}
 
@@ -460,11 +579,6 @@ def test_required_valid_until_uses_authenticated_completion_and_utc_schedule() -
     deadline = producer._required_valid_until_utc(config, payload)  # noqa: SLF001
 
     assert deadline == datetime(2026, 8, 2, 0, 1, tzinfo=timezone.utc)
-    source = inspect.getsource(producer._produce)  # noqa: SLF001
-    assert source.index("verify_raw_current_refit_execution") < source.index(
-        "_required_valid_until_utc"
-    )
-    assert source.count("_required_valid_until_utc(") == 1
 
 
 @pytest.mark.parametrize(
@@ -496,38 +610,42 @@ def test_rich_request_is_exact_and_never_caller_authorized() -> None:
             producer._request_body(_Request(mutation))  # noqa: SLF001
 
 
-def test_current_producer_is_one_shot(monkeypatch) -> None:
-    calls = []
-    monkeypatch.setattr(
-        producer,
-        "_produce",
-        lambda supplied, request: calls.append((supplied, request)) or "product",
-    )
+def test_retired_current_producer_stops_before_one_shot_or_execution() -> None:
     value = object.__new__(producer.CurrentRefitSearchProducer)
-    value._context = object()  # noqa: SLF001
-    value._search_process = object()  # noqa: SLF001
-    value._frozen_config = SimpleNamespace(  # noqa: SLF001
-        materialize=lambda context: producer.PipelineConfig()
+    value._used = False  # noqa: SLF001
+    for _attempt in range(2):
+        with pytest.raises(CurrentRefitSearchProducerError) as caught:
+            value(object())
+        assert caught.value.code == (
+            "RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED"
+        )
+        assert value._used is False  # noqa: SLF001
+
+
+@pytest.mark.parametrize("spread_mode", (
+    "fixed_spec", "historical_bar", "historical_max", "conservative_max",
+))
+@pytest.mark.parametrize("entry", ("public-facade", "direct-implementation"))
+def test_current_refit_entry_is_retired_before_source_access(spread_mode, entry):
+    config = producer.PipelineConfig(backtest_spread_mode=spread_mode)
+
+    class UnopenedInputs:
+        pipeline_config = config
+
+        def __getattribute__(self, attribute):
+            pytest.fail(f"retired current-refit route accessed input {attribute}")
+
+    if entry == "public-facade":
+        value = object.__new__(producer.CurrentRefitSearchProducer)
+        value._frozen_config = UnopenedInputs()  # noqa: SLF001
+        invoke = lambda: value(UnopenedInputs())
+    else:
+        invoke = lambda: producer._produce(UnopenedInputs(), UnopenedInputs())  # noqa: SLF001
+    with pytest.raises(CurrentRefitSearchProducerError) as caught:
+        invoke()
+    assert caught.value.code == (
+        "RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED"
     )
-    value._native_products = {}  # noqa: SLF001
-    value._current_selection_window = {  # noqa: SLF001
-        "start_date": "2025-07-15",
-        "end_date": "2026-07-15",
-    }
-    value._output_root = Path(".")  # noqa: SLF001
-    value._lock = producer.threading.Lock()  # noqa: SLF001
-    value._used = False
-    request = _Request(_request_body())
-    assert value(request) == "product"
-    assert len(calls) == 1
-    supplied, supplied_request = calls[0]
-    assert type(supplied) is producer._ExecutableCurrentRefitInputs  # noqa: SLF001
-    assert supplied.pipeline_config.backtest_spread_mode == "fixed_spec"
-    assert supplied_request == _request_body()
-    with pytest.raises(
-        CurrentRefitSearchProducerError, match="CURRENT_REFIT_PRODUCER_ALREADY_CONSUMED"
-    ):
-        value(request)
 
 
 def _producer_inputs_for_binding_test(config=None):
@@ -546,30 +664,55 @@ def _producer_inputs_for_binding_test(config=None):
     )
 
 
+def test_raw_artifact_bindings_require_winner_v14_types(monkeypatch) -> None:
+    observed = []
+
+    def reopen(_manifest, binding, *, artifact_type):
+        observed.append((binding, artifact_type))
+        return {"artifact_type": artifact_type}
+
+    monkeypatch.setattr(producer, "_manifest_artifact", reopen)
+    bindings = {
+        "winner_request": "request",
+        "winner_decision": "decision",
+        "production_receipt": "receipt",
+        "cross_binding": "cross",
+    }
+
+    result = producer._resolve_raw_artifacts({}, bindings, required=True)
+
+    assert result is not None
+    assert observed == [
+        ("request", "winner_v14_request"),
+        ("decision", "winner_v14_decision"),
+        ("receipt", "winner_raw_evidence_production_receipt"),
+        ("cross", "current_horizon_winner_cross_binding"),
+    ]
+
+
 def test_current_producer_owns_materialized_config_after_construction(
     monkeypatch,
 ) -> None:
-    supplied = producer.PipelineConfig(backtest_spread_mode="stress_p95")
-    owned = producer.PipelineConfig(backtest_spread_mode="stress_p95")
+    supplied = producer.PipelineConfig(backtest_spread_mode="historical_bar")
+    owned = producer.PipelineConfig(backtest_spread_mode="historical_bar")
     frozen = SimpleNamespace(materialize=lambda context: owned)
     monkeypatch.setattr(
         producer.config_binding,
         "freeze_production_pipeline_config",
         lambda *args, **kwargs: frozen,
     )
-    observed = []
-    monkeypatch.setattr(
-        producer,
-        "_produce",
-        lambda inputs, request: observed.append(inputs.pipeline_config) or "ok",
-    )
     value = producer.CurrentRefitSearchProducer(
         _producer_inputs_for_binding_test(supplied)
     )
-    supplied.backtest_spread_mode = "stress_max"
-    assert value(_Request(_request_body())) == "ok"
-    assert observed == [owned]
-    assert observed[0].backtest_spread_mode == "stress_p95"
+    supplied.backtest_spread_mode = "fixed_spec"
+    assert value._frozen_config is frozen  # noqa: SLF001
+    assert frozen.materialize(value._context) is owned  # noqa: SLF001
+    assert owned.backtest_spread_mode == "historical_bar"
+    with pytest.raises(CurrentRefitSearchProducerError) as caught:
+        value(_Request(_request_body()))
+    assert caught.value.code == (
+        "RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED"
+    )
 
 
 def test_current_producer_rejects_initial_effective_config_mismatch(
@@ -591,9 +734,12 @@ def test_current_producer_rejects_initial_effective_config_mismatch(
     assert caught.value.details[0] == "EFFECTIVE_PIPELINE_CONFIG_MISMATCH"
 
 
-def test_current_producer_rejects_active_config_drift_at_call(monkeypatch) -> None:
+def test_retirement_precedes_active_config_reopening(monkeypatch) -> None:
+    calls = []
+
     class _Frozen:
         def materialize(self, context):
+            calls.append(context)
             raise producer.config_binding.ProductionConfigBindingError(
                 "ACTIVE_CONFIG_BYTES_CHANGED"
             )
@@ -606,8 +752,13 @@ def test_current_producer_rejects_active_config_drift_at_call(monkeypatch) -> No
     value = producer.CurrentRefitSearchProducer(_producer_inputs_for_binding_test())
     with pytest.raises(CurrentRefitSearchProducerError) as caught:
         value(_Request(_request_body()))
-    assert caught.value.code == "CURRENT_PRODUCTION_CONFIG_REVERIFY_FAILED"
-    assert caught.value.details[0] == "ACTIVE_CONFIG_BYTES_CHANGED"
+    assert caught.value.code == (
+        "RETIRED_COST_POLICY_INTERVAL_QUALIFICATION_REPLACEMENT_REQUIRED"
+    )
+    assert calls == []
+    with pytest.raises(producer.config_binding.ProductionConfigBindingError) as drift:
+        value._frozen_config.materialize(value._context)  # noqa: SLF001
+    assert drift.value.code == "ACTIVE_CONFIG_BYTES_CHANGED"
 
 
 def test_book_stream_releases_timeframe_before_yield_and_on_failure(
@@ -862,8 +1013,6 @@ def test_exact_empty_current_book_is_typed_not_promotable() -> None:
         "COMPLETE_FAMILY_HAS_NO_LOCAL_WINNERS",
     )
     assert not isinstance(caught.value, CurrentRefitSearchProducerError)
-    source = inspect.getsource(producer._produce)  # noqa: SLF001
-    assert source.index("_selected_book_cells") < source.index("generation_sink =")
 
 
 @pytest.mark.parametrize(
@@ -1081,140 +1230,6 @@ def test_current_replay_contract_rejects_unbound_or_noncausal_windows(
         )
 
 
-def test_replay_candidates_emit_standalone_verifier_window_and_source_keys(
-    monkeypatch,
-) -> None:
-    material = _selected_material()
-    cell_id = "EURUSD|H1|TREND|EMACrossoverStrategy"
-    material = producer._SelectedMaterial(  # noqa: SLF001
-        **{
-            **{name: getattr(material, name) for name in material.__dataclass_fields__},
-            "book_cell": {
-                **material.book_cell,
-                "cell_id": cell_id,
-                "adjusted_q_value": 0.1,
-            },
-            "winner_process": {
-                **material.winner_process,
-                "strategy_class": "EMACrossoverStrategy",
-                "strategy_module": "pm_strategies",
-            },
-            "search": producer._SelectedSearch(  # noqa: SLF001
-                **{
-                    **{
-                        name: getattr(material.search, name)
-                        for name in material.search.__dataclass_fields__
-                    },
-                    "source_capture": {
-                        **material.search.source_capture,
-                        "selection_prefix_receipt": {"receipt": "selection"},
-                    },
-                }
-            ),
-        }
-    )
-    candidate = producer.portfolio.CandidateTrade(
-        candidate_id="raw-candidate",
-        cell_id=cell_id,
-        symbol="EURUSD",
-        timeframe="H1",
-        regime="TREND",
-        strategy_name="EMACrossoverStrategy",
-        promotion_status="PROCESS_VALIDATED_CURRENT_REFIT",
-        asset_class="fx",
-        risk_groups=(),
-        entry_time="2026-01-02T00:00:00Z",
-        direction=1,
-        stop_risk_per_lot=100.0,
-        margin_per_lot=1000.0,
-        volume_min=0.01,
-        volume_max=10.0,
-        volume_step=0.01,
-        priority_score=0.9,
-        legs=(
-            producer.portfolio.ExitLeg(
-                exit_time="2026-01-03T00:00:00Z",
-                fraction=1.0,
-                net_pnl_per_entry_lot=25.0,
-            ),
-        ),
-    )
-    captured = {}
-
-    def native_identity(
-        _product, *, expected_symbol, expected_timeframe, expected_cutoff_utc, role
-    ):
-        del expected_cutoff_utc, role
-        return {
-            "symbol": expected_symbol,
-            "timeframe": expected_timeframe,
-            "activation_id": "activation-v5",
-            "activation_manifest_sha256": "1" * 64,
-            "source_bars_sha256": ("2" if expected_timeframe == "H1" else "6") * 64,
-            "source_audit_sidecar_sha256": ("3" if expected_timeframe == "H1" else "7")
-            * 64,
-            "index_sha256": ("4" if expected_timeframe == "H1" else "8") * 64,
-            "source_identity_sha256": ("5" if expected_timeframe == "H1" else "9") * 64,
-        }
-
-    def execute(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            positions=(SimpleNamespace(candidate=candidate),),
-        )
-
-    monkeypatch.setattr(
-        producer.forward_replay, "_native_product_identity", native_identity
-    )
-    monkeypatch.setattr(
-        producer.forward_replay, "_deployment_config", lambda _config: object()
-    )
-    monkeypatch.setattr(producer.forward_replay, "_execute_anchor_replay", execute)
-    inputs = SimpleNamespace(
-        context=object(),
-        pipeline_config=producer.PipelineConfig(),
-        current_selection_window={
-            "start_date": "2025-07-15",
-            "end_date": "2026-07-15",
-        },
-        native_products={"EURUSD|H1": object(), "EURUSD|M5": object()},
-    )
-    current_book = {
-        "regime_fits": [
-            {
-                "payload": {
-                    "symbol": "EURUSD",
-                    "timeframe": "H1",
-                    "regime_detector_record": {
-                        "parameters_canonical_json": "{}",
-                        "parameters_sha256": "a" * 64,
-                    },
-                }
-            }
-        ]
-    }
-    candidates, replayed, window, native_sources, valuation_sources = (
-        producer._replay_candidates(  # noqa: SLF001
-            inputs=inputs,
-            current_book=current_book,
-            materials=(material,),
-            current_cutoff="2026-07-15T00:00:00+00:00",
-            current_refit_receipt={"receipt": "current"},
-        )
-    )
-    assert len(candidates) == 1
-    assert replayed == [cell_id]
-    assert captured["capital_window"] == {
-        "start_date": "2025-07-15",
-        "end_date": "2026-07-15",
-    }
-    assert window["partition"] == "current_refit_management_replay"
-    assert set(native_sources) == {cell_id}
-    assert set(valuation_sources) == {"EURUSD"}
-    assert native_sources[cell_id]["source_sha256"] == "2" * 64
-    assert valuation_sources["EURUSD"]["source_sha256"] == "6" * 64
-
-
 def _selected_material() -> producer._SelectedMaterial:  # noqa: SLF001
     book_entry = {
         "symbol": "EURUSD",
@@ -1268,6 +1283,109 @@ def _selected_material() -> producer._SelectedMaterial:  # noqa: SLF001
             "regime_detector_code_sha256": "d" * 64,
         },
     )
+
+
+def test_materialize_selected_preserves_complete_winner_book_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tolerance = {
+        "level_id": "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+        "single_fill_uplift_percentile": 75,
+        "uniform_entry_half_spread_multiplier_float64_hex": "0x1.a000000000000p+2",
+    }
+    process = {
+        "strategy_id": "EMACrossoverStrategy",
+        "process_candidate_id": "candidate",
+    }
+    process_sha = producer.current_artifacts.canonical_artifact_sha256(process)
+    cell = {
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "regime": "TREND",
+        "local_process_candidate_id": "candidate",
+        "local_process_sha256": process_sha,
+        "winner_decision_sha256": "4" * 64,
+        "historical_book_entry_sha256": "5" * 64,
+        "validated_cost_ladder_tolerance": tolerance,
+    }
+    source = {"schema_version": "source"}
+    source_descriptor = current_execution.build_raw_artifact_descriptor(
+        relative_path="source.json",
+        size_bytes=1,
+        content_sha256="1" * 64,
+        semantic_sha256=producer.current_artifacts.canonical_artifact_sha256(source),
+        format_version="source",
+    )
+    bars_descriptor = current_execution.build_raw_artifact_descriptor(
+        relative_path="bars.csv",
+        size_bytes=1,
+        content_sha256="2" * 64,
+        semantic_sha256="3" * 64,
+        format_version="bars",
+    )
+    selected = producer._SelectedSearch(  # noqa: SLF001
+        symbol="EURUSD",
+        timeframe="H1",
+        regime="TREND",
+        artifacts={
+            "winner_process": process,
+            "horizon_process": {"schema_version": "horizon"},
+            "trial_definition": {"parameters": {"fast": 10, "slow": 30}},
+            "refit_recipe": {"schema_version": "recipe"},
+        },
+        source_capture={
+            "source_snapshot": source,
+            "source_raw_descriptor": source_descriptor,
+            "bars_raw_descriptor": bars_descriptor,
+        },
+        winner_decision_sha256="4" * 64,
+    )
+    current_book = {
+        "regime_fits": [
+            {
+                "receipt_sha256": "a" * 64,
+                "payload": {
+                    "symbol": "EURUSD",
+                    "timeframe": "H1",
+                    "regime_detector_record": {
+                        "record_sha256": "b" * 64,
+                        "parameters_sha256": "c" * 64,
+                        "detector_code_sha256": "d" * 64,
+                    },
+                },
+            }
+        ]
+    }
+    captured = {}
+
+    class CaptureSink:
+        def put_json(self, path, artifact_type, body):
+            encoded = _canonical(body)
+            captured[artifact_type] = json.loads(encoded.decode("ascii"))
+            return {
+                "descriptor": {
+                    "relative_path": f"{path}.json",
+                    "size_bytes": len(encoded),
+                    "sha256": hashlib.sha256(encoded).hexdigest(),
+                }
+            }
+
+    monkeypatch.setattr(
+        current_execution,
+        "build_current_regime_params_bundle",
+        lambda **_kwargs: {"schema_version": "regimes"},
+    )
+    materials, _sources, _horizons, _regimes = producer._materialize_selected(  # noqa: SLF001
+        sink=CaptureSink(),
+        current_book=current_book,
+        selected_cells=[cell],
+        selected_search={"EURUSD|H1|TREND": selected},
+        current_cutoff="2026-07-15T00:00:00+00:00",
+    )
+
+    assert captured[producer.current_production.ART_BOOK_ENTRY] == cell
+    assert materials[0].book_cell == cell
+    assert materials[0].book_cell["validated_cost_ladder_tolerance"] == tolerance
 
 
 def test_refit_identity_uses_book_semantic_digest_not_file_digest() -> None:

@@ -150,6 +150,43 @@ class StrategyRegressionTests(unittest.TestCase):
         self.assertEqual(int((signals == -1).sum()), 1)
         self.assertEqual(int(signals.iloc[5]), -1)
 
+    def test_inside_bar_keeps_original_mother_through_a_longer_inside_streak(self):
+        for direction in (1, -1):
+            with self.subTest(direction=direction):
+                frame = pd.DataFrame({
+                    "Open": [10.0] * 6,
+                    "High": [12.0, 11.0, 10.8, 10.6, 11.6, 12.6],
+                    "Low": [8.0, 9.0, 9.1, 9.2, 9.4, 9.5],
+                    "Close": [10.0, 10.0, 10.0, 10.0, 11.5, 12.5],
+                })
+                if direction == -1:
+                    high, low = frame["High"].copy(), frame["Low"].copy()
+                    frame["High"], frame["Low"] = 20.0 - low, 20.0 - high
+                    frame["Close"] = 20.0 - frame["Close"]
+                actual = StrategyRegistry.get("InsideBarBreakoutStrategy", min_inside_bars=2).generate_signals(frame, "TEST")
+                expected = pd.Series([0, 0, 0, 0, 0, direction], index=frame.index, dtype=int)
+                pd.testing.assert_series_equal(actual, expected, check_exact=True)
+
+    def test_turtle_soup_new_breakout_replaces_pending_level_before_reclaim(self):
+        for direction in (-1, 1):
+            with self.subTest(direction=direction):
+                frame = pd.DataFrame({
+                    "Open": [100.0] * 34, "High": [101.0] * 34,
+                    "Low": [99.0] * 34, "Close": [100.0] * 34,
+                })
+                frame.loc[30:32, "High"] = [104.0, 106.0, 104.0]
+                frame.loc[30:32, "Low"] = [102.0, 104.0, 102.0]
+                frame.loc[30:32, "Close"] = [103.0, 105.0, 103.0]
+                if direction == 1:
+                    high, low = frame["High"].copy(), frame["Low"].copy()
+                    frame["High"], frame["Low"] = 200.0 - low, 200.0 - high
+                    frame["Close"] = 200.0 - frame["Close"]
+                actual = StrategyRegistry.get("TurtleSoupReversalStrategy", channel_period=20, reclaim_window=2).generate_signals(frame, "TEST")
+                self.assertEqual(int(actual.iloc[30]), 0)
+                self.assertEqual(int(actual.iloc[31]), 0)
+                self.assertEqual(int(actual.iloc[32]), direction)
+                self.assertEqual(int((actual != 0).sum()), 1)
+
     def test_pin_bar_reversal_is_not_delayed(self):
         n = 25
         close = np.linspace(99.0, 100.2, n)

@@ -158,7 +158,7 @@ def _process_precommitment() -> dict:
     risk = json.loads(json.dumps(causal._FROZEN_RISK_POLICY))
     cost = json.loads(json.dumps(causal._FROZEN_COST_POLICY))
     definition = {
-        "schema": "fxpm-frozen-historical-institution-process-v9",
+        "schema": "fxpm-frozen-historical-institution-process-v10",
         "symbols": list(causal.SYMBOLS),
         "timeframes": list(causal.TIMEFRAMES),
         "regimes": list(causal.REGIMES),

@@ -20,3 +20,12 @@
 /tests/test_authoritative_search_execution.py -text
 /tests/test_backtester_winner_daily_r.py -text
 /tests/test_winner_raw_evidence.py -text
+/tests/test_backtester.py -text
+/tests/test_backtester_cost_timing.py -text
+/tests/test_causal_evidence_producer.py -text
+/tests/test_config_source_of_truth.py -text
+/tests/test_current_refit_search_producer.py -text
+/tests/test_demo_readiness.py -text
+/tests/test_enhancement_seams.py -text
+/tests/test_position_sizing_edge_cases.py -text
+/tests/test_raw_winner_canary.py -text

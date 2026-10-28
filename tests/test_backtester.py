@@ -205,7 +205,7 @@ class BacktesterTests(unittest.TestCase):
         self.assertAlmostEqual(py_trade["entry_to_target_pips"], 10.0, places=2)
 
         if not pm_core.NUMBA_AVAILABLE:
-            return
+            self.skipTest("Numba not available")
         result = pm_core._backtest_loop_numba(
             open_arr,
             high_arr,
@@ -238,6 +238,110 @@ class BacktesterTests(unittest.TestCase):
         self.assertEqual(int(result[22][0]), 1)
         self.assertAlmostEqual(float(result[23][0]), 10.0, places=2)
         self.assertAlmostEqual(float(result[24][0]), 10.0, places=2)
+
+    def test_spread_on_gap_and_intrabar_exits_match_python_and_numba(self):
+        if not pm_core.NUMBA_AVAILABLE:
+            self.skipTest("Numba not available")
+
+        cfg = PipelineConfig(initial_capital=10000.0, use_spread=True)
+        bt = Backtester(cfg)
+        index = pd.date_range("2024-01-01", periods=7, freq="h")
+        features = pd.DataFrame(
+            {
+                "Open": [1.1000, 1.1000, 1.0988, 1.1000, 1.1000, 1.1000, 1.1000],
+                "High": [1.1000, 1.1005, 1.0990, 1.1000, 1.1013, 1.1000, 1.1000],
+                "Low": [1.1000, 1.0995, 1.0985, 1.1000, 1.0997, 1.1000, 1.1000],
+                "Close": [1.1000, 1.1000, 1.0988, 1.1000, 1.1010, 1.1000, 1.1000],
+                "Volume": [100] * 7,
+            },
+            index=index,
+        )
+        arrays = [
+            features[name].to_numpy(dtype=np.float64)
+            for name in ("Open", "High", "Low", "Close")
+        ]
+        signals = np.zeros(7, dtype=np.int32)
+        signals[[0, 3]] = 1
+        entry_prices = np.full(7, np.nan, dtype=np.float64)
+        stop_prices = np.full(7, np.nan, dtype=np.float64)
+        target_prices = np.full(7, np.nan, dtype=np.float64)
+        entry_prices[[1, 4]] = 1.1001
+        stop_prices[[1, 4]] = 1.0991
+        target_prices[[1, 4]] = 1.1011
+        spreads = np.full(7, 0.0001, dtype=np.float64)
+        spec = InstrumentSpec(
+            symbol="EURUSD",
+            pip_position=4,
+            pip_value=10.0,
+            spread_avg=2.0,
+            tick_size=0.0001,
+            tick_value=10.0,
+        )
+
+        python_trades, python_final, python_drawdown, python_curve = (
+            bt._run_python_loop(
+                features,
+                *arrays,
+                signals,
+                stop_prices,
+                target_prices,
+                entry_prices,
+                spreads,
+                spec,
+            )
+        )
+        numba = pm_core._backtest_loop_numba(
+            *arrays,
+            signals,
+            stop_prices,
+            target_prices,
+            entry_prices,
+            10000.0,
+            1.0,
+            spreads,
+            True,
+            spec.tick_size,
+            spec.tick_value,
+            spec.pip_size,
+            spec.pip_value,
+            spec.min_lot,
+            spec.max_lot,
+            spec.volume_step,
+            0,
+        )
+
+        self.assertEqual(
+            [trade["exit_reason"] for trade in python_trades],
+            ["closed_sl", "closed_tp"],
+        )
+        self.assertEqual(list(numba[11]), [pm_core.EXIT_SL, pm_core.EXIT_TP])
+        self.assertTrue(
+            np.allclose(
+                [trade["exit_price"] for trade in python_trades],
+                numba[5],
+                rtol=0.0,
+                atol=1e-12,
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                [trade["pnl_pips"] for trade in python_trades],
+                np.round(numba[10], 2),
+                rtol=0.0,
+                atol=1e-12,
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                [trade["pnl_dollars"] for trade in python_trades],
+                np.round(numba[9], 2),
+                rtol=0.0,
+                atol=1e-12,
+            )
+        )
+        self.assertAlmostEqual(python_final, float(numba[14]), places=10)
+        self.assertAlmostEqual(python_drawdown, float(numba[15]), places=10)
+        self.assertTrue(np.allclose(python_curve, numba[13], rtol=0.0, atol=1e-10))
 
     def test_warmup_prefix_is_excluded_from_bar_return_risk_metrics(self):
         cfg = PipelineConfig(initial_capital=100.0)
@@ -469,91 +573,6 @@ class BacktesterTests(unittest.TestCase):
         self.assertAlmostEqual(historical["spread_model"]["mean_effective_spread_price"], 0.10, places=8)
         self.assertAlmostEqual(historical["spread_model"]["mean_effective_spread_cash_per_lot"], 100.0, places=8)
 
-    def test_stress_max_spread_mode_charges_max_spread_at_entry(self):
-        idx = pd.date_range("2024-01-01", periods=3, freq="h")
-        df = pd.DataFrame({
-            "Open": [100.0, 100.0, 100.0],
-            "High": [100.0, 100.05, 100.05],
-            "Low": [100.0, 99.95, 99.95],
-            "Close": [100.0, 100.10, 100.20],
-            "Volume": [100, 100, 100],
-            "Spread": [2.0, 2.0, 2.0],
-            "SpreadOpen": [2.0, 2.0, 2.0],
-            "SpreadP90": [6.0, 6.0, 6.0],
-            "SpreadP95": [8.0, 8.0, 8.0],
-            "SpreadMax": [10.0, 10.0, 10.0],
-        }, index=idx)
-        spec = InstrumentSpec(
-            symbol="TEST",
-            pip_position=2,
-            pip_value=10.0,
-            spread_avg=0.0,
-            point=0.01,
-            tick_size=0.01,
-            tick_value=10.0,
-        )
-
-        conservative_entry, conservative_bar, conservative_meta = Backtester(
-            PipelineConfig(use_spread=True, backtest_spread_mode="conservative_max")
-        )._build_half_spread_arrays(df, spec)
-        stress_p90_entry, stress_p90_bar, stress_p90_meta = Backtester(
-            PipelineConfig(use_spread=True, backtest_spread_mode="stress_p90")
-        )._build_half_spread_arrays(df, spec)
-        stress_p95_entry, stress_p95_bar, stress_p95_meta = Backtester(
-            PipelineConfig(use_spread=True, backtest_spread_mode="stress_p95")
-        )._build_half_spread_arrays(df, spec)
-        stress_entry, stress_bar, stress_meta = Backtester(
-            PipelineConfig(use_spread=True, backtest_spread_mode="stress_max")
-        )._build_half_spread_arrays(df, spec)
-
-        self.assertAlmostEqual(conservative_entry[1], 0.01, places=8)
-        self.assertAlmostEqual(conservative_bar[1], 0.05, places=8)
-        self.assertEqual(conservative_meta["entry_column"], "SpreadOpen")
-        self.assertAlmostEqual(stress_p90_entry[1], 0.03, places=8)
-        self.assertAlmostEqual(stress_p90_bar[1], 0.05, places=8)
-        self.assertEqual(stress_p90_meta["entry_column"], "SpreadP90")
-        self.assertEqual(stress_p90_meta["entry_model"], "p90_spread_stress")
-        self.assertAlmostEqual(stress_p95_entry[1], 0.04, places=8)
-        self.assertAlmostEqual(stress_p95_bar[1], 0.05, places=8)
-        self.assertEqual(stress_p95_meta["entry_column"], "SpreadP95")
-        self.assertEqual(stress_p95_meta["entry_model"], "p95_spread_stress")
-        self.assertAlmostEqual(stress_entry[1], 0.05, places=8)
-        self.assertAlmostEqual(stress_bar[1], 0.05, places=8)
-        self.assertEqual(stress_meta["entry_column"], "SpreadMax")
-        self.assertEqual(stress_meta["entry_model"], "max_spread_stress")
-
-    def test_percentile_stress_falls_back_to_max_not_open(self):
-        idx = pd.date_range("2024-01-01", periods=3, freq="h")
-        df = pd.DataFrame({
-            "Open": [100.0, 100.0, 100.0],
-            "High": [100.0, 100.05, 100.05],
-            "Low": [100.0, 99.95, 99.95],
-            "Close": [100.0, 100.10, 100.20],
-            "Volume": [100, 100, 100],
-            "Spread": [2.0, 2.0, 2.0],
-            "SpreadOpen": [2.0, 2.0, 2.0],
-            "SpreadMax": [10.0, 10.0, 10.0],
-        }, index=idx)
-        spec = InstrumentSpec(
-            symbol="TEST",
-            pip_position=2,
-            pip_value=10.0,
-            spread_avg=0.0,
-            point=0.01,
-            tick_size=0.01,
-            tick_value=10.0,
-        )
-
-        stress_entry, stress_bar, stress_meta = Backtester(
-            PipelineConfig(use_spread=True, backtest_spread_mode="stress_p95")
-        )._build_half_spread_arrays(df, spec)
-
-        self.assertAlmostEqual(stress_entry[1], 0.05, places=8)
-        self.assertAlmostEqual(stress_bar[1], 0.05, places=8)
-        self.assertEqual(stress_meta["entry_column"], "SpreadMax")
-        self.assertEqual(stress_meta["entry_model"], "max_spread_stress")
-        self.assertTrue(stress_meta["stress_entry_fallback"])
-
     def test_non_fx_spread_outlier_is_flagged_for_provenance_review(self):
         idx = pd.date_range("2024-01-01", periods=3, freq="h")
         df = pd.DataFrame({
@@ -579,7 +598,8 @@ class BacktesterTests(unittest.TestCase):
 
         _, _, meta = Backtester(PipelineConfig(
             use_spread=True,
-            backtest_spread_mode="conservative_max",
+            # Synthetic outlier metadata remains a non-authorising diagnostic.
+            backtest_spread_mode="historical_bar",
         ))._build_half_spread_arrays(df, spec)
 
         self.assertEqual(meta["asset_class"], "crypto")

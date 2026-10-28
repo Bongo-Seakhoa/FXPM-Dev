@@ -9,9 +9,12 @@ import pytest
 
 from pm_core import PipelineConfig
 from pm_optuna import _bounded_cartesian_combinations as _optuna_bounded_cartesian
+from pm_optuna import _bounded_parameter_points as _optuna_bounded_points, ParameterSpace
+from pm_current_refit_parameters import build_parameter_domain, validate_parameter_domain_member
 from pm_pipeline import (
     RegimeOptimizer,
     _bounded_cartesian_combinations as _pipeline_bounded_cartesian,
+    _bounded_parameter_points as _pipeline_bounded_points,
     _signal_vector_sha256,
 )
 from pm_search_outcomes import (
@@ -78,7 +81,8 @@ def _authenticated_result(*, observations: int, seed: int, start_utc: str):
             build_numerical_execution_cost_attestation(
                 use_spread=True,
                 spread_mode="conservative_max",
-                spread_values_sha256="7" * 64,
+                entry_half_spread_values_sha256="7" * 64,
+                intrabar_half_spread_values_sha256="7" * 64,
                 instrument_spec_sha256="9" * 64,
             )
         ),
@@ -301,6 +305,105 @@ def test_cartesian_sampling_is_bounded_before_large_domain_materialization(build
     )[0]
 
 
+@pytest.mark.parametrize("builder", [_pipeline_bounded_points, _optuna_bounded_points])
+def test_structured_sampling_is_bounded_and_never_crosses_coupled_rows(builder):
+    defaults = {"fast": 12, "slow": 26, **{f"axis{i}": 0 for i in range(4)}}
+    grid = {"fast": [8, 12, 16], "slow": [21, 26, 34], **{f"axis{i}": list(range(100)) for i in range(4)}}
+    domain = build_parameter_domain(defaults, grid, coupled_groups=(
+        {"names": ("fast", "slow"), "choices": ((8, 21), (12, 26), (16, 34))},))
+    points, total = builder(domain, limit=7, seed=12345)
+    assert total == 300_000_000
+    assert len(points) == 7
+    assert len({tuple(point.items()) for point in points}) == 7
+    assert points == builder(domain, limit=7, seed=12345)[0]
+    for point in points:
+        assert validate_parameter_domain_member(domain, point) == point
+        assert (point["fast"], point["slow"]) in {(8, 21), (12, 26), (16, 34)}
+
+
+def test_optuna_coupled_axis_is_one_index_category_expanded_into_flat_runtime_parameters():
+    groups = ({"names": ("fast_period", "slow_period"), "choices": ((12, 26), (30, 20))},)
+    space = ParameterSpace({"fast_period": [12, 30], "slow_period": [26, 20], "signal": [7, 9]},
+        {"fast_period": 12, "slow_period": 26, "signal": 9, "fixed": True}, coupled_groups=groups)
+    calls = []
+    class Trial:
+        def suggest_categorical(self, name, choices):
+            calls.append((name, choices))
+            return choices[-1]
+    params = space.suggest(Trial())
+    assert space.get_search_space_size() == 4
+    assert params == {"fast_period": 30, "slow_period": 20, "signal": 9, "fixed": True}
+    assert calls == [("signal", [7, 9]), ("__coupled__fast_period__slow_period", [0, 1])]
+    assert set(params) == set(space.default_params)
+
+
+def test_prospect_route_passes_coupled_domain_to_real_sampler(monkeypatch):
+    from tools import strategy_prospect as prospect
+    sampled_domains, observed = [], []
+    original = prospect._sample_grid
+    def sample(domain, n, seed):
+        sampled_domains.append(domain)
+        return original(domain, n, seed)
+    def invented_run(cfg, loader, name, params, symbol, timeframes):
+        observed.append(params)
+        return None
+    monkeypatch.setattr(prospect, "_sample_grid", sample)
+    monkeypatch.setattr(prospect, "_run", invented_run)
+    result = prospect.screen("MACDHistogramMomentumStrategy", None, None,
+        ["SYNTHETIC"], samples=7, seed=17, tfs=("H1",))
+    assert len(sampled_domains) == 1 and sampled_domains[0]["point_count"] == 19_800
+    assert len(observed) == 7 and result["tradeful_runs"] == 0
+    for params in observed:
+        assert validate_parameter_domain_member(sampled_domains[0], params) == params
+        assert (params["macd_fast"], params["macd_slow"]) in {(8, 21), (12, 26), (16, 34)}
+
+
+def test_pbo_matrix_route_samples_grouped_domain_and_passes_flat_params(monkeypatch):
+    from tools import pbo
+    from pm_strategies import StrategyRegistry
+    # Invented callback-only transport fixture: no market data or financial engine.
+    frame = pd.DataFrame({"Close": np.ones(60)}, index=pd.date_range("2020-01-01", periods=60, freq="h", tz="UTC"))
+    sampled_domains, observed = [], []
+    original = pbo.parameter_domain_point
+    def point(domain, ordinal):
+        sampled_domains.append(domain)
+        return original(domain, ordinal)
+    class InventedBacktester:
+        def __init__(self, cfg):
+            pass
+        def run(self, features, signals, symbol, strategy, **kwargs):
+            observed.append(strategy.get_params())
+            return {"equity_curve": np.ones(60)}
+    loader = SimpleNamespace(load_symbol=lambda symbol: frame, resample=lambda source, tf: source)
+    strategy_class = type(StrategyRegistry.get("MACDHistogramMomentumStrategy"))
+    monkeypatch.setattr(strategy_class, "generate_signals",
+        lambda self, features, symbol: pd.Series(1, index=features.index))
+    monkeypatch.setattr(pbo, "parameter_domain_point", point)
+    monkeypatch.setattr(pbo.FeatureComputer, "compute_for_strategy", lambda source, *args, **kwargs: source)
+    monkeypatch.setattr(pbo, "get_instrument_spec", lambda symbol: object())
+    monkeypatch.setattr(pbo, "Backtester", InventedBacktester)
+    matrix = pbo.build_returns_matrix(SimpleNamespace(regime_params_file=None), loader,
+        "MACDHistogramMomentumStrategy", "SYNTHETIC", "H1", samples=3, seed=17)
+    assert matrix.shape == (59, 3) and np.count_nonzero(matrix) == 0
+    assert len(observed) == 3 and len(sampled_domains) == 3
+    assert all(domain["point_count"] == 19_800 for domain in sampled_domains)
+    for params in observed:
+        assert validate_parameter_domain_member(sampled_domains[0], params) == params
+        assert not any(name.startswith("__coupled__") for name in params)
+
+
+def test_convergence_census_uses_grouped_space_sizes():
+    from tools import optuna_convergence as convergence
+    sizes = {name: size for size, name in convergence._largest_spaces(100)}
+    assert len(sizes) == 100
+    assert {name: sizes[name] for name in (
+        "RegimeTransitionBreakoutStrategy", "EMARibbonADXStrategy", "StochRSITrendGateStrategy",
+        "SessionVWAPReversionStrategy", "MACDHistogramMomentumStrategy")} == {
+            "RegimeTransitionBreakoutStrategy": 26_730, "EMARibbonADXStrategy": 23_760,
+            "StochRSITrendGateStrategy": 23_760, "SessionVWAPReversionStrategy": 13_200,
+            "MACDHistogramMomentumStrategy": 19_800}
+
+
 def test_deep_search_supersedes_identical_b0_identity_and_validates_once():
     class Strategy:
         name = "Family"
@@ -390,7 +493,6 @@ def test_governed_oos_reuse_rejects_empty_record():
     optimizer = RegimeOptimizer(PipelineConfig(
         research_mode=True,
         oos_evidence_export_enabled=True,
-        oos_evidence_include_execution_cost_survival=False,
     ))
     features = pd.DataFrame(
         {"Close": np.arange(20.0), "REGIME_LIVE": ["TREND"] * 20},
@@ -482,7 +584,6 @@ def test_oos_reuse_refreshes_final_multiplicity_without_baseline_replay():
         oos_evidence_export_enabled=True,
         oos_evidence_periods=8,
         oos_evidence_min_periods=2,
-        oos_evidence_include_execution_cost_survival=False,
     ))
     features = pd.DataFrame(
         {"Close": np.arange(20.0), "REGIME_LIVE": ["TREND"] * 20},

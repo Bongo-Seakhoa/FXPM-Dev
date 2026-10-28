@@ -51,7 +51,8 @@ def _largest_spaces(top):
         try:
             strat = StrategyRegistry.get(name)
             grid = strat.get_param_grid()
-            size = ParameterSpace(grid, strat.get_params()).get_search_space_size()
+            size = ParameterSpace(grid, strat.get_params(),
+                coupled_groups=strat.get_param_couplings()).get_search_space_size()
             sizes.append((int(size), name))
         except Exception:
             continue

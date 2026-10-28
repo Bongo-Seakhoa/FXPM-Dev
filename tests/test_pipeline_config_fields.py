@@ -214,14 +214,10 @@ class PipelineConfigFieldTests(unittest.TestCase):
         cfg = PipelineConfig(backtest_spread_mode="wishful")
         self.assertEqual(cfg.backtest_spread_mode, "fixed_spec")
 
-    def test_backtest_spread_mode_accepts_stress_max(self):
-        cfg = PipelineConfig(backtest_spread_mode="stress_max")
-        self.assertEqual(cfg.backtest_spread_mode, "stress_max")
-
-    def test_backtest_spread_mode_accepts_realistic_stress_modes(self):
-        for mode in ("stress_p90", "stress_p95"):
-            cfg = PipelineConfig(backtest_spread_mode=mode)
-            self.assertEqual(cfg.backtest_spread_mode, mode)
+    def test_empirical_stress_spread_modes_are_retired(self):
+        for mode in ("stress_p90", "stress_p95", "stress_max"):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                PipelineConfig(backtest_spread_mode=mode)
 
     def test_regime_trade_stability_floor_defaults_and_clamps(self):
         self.assertAlmostEqual(PipelineConfig().regime_trade_stability_floor, 0.7, places=6)
@@ -230,10 +226,19 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertAlmostEqual(PipelineConfig(regime_trade_stability_floor=2.0).regime_trade_stability_floor, 1.0, places=6)
 
     def test_retired_pipeline_controls_are_not_constructor_fields(self):
+        retired_promotion_artifact_keys = {
+            "production_promotion_review_path",
+            "production_promotion_cell_safety_path",
+            "production_completion_marker_path",
+            "production_expected_promote_cells",
+        }
         self.assertTrue(
             {"use_commission", "use_slippage", "slippage_pips"}.issubset(
                 RETIRED_SCORING_CONFIG_KEYS
             )
+        )
+        self.assertTrue(
+            retired_promotion_artifact_keys.issubset(RETIRED_SCORING_CONFIG_KEYS)
         )
         self.assertTrue(
             RETIRED_SCORING_CONFIG_KEYS.isdisjoint(
@@ -243,6 +248,23 @@ class PipelineConfigFieldTests(unittest.TestCase):
         for key in RETIRED_SCORING_CONFIG_KEYS:
             with self.subTest(key=key), self.assertRaises(TypeError):
                 PipelineConfig(**{key: "retired"})
+
+    def test_promotion_gate_accepts_only_literal_immutable_exact(self):
+        self.assertEqual(
+            PipelineConfig().production_promotion_gate_mode,
+            "immutable_exact",
+        )
+        for retired_mode in (
+            "external_review_exact",
+            "ledger_status",
+            "immutable",
+            "authorization",
+            "IMMUTABLE_EXACT",
+            "",
+            None,
+        ):
+            with self.subTest(mode=retired_mode), self.assertRaises(ValueError):
+                PipelineConfig(production_promotion_gate_mode=retired_mode)
 
     def test_false_discovery_controls_default_on_and_clamp(self):
         cfg = PipelineConfig(
@@ -323,9 +345,6 @@ class PipelineConfigFieldTests(unittest.TestCase):
             oos_evidence_min_periods=999,
             oos_evidence_dirname="../bad",
             oos_evidence_trade_path_max_points=999999,
-            oos_evidence_include_execution_cost_survival=True,
-            oos_evidence_execution_stress_mode="stress_wish",
-            oos_evidence_execution_cost_max_candidates_per_tf=-3,
         )
         self.assertEqual(cfg.oos_validation_mode, "fixed_holdout")
         self.assertEqual(cfg.oos_kfold_splits, 2)
@@ -337,9 +356,12 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(cfg.oos_evidence_min_periods, 2)
         self.assertEqual(cfg.oos_evidence_dirname, "oos_evidence")
         self.assertEqual(cfg.oos_evidence_trade_path_max_points, 5000)
-        self.assertTrue(cfg.oos_evidence_include_execution_cost_survival)
-        self.assertEqual(cfg.oos_evidence_execution_stress_mode, "stress_p95")
-        self.assertEqual(cfg.oos_evidence_execution_cost_max_candidates_per_tf, 0)
+        for retired in (
+            "oos_evidence_include_execution_cost_survival",
+            "oos_evidence_execution_stress_mode",
+            "oos_evidence_execution_cost_max_candidates_per_tf",
+        ):
+            self.assertNotIn(retired, PipelineConfig.__dataclass_fields__)
 
         purged = PipelineConfig(
             research_mode=True,
@@ -355,14 +377,8 @@ class PipelineConfigFieldTests(unittest.TestCase):
         self.assertEqual(purged.oos_min_trades, 5)
         self.assertEqual(purged.oos_aggregate_policy, "all_folds")
 
-        stress = PipelineConfig(
-            oos_evidence_trade_path_max_points=128,
-            oos_evidence_execution_stress_mode="stress_max",
-            oos_evidence_execution_cost_max_candidates_per_tf=7,
-        )
-        self.assertEqual(stress.oos_evidence_trade_path_max_points, 128)
-        self.assertEqual(stress.oos_evidence_execution_stress_mode, "stress_max")
-        self.assertEqual(stress.oos_evidence_execution_cost_max_candidates_per_tf, 7)
+        bounded = PipelineConfig(oos_evidence_trade_path_max_points=128)
+        self.assertEqual(bounded.oos_evidence_trade_path_max_points, 128)
 
 
 if __name__ == "__main__":

@@ -66,7 +66,6 @@ class EnhancementSeamsTests(unittest.TestCase):
     def test_spread_overlay_soft_penalty_is_reachable(self):
         overlay = SpreadAwareExecutionOverlay(
             min_edge_mult=1.5,
-            spike_mult=2.0,
             penalty_start_mult=0.5,
             enabled=True,
         )
@@ -76,7 +75,6 @@ class EnhancementSeamsTests(unittest.TestCase):
                 timeframe="H1",
                 spread_pips=1.0,
                 atr_pips=1.8,
-                rolling_spread_median=0.8,
             )
         )
 
@@ -84,7 +82,7 @@ class EnhancementSeamsTests(unittest.TestCase):
         self.assertLess(decision.score_multiplier, 1.0)
         self.assertTrue(any("Spread penalty" in note for note in decision.notes))
 
-    def test_spread_overlay_blocks_spread_spike(self):
+    def test_spread_overlay_does_not_reintroduce_a_median_gate(self):
         overlay = SpreadAwareExecutionOverlay(enabled=True)
         decision = overlay.evaluate(
             ExecutionQualityContext(
@@ -92,12 +90,21 @@ class EnhancementSeamsTests(unittest.TestCase):
                 timeframe="H1",
                 spread_pips=3.0,
                 atr_pips=10.0,
-                rolling_spread_median=1.0,
             )
         )
 
+        self.assertTrue(decision.allow_trade)
+        self.assertEqual(decision.score_multiplier, 1.0)
+
+    def test_atr_edge_filter_still_blocks_insufficient_edge(self):
+        decision = SpreadAwareExecutionOverlay().evaluate(
+            ExecutionQualityContext(
+                symbol="EURUSD", timeframe="H1", spread_pips=3.0, atr_pips=4.0,
+            )
+        )
         self.assertFalse(decision.allow_trade)
         self.assertEqual(decision.score_multiplier, 0.0)
+        self.assertTrue(any("ATR" in note for note in decision.notes))
 
     def test_spread_overlay_penalty_does_not_saturate_at_high_ratios(self):
         """Findings.html §9: penalty must keep decaying past the old 0.5 floor.
@@ -105,10 +112,9 @@ class EnhancementSeamsTests(unittest.TestCase):
         Old implementation: max(0.5, 1 - delta) → flat at 0.5 once delta > 0.5.
         New implementation: max(0.25, 1 - 0.4*delta) → decays further until 0.25.
         """
-        # Disable min-edge and spike filters so we isolate the soft-penalty path.
+        # Disable the min-edge filter to isolate the sizing penalty.
         overlay = SpreadAwareExecutionOverlay(
             min_edge_mult=0.05,
-            spike_mult=999.0,
             penalty_start_mult=0.5,
             enabled=True,
         )
@@ -116,7 +122,7 @@ class EnhancementSeamsTests(unittest.TestCase):
         moderate = overlay.evaluate(
             ExecutionQualityContext(
                 symbol="EURUSD", timeframe="H1",
-                spread_pips=1.6, atr_pips=2.0, rolling_spread_median=1.0,
+                spread_pips=1.6, atr_pips=2.0,
             )
         )
         # ratio = 1.4 → delta = 0.9 → expected 1 - 0.4*0.9 = 0.64
@@ -124,7 +130,7 @@ class EnhancementSeamsTests(unittest.TestCase):
         severe = overlay.evaluate(
             ExecutionQualityContext(
                 symbol="EURUSD", timeframe="H1",
-                spread_pips=2.8, atr_pips=2.0, rolling_spread_median=1.0,
+                spread_pips=2.8, atr_pips=2.0,
             )
         )
         self.assertTrue(moderate.allow_trade)
@@ -137,7 +143,6 @@ class EnhancementSeamsTests(unittest.TestCase):
     def test_spread_overlay_penalty_floor_at_quarter(self):
         overlay = SpreadAwareExecutionOverlay(
             min_edge_mult=0.1,  # disable min-edge filter
-            spike_mult=999.0,    # disable spike filter
             penalty_start_mult=0.5,
             enabled=True,
         )
@@ -145,7 +150,7 @@ class EnhancementSeamsTests(unittest.TestCase):
         decision = overlay.evaluate(
             ExecutionQualityContext(
                 symbol="EURUSD", timeframe="H1",
-                spread_pips=20.0, atr_pips=2.0, rolling_spread_median=1.0,
+                spread_pips=20.0, atr_pips=2.0,
             )
         )
         self.assertGreaterEqual(decision.score_multiplier, 0.25 - 1e-9)
@@ -154,7 +159,6 @@ class EnhancementSeamsTests(unittest.TestCase):
         config = SimpleNamespace(
             execution_spread_filter_enabled=True,
             execution_spread_min_edge_mult=1.25,
-            execution_spread_spike_mult=5.0,
             execution_spread_penalty_start_mult=0.4,
         )
         seams = create_default_enhancement_seams(config)
@@ -163,7 +167,6 @@ class EnhancementSeamsTests(unittest.TestCase):
         self.assertIsInstance(overlay, SpreadAwareExecutionOverlay)
         self.assertTrue(overlay.enabled)
         self.assertEqual(overlay.min_edge_mult, 1.25)
-        self.assertEqual(overlay.spike_mult, 5.0)
         self.assertEqual(overlay.penalty_start_mult, 0.4)
 
     def test_portfolio_observatory_reports_clusters_without_mutation(self):

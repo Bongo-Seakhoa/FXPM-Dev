@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from pm_demo_readiness import (
     demo_position_config_sha256,
 )
 from pm_position import PositionConfig
+from pm_live_readiness import ReadinessFinding
 
 
 def _bytes(value: Any) -> bytes:
@@ -409,6 +411,114 @@ def test_capsule_snapshots_exact_closure_and_exposes_no_entry_configs(
     assert document["source_snapshots"]["native_activation_manifest"]["sha256"] == (
         case.activation_sha
     )
+
+
+def _block_interval_entries(case: SimpleNamespace) -> None:
+    case.report.ok = False
+    case.report.findings = [ReadinessFinding(
+        "error", "interval_cell_qualification_policy_unadopted",
+        "Synthetic fixture: interval entry qualification remains unadopted.",
+        "evidence",
+    )]
+
+
+def test_entry_policy_block_can_capture_but_cannot_grant_management(tmp_path: Path) -> None:
+    case = _case(tmp_path)
+    _block_interval_entries(case)
+    store = tmp_path / "store"
+    created = _create(store, case)
+    assert created["status"] == management.CAPSULE_WRITTEN
+    assert created["permissions"] == management.NO_MANAGEMENT_PERMISSIONS
+    assert case.report.ok is False
+    assert case.report.management_only is False
+    assert "entry_configs" not in created
+    loaded = management.load_demo_management_capsule(store, created["capsule_id"])
+    assert loaded["status"] == management.CAPSULE_VALID
+    assert loaded["permissions"] == management.NO_MANAGEMENT_PERMISSIONS
+
+
+def test_entry_policy_exception_preserves_the_same_captured_authority(tmp_path: Path) -> None:
+    case = _case(tmp_path)
+    authorized_at = datetime.now(timezone.utc)
+    ordinary_store, blocked_store = tmp_path / "ordinary", tmp_path / "entry-blocked"
+    ordinary = _create(ordinary_store, case, authorized_at=authorized_at)
+    _block_interval_entries(case)
+    blocked = _create(blocked_store, case, authorized_at=authorized_at)
+    captured = []
+    verified = []
+    validation_time = datetime.now(timezone.utc)
+    for store, result in ((ordinary_store, ordinary), (blocked_store, blocked)):
+        assert result["status"] == management.CAPSULE_WRITTEN
+        assert result["permissions"] == management.NO_MANAGEMENT_PERMISSIONS
+        document = json.loads((store / result["capsule_id"] / "capsule.json").read_text(encoding="utf-8"))
+        body = dict(document)
+        assert body.pop("capsule_id") == result["capsule_id"] == _sha(body)
+        # Only capture time and its content-addressed ID may differ.
+        body.pop("created_at_utc")
+        captured.append(body)
+        # Raw authority is deliberately fictional in this fixture, so both
+        # real reverifications must reject it without granting permissions.
+        response = management.reverify_demo_management_capsule(
+            store, result["capsule_id"], account_info=case.account,
+            native_universe=_native(case), validation_time_utc=validation_time,
+        )
+        assert response["status"] == management.BLOCKED
+        assert response["permissions"] == management.NO_MANAGEMENT_PERMISSIONS
+        assert response.pop("capsule_id") == result["capsule_id"]
+        verified.append(response)
+    assert captured[0] == captured[1]
+    assert verified[0] == verified[1]
+    assert case.report.ok is False
+    assert case.report.management_only is False
+
+
+@pytest.mark.parametrize("fault", [
+    "wrong_error", "wrong_scope", "extra_error", "missing_error", "missing_binding",
+    "invalid_binding", "mismatched_binding", "duck_report", "subclass_report", "false_like",
+])
+def test_entry_policy_capture_exception_is_exact(tmp_path: Path, fault: str) -> None:
+    case = _case(tmp_path)
+    _block_interval_entries(case)
+    if fault == "wrong_error":
+        case.report.findings[0].code = "unrelated_policy_unadopted"
+    elif fault == "wrong_scope":
+        case.report.findings[0].scope = "runtime"
+    elif fault == "extra_error":
+        case.report.findings.append(ReadinessFinding("error", "extra", "Synthetic blocker"))
+    elif fault == "missing_error":
+        case.report.findings = []
+    elif fault == "missing_binding":
+        case.report._execution_binding = None
+    elif fault == "invalid_binding":
+        case.report._execution_binding = replace(case.report._execution_binding, schema_version="wrong")
+    elif fault == "mismatched_binding":
+        case.report._execution_binding = replace(case.report._execution_binding, authority_result_sha256="0" * 64)
+    elif fault == "duck_report":
+        case.report = SimpleNamespace(**vars(case.report))
+    elif fault == "subclass_report":
+        class OtherReport(DemoProbationReadinessReport):
+            pass
+        case.report = OtherReport(**vars(case.report))
+    else:
+        case.report.ok = 0
+    store = tmp_path / "store"
+    result = _create(store, case)
+    assert result["status"] == management.BLOCKED
+    assert result["permissions"] == management.NO_MANAGEMENT_PERMISSIONS
+    assert not store.exists()
+
+
+def test_entry_blocked_capsule_still_requires_real_raw_reverification(tmp_path: Path) -> None:
+    case = _case(tmp_path)
+    _block_interval_entries(case)
+    store = tmp_path / "store"
+    created = _create(store, case)
+    assert created["status"] == management.CAPSULE_WRITTEN
+    result = management.reverify_demo_management_capsule(
+        store, created["capsule_id"], account_info=case.account, native_universe=_native(case),
+    )
+    assert result["status"] == management.BLOCKED
+    assert result["permissions"] == management.NO_MANAGEMENT_PERMISSIONS
 
 
 @pytest.mark.parametrize("replacement", [b"x", b""])

@@ -15,7 +15,7 @@ class PipelinePerfSmokeTests(unittest.TestCase):
             {
                 "Open": base - 0.05,
                 "High": base + np.abs(np.random.randn(n) * 0.2),
-                "Low": base - np.abs(np.random.randn(n) * 0.2),
+                "Low": np.minimum(base - 0.05, base) - np.abs(np.random.randn(n) * 0.2),
                 "Close": base,
                 "Volume": np.random.randint(100, 1000, n),
             },

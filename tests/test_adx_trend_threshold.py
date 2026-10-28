@@ -155,52 +155,36 @@ class LoadRegimeParamsAssetClassWiringTests(unittest.TestCase):
 
 
 class ADXNormalizationAnchoredTests(unittest.TestCase):
-    """Both ADX normalization curves must re-scale to `threshold` while
-    staying byte-identical to the legacy curves at the classic 25 anchor."""
+    """ADX score curves are continuous and threshold-relative."""
 
     def setUp(self):
         self.detector = MarketRegimeDetector(RegimeParams())
 
-    def _legacy_norm(self, a):
-        r = np.zeros_like(a, dtype=float)
-        m1 = a < 20
-        r[m1] = a[m1] / 40
-        m2 = (a >= 20) & (a < 40)
-        r[m2] = 0.5 + (a[m2] - 20) / 40
-        m3 = a >= 40
-        r[m3] = np.minimum(1.0, 0.75 + (a[m3] - 40) / 80)
-        return r
-
-    def _legacy_mid(self, a):
-        r = np.zeros_like(a, dtype=float)
-        m1 = a < 15
-        r[m1] = a[m1] / 30
-        m2 = (a >= 15) & (a < 30)
-        r[m2] = 0.5 + (30 - np.abs(a[m2] - 22.5)) / 30
-        m3 = a >= 30
-        r[m3] = np.maximum(0.0, 1.0 - (a[m3] - 30) / 40)
-        return r
-
-    def test_fx_threshold_matches_legacy_curve(self):
-        adx = np.linspace(0, 80, 81)
+    def test_trend_anchors_and_monotonicity(self):
         np.testing.assert_allclose(
-            self.detector._normalize_adx_vectorized(adx, 25.0),
-            self._legacy_norm(adx),
-            rtol=1e-9,
+            self.detector._normalize_adx_vectorized(np.array([0, 20, 40, 80]), 25.0),
+            [0.0, 0.5, 1.0, 1.0],
         )
+        scores = self.detector._normalize_adx_vectorized(np.linspace(0, 100, 1001), 25.0)
+        self.assertTrue((np.diff(scores) >= 0).all())
 
-    def test_fx_threshold_matches_legacy_mid_curve(self):
-        adx = np.linspace(0, 80, 81)
+    def test_chop_anchors_are_bounded_and_continuous(self):
         np.testing.assert_allclose(
-            self.detector._normalize_adx_mid_vectorized(adx, 25.0),
-            self._legacy_mid(adx),
-            rtol=1e-9,
+            self.detector._normalize_adx_mid_vectorized(
+                np.array([0, 15, 22.5, 30, 70]), 25.0,
+            ),
+            [0.0, 0.5, 1.0, 0.5, 0.0],
         )
+        scores = self.detector._normalize_adx_mid_vectorized(np.linspace(0, 100, 1001), 25.0)
+        self.assertTrue(((scores >= 0) & (scores <= 1)).all())
+        for knot in (15.0, 22.5, 30.0, 70.0):
+            pair = self.detector._normalize_adx_mid_vectorized(
+                np.array([knot - 1e-6, knot + 1e-6]), 25.0,
+            )
+            self.assertLess(abs(pair[1] - pair[0]), 1e-6)
 
     def test_crypto_curve_shifts_right(self):
-        # Same ADX=25 that's "moderate" (0.625) on FX (T=25) is only "weak"
-        # (below 0.5) on crypto (T=30) — because crypto's trend floor is
-        # higher. This is the point of E3.
+        # A higher threshold gives the same ADX less trend strength.
         fx = self.detector._normalize_adx_vectorized(np.array([25.0]), 25.0)[0]
         crypto = self.detector._normalize_adx_vectorized(np.array([25.0]), 30.0)[0]
         self.assertLess(crypto, fx)

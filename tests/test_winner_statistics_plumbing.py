@@ -91,7 +91,8 @@ class _EquityBacktester:
                 build_numerical_execution_cost_attestation(
                     use_spread=True,
                     spread_mode="conservative_max",
-                    spread_values_sha256="9" * 64,
+                    entry_half_spread_values_sha256="9" * 64,
+                    intrabar_half_spread_values_sha256="9" * 64,
                     instrument_spec_sha256="b" * 64,
                 )
             ),
@@ -326,6 +327,9 @@ def test_real_optuna_tpe_candidate_reaches_regime_optimizer_daily_mtm():
 
         def get_params(self):
             return dict(self.params)
+
+        def get_param_couplings(self):
+            return ()
 
         def generate_signals(self, frame, _symbol):
             return pd.Series(1, index=frame.index, dtype=int)

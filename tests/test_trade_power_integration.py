@@ -41,7 +41,8 @@ def _authenticated_result(
             build_numerical_execution_cost_attestation(
                 use_spread=True,
                 spread_mode="conservative_max",
-                spread_values_sha256="7" * 64,
+                entry_half_spread_values_sha256="7" * 64,
+                intrabar_half_spread_values_sha256="7" * 64,
                 instrument_spec_sha256="9" * 64,
             )
         ),

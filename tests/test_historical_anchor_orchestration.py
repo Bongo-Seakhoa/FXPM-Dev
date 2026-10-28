@@ -24,6 +24,21 @@ PROCESS_PRECOMMIT = "a" * 64
 PRODUCER_RELEASE = "b" * 64
 
 
+def test_v14_ladder_schema_bindings_match_active_producers() -> None:
+    import pm_historical_production_adapter as adapter
+
+    assert (
+        orchestration._ADAPTER_CAPTURE_CONTRACT
+        == adapter.CAPTURE_CONTRACT_VERSION
+    )
+    assert (
+        orchestration._ADAPTER_CROSS_BINDING_SCHEMA
+        == adapter.HORIZON_WINNER_CROSS_BINDING_SCHEMA
+    )
+    assert orchestration._HORIZON_PLAN_SCHEMA == training_horizon._PLAN_SCHEMA
+    assert orchestration._BOOK_ARTIFACT_TYPE == "historical_book_multiplicity_v14"
+
+
 def _sha(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -155,7 +170,7 @@ def _canary_prerequisites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             }
         )
         cutoff = end + timedelta(days=36)
-    causal_precommit = causal_producer.freeze_causal_process_precommit_v9(
+    causal_precommit = causal_producer.freeze_causal_process_precommit_v10(
         context=context,
         search_process=process,
         process_id="raw-winner-canary-nonauthorizing-process",
@@ -780,7 +795,7 @@ def test_generic_optimizer_payload_cannot_bypass_adapter_graph(tmp_path: Path) -
         )
 
 
-def test_persisted_book_is_replayed_by_exact_v11_semantic_authority() -> None:
+def test_persisted_book_is_replayed_by_exact_v14_semantic_authority() -> None:
     family = (
         evidence
         for symbol in book.PINNED_SYMBOL_ORDER
@@ -1068,3 +1083,255 @@ def test_horizon_commitment_rejects_missing_or_reordered_accounting_slots() -> N
         match="ROSTER_MISMATCH",
     ):
         orchestration.historical_horizon_binding_roster_sha256(reordered)
+
+
+def test_current_sealed_horizon_has_distinct_binding_and_preserves_archive_bytes():
+    requests = [horizon_fixture._request(), horizon_fixture._current_request()]
+    for request in requests:
+        # This synthetic formatter case belongs to the pinned production roster.
+        request["cell"]["symbol"] = "EURUSD"
+        request["native_prefix"]["symbol"] = "EURUSD"
+    old, current = [training_horizon.build_historical_horizon_plan(request)
+                    for request in requests]
+    old_binding = orchestration.historical_horizon_plan_binding(old)
+    current_binding = orchestration.historical_horizon_plan_binding(current)
+    assert old_binding["schema_version"] == "fxpm.historical-horizon-plan-binding.v1"
+    assert (
+        current_binding["schema_version"] == "fxpm.historical-horizon-plan-binding.v2"
+    )
+    assert current_binding["plan_receipt_sha256"] == current.receipt_sha256
+    assert set(current_binding) == set(old_binding) == orchestration._BINDING_FIELDS
+    assert "train_regime_support_receipt_sha256" not in current_binding
+    # A new compact binding does not upgrade the old issued anchor contract.
+    with pytest.raises(
+        orchestration.HistoricalAnchorOrchestrationError,
+        match="HORIZON_BINDING_SCHEMA_INVALID",
+    ):
+        orchestration._normalize_binding(
+            current_binding,
+            expected_cell=tuple(
+                current_binding["cell"][key]
+                for key in ("symbol", "timeframe", "regime")
+            ),
+            anchor={
+                "anchor_id": current_binding["anchor_id"],
+                "selection_cutoff_utc": current_binding["selection_cutoff_utc"],
+            },
+            process_precommit_receipt_sha256=current_binding[
+                "process_precommit_receipt_sha256"
+            ],
+        )
+    expected_old = {
+        "schema_version": orchestration.HORIZON_BINDING_SCHEMA,
+        "ordinal": orchestration._CELL_ORDINAL[
+            tuple(
+                old.to_dict()["cell"][key] for key in ("symbol", "timeframe", "regime")
+            )
+        ],
+        "cell": old.to_dict()["cell"],
+        **{
+            key: old.to_dict()["anchor"][key]
+            for key in (
+                "anchor_id",
+                "selection_cutoff_utc",
+                "process_precommit_receipt_sha256",
+            )
+        },
+        "plan_receipt_sha256": old.receipt_sha256,
+        **{
+            key: old.to_dict()[key]
+            for key in (
+                "source_prefix_receipt_sha256",
+                "candidate_registry_sha256",
+                "trial_registry_sha256",
+                "attempt_roster_sha256",
+                "evidence_roster_sha256",
+                "plan_status",
+            )
+        },
+    }
+    assert _canonical(old_binding) == _canonical(expected_old)
+    assert orchestration._HORIZON_PLAN_SCHEMA == "fxpm.historical-horizon-plan.v2"
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "mixed", "extra"])
+def test_horizon_roster_dispatch_preserves_old_digest_and_refuses_mixing(mutation):
+    roster = [
+        _binding("anchor-01", "2015-01-01T00:00:00Z", ordinal, cell)
+        for ordinal, cell in enumerate(causal.expected_cell_roster())
+    ]
+    assert (
+        orchestration.historical_horizon_binding_roster_sha256(roster)
+        == hashlib.sha256(_canonical(roster)).hexdigest()
+    )
+    current = [
+        {**binding, "schema_version": orchestration.CURRENT_HORIZON_BINDING_SCHEMA}
+        for binding in roster
+    ]
+    assert (
+        orchestration.historical_horizon_binding_roster_sha256(current)
+        == hashlib.sha256(_canonical(current)).hexdigest()
+    )
+    if mutation == "unknown":
+        current[0]["schema_version"] = "fxpm.historical-horizon-plan-binding.v99"
+        code = "HORIZON_BINDING_SCHEMA_INVALID"
+    elif mutation == "mixed":
+        current[1] = roster[1]
+        code = "HORIZON_BINDING_MIXED_GENERATIONS"
+    else:
+        current[0]["unbound_support_complete"] = True
+        code = "HORIZON_BINDING_FIELDS_INVALID"
+    with pytest.raises(orchestration.HistoricalAnchorOrchestrationError, match=code):
+        orchestration.historical_horizon_binding_roster_sha256(current)
+
+
+@pytest.mark.parametrize("schema", [
+    orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA,
+    orchestration.DECLARED_SLOT_REQUEST_SCHEMA,
+])
+def test_declared_transport_decoder_preserves_legacy_edition_without_new_field(schema):
+    # This pure decoder is not an issued-parent or request authentication fixture.
+    body = {"schema_version": schema}
+    before = _canonical(body, ascii_only=True)
+    assert orchestration.declared_slot_transport_edition(body) == orchestration.DECLARED_WINNER_TRANSPORT_V15
+    assert _canonical(body, ascii_only=True) == before
+    assert "winner_transport_edition" not in body
+
+
+@pytest.mark.parametrize("schema", [
+    orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2,
+    orchestration.DECLARED_SLOT_REQUEST_SCHEMA_V2,
+])
+def test_declared_transport_decoder_requires_explicit_v16_edition(schema):
+    body = {"schema_version": schema,
+        "winner_transport_edition": orchestration.DECLARED_WINNER_TRANSPORT_V16}
+    assert orchestration.declared_slot_transport_edition(body) == orchestration.DECLARED_WINNER_TRANSPORT_V16
+
+
+@pytest.mark.parametrize("body", [
+    {"schema_version": orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA,
+        "winner_transport_edition": orchestration.DECLARED_WINNER_TRANSPORT_V15},
+    {"schema_version": orchestration.DECLARED_SLOT_REQUEST_SCHEMA,
+        "winner_transport_edition": orchestration.DECLARED_WINNER_TRANSPORT_V16},
+    {"schema_version": orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2},
+    {"schema_version": orchestration.DECLARED_SLOT_REQUEST_SCHEMA_V2,
+        "winner_transport_edition": orchestration.DECLARED_WINNER_TRANSPORT_V15},
+    {"schema_version": orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2,
+        "winner_transport_edition": "fxpm.winner-transport.v14"},
+    {"schema_version": "fxpm.declared-slot-run-precommit.v14"},
+    {"schema_version": "fxpm.declared-slot-producer-request.v99",
+        "winner_transport_edition": orchestration.DECLARED_WINNER_TRANSPORT_V16},
+    None,
+])
+def test_declared_transport_decoder_refuses_relabelling_and_unknown_editions(body):
+    with pytest.raises(orchestration.HistoricalAnchorOrchestrationError,
+            match="^DECLARED_SLOT_TRANSPORT_EDITION_INVALID$"):
+        orchestration.declared_slot_transport_edition(body)
+
+
+@pytest.mark.parametrize("factory,edition", [
+    ("precommit_declared_slot_owner_run", orchestration.DECLARED_WINNER_TRANSPORT_V15),
+    ("precommit_declared_slot_owner_run_v2", orchestration.DECLARED_WINNER_TRANSPORT_V16),
+])
+def test_declared_public_factories_choose_fixed_edition_without_caller_resource_args(monkeypatch, factory, edition):
+    # Routing-only witness: no stub result is presented as an authenticated grant.
+    received, sentinel = [], object()
+    def record(context, **kwargs):
+        received.append((context, kwargs))
+        return sentinel
+    monkeypatch.setattr(orchestration, "_precommit_declared_slot_owner_run", record)
+    context = object()
+    kwargs = dict(run_id="synthetic-declared-routing", process=object(), slot_roster={},
+        cell_roster=[], frozen_pipeline_config=object(), spread_profile_identity={},
+        source_access_window_utc={}, launch_activation_utc="2024-01-01T00:00:00Z")
+    assert getattr(orchestration, factory)(context, **kwargs) is sentinel
+    assert received == [(context, {**kwargs, "transport_edition": edition})]
+    with pytest.raises(TypeError):
+        getattr(orchestration, factory)(context, **kwargs, transport_edition=edition)
+    assert len(received) == 1
+
+
+def test_declared_precommit_validator_refuses_request_role_on_genuine_metadata(tmp_path, monkeypatch):
+    from tests.test_declared_slot_owner_surface import _declared_environment
+
+    env = _declared_environment(tmp_path, monkeypatch)
+    v2 = orchestration.precommit_declared_slot_owner_run_v2(env.context, **env.arguments)
+    for parent in (env.precommit, v2):
+        body = orchestration.verify_declared_slot_owner_run_precommit(
+            env.context, parent, process=env.process)
+        assert orchestration._validate_declared_precommit_body(env.context, body) is None
+    malformed = env.precommit.to_dict()
+    malformed["schema_version"] = orchestration.DECLARED_SLOT_REQUEST_SCHEMA
+    with pytest.raises(orchestration.HistoricalAnchorOrchestrationError,
+            match="^DECLARED_SLOT_PRECOMMIT_INVALID$"):
+        orchestration._validate_declared_precommit_body(env.context, malformed)
+
+
+def test_declared_precommit_cold_reopen_refuses_request_role_on_genuine_metadata(tmp_path, monkeypatch):
+    from tests.test_declared_slot_owner_surface import _declared_environment
+    import pm_spread_profile as spread_profile
+
+    env = _declared_environment(tmp_path, monkeypatch)
+    malformed = env.precommit.to_dict()
+    malformed["schema_version"] = orchestration.DECLARED_SLOT_REQUEST_SCHEMA
+    digest = hashlib.sha256(orchestration._declared_json(malformed)).hexdigest()
+    # Coherent saved-byte mutation of genuine metadata, not an issued request.
+    spool._publish_exact_json(env.context,
+        f"declared-slots/{digest}/precommit.json", malformed,
+        orchestration._MAX_PRECOMMIT_BYTES)
+    def forbidden_profile_read(*args, **kwargs):
+        raise AssertionError("Invalid precommit role reached profile access")
+    monkeypatch.setattr(spread_profile, "load_spread_profile", forbidden_profile_read)
+    with pytest.raises(orchestration.HistoricalAnchorOrchestrationError,
+            match="^DECLARED_SLOT_PRECOMMIT_INVALID$"):
+        orchestration.reopen_declared_slot_owner_run_precommit(env.context,
+            receipt_sha256=digest, process=env.process,
+            frozen_pipeline_config=env.frozen)
+
+
+def test_declared_v2_precommit_public_cold_reopen_binds_saved_profile_and_source(tmp_path, monkeypatch):
+    """Real metadata custody; invented unavailable profile, no engine/OWNER proof."""
+    from tests.test_declared_slot_owner_surface import _declared_environment
+    import pm_spread_profile as spread_profile
+
+    env = _declared_environment(tmp_path, monkeypatch, issue=False)
+    profile_body = {
+        "schema_version": spread_profile.PROFILE_SCHEMA,
+        "status": "COMPLETE_CALIBRATION_WITH_EXPLICIT_UNAVAILABLE_GROUPS",
+        "calculation_policy": "ONE_TIME_OFFLINE_NO_RUNTIME_RECALCULATION",
+        "source_convention": "FINEST_ACTIVATED_CANDIDATE_FIXED_PER_SYMBOL_EXACT_PRIOR_CLOSE_AT_TARGET_OPEN",
+        "production_authority": False,
+        "fixture_provenance": "SYNTHETIC_METADATA_ONLY_NO_OBSERVATIONS_OR_EMPIRICAL_CALIBRATION",
+        "activation": {"id": "synthetic-declared-cold-v2", "manifest_sha256": "1" * 64},
+        "protected_cutoff_utc": "2024-07-14T08:05:00Z",
+        "cells": [{"symbol": "AUDUSD", "timeframe": "H1",
+            "status": "NO_VALID_SPREAD_OBSERVATIONS", "tiers": {}}],
+    }
+    profile_path = (Path(env.frozen.materialize(env.context).data_dir)
+        / "native" / "terms" / "spread_profile.json")
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_bytes = _canonical(profile_body)
+    profile_path.write_bytes(profile_bytes)
+    profile = spread_profile.load_spread_profile(profile_path)
+    assert profile.sha256 == hashlib.sha256(profile_bytes).hexdigest()
+    precommit = orchestration.precommit_declared_slot_owner_run_v2(env.context,
+        **{**env.arguments, "spread_profile_identity": {"profile_sha256": profile.sha256}})
+    saved_path = env.context.root / f"declared-slots/{precommit.receipt_sha256}/precommit.json"
+    saved = saved_path.read_bytes()
+    restored = orchestration.reopen_declared_slot_owner_run_precommit(env.context,
+        receipt_sha256=precommit.receipt_sha256, process=env.process,
+        frozen_pipeline_config=env.frozen)
+    assert restored is not precommit
+    assert restored.receipt_sha256 == precommit.receipt_sha256
+    assert restored._body_json == precommit._body_json == saved
+    body = orchestration.verify_declared_slot_owner_run_precommit(
+        env.context, restored, process=env.process)
+    assert body == precommit.to_dict()
+    assert body["schema_version"] == orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2
+    assert body["winner_transport_edition"] == orchestration.DECLARED_WINNER_TRANSPORT_V16
+    assert body["source_identity"] == orchestration._declared_source_identity()
+    assert body["spread_profile_identity"] == {"profile_sha256": profile.sha256}
+    for grant in ("qualification_authority", "capital_authority", "live_authority", "order_authority"):
+        assert body[grant] is False
+    assert saved_path.read_bytes() == saved
+    assert profile_path.read_bytes() == profile_bytes

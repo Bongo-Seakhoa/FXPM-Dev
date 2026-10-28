@@ -18,6 +18,7 @@ import unittest
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
@@ -36,8 +37,8 @@ class MockAccountInfo:
     profit: float = 0.0
     leverage: int = 500
     currency: str = "USD"
-    login: int = 0
-    server: str = ""
+    login: int = 123
+    server: str = "Broker-Test"
     company: str = ""
     trade_allowed: bool = True
     trade_expert: bool = True
@@ -80,6 +81,9 @@ def _make_trader(margin_level=0.0, positions=None, close_success=True, **cfg_ove
     acct = MockAccountInfo(margin_level=margin_level)
 
     mt5 = Mock()
+    mt5.config = SimpleNamespace(
+        expected_login=123, expected_server="Broker-Test", expected_currency="USD"
+    )
     mt5.is_connected.return_value = False  # skip spec sync in __init__
     mt5.get_account_info.return_value = acct
     mt5.get_positions.return_value = positions or []
@@ -141,6 +145,9 @@ def _make_persistent_trader(
     from pm_position import PositionConfig
 
     mt5 = Mock()
+    mt5.config = SimpleNamespace(
+        expected_login=123, expected_server="Broker-Test", expected_currency="USD"
+    )
     mt5.is_connected.return_value = False
     mt5.get_account_info.return_value = MockAccountInfo(
         margin_level=margin_level,
@@ -323,8 +330,9 @@ class TestRecoveryMode(unittest.TestCase):
         trader = _make_trader(margin_level=75.0, positions=positions)
         # After close, margin stays low so it won't early-stop.
         trader.mt5.get_account_info.side_effect = [
-            MockAccountInfo(margin_level=75.0),  # initial call
-            MockAccountInfo(margin_level=78.0),  # re-check after close
+            MockAccountInfo(margin_level=75.0),
+            MockAccountInfo(margin_level=75.0),
+            MockAccountInfo(margin_level=78.0),
         ]
         trader._run_margin_protection_cycle()
 
@@ -357,10 +365,13 @@ class TestPanicMode(unittest.TestCase):
         # All re-checks remain in PANIC.
         trader = _make_trader(margin_level=50.0, positions=positions)
         trader.mt5.get_account_info.side_effect = [
-            MockAccountInfo(margin_level=50.0),   # initial
-            MockAccountInfo(margin_level=52.0),   # after 1st close
-            MockAccountInfo(margin_level=55.0),   # after 2nd close
-            MockAccountInfo(margin_level=58.0),   # after 3rd close
+            MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=52.0),
+            MockAccountInfo(margin_level=52.0),
+            MockAccountInfo(margin_level=55.0),
+            MockAccountInfo(margin_level=55.0),
+            MockAccountInfo(margin_level=58.0),
         ]
         trader._run_margin_protection_cycle()
 
@@ -379,7 +390,10 @@ class TestPanicMode(unittest.TestCase):
         trader = _make_trader(margin_level=50.0, positions=positions)
         trader.mt5.get_account_info.side_effect = [
             MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=50.0),
             MockAccountInfo(margin_level=55.0),
+            MockAccountInfo(margin_level=55.0),
+            MockAccountInfo(margin_level=60.0),
             MockAccountInfo(margin_level=60.0),
             MockAccountInfo(margin_level=70.0),
         ]
@@ -398,8 +412,9 @@ class TestPanicMode(unittest.TestCase):
         ]
         trader = _make_trader(margin_level=50.0, positions=positions)
         trader.mt5.get_account_info.side_effect = [
-            MockAccountInfo(margin_level=50.0),    # initial
-            MockAccountInfo(margin_level=120.0),   # after 1st close -> recovered!
+            MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=120.0),
         ]
         trader._run_margin_protection_cycle()
 
@@ -423,8 +438,10 @@ class TestCloseFailureHandling(unittest.TestCase):
         ]
         trader.mt5.get_account_info.side_effect = [
             MockAccountInfo(margin_level=50.0),
-            MockAccountInfo(margin_level=50.0),  # still low after failed close
-            MockAccountInfo(margin_level=55.0),  # after successful close
+            MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=50.0),
+            MockAccountInfo(margin_level=55.0),
         ]
         trader._run_margin_protection_cycle()
 
@@ -663,7 +680,15 @@ class TestDurableMarginProtectionState(unittest.TestCase):
                 raise OSError("post-close state write interrupted")
 
             close_started = datetime.now(timezone.utc)
-            with patch("pm_main.os.replace", side_effect=fail_post_close_replace):
+            cycle_clock = tuple(
+                close_started + timedelta(microseconds=offset)
+                for offset in range(4)
+            )
+            with patch.object(
+                trader,
+                "_margin_utc_now",
+                side_effect=cycle_clock,
+            ), patch("pm_main.os.replace", side_effect=fail_post_close_replace):
                 changed = trader._run_margin_protection_cycle(
                     account_info=MockAccountInfo(margin_level=50.0),
                     positions_snapshot=positions,
@@ -687,6 +712,51 @@ class TestDurableMarginProtectionState(unittest.TestCase):
                 restarted._margin_cooldown_remaining_minutes(),
                 14.0,
             )
+
+    def test_identical_forced_close_timestamp_skips_redundant_second_write(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            positions = [
+                MockPosition(
+                    ticket=1,
+                    symbol="EURUSD",
+                    profit=-100.0,
+                    volume=0.10,
+                )
+            ]
+            trader = _make_persistent_trader(
+                root,
+                margin_level=50.0,
+                positions=positions,
+            )
+            identical_at = datetime.now(timezone.utc)
+            trader._margin_reopen_required = True
+            trader._last_margin_close_ts = identical_at - timedelta(hours=1)
+            self.assertTrue(trader._persist_margin_protection_state())
+
+            with patch.object(
+                trader,
+                "_margin_utc_now",
+                return_value=identical_at,
+            ), patch.object(
+                trader,
+                "_persist_margin_protection_state",
+                wraps=trader._persist_margin_protection_state,
+            ) as persist_mock:
+                changed = trader._run_margin_protection_cycle(
+                    account_info=MockAccountInfo(margin_level=50.0),
+                    positions_snapshot=positions,
+                )
+
+            self.assertTrue(changed)
+            trader.mt5.close_position.assert_called_once_with(positions[0])
+            self.assertEqual(persist_mock.call_count, 1)
+            self.assertEqual(trader._last_margin_close_ts, identical_at)
+            self.assertIsNone(trader._margin_state_persistence_block_reason())
+
+            restarted = _make_persistent_trader(root)
+            self.assertEqual(restarted._last_margin_close_ts, identical_at)
+            self.assertTrue(restarted._is_margin_reopen_required())
 
     def test_successful_forced_close_is_durable_across_restart(self):
         with TemporaryDirectory() as temp_dir:
@@ -828,6 +898,114 @@ class TestDurableMarginProtectionState(unittest.TestCase):
             self.assertIsNotNone(reason)
             self.assertIn("state save failed", reason)
             self.assertTrue(trader._is_margin_reopen_required())
+
+
+class TestMarginAccountIdentity(unittest.TestCase):
+    """Synthetic identity transitions cover direct and multi-close cycles."""
+
+    def _positions(self):
+        # Account-wide protection intentionally includes manual/other-EA positions.
+        return [MockPosition(ticket=1, symbol="EURUSD", profit=-100, magic=0),
+                MockPosition(ticket=2, symbol="GBPUSD", profit=-50, magic=987654)]
+
+    def test_direct_cycle_rejects_wrong_missing_malformed_or_failed_account(self):
+        cases = [None, MockAccountInfo(login=124, margin_level=50),
+                 MockAccountInfo(login="bad", margin_level=50),
+                 MockAccountInfo(server="Other", margin_level=50),
+                 MockAccountInfo(currency="EUR", margin_level=50),
+                 RuntimeError("synthetic account read failed")]
+        for value in cases:
+            with self.subTest(value=value):
+                trader = _make_trader(margin_level=50, positions=self._positions())
+                if isinstance(value, Exception):
+                    trader.mt5.get_account_info.side_effect = value
+                else:
+                    trader.mt5.get_account_info.return_value = value
+                self.assertFalse(trader._run_margin_protection_cycle())
+                trader.mt5.get_account_info.assert_called_once()
+                self.assertEqual(trader._margin_state, "BLOCKED")
+                trader.mt5.close_position.assert_not_called()
+                self.assertIsNone(trader._last_margin_close_ts)
+
+    def test_normal_cycle_reuses_supplied_snapshot_without_extra_poll(self):
+        for supplied in (False, True):
+            with self.subTest(supplied=supplied):
+                trader = _make_trader(margin_level=500)
+                account = MockAccountInfo(margin_level=500) if supplied else None
+                self.assertFalse(trader._run_margin_protection_cycle(
+                    account_info=account, positions_snapshot=[]
+                ))
+                self.assertEqual(trader.mt5.get_account_info.call_count, 0 if supplied else 1)
+                self.assertEqual(trader._margin_state, "NORMAL")
+                trader.mt5.close_position.assert_not_called()
+
+    def test_direct_passed_snapshot_requires_pins_and_matching_identity(self):
+        for pins, account in [
+            (None, MockAccountInfo(margin_level=50)),
+            (SimpleNamespace(expected_login=123, expected_server="", expected_currency="USD"),
+             MockAccountInfo(margin_level=50)),
+            (SimpleNamespace(expected_login=123, expected_server="Broker-Test", expected_currency="USD"),
+             MockAccountInfo(login=124, margin_level=50)),
+        ]:
+            with self.subTest(pins=pins, account=account):
+                trader = _make_trader(margin_level=50, positions=self._positions())
+                trader.mt5.config = pins
+                self.assertFalse(trader._run_margin_protection_cycle(account_info=account))
+                trader.mt5.get_account_info.assert_not_called()
+                trader.mt5.close_position.assert_not_called()
+
+    def test_preclose_denial_precedes_durable_forced_close_timestamp(self):
+        for value in (None, MockAccountInfo(login=124, margin_level=50),
+                      RuntimeError("synthetic confirmation failed")):
+            with self.subTest(value=value):
+                trader = _make_trader(margin_level=50, positions=self._positions())
+                trader.mt5.get_account_info.side_effect = [MockAccountInfo(margin_level=50), value]
+                with patch.object(trader, "_arm_margin_reopen_required",
+                                  wraps=trader._arm_margin_reopen_required) as arm:
+                    self.assertFalse(trader._run_margin_protection_cycle())
+                self.assertEqual(trader.mt5.get_account_info.call_count, 2)
+                trader.mt5.close_position.assert_not_called()
+                self.assertIsNone(trader._last_margin_close_ts)
+                self.assertFalse(any(c.kwargs.get("last_forced_close") for c in arm.call_args_list))
+
+    def test_account_switch_between_closes_blocks_next_close(self):
+        trader = _make_trader(margin_level=50, positions=self._positions())
+        trader.mt5.get_account_info.side_effect = [
+            MockAccountInfo(margin_level=50),  # sweep
+            MockAccountInfo(margin_level=50),  # first pre-close
+            MockAccountInfo(margin_level=50),  # first post-close
+            MockAccountInfo(login=124, margin_level=50),  # second pre-close
+        ]
+        self.assertTrue(trader._run_margin_protection_cycle())
+        self.assertEqual(trader.mt5.get_account_info.call_count, 4)
+        trader.mt5.close_position.assert_called_once()
+        self.assertEqual(trader.mt5.close_position.call_args.args[0].ticket, 1)
+        self.assertEqual(trader._margin_state, "BLOCKED")
+
+    def test_postclose_identity_switch_is_not_used_for_recovery(self):
+        trader = _make_trader(margin_level=50, positions=self._positions())
+        trader.mt5.get_account_info.side_effect = [
+            MockAccountInfo(margin_level=50), MockAccountInfo(margin_level=50),
+            MockAccountInfo(login=124, margin_level=500),
+        ]
+        self.assertTrue(trader._run_margin_protection_cycle())
+        self.assertEqual(trader.mt5.get_account_info.call_count, 3)
+        trader.mt5.close_position.assert_called_once()
+        self.assertEqual(trader._margin_state, "BLOCKED")
+        self.assertTrue(trader._is_margin_reopen_required())
+
+    def test_authorised_low_zero_negative_equity_still_allows_account_wide_protection(self):
+        for equity in (1.0, 0.0, -100.0):
+            with self.subTest(equity=equity):
+                positions = self._positions()
+                trader = _make_trader(margin_level=50, positions=positions)
+                trader.mt5.get_account_info.return_value = MockAccountInfo(
+                    equity=equity, margin_level=50, trade_allowed=False, trade_expert=False
+                )
+                self.assertTrue(trader._run_margin_protection_cycle())
+                self.assertEqual([c.args[0] for c in trader.mt5.close_position.call_args_list], positions)
+                self.assertEqual(trader.mt5.get_account_info.call_count, 5)
+                self.assertIsNotNone(trader._last_margin_close_ts)
 
 
 if __name__ == '__main__':

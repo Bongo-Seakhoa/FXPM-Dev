@@ -1,5 +1,8 @@
-"""Pareto multi-axis ("spider-web") winner selection -- the anti-arbitrary replacement
-for the hardcoded weighted scorer.
+"""Historical research-only Pareto selector.
+
+This utility reproduces pre-Winner-v14 candidate-selection experiments. It is
+not called by the canonical Winner -> Book -> current-refit -> live-readiness
+authority chain and cannot promote or authorize a production candidate.
 
 Mandate (Bongo): stop letting hardcoded constants define "success". The winner per
 regime/symbol/timeframe must be the candidate most likely to MAKE MONEY out-of-sample,
@@ -8,7 +11,8 @@ magic absolute thresholds.
 
 Pipeline per cell (symbol x timeframe x regime):
   1. HARD GATES (survival, pass/fail -- kept hard): min trades, max-DD ceiling.
-     (holdout / PBO / stress remain hard gates in promotion_review and compose ON TOP.)
+     Production holdout, PBO, and cost evidence are independently enforced by
+     the current versioned Winner and Book authority chain.
   2. AXES, all measured out-of-sample under honest cost, all oriented higher=better:
        a. oos_profit       = total_return_pct
        b. oos_pf           = profit_factor (clamped)
@@ -29,9 +33,9 @@ exposure, correlation, crowding, and account survival controls are downstream
 diagnostics/governors, not primary per-cell scoring axes.
 
 The CORE (pareto_mask / percentile_normalize / topsis) is schema-independent and
-unit-tested with synthetic data (see test_pareto_core). Read-only; selects nothing in
-the engine -- this is the candidate selection logic we will VALIDATE against the current
-scorer (tools/selection_validation.py) before any integration.
+unit-tested with synthetic data (see test_pareto_core). It selects nothing in
+the production engine; `tools/selection_validation.py` remains a historical
+comparison utility, not an integration or promotion path.
 
 Run:  python tools/pareto_select.py --symbols EURUSD [--min-trades 20 --dd-ceiling 35]
 """

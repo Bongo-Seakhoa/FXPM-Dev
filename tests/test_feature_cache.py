@@ -221,11 +221,12 @@ class FeatureCacheTests(unittest.TestCase):
             FeatureComputer.get_cache_stats(reset=True)
 
             changed = df.copy()
-            changed.iloc[len(changed) // 3, changed.columns.get_loc("Close")] = 99.0
+            expected_close = float(changed.iloc[len(changed) // 3]["Close"]) + 0.05
+            changed.iloc[len(changed) // 3, changed.columns.get_loc("Close")] = expected_close
             result = FeatureComputer.compute_all(changed, symbol="TEST", timeframe="H1", regime_params_file="")
             stats = FeatureComputer.get_cache_stats()
 
-            self.assertEqual(float(result.iloc[len(changed) // 3]["Close"]), 99.0)
+            self.assertEqual(float(result.iloc[len(changed) // 3]["Close"]), expected_close)
             self.assertEqual(stats["disk_hits"], 0)
             self.assertEqual(stats["disk_misses"], 1)
             self.assertEqual(stats["disk_writes"], 1)

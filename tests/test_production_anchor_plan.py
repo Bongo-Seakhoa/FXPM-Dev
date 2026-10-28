@@ -696,3 +696,378 @@ def test_receipt_hash_and_geometry_cannot_be_resealed_after_mutation(
         match="ANCHOR_PLAN_GEOMETRY_DERIVATION_MISMATCH",
     ):
         anchor_plan.verify_production_anchor_plan_receipt(data_dir, resealed)
+
+
+def _declared_owner_roster_inputs() -> dict[str, Any]:
+    """Synthetic identity references for pure declared-geometry unit coverage."""
+    return {
+        "launch_activation_utc": "2023-06-25T00:01:00Z",
+        "frozen_refit_clock": {
+            "anchor_activation_utc": "2026-03-29T00:01:00Z",
+            "interval_calendar_days": 28,
+        },
+        "config_identity_refs": {
+            "config_sha256": "a" * 64,
+            "effective_config_sha256": "b" * 64,
+        },
+        "extend_frozen_clock_backward": True,
+        "protected_end_exclusive_utc": "2024-07-14T08:05:00Z",
+    }
+
+
+def test_declared_owner_slot_roster_extends_frozen_clock_into_protected_past():
+    arguments = _declared_owner_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster(**arguments)
+    verified = anchor_plan.verify_declared_owner_slot_roster(roster, **arguments)
+    assert verified == roster and verified is not roster
+    assert roster["schema_version"] == "fxpm.declared-owner-slot-roster.v1"
+    assert roster["start_utc"] == "2023-06-25T00:01:00Z"
+    assert roster["end_exclusive_utc"] == "2024-06-23T00:01:00Z"
+    assert roster["protected_end_exclusive_utc"] == "2024-07-14T08:05:00Z"
+    assert (roster["slot_count"], roster["slot_calendar_days"], roster["total_calendar_days"]) == (13, 28, 364)
+    assert roster["frozen_refit_clock"] == arguments["frozen_refit_clock"]
+    assert roster["config_identity_refs"] == arguments["config_identity_refs"]
+    assert roster["clock_extended_backward"] is True
+    assert roster["clock_extension_scope"] == "EXPLICIT_DECLARED_GEOMETRY_NOT_LIVE_CLOCK_REANCHORING"
+    assert roster["handover_latency_seconds"] == 0
+    assert roster["handover_scope"] == "NOMINAL_PLAN_ONLY_NOT_COMPUTED_OWNER_AVAILABILITY_OR_BACKDATED_PERMISSION"
+    assert roster["native_cutoff_scope"] == "DECLARED_CLOSED_SOURCE_UPPER_BOUND_NOT_VERIFIED_AVAILABILITY"
+    assert roster["state_carry_scope"] == "NO_CASH_INVENTORY_OR_OWNER_POSITION_RESET_DECLARED_BY_ROSTER"
+    assert all(roster[name] is False for name in (
+        "qualification_authority", "capital_authority", "live_authority",
+        "order_authority", "profitability_claimed", anchor_plan._AUTHORITY_FLAG,
+    ))
+    slots = roster["slots"]
+    assert len(slots) == len({slot["slot_id"] for slot in slots}) == 13
+    for ordinal, slot in enumerate(slots, 1):
+        activation = datetime.fromisoformat(slot["activation_utc"])
+        end = datetime.fromisoformat(slot["end_exclusive_utc"])
+        cutoff = datetime.fromisoformat(slot["native_cutoff_utc"])
+        assert slot["ordinal"] == ordinal
+        assert end - activation == timedelta(days=28)
+        assert activation - cutoff == timedelta(minutes=1)
+        assert (cutoff.hour, cutoff.minute, cutoff.second) == (0, 0, 0)
+        assert activation < datetime(2026, 3, 29, 0, 1, tzinfo=UTC)
+        assert slot["owner_status"] == "UNMATERIALIZED" and slot["owner"] is None
+        if ordinal > 1:
+            assert slots[ordinal - 2]["end_exclusive_utc"] == slot["activation_utc"]
+    assert slots[0]["native_cutoff_utc"] == "2023-06-25T00:00:00Z"
+    assert slots[-1]["end_exclusive_utc"] == roster["end_exclusive_utc"]
+    arguments["frozen_refit_clock"]["interval_calendar_days"] = 1
+    arguments["config_identity_refs"]["config_sha256"] = "c" * 64
+    assert roster["frozen_refit_clock"]["interval_calendar_days"] == 28
+    assert roster["config_identity_refs"]["config_sha256"] == "a" * 64
+
+
+def test_declared_owner_slot_roster_refuses_next_launch_past_protected_end():
+    arguments = _declared_owner_roster_inputs()
+    arguments["launch_activation_utc"] = "2023-07-23T00:01:00Z"
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError,
+                       match="DECLARED_SLOT_PROTECTED_END_EXCEEDED"):
+        anchor_plan.derive_declared_owner_slot_roster(**arguments)
+
+
+@pytest.mark.parametrize("launch,code", [
+    ("2023-06-25T00:02:00Z", "DECLARED_SLOT_LAUNCH_OFF_CLOCK"),
+    ("2023-06-26T00:01:00Z", "DECLARED_SLOT_LAUNCH_OFF_CLOCK"),
+    ("2023-06-25T00:01:00.000001Z", "DECLARED_SLOT_LAUNCH_OFF_CLOCK"),
+    ("2023-06-25T00:01:00", "DECLARED_SLOT_LAUNCH_INVALID"),
+    ("2023-06-25T00:01:00+00:00", "DECLARED_SLOT_LAUNCH_INVALID"),
+    ("2023-06-25T00:01Z", "DECLARED_SLOT_LAUNCH_INVALID"),
+    (datetime(2023, 6, 25, 0, 1, tzinfo=UTC), "DECLARED_SLOT_LAUNCH_INVALID"),
+])
+def test_declared_owner_slot_roster_refuses_noncanonical_or_off_clock_launch(launch, code):
+    arguments = _declared_owner_roster_inputs()
+    arguments["launch_activation_utc"] = launch
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError, match=code):
+        anchor_plan.derive_declared_owner_slot_roster(**arguments)
+
+
+def test_declared_owner_slot_roster_requires_explicit_backward_extension():
+    arguments = _declared_owner_roster_inputs()
+    arguments["extend_frozen_clock_backward"] = False
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError,
+                       match="DECLARED_SLOT_CLOCK_EXTENSION_MISMATCH"):
+        anchor_plan.derive_declared_owner_slot_roster(**arguments)
+
+
+def test_declared_owner_slot_roster_requires_explicit_protected_end():
+    arguments = _declared_owner_roster_inputs()
+    del arguments["protected_end_exclusive_utc"]
+    with pytest.raises(TypeError, match="protected_end_exclusive_utc"):
+        anchor_plan.derive_declared_owner_slot_roster(**arguments)
+
+
+@pytest.mark.parametrize("mutation", ["anchor", "interval", "boolean_interval", "config_hash"])
+def test_declared_owner_slot_roster_refuses_changed_clock_or_invalid_identity(mutation):
+    arguments = _declared_owner_roster_inputs()
+    if mutation == "anchor":
+        arguments["frozen_refit_clock"]["anchor_activation_utc"] = "2026-03-30T00:01:00Z"
+    elif mutation == "interval":
+        arguments["frozen_refit_clock"]["interval_calendar_days"] = 27
+    elif mutation == "boolean_interval":
+        arguments["frozen_refit_clock"]["interval_calendar_days"] = True
+    else:
+        arguments["config_identity_refs"]["config_sha256"] = "not-an-observed-identity"
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError,
+                       match="DECLARED_SLOT_(REFIT_CLOCK|CONFIG_IDENTITY)_INVALID"):
+        anchor_plan.derive_declared_owner_slot_roster(**arguments)
+
+
+@pytest.mark.parametrize("mutation", [
+    "gap", "overlap", "duplicate_id", "cutoff", "owner", "authority",
+    "boolean_alias", "missing_slot", "extra_field", "config_binding",
+])
+def test_declared_owner_slot_roster_verifier_refuses_changed_geometry_or_claims(mutation):
+    arguments = _declared_owner_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster(**arguments)
+    changed = deepcopy(roster)
+    if mutation in {"gap", "overlap"}:
+        changed["slots"][1]["activation_utc"] = (
+            "2023-07-24T00:01:00Z" if mutation == "gap" else "2023-07-22T00:01:00Z")
+    elif mutation == "duplicate_id":
+        changed["slots"][1]["slot_id"] = changed["slots"][0]["slot_id"]
+    elif mutation == "cutoff":
+        changed["slots"][0]["native_cutoff_utc"] = "2023-06-25T00:02:00Z"
+    elif mutation == "owner":
+        changed["slots"][0]["owner"] = {"provenance": "SYNTHETIC_TAMPER_NOT_OWNER_EVIDENCE"}
+    elif mutation == "authority":
+        changed["live_authority"] = True
+    elif mutation == "boolean_alias":
+        changed["live_authority"] = 0
+    elif mutation == "missing_slot":
+        changed["slots"].pop()
+    elif mutation == "extra_field":
+        changed["invented_launch_grid"] = []
+    else:
+        changed["config_identity_refs"]["effective_config_sha256"] = "c" * 64
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError,
+                       match="DECLARED_SLOT_ROSTER_MISMATCH"):
+        anchor_plan.verify_declared_owner_slot_roster(changed, **arguments)
+
+
+def test_declared_owner_slot_roster_verifier_binds_external_launch():
+    arguments = _declared_owner_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster(**arguments)
+    arguments["launch_activation_utc"] = "2023-05-28T00:01:00Z"
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError,
+                       match="DECLARED_SLOT_ROSTER_MISMATCH"):
+        anchor_plan.verify_declared_owner_slot_roster(roster, **arguments)
+
+
+def test_declared_owner_slot_roster_does_not_resolve_native_or_existing_plans(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("declared geometry reached native authority or an existing plan deriver")
+
+    for name in ("resolve_active_native_universe", "_derive_anchor_plan",
+                 "_derive_current_selection_window", "derive_production_anchor_plan"):
+        monkeypatch.setattr(anchor_plan, name, forbidden)
+    arguments = _declared_owner_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster(**arguments)
+    assert anchor_plan.verify_declared_owner_slot_roster(roster, **arguments) == roster
+
+
+def _bar_aligned_roster_inputs():
+    arguments = _declared_owner_roster_inputs()
+    arguments["launch_activation_utc"] = "2023-06-24T00:00:00Z"
+    return arguments
+
+
+def test_declared_roster_v1_canonical_bytes_and_public_keys_remain_unchanged():
+    roster = anchor_plan.derive_declared_owner_slot_roster(**_declared_owner_roster_inputs())
+    assert hashlib.sha256(anchor_plan._canonical_bytes(roster)).hexdigest() == (
+        "cdc242b853dce80676b6e5b5e50bf697abb0bc3d63230370b425bf5c5e88a6ed"
+    )
+    assert set(roster) == {
+        "schema_version", "scope", "frozen_refit_clock", "config_identity_refs",
+        "clock_extended_backward", "clock_extension_scope", "protected_end_exclusive_utc",
+        "start_utc", "end_exclusive_utc", "slot_count", "slot_calendar_days",
+        "total_calendar_days", "handover_latency_seconds", "handover_scope",
+        "native_cutoff_scope", "state_carry_scope", "slots", "qualification_authority",
+        "capital_authority", "live_authority", "order_authority", "profitability_claimed",
+        anchor_plan._AUTHORITY_FLAG,
+    }
+    assert roster["scope"] == "DECLARED_UNMATERIALIZED_OWNER_GEOMETRY_ONLY"
+
+
+def test_bar_aligned_roster_declares_prior_day_cutoff_and_one_continuous_h364():
+    arguments = _bar_aligned_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+    assert anchor_plan.verify_declared_owner_slot_roster(roster, **arguments) == roster
+    assert roster["schema_version"] == anchor_plan.DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA
+    assert roster["frozen_refit_clock"] == arguments["frozen_refit_clock"]
+    assert roster["nominal_activation_phase_utc"] == "2026-03-28T00:00:00Z"
+    assert roster["nominal_handover_seconds"] == 86400
+    assert "handover_latency_seconds" not in roster
+    assert roster["start_utc"] == "2023-06-24T00:00:00Z"
+    assert roster["end_exclusive_utc"] == "2024-06-22T00:00:00Z"
+    assert (roster["slot_count"], roster["slot_calendar_days"], roster["total_calendar_days"]) == (13, 28, 364)
+    for name in ("qualification_authority", "capital_authority", "live_authority",
+                 "order_authority", "profitability_claimed", anchor_plan._AUTHORITY_FLAG):
+        assert roster[name] is False
+    for ordinal, slot in enumerate(roster["slots"], 1):
+        start = datetime.fromisoformat(slot["activation_utc"])
+        end = datetime.fromisoformat(slot["end_exclusive_utc"])
+        cutoff = datetime.fromisoformat(slot["native_cutoff_utc"])
+        assert start.weekday() == 5 and (start.hour, start.minute, start.second) == (0, 0, 0)
+        assert start - cutoff == timedelta(days=1)
+        assert end - start == timedelta(days=28)
+        assert slot == {
+            "slot_id": f"owner-slot-{ordinal:02d}-{start:%Y%m%dT%H%M%SZ}",
+            "ordinal": ordinal, "activation_utc": slot["activation_utc"],
+            "end_exclusive_utc": slot["end_exclusive_utc"],
+            "native_cutoff_utc": slot["native_cutoff_utc"],
+            "owner_status": "UNMATERIALIZED", "owner": None,
+        }
+        if ordinal > 1:
+            assert roster["slots"][ordinal - 2]["end_exclusive_utc"] == slot["activation_utc"]
+    assert roster["slots"][0]["native_cutoff_utc"] == "2023-06-23T00:00:00Z"
+    assert roster["slots"][-1]["end_exclusive_utc"] == roster["end_exclusive_utc"]
+
+
+@pytest.mark.parametrize("launch,code", [
+    ("2023-06-25T00:00:00Z", "DECLARED_SLOT_LAUNCH_OFF_CLOCK"),
+    ("2023-07-01T00:00:00Z", "DECLARED_SLOT_LAUNCH_OFF_CLOCK"),
+    ("2023-06-24T00:01:00Z", "DECLARED_SLOT_LAUNCH_OFF_CLOCK"),
+    ("2023-06-24T00:00:00.000001Z", "DECLARED_SLOT_LAUNCH_OFF_CLOCK"),
+    ("2023-06-24T00:00:00", "DECLARED_SLOT_LAUNCH_INVALID"),
+    ("2023-06-24T00:00:00+00:00", "DECLARED_SLOT_LAUNCH_INVALID"),
+    ("2023-07-22T00:00:00Z", "DECLARED_SLOT_PROTECTED_END_EXCEEDED"),
+])
+def test_bar_aligned_roster_refuses_wrong_phase_noncanonical_or_protected_launch(launch, code):
+    arguments = _bar_aligned_roster_inputs()
+    arguments["launch_activation_utc"] = launch
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError, match=code):
+        anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+
+
+def test_bar_aligned_roster_accepts_exact_protected_end_but_not_one_second_short():
+    arguments = _bar_aligned_roster_inputs()
+    arguments["protected_end_exclusive_utc"] = "2024-06-22T00:00:00Z"
+    roster = anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+    assert roster["end_exclusive_utc"] == arguments["protected_end_exclusive_utc"]
+    arguments["protected_end_exclusive_utc"] = "2024-06-21T23:59:59Z"
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError, match="DECLARED_SLOT_PROTECTED_END_EXCEEDED"):
+        anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+
+
+@pytest.mark.parametrize("field,value,code", [
+    ("frozen_refit_clock", {"anchor_activation_utc": "2026-03-28T00:00:00Z", "interval_calendar_days": 28},
+     "DECLARED_SLOT_REFIT_CLOCK_INVALID"),
+    ("frozen_refit_clock", {"anchor_activation_utc": "2026-03-29T00:01:00Z", "interval_calendar_days": True},
+     "DECLARED_SLOT_REFIT_CLOCK_INVALID"),
+    ("extend_frozen_clock_backward", False, "DECLARED_SLOT_CLOCK_EXTENSION_MISMATCH"),
+    ("config_identity_refs", {"config_sha256": "bad", "effective_config_sha256": "b" * 64},
+     "DECLARED_SLOT_CONFIG_IDENTITY_INVALID"),
+])
+def test_bar_aligned_roster_retains_independent_clock_and_identity_bindings(field, value, code):
+    arguments = _bar_aligned_roster_inputs()
+    arguments[field] = value
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError, match=code):
+        anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+
+
+@pytest.mark.parametrize("mutation", [
+    "phase", "handover", "same_day_cutoff", "gap", "duplicate", "owner", "authority_alias", "legacy_field",
+])
+def test_bar_aligned_roster_verifier_refuses_changed_geometry_or_authority(mutation):
+    arguments = _bar_aligned_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+    if mutation == "phase":
+        roster["nominal_activation_phase_utc"] = "2026-03-29T00:01:00Z"
+    elif mutation == "handover":
+        roster["nominal_handover_seconds"] = 0
+    elif mutation == "same_day_cutoff":
+        roster["slots"][0]["native_cutoff_utc"] = roster["slots"][0]["activation_utc"]
+    elif mutation == "gap":
+        roster["slots"][1]["activation_utc"] = "2023-07-23T00:00:00Z"
+    elif mutation == "duplicate":
+        roster["slots"][1]["slot_id"] = roster["slots"][0]["slot_id"]
+    elif mutation == "owner":
+        roster["slots"][0]["owner"] = {"provenance": "INVENTED_NOT_OWNER_EVIDENCE"}
+    elif mutation == "authority_alias":
+        roster["order_authority"] = 0
+    else:
+        roster["handover_latency_seconds"] = 86400
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError, match="DECLARED_SLOT_ROSTER_MISMATCH"):
+        anchor_plan.verify_declared_owner_slot_roster(roster, **arguments)
+
+
+@pytest.mark.parametrize("schema", ["fxpm.declared-owner-slot-roster.v3", None, 2, []])
+def test_declared_roster_verifier_refuses_unknown_schema_before_derivation(monkeypatch, schema):
+    arguments = _declared_owner_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster(**arguments)
+    roster["schema_version"] = schema
+    def forbidden(**kwargs):
+        pytest.fail("unknown roster schema reached a factory")
+    monkeypatch.setattr(anchor_plan, "derive_declared_owner_slot_roster", forbidden)
+    monkeypatch.setattr(anchor_plan, "derive_declared_owner_slot_roster_v2", forbidden)
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError):
+        anchor_plan.verify_declared_owner_slot_roster(roster, **arguments)
+
+
+@pytest.mark.parametrize("edition", [1, 2])
+def test_declared_roster_schema_relabelling_cannot_change_geometry(edition):
+    arguments = _declared_owner_roster_inputs() if edition == 1 else _bar_aligned_roster_inputs()
+    factory = anchor_plan.derive_declared_owner_slot_roster if edition == 1 else anchor_plan.derive_declared_owner_slot_roster_v2
+    roster = factory(**arguments)
+    roster["schema_version"] = anchor_plan.DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA if edition == 1 else anchor_plan.DECLARED_OWNER_SLOT_ROSTER_SCHEMA
+    with pytest.raises(anchor_plan.ProductionAnchorPlanError):
+        anchor_plan.verify_declared_owner_slot_roster(roster, **arguments)
+
+
+def test_bar_aligned_roster_never_resolves_native_or_claims_end_support(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("nominal geometry reached native data or a production plan")
+    for name in ("resolve_active_native_universe", "_derive_anchor_plan", "_derive_current_selection_window", "derive_production_anchor_plan"):
+        monkeypatch.setattr(anchor_plan, name, forbidden)
+    arguments = _bar_aligned_roster_inputs()
+    roster = anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+    assert anchor_plan.verify_declared_owner_slot_roster(roster, **arguments) == roster
+    assert roster["native_cutoff_scope"] == "DECLARED_CLOSED_SOURCE_UPPER_BOUND_NOT_VERIFIED_AVAILABILITY"
+
+
+def test_bar_aligned_roster_through_real_v2_precommit_requests_and_measurement(tmp_path, monkeypatch):
+    """Real metadata issuers on invented identities; no bars, OWNER or financial work."""
+    from tests import test_declared_slot_owner_surface as surface
+    import pm_forward_oos_replay_producer as forward
+    import pm_historical_anchor_orchestration as orchestration
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("metadata compatibility reached bars, profile or account execution")
+    monkeypatch.setattr(surface.execution.Backtester, "run", forbidden)
+    monkeypatch.setattr(surface.execution.spread_profile, "load_spread_profile", forbidden)
+    monkeypatch.setattr(forward, "_declared_cell_native_frames", forbidden)
+    env = surface._declared_environment(tmp_path, monkeypatch, issue=False)
+    arguments = _bar_aligned_roster_inputs()
+    arguments["config_identity_refs"] = env.roster["config_identity_refs"]
+    roster = anchor_plan.derive_declared_owner_slot_roster_v2(**arguments)
+    issuance = dict(env.arguments, slot_roster=roster, launch_activation_utc=arguments["launch_activation_utc"])
+    precommit = orchestration.precommit_declared_slot_owner_run_v2(env.context, **issuance)
+    parent = orchestration.verify_declared_slot_owner_run_precommit(env.context, precommit, process=env.process)
+    assert parent["slot_roster"] == roster
+    for slot in (roster["slots"][0], roster["slots"][-1]):
+        request = orchestration.declared_slot_producer_request(
+            env.context, precommit=precommit, process=env.process, cell_id=surface.CELL_ID,
+            slot_id=slot["slot_id"], attempt_id=f"synthetic-metadata-{slot['ordinal']}", sink=env.sink,
+        )
+        try:
+            body = orchestration.verify_declared_slot_producer_request(
+                env.context, request, precommit=precommit, process=env.process,
+            )
+            assert body["winner_transport_edition"] == orchestration.DECLARED_WINNER_TRANSPORT_V16
+            assert body["anchor"] == {
+                "anchor_id": slot["slot_id"], "ordinal": slot["ordinal"],
+                "selection_cutoff_utc": slot["native_cutoff_utc"],
+                "forward_start_utc": slot["activation_utc"],
+                "forward_end_exclusive_utc": slot["end_exclusive_utc"],
+                "process_precommit_receipt_sha256": precommit.receipt_sha256,
+            }
+        finally:
+            orchestration._release_declared_slot_producer_request(request, env.context)
+    assert forward._declared_cell_measurement(parent) == {
+        "calendar_days": 364, "refit_cycles": 13, "cycle_days": 28,
+        "risk_per_trade_pct": 0.25, "terminal_policy": "MARK_OPEN",
+        "start_utc": "2023-06-24T00:00:00Z", "end_exclusive_utc": "2024-06-22T00:00:00Z",
+    }
+

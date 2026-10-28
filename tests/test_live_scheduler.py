@@ -5,13 +5,16 @@ from unittest.mock import Mock
 
 import pandas as pd
 
-from pm_main import LiveTrader
+from pm_main import FXPortfolioManagerApp, LiveTrader
 from pm_position import PositionConfig
 
 
 class LiveSchedulerTests(unittest.TestCase):
     def _make_trader(self):
         mock_mt5 = Mock()
+        mock_mt5.config = SimpleNamespace(
+            expected_login=123, expected_server="Broker-Test", expected_currency="USD"
+        )
         mock_mt5.is_connected.return_value = False
 
         config = SimpleNamespace(
@@ -166,6 +169,7 @@ class LiveSchedulerTests(unittest.TestCase):
         trader.storage_manager = Mock()
         trader.mt5.get_positions.return_value = []
         trader.mt5.get_account_info.return_value = SimpleNamespace(
+            login=123, server="Broker-Test", currency="USD",
             equity=1000.0,
             margin=0.0,
             margin_level=1000.0,
@@ -182,6 +186,7 @@ class LiveSchedulerTests(unittest.TestCase):
 
         trader.process_all_symbols(symbols_filter=set(), timeframes_filter={})
 
+        trader.mt5.get_account_info.assert_called_once()
         trader._run_margin_protection_cycle.assert_called_once()
         trader._run_order_governance_cycle.assert_called_once()
         trader._process_symbol.assert_not_called()
@@ -192,6 +197,95 @@ class LiveSchedulerTests(unittest.TestCase):
         trader._evaluate_daily_loss_advisory.assert_called_once()
         trader._run_portfolio_observatory.assert_called_once()
         trader.storage_manager.on_sweep_complete.assert_not_called()
+
+
+class ReconnectIdentityTests(unittest.TestCase):
+    """Reconnect success requires actual identity even before trader creation."""
+
+    def _app(self, with_trader=True):
+        app = FXPortfolioManagerApp.__new__(FXPortfolioManagerApp)
+        app.mt5 = Mock()
+        app.mt5.config = SimpleNamespace(
+            expected_login=123, expected_server="Broker-Test", expected_currency="USD"
+        )
+        app.mt5.connect.return_value = True
+        app.mt5.get_account_info.return_value = SimpleNamespace(
+            login=123, server="Broker-Test", currency="USD", equity=-1
+        )
+        app.pipeline_config = SimpleNamespace(reconnect_max_attempts=2,
+            reconnect_attempt_interval_seconds=5, reconnect_failure_retry_seconds=30)
+        app.logger = Mock()
+        app.trader = Mock(_is_current_refit_demo=False) if with_trader else None
+        return app
+
+    def test_success_validates_actual_account_before_reset_and_cache_invalidation(self):
+        now = datetime(2026, 4, 3, 10)
+        for with_trader in (False, True):
+            with self.subTest(with_trader=with_trader):
+                app = self._app(with_trader)
+                state = {"attempts": 1, "next_attempt_at": now}
+                events = []
+                app.mt5.disconnect.side_effect = lambda: events.append("disconnect")
+                app.mt5.connect.side_effect = lambda: events.append("connect") or True
+                account = app.mt5.get_account_info.return_value
+                def read_account():
+                    self.assertEqual(state["attempts"], 1)
+                    events.append("account")
+                    return account
+                app.mt5.get_account_info.side_effect = read_account
+                if with_trader:
+                    app.trader.invalidate_runtime_caches.side_effect = lambda: events.append("cache")
+                self.assertTrue(app._attempt_reconnect(state, now=now))
+                self.assertEqual(events, ["disconnect", "connect", "account"] + (["cache"] if with_trader else []))
+                self.assertEqual(state, {"attempts": 0, "next_attempt_at": now})
+
+    def test_bad_or_missing_identity_uses_existing_retry_then_cooldown(self):
+        now = datetime(2026, 4, 3, 10)
+        for with_trader in (False, True):
+            for value in (None, SimpleNamespace(login=124, server="Broker-Test", currency="USD"),
+                          SimpleNamespace(login="bad", server="Broker-Test", currency="USD"),
+                          SimpleNamespace(login=123, server="Other", currency="USD"),
+                          SimpleNamespace(login=123, server="Broker-Test", currency="EUR"),
+                          RuntimeError("synthetic account read error")):
+                with self.subTest(with_trader=with_trader, value=value):
+                    app = self._app(with_trader)
+                    if isinstance(value, Exception):
+                        app.mt5.get_account_info.side_effect = value
+                    else:
+                        app.mt5.get_account_info.return_value = value
+                    state = {"attempts": 0, "next_attempt_at": now}
+                    self.assertFalse(app._attempt_reconnect(state, now=now))
+                    self.assertEqual(state, {"attempts": 1, "next_attempt_at": now + timedelta(seconds=5)})
+                    self.assertEqual(app.mt5.disconnect.call_count, 2)
+                    self.assertFalse(app._attempt_reconnect(state, now=now + timedelta(seconds=4)))
+                    self.assertEqual(app.mt5.connect.call_count, 1)
+                    self.assertFalse(app._attempt_reconnect(state, now=now + timedelta(seconds=5)))
+                    self.assertEqual(state, {"attempts": 0, "next_attempt_at": now + timedelta(seconds=35)})
+                    if with_trader:
+                        app.trader.invalidate_runtime_caches.assert_not_called()
+
+    def test_reconnect_without_trader_never_bypasses_missing_or_malformed_pins(self):
+        now = datetime(2026, 4, 3, 10)
+        for pins in (None, SimpleNamespace(expected_login="bad"),
+                     SimpleNamespace(expected_login=123, expected_server="", expected_currency="USD"),
+                     SimpleNamespace(expected_login=123, expected_server="Broker-Test", expected_currency="")):
+            with self.subTest(pins=pins):
+                app = self._app(False)
+                app.mt5.config = pins
+                state = {"attempts": 0, "next_attempt_at": now}
+                self.assertFalse(app._attempt_reconnect(state, now=now))
+                self.assertEqual(state["attempts"], 1)
+                app.mt5.get_account_info.assert_called_once()
+
+    def test_failed_connect_does_not_read_account_or_invalidate_caches(self):
+        app = self._app()
+        app.mt5.connect.return_value = False
+        now = datetime(2026, 4, 3, 10)
+        state = {"attempts": 0, "next_attempt_at": now}
+        self.assertFalse(app._attempt_reconnect(state, now=now))
+        app.mt5.get_account_info.assert_not_called()
+        app.trader.invalidate_runtime_caches.assert_not_called()
+        self.assertEqual(state["next_attempt_at"], now + timedelta(seconds=5))
 
 
 if __name__ == "__main__":

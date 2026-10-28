@@ -298,6 +298,13 @@ def _production_fixture(
             ),
             "local_process_candidate_id": process["process_candidate_id"],
             "local_process_sha256": process_sha,
+            "validated_cost_ladder_tolerance": {
+                "level_id": "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+                "single_fill_uplift_percentile": 75,
+                "uniform_entry_half_spread_multiplier_float64_hex": (
+                    "0x1.a000000000000p+2"
+                ),
+            },
             "process_state_payload": None,
             "process_state_receipt_sha256": None,
             "within_cell_attempted_trials_exact": 10,
@@ -658,7 +665,18 @@ def _production_fixture(
 
 
 def test_raw_current_refit_executor_rederives_complete_book(tmp_path: Path) -> None:
-    receipt, manifest = _production_fixture(tmp_path)
+    receipt, manifest, details = _production_fixture(tmp_path, return_details=True)
+    assert all(
+        entry["validated_cost_ladder_tolerance"]
+        == {
+            "level_id": "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+            "single_fill_uplift_percentile": 75,
+            "uniform_entry_half_spread_multiplier_float64_hex": (
+                "0x1.a000000000000p+2"
+            ),
+        }
+        for entry in details["book_entries"].values()
+    )
     plan, errors = validate_raw_current_refit_manifest(
         receipt, manifest, artifact_root=tmp_path
     )

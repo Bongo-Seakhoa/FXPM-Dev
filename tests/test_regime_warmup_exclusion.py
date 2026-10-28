@@ -11,19 +11,24 @@ class RegimeWarmupTests(unittest.TestCase):
     def _make_ohlcv(self, n=500):
         np.random.seed(42)
         close = 100 + np.cumsum(np.random.randn(n) * 0.5)
+        opn = close - 0.1
         return pd.DataFrame({
-            'Open': close - 0.1,
-            'High': close + abs(np.random.randn(n) * 0.3),
-            'Low': close - abs(np.random.randn(n) * 0.3),
+            'Open': opn,
+            'High': np.maximum(opn, close) + abs(np.random.randn(n) * 0.3),
+            'Low': np.minimum(opn, close) - abs(np.random.randn(n) * 0.3),
             'Close': close,
             'Volume': np.random.randint(100, 1000, n),
         }, index=pd.date_range('2024-01-01', periods=n, freq='h'))
 
     def test_warmup_bars_property(self):
-        """warmup_bars should equal max(bb_squeeze_lookback, atr_lookback, 50)."""
+        """Readiness includes each score's upstream indicator context."""
         params = RegimeParams()
         detector = MarketRegimeDetector(params)
-        expected = max(params.bb_squeeze_lookback, params.atr_lookback, 50)
+        expected = max(
+            50, 2 * params.adx_period, params.atr_period + params.atr_lookback,
+            params.bb_period + params.bb_squeeze_lookback,
+            params.efficiency_period, params.structure_period,
+        )
         self.assertEqual(detector.warmup_bars, expected)
 
     def test_regime_warmup_column_exists(self):

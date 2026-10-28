@@ -153,18 +153,9 @@ def test_production_readiness_has_no_legacy_prelockbox_dependency():
     assert "independent_cell_ledger_incomplete" not in source
 
 
-def test_retired_validator_does_not_force_physical_four_regime_grids():
-    source = inspect.getsource(readiness._validate_legacy_live_readiness)
-    assert "validate_native_exclusion_no_trade_grid" not in source
-    assert "independent_cell_ledger_incomplete" not in source
-
-
-@pytest.mark.parametrize(
-    "validator",
-    (readiness.validate_live_readiness, readiness._validate_legacy_live_readiness),
-)
-def test_live_cost_prerequisites_are_spread_and_swap_only(validator):
-    source = inspect.getsource(validator)
+def test_live_cost_prerequisites_are_spread_and_swap_only():
+    source = inspect.getsource(readiness.validate_live_readiness)
+    assert "oos_evidence_include_execution_cost_survival" not in source
     assert "use_commission" not in source
     assert "use_slippage" not in source
     assert "slippage_pips" not in source

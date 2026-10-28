@@ -2,11 +2,12 @@ import unittest
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+from functools import lru_cache
 
 import pandas as pd
 
-from pm_core import PipelineConfig, RETIRED_SCORING_CONFIG_KEYS
+from pm_core import DataLoader, PipelineConfig, RETIRED_SCORING_CONFIG_KEYS
 from pm_main import (
     ACTIONABLE_SCHEMA_VERSION,
     FUNDED_FIXED_PIPELINE_VALUES,
@@ -26,6 +27,59 @@ from pm_main import (
 from pm_demo_readiness import AUTHORIZED_DEMO_ACCOUNT_IDENTITY
 from pm_position import PositionConfig, TradeTagEncoder
 from pm_live_outcomes import LiveOutcomeError
+from pm_spread_profile import load_spread_profile
+
+
+@lru_cache(maxsize=1)
+def _risk_fixture_spread_profile():
+    return load_spread_profile()
+
+
+def _execute_with_frozen_spread_fixture(trader, **kwargs):
+    """Synthetic broker inputs exercise real spread checks before risk assertions."""
+    symbol = kwargs["symbol"]
+    point = {"XAUUSD": 0.01, "GBPUSD": 0.00001}[symbol]
+    candidate = dict(kwargs["best_candidate"])
+    timeframe = candidate["timeframe"]
+    identity_sha = "0be6d0831806c1a62ab723193a87a362772a14d8bf4ccbe2d3a8774962eefe09"
+    profile = _risk_fixture_spread_profile()
+    tier = profile.resolve(symbol, timeframe, "P75", point=point,
+                           source_identity_sha256=identity_sha)
+    cell = candidate.get("regime_config")
+    if cell is None:
+        cell = SimpleNamespace(artifact_meta={})
+    cell.artifact_meta = {**cell.artifact_meta, "validated_spread_tier": tier.descriptor()}
+    candidate["regime_config"] = cell
+    kwargs["best_candidate"] = candidate
+    kwargs["spec"].point = point
+    trader.mt5.get_symbol_info.return_value.point = point
+    features = kwargs["features"].copy()
+    if not isinstance(features.index, pd.DatetimeIndex):
+        features.index = pd.date_range(
+            "2020-01-01", periods=len(features),
+            freq=f"{DataLoader.TIMEFRAME_MINUTES[timeframe]}min", tz="UTC",
+        )
+    kwargs["features"] = features
+    target_open = features.index[-1]
+    trader.mt5.get_bars.return_value = pd.DataFrame(
+        {"Spread": [1, 1, 1000]},
+        index=pd.date_range(target_open - pd.Timedelta(minutes=10), periods=3, freq="5min"),
+    )
+    if symbol == "GBPUSD":
+        # Preserve the executed side; both quote checks see five spread points.
+        quote = trader.mt5.get_symbol_tick.return_value
+        trader.mt5.get_symbol_tick.return_value = (
+            SimpleNamespace(ask=quote.ask, bid=quote.ask - 5 * point)
+            if kwargs["signal"] == 1
+            else SimpleNamespace(bid=quote.bid, ask=quote.bid + 5 * point)
+        )
+    trader._frozen_spread_profile = profile
+    with patch("tools.acquire_native_history.snapshot_read_only_runtime_metadata",
+               return_value={"synthetic_risk_fixture_metadata": True}), patch(
+        "pm_native_request_contract.canonical_source_identity",
+        return_value={"identity_sha256": identity_sha},
+    ):
+        return trader._execute_entry(**kwargs)
 
 
 class ConfigSourceOfTruthTests(unittest.TestCase):
@@ -320,7 +374,15 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
         self.assertEqual(
             RETIRED_SCORING_CONFIG_KEYS,
             {
+                "execution_spread_spike_mult",
                 "legacy_confidence_bonus_cap",
+                "oos_evidence_execution_cost_max_candidates_per_tf",
+                "oos_evidence_execution_stress_mode",
+                "oos_evidence_include_execution_cost_survival",
+                "production_completion_marker_path",
+                "production_expected_promote_cells",
+                "production_promotion_cell_safety_path",
+                "production_promotion_review_path",
                 "regime_scoring_model",
                 "slippage_pips",
                 "specialist_spokes_v2_allow_promote_small_default",
@@ -355,7 +417,7 @@ class ConfigSourceOfTruthTests(unittest.TestCase):
                 _validate_funded_config_schema(payload)
             with self.subTest(key=key), self.assertRaisesRegex(
                 ValueError,
-                "retired scoring config keys",
+                "retired pipeline config keys",
             ):
                 _filter_dataclass_kwargs(PipelineConfig, {key: "retired"})
 
@@ -454,6 +516,7 @@ class LiveRiskIntentTests(unittest.TestCase):
             target_annual_vol=0.10,
             live_min_account_equity=0.0,
             live_min_account_equity_currency="",
+            production_require_promotion_gate=False,
         )
         trader.position_calc = MagicMock()
         trader.position_calc.calculate_stop_prices.return_value = (1.1900, 1.2200)
@@ -542,7 +605,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         }
         if regime_config is not None:
             best_candidate["regime_config"] = regime_config
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -600,7 +663,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         strategy.calculate_stops.return_value = (10.0, 20.0)
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -675,7 +738,7 @@ class LiveRiskIntentTests(unittest.TestCase):
             }
         )
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -741,7 +804,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -802,7 +865,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         ]
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -860,7 +923,7 @@ class LiveRiskIntentTests(unittest.TestCase):
             {"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]}
         )
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -907,7 +970,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         strategy.calculate_stops.return_value = (10.0, 20.0)
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -958,7 +1021,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         strategy.calculate_stops.return_value = (10.0, 20.0)
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -999,7 +1062,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1048,7 +1111,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1090,7 +1153,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1142,7 +1205,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         strategy = MagicMock()
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1461,7 +1524,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1524,7 +1587,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1573,7 +1636,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1619,7 +1682,7 @@ class LiveRiskIntentTests(unittest.TestCase):
 
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,
@@ -1747,7 +1810,7 @@ class LiveRiskIntentTests(unittest.TestCase):
         strategy.calculate_stops.return_value = (10.0, 20.0)
         features = pd.DataFrame({"Open": [1.0, 1.0], "High": [1.0, 1.0], "Low": [1.0, 1.0], "Close": [1.0, 1.0]})
 
-        trader._execute_entry(
+        _execute_with_frozen_spread_fixture(trader,
             symbol="XAUUSD",
             broker_symbol="XAUUSD",
             signal=1,

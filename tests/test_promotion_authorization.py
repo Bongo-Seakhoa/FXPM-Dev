@@ -333,18 +333,47 @@ def test_portfolio_manager_rechecks_exact_cell_authorization(tmp_path):
     assert "FILE_SHA256_MISMATCH" in reason
 
 
-def test_funded_runtime_rejects_legacy_mutable_ledger_gate(tmp_path):
-    _now, config, ledger, _cell, _symbol, _authorization = _authorized_fixture(tmp_path)
-    config.production_promotion_gate_mode = "ledger_status"
-    config._funded_live_execution = True
-    manager = PortfolioManager(config, ["EURUSD"], config_file=str(ledger))
+def test_enabled_runtime_rejects_mutated_gate_mode_and_disabled_research_bypasses():
+    config = SimpleNamespace(
+        production_require_promotion_gate=True,
+        production_promotion_gate_mode="ledger_status",
+        _funded_live_execution=False,
+    )
+    manager = PortfolioManager.__new__(PortfolioManager)
+    manager.config = config
 
     authorized, reason = manager.is_exact_cell_authorized_for_live(
         "EURUSD", "H1", "TREND", refresh=True
     )
 
     assert not authorized
-    assert "rejects weak promotion gate" in reason
+    assert "requires literal immutable_exact" in reason
+
+    config.production_require_promotion_gate = False
+    authorized, reason = manager.is_exact_cell_authorized_for_live(
+        "EURUSD", "H1", "TREND", refresh=True
+    )
+    assert authorized
+    assert reason == "promotion gate disabled for research"
+
+
+def test_funded_startup_eligibility_cannot_disable_promotion_gate():
+    manager = PortfolioManager.__new__(PortfolioManager)
+    manager.config = SimpleNamespace(
+        production_require_promotion_gate=False,
+        production_promotion_gate_mode="immutable_exact",
+        _funded_live_execution=True,
+        live_artifact_drift_policy="block",
+        live_config_expiry_grace_minutes=0,
+    )
+    manager.ledger = SimpleNamespace(
+        get_all_configs=lambda: {"EURUSD": object()}
+    )
+
+    assert manager.get_live_eligible_configs(current_artifact_meta={}) == {}
+    assert manager._last_live_eligibility_rejections == {
+        "EURUSD": "funded execution cannot disable the promotion gate"
+    }
 
 
 def test_final_send_boundary_rechecks_exact_cell_with_refresh():

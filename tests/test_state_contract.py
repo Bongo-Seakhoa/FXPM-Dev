@@ -5,6 +5,7 @@ from itertools import product
 import pytest
 
 from pm_core import FeatureComputer
+from pm_current_refit_parameters import build_parameter_domain, decode_parameter_mapping
 from pm_state_contract import (
     ACTUAL_STRATEGY_NAMES,
     ContractionFormula,
@@ -94,7 +95,7 @@ def test_every_registered_default_cell_resolves_with_all_required_state_evidence
 
 
 def test_every_registered_cartesian_point_is_within_its_domain_ceiling() -> None:
-    """Prove the complete 2.64m-point registry, including axis interactions."""
+    """Prove every legal current point, including interactions across groups."""
 
     evidence = {
         name: _evidence(DEFAULT_AUTHORITY, name)
@@ -106,22 +107,27 @@ def test_every_registered_cartesian_point_is_within_its_domain_ceiling() -> None
         registered = StrategyRegistry.get(name)
         defaults = registered.get_default_params()
         grid = registered.get_param_grid()
-        axes = tuple(grid)
+        domain = build_parameter_domain(defaults, grid, coupled_groups=registered.get_param_couplings())
         declared_union = set(
             StrategyRegistry.get(name, **defaults).get_feature_request()
         )
-        for axis, choices in grid.items():
-            for choice in choices:
+        for axis in domain["axes"]:
+            for row in axis["choices"]:
                 declared_union.update(
                     StrategyRegistry.get(
-                        name, **{**defaults, axis: choice}
+                        name, **decode_parameter_mapping(
+                            {**domain["defaults"], **dict(zip(axis["names"], row))}, defaults
+                        )
                     ).get_feature_request()
                 )
         requested_union: set[str] = set()
         exact_maximum = 0
         strategy_count = 0
-        for values in product(*(grid[axis] for axis in axes)):
-            parameters = {**defaults, **dict(zip(axes, values))}
+        for rows in product(*(axis["choices"] for axis in domain["axes"])):
+            wire = dict(domain["defaults"])
+            for axis, row in zip(domain["axes"], rows):
+                wire.update(zip(axis["names"], row))
+            parameters = decode_parameter_mapping(wire, defaults)
             strategy = StrategyRegistry.get(name, **parameters)
             normalized = strategy.get_params()
             requested = sorted(strategy.get_feature_request())
@@ -155,6 +161,7 @@ def test_every_registered_cartesian_point_is_within_its_domain_ceiling() -> None
             initial_error_bound=100.0,
             tolerance=0.000005,
             state_evidence=evidence,
+            parameter_domain=domain,
         )
         assert ceiling.proved, (name, ceiling.reason_codes)
         assert strategy_count == ceiling.full_domain_point_count
@@ -166,7 +173,65 @@ def test_every_registered_cartesian_point_is_within_its_domain_ceiling() -> None
         assert set(ceiling.requested_features) == declared_union
         evaluated += strategy_count
 
-    assert evaluated == 2_644_015
+    assert evaluated == 784_465
+
+
+def test_coupled_state_projection_keeps_legal_partners_without_full_enumeration(monkeypatch) -> None:
+    authority = StateContractAuthority(
+        (StateContract("strategy:Coupled", StateKind.FINITE_WINDOW,
+                       finite_rule=FiniteWindowRule(terms=(WindowTerm("slow", required=True),))),),
+        candidate_domain_hash=_digest("synthetic-coupled-domain"),
+    )
+    domain = build_parameter_domain(
+        {"fast": 2, "slow": 10, "irrelevant": 0},
+        {"fast": [2, 5], "slow": [10, 20], "irrelevant": list(range(1000))},
+        coupled_groups=({"names": ["fast", "slow"], "choices": [[2, 10], [5, 20]]},),
+    )
+    observed = []
+    original = authority.resolve_cell
+    def record(*args, **kwargs):
+        observed.append(dict(kwargs["parameters"]))
+        assert (kwargs["parameters"]["fast"], kwargs["parameters"]["slow"]) in {(2, 10), (5, 20)}
+        return original(*args, **kwargs)
+    monkeypatch.setattr(authority, "resolve_cell", record)
+    ceiling = authority.resolve_cell_domain_ceiling(
+        "Coupled", parameter_domains={"fast": [2, 5], "slow": [10, 20], "irrelevant": list(range(1000))},
+        parameter_domain=domain, requested_features=(), timeframe="H1",
+        effective_domain_hash=_digest("synthetic-coupled-effective"),
+        initial_error_bound=100.0, tolerance=0.00001,
+    )
+    assert ceiling.proved and ceiling.full_domain_point_count == 2000
+    assert ceiling.state_parameter_keys == ("slow",)
+    assert ceiling.state_projection_point_count == len(observed) == 2
+    assert ceiling.bounded_context_bars == 20
+
+
+@pytest.mark.parametrize("bad_left", (None, [True, 2], [1.0, 2], [1], [1, 2, 3]))
+def test_coupled_marginals_compare_typed_members_not_legal_row_order(bad_left) -> None:
+    """Synthetic reverse-ordered partners model the actual StochRSI marginal seam."""
+    authority = StateContractAuthority(
+        (StateContract("strategy:ReversePartners", StateKind.FINITE_WINDOW,
+                       finite_rule=FiniteWindowRule(terms=(WindowTerm("right", required=True),))),),
+        candidate_domain_hash=_digest("synthetic-reverse-partners"),
+    )
+    domain = build_parameter_domain(
+        {"left": 1, "right": 20}, {"left": [1, 2], "right": [10, 20]},
+        coupled_groups=({"names": ["left", "right"], "choices": [[1, 20], [2, 10]]},),
+    )
+    kwargs = {
+        "parameter_domains": {"left": [2, 1] if bad_left is None else bad_left, "right": [10, 20]},
+        "parameter_domain": domain, "requested_features": (), "timeframe": "H1",
+        "effective_domain_hash": _digest("synthetic-reverse-partners-effective"),
+        "initial_error_bound": 100.0, "tolerance": 0.00001,
+    }
+    if bad_left is not None:
+        with pytest.raises(ValueError, match="parameter domain marginals differ"):
+            authority.resolve_cell_domain_ceiling("ReversePartners", **kwargs)
+    else:
+        ceiling = authority.resolve_cell_domain_ceiling("ReversePartners", **kwargs)
+        assert ceiling.proved and ceiling.full_domain_point_count == 2
+        assert ceiling.state_projection_point_count == 2
+        assert ceiling.bounded_context_bars == 20
 
 
 def test_domain_ceiling_projects_exact_state_axes_and_keeps_full_count() -> None:
@@ -568,7 +633,36 @@ def test_default_cell_requires_independent_regime_controller_state() -> None:
         state_evidence={node: _evidence(DEFAULT_AUTHORITY, node)},
     )
     assert admitted.admissible
-    assert admitted.bounded_context_bars >= 400
+    strategy_only = DEFAULT_AUTHORITY.resolve_cell(
+        strategy, parameters=StrategyRegistry.get(strategy).params,
+        timeframe="M15", include_regime_controller=False,
+    )
+    assert admitted.bounded_context_bars == strategy_only.bounded_context_bars
+    contract = DEFAULT_AUTHORITY._contracts[node]
+    assert contract.checkpoint_schema == "fxpm.regime-stream-state.v2"
+    assert contract.transition_schema == "fxpm.regime-stream-transition.v2"
+
+
+@pytest.mark.parametrize("feature", sorted(STATE_FEATURE_ALIASES))
+def test_every_regime_view_requires_one_authenticated_stream_state(feature: str) -> None:
+    node = "controller:REGIME_HYSTERESIS"
+    kwargs = dict(
+        strategy_name="DonchianBreakoutStrategy",
+        parameters=StrategyRegistry.get("DonchianBreakoutStrategy").params,
+        requested_features=(f"feature:{feature}",),
+        timeframe="H1", include_regime_controller=False,
+    )
+    missing = DEFAULT_AUTHORITY.resolve_cell(**kwargs)
+    assert not missing.admissible
+    assert missing.required_path_state_nodes == (node,)
+    admitted = DEFAULT_AUTHORITY.resolve_cell(
+        **kwargs, state_evidence={node: _evidence(DEFAULT_AUTHORITY, node)},
+    )
+    assert admitted.admissible
+    assert admitted.required_path_state_nodes == ()
+    path_nodes = [item for item in admitted.nodes if item.kind == "PATH_STATE"]
+    assert [item.name for item in path_nodes] == [node]
+    assert path_nodes[0].state_evidence_mode == "CHECKPOINT"
 
 
 def test_session_cumulative_state_requires_authenticated_reset_boundary() -> None:

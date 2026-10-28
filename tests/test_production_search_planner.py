@@ -14,10 +14,15 @@ import pytest
 import pm_authority_spool as authority_spool
 import pm_causal_evidence_producer as causal_producer
 import pm_causal_process as causal
+import pm_core
 import pm_historical_anchor_orchestration as historical
 import pm_pipeline as pipeline
 import pm_production_search_planner as planner
-from pm_current_refit_parameters import parameter_values_equal
+from pm_current_refit_parameters import (
+    load_retained_strategy_domain_v1,
+    parameter_values_equal,
+    validate_parameter_domain_member,
+)
 from pm_strategies import StrategyRegistry
 
 
@@ -178,15 +183,66 @@ def test_process_freeze_reopens_exact_100_strategy_domain(tmp_path) -> None:
 
     assert planner.verify_frozen_production_search_process(context, frozen) is True
     body = frozen.to_dict()
-    assert body["candidate_domain_sha256"] == (
-        "d4d8ae2deee050989bdc8e93b21d779c8d68ddb4666668a9c34c5d65177803e3"
-    )
+    assert body["candidate_domain_sha256"] == planner.state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
+    assert body["candidate_domain_sha256"] != planner.state_contract.ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256
     assert body["semantics"]["strategy_domain_count"] == 100
     assert (
         body["semantics"]["attempt_policy"]["attempt_count_per_observed_cell"]
         == planner.ATTEMPT_COUNT
     )
     assert body["semantics"]["all_100_strategies_represented"] is True
+    policy = body["semantics"]["attempt_policy"]
+    assert body["schema_version"] == planner.PROCESS_SCHEMA
+    assert policy["variant_parameter_sampler"] == "SHA256_COPRIME_MIXED_RADIX_LEGAL_POINTS_V2"
+    reopened = planner.reopen_production_search_process(
+        context, spool_receipt=frozen.spool_receipt, expected_receipt_sha256=frozen.receipt_sha256,
+    )
+    assert reopened._body_json == frozen._body_json
+
+
+def test_retained_original_process_reopens_without_live_registry_or_reissue(tmp_path, monkeypatch) -> None:
+    """A synthetic generation carries the real retained v1 process template."""
+    context = authority_spool.freeze_generation_context(
+        (tmp_path / "original-transport").resolve(), generation_id="synthetic-retained-v1-process",
+        native_universe_sha256="a" * 64, config_sha256="b" * 64,
+    )
+    body = planner._expected_process_body(
+        context, run_id="synthetic-v1-transport", schema_version=planner.ORIGINAL_PROCESS_SCHEMA,
+    )
+    sink = authority_spool.open_symbol_sink(context, planner.PROCESS_SPOOL_SYMBOL)
+    entry = sink.put_json(planner.PROCESS_ARTIFACT_ID, planner.PROCESS_ARTIFACT_TYPE, body)
+    receipt = sink.seal()
+    def reject_live(*args, **kwargs):
+        raise AssertionError("retained process verification read the live registry")
+    monkeypatch.setattr(planner.StrategyRegistry, "get", reject_live)
+    restored = planner.reopen_production_search_process(
+        context, spool_receipt=receipt, expected_receipt_sha256=entry["descriptor"]["sha256"],
+    )
+    assert restored.to_dict() == body
+    assert restored.to_dict()["semantics"] == load_retained_strategy_domain_v1()["process_template"]["semantics"]
+    with pytest.raises(planner.ProductionSearchPlannerError, match="RETAINED_PROCESS_IS_READ_ONLY"):
+        planner._require_current_process(restored)
+    with pytest.raises(planner.ProductionSearchPlannerError, match="PROCESS_SPOOL_DESCRIPTOR_MISMATCH"):
+        planner.reopen_production_search_process(context, spool_receipt=receipt, expected_receipt_sha256="0" * 64)
+    monkeypatch.setattr(planner, "_source_sha256", lambda _value: "0" * 64)
+    with pytest.raises(planner.ProductionSearchPlannerError, match="RETAINED_STRATEGY_SUCCESSOR_CHANGED"):
+        planner.verify_frozen_production_search_process(context, restored)
+
+
+def test_unknown_candidate_authority_is_never_inferred() -> None:
+    with pytest.raises(planner.ProductionSearchPlannerError, match="PROCESS_SOURCE_EDITION_UNKNOWN"):
+        planner._state_authority_for_candidate("0" * 64)
+
+
+@pytest.mark.parametrize(("name", "expected"), (
+    ("RegimeTransitionBreakoutStrategy", 26_730), ("EMARibbonADXStrategy", 23_760),
+    ("StochRSITrendGateStrategy", 23_760), ("SessionVWAPReversionStrategy", 13_200),
+    ("MACDHistogramMomentumStrategy", 19_800),
+))
+def test_trimmed_domains_count_legal_atomic_rows(name, expected) -> None:
+    domain = planner._strategy_domain(name, 0)
+    assert domain["grid_size"] == domain["parameter_domain"]["point_count"] == expected
+    assert validate_parameter_domain_member(domain["parameter_domain"], domain["defaults"]) == domain["defaults"]
 
 
 def test_pre_evidence_and_post_precommit_requests_build_identical_anchor_body(
@@ -217,7 +273,7 @@ def test_pre_evidence_and_post_precommit_requests_build_identical_anchor_body(
             }
         )
         cutoff = end + timedelta(days=36)
-    causal_precommit = causal_producer.freeze_causal_process_precommit_v9(
+    causal_precommit = causal_producer.freeze_causal_process_precommit_v10(
         context=context,
         search_process=process,
         process_id="planner-pre-evidence-process",
@@ -337,6 +393,8 @@ def test_attempt_roster_tunes_every_strategy_with_real_grid_variants() -> None:
     for item in variants:
         strategy = StrategyRegistry.get(item["strategy_id"])
         parameters = item["parameters"]
+        domain = next(row for row in process["semantics"]["strategy_domains"] if row["strategy_id"] == item["strategy_id"])
+        assert validate_parameter_domain_member(domain["parameter_domain"], parameters) == parameters
         changed = False
         for axis, choices in strategy.get_param_grid().items():
             assert any(
@@ -1329,7 +1387,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
     payload_sha256 = planner._sha(payload)
     plan = planner.training_horizon.build_historical_horizon_plan(
         {
-            "schema_version": "fxpm.historical-horizon-request.v1",
+            "schema_version": "fxpm.historical-horizon-request.v2",
             "run_id": "state-context-geometry-binding",
             "anchor": {
                 "anchor_id": "ANCHOR-01",
@@ -1354,11 +1412,11 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
                 "payload": payload,
             },
             "horizon_policy": {
-                "schema_version": "fxpm.historical-horizon-policy.v1",
+                "schema_version": "fxpm.historical-horizon-policy.v2",
                 "policy_id": "state-context-geometry-binding",
                 "policy_release_sha256": "c" * 64,
                 "cost_contract_sha256": "d" * 64,
-                "cost_stress_contract_sha256": "e" * 64,
+                "cost_ladder_contract_sha256": "e" * 64,
                 "evaluator_release_sha256": "a" * 64,
             },
             "candidates": [candidate],
@@ -1366,6 +1424,8 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
         }
     )
     plan_body = plan.to_dict()
+    assert planner.training_horizon._PLAN_SCHEMA == "fxpm.historical-horizon-plan.v2"
+    assert plan_body["schema_version"] == "fxpm.historical-horizon-plan.v2"
     assert plan_body["derived_dependency_geometry"] == geometry
     assert plan_body["attempts"][0]["status"] == "PROCESS_REJECTED"
     assert plan_body["attempts"][0]["reason_code"] == "SOURCE_BOUNDARY_SHORTFALL"
@@ -1813,6 +1873,41 @@ def _terminal_context(tmp_path: Path):
     )
 
 
+def _assert_current_terminal_absence(plan, product) -> None:
+    body = plan.horizon_plan.to_dict()
+    assert body["schema_version"] == "fxpm.historical-horizon-plan.v3"
+    assert body["confers_trading_or_capital_authority"] is False
+    assert body["candidates"] == body["trials"] == body["attempts"] == []
+    assert body["expected_evaluations"] == []
+    assert plan.cell_receipt["horizon_plan_binding"]["schema_version"] == (
+        "fxpm.historical-horizon-plan-binding.v2"
+    )
+    assert plan.cell_receipt[
+        "confers_winner_causal_current_capital_publication_or_live_authority"
+    ] is False
+    terminal_contract = {
+        "schema_version": "fxpm.terminal-search-non-evaluation-contract.v1",
+        "source_state": product.source_state,
+        "native_prefix_index_sha256": product.index_sha256,
+        "source_terminal_receipt_sha256": product.native_prefix[
+            "source_terminal_receipt_sha256"
+        ],
+        "economic_evaluation": "NOT_APPLICABLE",
+    }
+    policy = body["horizon_policy"]
+    assert policy["schema_version"] == "fxpm.historical-horizon-policy.v3"
+    assert "cost_ladder_contract_sha256" not in policy
+    assert policy["cost_contract_sha256"] == planner._sha({
+        **terminal_contract,
+        "binding_domain": "fxpm.terminal-cost-not-applicable.v1",
+    })
+    assert policy["frozen_tier_pair_contract_sha256"] == planner._sha({
+        **terminal_contract,
+        "binding_domain": "fxpm.terminal-frozen-tier-evaluation-not-applicable.v1",
+    })
+    assert policy["cost_contract_sha256"] != policy["frozen_tier_pair_contract_sha256"]
+
+
 def test_terminal_reverify_uses_sealed_product_root_outside_cwd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1932,6 +2027,7 @@ def test_terminal_plan_is_zero_attempt_and_not_a_market_verdict(
 
     assert plan.mode == "TERMINAL"
     assert plan.attempt_count == 0
+    _assert_current_terminal_absence(plan, product)
     assert plan.horizon_plan.to_dict()["plan_status"] == (
         "HISTORICAL_SOURCE_UNAVAILABLE"
     )
@@ -1992,6 +2088,7 @@ def test_authenticated_terminal_technical_plan_is_zero_attempt_abstention(
 
     assert plan.mode == "TERMINAL"
     assert plan.attempt_count == 0
+    _assert_current_terminal_absence(plan, product)
     assert plan.horizon_plan.to_dict()["plan_status"] == (
         "HISTORICAL_TERMINAL_TECHNICAL"
     )
@@ -2003,6 +2100,8 @@ def test_authenticated_terminal_technical_plan_is_zero_attempt_abstention(
 
 
 def _unobserved_fitted_timeframe():
+    from test_authoritative_search_execution import _pair_fixture
+
     native = {
         "source_state": planner.native_prefix.AVAILABLE,
         "source_reason": None,
@@ -2107,14 +2206,15 @@ def _unobserved_fitted_timeframe():
         source_group_decision=source,
         regime_fit_decision=fit,
         source_contract_seed={},
-        base_cost_policy={"lane": "BASE"},
-        stress_cost_policy={"lane": "STRESS"},
+        cost_ladder_contract={},
         regime_parameters={},
         train_regime_support=support,
         instrument_spec=None,
         execution_spec_receipt={},
         frame_sha256="f" * 64,
         _frame=pd.DataFrame(),
+        frozen_tier_pair_contract=_pair_fixture(timeframe="H1"),
+        source_contract_seeds={},
     )
     opens = pd.date_range("2024-12-01T00:00:00Z", periods=744, freq="h")
     closes = opens + pd.Timedelta(hours=1)
@@ -2171,14 +2271,51 @@ def test_unobserved_plan_binds_exact_support_and_has_zero_attempts(
     )
 
     assert plan.attempt_count == 0
+    assert plan.horizon_plan.to_dict()["schema_version"] == "fxpm.historical-horizon-plan.v3"
     assert plan.horizon_plan.to_dict()["plan_status"] == (
         "HISTORICAL_REGIME_UNOBSERVED"
     )
     assert plan.cell_receipt["regime_support_binding"]["target_regime_count"] == 0
     assert plan.cell_receipt["empirically_unobserved_is_no_trade_verdict"] is False
+    horizon_policy = plan.horizon_plan.to_dict()["horizon_policy"]
+    pair = fitted.frozen_tier_pair_contract
+    assert horizon_policy["schema_version"] == "fxpm.historical-horizon-policy.v3"
+    policies = {item["tier"]: planner._sha(item["numerical_execution_cost_policy"])
+                for item in pair["tiers"]}
+    assert set(policies) == {"P75", "P95"}
+    assert horizon_policy["cost_contract_sha256"] == planner._sha(policies)
+    assert horizon_policy["frozen_tier_pair_contract_sha256"] == planner._sha(pair)
+    assert "cost_ladder_contract_sha256" not in horizon_policy
+    assert fitted.cost_ladder_contract == fitted.source_contract_seed == {}
     assert planner.verify_production_cell_search_plan(
         context, process=process, sink=sink, plan=plan
     )
+
+
+def test_horizon_cost_binding_rejects_noncanonical_frozen_tier_order() -> None:
+    fitted, _native, _opens, _closes = _unobserved_fitted_timeframe()
+    malformed = dict(fitted.frozen_tier_pair_contract)
+    malformed["tiers"] = list(reversed(malformed["tiers"]))
+    with pytest.raises(
+        planner.ProductionSearchPlannerError,
+        match="FROZEN_TIER_PAIR_CONTRACT_INVALID",
+    ):
+        planner._frozen_tier_horizon_hashes(malformed)
+
+
+def test_archive_cost_codec_cannot_be_submitted_as_current_horizon_policy() -> None:
+    archived = pm_core.build_backtest_cost_ladder_contract(
+        {"mode": "authenticated_base", "source": "SYNTHETIC_ARCHIVE_POLICY_ONLY"},
+        use_spread=True, instrument_spec_sha256="e" * 64,
+    )
+    assert archived["schema_version"] == "fxpm.backtester-cost-ladder-contract.v1"
+    assert [item["level_id"] for item in archived["levels"]] == [
+        "BASE", "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P75",
+        "UNIFORM_ALL_FILLS_SINGLE_FILL_UPLIFT_P95",
+    ]
+    with pytest.raises(planner.ProductionSearchPlannerError,
+                       match="FROZEN_TIER_PAIR_CONTRACT_INVALID"):
+        planner._frozen_tier_horizon_hashes(archived)
 
 
 def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
@@ -2264,6 +2401,7 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         state_context_selection={},
         state_error_envelope=_state_error_envelope_receipt(
             regime_parameters_sha256=parameters_sha256,
+            regime_warmup_bars=planner._regime_warmup_contract(fitted)[0],
         ),
         boundary_limited=False,
     )

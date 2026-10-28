@@ -1268,3 +1268,64 @@ def test_contract_explicitly_denies_downstream_authority() -> None:
         body["confers_causal_current_capital_publication_or_trading_authority"] is False
     )
     assert len(producer.HISTORICAL_SEARCH_PRODUCER_RELEASE_SHA256) == 64
+
+
+@pytest.mark.parametrize("edition", ["v15", "v16"])
+def test_declared_verified_parent_selects_transport_capture_and_executor(tmp_path, monkeypatch, edition):
+    """Real issued parent/request dispatch; native, fit and outcome are labelled stubs."""
+    import pm_historical_production_adapter as adapter
+    from tests.test_declared_slot_owner_surface import (
+        _declared_transport_environment, _request, _structural_completion,
+        _structural_native_snapshot, _structural_snapshot_backend,
+    )
+
+    snapshot = _structural_native_snapshot()
+    env = _declared_transport_environment(tmp_path, monkeypatch, edition, native_snapshot=snapshot)
+    request = _request(env)
+    request_before = request._body_json
+    source_calls = _structural_snapshot_backend(env, monkeypatch,
+        observed=snapshot, state=native_prefix.AVAILABLE)
+    fitted = SimpleNamespace(
+        source_group_decision=SimpleNamespace(receipt_sha256="3" * 64,
+            to_dict=lambda: {"availability": producer.book.AVAILABLE}),
+        regime_fit_decision=SimpleNamespace(receipt_sha256="4" * 64,
+            to_dict=lambda: {"fit_state": producer.book.REGIME_FITTED}),
+        train_regime_support={"counts": {regime: 1 for regime in producer.book.REGIME_ORDER}},
+        _spread_tiers={tier: SimpleNamespace(descriptor=lambda: {"profile_sha256": "e" * 64})
+                       for tier in ("P75", "P95")},
+    )
+    monkeypatch.setattr(search_execution, "fit_native_timeframe_for_search", lambda **kwargs: fitted)
+    plan = SimpleNamespace(classification="STRUCTURAL_DISPATCH_PLAN_NOT_OWNER_EVIDENCE")
+    monkeypatch.setattr(planner, "build_declared_slot_observed_cell_plan", lambda *args, **kwargs: plan)
+    observed = []
+
+    def open_capture(context, *, request, process, plan, source_session):
+        assert context is env.context and process is env.process
+        assert producer._verified_declared_slot_source_session(context, request=request,
+            process=process, source_session=source_session) is source_session
+        observed.append(("capture", edition))
+        return SimpleNamespace(request=request, plan=plan, _completion=None, completion=None)
+
+    def execute_cell(**kwargs):
+        assert kwargs["fitted"] is fitted and kwargs["cell_plan"] is plan
+        capture = kwargs["capture"]
+        completion = _structural_completion(capture.request, reason="STRUCTURAL_DISPATCH_NOT_OWNER_EVIDENCE")
+        capture._completion = capture.completion = completion
+        observed.append(("executor", edition))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Verified parent dispatched to the opposite transport edition")
+
+    monkeypatch.setattr(adapter, "open_declared_slot_capture", open_capture if edition == "v15" else forbidden)
+    monkeypatch.setattr(adapter, "open_transport_declared_slot_capture", open_capture if edition == "v16" else forbidden)
+    monkeypatch.setattr(search_execution, "execute_historical_observed_cell", execute_cell if edition == "v15" else forbidden)
+    monkeypatch.setattr(search_execution, "execute_transport_historical_observed_cell", execute_cell if edition == "v16" else forbidden)
+    completion = producer.execute_declared_slot_owner_search(env.context,
+        request=request, process=env.process, frozen_pipeline_config=env.frozen)
+    expected = historical.DECLARED_WINNER_TRANSPORT_V16 if edition == "v16" else historical.DECLARED_WINNER_TRANSPORT_V15
+    assert historical.declared_slot_transport_edition(env.precommit.to_dict()) == expected
+    assert historical.declared_slot_transport_edition(completion["request_body"]) == expected
+    assert observed == [("capture", edition), ("executor", edition)]
+    assert source_calls == ["observe", "produce", "reverify"]
+    assert completion["classification"] == "STRUCTURAL_STUB_NOT_OWNER_EVIDENCE"
+    assert completion["status"] == "NO_TRADE" and request._body_json == request_before

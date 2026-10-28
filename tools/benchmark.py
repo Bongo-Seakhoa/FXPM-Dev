@@ -38,9 +38,6 @@ SPREAD_MODES = (
     "fixed_spec",
     "historical_max",
     "conservative_max",
-    "stress_p90",
-    "stress_p95",
-    "stress_max",
 )
 
 

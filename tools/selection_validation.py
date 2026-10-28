@@ -1,4 +1,8 @@
-"""Validate candidate-selection rules on forward OOS evidence.
+"""Historical research validation of candidate-selection rules.
+
+This utility is outside the Winner-v14 production authority chain. It can
+reproduce comparative research evidence but cannot authenticate a Winner,
+build a Book, approve current refit, or pass live readiness.
 
 Method (self-contained -- uses only the existing OOS returns matrix, no re-backtest, no
 engine touch):
@@ -23,9 +27,11 @@ engine touch):
   * Let the metrics disagree honestly: profitability, shape/risk, and runtime are reported
     separately, with a Pareto summary over reliability, capital preservation, and runtime.
 
-Caveat: this validates the SELECTION RULE's generalization on the OOS surface; the ultimate
-live proof remains the clean holdout (promotion_review). Returns are face-value matrix units,
-identical scale across rules, so the comparison is valid.
+Caveat: this validates a research selection rule's generalization on its saved
+OOS surface only. Production proof is the versioned Winner -> Book ->
+current-refit -> replay/readiness chain. Returns are face-value matrix units,
+identical across these research rules, so the comparison remains internally
+valid.
 
 Run:  python tools/selection_validation.py [--symbols EURUSD GBPUSD] [--min-survivors 4]
 """

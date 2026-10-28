@@ -58,7 +58,8 @@ def _with_authenticated_trade_evidence(
         build_numerical_execution_cost_attestation(
             use_spread=True,
             spread_mode="conservative_max",
-            spread_values_sha256="7" * 64,
+            entry_half_spread_values_sha256="7" * 64,
+            intrabar_half_spread_values_sha256="7" * 64,
             instrument_spec_sha256="9" * 64,
         )
     )
@@ -147,7 +148,9 @@ class OptimizerHardeningTests(unittest.TestCase):
             ]
 
         optimizer = OptunaTPEOptimizer(OptunaConfig(), None, None, None)
-        param_space = ParameterSpace({"a": [1, 2, 3], "b": [10, 20, 30]}, {})
+        param_space = ParameterSpace(
+            {"a": [1, 2, 3], "b": [10, 20, 30]}, {"a": 2, "b": 20}, coupled_groups=(),
+        )
 
         evidence = optimizer._build_parameter_stability_evidence(
             FakeStudy(),
@@ -181,7 +184,9 @@ class OptimizerHardeningTests(unittest.TestCase):
             ]
 
         optimizer = OptunaTPEOptimizer(OptunaConfig(), None, None, None)
-        param_space = ParameterSpace({"a": [1, 2, 3], "b": [10, 20, 30]}, {})
+        param_space = ParameterSpace(
+            {"a": [1, 2, 3], "b": [10, 20, 30]}, {"a": 2, "b": 20}, coupled_groups=(),
+        )
 
         evidence = optimizer._build_parameter_stability_evidence(
             FakeStudy(),
@@ -1005,13 +1010,6 @@ class OptimizerHardeningTests(unittest.TestCase):
                 {"r_multiple": 0.4},
             ],
         }
-        stress_result = {
-            "total_trades": 3,
-            "profit_factor": 1.05,
-            "total_return_pct": 1.0,
-            "max_drawdown_pct": 1.5,
-        }
-
         first = optimizer._build_oos_evidence_record(
             "EURUSD",
             "H1",
@@ -1019,8 +1017,6 @@ class OptimizerHardeningTests(unittest.TestCase):
             val_result,
             features,
             val_warmup_bars=1,
-            stress_result=stress_result,
-            stress_mode="stress_p95",
         )
         second = optimizer._build_oos_evidence_record(
             "EURUSD",
@@ -1039,7 +1035,7 @@ class OptimizerHardeningTests(unittest.TestCase):
             val_warmup_bars=1,
         )
 
-        self.assertEqual(first["format_version"], "oos_candidate_returns_v4")
+        self.assertEqual(first["format_version"], "oos_candidate_returns_v5")
         self.assertEqual(first["candidate_id"], second["candidate_id"])
         self.assertNotEqual(first["candidate_id"], other_regime["candidate_id"])
         self.assertEqual(first["regime"], "TREND")
@@ -1057,15 +1053,13 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(first["trade_path_evidence"]["trade_count"], 3)
         self.assertEqual(first["equity_path_evidence"]["status"], "available")
         self.assertIn("capital_preservation_blocks", first["equity_path_evidence"])
-        self.assertEqual(first["execution_cost_survival"]["status"], "available")
-        self.assertEqual(first["execution_cost_survival"]["stress_mode"], "stress_p95")
-        self.assertAlmostEqual(first["execution_cost_survival"]["return_retention"], 0.5)
+        self.assertNotIn("execution_cost_survival", first)
         self.assertEqual(first["parameter_stability_evidence"]["status"], "available")
         self.assertAlmostEqual(
             first["parameter_stability_evidence"]["nearest_neighbor_median_score_ratio"],
             0.91,
         )
-        self.assertEqual(second["execution_cost_survival"]["status"], "not_requested")
+        self.assertNotIn("execution_cost_survival", second)
         self.assertEqual(second["parameter_stability_evidence"]["status"], "available")
 
     def test_oos_evidence_trims_warmup_equity_prefix(self):
@@ -1151,28 +1145,8 @@ class OptimizerHardeningTests(unittest.TestCase):
         self.assertEqual(record["period_returns"], [0.0] * 5)
         self.assertEqual(record["metrics"]["total_trades"], 0)
         self.assertEqual(record["trade_path_evidence"]["status"], "no_trades")
-        self.assertEqual(record["execution_cost_survival"]["status"], "not_requested")
+        self.assertNotIn("execution_cost_survival", record)
         self.assertEqual(record["parameter_stability_evidence"]["status"], "not_available")
-
-    def test_execution_cost_survival_marks_capped_and_error_explicitly(self):
-        cfg = PipelineConfig(oos_evidence_export_enabled=True)
-        optimizer = RegimeOptimizer(cfg)
-        baseline = {"total_return_pct": 5.0, "profit_factor": 1.5, "max_drawdown_pct": 2.0}
-
-        capped = optimizer._execution_cost_survival_evidence(
-            baseline,
-            {"status": "capped"},
-            "stress_p95",
-        )
-        errored = optimizer._execution_cost_survival_evidence(
-            baseline,
-            {"status": "error", "error": "boom"},
-            "stress_p95",
-        )
-
-        self.assertEqual(capped["status"], "capped")
-        self.assertEqual(errored["status"], "error")
-        self.assertIn("boom", errored["error"])
 
     def test_oos_evidence_attach_collects_final_candidate_records(self):
         class FakeStrategy:
@@ -1201,7 +1175,6 @@ class OptimizerHardeningTests(unittest.TestCase):
             oos_evidence_export_enabled=True,
             oos_evidence_periods=5,
             oos_evidence_min_periods=2,
-            oos_evidence_include_execution_cost_survival=False,
         )
         optimizer = RegimeOptimizer(cfg)
         backtester = FakeBacktester()
@@ -1230,8 +1203,7 @@ class OptimizerHardeningTests(unittest.TestCase):
         )
 
         self.assertIn("oos_evidence", candidate)
-        self.assertIn("selection_execution_cost_survival", candidate)
-        self.assertEqual(candidate["selection_execution_cost_survival"]["status"], "not_requested")
+        self.assertNotIn("selection_execution_cost_survival", candidate)
         records = optimizer.consume_oos_candidate_evidence()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["strategy_name"], "FakeEvidenceStrategy")
@@ -1605,6 +1577,9 @@ class OptimizerHardeningTests(unittest.TestCase):
             def get_params(self):
                 return dict(self.params)
 
+            def get_param_couplings(self):
+                return ()
+
             def get_param_grid(self):
                 return {
                     "sl_atr_mult": [1.0, 2.0, 3.0],
@@ -1752,6 +1727,9 @@ class OptimizerHardeningTests(unittest.TestCase):
             def get_params(self):
                 return {"p": self.p}
 
+            def get_param_couplings(self):
+                return ()
+
             def generate_signals(self, features, symbol):
                 return pd.Series([1] * len(features), index=features.index)
 
@@ -1837,13 +1815,16 @@ class OptimizerHardeningTests(unittest.TestCase):
             name = "Fake"
 
             def __init__(self, **params):
-                self.params = params
+                self.params = {"p": 1, **params}
 
             def get_default_params(self):
                 return {"p": 1}
 
             def get_params(self):
                 return dict(self.params)
+
+            def get_param_couplings(self):
+                return ()
 
             def generate_signals(self, features, symbol):
                 return pd.Series([1] * len(features), index=features.index)
@@ -1922,13 +1903,16 @@ class OptimizerHardeningTests(unittest.TestCase):
             name = "Fake"
 
             def __init__(self, **params):
-                self.params = params
+                self.params = {"p": 1, **params}
 
             def get_default_params(self):
                 return {"p": 1}
 
             def get_params(self):
                 return dict(self.params)
+
+            def get_param_couplings(self):
+                return ()
 
             def generate_signals(self, features, symbol):
                 return pd.Series([1] * len(features), index=features.index)
@@ -1986,6 +1970,9 @@ class OptimizerHardeningTests(unittest.TestCase):
 
             def get_params(self):
                 return {"p": self.p}
+
+            def get_param_couplings(self):
+                return ()
 
             def generate_signals(self, features, symbol):
                 return pd.Series(1, index=features.index, dtype=int)

@@ -71,6 +71,9 @@ class _PrefixStateStrategy:
     def get_param_grid(self):
         return {"variant": [1]}
 
+    def get_param_couplings(self):
+        return ()
+
     def generate_signals(self, features: pd.DataFrame, _symbol: str) -> pd.Series:
         armed = features["Arm"].fillna(0).cumsum().gt(0)
         return (armed & features["Trigger"].fillna(False)).astype(int)

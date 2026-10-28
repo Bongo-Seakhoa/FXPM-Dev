@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPO / "tools"))
 
 from pm_core import DataLoader, FeatureComputer, Backtester, get_instrument_spec
 from pm_strategies import StrategyRegistry
+from pm_current_refit_parameters import build_parameter_domain, parameter_domain_point
 from benchmark import build_config, _git_head, is_fx
 
 # Representative FX-led pool + one of each non-FX class for coverage.
@@ -34,13 +35,11 @@ def _resampled(loader, symbol, tf):
     return _RESAMPLE_CACHE[key]
 
 
-def _sample_grid(grid, n, seed):
-    keys = list(grid.keys())
-    combos = list(itertools.product(*[grid[k] for k in keys]))
+def _sample_grid(domain, n, seed):
     rng = random.Random(seed)
-    if len(combos) > n:
-        combos = rng.sample(combos, n)
-    return [dict(zip(keys, c)) for c in combos]
+    count = domain["point_count"]
+    ordinals = range(count) if count <= n else rng.sample(range(count), n)
+    return [parameter_domain_point(domain, ordinal) for ordinal in ordinals]
 
 
 def _run(cfg, loader, name, params, symbol, tfs):
@@ -73,8 +72,10 @@ def screen(name, cfg, loader, pool, samples, seed, tfs):
     A genuine edge should be profitable across a meaningful FRACTION of reasonable params/
     symbols with median PF >= 1 (robustness), not just in a best-of-N outlier. Promotion still
     requires full re-opt + holdout + global-family DSR/PBO (see audit C3)."""
-    grid = StrategyRegistry.get(name).get_param_grid()
-    param_sets = _sample_grid(grid, samples, seed)
+    strategy = StrategyRegistry.get(name)
+    domain = build_parameter_domain(strategy.get_default_params(), strategy.get_param_grid(),
+        coupled_groups=strategy.get_param_couplings())
+    param_sets = _sample_grid(domain, samples, seed)
     pfs, profitable, best = [], 0, None
     for params in param_sets:
         for symbol in pool:

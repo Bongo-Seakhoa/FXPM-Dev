@@ -475,7 +475,7 @@ def test_demo_pre_send_uses_authorized_identity_not_data_account_pin():
     assert error is None
 
 
-def test_paper_preflight_is_demo_readiness_only_and_never_starts_trading(
+def test_mt5_demo_preflight_is_demo_readiness_only_and_never_starts_trading(
     tmp_path, monkeypatch
 ):
     observed = {}
@@ -535,7 +535,7 @@ def test_paper_preflight_is_demo_readiness_only_and_never_starts_trading(
         pm_main,
         "validate_live_readiness",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("funded readiness must not run for --preflight --paper")
+            AssertionError("funded readiness must not run for --preflight --mt5-demo")
         ),
     )
     monkeypatch.setattr(
@@ -549,7 +549,7 @@ def test_paper_preflight_is_demo_readiness_only_and_never_starts_trading(
             "--config",
             str(config_path),
             "--preflight",
-            "--paper",
+            "--mt5-demo",
         ],
     )
 
@@ -564,6 +564,51 @@ def test_paper_preflight_is_demo_readiness_only_and_never_starts_trading(
         pm_main.LiveTrader._current_refit_demo_account_block_reason(_demo_account())
         is None
     )
+
+
+@pytest.fixture
+def forbidden_paper_runtime(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Destination refusal must precede configuration, app and MT5 access")
+
+    for name in ("load_config_json", "FXPortfolioManagerApp", "MT5Connector"):
+        monkeypatch.setattr(pm_main, name, forbidden)
+    monkeypatch.setattr(pm_main, "MT5_AVAILABLE", True)
+
+
+@pytest.mark.parametrize("arguments,supervised_generation", [
+    (["--paper"], None),
+    (["--preflight", "--paper"], None),
+    (["--paper"], "LABELLED_SYNTHETIC_SUPERVISED_CHILD"),
+])
+def test_local_paper_refuses_before_configuration_application_or_broker(
+    forbidden_paper_runtime, capsys, arguments, supervised_generation,
+):
+    assert pm_main.main(
+        arguments, _supervised_generation_id=supervised_generation,
+    ) == 2
+    message = capsys.readouterr().out
+    assert "Refusing --paper" in message
+    assert "local-ledger paper trading is not available" in message
+    assert "--mt5-demo" in message and "MT5 DEMO account" in message
+
+
+def test_local_paper_and_mt5_demo_destinations_are_mutually_exclusive(
+    forbidden_paper_runtime, capsys,
+):
+    with pytest.raises(SystemExit) as caught:
+        pm_main.main(["--paper", "--mt5-demo"])
+    assert caught.value.code == 2
+    message = capsys.readouterr().err
+    assert "--paper" in message and "--mt5-demo" in message
+
+
+def test_mt5_demo_preserves_supervised_child_scope_refusal(forbidden_paper_runtime):
+    with pytest.raises(ValueError, match="PRODUCTION_SUPERVISOR_CHILD_SCOPE_INVALID"):
+        pm_main.main(
+            ["--optimize", "--trade", "--mt5-demo"],
+            _supervised_generation_id="LABELLED_SYNTHETIC_SUPERVISED_CHILD",
+        )
 
 
 def test_bounded_paper_preflight_fails_closed_and_disconnects_on_probe_error(

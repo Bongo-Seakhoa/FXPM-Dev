@@ -50,20 +50,20 @@ def test_partial_legs_become_one_flat_to_flat_position() -> None:
     assert event["entry_event_order"] < event["exit_event_order"]
 
 
-def test_base_and_cost_stress_keep_position_identity() -> None:
+def test_base_and_cost_ladder_keep_position_identity() -> None:
     base = [_leg()]
-    stress = [deepcopy(base[0])]
-    stress[0]["pnl_dollars"] = 9.0
+    ladder = [deepcopy(base[0])]
+    ladder[0]["pnl_dollars"] = 9.0
 
     base_event = build_backtest_position_events(
         base, namespace="EURUSD|M5|alpha"
     )[0]
-    stress_event = build_backtest_position_events(
-        stress, namespace="EURUSD|M5|alpha"
+    ladder_event = build_backtest_position_events(
+        ladder, namespace="EURUSD|M5|alpha"
     )[0]
 
-    assert base_event["position_id"] == stress_event["position_id"]
-    assert base_event["pnl_dollars"] != stress_event["pnl_dollars"]
+    assert base_event["position_id"] == ladder_event["position_id"]
+    assert base_event["pnl_dollars"] != ladder_event["pnl_dollars"]
 
 
 def test_events_are_in_canonical_close_order() -> None:

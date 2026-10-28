@@ -68,6 +68,7 @@ def test_direct_override_matches_identical_file_loaded_surface(tmp_path):
         "REGIME_STRENGTH",
         "REGIME_STRENGTH_LIVE",
         "REGIME_GAP",
+        "REGIME_RAW_STRENGTH", "REGIME_RAW_STRENGTH_LIVE", "REGIME_WARMUP",
     ):
         pd.testing.assert_series_equal(file_loaded[column], direct[column])
 
@@ -161,6 +162,20 @@ def test_direct_override_uses_raw_canonical_detector_periods():
     expected = MarketRegimeDetector(params).compute_regime_scores(bars)
     for column in FeatureComputer._REGIME_FEATURE_COLUMNS:
         pd.testing.assert_series_equal(direct[column], expected[column])
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_invalid_ohlc_cannot_silently_remove_regime_admission(override):
+    bars = _bars()
+    bars.loc[bars.index[-1], "Open"] = bars["High"].iloc[-1] + 1.0
+    params = RegimeParams()
+    kwargs = (
+        {"regime_params_override": params,
+         "regime_params_sha256": regime_params_sha256(params.to_dict())}
+        if override else {}
+    )
+    with pytest.raises(ValueError, match="OHLC"):
+        FeatureComputer.compute_all(bars, symbol="EURUSD", timeframe="H1", **kwargs)
 
 
 def test_direct_override_never_uses_disk_cache(tmp_path):
