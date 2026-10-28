@@ -12690,6 +12690,211 @@ def _production_hard_supervision_required(
     )
 
 
+_DECLARED_RND_REPORT_SCHEMA = "fxpm.declared-rnd-launcher-report.v1"
+_DECLARED_RND_CONTRACT_MAX_BYTES = 32 * 1024**2
+
+
+def _declared_rnd_read_json(path: Path) -> Any:
+    """Read the explicit R&D input without accepting ambiguous JSON."""
+    def unique_keys(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("DECLARED_RND_DUPLICATE_JSON_KEY")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value):
+        raise ValueError("DECLARED_RND_NONFINITE_JSON")
+
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("DECLARED_RND_INPUT_NOT_REGULAR")
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        if before.st_size > _DECLARED_RND_CONTRACT_MAX_BYTES:
+            raise ValueError("DECLARED_RND_JSON_TOO_LARGE")
+        raw = stream.read(_DECLARED_RND_CONTRACT_MAX_BYTES + 1)
+        after = os.fstat(stream.fileno())
+    if (len(raw) > _DECLARED_RND_CONTRACT_MAX_BYTES
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+        raise ValueError("DECLARED_RND_INPUT_CHANGED_OR_TOO_LARGE")
+    return json.loads(raw.decode("utf-8"), object_pairs_hook=unique_keys,
+                      parse_constant=invalid_constant)
+
+
+def _declared_rnd_write_report(path: Path, body: Mapping[str, Any]) -> None:
+    """Publish one latest report atomically; immutable cell receipts stay separate."""
+    import tempfile
+
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=True, allow_nan=False).encode("ascii") + b"\n"
+    if len(encoded) > _DECLARED_RND_CONTRACT_MAX_BYTES:
+        raise ValueError("DECLARED_RND_REPORT_TOO_LARGE")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp",
+                                dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if path.is_symlink():
+            raise ValueError("DECLARED_RND_REPORT_SYMLINK_REFUSED")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _run_declared_rnd_contract(
+    contract_path: Any,
+    report_path: Any,
+    *,
+    requested_workers: int = 0,
+    _worker: Any = None,
+) -> int:
+    """Own the report and telemetry for one dispatcher invocation."""
+    from pm_storage import _exclusive_file_lock
+
+    try:
+        supplied = Path(report_path)
+        if supplied.is_symlink():
+            raise ValueError("DECLARED_RND_REPORT_SYMLINK_REFUSED")
+        report = supplied.resolve()
+        if report.suffix.lower() != ".json":
+            raise ValueError("DECLARED_RND_REPORT_JSON_REQUIRED")
+        lock_path = report.with_name(report.name + ".lock")
+        if lock_path.is_symlink():
+            raise ValueError("DECLARED_RND_REPORT_LOCK_SYMLINK_REFUSED")
+    except (OSError, ValueError, TypeError) as exc:
+        print("Refusing declared R&D report: " + str(exc))
+        return 2
+    try:
+        # The existing kernel-backed lock also survives an interrupted writer.
+        # Ownership is checked inside it before either output can be changed.
+        with _exclusive_file_lock(lock_path, timeout_seconds=0):
+            return _run_declared_rnd_contract_locked(
+                contract_path, report, requested_workers=requested_workers, _worker=_worker)
+    except TimeoutError:
+        print("Declared R&D report is busy: " + str(report))
+        return 2
+    except OSError as exc:
+        print("Cannot own declared R&D report: " + type(exc).__name__)
+        return 3
+
+
+def _run_declared_rnd_contract_locked(
+    contract_path: Any,
+    report_path: Any,
+    *,
+    requested_workers: int = 0,
+    _worker: Any = None,
+) -> int:
+    """Launch the existing historical cell dispatcher, with no trading authority.
+
+    The optional worker is an internal assurance seam. The CLI always uses the
+    real declared worker and cannot select or import a worker from its input.
+    """
+    import pm_historical_scheduler as scheduler
+
+    authority = {name: False for name in (
+        "qualification_authority", "capital_authority", "live_authority", "order_authority")}
+    try:
+        if type(requested_workers) is not int or requested_workers < 0:
+            raise ValueError("DECLARED_RND_WORKERS_INVALID")
+        supplied_report = Path(report_path)
+        if supplied_report.is_symlink():
+            raise ValueError("DECLARED_RND_REPORT_SYMLINK_REFUSED")
+        source = Path(contract_path).resolve(strict=True)
+        report = supplied_report.resolve()
+        if report.suffix.lower() != ".json":
+            raise ValueError("DECLARED_RND_REPORT_JSON_REQUIRED")
+        telemetry = report.with_suffix(".telemetry.jsonl")
+        if source in (report, telemetry):
+            raise ValueError("DECLARED_RND_OUTPUT_INPUT_COLLISION")
+        contract = _declared_rnd_read_json(source)
+        if type(contract) is not dict:
+            raise ValueError("DECLARED_RND_CONTRACT_NOT_OBJECT")
+        active_config = contract.get("active_config_path")
+        if type(active_config) is str and Path(active_config).resolve() in (report, telemetry):
+            raise ValueError("DECLARED_RND_OUTPUT_CONFIG_COLLISION")
+        contract_bytes = json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=True, allow_nan=False).encode("ascii")
+        contract_sha = hashlib.sha256(contract_bytes).hexdigest()
+        owned_report = report.exists()
+        if owned_report:
+            prior = _declared_rnd_read_json(report)
+            if (type(prior) is not dict
+                    or prior.get("schema_version") != _DECLARED_RND_REPORT_SCHEMA
+                    or prior.get("contract_sha256") != contract_sha
+                    or any(prior.get(name) is not False for name in authority)):
+                raise ValueError("DECLARED_RND_REPORT_DIFFERENT_OWNER")
+        if telemetry.is_symlink():
+            raise ValueError("DECLARED_RND_TELEMETRY_SYMLINK_REFUSED")
+        if telemetry.exists() and (not owned_report or not telemetry.is_file()):
+            raise ValueError("DECLARED_RND_TELEMETRY_DIFFERENT_OWNER")
+    except (OSError, ValueError, TypeError) as exc:
+        print("Refusing declared R&D input: " + str(exc))
+        return 2
+
+    body = {
+        "schema_version": _DECLARED_RND_REPORT_SCHEMA,
+        "operation": "DECLARED_HISTORICAL_RND",
+        "status": "RUNNING",
+        "contract_sha256": contract_sha,
+        "contract_path": str(source),
+        "telemetry_path": str(telemetry),
+        "requested_workers": requested_workers,
+        "started_utc": datetime.now(timezone.utc).isoformat(),
+        "dispatch_report": None,
+        "error_code": None,
+        **authority,
+    }
+    try:
+        _declared_rnd_write_report(report, body)
+    except (OSError, ValueError, TypeError) as exc:
+        print("Cannot publish declared R&D report: " + type(exc).__name__)
+        return 3
+
+    code = 1
+    try:
+        arguments = {"contract": contract, "telemetry_path": telemetry,
+                     "requested_workers": requested_workers}
+        if _worker is not None:
+            arguments["worker"] = _worker
+        body["dispatch_report"] = scheduler.run_declared_symbol_scheduler(**arguments)
+        body["status"] = "COMPLETED"
+        code = 0
+    except scheduler.DeclaredSymbolSchedulerError as exc:
+        body.update(status="FAILED", dispatch_report=exc.report, error_code=exc.code)
+    except KeyboardInterrupt:
+        body.update(status="INTERRUPTED", error_code="KEYBOARD_INTERRUPT")
+        code = 130
+    except Exception as exc:
+        body.update(status="FAILED", error_code=getattr(exc, "code", type(exc).__name__))
+    body["finished_utc"] = datetime.now(timezone.utc).isoformat()
+    try:
+        _declared_rnd_write_report(report, body)
+    except (OSError, ValueError, TypeError) as exc:
+        print("Cannot publish final declared R&D report: " + type(exc).__name__)
+        return 3
+    print("Declared R&D dispatch " + body["status"].lower() + "; report: " + str(report))
+    return code
+
+
+def _declared_rnd_main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(prog="pm_main.py declared-rnd",
+        description="Run a saved historical R&D cell contract through the rolling symbol dispatcher.")
+    parser.add_argument("--contract", required=True, help="Saved declared R&D contract JSON")
+    parser.add_argument("--report", required=True, help="Latest dispatch report JSON")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Requested symbol workers (0 uses the existing resource policy)")
+    args = parser.parse_args(list(argv))
+    return _run_declared_rnd_contract(args.contract, args.report,
+                                      requested_workers=args.workers)
+
+
 def main(
     argv: Optional[Sequence[str]] = None,
     *,
@@ -12697,6 +12902,12 @@ def main(
 ):
     """Main entry point."""
     global _app_instance
+
+    command_argv = sys.argv[1:] if argv is None else argv
+    if isinstance(command_argv, Sequence) and command_argv and command_argv[0] == "declared-rnd":
+        if _supervised_generation_id is not None:
+            raise ValueError("PRODUCTION_SUPERVISOR_CHILD_SCOPE_INVALID")
+        return _declared_rnd_main(command_argv[1:])
 
     parser = argparse.ArgumentParser(
         description="FX Portfolio Manager - Automated Trading System"
