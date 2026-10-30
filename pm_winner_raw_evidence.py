@@ -1683,16 +1683,33 @@ class _PartitionCostIndex:
     partition_bytes: bytes
     precommitments: Mapping[str, Any]
     rows_by_fold: Mapping[tuple[int, int], list[Mapping[str, Any]]]
+    attempt_ledger: Optional[Mapping[str, Any]] = None
+    source_inputs: Any = None
 
 
 def _index_partition_cost_precommitments(
     frozen: FrozenWinnerSearchPlan, validated: Mapping[str, Any],
+    *, attempt_ledger: Optional[Mapping[str, Any]] = None,
 ) -> _PartitionCostIndex:
     rows_by_fold: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
     for row in validated["rows"]:
         rows_by_fold.setdefault((row["attempt_ordinal"], row["fold_ordinal"]), []).append(row)
     return _PartitionCostIndex(
-        frozen, frozen.partition_cost_precommitments_bytes, validated, rows_by_fold)
+        frozen, frozen.partition_cost_precommitments_bytes, validated, rows_by_fold,
+        frozen.attempt_ledger if attempt_ledger is None else attempt_ledger,
+        _SourceObservationInputs(frozen))
+
+
+
+def _owned_attempt_ledger(frozen, partition_cost_index):
+    if partition_cost_index is None:
+        return frozen.attempt_ledger
+    if (type(partition_cost_index) is not _PartitionCostIndex
+            or partition_cost_index.frozen is not frozen
+            or partition_cost_index.partition_bytes != frozen.partition_cost_precommitments_bytes):
+        _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
+    return (frozen.attempt_ledger if partition_cost_index.attempt_ledger is None
+            else partition_cost_index.attempt_ledger)
 
 
 def _selected_partition_cost_precommitments(
@@ -4110,9 +4127,69 @@ def verify_source_observation_reference_closure(context: Any, *, frozen: FrozenW
         _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
 
 
+
+def _open_source_observation_native(carrier, *, sink, symbol):
+    import pm_native_prefix_production as native
+    try:
+        product = native.verify_activated_native_prefix(data_dir=Path(carrier["data_dir"]), context=sink.context,
+            index_descriptor=carrier["index_descriptor"], expected_index_sha256=carrier["index_sha256"],
+            expected_symbol=symbol, expected_timeframe=carrier["timeframe"], expected_cutoff_utc=carrier["cutoff_utc"],
+            expected_activation_manifest_sha256=carrier["activation_manifest_sha256"],
+            production_contract_required=carrier["production_contract_required"], require_current_activation=False)
+        return product, native.open_verified_prefix_frame(product)
+    except (native.NativePrefixError, TypeError, ValueError, OSError, KeyError) as exc:
+        raise WinnerRawEvidenceError("SOURCE_OBSERVATION_NATIVE_REOPEN_FAILED") from exc
+
+
+class _SourceObservationInputs:
+    """One Raw invocation's verified source; never a caller-provided frame."""
+
+    def __init__(self, frozen):
+        self._frozen = frozen
+        self._entry = None
+        self._axes = {}
+
+    def _require(self, frozen, sink):
+        if frozen is not self._frozen or sink.context.context_sha256 != frozen.generation_context_sha256:
+            _fail("SOURCE_OBSERVATION_INPUT_OWNER_MISMATCH")
+
+    def open(self, carrier, *, frozen, sink):
+        self._require(frozen, sink)
+        key = _canonical_bytes(dict(carrier))
+        if self._entry is not None and key == self._entry[0]:
+            return self._entry[1], self._entry[2]
+        product, frame = _open_source_observation_native(carrier, sink=sink, symbol=frozen.symbol)
+        if self._entry is None:
+            self._entry = (key, product, frame)
+        return product, frame
+
+    def align(self, target, fine, source_timeframe, carrier):
+        key = (_canonical_bytes(dict(carrier)), source_timeframe, str(target.tz), target.asi8.tobytes())
+        if self._entry is None or key[0] != self._entry[0]:
+            return align_prior_completed_spreads(target, fine, source_timeframe, include_matched_closes=True)
+        if fine is not self._entry[2]:
+            _fail("SOURCE_OBSERVATION_INPUT_OWNER_MISMATCH")
+        if key not in self._axes:
+            values = align_prior_completed_spreads(target, fine, source_timeframe, include_matched_closes=True)
+            if len(self._axes) >= 12:
+                del self._axes[next(iter(self._axes))]
+            self._axes[key] = values
+        return self._axes[key]
+
+    def finish(self, *, frozen, sink):
+        self._require(frozen, sink)
+        carrier = None if self._entry is None else json.loads(self._entry[0].decode("ascii"))
+        # Release retained bulk input before the independent publication reopen.
+        self._entry = None
+        self._axes.clear()
+        if carrier is not None:
+            _open_source_observation_native(carrier, sink=sink, symbol=frozen.symbol)
+
+
 def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySink,
         frozen: FrozenWinnerSearchPlan, expected_sha256: str, partition: str,
-        signals: Mapping[str, Any], lanes: Mapping[str, Any]) -> dict[str, Any]:
+        signals: Mapping[str, Any], lanes: Mapping[str, Any],
+    source_inputs: Optional[_SourceObservationInputs] = None) -> dict[str, Any]:
     import numpy as np
     import pm_native_prefix_production as native
 
@@ -4133,15 +4210,12 @@ def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySi
             or type(carrier["production_contract_required"]) is not bool
             or carrier["symbol"] != frozen.symbol or carrier["timeframe"] != body["source_timeframe"]):
         _fail("SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID")
-    try:
-        product = native.verify_activated_native_prefix(data_dir=Path(carrier["data_dir"]), context=sink.context,
-            index_descriptor=carrier["index_descriptor"], expected_index_sha256=carrier["index_sha256"],
-            expected_symbol=frozen.symbol, expected_timeframe=carrier["timeframe"], expected_cutoff_utc=carrier["cutoff_utc"],
-            expected_activation_manifest_sha256=carrier["activation_manifest_sha256"],
-            production_contract_required=carrier["production_contract_required"], require_current_activation=False)
-        fine = native.open_verified_prefix_frame(product)
-    except (native.NativePrefixError, TypeError, ValueError, OSError, KeyError) as exc:
-        raise WinnerRawEvidenceError("SOURCE_OBSERVATION_NATIVE_REOPEN_FAILED") from exc
+    if source_inputs is None:
+        product, fine = _open_source_observation_native(carrier, sink=sink, symbol=frozen.symbol)
+    else:
+        if type(source_inputs) is not _SourceObservationInputs:
+            _fail("SOURCE_OBSERVATION_INPUT_OWNER_MISMATCH")
+        product, fine = source_inputs.open(carrier, frozen=frozen, sink=sink)
     rows = body["observations"]
     if type(rows) is not list or not 1 <= len(rows) <= MAX_SIGNAL_VECTOR_OBSERVATIONS:
         _fail("SOURCE_OBSERVATION_ROSTER_INVALID")
@@ -4153,7 +4227,8 @@ def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySi
         _fail("SOURCE_OBSERVATION_VALUE_INVALID")
     try:
         target = pd.DatetimeIndex([row["target_open_utc"] for row in rows])
-        observations, matched = align_prior_completed_spreads(target, fine, body["source_timeframe"], include_matched_closes=True)
+        observations, matched = (align_prior_completed_spreads(target, fine, body["source_timeframe"], include_matched_closes=True)
+            if source_inputs is None else source_inputs.align(target, fine, body["source_timeframe"], carrier))
     except (TypeError, ValueError, KeyError, OverflowError) as exc:
         raise WinnerRawEvidenceError("SOURCE_OBSERVATION_AXIS_INVALID") from exc
     rebuilt_rows = [{"target_open_utc": _utc_second(stamp.isoformat(), "SOURCE_OBSERVATION_AXIS_INVALID"),
@@ -4421,7 +4496,7 @@ def _validated_provenance(
         or trial.get("attempt_roster_sha256")
         != cross_binding["horizon_roster"].get("attempt_roster_sha256")
         or trial.get("attempted_trials_exact")
-        != frozen.attempt_ledger.get("attempt_count")
+        != _owned_attempt_ledger(frozen, partition_cost_index).get("attempt_count")
     ):
         _fail("TRIAL_LEDGER_PROVENANCE_SPLICE")
     _hex(
@@ -4515,7 +4590,8 @@ def _validated_provenance(
                     source_observation_entries[source_entry["artifact_id"]] = source_entry
             _validated_source_observation_receipt(observation_receipt, sink=sink, frozen=frozen,
                 expected_sha256=precommit_row["source_observation_receipt_sha256"], partition=partition,
-                signals=signal, lanes=lanes)
+                signals=signal, lanes=lanes,
+                source_inputs=None if partition_cost_index is None else partition_cost_index.source_inputs)
             for tier, result in tier_results.items():
                 expected = precommit_row["tiers"][tier]
                 admission = result["spread_admission"]
@@ -4832,7 +4908,7 @@ def _build_evaluated_fold(
         opens, closes, ids, open_orders, close_orders, trade_r = _tier_event_vectors(final["position_events"], fold_start=start, fold_end_exclusive=end)
         if sum((Decimal(str(value)) for value in daily), Decimal(0)) != sum((Decimal(str(value)) for value in trade_r), Decimal(0)):
             _fail("TIER_DAILY_TRADE_ACCOUNTING_MISMATCH")
-        decisions = _power_chain(attempt_ledger=frozen.attempt_ledger, train=lanes["optimizer_train_" + tier.lower()],
+        decisions = _power_chain(attempt_ledger=_owned_attempt_ledger(frozen, partition_cost_index), train=lanes["optimizer_train_" + tier.lower()],
             tuning=lanes["tuning_validation_" + tier.lower()], final=final, frozen=frozen, tier=tier)
         for decision in decisions:
             if decision is not None and not decision.passed and _power_status(decision) == "TECHNICAL_FAILURE":
@@ -4844,7 +4920,7 @@ def _build_evaluated_fold(
         activity_entry = _put_ascii_json(sink, prefix + "/" + tier.lower() + "/position-activity", "winner_position_activity_ledger", activity)
         entries[tier.lower() + "-position-activity"] = activity_entry
         entries[tier.lower() + "-daily-surface"] = _put_ascii_json(sink, prefix + "/" + tier.lower() + "/daily-r-surface", "winner_daily_r_surface", surface)
-        binding = _fold_power_binding(attempt_ledger=frozen.attempt_ledger, train=decisions[0], final=decisions[2]) if all(decision is not None and decision.passed for decision in decisions) else None
+        binding = _fold_power_binding(attempt_ledger=_owned_attempt_ledger(frozen, partition_cost_index), train=decisions[0], final=decisions[2]) if all(decision is not None and decision.passed for decision in decisions) else None
         order_anchor, open_offsets, close_offsets = winner._encode_event_order_offsets(open_orders, close_orders, "TIER_TRADE_EVENT_ORDER_INVALID")
         level = next(item for item in frozen.frozen_tier_pair_contract["tiers"] if item["tier"] == tier)
         row = {"spread_tier": tier, "source_contract_sha256": _validated_source_identity(frozen.source_contract_seeds[tier]),
@@ -5424,7 +5500,8 @@ def _produce_winner_raw_evidence(
             or receipt.get("precommitment_sha256") != _sha_json(precommitment)
             or receipt.get("attempt_ledger_sha256") != _sha_json(attempt_ledger)):
         _fail("FROZEN_PARTITION_COST_BINDING_INVALID")
-    partition_cost_index = _index_partition_cost_precommitments(frozen, partition_precommits)
+    partition_cost_index = _index_partition_cost_precommitments(
+        frozen, partition_precommits, attempt_ledger=attempt_ledger)
     attempt_bundles = _verified_frozen_attempt_bundle(frozen=frozen, attempt_ledger=attempt_ledger, frozen_receipt=receipt)
     receipt = _reopen_current_frozen_plan_artifacts(sink, frozen=frozen, precommitment=precommitment,
         attempt_ledger=attempt_ledger, source_seeds=source_seeds, pair_contract=pair_contract,
@@ -5646,6 +5723,7 @@ def _produce_winner_raw_evidence(
         "evidence_scope": "PROCESS_LEVEL_ONLY",
         "parameter_evidence_inherited": False,
     }
+    partition_cost_index.source_inputs.finish(frozen=frozen, sink=sink)
     request_builder = (winner.create_winner_selection_request_v16 if _generation is winner.V16_GENERATION
         else winner.create_winner_selection_request)
     try:
