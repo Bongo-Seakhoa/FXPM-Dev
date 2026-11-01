@@ -241,6 +241,10 @@ _CURRENT_FROZEN_ARTIFACT_TYPES = {
     "trade_power_policy": "winner_trade_power_policy",
     "multiplicity_receipt": "winner_trade_power_multiplicity",
 }
+_BOUND_FIT_FROZEN_ARTIFACT_TYPES = {
+    **_CURRENT_FROZEN_ARTIFACT_TYPES,
+    "bound_fitted_state": "winner_bound_fitted_state",
+}
 
 
 
@@ -2447,7 +2451,25 @@ class HistoricalSymbolSearchCapture:
         attempts = frozen.attempt_ledger.get("attempts")
         if type(attempts) is not list:
             _fail("WINNER_FROZEN_ATTEMPT_ROSTER_INVALID")
-        if receipt.get("schema_version") in {raw_winner.CURRENT_FROZEN_PLAN_SCHEMA, raw_winner.V16_FROZEN_PLAN_SCHEMA}:
+        if receipt.get("schema_version") in {
+            raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA,
+            raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA,
+        }:
+            if type(self) is not DeclaredSlotSearchCapture:
+                _fail("BOUND_FIT_CANARY_OR_LEGACY_CAPTURE_FORBIDDEN")
+            _verify_declared_slot_capture(self)
+            expected_schema = (
+                raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA
+                if self._winner_generation is winner_selection.V16_GENERATION
+                else raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA
+            )
+            if receipt.get("schema_version") != expected_schema:
+                _fail("WINNER_FROZEN_RECEIPT_SCHEMA_INVALID")
+            reference = frozen.bound_fitted_state_entry
+            if type(reference) is not dict or not reference:
+                _fail("BOUND_FIT_DECLARED_ENTRY_REQUIRED")
+            artifact_types = _BOUND_FIT_FROZEN_ARTIFACT_TYPES
+        elif receipt.get("schema_version") in {raw_winner.CURRENT_FROZEN_PLAN_SCHEMA, raw_winner.V16_FROZEN_PLAN_SCHEMA}:
             artifact_types = _CURRENT_FROZEN_ARTIFACT_TYPES
         elif receipt.get("schema_version") == raw_winner.ARCHIVED_FROZEN_PLAN_SCHEMA:
             artifact_types = _FROZEN_ARTIFACT_TYPES
@@ -2872,6 +2894,7 @@ class HistoricalSymbolSearchCapture:
         frozen_tier_pair_contract: Mapping[str, Any],
         partition_cost_precommitments: Mapping[str, Any],
         risk_unit_contract: Mapping[str, Any],
+        bound_fitted_state_entry=None,
     ) -> FrozenHistoricalCell:
         """Freeze the complete cell roster before raw evidence access."""
 
@@ -2909,6 +2932,14 @@ class HistoricalSymbolSearchCapture:
         )
         transport = getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
         freeze = raw_winner.freeze_winner_search_plan_v5 if transport else raw_winner.freeze_winner_search_plan_v4
+        if type(self) is DeclaredSlotSearchCapture and (
+            type(bound_fitted_state_entry) is not dict or not bound_fitted_state_entry
+        ):
+            _fail("BOUND_FIT_DECLARED_ENTRY_REQUIRED")
+        if bound_fitted_state_entry is not None:
+            if type(self) is not DeclaredSlotSearchCapture:
+                _fail("BOUND_FIT_CANARY_OR_LEGACY_CAPTURE_FORBIDDEN")
+            freeze = raw_winner.freeze_winner_search_plan_v7 if transport else raw_winner.freeze_winner_search_plan_v6
         produce = raw_winner.produce_winner_v16_raw_evidence if transport else raw_winner.produce_winner_v15_raw_evidence
         if not _raw_namespace_supported(freeze) or not _raw_namespace_supported(produce):
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
@@ -2929,6 +2960,7 @@ class HistoricalSymbolSearchCapture:
                 partition_cost_precommitments=partition_cost_precommitments,
                 risk_unit_contract=risk_unit_contract,
                 artifact_namespace=self.raw_artifact_namespace,
+                **({"bound_fitted_state_entry": bound_fitted_state_entry} if bound_fitted_state_entry is not None else {}),
             )
         except TypeError as exc:
             raise HistoricalProductionAdapterError(
@@ -5843,6 +5875,42 @@ class DeclaredSlotSearchCapture(HistoricalSymbolSearchCapture):
         _verify_declared_slot_capture(self)
         return super().freeze_observed_cell(*args, **kwargs)
 
+
+    def restore_completed_unit_handle(self, header, *, native_prefix_product, attempt_artifacts):
+        """Reopen the original frozen authority; never freeze a replacement."""
+        _verify_declared_slot_capture(self)
+        if self._active is not None or self._finished or header.get("request_body") != self.request_body:
+            _fail("DECLARED_UNIT_CAPTURE_STATE_INVALID")
+        entries = {}
+        for entry in header["artifact_roster"]:
+            if entry["artifact_id"] in entries:
+                _fail("DECLARED_UNIT_ARTIFACT_ROSTER_INVALID")
+            entries[entry["artifact_id"]] = self.sink.register_artifact(
+                entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+        fitted, plan = self.fitted_timeframe, self.cell_plan
+        frozen, cross, cross_bytes, _ = _verify_declared_slot_frozen_chain(self.context,
+            completion=header, parent=self.request._precommit.to_dict(),
+            body=self.request_body, request=self.request, plan=plan,
+            source=fitted.source_group_decision, fit=fitted.regime_fit_decision,
+            entries=entries, precommit=self.request._precommit)
+        key = (self.request_body["timeframe"], self.regime)
+        normalized, contracts, counts = _strict_attempt_artifacts(attempt_artifacts,
+            symbol=self.symbol, timeframe=key[0], regime=key[1],
+            plan_body=self._horizon_plan_bodies[key],
+            plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
+            native_prefix_product=native_prefix_product)
+        handle = FrozenHistoricalCell(symbol=self.symbol, timeframe=key[0], regime=key[1],
+            frozen=frozen, frozen_receipt_descriptor=header["frozen_plan_receipt"],
+            frozen_descriptor_graph=header["frozen_descriptor_graph"],
+            cross_binding_descriptor=header["horizon_winner_cross_binding"],
+            artifact_namespace=self.raw_artifact_namespace, _attempt_artifacts=normalized,
+            _horizon_execution_contracts=contracts, _source_count_receipts=counts,
+            _native_prefix_product=native_prefix_product, _cross_binding_bytes=cross_bytes,
+            _capture_nonce=_sha256({"capture": id(self),
+                "original_frozen_receipt": header["frozen_plan_receipt"]["sha256"]}))
+        self._active = handle
+        return handle
+
     @property
     def verified_fitted_timeframe(self):
         _verify_declared_slot_capture(self)
@@ -5861,6 +5929,18 @@ class DeclaredSlotSearchCapture(HistoricalSymbolSearchCapture):
         body = _declared_capture_completion_body(self, status=status, reason_code=reason_code,
                                                 handle=handle, completed=completed)
         body["technical_failure_entry"] = technical_failure_entry
+        if completed is not None:
+            import pm_authoritative_search_execution as search_execution
+            namespace = self.request_body["artifact_namespace"] + "/"
+            saved = {"schema_version": "fxpm.declared-slot-raw-completion-unit.v1",
+                "request_sha256": self.request.receipt_sha256, "completion": body,
+                "artifact_roster": [entry for entry in self.sink.artifact_roster()
+                    if entry["artifact_id"].startswith(namespace)]}
+            # All Raw payloads/decision/graphs are durable before this boundary.
+            # Reuse requires the existing public cold verifier, never this flag.
+            authority_spool._publish_exact_json(self.context,
+                search_execution._declared_unit_relative(self.request_body, "raw-completion.json"),
+                saved, self.context.limits.max_json_bytes)
         self._completion = body
         self._finished = True
         self._active = None
@@ -6279,14 +6359,30 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
     frozen_schema = json.loads(_reopen_worker_descriptor_bytes(context, frozen_entry["descriptor"],
         maximum_bytes=winner_selection.MAX_REQUEST_BYTES, expected_format=raw_winner.ASCII_JSON_FORMAT,
         code="DECLARED_SLOT_FROZEN_INVALID")).get("schema_version")
-    restore = (raw_winner.restore_frozen_winner_search_plan_v5
-               if frozen_schema == raw_winner.V16_FROZEN_PLAN_SCHEMA
-               else raw_winner.restore_frozen_winner_search_plan_v4)
+    restore = {
+        raw_winner.CURRENT_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v4,
+        raw_winner.V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v5,
+        raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v6,
+        raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v7,
+    }.get(frozen_schema)
+    if restore is None:
+        _fail("DECLARED_SLOT_FROZEN_SCHEMA_INVALID")
     frozen = restore(context_identity={
         "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
         "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256},
         symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"], artifact_namespace=namespace,
         manifest_entries=frozen_entries, body_bytes=frozen_bytes)
+    if frozen.bound_fitted_state_entry is not None:
+        import pm_current_refit_artifacts as fit_artifacts
+        state, _ = fit_artifacts.read_bound_fitted_state_reference(context, frozen.bound_fitted_state_entry, artifact_namespace=namespace)
+        meta = state["metadata"]
+        if (meta["binding"]["producer_request_sha256"] != request.receipt_sha256
+                or _canonical_bytes(meta["receipts"]["source_group_decision"]) != _canonical_bytes(source.to_dict())
+                or _canonical_bytes(meta["receipts"]["regime_fit_decision"]) != _canonical_bytes(fit.to_dict())
+                or _canonical_bytes(meta["fold_plan"]) != _canonical_bytes(frozen.precommitment["causal_fold_plan"])
+                or _canonical_bytes(meta["receipts"]["source_contract_seeds"]) != _canonical_bytes(frozen.source_contract_seeds)
+                or _canonical_bytes(meta["receipts"]["frozen_tier_pair_contract"]) != _canonical_bytes(frozen.frozen_tier_pair_contract)):
+            _fail("DECLARED_SLOT_BOUND_FIT_CHAIN_CHANGED")
     if any(tier["frozen_spread_tier"]["profile_sha256"] != parent["spread_profile_identity"]["profile_sha256"]
            for tier in frozen.frozen_tier_pair_contract["tiers"]):
         _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")

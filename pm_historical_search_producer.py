@@ -2018,6 +2018,7 @@ class _DeclaredSlotSourceSession:
     _config: Any
     _frozen_config: Any
     _entry: Mapping[str, Any]
+    _reopen_validation_json: bytes | None = None
     def to_dict(self):
         return json.loads(self._body_json)
     @property
@@ -2062,10 +2063,13 @@ def _verify_declared_completion_transport(context, *, completion, expected_editi
             code=code)
     except historical_adapter.HistoricalProductionAdapterError as exc:
         raise HistoricalSearchProducerError(code) from exc
-    expected_schema = (historical_adapter.raw_winner.V16_FROZEN_PLAN_SCHEMA
-        if expected_edition == historical.DECLARED_WINNER_TRANSPORT_V16
-        else historical_adapter.raw_winner.CURRENT_FROZEN_PLAN_SCHEMA)
-    if receipt.get("schema_version") != expected_schema:
+    expected_schemas = ({
+        historical_adapter.raw_winner.V16_FROZEN_PLAN_SCHEMA,
+        historical_adapter.raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA}
+        if expected_edition == historical.DECLARED_WINNER_TRANSPORT_V16 else {
+        historical_adapter.raw_winner.CURRENT_FROZEN_PLAN_SCHEMA,
+        historical_adapter.raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA})
+    if receipt.get("schema_version") not in expected_schemas:
         _fail(code)
 
 
@@ -2081,6 +2085,13 @@ def _make_declared_slot_source_authority():
                 or row[2] != id(context) or row[3] is not request
                 or row[4] is not source_session._fitted or row[5] is not source_session._config
                 or row[6] != _canonical_bytes(dict(source_session._entry))):
+            _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
+        validation = source_session._reopen_validation_json
+        if validation is not None:
+            if (len(row) != 9 or row[7] != validation
+                    or row[8] is not getattr(source_session._fitted, "_bound_fit_owner", None)):
+                _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
+        elif len(row) != 7:
             _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
         return source_session
 
@@ -2110,6 +2121,10 @@ def _make_declared_slot_source_authority():
         if (frozen_pipeline_config.effective_config_sha256 != body["effective_config_sha256"]
                 or config.discovery_risk_per_trade_pct != 1.0):
             _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+        saved = _declared_saved_raw_completion(context, request=request, process=process,
+            frozen_pipeline_config=frozen_pipeline_config)
+        if saved is not None:
+            return finish(saved)
         window = body["source_access_window_utc"]
         in_window = window["start_utc"] <= _now_utc_seconds() < window["end_exclusive_utc"]
         if in_window:
@@ -2129,6 +2144,57 @@ def _make_declared_slot_source_authority():
             "regime_fit_decision_sha256": None, "caller_supplied_product_or_fit_accepted": False,
             "qualification_authority": False, "live_authority": False, "order_authority": False}
         capture = None
+        def run_session(fitted, session, restored_plan=None):
+            nonlocal capture
+            entry = session._entry
+            if (fitted.source_group_decision.to_dict().get("availability") != book.AVAILABLE
+                    or fitted.regime_fit_decision.to_dict().get("fit_state") != book.REGIME_FITTED):
+                _fail("DECLARED_SLOT_FIT_NOT_READY")
+            counts = _verified_support_counts(fitted)
+            if counts[body["regime"]] == 0:
+                if restored_plan is not None:
+                    _fail("DECLARED_BOUND_FIT_SUPPORT_CHANGED")
+                completion = _declared_base_completion(request, status="NO_TRADE", reason_code="REGIME_UNOBSERVED", source_entry=entry)
+                completion["source_group"] = historical_adapter._owned_decision_envelope(fitted.source_group_decision, "DECLARED_SLOT_SOURCE_INVALID")
+                completion["regime_fit"] = historical_adapter._owned_decision_envelope(fitted.regime_fit_decision, "DECLARED_SLOT_FIT_INVALID")
+                return finish(completion)
+            plan = restored_plan if restored_plan is not None else search_planner.build_declared_slot_observed_cell_plan(
+                context, process=process, request=request, fitted=fitted)
+            open_capture = (historical_adapter.open_transport_declared_slot_capture
+                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
+                else historical_adapter.open_declared_slot_capture)
+            execute_cell = (search_execution.execute_transport_historical_observed_cell
+                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
+                else search_execution.execute_historical_observed_cell)
+            capture = open_capture(context, request=request, process=process, plan=plan, source_session=session)
+            execute_cell(capture=capture, fitted=fitted, regime=body["regime"],
+                search_process=process, cell_plan=plan, config=config)
+            return finish(capture.completion)
+
+        pending_header = _declared_partial_unit_header(context, body)
+        if pending_header is not None:
+            if not in_window:
+                _fail("DECLARED_UNIT_ORIGINAL_WINDOW_CLOSED")
+            fitted, original_source, original_entry, original_plan, validation = _reopen_declared_source_material(
+                context, request=request, process=process, frozen_pipeline_config=frozen_pipeline_config)
+            session = _DeclaredSlotSourceSession(_canonical_bytes(original_source), fitted, config,
+                frozen_pipeline_config, original_entry, _canonical_bytes(validation))
+            owner = getattr(fitted, "_bound_fit_owner", None)
+            # A newly registered LOCAL object capability, never a reminted old fit.
+            sessions[request.receipt_sha256] = (session, session._body_json, id(context), request,
+                fitted, config, _canonical_bytes(original_entry), session._reopen_validation_json, owner)
+            try:
+                return run_session(fitted, session, restored_plan=original_plan)
+            except Exception as exc:
+                if (authority_spool.is_resource_capacity_error(exc)
+                        or getattr(exc, "code", None) == "DECLARED_SLOT_RUN_ACTIVE"):
+                    raise
+                if capture is not None and capture._completion is not None:
+                    raise _DeclaredSlotPostCompletionFailure(capture.completion, _declared_failure_details(exc)) from exc
+                raise
+            finally:
+                sessions.pop(request.receipt_sha256, None)
+
         try:
             if not in_window:
                 _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
@@ -2176,28 +2242,10 @@ def _make_declared_slot_source_authority():
             entry = sink.put_json(f"{body['artifact_namespace']}/source-session", "declared_slot_source_session", source_body)
             session = _DeclaredSlotSourceSession(_canonical_bytes(source_body), fitted, config, frozen_pipeline_config, entry)
             sessions[request.receipt_sha256] = (session, session._body_json, id(context), request, fitted, config, _canonical_bytes(entry))
-            if (fitted.source_group_decision.to_dict().get("availability") != book.AVAILABLE
-                    or fitted.regime_fit_decision.to_dict().get("fit_state") != book.REGIME_FITTED):
-                _fail("DECLARED_SLOT_FIT_NOT_READY")
-            counts = _verified_support_counts(fitted)
-            if counts[body["regime"]] == 0:
-                completion = _declared_base_completion(request, status="NO_TRADE", reason_code="REGIME_UNOBSERVED", source_entry=entry)
-                completion["source_group"] = historical_adapter._owned_decision_envelope(fitted.source_group_decision, "DECLARED_SLOT_SOURCE_INVALID")
-                completion["regime_fit"] = historical_adapter._owned_decision_envelope(fitted.regime_fit_decision, "DECLARED_SLOT_FIT_INVALID")
-                return finish(completion)
-            plan = search_planner.build_declared_slot_observed_cell_plan(context, process=process, request=request, fitted=fitted)
-            open_capture = (historical_adapter.open_transport_declared_slot_capture
-                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
-                else historical_adapter.open_declared_slot_capture)
-            execute_cell = (search_execution.execute_transport_historical_observed_cell
-                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
-                else search_execution.execute_historical_observed_cell)
-            capture = open_capture(context, request=request, process=process, plan=plan, source_session=session)
-            execute_cell(capture=capture, fitted=fitted, regime=body["regime"],
-                search_process=process, cell_plan=plan, config=config)
-            return finish(capture.completion)
+            return run_session(fitted, session)
         except Exception as exc:
-            if authority_spool.is_resource_capacity_error(exc):
+            if (authority_spool.is_resource_capacity_error(exc)
+                    or getattr(exc, "code", None) == "DECLARED_SLOT_RUN_ACTIVE"):
                 raise
             if capture is not None and capture._completion is not None:
                 raise _DeclaredSlotPostCompletionFailure(capture.completion, _declared_failure_details(exc)) from exc
@@ -2545,6 +2593,130 @@ def _commit_declared_slot_completion(context, *, precommit, process, cell_id, sl
     return _declared_slot_summary(body, descriptor["sha256"]), descriptor
 
 
+
+def _declared_pending_unit_attempt(context, precommit, cell_id, slot):
+    """Select an original started request, never an orphan object or outcome."""
+    pending = []
+    for marker in _declared_prior_attempt_starts(context, precommit, cell_id, slot):
+        start = search_execution._read_declared_unit_json(context, marker["relative_path"])
+        attempt_id = Path(marker["relative_path"]).stem
+        relative = (f"declared-slots/{precommit.receipt_sha256}/requests/"
+                    f"{cell_id}/{slot['slot_id']}/{attempt_id}.json")
+        body = search_execution._read_declared_unit_json(context, relative)
+        if body is None or start.get("request_sha256") != hashlib.sha256(_canonical_bytes(body)).hexdigest():
+            _fail("DECLARED_UNIT_ORIGINAL_REQUEST_MISSING")
+        header = search_execution._read_declared_unit_header(context, body)
+        raw = search_execution._read_declared_unit_json(context,
+            search_execution._declared_unit_relative(body, "raw-completion.json"))
+        if header is not None or raw is not None:
+            if (body.get("cell_id") != cell_id or body.get("slot_id") != slot["slot_id"]
+                    or body.get("precommit_sha256") != precommit.receipt_sha256
+                    or body.get("attempt_id") != attempt_id):
+                _fail("DECLARED_UNIT_OWNER_INVALID")
+            pending.append(attempt_id)
+    if len(pending) > 1:
+        _fail("DECLARED_UNIT_OWNER_AMBIGUOUS")
+    return pending[0] if pending else None
+
+
+
+def _declared_partial_unit_header(context, body):
+    try:
+        return search_execution._read_declared_unit_header(context, body)
+    except search_execution.AuthoritativeSearchExecutionError as exc:
+        if exc.code == "DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE":
+            raise HistoricalSearchProducerError(exc.code) from exc
+        raise
+
+
+def _require_reopened_declared_plan(header, validation_receipt, plan):
+    """Join original horizon and cell receipts separately, without issuing authority."""
+    expected_horizon = header["binding"].get("horizon_plan_receipt_sha256")
+    expected_cell = header["binding"].get("cell_plan_receipt_sha256")
+    if (type(expected_horizon) is not str or len(expected_horizon) != 64
+            or type(expected_cell) is not str or len(expected_cell) != 64
+            or plan.horizon_plan.receipt_sha256 != expected_horizon
+            or plan.receipt_sha256 != expected_cell
+            or validation_receipt.get("original_horizon_plan_receipt_sha256") != expected_horizon
+            or validation_receipt.get("original_cell_plan_receipt_sha256") != expected_cell):
+        _fail("DECLARED_BOUND_FIT_ORIGINAL_PLAN_CHANGED")
+
+
+def _reopen_declared_source_material(context, *, request, process, frozen_pipeline_config):
+    """Cold-read original durable header, then use the real bound-state verifier."""
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    historical._verify_declared_request_identity(request, context, require_live=True)
+    header = _declared_partial_unit_header(context, body)
+    if header is None:
+        _fail("DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE")
+    # No caller-provided header, fitted object, hash flag, fit or model fallback.
+    fitted, validation = search_execution.reopen_bound_fitted_timeframe(context,
+        request=request, process=process, frozen_pipeline_config=frozen_pipeline_config, header=header)
+    reference = search_execution.bound_fitted_state_reference(fitted, context=context, request=request)
+    if (reference != header["fitted_state_entry"]
+            or validation.get("schema_version") != "fxpm.bound-fit-reopen-validation.v1"
+            or validation.get("origin") != "REOPENED_BOUND_FIT"
+            or validation.get("producer_request_sha256") != request.receipt_sha256
+            or validation.get("frozen_receipt_sha256") != header["frozen_plan_receipt"]["sha256"]):
+        _fail("DECLARED_BOUND_FIT_REOPEN_BINDING_MISMATCH")
+    entry = header["source_session_entry"]
+    source = historical_adapter._reopen_ascii_json_entry(context, entry,
+        expected_type="declared_slot_source_session", code="DECLARED_BOUND_FIT_SOURCE_CHANGED")
+    if (source.get("source_state") != native_prefix.AVAILABLE
+            or source.get("request_sha256") != request.receipt_sha256
+            or source.get("generation_context_sha256") != context.context_sha256
+            or source.get("config_sha256") != context.config_sha256
+            or source.get("effective_config_sha256") != body["effective_config_sha256"]
+            or source.get("spread_profile_identity") != body["spread_profile_identity"]
+            or source.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or source.get("source_accessed_at_utc") != fitted.product.index["source_accessed_at_utc"]
+            or source.get("native_source_route") != _prefix_route(fitted.product)
+            or source.get("source_group_decision_sha256") != fitted.source_group_decision.receipt_sha256
+            or source.get("regime_fit_decision_sha256") != fitted.regime_fit_decision.receipt_sha256
+            or source.get("caller_supplied_product_or_fit_accepted") is not False
+            or any(source.get(key) is not False for key in
+                ("qualification_authority", "live_authority", "order_authority"))
+            or hashlib.sha256(_canonical_bytes(source)).hexdigest() != entry["descriptor"]["sha256"]):
+        _fail("DECLARED_BOUND_FIT_SOURCE_CHANGED")
+    roster = header.get("artifact_roster")
+    if type(roster) is not list or entry not in roster:
+        _fail("DECLARED_BOUND_FIT_ORIGINAL_ROSTER_CHANGED")
+    sink = request.symbol_sink(body["symbol"])
+    for original in roster:
+        sink.register_artifact(original["artifact_id"], original["artifact_type"], original["descriptor"])
+    # This existing cold path reopens actual original receipt bytes and verifies
+    # the reconstructed plan. It neither searches nor refits a model.
+    plan = historical_adapter._restore_declared_slot_plan(context, request=request,
+        process=process, completion=header, sink=sink)
+    _require_reopened_declared_plan(header, validation, plan)
+    # Registration of a local source-session/capture happens ONLY after this join.
+    return fitted, source, entry, plan, validation
+
+
+def _declared_saved_raw_completion(context, *, request, process, frozen_pipeline_config):
+    """Cold-verify a committed Raw unit before normal original outer publication."""
+    body = request.to_dict()
+    saved = search_execution._read_declared_unit_json(context,
+        search_execution._declared_unit_relative(body, "raw-completion.json"))
+    if saved is None:
+        # A partial locator is not a completed Raw result or fit capability.
+        # Legacy/missing-reference headers still refuse rather than rerun a fit.
+        _declared_partial_unit_header(context, body)
+        return None
+    if (set(saved) != {"schema_version", "request_sha256", "completion", "artifact_roster"}
+            or saved["schema_version"] != "fxpm.declared-slot-raw-completion-unit.v1"
+            or saved["request_sha256"] != request.receipt_sha256
+            or saved["completion"].get("request_body") != body):
+        _fail("DECLARED_UNIT_RAW_COMPLETION_INVALID")
+    historical_adapter.verify_declared_slot_completion(context,
+        precommit=request._precommit, process=process, completion=saved["completion"],
+        artifact_roster=saved["artifact_roster"], frozen_pipeline_config=frozen_pipeline_config)
+    sink = request.symbol_sink(body["symbol"])
+    for entry in saved["artifact_roster"]:
+        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+    return saved["completion"]
+
+
 def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, frozen_pipeline_config, cell_id):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     search_planner._require_current_process(process)
@@ -2565,17 +2737,19 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
             import secrets
             import os
             sink = authority_spool.open_symbol_sink(context, symbol)
-            attempt_id = "attempt-" + secrets.token_hex(16)
+            original_attempt = _declared_pending_unit_attempt(context, precommit, cell_id, slot)
+            attempt_id = original_attempt or ("attempt-" + secrets.token_hex(16))
             request = historical.declared_slot_producer_request(context, precommit=precommit, process=process,
                 cell_id=cell_id, slot_id=slot["slot_id"], attempt_id=attempt_id, sink=sink)
             try:
-                attempt_body = {"schema_version": "fxpm.declared-slot-attempt-start.v1", "request_sha256": request.receipt_sha256,
-                    "slot_id": slot["slot_id"], "started_at_utc": _now_utc_seconds(), "pid": os.getpid(),
-                    "meaning": "START_ONLY_NOT_A_COMPLETION_OR_FUTURE_OUTCOME",
-                    "prior_uncommitted_attempts": _declared_prior_attempt_starts(context, precommit, cell_id, slot)}
-                authority_spool._publish_exact_json(context,
-                    f"declared-slots/{precommit.receipt_sha256}/{cell_id}/attempts/{slot['slot_id']}/{attempt_id}.json",
-                    attempt_body, context.limits.max_json_bytes)
+                if original_attempt is None:
+                    attempt_body = {"schema_version": "fxpm.declared-slot-attempt-start.v1", "request_sha256": request.receipt_sha256,
+                        "slot_id": slot["slot_id"], "started_at_utc": _now_utc_seconds(), "pid": os.getpid(),
+                        "meaning": "START_ONLY_NOT_A_COMPLETION_OR_FUTURE_OUTCOME",
+                        "prior_uncommitted_attempts": _declared_prior_attempt_starts(context, precommit, cell_id, slot)}
+                    authority_spool._publish_exact_json(context,
+                        f"declared-slots/{precommit.receipt_sha256}/{cell_id}/attempts/{slot['slot_id']}/{attempt_id}.json",
+                        attempt_body, context.limits.max_json_bytes)
                 post_completion_failure = None
                 try:
                     completion = execute_declared_slot_owner_search(context, request=request, process=process,

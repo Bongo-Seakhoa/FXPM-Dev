@@ -878,6 +878,172 @@ def spool_current_refit_search_attempt_v2(
     return CurrentRefitSpoolWrite(artifacts=artifacts, entries=entries)
 
 
+# Prospective original-run hash-chain custody. Hashes are not signatures.
+BOUND_FITTED_STATE_SCHEMA = "fxpm.bound-fitted-timeframe-state.v1"
+BOUND_FITTED_STATE_FORMAT = "fxpm-fitted-timeframe-state-v1"
+BOUND_FITTED_REFERENCE_SCHEMA = "fxpm.bound-fitted-state-reference.v1"
+BOUND_REGIME_COLUMNS = ("TREND_SCORE", "RANGE_SCORE", "BREAKOUT_SCORE", "CHOP_SCORE",
+    "REGIME_RAW", "REGIME", "REGIME_STRENGTH", "REGIME_GAP", "REGIME_WARMUP",
+    "REGIME_LIVE", "REGIME_STRENGTH_LIVE")
+_BOUND_FIT_MAGIC = b"FXPM-BOUND-FIT\x00v1\n"
+_BOUND_FIT_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def build_bound_fitted_state_bytes(*, frame: pd.DataFrame, metadata: Mapping[str, Any]) -> bytes:
+    """Only exact UTC index and derived columns; never copy base native columns."""
+    import struct
+    if (type(frame) is not pd.DataFrame or not frame.columns.is_unique
+            or type(frame.index) is not pd.DatetimeIndex
+            or str(frame.index.dtype) != "datetime64[ns, UTC]"
+            or type(frame.index.name) not in {str, type(None)}
+            or not 1 <= len(frame) <= 10_000_000 or frame.index.hasnans
+            or not frame.index.is_unique or not frame.index.is_monotonic_increasing):
+        _fail("BOUND_FIT_FRAME_INVALID")
+    blocks, columns, offset = [], [], 0
+    values = [("__utc_index__", frame.index.asi8, None)]
+    for name in BOUND_REGIME_COLUMNS:
+        if name not in frame:
+            _fail("BOUND_FIT_COLUMN_MISSING")
+        values.append((name, frame[name], frame[name].dtype))
+    for name, value, dtype in values:
+        categories, ordered, category_dtype = None, None, None
+        if name == "__utc_index__":
+            array, tag = np.asarray(value, dtype="<i8"), "<i8"
+        elif isinstance(dtype, pd.CategoricalDtype):
+            if (name not in {"REGIME_RAW", "REGIME", "REGIME_LIVE"}
+                    or any(type(x) is not str for x in dtype.categories)
+                    or str(dtype.categories.dtype) != "object"):
+                _fail("BOUND_FIT_DTYPE_INVALID")
+            array = value.cat.codes.to_numpy(copy=True)
+            if array.dtype.str != "|i1":
+                _fail("BOUND_FIT_DTYPE_INVALID")
+            tag, categories, ordered, category_dtype = "|i1", list(dtype.categories), dtype.ordered, "object"
+        else:
+            tag = "|b1" if name == "REGIME_WARMUP" else "<f8"
+            if value.dtype.str != tag:
+                _fail("BOUND_FIT_DTYPE_INVALID")
+            array = value.to_numpy(copy=True)
+        raw = array.tobytes(order="C")
+        columns.append({"name": name, "dtype": tag, "offset": offset, "size_bytes": len(raw),
+            "categories": categories, "ordered": ordered, "category_dtype": category_dtype})
+        blocks.append(raw);offset += len(raw)
+    data = b"".join(blocks)
+    body = {"schema_version": BOUND_FITTED_STATE_SCHEMA, "metadata": dict(metadata),
+        "rows": len(frame), "index_name": frame.index.name, "index_timezone": "UTC",
+        "columns": columns, "data_sha256": hashlib.sha256(data).hexdigest()}
+    body["receipt_sha256"] = canonical_artifact_sha256(body)
+    header = canonical_artifact_bytes(body)
+    result = _BOUND_FIT_MAGIC + struct.pack("<Q", len(header)) + header + data
+    if len(result) > _BOUND_FIT_MAX_BYTES:
+        _fail("BOUND_FIT_BYTE_BOUND_EXCEEDED")
+    return result
+
+
+def verify_bound_fitted_state_bytes(raw: bytes, *, expected_sha256: str):
+    """Decode fixed safe typed blocks; this alone confers no run authority."""
+    import struct
+    import pm_authority_spool as spool
+    if (type(raw) is not bytes or not len(_BOUND_FIT_MAGIC) + 8 < len(raw) <= _BOUND_FIT_MAX_BYTES
+            or hashlib.sha256(raw).hexdigest() != expected_sha256 or not raw.startswith(_BOUND_FIT_MAGIC)):
+        _fail("BOUND_FIT_BYTES_INVALID")
+    start = len(_BOUND_FIT_MAGIC);size = struct.unpack("<Q", raw[start:start+8])[0];start += 8
+    if not 1 <= size <= _MAX_ARTIFACT_BYTES or start + size > len(raw):
+        _fail("BOUND_FIT_HEADER_INVALID")
+    header_raw = raw[start:start+size]
+    body = spool._strict_json_bytes(header_raw, _MAX_ARTIFACT_BYTES)
+    keys = {"schema_version", "metadata", "rows", "index_name", "index_timezone", "columns", "data_sha256", "receipt_sha256"}
+    if (type(body) is not dict or set(body) != keys or canonical_artifact_bytes(body) != header_raw
+            or body["schema_version"] != BOUND_FITTED_STATE_SCHEMA
+            or type(body["metadata"]) is not dict or type(body["rows"]) is not int
+            or not 1 <= body["rows"] <= 10_000_000 or body["index_timezone"] != "UTC"
+            or type(body["index_name"]) not in {str, type(None)}
+            or type(body["columns"]) is not list or len(body["columns"]) != 12):
+        _fail("BOUND_FIT_HEADER_INVALID")
+    unsigned = dict(body);receipt = unsigned.pop("receipt_sha256")
+    data = memoryview(raw)[start+size:]
+    if receipt != canonical_artifact_sha256(unsigned) or hashlib.sha256(data).hexdigest() != body["data_sha256"]:
+        _fail("BOUND_FIT_RECEIPT_INVALID")
+    arrays, offset = {}, 0
+    for expected_name, item in zip(("__utc_index__", *BOUND_REGIME_COLUMNS), body["columns"], strict=True):
+        if (type(item) is not dict or set(item) != {"name", "dtype", "offset", "size_bytes", "categories", "ordered", "category_dtype"}
+                or item["name"] != expected_name or type(item["offset"]) is not int or item["offset"] != offset
+                or type(item["size_bytes"]) is not int):
+            _fail("BOUND_FIT_COLUMN_LAYOUT_INVALID")
+        categorical = expected_name in {"REGIME_RAW", "REGIME", "REGIME_LIVE"}
+        tag = "<i8" if expected_name == "__utc_index__" else ("|i1" if categorical else (
+            "|b1" if expected_name == "REGIME_WARMUP" else "<f8"))
+        if item["dtype"] != tag or item["size_bytes"] != body["rows"] * np.dtype(tag).itemsize:
+            _fail("BOUND_FIT_DTYPE_INVALID")
+        if offset + item["size_bytes"] > len(data):
+            _fail("BOUND_FIT_COLUMN_LAYOUT_INVALID")
+        array = np.frombuffer(data[offset:offset+item["size_bytes"]], dtype=tag).copy();offset += item["size_bytes"]
+        if categorical:
+            cats = item["categories"]
+            if (type(cats) is not list or not 1 <= len(cats) <= 127 or len(set(cats)) != len(cats)
+                    or any(type(x) is not str for x in cats) or type(item["ordered"]) is not bool
+                    or item["category_dtype"] != "object" or np.any(array < -1) or np.any(array >= len(cats))):
+                _fail("BOUND_FIT_CATEGORY_INVALID")
+            arrays[expected_name] = pd.Categorical.from_codes(array, categories=cats, ordered=item["ordered"])
+        else:
+            if any(item[k] is not None for k in ("categories", "ordered", "category_dtype")):
+                _fail("BOUND_FIT_DTYPE_INVALID")
+            if tag == "|b1" and not np.isin(array.view(np.uint8), (0, 1)).all():
+                _fail("BOUND_FIT_DTYPE_INVALID")
+            arrays[expected_name] = array
+    if offset != len(data):
+        _fail("BOUND_FIT_TRAILING_BYTES")
+    # These integers already denote UTC nanoseconds: this attaches the recorded tag, not a timezone conversion.
+    index = pd.DatetimeIndex(arrays.pop("__utc_index__").view("datetime64[ns]"), tz="UTC", name=body["index_name"])
+    if index.hasnans or not index.is_unique or not index.is_monotonic_increasing:
+        _fail("BOUND_FIT_INDEX_INVALID")
+    return body, pd.DataFrame(arrays, index=index)
+
+
+def read_bound_fitted_state_reference(context, reference, *, artifact_namespace):
+    import pm_authority_spool as spool
+    if (type(reference) is not dict or set(reference) != {"schema_version", "state_entry", "state_receipt_sha256", "producer_request_sha256", "frame_sha256"}
+            or reference["schema_version"] != BOUND_FITTED_REFERENCE_SCHEMA):
+        _fail("BOUND_FIT_REFERENCE_INVALID")
+    entry = reference["state_entry"]
+    if (type(entry) is not dict or set(entry) != {"artifact_id", "artifact_type", "descriptor"}
+            or entry["artifact_id"] != artifact_namespace + "/fit-state"
+            or entry["artifact_type"] != "bound_fitted_timeframe_state"):
+        _fail("BOUND_FIT_NAMESPACE_INVALID")
+    descriptor = spool._validate_descriptor(dict(entry["descriptor"]), content_addressed=True)
+    if descriptor["format"] != BOUND_FITTED_STATE_FORMAT:
+        _fail("BOUND_FIT_FORMAT_INVALID")
+    spool._verify_artifact_file(context, descriptor)
+    digest, size, raw = spool._stream_file(context.root, descriptor["relative_path"],
+        maximum_bytes=min(context.limits.max_artifact_bytes, _BOUND_FIT_MAX_BYTES),
+        expected_size=descriptor["size_bytes"], collect=True)
+    if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
+        _fail("BOUND_FIT_BYTES_INVALID")
+    state, delta = verify_bound_fitted_state_bytes(raw, expected_sha256=digest)
+    binding = state["metadata"].get("binding")
+    if (type(binding) is not dict or binding.get("artifact_namespace") != artifact_namespace
+            or binding.get("generation_context_sha256") != context.context_sha256
+            or reference["state_receipt_sha256"] != state["receipt_sha256"]
+            or reference["producer_request_sha256"] != binding.get("producer_request_sha256")
+            or reference["frame_sha256"] != state["metadata"].get("frame_sha256")):
+        _fail("BOUND_FIT_REFERENCE_BINDING_INVALID")
+    return state, delta
+
+
+def spool_bound_fitted_state(sink, *, frame, metadata):
+    import pm_authority_spool as spool
+    if type(sink) is not SymbolAuthoritySink:
+        _fail("BOUND_FIT_SINK_INVALID")
+    namespace = metadata["binding"]["artifact_namespace"]
+    raw = build_bound_fitted_state_bytes(frame=frame, metadata=metadata)
+    state, _ = verify_bound_fitted_state_bytes(raw, expected_sha256=hashlib.sha256(raw).hexdigest())
+    entry = sink.put_opaque(namespace + "/fit-state", "bound_fitted_timeframe_state", (raw,), format=BOUND_FITTED_STATE_FORMAT)
+    reference = {"schema_version": BOUND_FITTED_REFERENCE_SCHEMA, "state_entry": entry,
+        "state_receipt_sha256": state["receipt_sha256"],
+        "producer_request_sha256": metadata["binding"]["producer_request_sha256"], "frame_sha256": metadata["frame_sha256"]}
+    read_bound_fitted_state_reference(sink.context, reference, artifact_namespace=namespace)
+    return reference
+
+
 __all__ = [
     "CurrentRefitArtifactError",
     "CurrentRefitSearchArtifacts",
@@ -896,3 +1062,6 @@ __all__ = [
     "spool_current_refit_search_attempt_v2",
     "verify_current_refit_search_artifacts_bytes_v2",
 ]
+
+__all__ += ["BOUND_FITTED_STATE_SCHEMA", "BOUND_FITTED_STATE_FORMAT", "BOUND_FITTED_REFERENCE_SCHEMA",
+    "build_bound_fitted_state_bytes", "verify_bound_fitted_state_bytes", "read_bound_fitted_state_reference", "spool_bound_fitted_state"]

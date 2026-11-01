@@ -33,7 +33,7 @@ import secrets
 import stat
 import tempfile
 import time
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Mapping, Sequence
@@ -73,7 +73,7 @@ from pm_strategies import StrategyRegistry
 
 
 UTC: Final = timezone.utc
-EXECUTION_CONTRACT_VERSION: Final = "fxpm.authoritative-search-execution.v5"
+EXECUTION_CONTRACT_VERSION: Final = "fxpm.authoritative-search-execution.v6"
 REGIME_FIT_POLICY_VERSION: Final = "fxpm.historical-regime-fit-policy.v1"
 REGIME_FIT_EVIDENCE_VERSION: Final = "fxpm.historical-regime-fit-evidence.v1"
 PARTITION_GEOMETRY_VERSION: Final = "fxpm.winner-partition-geometry.v1"
@@ -173,6 +173,7 @@ class FittedNativeSearchTimeframe:
     _entry_spread_observations: pd.Series | None = None
     _spread_source_product: native_prefix.NativePrefixProduct | None = None
     _spread_source_frame: pd.DataFrame | None = None
+    _bound_fit_owner: Any = field(default=None, repr=False, compare=False)
 
     def frame_copy(self) -> pd.DataFrame:
         """Return an isolated copy; callers cannot mutate the bound surface."""
@@ -549,7 +550,7 @@ def _source_identity(source_contract: Mapping[str, Any]) -> str:
 
 def _native_spread_inputs(
     *, product: native_prefix.NativePrefixProduct, config: PipelineConfig,
-    frame: pd.DataFrame, spec: InstrumentSpec,
+    frame: pd.DataFrame, spec: InstrumentSpec, _reopened_fine_product=None,
 ) -> tuple[dict[str, spread_profile.FrozenSpreadTier], pd.Series, native_prefix.NativePrefixProduct, pd.DataFrame]:
     """Reopen the same sealed generation and its exact prior-fine source."""
     descriptor = product.prefix_descriptor
@@ -583,7 +584,11 @@ def _native_spread_inputs(
             source_identity_sha256=native["source_identity_sha256"],
         ) for tier in ("P75", "P95")}
         source_timeframe = tiers["P75"].source_timeframe
-        if source_timeframe == native["timeframe"]:
+        if _reopened_fine_product is not None:
+            fine = native_prefix.reverify_activated_native_prefix_product(_reopened_fine_product, context, require_current_activation=True)
+            if fine.index["timeframe"] != source_timeframe:
+                _fail("BOUND_FIT_FINE_TIMEFRAME_CHANGED")
+        elif source_timeframe == native["timeframe"]:
             fine = replayed
         else:
             fine = native_prefix.produce_activated_native_prefix(
@@ -2724,6 +2729,8 @@ def _reverify_fitted_timeframe(
 
     if type(fitted) is not FittedNativeSearchTimeframe:
         _fail("FITTED_TIMEFRAME_INVALID")
+    if getattr(fitted, "_bound_fit_owner", None) is not None:
+        _fail("REOPENED_FITTED_STATE_REQUIRES_DECLARED_VERIFIER")
     source = fitted.source_group_decision.to_dict()
     attempts = source.get("acquisition_attempts_exact")
     if type(attempts) is not int or attempts <= 0:
@@ -2759,6 +2766,351 @@ def _reverify_fitted_timeframe(
             or fitted._spread_source_product.index_sha256 != refreshed._spread_source_product.index_sha256):
         _fail("FITTED_TIMEFRAME_SPREAD_SOURCE_CHANGED")
     return refreshed
+
+
+_BOUND_FIT_OWNER_SEAL = object()
+
+
+class _FreshFitOwner:
+    __slots__ = ("seal", "fitted", "context_id", "request_sha256", "original_fitted", "config")
+    def __new__(cls, *args, **kwargs):
+        _fail("BOUND_FIT_ISSUER_PRIVATE")
+
+
+class _BoundFitOwner:
+    __slots__ = ("seal", "fitted", "context_id", "request_sha256", "header_bytes", "reference_bytes", "validation_receipt")
+    def __new__(cls, *args, **kwargs):
+        _fail("BOUND_FIT_OWNER_PRIVATE")
+
+
+def _bound_fit_runtime(parameters):
+    import sys
+    current_release = _sha256(authoritative_search_execution_contract())
+    if current_release != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256:
+        _fail("BOUND_FIT_SOURCE_CHANGED_AFTER_IMPORT")
+    return {"python": sys.version, "numpy": np.__version__, "pandas": pd.__version__,
+        "detector_code_sha256": pm_regime.detector_code_sha256(),
+        "regime_parameters_sha256": pm_regime.regime_params_sha256(parameters),
+        "execution_release_sha256": AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+        "pm_core_sha256": _file_sha256(Path(pm_core.__file__))}
+
+
+def _bound_fit_carrier(product):
+    return {"index_descriptor": dict(product.index_descriptor), "index_sha256": product.index_sha256,
+        "symbol": product.index["symbol"], "timeframe": product.index["timeframe"],
+        "cutoff_utc": product.index["cutoff_utc"],
+        "activation_id": product.index["activation"]["activation_id"],
+        "activation_manifest_sha256": product.index["activation"]["manifest_sha256"],
+        "production_contract_required": product._production_contract_required}
+
+
+def _bound_fit_entry_bytes(context, entry, *, expected_format=None):
+    descriptor = authority_spool._validate_descriptor(dict(entry["descriptor"]), content_addressed=True)
+    if expected_format is not None and descriptor["format"] != expected_format:
+        _fail("BOUND_FIT_DESCRIPTOR_FORMAT_INVALID")
+    authority_spool._verify_artifact_file(context, descriptor)
+    digest, size, encoded = authority_spool._stream_file(context.root, descriptor["relative_path"],
+        maximum_bytes=context.limits.max_artifact_bytes, expected_size=descriptor["size_bytes"], collect=True)
+    if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
+        _fail("BOUND_FIT_DESCRIPTOR_CHANGED")
+    return encoded
+
+
+def _bound_fit_frozen_chain(context, body, header):
+    namespace = body["artifact_namespace"]
+    prefix = f"{namespace}/winner-search/{body['timeframe']}/{body['regime']}/frozen/"
+    entries = header.get("artifact_roster")
+    if type(entries) is not list or len({entry["artifact_id"] for entry in entries}) != len(entries):
+        _fail("BOUND_FIT_FROZEN_ROSTER_INVALID")
+    frozen_entries = [dict(entry) for entry in entries if entry["artifact_id"].startswith(prefix)]
+    receipt_entry = next((x for x in frozen_entries if x["artifact_id"] == prefix + "receipt"), None)
+    if receipt_entry is None or receipt_entry["descriptor"] != header.get("frozen_plan_receipt"):
+        _fail("BOUND_FIT_FROZEN_BINDING_INVALID")
+    raws = [_bound_fit_entry_bytes(context, entry, expected_format=raw_winner.ASCII_JSON_FORMAT) for entry in frozen_entries]
+    schema = json.loads(_bound_fit_entry_bytes(context, receipt_entry,
+        expected_format=raw_winner.ASCII_JSON_FORMAT).decode("ascii")).get("schema_version")
+    restorers = {raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v6,
+        raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v7}
+    restore = restorers.get(schema)
+    if restore is None:
+        _fail("BOUND_FIT_LEGACY_FROZEN_PLAN_FORBIDDEN")
+    frozen = restore(context_identity={"generation_id": context.generation_id,
+        "generation_context_sha256": context.context_sha256, "native_universe_sha256": context.native_universe_sha256,
+        "config_sha256": context.config_sha256}, symbol=body["symbol"], timeframe=body["timeframe"],
+        regime=body["regime"], artifact_namespace=namespace, manifest_entries=frozen_entries, body_bytes=raws)
+    if frozen.bound_fitted_state_entry is None or _canonical_bytes(header.get("fitted_state_entry")) != _canonical_bytes(frozen.bound_fitted_state_entry):
+        _fail("BOUND_FIT_FROZEN_BINDING_INVALID")
+    cross_descriptor = header.get("horizon_winner_cross_binding")
+    cross_entry = next((entry for entry in entries if entry.get("descriptor") == cross_descriptor
+        and entry.get("artifact_type") == "historical_horizon_winner_cross_binding"), None)
+    if cross_entry is None:
+        _fail("BOUND_FIT_CROSS_BINDING_MISSING")
+    cross, _, _ = raw_winner.verify_historical_frozen_winner_cross_binding(
+        _bound_fit_entry_bytes(context, cross_entry, expected_format=raw_winner.ASCII_JSON_FORMAT), frozen=frozen)
+    return frozen, cross
+
+
+def _bound_fit_open_carrier(context, config, carrier):
+    keys = {"index_descriptor", "index_sha256", "symbol", "timeframe", "cutoff_utc", "activation_id",
+        "activation_manifest_sha256", "production_contract_required"}
+    if type(carrier) is not dict or set(carrier) != keys or carrier["production_contract_required"] is not True:
+        _fail("BOUND_FIT_NATIVE_CARRIER_INVALID")
+    product = native_prefix.verify_activated_native_prefix(data_dir=Path(config.data_dir), context=context,
+        index_descriptor=carrier["index_descriptor"], expected_index_sha256=carrier["index_sha256"],
+        expected_symbol=carrier["symbol"], expected_timeframe=carrier["timeframe"], expected_cutoff_utc=carrier["cutoff_utc"],
+        expected_activation_manifest_sha256=carrier["activation_manifest_sha256"], production_contract_required=True,
+        pinned_activation_manifest_sha256=carrier["activation_manifest_sha256"])
+    active = native_prefix.resolve_active_native_artifact(Path(config.data_dir), carrier["symbol"], carrier["timeframe"],
+        production_contract_required=True)
+    if (not active.valid or active.activation_id != carrier["activation_id"]
+            or active.activation_manifest_sha256 != carrier["activation_manifest_sha256"]
+            or product.source_state != native_prefix.AVAILABLE):
+        _fail("BOUND_FIT_CURRENT_ACTIVATION_CHANGED")
+    return product
+
+
+def _bound_fit_decision(body, cls):
+    if type(body) is not dict or "receipt_sha256" not in body:
+        _fail("BOUND_FIT_DECISION_INVALID")
+    unsigned = dict(body);digest = unsigned.pop("receipt_sha256")
+    if digest != _sha256(unsigned):
+        _fail("BOUND_FIT_DECISION_INVALID")
+    return cls(_canonical_bytes(unsigned), digest)
+
+
+def bound_fitted_state_reference(fitted, *, context, request):
+    owner = getattr(fitted, "_bound_fit_owner", None)
+    if (type(owner) is not _BoundFitOwner or owner.seal is not _BOUND_FIT_OWNER_SEAL
+            or owner.fitted is not fitted or owner.context_id != id(context)
+            or owner.request_sha256 != request.receipt_sha256
+            or _frame_sha256(fitted._frame) != fitted.frame_sha256):
+        _fail("BOUND_FIT_REOPEN_CAPABILITY_INVALID")
+    return json.loads(owner.reference_bytes.decode("ascii"))
+
+
+def _publish_declared_bound_fit(capture, fitted, fold_plan, issue_owner):
+    if not historical_adapter._verify_declared_slot_capture(capture):
+        _fail("BOUND_FIT_CAPTURE_INVALID")
+    normalized_folds, _ = raw_winner._normalize_fold_plan(fold_plan, symbol=capture.symbol,
+        timeframe=capture.request_body["timeframe"], regime=capture.regime)
+    original = getattr(fitted, "_bound_fit_owner", None)
+    if original is not None:
+        reference = bound_fitted_state_reference(fitted, context=capture.context, request=capture.request)
+        state, _ = current_refit.read_bound_fitted_state_reference(capture.context, reference,
+            artifact_namespace=capture.raw_artifact_namespace)
+        if _canonical_bytes(state["metadata"]["fold_plan"]) != _canonical_bytes(normalized_folds):
+            _fail("BOUND_FIT_FOLD_PLAN_CHANGED")
+        return reference
+    if (type(issue_owner) is not _FreshFitOwner or issue_owner.seal is not _BOUND_FIT_OWNER_SEAL
+            or issue_owner.fitted is not fitted or issue_owner.context_id != id(capture.context)
+            or issue_owner.request_sha256 != capture.request.receipt_sha256
+            or issue_owner.original_fitted is not capture.verified_fitted_timeframe
+            or issue_owner.config is not capture.verified_pipeline_config):
+        _fail("BOUND_FIT_SUCCESSFUL_REVERIFY_REQUIRED")
+    frozen_config = capture.source_session._frozen_config
+    frozen_config.verify_current(capture.context)
+    receipts = {"source_group_decision": fitted.source_group_decision.to_dict(),
+        "regime_fit_decision": fitted.regime_fit_decision.to_dict(),
+        "source_contract_seed": dict(fitted.source_contract_seed), "cost_ladder_contract": dict(fitted.cost_ladder_contract),
+        "source_contract_seeds": fitted.source_contract_seeds, "frozen_tier_pair_contract": fitted.frozen_tier_pair_contract,
+        "regime_parameters": dict(fitted.regime_parameters), "train_regime_support": dict(fitted.train_regime_support),
+        "instrument_spec": asdict(fitted.instrument_spec), "execution_spec_receipt": dict(fitted.execution_spec_receipt)}
+    metadata = {"binding": {"generation_context_sha256": capture.context.context_sha256,
+        "producer_request_sha256": capture.request.receipt_sha256, "precommit_sha256": capture.request_body["precommit_sha256"],
+        "process_sha256": capture.process.receipt_sha256, "artifact_namespace": capture.raw_artifact_namespace,
+        "effective_config_sha256": frozen_config.effective_config_sha256,
+        "horizon_plan_receipt_sha256": capture.cell_plan.horizon_plan.receipt_sha256,
+        "cell_plan_receipt_sha256": capture.cell_plan.receipt_sha256},
+        "snapshot_issued_at_utc": _now_utc_seconds(), "runtime": _bound_fit_runtime(fitted.regime_parameters),
+        "frame_sha256": fitted.frame_sha256, "receipts": receipts, "fold_plan": normalized_folds,
+        "source_session_entry": dict(capture.source_session._entry),
+        "source_session_receipt_sha256": capture.source_session.receipt_sha256,
+        "target_carrier": _bound_fit_carrier(fitted.product), "fine_carrier": _bound_fit_carrier(fitted._spread_source_product),
+        "base_columns": [{"name": name, "dtype": str(dtype)} for name, dtype in fitted._frame.dtypes.items() if name not in _REGIME_COLUMNS],
+        "entry_observations_sha256": hashlib.sha256(pd.util.hash_pandas_object(
+            fitted._entry_spread_observations, index=True).values.tobytes()).hexdigest(),
+        "spread_profile_sha256": capture.request_body["spread_profile_identity"]["profile_sha256"]}
+    return current_refit.spool_bound_fitted_state(capture.sink, frame=fitted._frame, metadata=metadata)
+
+
+def reopen_bound_fitted_timeframe(context, *, request, process, frozen_pipeline_config, header):
+    """Original run-owned hash chain only; this is not whole-chain signature authentication."""
+    started = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    if (type(header) is not dict or header.get("schema_version") != "fxpm.declared-attempt-unit-header.v2"
+            or _canonical_bytes(header.get("request_body")) != _canonical_bytes(body)
+            or "source_access_renewal_sha256" in body):
+        _fail("BOUND_FIT_ORIGINAL_HEADER_REQUIRED")
+    frozen_pipeline_config.verify_current(context)
+    if frozen_pipeline_config.effective_config_sha256 != body["effective_config_sha256"]:
+        _fail("BOUND_FIT_CONFIG_CHANGED")
+    config = frozen_pipeline_config.materialize(context)
+    window = body["source_access_window_utc"]
+    if not window["start_utc"] <= _now_utc_seconds() < window["end_exclusive_utc"]:
+        _fail("BOUND_FIT_ORIGINAL_WINDOW_CLOSED")
+    frozen, cross = _bound_fit_frozen_chain(context, body, header)
+    reference = frozen.bound_fitted_state_entry
+    state, delta = current_refit.read_bound_fitted_state_reference(context, reference,
+        artifact_namespace=body["artifact_namespace"])
+    meta = state["metadata"]
+    required = {"binding", "snapshot_issued_at_utc", "runtime", "frame_sha256", "receipts", "fold_plan",
+        "source_session_entry", "source_session_receipt_sha256", "target_carrier", "fine_carrier", "base_columns",
+        "entry_observations_sha256", "spread_profile_sha256"}
+    if type(meta) is not dict or set(meta) != required:
+        _fail("BOUND_FIT_METADATA_INVALID")
+    binding, receipts = meta["binding"], meta["receipts"]
+    if (type(binding) is not dict or set(binding) != {"generation_context_sha256", "producer_request_sha256", "precommit_sha256",
+            "process_sha256", "artifact_namespace", "effective_config_sha256", "horizon_plan_receipt_sha256", "cell_plan_receipt_sha256"}
+            or type(receipts) is not dict or set(receipts) != {"source_group_decision", "regime_fit_decision", "source_contract_seed",
+                "cost_ladder_contract", "source_contract_seeds", "frozen_tier_pair_contract", "regime_parameters", "train_regime_support",
+                "instrument_spec", "execution_spec_receipt"}):
+        _fail("BOUND_FIT_METADATA_INVALID")
+    if (binding.get("producer_request_sha256") != request.receipt_sha256
+            or binding.get("precommit_sha256") != body["precommit_sha256"]
+            or binding.get("process_sha256") != process.receipt_sha256
+            or binding.get("effective_config_sha256") != frozen_pipeline_config.effective_config_sha256
+            or cross.get("producer_request_sha256") != request.receipt_sha256
+            or cross.get("process_precommit_receipt_sha256") != body["precommit_sha256"]
+            or cross.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or cross.get("anchor_id") != body["slot_id"]
+            or cross["horizon_roster"]["plan_receipt_sha256"] != binding.get("horizon_plan_receipt_sha256")
+            or binding["horizon_plan_receipt_sha256"] != header["binding"].get("horizon_plan_receipt_sha256")
+            or binding["cell_plan_receipt_sha256"] != header["binding"].get("cell_plan_receipt_sha256")
+            or _canonical_bytes(meta["fold_plan"]) != _canonical_bytes(frozen.precommitment["causal_fold_plan"])
+            or _canonical_bytes(receipts["source_contract_seeds"]) != _canonical_bytes(frozen.source_contract_seeds)
+            or _canonical_bytes(receipts["frozen_tier_pair_contract"]) != _canonical_bytes(frozen.frozen_tier_pair_contract)
+            or meta["spread_profile_sha256"] != body["spread_profile_identity"]["profile_sha256"]):
+        _fail("BOUND_FIT_ORIGINAL_CHAIN_CHANGED")
+    issued = _utc(meta["snapshot_issued_at_utc"], "BOUND_FIT_ISSUED_TIME_INVALID")
+    if issued > frozen.precommitment["precommitted_at_utc"]:
+        _fail("BOUND_FIT_SNAPSHOT_AFTER_FREEZE")
+    source = _bound_fit_decision(receipts["source_group_decision"], book.HistoricalSourceGroupDecision)
+    fit = _bound_fit_decision(receipts["regime_fit_decision"], book.RegimeFitDecision)
+    book._source_body(source);fit_body = book._regime_fit_body(fit, source)
+    if (cross.get("source_group_decision_sha256") != source.receipt_sha256
+            or cross.get("regime_fit_decision_sha256") != fit.receipt_sha256
+            or meta["runtime"] != _bound_fit_runtime(receipts["regime_parameters"])):
+        _fail("BOUND_FIT_CODE_RUNTIME_OR_RECEIPT_CHANGED")
+    target = _bound_fit_open_carrier(context, config, meta["target_carrier"])
+    fine = _bound_fit_open_carrier(context, config, meta["fine_carrier"])
+    if (target.index["symbol"] != body["symbol"] or target.index["timeframe"] != body["timeframe"]
+            or target.index["cutoff_utc"] != body["anchor"]["selection_cutoff_utc"]):
+        _fail("BOUND_FIT_SOURCE_CUTOFF_CHANGED")
+    base = native_prefix.open_verified_prefix_frame(target)
+    if ([{"name": name, "dtype": str(dtype)} for name, dtype in base.dtypes.items()] != meta["base_columns"]
+            or not base.index.equals(delta.index) or base.index.name != delta.index.name):
+        _fail("BOUND_FIT_NATIVE_FRAME_CHANGED")
+    for label in ("REGIME_RAW", "REGIME", "REGIME_LIVE"):
+        if (list(delta[label].cat.categories) != list(pm_regime.REGIME_DTYPE.categories)
+                or delta[label].cat.ordered is not False):
+            _fail("BOUND_FIT_CATEGORY_CHANGED")
+    frame = base.copy(deep=True)
+    for name in _REGIME_COLUMNS:
+        frame[name] = delta[name]
+    if _frame_sha256(frame) != meta["frame_sha256"]:
+        _fail("BOUND_FIT_FRAME_CHANGED")
+    spec, spec_receipt = _freeze_bound_execution_spec(product=target, config=config)
+    tiers, observations, verified_fine, fine_frame = _native_spread_inputs(product=target, config=config,
+        frame=base, spec=spec, _reopened_fine_product=fine)
+    profile = spread_profile.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
+    if (profile.sha256 != meta["spread_profile_sha256"] or verified_fine.index_sha256 != meta["fine_carrier"]["index_sha256"]
+            or hashlib.sha256(pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest() != meta["entry_observations_sha256"]
+            or _canonical_bytes(spec_receipt) != _canonical_bytes(receipts["execution_spec_receipt"])
+            or _canonical_bytes(asdict(spec)) != _canonical_bytes(receipts["instrument_spec"])):
+        _fail("BOUND_FIT_COST_OR_OBSERVATIONS_CHANGED")
+    seeds, pair, pair_hashes = raw_winner._current_pair_inputs(receipts["source_contract_seeds"], receipts["frozen_tier_pair_contract"])
+    if any(row["frozen_spread_tier"] != tiers[row["tier"]].descriptor() for row in pair["tiers"]):
+        _fail("BOUND_FIT_FROZEN_TIERS_CHANGED")
+    native = target.native_prefix
+    rebuilt_source = book.create_historical_source_group_decision(symbol=body["symbol"], timeframe=body["timeframe"],
+        availability=book.AVAILABLE, reason_code="AUTHENTICATED_NATIVE_PREFIX_AVAILABLE",
+        source_contract_sha256=pair_hashes["source_contract_sha256"], source_group_evidence_sha256=target.index_sha256,
+        acquisition_attempts_exact=source.to_dict()["acquisition_attempts_exact"], activation_id=native["activation_id"],
+        activation_manifest_sha256=native["activation_manifest_sha256"], activation_entry_sha256=native["activation_entry_sha256"],
+        native_source_sha256=native["artifact_sha256"])
+    parameters = _default_regime_parameters(body["timeframe"])
+    if rebuilt_source is None or _canonical_bytes(rebuilt_source.to_dict()) != _canonical_bytes(source.to_dict()) or _canonical_bytes(parameters) != _canonical_bytes(receipts["regime_parameters"]):
+        _fail("BOUND_FIT_SOURCE_OR_PARAMETERS_CHANGED")
+    detector_sha = pm_regime.detector_code_sha256();params_sha = pm_regime.regime_params_sha256(parameters)
+    support = _build_train_regime_support(frame=base, surface=delta, product=target, symbol=body["symbol"],
+        timeframe=body["timeframe"], parameters_sha256=params_sha, detector_code_sha256=detector_sha)
+    detector = book.create_regime_detector_record(source_group_decision=source,
+        fit_cutoff_utc=_book_canonical_utc(native["prefix_end_exclusive_utc"], "REGIME_DETECTOR_CUTOFF_INVALID"),
+        detector_version=REGIME_FIT_POLICY_VERSION, detector_code_sha256=detector_sha, parameters=parameters)
+    policy = {"schema_version": REGIME_FIT_POLICY_VERSION, "parameter_source": "PINNED_TIMEFRAME_DEFAULT_NO_POSTHOC_TUNING",
+        "timeframe": body["timeframe"], "label_order": list(book.REGIME_ORDER), "surface": "REGIME_LIVE",
+        "warmup_policy": book.REGIME_TRAIN_SUPPORT_WARMUP_POLICY, "detector_code_sha256": detector_sha, "parameters_sha256": params_sha}
+    evidence = {"schema_version": REGIME_FIT_EVIDENCE_VERSION, "source_group_decision_sha256": source.receipt_sha256,
+        "native_prefix_index_sha256": target.index_sha256, "train_regime_support_receipt_sha256": support["receipt_sha256"],
+        "detector_record_sha256": detector["record_sha256"]}
+    mapping = {"schema_version": "fxpm.four-regime-mapping.v1", "label_order": list(book.REGIME_ORDER),
+        "unobserved_regimes_are_explicit": True, "all_regimes_are_not_required": True}
+    rebuilt_fit = book.create_regime_fit_decision(source_group_decision=source, fit_state=book.REGIME_FITTED,
+        reason_code="ANCHOR_LOCAL_CAUSAL_REGIME_FIT_COMPLETE", regime_fit_policy_sha256=_sha256(policy),
+        detector_process_sha256=detector_sha, regime_fit_evidence_sha256=_sha256(evidence),
+        four_regime_mapping_sha256=_sha256(mapping), regime_params_sha256=params_sha,
+        regime_detector_record=detector, train_regime_support=support)
+    if (rebuilt_fit is None or _canonical_bytes(rebuilt_fit.to_dict()) != _canonical_bytes(fit.to_dict())
+            or _canonical_bytes(support) != _canonical_bytes(receipts["train_regime_support"])
+            or receipts["source_contract_seed"] != {} or receipts["cost_ladder_contract"] != {}):
+        _fail("BOUND_FIT_FULL_RECEIPT_COMPARISON_FAILED")
+    source_raw = _bound_fit_entry_bytes(context, meta["source_session_entry"])
+    source_session = authority_spool._strict_json_bytes(source_raw, context.limits.max_json_bytes)
+    if (_sha256(source_session) != meta["source_session_receipt_sha256"]
+            or source_session.get("source_state") != native_prefix.AVAILABLE
+            or source_session.get("generation_context_sha256") != context.context_sha256
+            or source_session.get("config_sha256") != context.config_sha256
+            or source_session.get("effective_config_sha256") != body["effective_config_sha256"]
+            or source_session.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or source_session.get("spread_profile_identity") != body["spread_profile_identity"]
+            or source_session.get("native_prefix_index_descriptor") != target.index_descriptor
+            or meta["source_session_entry"] != header.get("source_session_entry")
+            or source_session.get("request_sha256") != request.receipt_sha256
+            or source_session.get("source_group_decision_sha256") != source.receipt_sha256
+            or source_session.get("regime_fit_decision_sha256") != fit.receipt_sha256
+            or source_session.get("native_prefix_index_sha256") != target.index_sha256
+            or source_session.get("source_accessed_at_utc") != target.index["source_accessed_at_utc"]):
+        _fail("BOUND_FIT_ORIGINAL_SOURCE_SESSION_CHANGED")
+    fitted = FittedNativeSearchTimeframe(product=target, source_group_decision=source, regime_fit_decision=fit,
+        source_contract_seed={}, cost_ladder_contract={}, regime_parameters=parameters, train_regime_support=support,
+        instrument_spec=spec, execution_spec_receipt=spec_receipt, frame_sha256=meta["frame_sha256"], _frame=frame,
+        source_contract_seeds=seeds, frozen_tier_pair_contract=pair, _spread_tiers=tiers,
+        _entry_spread_observations=observations, _spread_source_product=verified_fine, _spread_source_frame=fine_frame)
+    receipt = {"schema_version": "fxpm.bound-fit-reopen-validation.v1", "origin": "REOPENED_BOUND_FIT",
+        "producer_request_sha256": request.receipt_sha256, "fitted_state_receipt_sha256": state["receipt_sha256"],
+        "frozen_receipt_sha256": header["frozen_plan_receipt"]["sha256"],
+        "original_horizon_plan_receipt_sha256": binding["horizon_plan_receipt_sha256"],
+        "original_cell_plan_receipt_sha256": binding["cell_plan_receipt_sha256"],
+        "validation_started_at_utc": started,
+        "validation_completed_at_utc": datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")}
+    if context.writable is True:
+        # Separate current validation record in the existing original-request unit domain.
+        # Never rewrite historical acquisition/freeze/source-session clocks.
+        unit_root = _declared_unit_relative(body, "header.json").rsplit("/", 1)[0]
+        authority_spool._publish_exact_json(context, unit_root + "/fit-reopens/" + _sha256(receipt) + ".json",
+            receipt, context.limits.max_json_bytes)
+    owner = object.__new__(_BoundFitOwner)
+    owner.seal, owner.fitted, owner.context_id, owner.request_sha256 = _BOUND_FIT_OWNER_SEAL, fitted, id(context), request.receipt_sha256
+    owner.header_bytes, owner.reference_bytes, owner.validation_receipt = _canonical_bytes(header), _canonical_bytes(reference), receipt
+    object.__setattr__(fitted, "_bound_fit_owner", owner)
+    return fitted, dict(receipt)
+
+
+def _declared_fitted_for_execution(capture, fitted, config):
+    owner = getattr(fitted, "_bound_fit_owner", None)
+    if owner is None:
+        # Replaces the one existing call; this is not an additional fit/replay.
+        refreshed = _reverify_fitted_timeframe(fitted, config)
+        issued = object.__new__(_FreshFitOwner)
+        issued.seal, issued.fitted = _BOUND_FIT_OWNER_SEAL, refreshed
+        issued.context_id, issued.request_sha256 = id(capture.context), capture.request.receipt_sha256
+        issued.original_fitted, issued.config = fitted, config
+        return refreshed, issued
+    bound_fitted_state_reference(fitted, context=capture.context, request=capture.request)
+    reopened, _ = reopen_bound_fitted_timeframe(capture.context, request=capture.request, process=capture.process,
+        frozen_pipeline_config=capture.source_session._frozen_config,
+        header=json.loads(owner.header_bytes.decode("ascii")))
+    return reopened, reopened._bound_fit_owner
 
 
 def _reverify_cell_state_error_envelope(
@@ -2869,6 +3221,301 @@ def _raw_attempt_ids(
 def _is_reparse(info: os.stat_result) -> bool:
     marker = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
     return bool(marker and int(getattr(info, "st_file_attributes", 0)) & marker)
+
+
+
+# Original-request completed attempt units live in the existing generation store.
+# This is neither a search outcome nor a grant to qualify, publish or trade.
+_DECLARED_UNIT_HEADER_SCHEMA = "fxpm.declared-attempt-unit-header.v2"
+_DECLARED_UNIT_SCHEMA = "fxpm.declared-attempt-unit-complete.v1"
+
+
+def _declared_unit_relative(body: Mapping[str, Any], name: str) -> str:
+    for field in ("cell_id", "slot_id", "attempt_id"):
+        historical._safe_id(body.get(field), "DECLARED_UNIT_OWNER_INVALID")
+    if (type(body.get("precommit_sha256")) is not str or len(body["precommit_sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in body["precommit_sha256"])):
+        _fail("DECLARED_UNIT_OWNER_INVALID")
+    if name not in {"header.json", "evidence-completed.json", "raw-completion.json", "units.lock"} and (
+        len(name) != 11 or not name[:6].isdigit() or name[6:] != ".json"
+    ):
+        _fail("DECLARED_UNIT_NAME_INVALID")
+    return (f"declared-slots/{body['precommit_sha256']}/requests/"
+            f"{body['cell_id']}/{body['slot_id']}/{body['attempt_id']}/units/{name}")
+
+
+def _read_declared_unit_json(context: Any, relative: str) -> dict[str, Any] | None:
+    path = authority_spool._local_path(context.root, relative)
+    authority_spool._reject_reparse_chain(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or _is_reparse(info):
+        _fail("DECLARED_UNIT_PATH_INVALID")
+    _, _, raw = authority_spool._stream_file(context.root, relative,
+        maximum_bytes=context.limits.max_json_bytes, collect=True)
+    value = authority_spool._strict_json_bytes(raw, context.limits.max_json_bytes)
+    if type(value) is not dict:
+        _fail("DECLARED_UNIT_RECORD_INVALID")
+    return value
+
+
+def _read_declared_unit_header(context: Any, body: Mapping[str, Any]) -> dict[str, Any] | None:
+    header = _read_declared_unit_json(context, _declared_unit_relative(body, "header.json"))
+    if header is None:
+        return None
+    if header.get("schema_version") == "fxpm.declared-attempt-unit-header.v1":
+        _fail("DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE")
+    binding = header.get("binding")
+    if (header.get("schema_version") != _DECLARED_UNIT_HEADER_SCHEMA
+            or header.get("request_body") != dict(body)
+            or type(binding) is not dict
+            or binding.get("generation_context_sha256") != context.context_sha256
+            or binding.get("producer_request_sha256") != _sha256(body)
+            or binding.get("executor_release_sha256") != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
+            or binding.get("producer_source_sha256") != _file_sha256(Path(__file__).with_name("pm_historical_search_producer.py"))
+            or header.get("qualification_authority") is not False
+            or header.get("live_authority") is not False):
+        _fail("DECLARED_UNIT_HEADER_BINDING_MISMATCH")
+    reference = header.get("fitted_state_entry")
+    if type(reference) is not dict or not reference:
+        _fail("DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE")
+    if (binding.get("fitted_state_reference_sha256") != _sha256(reference)
+            or header.get("fit_state_origin_contract") !=
+                "RECOMPUTED_OR_REOPENED_FROM_PRECOMMITTED_BOUND_STATE"
+            or type(header.get("plan_transport")) is not dict
+            or type(header.get("horizon_plan")) is not dict):
+        _fail("DECLARED_UNIT_HEADER_BINDING_MISMATCH")
+    return header
+
+
+def _declared_unit_identity(attempt: Any, raw_id: str) -> dict[str, Any]:
+    return {"ordinal": attempt.ordinal, "raw_attempt_id": raw_id,
+            "plan_attempt_sha256": _sha256(attempt.plan_attempt),
+            "status": attempt.plan_attempt["status"]}
+
+
+def _read_declared_completed_unit(context: Any, body: Mapping[str, Any],
+        binding_sha256: str, unit: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    record = _read_declared_unit_json(context,
+        _declared_unit_relative(body, f"{unit['ordinal']:06d}.json"))
+    if record is None:
+        return None
+    if (set(record) != {"schema_version", "binding_sha256", "unit", "payload",
+                        "completed_at_utc"}
+            or record["schema_version"] != _DECLARED_UNIT_SCHEMA
+            or record["binding_sha256"] != binding_sha256 or record["unit"] != dict(unit)):
+        _fail("DECLARED_UNIT_BINDING_MISMATCH", unit["ordinal"])
+    descriptor = record["payload"]
+    authority_spool._verify_artifact_file(context, descriptor)
+    _, _, raw = authority_spool._stream_file(context.root, descriptor["relative_path"],
+        maximum_bytes=MAX_ATTEMPT_EVIDENCE_BYTES,
+        expected_size=descriptor["size_bytes"], collect=True)
+    value = json.loads(raw.decode("ascii"), object_pairs_hook=_strict_pairs,
+                      parse_constant=_reject_json_constant)
+    if (type(value) is not dict or value.get("attempt_id") != unit["raw_attempt_id"]
+            or _canonical_bytes(value) != raw):
+        _fail("DECLARED_UNIT_PAYLOAD_INVALID", unit["ordinal"])
+    _utc(record["completed_at_utc"], "DECLARED_UNIT_COMPLETION_TIME_INVALID")
+    return record, value
+
+
+def _declared_completed_prefix(context: Any, body: Mapping[str, Any],
+        binding_sha256: str, units: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    prefix = []
+    missing = False
+    for ordinal, unit in enumerate(units):
+        if unit.get("ordinal") != ordinal:
+            _fail("DECLARED_UNIT_ROSTER_ORDER_INVALID")
+        found = _read_declared_completed_unit(context, body, binding_sha256, unit)
+        if found is None:
+            missing = True
+        elif missing:
+            _fail("DECLARED_UNIT_PREFIX_HOLE", ordinal)
+        else:
+            prefix.append(found[0])
+    return prefix
+
+
+def _publish_declared_completed_unit(context: Any, body: Mapping[str, Any],
+        binding_sha256: str, unit: Mapping[str, Any], value: Mapping[str, Any],
+        *, remaining_cell_bytes: int) -> dict[str, Any]:
+    if _read_declared_completed_unit(context, body, binding_sha256, unit) is not None:
+        _fail("DECLARED_UNIT_ALREADY_COMPLETE", unit["ordinal"])
+    _, size = _canonical_digest_and_size(value)
+    if size > MAX_ATTEMPT_EVIDENCE_BYTES or size > remaining_cell_bytes:
+        _fail("ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED", unit["ordinal"])
+    if value.get("attempt_id") != unit["raw_attempt_id"]:
+        _fail("DECLARED_UNIT_PAYLOAD_INVALID", unit["ordinal"])
+    encoder = json.JSONEncoder(allow_nan=False, ensure_ascii=True,
+        separators=(",", ":"), sort_keys=True)
+    descriptor = authority_spool.write_opaque_artifact(context,
+        (piece.encode("ascii") for piece in encoder.iterencode(value)),
+        format=raw_winner.ASCII_JSON_FORMAT)
+    record = {"schema_version": _DECLARED_UNIT_SCHEMA, "binding_sha256": binding_sha256,
+        "unit": dict(unit), "payload": descriptor,
+        "completed_at_utc": _now_utc_seconds()}
+    # Payload is durable first. An interruption here leaves no claimed unit.
+    # This exact metadata publication is the unit's sole completion boundary.
+    authority_spool._publish_exact_json(context,
+        _declared_unit_relative(body, f"{unit['ordinal']:06d}.json"),
+        record, context.limits.max_json_bytes)
+    return record
+
+
+def _declared_unit_binding(capture: Any, fitted: Any, cell_plan: Any,
+        attempts: Sequence[Any], fold_plan: Any, handle: Any) -> dict[str, Any]:
+    return {"generation_context_sha256": capture.context.context_sha256,
+        "producer_request_sha256": capture.request.receipt_sha256,
+        "executor_release_sha256": AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+        "producer_source_sha256": _file_sha256(Path(__file__).with_name("pm_historical_search_producer.py")),
+        "horizon_plan_receipt_sha256": cell_plan.horizon_plan.receipt_sha256,
+        "cell_plan_receipt_sha256": cell_plan.receipt_sha256,
+        "source_group_sha256": fitted.source_group_decision.receipt_sha256,
+        "regime_fit_sha256": fitted.regime_fit_decision.receipt_sha256,
+        "frame_sha256": fitted.frame_sha256,
+        "fitted_state_reference_sha256": _sha256(handle.frozen.bound_fitted_state_entry),
+        "execution_spec_sha256": _sha256(fitted.execution_spec_receipt),
+        "frozen_receipt_sha256": handle.frozen_receipt_descriptor["sha256"],
+        "cost_precommitments_sha256": _sha256(handle.frozen.partition_cost_precommitments),
+        "fold_plan_sha256": _sha256(fold_plan),
+        "attempt_roster_sha256": _sha256([attempt.plan_attempt for attempt in attempts])}
+
+
+def _make_declared_unit_header(capture: Any, fitted: Any, cell_plan: Any,
+        attempts: Sequence[Any], fold_plan: Any, handle: Any, references: Any,
+        evidence_started: str) -> dict[str, Any]:
+    reference = handle.frozen.bound_fitted_state_entry
+    if type(reference) is not dict or not reference:
+        _fail("DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE")
+    # Same existing horizon artifact is now durably referenced before evidence.
+    body = capture.request.to_dict()
+    horizon_entry = capture.sink.put_json(f"{body['artifact_namespace']}/horizon-plan",
+        "declared_slot_horizon_plan", cell_plan.horizon_plan.to_dict())
+    return {"schema_version": _DECLARED_UNIT_HEADER_SCHEMA,
+        "fit_state_origin_contract": "RECOMPUTED_OR_REOPENED_FROM_PRECOMMITTED_BOUND_STATE",
+        "fitted_state_entry": reference,
+        "horizon_plan": {"descriptor": horizon_entry["descriptor"],
+            "receipt_sha256": cell_plan.horizon_plan.receipt_sha256},
+        "plan_transport": {"cell_receipt": cell_plan.cell_receipt, "spool_entry": cell_plan.spool_entry,
+            "attempt_artifacts": list(cell_plan.attempt_artifacts()),
+            "state_requirements": list(cell_plan.state_requirements())},
+        "binding": _declared_unit_binding(capture, fitted, cell_plan, attempts, fold_plan, handle),
+        "request_body": capture.request.to_dict(),
+        "source_session_entry": dict(capture.source_session._entry),
+        "native_activation_manifest_sha256": fitted.product.index["activation"]["manifest_sha256"],
+        "frozen_plan_receipt": dict(handle.frozen_receipt_descriptor),
+        "frozen_descriptor_graph": dict(handle.frozen_descriptor_graph),
+        "horizon_winner_cross_binding": dict(handle.cross_binding_descriptor),
+        "partition_cost_precommitments": dict(handle.frozen.partition_cost_precommitments),
+        "source_observation_references": references,
+        "artifact_roster": capture.sink.artifact_roster(),
+        "evidence_access_started_at_utc": evidence_started,
+        "qualification_authority": False, "live_authority": False}
+
+
+
+def _continue_declared_attempt_units(context: Any, body: Mapping[str, Any],
+        binding_sha256: str, units: Sequence[Mapping[str, Any]], produce: Any) -> tuple[list[dict[str, Any]], str]:
+    """Resume whole attempts; no partially executed fold or ledger is inferred."""
+    records = _declared_completed_prefix(context, body, binding_sha256, units)
+    end_path = _declared_unit_relative(body, "evidence-completed.json")
+    end = _read_declared_unit_json(context, end_path)
+    if end is not None and len(records) != len(units):
+        _fail("DECLARED_UNIT_COMPLETION_ROSTER_INCOMPLETE")
+    if len(records) < len(units):
+        window = body["source_access_window_utc"]
+        now = _now_utc_seconds()
+        if not window["start_utc"] <= now < window["end_exclusive_utc"]:
+            _fail("DECLARED_UNIT_ORIGINAL_WINDOW_CLOSED")
+    total_bytes = sum(row["payload"]["size_bytes"] for row in records)
+    if total_bytes > MAX_CELL_EVIDENCE_BYTES:
+        _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
+    for unit in units[len(records):]:
+        value = produce(unit)
+        row = _publish_declared_completed_unit(context, body, binding_sha256, unit, value,
+            remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes)
+        total_bytes += row["payload"]["size_bytes"]
+        records.append(row)
+        del value
+    completed = {"binding_sha256": binding_sha256, "unit_count": len(units),
+        "unit_receipt_sha256": [_sha256(row) for row in records]}
+    if end is None:
+        # This clock is observed only AFTER the last actual missing unit completed.
+        # Publication precedes the first Raw semantic consumption.
+        end = {**completed, "evidence_access_completed_at_utc": _now_utc_seconds()}
+        authority_spool._publish_exact_json(context, end_path, end, context.limits.max_json_bytes)
+    if (set(end) != set(completed) | {"evidence_access_completed_at_utc"}
+            or any(end.get(key) != value for key, value in completed.items())):
+        _fail("DECLARED_UNIT_EVIDENCE_END_CHANGED")
+    ended = _utc(end["evidence_access_completed_at_utc"], "DECLARED_UNIT_COMPLETION_TIME_INVALID")
+    if any(row["completed_at_utc"] > ended for row in records):
+        _fail("DECLARED_UNIT_COMPLETION_TIME_INVALID")
+    return records, ended
+
+
+
+def _declared_unit_lease(context: Any, body: Mapping[str, Any]) -> Any:
+    from contextlib import contextmanager
+    import pm_native_storage as storage
+    @contextmanager
+    def locked():
+        relative = _declared_unit_relative(body, "units.lock")
+        path = authority_spool._local_path(context.root, relative)
+        authority_spool._reject_reparse_chain(path)
+        if not path.exists():
+            # Atomic one-byte creation uses the existing quota/publication
+            # primitives. Never hash/read a contender's already locked byte.
+            with authority_spool.spool_quota.publication_lease(context.root,
+                    max_generation_bytes=context.limits.max_generation_bytes,
+                    min_free_bytes=context.limits.min_free_bytes) as reservation:
+                temporary = None
+                created = False
+                try:
+                    reservation.consume(1)
+                    temporary = authority_spool._temporary_path(context.root)
+                    fd = authority_spool._open_exclusive(temporary)
+                    try:
+                        authority_spool._write_all(fd, memoryview(b"0"))
+                        reservation.materialize(1)
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    try:
+                        authority_spool._publish_temp_exclusive(context.root, temporary, relative)
+                        created = True
+                    except FileExistsError:
+                        # The winning file is checked after kernel acquisition.
+                        pass
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                reservation.commit(1 if created else 0)
+        authority_spool._reject_reparse_chain(path)
+        descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "r+b", buffering=0) as stream:
+            before, opened = path.lstat(), os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+                    or _is_reparse(before) or opened.st_size != 1
+                    or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)):
+                _fail("DECLARED_UNIT_LEASE_INVALID")
+            if not storage._try_kernel_lock(stream):
+                _fail("DECLARED_SLOT_RUN_ACTIVE")
+            try:
+                authority_spool._reject_reparse_chain(path)
+                current, pinned = path.lstat(), os.fstat(stream.fileno())
+                if ((current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+                        or (pinned.st_dev, pinned.st_ino) != (opened.st_dev, opened.st_ino)
+                        or pinned.st_size != 1):
+                    _fail("DECLARED_UNIT_LEASE_INVALID")
+                stream.seek(0)
+                if stream.read(1) != b"0":
+                    _fail("DECLARED_UNIT_LEASE_INVALID")
+                yield
+            finally:
+                storage._release_kernel_lock(stream)
+    return locked()
 
 
 def _create_stage_directory(root: Path, key: str) -> Path:
@@ -4489,8 +5136,22 @@ def execute_historical_observed_cell(
     stage_custody: _StageCapacityCustody | None = None
     evidence_started: str | None = None
     evidence_completed: str | None = None
+    declared_mode = type(capture) is historical_adapter.DeclaredSlotSearchCapture
+    declared_header = None
+    declared_units = []
+    declared_records = []
+    declared_binding_sha256 = None
+    declared_scope = None
+    bound_fit_issue_owner = None
+    bound_fitted_state_entry = None
+    if declared_mode:
+        declared_scope = _declared_unit_lease(capture.context, capture.request.to_dict())
+        declared_scope.__enter__()
     try:
-        refreshed = _reverify_fitted_timeframe(fitted, config)
+        if declared_mode:
+            refreshed, bound_fit_issue_owner = _declared_fitted_for_execution(capture, fitted, config)
+        else:
+            refreshed = _reverify_fitted_timeframe(fitted, config)
         _reverify_cell_state_error_envelope(cell_plan=cell_plan, fitted=refreshed)
         plan_body, attempts = _verify_attempt_roster(
             plan=horizon_plan,
@@ -4521,29 +5182,38 @@ def execute_historical_observed_cell(
         if len(fold_plan) < minimum_folds:
             _fail("WINNER_FOLD_PLAN_BELOW_EVIDENCE_FLOOR")
         source_observation_cache: dict[str, tuple[str, bytes]] = {}
-        partition_cost_precommitments = _partition_cost_precommitments(
-            attempts=attempts,
-            fold_plan=fold_plan,
-            plan_body=plan_body,
-            fitted=refreshed,
-            config=config,
-            source_observation_cache=source_observation_cache,
-        )
-        precommitted_at = _now_utc_seconds()
-        attempts_frozen_at = _next_observed_utc_second(precommitted_at)
-        handle = capture.freeze_observed_cell(
-            timeframe,
-            normalized_regime,
-            native_prefix_product=refreshed.product,
-            precommitted_at_utc=precommitted_at,
-            attempts_frozen_at_utc=attempts_frozen_at,
-            fold_plan=fold_plan,
-            attempt_artifacts=attempt_artifacts,
-            source_contract_seeds=refreshed.source_contract_seeds,
-            frozen_tier_pair_contract=refreshed.frozen_tier_pair_contract,
-            risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
-            partition_cost_precommitments=partition_cost_precommitments,
-        )
+        if declared_mode:
+            bound_fitted_state_entry = _publish_declared_bound_fit(capture, refreshed, fold_plan, bound_fit_issue_owner)
+        declared_header = (_read_declared_unit_header(capture.context, capture.request.to_dict())
+                           if declared_mode else None)
+        if declared_header is not None:
+            handle = capture.restore_completed_unit_handle(declared_header,
+                native_prefix_product=refreshed.product, attempt_artifacts=attempt_artifacts)
+        else:
+            partition_cost_precommitments = _partition_cost_precommitments(
+                attempts=attempts,
+                fold_plan=fold_plan,
+                plan_body=plan_body,
+                fitted=refreshed,
+                config=config,
+                source_observation_cache=source_observation_cache,
+            )
+            precommitted_at = _now_utc_seconds()
+            attempts_frozen_at = _next_observed_utc_second(precommitted_at)
+            handle = capture.freeze_observed_cell(
+                timeframe,
+                normalized_regime,
+                native_prefix_product=refreshed.product,
+                precommitted_at_utc=precommitted_at,
+                attempts_frozen_at_utc=attempts_frozen_at,
+                fold_plan=fold_plan,
+                attempt_artifacts=attempt_artifacts,
+                source_contract_seeds=refreshed.source_contract_seeds,
+                frozen_tier_pair_contract=refreshed.frozen_tier_pair_contract,
+                risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
+                partition_cost_precommitments=partition_cost_precommitments,
+                **({"bound_fitted_state_entry": bound_fitted_state_entry} if declared_mode else {}),
+            )
         raw_ids = _raw_attempt_ids(handle.frozen, attempts)
         latest_boundary = _utc(
             handle.frozen.precommitment["latest_evidence_boundary_utc"],
@@ -4552,80 +5222,127 @@ def execute_historical_observed_cell(
         now = datetime.now(UTC).replace(microsecond=0)
         if now < datetime.fromisoformat(latest_boundary.replace("Z", "+00:00")):
             _fail("EVIDENCE_BOUNDARY_NOT_CLOSED")
-        evidence_started = _next_observed_utc_second(attempts_frozen_at)
+        evidence_started = (declared_header["evidence_access_started_at_utc"]
+            if declared_header is not None else _next_observed_utc_second(attempts_frozen_at))
         source_observation_references = _require_source_observation_references(
-            _publish_source_observation_references(
+            declared_header["source_observation_references"] if declared_header is not None
+            else _publish_source_observation_references(
                 capture.sink, frozen=handle.frozen, source_observation_cache=source_observation_cache))
-        reservation_scope = authority_spool.reserve_transient_publication(
-            capture.context
-        )
-        stage_reservation = reservation_scope.__enter__()
-        stage_reservation_scope = reservation_scope
-        stage = _stage_directory(capture, handle)
-        request_body = capture.request.to_dict()
-        stage_custody = _create_stage_capacity_custody(root=capture.context.root,
-            stage=stage, reservation=stage_reservation,
-            binding={"generation_context_sha256": capture.context.context_sha256,
-                "producer_request_sha256": capture.request.receipt_sha256,
-                "precommit_sha256": request_body.get("precommit_sha256"),
-                "process_receipt_sha256": request_body.get("search_process_receipt_sha256"),
-                "attempt_id": request_body.get("attempt_id"),
-                "cell_id": request_body.get("cell_id"), "slot_id": request_body.get("slot_id"),
-                "artifact_namespace": request_body.get("artifact_namespace"),
-                "source_access_window_utc": request_body.get("source_access_window_utc"),
-                "cell": [handle.symbol, handle.timeframe, handle.regime],
-                "frozen_receipt_descriptor": dict(handle.frozen_receipt_descriptor)})
-        total_bytes = 0
         plan_receipt_sha256 = _sha256(plan_body)
-        for attempt, raw_id in zip(attempts, raw_ids, strict=True):
-            if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
-                outcome = _process_rejection_outcome(
-                    attempt=attempt,
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    regime=normalized_regime,
-                )
-                outcome_sha, outcome_size = _canonical_digest_and_size(
-                    {"attempt_id": raw_id, "outcome": outcome.to_dict()}
-                )
-                staged.append(
-                    _StagedAttemptEvidence(
-                        ordinal=attempt.ordinal,
-                        kind="PROCESS_REJECTED",
-                        path=None,
-                        size_bytes=outcome_size,
-                        sha256=outcome_sha,
+        if declared_mode:
+            request_body = capture.request.to_dict()
+            binding = _declared_unit_binding(capture, refreshed, cell_plan, attempts, fold_plan, handle)
+            if declared_header is None:
+                declared_header = _make_declared_unit_header(capture, refreshed, cell_plan,
+                    attempts, fold_plan, handle, source_observation_references, evidence_started)
+                authority_spool._publish_exact_json(capture.context,
+                    _declared_unit_relative(request_body, "header.json"),
+                    declared_header, capture.context.limits.max_json_bytes)
+            elif declared_header["binding"] != binding:
+                _fail("DECLARED_UNIT_HEADER_BINDING_MISMATCH")
+            declared_binding_sha256 = _sha256(binding)
+            declared_units = [_declared_unit_identity(attempt, raw_id)
+                for attempt, raw_id in zip(attempts, raw_ids, strict=True)]
+            def produce_unit(unit):
+                attempt = attempts[unit["ordinal"]]
+                if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
+                    outcome = _process_rejection_outcome(attempt=attempt, symbol=symbol,
+                        timeframe=timeframe, regime=normalized_regime)
+                    return {"attempt_id": unit["raw_attempt_id"], "outcome": outcome.to_dict()}
+                return _build_planned_attempt_evidence(attempt=attempt,
+                    raw_attempt_id=unit["raw_attempt_id"], plan_body=plan_body,
+                    plan_receipt_sha256=plan_receipt_sha256, fitted=refreshed, config=config,
+                    partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
+                    source_observation_references=source_observation_references)
+            declared_records, evidence_completed = _continue_declared_attempt_units(
+                capture.context, request_body, declared_binding_sha256, declared_units, produce_unit)
+        else:
+            reservation_scope = authority_spool.reserve_transient_publication(
+                capture.context
+            )
+            stage_reservation = reservation_scope.__enter__()
+            stage_reservation_scope = reservation_scope
+            stage = _stage_directory(capture, handle)
+            request_body = capture.request.to_dict()
+            stage_custody = _create_stage_capacity_custody(root=capture.context.root,
+                stage=stage, reservation=stage_reservation,
+                binding={"generation_context_sha256": capture.context.context_sha256,
+                    "producer_request_sha256": capture.request.receipt_sha256,
+                    "precommit_sha256": request_body.get("precommit_sha256"),
+                    "process_receipt_sha256": request_body.get("search_process_receipt_sha256"),
+                    "attempt_id": request_body.get("attempt_id"),
+                    "cell_id": request_body.get("cell_id"), "slot_id": request_body.get("slot_id"),
+                    "artifact_namespace": request_body.get("artifact_namespace"),
+                    "source_access_window_utc": request_body.get("source_access_window_utc"),
+                    "cell": [handle.symbol, handle.timeframe, handle.regime],
+                    "frozen_receipt_descriptor": dict(handle.frozen_receipt_descriptor)})
+            total_bytes = 0
+            plan_receipt_sha256 = _sha256(plan_body)
+            for attempt, raw_id in zip(attempts, raw_ids, strict=True):
+                if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
+                    outcome = _process_rejection_outcome(
+                        attempt=attempt,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        regime=normalized_regime,
                     )
+                    outcome_sha, outcome_size = _canonical_digest_and_size(
+                        {"attempt_id": raw_id, "outcome": outcome.to_dict()}
+                    )
+                    staged.append(
+                        _StagedAttemptEvidence(
+                            ordinal=attempt.ordinal,
+                            kind="PROCESS_REJECTED",
+                            path=None,
+                            size_bytes=outcome_size,
+                            sha256=outcome_sha,
+                        )
+                    )
+                    total_bytes += outcome_size
+                    if total_bytes > MAX_CELL_EVIDENCE_BYTES:
+                        _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
+                    continue
+                body = _build_planned_attempt_evidence(
+                    attempt=attempt,
+                    raw_attempt_id=raw_id,
+                    plan_body=plan_body,
+                    plan_receipt_sha256=plan_receipt_sha256,
+                    fitted=refreshed,
+                    config=config,
+                    partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
+                    source_observation_references=source_observation_references,
                 )
-                total_bytes += outcome_size
-                if total_bytes > MAX_CELL_EVIDENCE_BYTES:
-                    _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
-                continue
-            body = _build_planned_attempt_evidence(
-                attempt=attempt,
-                raw_attempt_id=raw_id,
-                plan_body=plan_body,
-                plan_receipt_sha256=plan_receipt_sha256,
-                fitted=refreshed,
-                config=config,
-                partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
-                source_observation_references=source_observation_references,
-            )
-            row = _write_staged_attempt(
-                stage=stage,
-                ordinal=attempt.ordinal,
-                value=body,
-                remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes,
-                reservation=stage_reservation,
-            )
-            staged.append(row)
-            total_bytes += row.size_bytes
-            del body
-        if len(staged) != len(attempts) or total_bytes > MAX_CELL_EVIDENCE_BYTES:
-            _fail("STAGED_ATTEMPT_ROSTER_INCOMPLETE")
-        evidence_completed = _now_utc_seconds()
+                row = _write_staged_attempt(
+                    stage=stage,
+                    ordinal=attempt.ordinal,
+                    value=body,
+                    remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes,
+                    reservation=stage_reservation,
+                )
+                staged.append(row)
+                total_bytes += row.size_bytes
+                del body
+            if len(staged) != len(attempts) or total_bytes > MAX_CELL_EVIDENCE_BYTES:
+                _fail("STAGED_ATTEMPT_ROSTER_INCOMPLETE")
+            evidence_completed = _now_utc_seconds()
 
         def evidence_stream() -> Any:
+            if declared_mode:
+                for attempt, unit in zip(attempts, declared_units, strict=True):
+                    found = _read_declared_completed_unit(capture.context, capture.request.to_dict(),
+                        declared_binding_sha256, unit)
+                    if found is None:
+                        _fail("DECLARED_UNIT_COMPLETION_ROSTER_INCOMPLETE")
+                    _, body = found
+                    if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
+                        outcome = _process_rejection_outcome(attempt=attempt, symbol=symbol,
+                            timeframe=timeframe, regime=normalized_regime)
+                        if body != {"attempt_id": unit["raw_attempt_id"], "outcome": outcome.to_dict()}:
+                            _fail("PROCESS_REJECTION_STAGE_BINDING_CHANGED", attempt.ordinal)
+                        yield {"attempt_id": unit["raw_attempt_id"], "outcome": outcome}
+                    else:
+                        yield body
+                return
             for attempt, raw_id, row in zip(attempts, raw_ids, staged, strict=True):
                 if row.ordinal != attempt.ordinal:
                     _fail("STAGED_ATTEMPT_ORDER_INVALID", attempt.ordinal)
@@ -4728,16 +5445,20 @@ def execute_historical_observed_cell(
                 failure_code=code,
             )
     finally:
-        _close_historical_reserved_stage(
-            stage=stage,
-            rows=staged,
-            reservation=stage_reservation,
-            reservation_scope=stage_reservation_scope,
-            primary_error=primary_error,
-            custody=stage_custody,
-            evidence_started=evidence_started,
-            evidence_completed=evidence_completed,
-        )
+        try:
+            _close_historical_reserved_stage(
+                stage=stage,
+                rows=staged,
+                reservation=stage_reservation,
+                reservation_scope=stage_reservation_scope,
+                primary_error=primary_error,
+                custody=stage_custody,
+                evidence_started=evidence_started,
+                evidence_completed=evidence_completed,
+            )
+        finally:
+            if declared_scope is not None:
+                declared_scope.__exit__(None, None, None)
     if result is None:
         _fail("HISTORICAL_CELL_EXECUTION_TERMINAL_STATE_MISSING")
     return result
@@ -5344,7 +6065,7 @@ def authoritative_search_execution_contract() -> dict[str, Any]:
         "schema_version": EXECUTION_CONTRACT_VERSION,
         "dependency_source_sha256": dependency_sources,
         "native_prefix_reopened_before_search": True,
-        "regime_surface_recomputed_before_search": True,
+        "regime_surface_acquisition": "RECOMPUTED_OR_REOPENED_FROM_ORIGINAL_BOUND_STATE",
         "released_horizon_plan_required": True,
         "sealed_current_cell_plan_required": True,
         "current_fitted_support_receipt_cross_binding_required": True,
@@ -5398,3 +6119,5 @@ __all__ = [
     "minimum_fold_fit_rows",
     "reverify_fitted_native_timeframe_for_search",
 ]
+
+__all__ += ["reopen_bound_fitted_timeframe", "bound_fitted_state_reference"]

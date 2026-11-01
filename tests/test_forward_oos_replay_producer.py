@@ -2711,9 +2711,9 @@ def _current_owner_capture_arguments(case, *, frozen, cross):
     "\u00e9" * 256,
 ], ids=["short", "ascii-300-bytes", "ascii-512-bytes", "utf8-512-bytes"])
 def test_readonly_current_frozen_restore_matches_every_real_freeze_field(
-    tmp_path, retained_current_owner_metadata, forbid_current_owner_economics, generation_id,
+    tmp_path, current_f_produced_owner_metadata, forbid_current_owner_economics, generation_id,
 ):
-    retained = retained_current_owner_metadata
+    retained = current_f_produced_owner_metadata
     bodies = retained["bodies"]
     precommitment = bodies["precommitment"]
     ledger = bodies["attempt_ledger"]
@@ -2762,9 +2762,9 @@ def test_current_generation_factory_refuses_ids_over_512_utf8_bytes(tmp_path, ge
 
 
 def test_retained_two_attempt_frozen_receipt_and_cross_restore_exactly(
-    retained_current_owner_metadata, forbid_current_owner_economics, monkeypatch,
+    current_f_produced_owner_metadata, forbid_current_owner_economics, monkeypatch,
 ):
-    case = retained_current_owner_metadata
+    case = current_f_produced_owner_metadata
     arguments, bodies = case["arguments"], case["bodies"]
     prefix = (f"{arguments['artifact_namespace']}/winner-search/"
               f"{arguments['timeframe']}/{arguments['regime']}/frozen/")
@@ -2784,7 +2784,7 @@ def test_retained_two_attempt_frozen_receipt_and_cross_restore_exactly(
         attempt_ledger=bodies["attempt_ledger"], horizon_execution_contracts=bodies["horizon_execution_contracts"],
         partition_cost_precommitments=bodies["partition_cost_precommitments"], artifact_entries=artifact_entries)
     assert producer._canonical_bytes(rebuilt) == case["frozen_receipt_bytes"]
-    assert hashlib.sha256(case["frozen_receipt_bytes"]).hexdigest() == _RETAINED_CURRENT_FROZEN_RECEIPT_SHA256
+    assert hashlib.sha256(case["frozen_receipt_bytes"]).hexdigest() == case["frozen_receipt_sha256"]
     frozen, cross, verified_attempts, binding_context = _restore_current_binding(case)
     assert frozen.frozen_receipt_bytes == case["frozen_receipt_bytes"]
     assert cross == case["cross"]
@@ -2792,7 +2792,7 @@ def test_retained_two_attempt_frozen_receipt_and_cross_restore_exactly(
     assert binding_context["mode"] == raw_winner.HISTORICAL_CROSS_BINDING_MODE
     assert {row["ordinal"] for row in cross["mapping"]} == {0, 1}
     assert producer._verify_current_owner_capture_binding(
-        **_current_owner_capture_arguments(case, frozen=frozen, cross=cross)) is None
+        **_current_f_owner_capture_arguments(case, frozen=frozen, cross=cross)) is None
 
 
 @pytest.mark.parametrize(("mutation", "expected"), [
@@ -2938,9 +2938,9 @@ def test_current_mode_cross_schemas_refuse_before_canonical_delegation(
     raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
 ])
 def test_raw_current_mode_cross_schemas_refuse_before_canonical_delegation(
-    retained_current_owner_metadata, forbid_current_owner_economics, monkeypatch, schema,
+    current_f_produced_owner_metadata, forbid_current_owner_economics, monkeypatch, schema,
 ):
-    case = retained_current_owner_metadata
+    case = current_f_produced_owner_metadata
     frozen = raw_winner.restore_frozen_winner_search_plan_v4(**case["arguments"])
     calls = []
     def forbidden(*_args, **_kwargs):
@@ -2970,9 +2970,9 @@ def test_readonly_current_owner_rejects_coherently_rehashed_mapping_splice(
 
 
 def test_current_owner_rejects_missing_pair_before_cross_delegation(
-    retained_current_owner_metadata, forbid_current_owner_economics, monkeypatch,
+    current_f_produced_owner_metadata, forbid_current_owner_economics, monkeypatch,
 ):
-    frozen = raw_winner.restore_frozen_winner_search_plan_v4(**retained_current_owner_metadata["arguments"])
+    frozen = raw_winner.restore_frozen_winner_search_plan_v4(**current_f_produced_owner_metadata["arguments"])
     calls = []
     def without_pair(**_kwargs):
         calls.append("restore")
@@ -2983,7 +2983,7 @@ def test_current_owner_rejects_missing_pair_before_cross_delegation(
     monkeypatch.setattr(raw_winner, "verify_historical_frozen_winner_cross_binding", forbidden)
     with pytest.raises(producer.ForwardOOSReplayProductionError,
                        match="CURRENT_OWNER_FROZEN_PAIR_GENERATION_MISMATCH"):
-        _restore_current_binding(retained_current_owner_metadata)
+        _restore_current_binding(current_f_produced_owner_metadata)
     assert calls == ["restore"]
 
 
@@ -4095,3 +4095,109 @@ def test_synthetic_current_raw_disk_session_refuses_unsafe_clone_before_copy(
             SimpleNamespace(mktemp=lambda name: destination), pytestconfig,
             metadata_path=metadata, spool_root=saved)
     assert not hasattr(pytestconfig, "_fxpm_current_raw_transport")
+
+
+# Retained CURRENT F-produced engineering witness, not pre-F compatibility proof.
+_CURRENT_F_PRODUCED_OWNER_ROOT = 'audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/f_only_rebind_001/affected84_001/pytest_tmp/test_declared_native_two_trial0/spool'
+_CURRENT_F_PRODUCED_MANIFEST_SHA256 = 'ee0138981737c6963521f65fd396375a9c5c6e293ca25456580c38356c04327b'
+_CURRENT_F_PRODUCED_FROZEN_SHA256 = '9365b625700ec7dccfbac79e09f9017f2d8cf743381e2069d247ecdc8ad248fc'
+_CURRENT_F_PRODUCED_CROSS_SHA256 = '7f91bad14f28218883975bdf3b9d97ac598de4e4743c0f175ee80e4abede0829'
+_CURRENT_F_PRODUCED_INDEX_ID = 'unissued-selected-owner-flat-anchor-control/adapter/production-index'
+
+
+@pytest.fixture(scope="module")
+def current_f_produced_owner_metadata(tmp_path_factory):
+    """CURRENT F-produced v4 mechanics only; no pre-F/native/issued300 claim."""
+    original = Path(__file__).resolve().parents[1] / _CURRENT_F_PRODUCED_OWNER_ROOT
+    manifest_bytes = (original / _RETAINED_CURRENT_MANIFEST).read_bytes()
+    assert hashlib.sha256(manifest_bytes).hexdigest() == _CURRENT_F_PRODUCED_MANIFEST_SHA256
+    manifest = json.loads(manifest_bytes)
+    destination = tmp_path_factory.mktemp("current-f-produced-owner") / "spool"
+    # Copy the sealed closure as the existing archive fixture does; never rewrite its inputs.
+    shutil.copytree(original, destination)
+    context = authority_spool.reopen_generation_context(destination,
+        expected_generation_id=manifest["generation_id"],
+        expected_native_universe_sha256=manifest["native_universe_sha256"],
+        expected_config_sha256=manifest["config_sha256"])
+    receipt = {name: manifest[name] for name in (
+        "generation_id", "symbol", "manifest_domain", "native_universe_sha256",
+        "config_sha256", "generation_context_sha256")}
+    receipt.update({"schema_version": authority_spool.COMPACT_RECEIPT_SCHEMA,
+        "symbol_manifest": {
+            "schema_version": authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
+            "relative_path": _RETAINED_CURRENT_MANIFEST,
+            "sha256": _CURRENT_F_PRODUCED_MANIFEST_SHA256,
+            "size_bytes": len(manifest_bytes), "format": authority_spool.CANONICAL_JSON_FORMAT}})
+    reopened_manifest, entries = producer._verified_manifest(context, receipt, manifest["symbol"])
+    assert reopened_manifest == manifest and manifest["artifact_count"] == 196
+    frozen_entries = [entry for entry in entries.values()
+                      if entry["artifact_type"] == "winner_frozen_search_plan_receipt"]
+    assert len(frozen_entries) == 1
+    frozen_entry = frozen_entries[0]
+    assert frozen_entry["descriptor"]["sha256"] == _CURRENT_F_PRODUCED_FROZEN_SHA256
+    frozen_receipt_bytes = producer._read_descriptor_bytes(context, frozen_entry["descriptor"],
+        code="TEST_CURRENT_F_PRODUCED_FROZEN_RECEIPT")
+    frozen_receipt = json.loads(frozen_receipt_bytes)
+    assert frozen_receipt["schema_version"] == "fxpm.winner-search-plan-frozen.v4"
+    namespace = frozen_receipt["artifact_namespace"]
+    cross_id = "unissued-selected-owner-flat-anchor-control/adapter/H1/TREND/horizon-winner-cross-binding"
+    cross_entry = entries[cross_id]
+    assert cross_entry["descriptor"]["sha256"] == _CURRENT_F_PRODUCED_CROSS_SHA256
+    cross = producer._manifest_body(context, entries, cross_id, code="TEST_CURRENT_F_PRODUCED_CROSS")
+    arguments, bodies = _frozen_restore_transport(context, entries,
+        symbol=frozen_receipt["symbol"], timeframe=frozen_receipt["timeframe"],
+        regime=frozen_receipt["regime"], namespace=namespace)
+    assert len(arguments["manifest_entries"]) == 18
+    assert bodies["receipt"] == frozen_receipt
+    assert len(bodies["attempt_ledger"]["attempts"]) == 2
+    for ordinal in (0, 1):
+        for name in _RESTORE_ARTIFACT_NAMES:
+            assert f"attempt-{ordinal:04d}-{name}" in bodies
+    yield {"context": context, "entries": entries, "arguments": arguments,
+           "bodies": bodies, "cross": cross, "frozen_receipt_bytes": frozen_receipt_bytes,
+           "frozen_receipt_sha256": _CURRENT_F_PRODUCED_FROZEN_SHA256,
+           "production_index_artifact_id": _CURRENT_F_PRODUCED_INDEX_ID,
+           "witness_provenance": "CURRENT_F_PRODUCED_SYNTHETIC_ENGINEERING_NOT_PREF_COMPATIBILITY"}
+    assert (original / _RETAINED_CURRENT_MANIFEST).read_bytes() == manifest_bytes
+
+
+def test_archived_qa97_core_edition_refuses_current_frozen_restore(
+    retained_current_owner_metadata, forbid_current_owner_economics,
+):
+    """Keep the archived e719 recipe immutable and its exact typed refusal visible."""
+    trial = retained_current_owner_metadata["bodies"]["attempt-0000-trial_definition"]
+    assert trial["indicator_contract_sha256"] == "e7196d38a0009f5a468b57e1990a8995e7b3d1c8209e7eb6915ed76827663222"
+    with pytest.raises(raw_winner.WinnerRawEvidenceError,
+            match=r"^ATTEMPT_0000_ARTIFACT_UNVERIFIABLE: TRIAL_DEFINITION_SEMANTICS_INVALID$") as caught:
+        raw_winner.restore_frozen_winner_search_plan_v4(**retained_current_owner_metadata["arguments"])
+    assert caught.value.code == "ATTEMPT_0000_ARTIFACT_UNVERIFIABLE"
+    assert type(caught.value.__cause__) is raw_winner.refit_artifacts.CurrentRefitArtifactError
+    assert str(caught.value.__cause__) == "TRIAL_DEFINITION_SEMANTICS_INVALID"
+
+def _current_f_owner_capture_arguments(case, *, frozen, cross):
+    context, entries = case["context"], case["entries"]
+    index = producer._manifest_body(context, entries,
+        case["production_index_artifact_id"],
+        code="TEST_RETAINED_PRODUCTION_INDEX")
+    records = [row for row in index["cell_records"]
+               if (row["symbol"], row["timeframe"], row["regime"])
+               == (frozen.symbol, frozen.timeframe, frozen.regime)]
+    assert len(records) == 1
+    record = records[0]
+    assert record["raw_artifact_namespace"] == frozen.artifact_namespace
+    prefix = f"{frozen.artifact_namespace}/winner-search/{frozen.timeframe}/{frozen.regime}/authority"
+    request_body = producer._manifest_body(context, entries, f"{prefix}/winner-request",
+        code="TEST_RETAINED_WINNER_REQUEST", maximum=producer.winner.MAX_REQUEST_BYTES)
+    request = producer._winner_request(request_body, record["winner_request_sha256"])
+    decision_body = producer._manifest_body(context, entries, f"{prefix}/winner-decision",
+        code="TEST_RETAINED_WINNER_DECISION", maximum=producer.winner.MAX_DECISION_BYTES)
+    owned_decision = copy.deepcopy(decision_body)
+    decision_sha256 = owned_decision.pop("receipt_sha256")
+    assert decision_sha256 == record["winner_decision_sha256"] == producer._sha(owned_decision)
+    # Own the sealed result without rerunning the selection policy.
+    decision = producer.winner.WinnerSelectionDecision(
+        producer._canonical_bytes(owned_decision, producer.winner.MAX_DECISION_BYTES), decision_sha256)
+    assert request.to_dict() == request_body and decision.to_dict() == decision_body
+    return {"context": context, "entries": entries, "anchor": index["anchor"],
+            "index": index, "record": record, "request": request, "decision": decision,
+            "frozen": frozen, "cross": cross, "cell_id": frozen.precommitment["cell_id"]}

@@ -60,6 +60,8 @@ ARCHIVED_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v3"
 FROZEN_PLAN_SCHEMA = ARCHIVED_FROZEN_PLAN_SCHEMA
 CURRENT_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v4"
 V16_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v5"
+BOUND_FIT_V15_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v6"
+BOUND_FIT_V16_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v7"
 FROZEN_COST_LADDER_CONTRACT_SCHEMA = BACKTEST_COST_LADDER_CONTRACT_SCHEMA_VERSION
 ARCHIVED_RAW_LANE_SCHEMA = "fxpm.winner-raw-backtester-lane.v4"
 RAW_LANE_SCHEMA = ARCHIVED_RAW_LANE_SCHEMA
@@ -227,6 +229,12 @@ class FrozenWinnerSearchPlan:
     source_contract_seeds_bytes: bytes = b""
     frozen_tier_pair_contract_bytes: bytes = b""
     partition_cost_precommitments_bytes: bytes = b""
+    bound_fitted_state_entry_bytes: bytes = b""
+
+    @property
+    def bound_fitted_state_entry(self):
+        return (_decode_object(self.bound_fitted_state_entry_bytes, "BOUND_FIT_REFERENCE_INVALID")
+                if self.bound_fitted_state_entry_bytes else None)
 
     @property
     def selection_generation(self):
@@ -1745,6 +1753,12 @@ def _restored_frozen_context_identity(context_identity: Any) -> dict[str, str]:
     return identity
 
 
+def _bound_frozen_schema(generation, present):
+    if present:
+        return BOUND_FIT_V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else BOUND_FIT_V15_FROZEN_PLAN_SCHEMA
+    return V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA
+
+
 def _build_frozen_winner_search_plan_receipt(
     *,
     context_identity: Mapping[str, str],
@@ -1781,7 +1795,7 @@ def _build_frozen_winner_search_plan_receipt(
         "trial_registry_sha256": _trial_registry(attempts),
     }
     return {
-        "schema_version": V16_FROZEN_PLAN_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA,
+        "schema_version": _bound_frozen_schema(_generation, "bound_fitted_state" in artifact_entries),
         **identity,
         "artifact_namespace": artifact_namespace,
         "symbol": symbol,
@@ -1821,6 +1835,7 @@ def _freeze_winner_search_plan(
     risk_unit_contract: Mapping[str, Any],
     partition_cost_precommitments: Mapping[str, Any],
     artifact_namespace: Optional[str] = None,
+    bound_fitted_state_entry=None,
     _generation=winner.CURRENT_GENERATION,
 ) -> FrozenWinnerSearchPlan:
     """Freeze exact attempt/fold truth and persist it before evaluation.
@@ -1894,7 +1909,8 @@ def _freeze_winner_search_plan(
     }
     run_id = _sha_json(
         {
-            "schema_version": V16_FROZEN_PLAN_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA,
+            "schema_version": _bound_frozen_schema(_generation, bound_fitted_state_entry is not None),
+            **({"bound_fitted_state_reference_sha256": _sha_json(bound_fitted_state_entry)} if bound_fitted_state_entry is not None else {}),
             "generation_context_sha256": sink.context.context_sha256,
             "artifact_namespace": namespace,
             "precommitted_at_utc": precommitted_at,
@@ -1969,6 +1985,17 @@ def _freeze_winner_search_plan(
         ),
         "multiplicity_receipt": ("winner_trade_power_multiplicity", multiplicity),
     }
+    if bound_fitted_state_entry is not None:
+        import pm_current_refit_artifacts as fit_artifacts
+        if namespace is None or not namespace.startswith("declared-slot/"):
+            _fail("BOUND_FIT_DECLARED_NAMESPACE_REQUIRED")
+        state, _ = fit_artifacts.read_bound_fitted_state_reference(sink.context, bound_fitted_state_entry, artifact_namespace=namespace)
+        if (_canonical_bytes(state["metadata"]["fold_plan"]) != _canonical_bytes(normalized_folds)
+                or _canonical_bytes(state["metadata"]["receipts"]["source_contract_seeds"]) != _canonical_bytes(source_seeds)
+                or _canonical_bytes(state["metadata"]["receipts"]["frozen_tier_pair_contract"]) != _canonical_bytes(pair_contract)
+                or state["metadata"]["snapshot_issued_at_utc"] > precommitted_at):
+            _fail("BOUND_FIT_FROZEN_INPUT_CHANGED")
+        bodies["bound_fitted_state"] = ("winner_bound_fitted_state", bound_fitted_state_entry)
     for name, (artifact_type, body) in bodies.items():
         spool_entries[name] = _put_ascii_json(
             sink, f"{prefix}/frozen/{name}", artifact_type, body
@@ -2041,6 +2068,7 @@ def _freeze_winner_search_plan(
         source_contract_seeds_bytes=_canonical_bytes(source_seeds),
         frozen_tier_pair_contract_bytes=_canonical_bytes(pair_contract),
         partition_cost_precommitments_bytes=partition_bytes,
+        bound_fitted_state_entry_bytes=(_canonical_bytes(bound_fitted_state_entry) if bound_fitted_state_entry is not None else b""),
     )
 
 
@@ -5150,6 +5178,8 @@ def _reopen_current_frozen_plan_artifacts(
         ),
         "multiplicity_receipt": ("winner_trade_power_multiplicity", multiplicity),
     }
+    if frozen.bound_fitted_state_entry is not None:
+        bodies["bound_fitted_state"] = ("winner_bound_fitted_state", frozen.bound_fitted_state_entry)
     reopened: dict[str, dict[str, Any]] = {}
     for name, (artifact_type, body) in bodies.items():
         reopened[name] = _put_ascii_json(
@@ -5216,6 +5246,7 @@ def _restore_frozen_winner_search_plan(
     artifact_namespace: Optional[str],
     manifest_entries: Sequence[Mapping[str, Any]],
     body_bytes: Sequence[bytes],
+    _bound_fit=False,
     _generation=winner.CURRENT_GENERATION,
 ) -> FrozenWinnerSearchPlan:
     """Restore a current plan from caller-authenticated sealed-manifest bodies.
@@ -5234,7 +5265,7 @@ def _restore_frozen_winner_search_plan(
     if (not isinstance(manifest_entries, (list, tuple))
             or not isinstance(body_bytes, (list, tuple))
             or len(manifest_entries) != len(body_bytes)
-            or not 1 <= len(manifest_entries) <= 10 + 4 * winner.MAX_ATTEMPTS):
+            or not 1 <= len(manifest_entries) <= (11 if _bound_fit else 10) + 4 * winner.MAX_ATTEMPTS):
         _fail("FROZEN_PLAN_RESTORE_INPUT_ROSTER_INVALID")
     prefix = _artifact_prefix(namespace, normalized_timeframe, normalized_regime)
     frozen_prefix = f"{prefix}/frozen/"
@@ -5281,7 +5312,7 @@ def _restore_frozen_winner_search_plan(
         return decoded_by_id[artifact_id]
 
     receipt = body_for("receipt", "winner_frozen_search_plan_receipt")
-    if (receipt.get("schema_version") != (V16_FROZEN_PLAN_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA)
+    if (receipt.get("schema_version") != _bound_frozen_schema(_generation, _bound_fit)
             or any(receipt.get(name) != value for name, value in identity.items())
             or receipt.get("artifact_namespace") != namespace
             or receipt.get("symbol") != normalized_symbol
@@ -5306,6 +5337,9 @@ def _restore_frozen_winner_search_plan(
                      "frozen_tier_pair_contract", "risk_unit_contract", "partition_cost_precommitments",
                      "horizon_execution_contracts", "trade_power_policy", "multiplicity_receipt")
     }
+    bound_fit = body_for("bound_fitted_state", "winner_bound_fitted_state") if _bound_fit else None
+    if _bound_fit:
+        logical_entries["bound_fitted_state"] = entries_by_id[frozen_prefix + "bound_fitted_state"]
     bundle = []
     for ordinal in range(len(attempts)):
         artifacts = {}
@@ -5377,6 +5411,20 @@ def _restore_frozen_winner_search_plan(
             or any(precommitment.get(name) != value or attempt_ledger.get(name) != value
                    for name, value in common.items())):
         _fail("FROZEN_PLAN_RESTORE_BINDING_INVALID")
+    if _bound_fit:
+        expected_run_id = _sha_json({
+            "schema_version": _bound_frozen_schema(_generation, True),
+            "bound_fitted_state_reference_sha256": _sha_json(bound_fit),
+            "generation_context_sha256": identity["generation_context_sha256"],
+            "artifact_namespace": namespace, "precommitted_at_utc": precommitment.get("precommitted_at_utc"),
+            "symbol": normalized_symbol, "timeframe": normalized_timeframe, "regime": normalized_regime,
+            "attempts": attempts, "fold_plan": folds,
+            "horizon_execution_contracts_sha256": _sha_json(horizon_contracts),
+            "partition_cost_precommitments_sha256": _sha_json(partition_precommits),
+            **pair_hashes, "risk_unit_contract_sha256": _sha_json(risk_contract),
+            **{key: expected_receipt[key] for key in ("process_registry_sha256", "horizon_registry_sha256", "trial_registry_sha256")}})
+        if precommitment.get("run_id") != expected_run_id:
+            _fail("BOUND_FIT_FROZEN_RUN_ID_CHANGED")
     precommitted_at = _utc(precommitment.get("precommitted_at_utc"), "PRECOMMITTED_AT_INVALID")
     frozen_at = _utc(attempt_ledger.get("frozen_at_utc"), "ATTEMPTS_FROZEN_AT_INVALID")
     if frozen_at <= precommitted_at:
@@ -5396,6 +5444,7 @@ def _restore_frozen_winner_search_plan(
         source_contract_seeds_bytes=encoded_by_id[frozen_prefix + "source_contract_seeds"],
         frozen_tier_pair_contract_bytes=encoded_by_id[frozen_prefix + "frozen_tier_pair_contract"],
         partition_cost_precommitments_bytes=encoded_by_id[frozen_prefix + "partition_cost_precommitments"],
+        bound_fitted_state_entry_bytes=(_canonical_bytes(bound_fit) if _bound_fit else b""),
     )
     verified_bundle = _verified_frozen_attempt_bundle(frozen=frozen,
         attempt_ledger=attempt_ledger, frozen_receipt=receipt)
@@ -5428,7 +5477,7 @@ def verify_historical_frozen_winner_cross_binding(
     }:
         _fail("HISTORICAL_CROSS_BINDING_CURRENT_PLAN_FORBIDDEN")
     receipt = _decode_object(frozen.frozen_receipt_bytes, "FROZEN_RECEIPT_INVALID")
-    if (receipt.get("schema_version") != (V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA)
+    if (receipt.get("schema_version") != _bound_frozen_schema(generation, bool(frozen.bound_fitted_state_entry_bytes))
             or not frozen.frozen_tier_pair_contract_bytes
             or binding.get("schema_version") != (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
                 if generation is winner.V16_GENERATION else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3)):
@@ -5801,6 +5850,30 @@ def build_frozen_winner_search_plan_v5_receipt(*, context_identity, symbol, time
     return _build_frozen_winner_search_plan_receipt(**locals(), _generation=winner.V16_GENERATION)
 
 
+def freeze_winner_search_plan_v6(sink, *, symbol, timeframe, regime, precommitted_at_utc, attempts_frozen_at_utc,
+        fold_plan, attempt_artifacts, precommitted_evidence_roles, horizon_execution_contracts, source_contract_seeds,
+        frozen_tier_pair_contract, risk_unit_contract, partition_cost_precommitments, bound_fitted_state_entry, artifact_namespace=None):
+    if bound_fitted_state_entry is None:
+        _fail("BOUND_FIT_REFERENCE_REQUIRED")
+    return _freeze_winner_search_plan(**locals(), _generation=winner.CURRENT_GENERATION)
+
+
+def restore_frozen_winner_search_plan_v6(*, context_identity, symbol, timeframe, regime, artifact_namespace, manifest_entries, body_bytes):
+    return _restore_frozen_winner_search_plan(**locals(), _generation=winner.CURRENT_GENERATION, _bound_fit=True)
+
+
+def freeze_winner_search_plan_v7(sink, *, symbol, timeframe, regime, precommitted_at_utc, attempts_frozen_at_utc,
+        fold_plan, attempt_artifacts, precommitted_evidence_roles, horizon_execution_contracts, source_contract_seeds,
+        frozen_tier_pair_contract, risk_unit_contract, partition_cost_precommitments, bound_fitted_state_entry, artifact_namespace=None):
+    if bound_fitted_state_entry is None:
+        _fail("BOUND_FIT_REFERENCE_REQUIRED")
+    return _freeze_winner_search_plan(**locals(), _generation=winner.V16_GENERATION)
+
+
+def restore_frozen_winner_search_plan_v7(*, context_identity, symbol, timeframe, regime, artifact_namespace, manifest_entries, body_bytes):
+    return _restore_frozen_winner_search_plan(**locals(), _generation=winner.V16_GENERATION, _bound_fit=True)
+
+
 def freeze_winner_search_plan_v4(sink, *, symbol, timeframe, regime, precommitted_at_utc, attempts_frozen_at_utc,
         fold_plan, attempt_artifacts, precommitted_evidence_roles, horizon_execution_contracts, source_contract_seeds,
         frozen_tier_pair_contract, risk_unit_contract, partition_cost_precommitments, artifact_namespace=None):
@@ -5885,3 +5958,7 @@ __all__ = [
     "produce_winner_v14_raw_evidence",
     "produce_winner_v15_raw_evidence",
 ]
+
+__all__ += ["BOUND_FIT_V15_FROZEN_PLAN_SCHEMA", "BOUND_FIT_V16_FROZEN_PLAN_SCHEMA",
+    "freeze_winner_search_plan_v6", "freeze_winner_search_plan_v7",
+    "restore_frozen_winner_search_plan_v6", "restore_frozen_winner_search_plan_v7"]

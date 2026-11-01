@@ -29,3 +29,4 @@
 /tests/test_enhancement_seams.py -text
 /tests/test_position_sizing_edge_cases.py -text
 /tests/test_raw_winner_canary.py -text
+/pm_current_refit_artifacts.py -text

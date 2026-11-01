@@ -893,7 +893,9 @@ def test_decision_relevant_result_rejects_invalid_trade_projection_source(
 
 def test_release_contract_binds_all_execution_dependencies() -> None:
     contract = execution.authoritative_search_execution_contract()
-    assert contract["schema_version"] == "fxpm.authoritative-search-execution.v5"
+    assert contract["schema_version"] == "fxpm.authoritative-search-execution.v6"
+    assert contract["regime_surface_acquisition"] == "RECOMPUTED_OR_REOPENED_FROM_ORIGINAL_BOUND_STATE"
+    assert contract["bounded_canary_accepts_prebuilt_source_or_fit"] is False
     assert contract["position_event_source"].endswith("position-events-v2")
     assert contract["candidate_costs"] == execution.pm_core.BACKTEST_FROZEN_TIER_PAIR_CONTRACT_SCHEMA_VERSION
     assert contract["independent_cost_accounts_per_partition"] == ["P75", "P95"]
@@ -2785,6 +2787,23 @@ def test_declared_executor_empty_reference_set_records_stop_with_frozen_pointers
     monkeypatch.setattr(execution, "_reverify_cell_state_error_envelope", lambda **kwargs: None)
     monkeypatch.setattr(execution, "_verify_attempt_roster", lambda **kwargs: (plan_body, (verified,)))
     monkeypatch.setattr(execution, "_winner_fold_plan", lambda attempts: folds)
+    snapshot_calls = []
+    snapshot_marker = {"classification": "SYNTHETIC_SNAPSHOT_PHASE_MARKER_NOT_A_BOUND_REFERENCE"}
+    def structural_snapshot(actual, actual_fitted, actual_folds, issue_owner):
+        # This negative guard test never consumes a fitted reference as authority.
+        assert actual is capture and actual_fitted is fitted and actual_folds is folds
+        assert type(issue_owner) is execution._FreshFitOwner
+        assert issue_owner.fitted is fitted and issue_owner.original_fitted is fitted
+        assert issue_owner.context_id == id(capture.context)
+        assert issue_owner.request_sha256 == capture.request.receipt_sha256
+        assert issue_owner.config is config
+        snapshot_calls.append(issue_owner)
+        return snapshot_marker
+    monkeypatch.setattr(execution, "_publish_declared_bound_fit", structural_snapshot)
+    def forbidden_unit_work(*args, **kwargs):
+        pytest.fail("Empty reference guard reached F header or unit publication")
+    monkeypatch.setattr(execution, "_make_declared_unit_header", forbidden_unit_work)
+    monkeypatch.setattr(execution, "_continue_declared_attempt_units", forbidden_unit_work)
     costs = {"schema_version": "SYNTHETIC_REFERENCE_GUARD_COST_STUB", "rows": []}
     order = []
     def empty_cost_precommit(**kwargs):
@@ -2807,6 +2826,7 @@ def test_declared_executor_empty_reference_set_records_stop_with_frozen_pointers
     def freeze(actual, timeframe, regime, **kwargs):
         assert actual is capture and (timeframe, regime) == ("H1", "TREND")
         assert kwargs["partition_cost_precommitments"] is costs
+        assert kwargs["bound_fitted_state_entry"] is snapshot_marker
         capture._active = handle
         order.append("freeze")
         return handle
@@ -2823,7 +2843,7 @@ def test_declared_executor_empty_reference_set_records_stop_with_frozen_pointers
     monkeypatch.setattr(execution, "_build_planned_attempt_evidence", forbidden_evaluation)
     def completion_body(actual, *, status, reason_code, handle, completed):
         assert actual is capture and completed is None
-        assert handle is capture._active
+        assert handle is not None and handle is capture._active
         return {"classification": "SYNTHETIC_REFERENCE_GUARD_LIFECYCLE_NOT_FULL300_PRODUCTION",
             "status": status, "reason_code": reason_code, "owner": None,
             "frozen_plan_receipt": handle.frozen_receipt_descriptor,
@@ -2836,6 +2856,7 @@ def test_declared_executor_empty_reference_set_records_stop_with_frozen_pointers
     result = execution.execute_historical_observed_cell(capture=capture, fitted=fitted,
         regime="TREND", search_process=env.process, cell_plan=plan, config=config)
     assert guard_inputs == [{}] and order == ["costs", "freeze"]
+    assert len(snapshot_calls) == 1
     assert (result.status, result.failure_code) == ("TECHNICAL_FAILURE", "SOURCE_OBSERVATION_REFERENCE_SET_REQUIRED")
     assert result.production is None and result.attempted_trials_exact == 1
     observed = capture.completion
@@ -2853,3 +2874,445 @@ def test_declared_executor_empty_reference_set_records_stop_with_frozen_pointers
         "raw_production_receipt", "production_descriptor_graph"))
     assert all(observed[name] is False for name in (
         "qualification_authority", "capital_authority", "live_authority", "order_authority"))
+
+
+# Labelled synthetic store tests. These do not claim native/300-trial/Raw authority.
+def _completed_unit_store_fixture(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    context = execution.authority_spool.freeze_generation_context(
+        (tmp_path / "unit-store").resolve(), generation_id="synthetic-completed-units",
+        native_universe_sha256="a" * 64, config_sha256="b" * 64,
+        limits=execution.authority_spool.SpoolLimits(
+            max_artifact_bytes=65536, max_symbol_bytes=1048576,
+            max_artifacts_per_symbol=100, max_manifest_bytes=65536,
+            max_json_bytes=65536, stream_chunk_bytes=1024,
+            max_generation_bytes=1048576, min_free_bytes=0))
+    body = {"precommit_sha256": "c" * 64, "cell_id": "synthetic-cell",
+        "slot_id": "synthetic-slot", "attempt_id": "original-synthetic-attempt",
+        "source_access_window_utc": {"start_utc": "2000-01-01T00:00:00Z",
+                                   "end_exclusive_utc": "2099-01-01T00:00:00Z"}}
+    units = [{"ordinal": ordinal, "raw_attempt_id": f"raw-{ordinal}",
+        "plan_attempt_sha256": str(ordinal + 1) * 64,
+        "status": "PROCESS_REJECTED" if ordinal == 1 else "PLANNED"}
+        for ordinal in range(3)]
+    return context, body, "d" * 64, units
+
+
+def _synthetic_completed_unit_value(unit):
+    return {"attempt_id": unit["raw_attempt_id"],
+        "synthetic_only": True, "delta": [7, 0, -2][unit["ordinal"]],
+        "outcome": {"status": "PROCESS_REJECTED"} if unit["status"] == "PROCESS_REJECTED" else None}
+
+
+def test_completed_units_resume_disk_prefix_without_recalculating_and_match_uninterrupted(tmp_path):
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path / "resumed")
+    calls = []
+    def interrupted(unit):
+        calls.append(unit["ordinal"])
+        if unit["ordinal"] == 2:
+            raise KeyboardInterrupt("labelled interruption before third unit")
+        return _synthetic_completed_unit_value(unit)
+    with pytest.raises(KeyboardInterrupt):
+        execution._continue_declared_attempt_units(context, body, binding, units, interrupted)
+    assert calls == [0, 1, 2]
+    # Reopen the real generation context, not an in-memory row list.
+    reopened = execution.authority_spool.reopen_generation_context(context.root,
+        expected_generation_id=context.generation_id,
+        expected_native_universe_sha256=context.native_universe_sha256,
+        expected_config_sha256=context.config_sha256)
+    # Existing reopen is read-only; the ordinary writable freeze verifies identical context.
+    reopened = execution.authority_spool.freeze_generation_context(context.root,
+        generation_id=context.generation_id,
+        native_universe_sha256=context.native_universe_sha256,
+        config_sha256=context.config_sha256, limits=context.limits)
+    resumed_calls = []
+    def remaining(unit):
+        resumed_calls.append(unit["ordinal"])
+        return _synthetic_completed_unit_value(unit)
+    records, ended = execution._continue_declared_attempt_units(reopened, body, binding, units, remaining)
+    assert resumed_calls == [2]
+    assert len(records) == 3 and records[1]["unit"]["status"] == "PROCESS_REJECTED"
+    expected_context, expected_body, expected_binding, expected_units = _completed_unit_store_fixture(tmp_path / "whole")
+    full, _ = execution._continue_declared_attempt_units(expected_context, expected_body,
+        expected_binding, expected_units, _synthetic_completed_unit_value)
+    actual = [execution._read_declared_completed_unit(reopened, body, binding, unit)[1] for unit in units]
+    expected = [execution._read_declared_completed_unit(expected_context, expected_body,
+        expected_binding, unit)[1] for unit in expected_units]
+    assert actual == expected
+    # Explicit synthetic carry; no skipped rejected row, and no cash reset within the chain.
+    cash = [10000]
+    for value in actual:
+        cash.append(cash[-1] + value["delta"])
+    assert cash == [10000, 10007, 10007, 10005]
+    assert [row["payload"]["sha256"] for row in records] == [row["payload"]["sha256"] for row in full]
+    assert max(row["completed_at_utc"] for row in records) <= ended
+    def no_recalculation(_unit):
+        pytest.fail("fully committed unit was recalculated")
+    again, again_ended = execution._continue_declared_attempt_units(reopened, body, binding, units, no_recalculation)
+    assert again == records and again_ended == ended
+
+
+@pytest.mark.parametrize("phase", ["before_completion_record", "after_completion_record"])
+def test_completed_unit_publication_interruption_has_one_truthful_boundary(tmp_path, monkeypatch, phase):
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path)
+    real = execution.authority_spool._publish_exact_json
+    cut = execution._declared_unit_relative(body, "000000.json")
+    tripped = []
+    def publish(ctx, relative, value, maximum_bytes):
+        if relative == cut and not tripped:
+            tripped.append(True)
+            if phase == "after_completion_record":
+                real(ctx, relative, value, maximum_bytes)
+            raise KeyboardInterrupt("labelled metadata boundary interruption")
+        return real(ctx, relative, value, maximum_bytes)
+    monkeypatch.setattr(execution.authority_spool, "_publish_exact_json", publish)
+    with pytest.raises(KeyboardInterrupt):
+        execution._continue_declared_attempt_units(context, body, binding, units, _synthetic_completed_unit_value)
+    monkeypatch.setattr(execution.authority_spool, "_publish_exact_json", real)
+    calls = []
+    def produce(unit):
+        calls.append(unit["ordinal"])
+        return _synthetic_completed_unit_value(unit)
+    execution._continue_declared_attempt_units(context, body, binding, units, produce)
+    assert calls == ([0, 1, 2] if phase == "before_completion_record" else [1, 2])
+
+
+@pytest.mark.parametrize("kind", ["payload_tamper", "missing_payload", "wrong_binding",
+                                  "wrong_unit", "prefix_hole", "promised_missing_tail"])
+def test_completed_units_refuse_corrupt_or_incompatible_prefix_before_more_work(tmp_path, kind):
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path)
+    records, _ = execution._continue_declared_attempt_units(context, body, binding, units,
+        _synthetic_completed_unit_value)
+    if kind in {"payload_tamper", "missing_payload"}:
+        payload = context.root / records[0]["payload"]["relative_path"]
+        if kind == "missing_payload":
+            payload.unlink()
+        else:
+            payload.write_bytes(payload.read_bytes() + b" ")
+    elif kind == "wrong_binding":
+        binding = "e" * 64
+    elif kind == "wrong_unit":
+        units[0] = {**units[0], "plan_attempt_sha256": "f" * 64}
+    elif kind == "prefix_hole":
+        (context.root / execution._declared_unit_relative(body, "000001.json")).unlink()
+    else:
+        (context.root / execution._declared_unit_relative(body, "000002.json")).unlink()
+    def forbidden(_unit):
+        pytest.fail("incompatible completed prefix reached new unit work")
+    with pytest.raises((execution.AuthoritativeSearchExecutionError,
+                        execution.authority_spool.AuthoritySpoolError)):
+        execution._continue_declared_attempt_units(context, body, binding, units, forbidden)
+
+
+def test_completed_units_preserve_original_request_and_do_not_claim_old_orphan_recovery(tmp_path):
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path)
+    execution._continue_declared_attempt_units(context, body, binding, units, _synthetic_completed_unit_value)
+    foreign = {**body, "attempt_id": "different-synthetic-attempt"}
+    # Complete objects in another request are not a unit roster for this one.
+    assert execution._declared_completed_prefix(context, foreign, binding, units) == []
+    observed = []
+    def no_transfer(unit):
+        observed.append(unit["ordinal"])
+        return _synthetic_completed_unit_value(unit)
+    execution._continue_declared_attempt_units(context, foreign, binding, units, no_transfer)
+    assert observed == [0, 1, 2]
+
+
+def test_completed_units_missing_work_respects_original_window_and_actual_completion_clock(tmp_path, monkeypatch):
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path)
+    body["source_access_window_utc"] = {"start_utc": "2020-01-01T00:00:00Z",
+                                     "end_exclusive_utc": "2020-01-02T00:00:00Z"}
+    monkeypatch.setattr(execution, "_now_utc_seconds", lambda: "2020-01-03T00:00:00Z")
+    with pytest.raises(execution.AuthoritativeSearchExecutionError, match="ORIGINAL_WINDOW_CLOSED"):
+        execution._continue_declared_attempt_units(context, body, binding, units,
+            lambda _unit: pytest.fail("expired original window admitted new work"))
+    assert execution._declared_completed_prefix(context, body, binding, units) == []
+    observed = ["2020-01-01T01:00:00Z"]
+    monkeypatch.setattr(execution, "_now_utc_seconds", lambda: observed[0])
+    def work(unit):
+        observed[0] = f"2020-01-01T02:00:0{unit['ordinal']}Z"
+        return _synthetic_completed_unit_value(unit)
+    rows, ended = execution._continue_declared_attempt_units(context, body, binding, units, work)
+    assert ended == "2020-01-01T02:00:02Z"
+    assert rows[-1]["completed_at_utc"] == ended
+    observed[0] = "2020-02-01T00:00:00Z"
+    _, same_end = execution._continue_declared_attempt_units(context, body, binding, units,
+        lambda _unit: pytest.fail("completed boundary was recomputed"))
+    assert same_end == ended
+
+
+@pytest.mark.parametrize("field", ["producer_request_sha256", "executor_release_sha256",
+                                  "producer_source_sha256", "generation_context_sha256"])
+def test_completed_unit_header_refuses_owner_or_source_edition_changes(tmp_path, field):
+    context, body, _, _ = _completed_unit_store_fixture(tmp_path)
+    binding = {"generation_context_sha256": context.context_sha256,
+        "producer_request_sha256": execution._sha256(body),
+        "executor_release_sha256": execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+        "producer_source_sha256": execution._file_sha256(
+            execution.Path(execution.__file__).with_name("pm_historical_search_producer.py"))}
+    header = {"schema_version": execution._DECLARED_UNIT_HEADER_SCHEMA,
+        "binding": {**binding, field: "f" * 64}, "request_body": body,
+        "qualification_authority": False, "live_authority": False}
+    execution.authority_spool._publish_exact_json(context,
+        execution._declared_unit_relative(body, "header.json"),
+        header, context.limits.max_json_bytes)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError, match="HEADER_BINDING_MISMATCH"):
+        execution._read_declared_unit_header(context, body)
+
+
+def test_completed_units_copied_index_cannot_cross_original_request_owner(tmp_path):
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path)
+    records, _ = execution._continue_declared_attempt_units(context, body, binding, units,
+        _synthetic_completed_unit_value)
+    foreign = {**body, "attempt_id": "foreign-original-request"}
+    execution.authority_spool._publish_exact_json(context,
+        execution._declared_unit_relative(foreign, "000000.json"),
+        records[0], context.limits.max_json_bytes)
+    foreign_binding = execution._sha256({"original_request_sha256": execution._sha256(foreign)})
+    with pytest.raises(execution.AuthoritativeSearchExecutionError, match="UNIT_BINDING_MISMATCH"):
+        execution._continue_declared_attempt_units(context, foreign, foreign_binding, units,
+            lambda _unit: pytest.fail("copied index admitted foreign-owner work"))
+
+
+def _completed_unit_lease_child(root, generation, native, config, body, ready, release,
+                                diagnostic_path):
+    entry_clock = (__import__("time").monotonic_ns(), __import__("time").time_ns())
+    import json
+    import os
+    import time
+    import traceback
+
+    phase = "CHILD_ENTRY"
+    def record(stage, *, clock=None, **details):
+        nonlocal phase
+        phase = stage
+        monotonic_ns, utc_ns = clock or (time.monotonic_ns(), time.time_ns())
+        utc = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(utc_ns // 10**9))
+        row = {"classification": "SYNTHETIC_LEASE_DIAGNOSTIC_ONLY", "phase": stage,
+            "pid": os.getpid(), "parent_pid": os.getppid(),
+            "monotonic_ns": monotonic_ns, "utc": utc + f".{utc_ns % 10**9:09d}Z",
+            **details}
+        with open(diagnostic_path, "a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+    record("CHILD_ENTRY", clock=entry_clock)
+    try:
+        record("BEFORE_INNER_IMPORTS")
+        from pathlib import Path
+        import pm_authoritative_search_execution as child_execution
+        record("INNER_IMPORTS_COMPLETE")
+        record("BEFORE_CONTEXT_REOPEN")
+        current = child_execution.authority_spool.reopen_generation_context(Path(root),
+            expected_generation_id=generation, expected_native_universe_sha256=native,
+            expected_config_sha256=config)
+        record("CONTEXT_REOPEN_COMPLETE")
+        record("BEFORE_CONTEXT_FREEZE")
+        writable = child_execution.authority_spool.freeze_generation_context(Path(root),
+            generation_id=generation, native_universe_sha256=native,
+            config_sha256=config, limits=current.limits)
+        record("CONTEXT_FREEZE_COMPLETE")
+        record("BEFORE_LEASE_ENTRY")
+        with child_execution._declared_unit_lease(writable, body):
+            record("LEASE_ACQUIRED")
+            ready.set()
+            record("READY_SET")
+            record("BEFORE_RELEASE_WAIT")
+            released = release.wait(15)
+            record("RELEASE_WAIT_COMPLETE", released=released)
+            if not released:
+                raise RuntimeError("synthetic lease test release not received")
+        record("LEASE_EXITED")
+    except BaseException as error:
+        try:
+            record("CHILD_EXCEPTION", failed_phase=phase,
+                exception_type=type(error).__name__, exception_message=str(error),
+                traceback=traceback.format_exc())
+        except OSError:
+            traceback.print_exc()
+        raise
+    record("CHILD_RETURNING")
+
+
+def test_completed_unit_os_lease_excludes_second_resumer_and_releases_after_exit(tmp_path):
+    import json
+    import multiprocessing
+    import os
+    import time
+
+    parent_diagnostic = tmp_path / "lease-parent-diagnostic.jsonl"
+    child_diagnostic = tmp_path / "lease-child-diagnostic.jsonl"
+    def record(stage, **details):
+        monotonic_ns, utc_ns = time.monotonic_ns(), time.time_ns()
+        utc = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(utc_ns // 10**9))
+        row = {"classification": "SYNTHETIC_LEASE_DIAGNOSTIC_ONLY", "phase": stage,
+            "pid": os.getpid(), "monotonic_ns": monotonic_ns,
+            "utc": utc + f".{utc_ns % 10**9:09d}Z", **details}
+        with parent_diagnostic.open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+
+    record("PARENT_ENTRY")
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path)
+    spawn = multiprocessing.get_context("spawn")
+    ready, release = spawn.Event(), spawn.Event()
+    child = spawn.Process(target=_completed_unit_lease_child, args=(str(context.root),
+        context.generation_id, context.native_universe_sha256, context.config_sha256,
+        body, ready, release, str(child_diagnostic)))
+    record("BEFORE_CHILD_START")
+    child.start()
+    record("CHILD_START_RETURNED", child_pid=child.pid)
+    try:
+        record("BEFORE_READY_WAIT", child_pid=child.pid)
+        ready_result = ready.wait(15)
+        record("READY_WAIT_COMPLETE", child_pid=child.pid, ready=ready_result,
+            child_exitcode=child.exitcode, child_alive=child.is_alive())
+        assert ready_result, "synthetic child never acquired the actual OS lease"
+        with pytest.raises(execution.AuthoritativeSearchExecutionError, match="DECLARED_SLOT_RUN_ACTIVE"):
+            with execution._declared_unit_lease(context, body):
+                pytest.fail("two concurrent original-request resumers were admitted")
+        assert execution._declared_completed_prefix(context, body, binding, units) == []
+    finally:
+        try:
+            release.set()
+        finally:
+            try:
+                child.join(20)
+            finally:
+                record("POST_JOIN", child_pid=child.pid, child_exitcode=child.exitcode,
+                    child_alive=child.is_alive(), ready=ready.is_set(), release=release.is_set())
+    assert child.exitcode == 0
+    with execution._declared_unit_lease(context, body):
+        rows, _ = execution._continue_declared_attempt_units(context, body, binding, units,
+            _synthetic_completed_unit_value)
+    assert len(rows) == 3
+    lease = context.root / execution._declared_unit_relative(body, "units.lock")
+    assert lease.read_bytes() == b"0"  # persistent, quota-accounted, never deleted/truncated
+
+
+def test_completed_unit_os_lease_releases_on_exception(tmp_path):
+    context, body, _, _ = _completed_unit_store_fixture(tmp_path)
+    with pytest.raises(KeyboardInterrupt):
+        with execution._declared_unit_lease(context, body):
+            raise KeyboardInterrupt("synthetic abrupt stack unwind")
+    with execution._declared_unit_lease(context, body):
+        pass
+
+
+def test_saved_partial_units_refuse_missing_fit_loader_instead_of_rerunning_fit(tmp_path, monkeypatch):
+    import pm_historical_search_producer as producer
+    context, body, _, _ = _completed_unit_store_fixture(tmp_path)
+    binding = {"generation_context_sha256": context.context_sha256,
+        "producer_request_sha256": execution._sha256(body),
+        "executor_release_sha256": execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+        "producer_source_sha256": execution._file_sha256(
+            execution.Path(producer.__file__))}
+    header = {"schema_version": execution._DECLARED_UNIT_HEADER_SCHEMA,
+        "binding": binding, "request_body": body,
+        "qualification_authority": False, "live_authority": False}
+    execution.authority_spool._publish_exact_json(context,
+        execution._declared_unit_relative(body, "header.json"),
+        header, context.limits.max_json_bytes)
+    monkeypatch.setattr(execution, "fit_native_timeframe_for_search",
+        lambda **_kw: pytest.fail("completed fit was implicitly recalculated"))
+    request = SimpleNamespace(to_dict=lambda: body)
+    with pytest.raises(producer.HistoricalSearchProducerError,
+            match="DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE"):
+        producer._declared_saved_raw_completion(context, request=request,
+            process=None, frozen_pipeline_config=None)
+
+
+def _synthetic_bound_fit_header_locator(context, body):
+    """Structural locator only: these invented bytes are NOT fit/source authority."""
+    import pm_historical_search_producer as producer
+    reference = {"synthetic_only": "NOT_A_VERIFIED_BOUND_FIT_SNAPSHOT"}
+    return {"schema_version": execution._DECLARED_UNIT_HEADER_SCHEMA,
+        "fit_state_origin_contract": "RECOMPUTED_OR_REOPENED_FROM_PRECOMMITTED_BOUND_STATE",
+        "fitted_state_entry": reference, "plan_transport": {}, "horizon_plan": {},
+        "binding": {"generation_context_sha256": context.context_sha256,
+            "producer_request_sha256": execution._sha256(body),
+            "executor_release_sha256": execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+            "producer_source_sha256": execution._file_sha256(execution.Path(producer.__file__)),
+            "fitted_state_reference_sha256": execution._sha256(reference)},
+        "request_body": body, "qualification_authority": False, "live_authority": False}
+
+
+@pytest.mark.parametrize("mutation", ["legacy", "missing", "type", "changed_ref",
+                                      "changed_hash", "contract", "plan", "horizon"])
+def test_bound_fit_unit_header_refuses_incompatible_or_unbound_locators(tmp_path, monkeypatch, mutation):
+    context, body, _, _ = _completed_unit_store_fixture(tmp_path)
+    header = _synthetic_bound_fit_header_locator(context, body)
+    expected = "DECLARED_UNIT_HEADER_BINDING_MISMATCH"
+    if mutation == "legacy":
+        header["schema_version"] = "fxpm.declared-attempt-unit-header.v1"
+        expected = "DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE"
+    elif mutation == "missing":
+        del header["fitted_state_entry"]
+        expected = "DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE"
+    elif mutation == "type":
+        header["fitted_state_entry"] = []
+        expected = "DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE"
+    elif mutation == "changed_ref":
+        header["fitted_state_entry"]["changed"] = True
+    elif mutation == "changed_hash":
+        header["binding"]["fitted_state_reference_sha256"] = "f" * 64
+    elif mutation == "contract":
+        header["fit_state_origin_contract"] = "ALREADY_VERIFIED"
+    elif mutation == "plan":
+        del header["plan_transport"]
+    else:
+        del header["horizon_plan"]
+    execution.authority_spool._publish_exact_json(context,
+        execution._declared_unit_relative(body, "header.json"), header, context.limits.max_json_bytes)
+    monkeypatch.setattr(execution, "fit_native_timeframe_for_search",
+        lambda **_kwargs: pytest.fail("a bad cold locator initiated fitting"))
+    with pytest.raises(execution.AuthoritativeSearchExecutionError, match=expected):
+        execution._read_declared_unit_header(context, body)
+
+
+def test_partial_v2_locator_is_neither_raw_completion_nor_a_source_capability(tmp_path, monkeypatch):
+    import pm_historical_search_producer as producer
+    context, body, _, _ = _completed_unit_store_fixture(tmp_path)
+    header = _synthetic_bound_fit_header_locator(context, body)
+    execution.authority_spool._publish_exact_json(context,
+        execution._declared_unit_relative(body, "header.json"), header, context.limits.max_json_bytes)
+    monkeypatch.setattr(execution, "fit_native_timeframe_for_search",
+        lambda **_kwargs: pytest.fail("a locator was treated as a fitted source"))
+    request = SimpleNamespace(to_dict=lambda: body)
+    # Only the actual Raw cold verifier can return a portable completed result.
+    assert producer._declared_saved_raw_completion(context, request=request,
+        process=None, frozen_pipeline_config=None) is None
+    assert execution._read_declared_unit_header(context, body) == header
+
+
+@pytest.mark.parametrize("changed", ["header", "validation", "actual_plan"])
+def test_reopened_declared_plan_join_refuses_any_different_original_identity(changed):
+    import pm_historical_search_producer as producer
+    expected = "a" * 64
+    cell = "c" * 64
+    header = {"binding": {"horizon_plan_receipt_sha256": expected,
+                          "cell_plan_receipt_sha256": cell}}
+    validation = {"original_horizon_plan_receipt_sha256": expected,
+                  "original_cell_plan_receipt_sha256": cell}
+    plan = SimpleNamespace(receipt_sha256=cell,
+                           horizon_plan=SimpleNamespace(receipt_sha256=expected))
+    if changed == "header":
+        header["binding"]["horizon_plan_receipt_sha256"] = "b" * 64
+    elif changed == "validation":
+        validation["original_cell_plan_receipt_sha256"] = "b" * 64
+    else:
+        plan.receipt_sha256 = "b" * 64
+    with pytest.raises(producer.HistoricalSearchProducerError,
+                       match="DECLARED_BOUND_FIT_ORIGINAL_PLAN_CHANGED"):
+        producer._require_reopened_declared_plan(header, validation, plan)
+
+
+def test_reopened_plan_join_is_a_non_authorising_equality_check():
+    import pm_historical_search_producer as producer
+    expected = "a" * 64
+    cell = "c" * 64
+    assert producer._require_reopened_declared_plan(
+        {"binding": {"horizon_plan_receipt_sha256": expected,
+                     "cell_plan_receipt_sha256": cell}},
+        {"original_horizon_plan_receipt_sha256": expected,
+         "original_cell_plan_receipt_sha256": cell},
+        SimpleNamespace(receipt_sha256=cell,
+                        horizon_plan=SimpleNamespace(receipt_sha256=expected))) is None
