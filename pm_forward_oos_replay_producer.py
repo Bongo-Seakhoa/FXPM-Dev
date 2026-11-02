@@ -1498,7 +1498,9 @@ def _pipeline_config_identity(config: PipelineConfig) -> dict[str, Any]:
     }
 
 
-def _deployment_config(config: PipelineConfig) -> _DeploymentBinding:
+def _deployment_config(
+    config: PipelineConfig, *, declared_research_account: bool = False
+) -> _DeploymentBinding:
     if type(config) is not PipelineConfig:
         _fail("PIPELINE_CONFIG_INVALID")
     raw_path = str(getattr(config, "_deployment_config_path", "") or "").strip()
@@ -1510,9 +1512,17 @@ def _deployment_config(config: PipelineConfig) -> _DeploymentBinding:
     pipeline_body = body.get("pipeline")
     position_body = body.get("position")
     metadata = body.get("_meta")
+    allow_missing_position = (
+        declared_research_account is True
+        and config.research_mode is True
+        and getattr(config, "_funded_live_execution", False) is False
+        and "position" not in body
+        and type(metadata) is dict
+        and str(metadata.get("scope") or "").strip().lower() != config_binding.FUNDED_SCOPE
+    )
     if (
         type(pipeline_body) is not dict
-        or type(position_body) is not dict
+        or (type(position_body) is not dict and not allow_missing_position)
         or type(metadata) is not dict
         or not str(metadata.get("scope") or "").strip()
     ):
@@ -1557,9 +1567,10 @@ def _deployment_config(config: PipelineConfig) -> _DeploymentBinding:
 
 
 def _assert_deployment_config_unchanged(
-    binding: _DeploymentBinding, config: PipelineConfig
+    binding: _DeploymentBinding, config: PipelineConfig,
+    *, declared_research_account: bool = False,
 ) -> None:
-    refreshed = _deployment_config(config)
+    refreshed = _deployment_config(config, declared_research_account=declared_research_account)
     if refreshed.receipt_body() != binding.receipt_body():
         _fail("DEPLOYMENT_OR_BROKER_CONFIG_CHANGED_DURING_REPLAY")
 
@@ -4132,7 +4143,8 @@ def declared_cell_account_native_request(context, *, precommit, process,
             product = _reopen_bound_native_product(context=context, product=execution_product,
                 expected_identity=identity, config=config,
                 production_contract_required=not config.research_mode, pin_consumed_activation=True)
-            spec, _ = _freeze_execution_spec(product=product, config=config, deployment=_deployment_config(config))
+            spec, _ = _freeze_execution_spec(product=product, config=config,
+                deployment=_deployment_config(config, declared_research_account=True))
             source_timeframe = profile.resolve(cell["symbol"], cell["timeframe"], "P75", point=spec.point,
                 source_identity_sha256=identity["source_identity_sha256"]).source_timeframe
         return {"schema_version": "fxpm.declared-cell-account-native-request.v1",
@@ -4163,7 +4175,7 @@ def produce_declared_cell_account_artifact(context, *, precommit, process, froze
             _fail("DECLARED_CELL_NATIVE_INPUTS_REQUIRED")
         config = inputs["config"]
         measured = _declared_cell_measured_config(config)
-        deployment = _deployment_config(config)
+        deployment = _deployment_config(config, declared_research_account=True)
         cell, end = body["cell"], body["measurement"]["end_exclusive_utc"]
         execution_identity = _native_product_identity(execution_product, expected_symbol=cell["symbol"],
             expected_timeframe=cell["timeframe"], expected_cutoff_utc=end, role="DECLARED_CELL_EXECUTION")
@@ -4205,7 +4217,7 @@ def produce_declared_cell_account_artifact(context, *, precommit, process, froze
             config=measured, observations=observations, matched_closes=matched,
             timeframe=cell["timeframe"], schedule=schedule)
         body["account"] = account
-        _assert_deployment_config_unchanged(deployment, config)
+        _assert_deployment_config_unchanged(deployment, config, declared_research_account=True)
     _canonical_bytes(body, _DECLARED_CELL_MAX_RAW_BYTES)
     sink = authority_spool.open_symbol_sink(context, _declared_cell_transport_symbol(body),
         manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
@@ -4239,7 +4251,7 @@ def verify_declared_cell_account_transport(context, body, *, process, frozen_pip
         if (body["original_config_identity"] != _pipeline_config_identity(config)
                 or body["measured_config_identity"] != _pipeline_config_identity(measured)):
             _fail("DECLARED_CELL_CONFIG_DERIVATION_CHANGED")
-        deployment = _deployment_config(config)
+        deployment = _deployment_config(config, declared_research_account=True)
         sources = body["deployment_source_descriptors"]
         if type(sources) is not dict or set(sources) != {"config", "broker"}:
             _fail("DECLARED_CELL_DEPLOYMENT_SOURCES_INVALID")
