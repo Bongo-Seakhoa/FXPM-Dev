@@ -293,7 +293,6 @@ def _strict_json_bytes(encoded: bytes, maximum_bytes: int) -> Any:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise AuthoritySpoolError("JSON_INVALID") from exc
-    _bounded_json_value(value)
     if _canonical_json_bytes(value, maximum_bytes) != encoded:
         _fail("JSON_NOT_CANONICAL")
     return value

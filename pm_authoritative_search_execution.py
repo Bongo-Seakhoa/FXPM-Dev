@@ -2430,6 +2430,7 @@ def _run_tier_partition(
     expected_source_contract_sha256: str,
     spread_tier: spread_profile.FrozenSpreadTier,
     entry_spread_observations: pd.Series,
+    decision_result_out: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.Series, Backtester]:
     try:
         features, raw_signals = _slice_full_prefix_strategy_surface(
@@ -2485,7 +2486,9 @@ def _run_tier_partition(
         ) from exc
     if _source_identity(source_contract) != expected_source_contract_sha256:
         _fail("BACKTEST_SOURCE_CONTRACT_DRIFT", partition.role)
-    _decision_relevant_result(result, partition.role)
+    decision_result = _decision_relevant_result(result, partition.role)
+    if decision_result_out is not None:
+        decision_result_out.update(decision_result)
     return result, features, signals, backtester
 
 
@@ -2683,6 +2686,7 @@ def _build_planned_attempt_evidence(
         for partition in partitions:
             actual_results = {}
             for tier in ("P75", "P95"):
+                decision_result = {}
                 result, _features, signals, _backtester = _run_tier_partition(
                     partition=partition, full_prefix_surface=full_prefix_surface,
                     backtester=backtester, strategy=strategy, symbol=symbol,
@@ -2691,6 +2695,7 @@ def _build_planned_attempt_evidence(
                     expected_source_contract_sha256=_source_identity(fitted.source_contract_seeds[tier]),
                     spread_tier=fitted._spread_tiers[tier],
                     entry_spread_observations=fitted._entry_spread_observations,
+                    decision_result_out=decision_result,
                 )
                 _verify_partition_precommitment(precommitments=partition_cost_precommitments,
                     attempt=attempt, fold_ordinal=fold_ordinal, partition=partition,
@@ -2699,7 +2704,7 @@ def _build_planned_attempt_evidence(
                     _fail("PARTITION_SIGNAL_VECTOR_TIER_MISMATCH")
                 partition_signals[partition.role] = signals
                 name = f"{partition.role}_{tier.lower()}"
-                lanes[name] = _decision_relevant_result(result, name)
+                lanes[name] = decision_result
                 actual_results[tier] = result
             pair = pm_core.build_backtest_frozen_tier_pair_contract(
                 actual_results, spec=fitted.instrument_spec, use_spread=bool(config.use_spread))
