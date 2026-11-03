@@ -39,6 +39,7 @@ _INTEGRITY_CODES = frozenset({
     "SOURCE_CELL_NOT_OWNED", "SOURCE_AUTHENTICATION_FAILED",
     "SOURCE_METADATA_AUTHENTICATION_FAILED", "SOURCE_CSV_PARSING_UNAUTHENTICATED",
     "PLANNING_IO_ABORT",
+    "CLOCK_SOURCE_CELL_NOT_OWNED", "CLOCK_SOURCE_METADATA_CHANGED",
 })
 
 
@@ -241,6 +242,33 @@ def instrument_session_class(symbol: str, instrument: Mapping[str, Any]) -> str:
                                  "calendar_proof": False}).decode("ascii")
 
 
+def _clock_observed_bounds(entry: Mapping[str, Any], expected_rows: int) -> Interval | None:
+    """Use a recorded coarse close only; never add a nominal H4/D1 duration."""
+    try:
+        evidence = entry.get("evidence_metadata", {})
+        if not isinstance(evidence, Mapping):
+            _fail("AUTHENTICATED_OBSERVED_BOUNDS_UNAVAILABLE")
+        observed = evidence.get("observed_interval", {})
+        gaps = evidence.get("page_gap_diagnostics", {})
+        if not isinstance(observed, Mapping) or not isinstance(gaps, Mapping):
+            _fail("AUTHENTICATED_OBSERVED_BOUNDS_UNAVAILABLE")
+        if "start_open_utc" not in observed or "actual_last_close_utc" not in gaps:
+            return None
+        first = _utc(observed["start_open_utc"])
+        last = _utc(observed["end_open_utc"])
+        closed = _utc(gaps["actual_last_close_utc"])
+        if (type(observed.get("rows")) is not int or observed["rows"] != expected_rows
+                or not first <= last < closed):
+            _fail("AUTHENTICATED_OBSERVED_BOUNDS_UNAVAILABLE")
+        for key, expected in (("actual_first_open_utc", first), ("actual_last_open_utc", last)):
+            if key in gaps and _utc(gaps[key]) != expected:
+                _fail("AUTHENTICATED_OBSERVED_BOUNDS_UNAVAILABLE")
+        return Interval(observed["start_open_utc"], gaps["actual_last_close_utc"])
+    except (KeyError, TypeError, AttributeError) as error:
+        raise NativeInputsError("AUTHENTICATED_OBSERVED_BOUNDS_UNAVAILABLE",
+                                detail=_bounded_message(error)) from error
+
+
 @dataclass(frozen=True, slots=True)
 class SourceCell:
     symbol: str
@@ -261,6 +289,56 @@ class SourceCell:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ClockSourceCell:
+    symbol: str
+    timeframe: str
+    native_status: str
+    bars_path: str
+    sidecar_path: str
+    provenance_path: str
+    source_identity: SourceIdentity
+    acquisition_interval: Interval
+    prefix_interval: Interval
+    observed_interval: Interval | None
+    broker_source_sha256: str
+    broker_policy_sha256: str
+    instrument_session_class: str
+    alignment_mode: str
+    request_sha256: str
+    calendar_sha256: str
+    expected_rows: int
+    expected_bytes: int
+    cutoff_utc: str
+    metadata_digest: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ClockCandidate:
+    native: ClockSourceCell
+    m5: SourceCell
+
+
+@dataclass(frozen=True, slots=True)
+class ClockCatalogStatus:
+    symbol: str
+    native_status: str | None
+    m5_status: str | None
+    eligible: bool
+    reason_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ClockCatalog:
+    timeframe: str
+    candidates: tuple[ClockCandidate, ...]
+    metadata_refusals: tuple[StopCell, ...]
+    status_roster: tuple[ClockCatalogStatus, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -431,6 +509,110 @@ class _DigestReader(io.RawIOBase):
         return count or 0
 
 
+@dataclass(frozen=True, slots=True)
+class _CsvReadContract:
+    """Ordinary file metadata, never a native authority or registered source."""
+    path: Path
+    symbol: str
+    timeframe: str
+    sha256: str
+    expected_bytes: int
+    expected_rows: int
+    cutoff_utc: str
+
+
+@dataclass(slots=True)
+class _CsvReadState:
+    authenticated: bool = False
+    sha256: str | None = None
+    bytes_read: int = 0
+    rows: int = 0
+    after: os.stat_result | None = None
+
+
+def _read_csv_bars(contract: _CsvReadContract, interval: Interval,
+                   before: os.stat_result, state: _CsvReadState, *,
+                   clock_prefix: bool = False) -> Iterable[Bar]:
+    """Shared ordinary CSV mechanics; wrappers own native registration checks."""
+    path = contract.path
+    lower, upper = _bounds(interval)
+    cutoff = _utc(contract.cutoff_utc)
+    rows = 0
+    previous_open = previous_close = None
+    exhausted = parsing_failed = False
+    with path.open("rb") as raw:
+        first_handle = os.fstat(raw.fileno())
+        if _common_identity(before) != _common_identity(first_handle):
+            _fail("SOURCE_CHANGED_BEFORE_SCAN")
+        reader = _DigestReader(raw)
+        with io.BufferedReader(reader) as buffer:
+            with io.TextIOWrapper(buffer, encoding="utf-8-sig", newline="") as text:
+                table = csv.DictReader(text, strict=True)
+                try:
+                    fields = table.fieldnames
+                    required = {"time", "_BAR_CLOSE_TS", "Open", "High", "Low", "Close", "Volume"}
+                    if (fields is None or len(fields) != len(set(fields))
+                            or not required.issubset(fields)):
+                        _fail("SOURCE_CSV_SCHEMA_UNSUPPORTED", contract.symbol, contract.timeframe)
+                    for row in table:
+                        rows += 1
+                        if None in row or any(row.get(name) is None for name in fields):
+                            _fail("SOURCE_CSV_ROW_INVALID", contract.symbol, contract.timeframe)
+                        opened, closed = _utc(row["time"]), _utc(row["_BAR_CLOSE_TS"])
+                        if (closed <= opened or (previous_open is not None
+                                and (opened <= previous_open or opened < previous_close))):
+                            _fail("SOURCE_UTC_AXIS_INVALID", contract.symbol, contract.timeframe)
+                        previous_open, previous_close = opened, closed
+                        if clock_prefix and closed > cutoff:
+                            continue
+                        if ((opened < lower < closed)
+                                or (opened < upper < closed and opened >= lower)):
+                            _fail("SOURCE_ROW_STRADDLES_FROZEN_INTERVAL", contract.symbol, contract.timeframe)
+                        if opened < lower or opened >= upper or closed > cutoff:
+                            continue
+                        try:
+                            prices = [float(row[name]) for name in ("Open", "High", "Low", "Close")]
+                        except (ValueError, TypeError, OverflowError) as error:
+                            raise NativeInputsError("SOURCE_PRICE_PARSE_INVALID", symbol=contract.symbol,
+                                timeframe=contract.timeframe, detail=_bounded_message(error),
+                                abort_attempt=False) from error
+                        if not all(math.isfinite(value) for value in prices):
+                            _fail("SOURCE_PRICE_INVALID", contract.symbol, contract.timeframe)
+                        volume = NativeInputs._counter(row["Volume"], "SOURCE_VOLUME_INVALID")
+                        real = (NativeInputs._counter(row["RealVolume"], "SOURCE_REAL_VOLUME_INVALID")
+                                if "RealVolume" in fields else None)
+                        spread = (NativeInputs._counter(row["Spread"], "SOURCE_SPREAD_INVALID")
+                                  if "Spread" in fields and row["Spread"] != "" else None)
+                        yield Bar(row["time"], row["_BAR_CLOSE_TS"], *prices, volume, real, spread)
+                    exhausted = True
+                except (csv.Error, UnicodeError) as error:
+                    parsing_failed = True
+                    raise NativeInputsError("SOURCE_CSV_PARSING_UNAUTHENTICATED", symbol=contract.symbol,
+                        timeframe=contract.timeframe, detail=_bounded_message(error),
+                        abort_attempt=True) from error
+                finally:
+                    # Authenticate EOF even after schema/value refusal or consumer close.
+                    try:
+                        if not exhausted:
+                            for row in table:
+                                rows += 1
+                    except (csv.Error, UnicodeError) as error:
+                        raise NativeInputsError("SOURCE_CSV_PARSING_UNAUTHENTICATED", symbol=contract.symbol,
+                            timeframe=contract.timeframe, detail=_bounded_message(error),
+                            abort_attempt=True) from error
+                    last_handle = os.fstat(raw.fileno())
+                    after = _no_reparse(path)
+                    if (_stat_identity(before) != _stat_identity(after)
+                            or _stat_identity(first_handle) != _stat_identity(last_handle)):
+                        _fail("SOURCE_CHANGED_DURING_SCAN", contract.symbol, contract.timeframe)
+                    if (parsing_failed or reader.digest.hexdigest() != contract.sha256
+                            or reader.bytes_read != contract.expected_bytes or rows != contract.expected_rows):
+                        _fail("SOURCE_DIGEST_ROWS_OR_BYTES_MISMATCH", contract.symbol, contract.timeframe)
+                    state.sha256, state.bytes_read, state.rows, state.after = (
+                        reader.digest.hexdigest(), reader.bytes_read, rows, after)
+                    state.authenticated = True
+
+
 class NativeInputs:
     def __init__(self, data_dir: Path, expected_activation_sha256: str,
                  expected_pointer_sha256: str) -> None:
@@ -449,6 +631,9 @@ class NativeInputs:
         self._cell_cache: dict[tuple[str, str], SourceCell] = {}
         self._registered: dict[int, SourceCell] = {}
         self._metadata: dict[int, dict[str, Any]] = {}
+        self._clock_cell_cache: dict[tuple[str, str], ClockSourceCell] = {}
+        self._clock_registered: dict[int, ClockSourceCell] = {}
+        self._clock_catalog_cache: dict[str, ClockCatalog] = {}
         self._inflight: set[str] = set()
         self._failed_streams: set[str] = set()
         self._calibration_key = None
@@ -769,6 +954,153 @@ class NativeInputs:
             _fail("SOURCE_CELL_NOT_OWNED")
         return self._metadata[id(cell)]
 
+    def target_spec(self, symbol: str, timeframe: str) -> dict[str, Any]:
+        self._live()
+        return self._target_spec(symbol, timeframe)
+
+    def m5_source(self, symbol: str) -> SourceCell:
+        self._live()
+        return self._cell(symbol, "M5")
+
+    def project_m5_source(self, cell: SourceCell, interval: Interval) -> SourceCell:
+        self._known(cell)
+        if type(cell) is not SourceCell or cell.timeframe != "M5":
+            _fail("ACCEPTED_M5_SOURCE_REQUIRED")
+        return self._project_cell(cell, interval, cell.stratum)
+
+    def _clock_common_request(self) -> dict[str, Any]:
+        from pm_native_request_contract import COMMON_REQUEST_KEYS
+
+        request = self._authority.run_manifest["request"]
+        return {key: request[key] for key in COMMON_REQUEST_KEYS if key in request}
+
+    def _clock_policy(self, timeframe: str) -> dict[str, Any]:
+        self._live()
+        if timeframe not in {"H4", "D1"}:
+            _fail("CLOCK_COARSE_TIMEFRAME_REQUIRED", timeframe=timeframe)
+        from pm_native_request_contract import (
+            BROKER_SESSION_ALIGNMENT_MODE, canonical_source_identity,
+            validate_v5_common_request,
+        )
+
+        validate_v5_common_request(self._clock_common_request())
+        broker = canonical_source_identity(self._authority.run_manifest["source_environment"])
+        broker_sha = _digest(broker)
+        policy = {"timeframe": timeframe, "broker_source_sha256": broker_sha,
+                  "alignment_mode": BROKER_SESSION_ALIGNMENT_MODE,
+                  "successor_sentinel_fetch_slack_seconds": 1}
+        return {**policy, "broker_policy_sha256": _digest(policy),
+                "policy_semantics": "AUTHENTICATED_RUN_V5_COARSE_POLICY_NOT_TARGET_NATIVE_AXIS"}
+
+    def clock_target_metadata(self, symbol: str, timeframe: str) -> dict[str, Any]:
+        return {"target_spec": self.target_spec(symbol, timeframe),
+                **self._clock_policy(timeframe)}
+
+    def clock_source(self, symbol: str, timeframe: str, *,
+                     cutoff: str = PROTECTED_CUTOFF) -> ClockSourceCell:
+        self._live()
+        if _utc(cutoff) != _utc(PROTECTED_CUTOFF):
+            _fail("PROTECTED_CUTOFF_MISMATCH", symbol, timeframe)
+        policy = self._clock_policy(timeframe)
+        entry = self._entry(symbol, timeframe)
+        if entry.get("status") != "evidence_candidate":
+            _fail("CLOCK_SOURCE_NOT_EVIDENCE_CANDIDATE", symbol, timeframe)
+        cached = self._clock_cell_cache.get((symbol, timeframe))
+        if cached is not None:
+            return cached
+        from pm_native_request_contract import validate_v5_leaf_request
+        from tools.build_spread_profile import _source_metadata
+
+        bars_path = _safe_path(self.native_root, entry["bars_relative_path"])
+        sidecar, sidecar_path = self._read_json(entry["sidecar_relative_path"], entry["sidecar_sha256"])
+        provenance, provenance_path = self._read_json(
+            sidecar["source_provenance_relative_path"], sidecar["source_provenance_sha256"])
+        try:
+            meta = _source_metadata(self.native_root, dict(entry), self._authority.activation_id,
+                                    dict(self._authority.run_manifest))
+        except ValueError as error:
+            if str(error) in {"METADATA_DIGEST_MISMATCH", "ARTIFACT_SIZE_MISMATCH"}:
+                raise NativeInputsError("SOURCE_METADATA_AUTHENTICATION_FAILED", symbol=symbol,
+                    timeframe=timeframe, detail=_bounded_message(error), abort_attempt=True) from error
+            raise
+        if str(meta["path"]) != str(bars_path):
+            _fail("SOURCE_METADATA_PATH_MISMATCH", symbol, timeframe)
+        request = provenance.get("request")
+        validate_v5_leaf_request(request, self._clock_common_request(), timeframe)
+        if (request["alignment_mode"] != policy["alignment_mode"]
+                or request["successor_sentinel_fetch_slack_seconds"] != 1):
+            _fail("CLOCK_BROKER_POLICY_MISMATCH", symbol, timeframe)
+        acquisition = Interval(**request["source_request_interval"])
+        first, last = _bounds(acquisition)
+        protected = meta["protected_cutoff"].isoformat()
+        if _utc(protected) != _utc(cutoff) or first >= _utc(cutoff) or last < _utc(cutoff):
+            _fail("PROTECTED_CUTOFF_MISMATCH", symbol, timeframe)
+        if (type(meta["expected_rows"]) is not int or meta["expected_rows"] <= 0
+                or type(meta["expected_bytes"]) is not int or meta["expected_bytes"] <= 0):
+            _fail("SOURCE_ARTIFACT_METADATA_INVALID", symbol, timeframe)
+        observed = _clock_observed_bounds(entry, meta["expected_rows"])
+        identity = SourceIdentity(symbol, timeframe, self._authority.activation_id,
+            self._authority.activation_manifest_sha256, meta["sha256"], meta["sidecar_sha256"],
+            meta["provenance_sha256"], _digest(request), meta["point"], "points")
+        cell = ClockSourceCell(symbol, timeframe, entry["status"], str(bars_path), str(sidecar_path),
+            str(provenance_path), identity, acquisition, Interval(acquisition.start_utc, protected),
+            observed, policy["broker_source_sha256"], policy["broker_policy_sha256"],
+            instrument_session_class(symbol, provenance.get("instrument")), policy["alignment_mode"],
+            _digest(request), _digest(request["cell_calendar_boundaries"]),
+            meta["expected_rows"], meta["expected_bytes"], protected, "")
+        cell = replace(cell, metadata_digest=_digest(asdict(cell)))
+        self._clock_cell_cache[(symbol, timeframe)] = cell
+        self._clock_registered[id(cell)] = cell
+        return cell
+
+    def clock_catalog(self, timeframe: str) -> ClockCatalog:
+        self._clock_policy(timeframe)
+        cached = self._clock_catalog_cache.get(timeframe)
+        if cached is not None:
+            return cached
+        candidates, refusals, statuses = [], [], []
+        for symbol in sorted(self._authority.entries):
+            native_status = m5_status = None
+            try:
+                native_status = self._entry(symbol, timeframe).get("status")
+                m5_status = self._entry(symbol, "M5").get("status")
+                if native_status != "evidence_candidate" or m5_status != "evidence_candidate":
+                    statuses.append(ClockCatalogStatus(symbol, native_status, m5_status, False,
+                                                        "COARSE_AND_M5_CANDIDATES_REQUIRED"))
+                    continue
+                coarse, m5 = self.clock_source(symbol, timeframe), self.m5_source(symbol)
+                if (coarse.source_identity.point != m5.source_identity.point
+                        or coarse.instrument_session_class != m5.stratum.instrument_session_class):
+                    _fail("CLOCK_M5_INSTRUMENT_CLASS_MISMATCH", symbol, timeframe)
+                candidates.append(ClockCandidate(coarse, m5))
+                statuses.append(ClockCatalogStatus(symbol, native_status, m5_status, True, None))
+            except OSError as error:
+                raise NativeInputsError("PLANNING_IO_ABORT", symbol=symbol, timeframe=timeframe,
+                    detail=_bounded_message(error), abort_attempt=True) from error
+            except (NativeInputsError, ValueError, KeyError, TypeError) as error:
+                if getattr(error, "abort_attempt", False):
+                    raise
+                code = getattr(error, "code", "CLOCK_METADATA_UNSUPPORTED")
+                refusals.append(StopCell(symbol, timeframe, code, **exception_details(error)))
+                statuses.append(ClockCatalogStatus(symbol, native_status, m5_status, False, code))
+        catalog = ClockCatalog(timeframe, tuple(candidates), tuple(refusals), tuple(statuses))
+        self._clock_catalog_cache[timeframe] = catalog
+        return catalog
+
+    def iter_clock_bars(self, cell: ClockSourceCell, interval: Interval) -> Iterable[Bar]:
+        self._live()
+        if type(cell) is not ClockSourceCell or self._clock_registered.get(id(cell)) is not cell:
+            _fail("CLOCK_SOURCE_CELL_NOT_OWNED")
+        body = asdict(cell)
+        body["metadata_digest"] = ""
+        if cell.metadata_digest != _digest(body):
+            _fail("CLOCK_SOURCE_METADATA_CHANGED")
+        lower, upper = _bounds(interval)
+        first, last = _bounds(cell.prefix_interval)
+        if lower < first or upper > last:
+            _fail("FROZEN_SOURCE_INTERVAL_MISMATCH", cell.symbol, cell.timeframe)
+        yield from self._iter_owned_bars(cell, interval, clock_prefix=True)
+
     @staticmethod
     def _counter(value: str, code: str) -> int:
         try:
@@ -783,6 +1115,10 @@ class NativeInputs:
         self._known(cell)
         if interval != cell.interval:
             _fail("FROZEN_SOURCE_INTERVAL_MISMATCH", cell.symbol, cell.timeframe)
+        yield from self._iter_owned_bars(cell, interval)
+
+    def _iter_owned_bars(self, cell: SourceCell | ClockSourceCell, interval: Interval, *,
+                         clock_prefix: bool = False) -> Iterable[Bar]:
         lower, upper = _bounds(interval)
         cutoff = _utc(cell.cutoff_utc)
         try:
@@ -803,88 +1139,31 @@ class NativeInputs:
             _fail("SOURCE_SIZE_MISMATCH", cell.symbol, cell.timeframe)
         self._inflight.add(key)
         self._revalidated = False
-        rows = 0
-        previous_open = previous_close = None
-        exhausted = authenticated = parsing_failed = False
+        state = _CsvReadState()
+        contract = _CsvReadContract(path, cell.symbol, cell.timeframe,
+            cell.source_identity.bars_sha256, cell.expected_bytes,
+            cell.expected_rows, cell.cutoff_utc)
         try:
-            with path.open("rb") as raw:
-                first_handle = os.fstat(raw.fileno())
-                if _common_identity(before) != _common_identity(first_handle):
-                    _fail("SOURCE_CHANGED_BEFORE_SCAN")
-                reader = _DigestReader(raw)
-                with io.BufferedReader(reader) as buffer:
-                    with io.TextIOWrapper(buffer, encoding="utf-8-sig", newline="") as text:
-                        table = csv.DictReader(text, strict=True)
-                        try:
-                            fields = table.fieldnames
-                            required = {"time", "_BAR_CLOSE_TS", "Open", "High", "Low", "Close", "Volume"}
-                            if (fields is None or len(fields) != len(set(fields))
-                                    or not required.issubset(fields)):
-                                _fail("SOURCE_CSV_SCHEMA_UNSUPPORTED", cell.symbol, cell.timeframe)
-                            for row in table:
-                                rows += 1
-                                if None in row or any(row.get(name) is None for name in fields):
-                                    _fail("SOURCE_CSV_ROW_INVALID", cell.symbol, cell.timeframe)
-                                opened, closed = _utc(row["time"]), _utc(row["_BAR_CLOSE_TS"])
-                                if (closed <= opened or (previous_open is not None
-                                        and (opened <= previous_open or opened < previous_close))):
-                                    _fail("SOURCE_UTC_AXIS_INVALID", cell.symbol, cell.timeframe)
-                                previous_open, previous_close = opened, closed
-                                if ((opened < lower < closed)
-                                        or (opened < upper < closed and opened >= lower)):
-                                    _fail("SOURCE_ROW_STRADDLES_FROZEN_INTERVAL", cell.symbol, cell.timeframe)
-                                if opened < lower or opened >= upper or closed > cutoff:
-                                    continue
-                                try:
-                                    prices = [float(row[name]) for name in ("Open", "High", "Low", "Close")]
-                                except (ValueError, TypeError, OverflowError) as error:
-                                    raise NativeInputsError("SOURCE_PRICE_PARSE_INVALID", symbol=cell.symbol,
-                                        timeframe=cell.timeframe, detail=_bounded_message(error),
-                                        abort_attempt=False) from error
-                                if not all(math.isfinite(value) for value in prices):
-                                    _fail("SOURCE_PRICE_INVALID", cell.symbol, cell.timeframe)
-                                volume = self._counter(row["Volume"], "SOURCE_VOLUME_INVALID")
-                                real = (self._counter(row["RealVolume"], "SOURCE_REAL_VOLUME_INVALID")
-                                        if "RealVolume" in fields else None)
-                                spread = (self._counter(row["Spread"], "SOURCE_SPREAD_INVALID")
-                                          if "Spread" in fields and row["Spread"] != "" else None)
-                                yield Bar(row["time"], row["_BAR_CLOSE_TS"], *prices, volume, real, spread)
-                            exhausted = True
-                        except (csv.Error, UnicodeError) as error:
-                            parsing_failed = True
-                            raise NativeInputsError("SOURCE_CSV_PARSING_UNAUTHENTICATED", symbol=cell.symbol,
-                                timeframe=cell.timeframe, detail=_bounded_message(error),
-                                abort_attempt=True) from error
-                        finally:
-                            # Authenticate EOF even after schema/value refusal or consumer close.
-                            try:
-                                if not exhausted:
-                                    for row in table:
-                                        rows += 1
-                            except (csv.Error, UnicodeError) as error:
-                                raise NativeInputsError("SOURCE_CSV_PARSING_UNAUTHENTICATED", symbol=cell.symbol,
-                                    timeframe=cell.timeframe, detail=_bounded_message(error),
-                                    abort_attempt=True) from error
-                            last_handle = os.fstat(raw.fileno())
-                            after = _no_reparse(path)
-                            if (_stat_identity(before) != _stat_identity(after)
-                                    or _stat_identity(first_handle) != _stat_identity(last_handle)):
-                                _fail("SOURCE_CHANGED_DURING_SCAN", cell.symbol, cell.timeframe)
-                            if (parsing_failed or reader.digest.hexdigest() != cell.source_identity.bars_sha256
-                                    or reader.bytes_read != cell.expected_bytes or rows != cell.expected_rows):
-                                _fail("SOURCE_DIGEST_ROWS_OR_BYTES_MISMATCH", cell.symbol, cell.timeframe)
-                            self._record(path, reader.digest.hexdigest(), reader.bytes_read, after, "csv", rows)
-                            authenticated = True
+            yield from _read_csv_bars(contract, interval, before, state,
+                                      clock_prefix=clock_prefix)
         except OSError as error:
             self._failed_streams.add(key)
             raise NativeInputsError("SOURCE_AUTHENTICATION_FAILED", symbol=cell.symbol,
                 timeframe=cell.timeframe, detail=_bounded_message(error), abort_attempt=True) from error
         except BaseException:
-            if not authenticated:
+            if not state.authenticated:
                 self._failed_streams.add(key)
             raise
         finally:
-            self._inflight.discard(key)
+            try:
+                if state.authenticated:
+                    try:
+                        self._record(path, state.sha256, state.bytes_read, state.after, "csv", state.rows)
+                    except BaseException:
+                        self._failed_streams.add(key)
+                        raise
+            finally:
+                self._inflight.discard(key)
 
     def _authenticate_csv_read(self, cell: SourceCell,
                                expected_stat: tuple[int, ...]) -> None:
