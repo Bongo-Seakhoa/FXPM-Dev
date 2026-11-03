@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FxPM Prototype Flow</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --fg: #1b1f27;
+    --muted: #5b6270;
+    --panel: #ffffff;
+    --panel-2: #eef1f5;
+    --line: #d7dbe3;
+    --l0: #4f46e5; --l1: #0f766e; --l2: #b45309; --l3: #7c3aed; --l4: #be185d;
+    --l5: #dc2626; --l6: #2563eb; --l7: #059669; --l8: #6b7280;
+    --code-bg: #dcfce7; --code-fg: #14532d;
+    --dir-bg: #fef3c7; --dir-fg: #78350f;
+    --prop-bg: #dbeafe; --prop-fg: #1e3a8a;
+    --stage-bg: #1b1f27; --stage-fg: #ffffff;
+    --par-bg: #ede9fe; --par-fg: #4c1d95;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1218; --fg: #e6e8ee; --muted: #a3aab8; --panel: #171b23; --panel-2: #1f2430; --line: #2b3140;
+      --l0: #8b85ff; --l1: #2dd4bf; --l2: #f59e0b; --l3: #a78bfa; --l4: #f472b6;
+      --l5: #f87171; --l6: #60a5fa; --l7: #34d399; --l8: #9ca3af;
+      --code-bg: #14532d; --code-fg: #bbf7d0;
+      --dir-bg: #78350f; --dir-fg: #fde68a;
+      --prop-bg: #1e3a8a; --prop-fg: #bfdbfe;
+      --stage-bg: #e6e8ee; --stage-fg: #0f1218;
+      --par-bg: #3b2a6b; --par-fg: #ddd6fe;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1218; --fg: #e6e8ee; --muted: #a3aab8; --panel: #171b23; --panel-2: #1f2430; --line: #2b3140;
+    --l0: #8b85ff; --l1: #2dd4bf; --l2: #f59e0b; --l3: #a78bfa; --l4: #f472b6;
+    --l5: #f87171; --l6: #60a5fa; --l7: #34d399; --l8: #9ca3af;
+    --code-bg: #14532d; --code-fg: #bbf7d0;
+    --dir-bg: #78350f; --dir-fg: #fde68a;
+    --prop-bg: #1e3a8a; --prop-fg: #bfdbfe;
+    --stage-bg: #e6e8ee; --stage-fg: #0f1218;
+    --par-bg: #3b2a6b; --par-fg: #ddd6fe;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 24px 16px 48px;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 1.05rem; margin: 0 0 8px; }
+  .lede { color: var(--muted); margin: 0 0 16px; max-width: 70ch; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 0 0 14px; }
+  button {
+    font: inherit; font-size: 0.85rem; padding: 6px 12px; border-radius: 8px;
+    border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer;
+  }
+  button:hover { background: var(--panel-2); }
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; font-size: 0.82rem; color: var(--muted); margin: 0 0 18px; }
+  .chip {
+    display: inline-block; font-size: 0.72rem; font-weight: 600; letter-spacing: 0.02em;
+    padding: 1px 8px; border-radius: 999px; white-space: nowrap; vertical-align: middle; line-height: 1.6;
+  }
+  .st-code { background: var(--code-bg); color: var(--code-fg); }
+  .st-dir  { background: var(--dir-bg);  color: var(--dir-fg); }
+  .st-prop { background: var(--prop-bg); color: var(--prop-fg); }
+  .stage   { background: var(--stage-bg); color: var(--stage-fg); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .par     { background: var(--par-bg); color: var(--par-fg); }
+
+  details.loop {
+    --lc: var(--l8);
+    border-left: 4px solid var(--lc);
+    background: var(--panel);
+    border-radius: 0 10px 10px 0;
+    margin: 10px 0 10px 0;
+    padding: 8px 12px 10px;
+    box-shadow: 0 1px 0 var(--line);
+  }
+  details.loop details.loop { margin-left: clamp(6px, 2.2vw, 22px); }
+  details.loop > summary {
+    list-style: none; cursor: pointer; display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center;
+  }
+  details.loop > summary::-webkit-details-marker { display: none; }
+  details.loop > summary::before {
+    content: "▸"; color: var(--lc); font-size: 0.9rem; width: 12px; display: inline-block;
+  }
+  details.loop[open] > summary::before { content: "▾"; }
+  .kw { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; color: var(--lc); }
+  .kw small { font-weight: 500; color: var(--muted); }
+  .what { color: var(--muted); font-size: 0.9rem; }
+  .body { margin: 6px 0 0 14px; }
+  .body ul { margin: 4px 0 6px; padding-left: 18px; }
+  .body li { margin: 2px 0; }
+  .after {
+    margin: 8px 0 2px 14px; padding: 6px 10px; border-radius: 8px;
+    background: var(--panel-2); font-size: 0.92rem;
+  }
+  .after .lbl { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.78rem; color: var(--muted); margin-right: 6px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.86em; background: var(--panel-2); padding: 0 4px; border-radius: 4px; }
+
+  .l0 { --lc: var(--l0); } .l1 { --lc: var(--l1); } .l2 { --lc: var(--l2); } .l3 { --lc: var(--l3); }
+  .l4 { --lc: var(--l4); } .l5 { --lc: var(--l5); } .l6 { --lc: var(--l6); } .l7 { --lc: var(--l7); } .l8 { --lc: var(--l8); }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-top: 22px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .card ul { margin: 0; padding-left: 18px; }
+  .card li { margin: 4px 0; }
+  footer { margin-top: 24px; color: var(--muted); font-size: 0.8rem; border-top: 1px solid var(--line); padding-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>FxPM prototype flow, Route A</h1>
+  <p class="lede">One 28-day cycle, symbol first, M5 derived on demand, concurrent opportunity search, regime grouping inside one pass, then a narrow account-path qualification of a shortlist per cell. Loops are nested by indentation; the innermost ones run concurrently.</p>
+
+  <div class="toolbar">
+    <button type="button" onclick="setAll(true)">Expand all</button>
+    <button type="button" onclick="setAll(false)">Collapse all</button>
+  </div>
+
+  <div class="legend">
+    <span><span class="chip st-code">in code</span> exists in the checkout today</span>
+    <span><span class="chip st-dir">directed</span> operator direction or accepted design, not built</span>
+    <span><span class="chip st-prop">proposed</span> open proposal, needs a decision</span>
+    <span><span class="chip stage">OPEN</span> lifecycle stage, OPEN · USE · PROCESS · RESULT · DELETE</span>
+    <span><span class="chip par">concurrent</span> independent iterations, runs in parallel</span>
+  </div>
+
+  <!-- L0 CYCLE -->
+  <details class="loop l0" open>
+    <summary><span class="kw">for CYCLE t</span> <span class="what">every 28 days; information cutoff = t; nothing after t is visible</span> <span class="chip st-code">in code</span></summary>
+    <div class="body">
+      <ul>
+        <li>Every window below ends at t. Train start differs by timeframe; tuning and final are the same calendar interval for all six.</li>
+        <li>R&amp;D replays this whole cycle at successive pre-lockbox boundaries, 13 × 28 days, with account carry. Not shown below.</li>
+      </ul>
+
+      <!-- L1 SYMBOL -->
+      <details class="loop l1" open>
+        <summary><span class="kw">for SYMBOL</span> <span class="what">in universe, about 100</span> <span class="chip stage">OPEN</span> <span class="chip par">concurrent</span> <span class="chip st-dir">directed</span></summary>
+        <div class="body">
+          <ul>
+            <li>Load canonical M5 history up to t with its source and gap metadata. M5 is the only permanent price data.</li>
+            <li>Known gap: skip the interval like a weekend. Keep the real time gap, invent no prices.</li>
+            <li>New gap: one bounded native-timeframe comparison for that symbol and interval. Attach the compact finding to the M5 metadata so it is never investigated twice.</li>
+          </ul>
+
+          <!-- L2 TIMEFRAME -->
+          <details class="loop l2" open>
+            <summary><span class="kw">for TIMEFRAME</span> <span class="what">in M5, M15, M30, H1, H4, D1</span> <span class="chip stage">USE</span> <span class="chip par">concurrent</span></summary>
+            <div class="body">
+              <ul>
+                <li>Derive this timeframe's view from M5. M5 is itself. Session and observed-clock aligned, job-owned, in memory where possible. <span class="chip st-dir">directed</span></li>
+                <li>Cut windows: TRAIN (timeframe-specific start) | purge | TUNING | purge | FINAL, all ending at t. <span class="chip st-code">in code</span></li>
+                <li>Compute the feature surface once, closed-bar and causal. <span class="chip st-code">in code</span></li>
+                <li>Run the regime detector once with train-only fitted params. Output: <code>REGIME_LIVE</code> per bar, lagged to decision time. <span class="chip st-code">in code</span></li>
+                <li>Load the frozen cost tiers for this symbol and timeframe: P75 and P95. <span class="chip st-code">in code</span></li>
+              </ul>
+
+              <!-- L3 STRATEGY -->
+              <details class="loop l3" open>
+                <summary><span class="kw">for STRATEGY</span> <span class="what">in registry</span> <span class="chip stage">PROCESS</span> <span class="what">search</span> <span class="chip st-dir">directed</span></summary>
+                <div class="body">
+                  <ul>
+                    <li>Finite domain of size N<sub>s</sub>. One continuing study per strategy, seeded, never reset by an early weak result.</li>
+                    <li>Budget is a percentage of N<sub>s</sub>: checkpoints at 1%, 2.5%, 5%, 10%. Protected coverage first, adaptive TPE after.</li>
+                    <li>Today the production path is a frozen outcome-blind roster of 300 attempts per cell instead of this study. <span class="chip st-code">in code</span></li>
+                  </ul>
+
+                  <!-- L4 PARAMS -->
+                  <details class="loop l4" open>
+                    <summary><span class="kw">for PARAMS</span> <span class="what">proposed by the study</span> <span class="chip par">concurrent</span> <span class="chip st-prop">proposed</span></summary>
+                    <div class="body">
+                      <ul>
+                        <li>Cache by tuple hash. An exact duplicate reuses its result; a duplicate sampler proposal is not a new evaluation.</li>
+                        <li>Generate signals over the TRAIN surface for the whole timeframe, <strong>ungated</strong> by regime. <span class="chip st-prop">proposed</span></li>
+                        <li>Entry, stop and target are precomputed for every nonzero signal bar. <span class="chip st-code">in code</span></li>
+                      </ul>
+
+                      <!-- L5 SIGNAL_BAR -->
+                      <details class="loop l5" open>
+                        <summary><span class="kw">for SIGNAL_BAR</span> <span class="what">in nonzero signals</span> <span class="chip par">concurrent</span> <span class="what">Numba kernel</span> <span class="chip st-code">in code</span></summary>
+                        <div class="body">
+                          <ul>
+                            <li>One opportunity per signal bar. Nothing blocks it: no single-position gate, no earlier trade in the way.</li>
+                            <li>Entry at the next open plus half spread. Stop and target from the strategy's stop API.</li>
+                            <li>Exit at first touch of stop or target with the exit half spread. Right-censored at the window end. Same exit set as the account kernel: SL, TP, end of data.</li>
+                            <li>Label = <code>REGIME_LIVE</code> at the signal bar. <code>run_start</code> flag on the first bar of a signal run.</li>
+                            <li>Cash-free: price delta, pips, R-multiple. Swap unavailable, no sizing, no qualification authority. This is <code>pm_signal_opportunities.py</code>.</li>
+                          </ul>
+                        </div>
+                      </details>
+
+                      <div class="after"><span class="lbl">after the signal-bar loop</span>
+                        Group the opportunities by regime: <strong>four regime scores from one pass</strong>, run-start and cluster aware. Each regime's leaderboard for this strategy updates. This is the running comparison. <span class="chip st-prop">proposed</span>
+                      </div>
+                    </div>
+                  </details>
+
+                  <div class="after"><span class="lbl">after the params loop</span>
+                    Stop at the declared budget. Write the coverage receipt and the plateau-versus-needle diagnostic. No convergence claim. <span class="chip st-dir">directed</span>
+                  </div>
+                </div>
+              </details>
+
+              <!-- L6 REGIME -->
+              <details class="loop l6" open>
+                <summary><span class="kw">for REGIME</span> <span class="what">in TREND, RANGE, CHOP, BREAKOUT</span> <span class="what">cell = symbol × timeframe × regime</span> <span class="chip stage">RESULT 1</span> <span class="chip st-prop">proposed</span></summary>
+                <div class="body">
+                  <ul>
+                    <li>Shortlist the top k (strategy, params) by this regime's opportunity statistics, deflated for every configuration searched in this cell.</li>
+                    <li>k = 5, operator decision 2026-11-03. <span class="chip st-dir">directed</span></li>
+                    <li>Recommended statistic: lower confidence bound of total R over the regime's non-overlapping chain at P95, after signal-vector dedupe, at most 2 slots per strategy family. Pending MAIN disposition. <span class="chip st-prop">proposed</span></li>
+                  </ul>
+
+                  <!-- L7 CANDIDATE -->
+                  <details class="loop l7" open>
+                    <summary><span class="kw">for CANDIDATE</span> <span class="what">in shortlist, k not 300</span> <span class="chip stage">PROCESS</span> <span class="what">qualification</span> <span class="chip st-code">in code</span></summary>
+                    <div class="body">
+                      <ul>
+                        <li>Account path through the existing kernel: regime-gated, one position per cell, risk sized from path equity.</li>
+                        <li>TRAIN fit confirmation, then exactly one frozen evaluation on TUNING. Tuning never re-selects parameters.</li>
+                      </ul>
+
+                      <!-- L8 TIER -->
+                      <details class="loop l8" open>
+                        <summary><span class="kw">for TIER</span> <span class="what">in P75, P95</span> <span class="chip st-code">in code</span></summary>
+                        <div class="body">
+                          <ul>
+                            <li>Independent cost account per tier. Missing P75 means NO_TRADE for new entries.</li>
+                          </ul>
+                        </div>
+                      </details>
+
+                      <div class="after"><span class="lbl">after the tier loop</span>
+                        Gates: minimum trades, power, drawdown, return over drawdown, both cost tiers. A gate failure is a typed ineligible result, not an error.
+                      </div>
+                    </div>
+                  </details>
+
+                  <div class="after"><span class="lbl">after the candidate loop</span>
+                    Winner or NO_TRADE for [t, t+28). FINAL is evaluated once, for the frozen winner only; it may reject, it never chooses. Write the end-grid row with compact provenance: code sha, M5 source identity, configuration identity, outcome. <span class="chip stage">RESULT 2</span>
+                  </div>
+                </div>
+              </details>
+
+              <div class="after"><span class="lbl">after the regime loop</span>
+                Release the timeframe view, feature surface, opportunity tape and study scratch. Nothing from this level persists except the end-grid rows. <span class="chip stage">DELETE</span> <span class="chip st-dir">directed</span>
+              </div>
+            </div>
+          </details>
+
+          <div class="after"><span class="lbl">after the timeframe loop</span> Release the M5 handle.</div>
+        </div>
+      </details>
+
+      <div class="after"><span class="lbl">after the symbol loop</span>
+        Portfolio layer, outside every cell: capital admission, exposure limits, the 28-day account handoff per cell. Then the next cycle at t + 28.
+      </div>
+    </div>
+  </details>
+
+  <div class="cards">
+    <div class="card">
+      <h2>Where the parallelism sits</h2>
+      <ul>
+        <li>Symbol by timeframe jobs are independent and fan out across cores under the existing per-symbol queue bound.</li>
+        <li>Inside a job every params evaluation is independent, and inside an evaluation every opportunity is independent.</li>
+        <li>The only sequential piece left is the account path, now run for k candidates per cell instead of 300.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Where this differs from the operator's text</h2>
+      <ul>
+        <li>Regime is not an outer loop around strategies. It is a grouping inside one evaluation and becomes a loop only at shortlist and qualification. That is what makes four cells cost one pass.</li>
+        <li>Optuna lives at the params loop, one study per strategy. Numba lives at the signal-bar loop and inside the account kernel. Neither skips anything.</li>
+        <li>Timeframe iterations are independent. Nothing found on M5 feeds H1. The only cross-timeframe sharing is the M5 base.</li>
+        <li>Qualification is a second, narrow pass through the existing account kernel. What qualifies is what live executes.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Decisions and recommendations, 2026-11-03</h2>
+      <ul>
+        <li><span class="chip st-dir">directed</span> Route A accepted by the operator; Route B closed. Shortlist size k = 5 per cell.</li>
+        <li><span class="chip st-prop">proposed</span> Statistic: per regime, chain the opportunities non-overlapping, the trades a gated single-position taker would make, and rank by the lower confidence bound of total R on the TRAIN chain at P95. Dedupe by signal-vector sha; at most 2 of 5 per strategy family. All-opportunity expectancy is reported beside it as the masking diagnostic only.</li>
+        <li><span class="chip st-prop">proposed</span> Acceptance before the statistic selects anything: chain trade list byte-equal to the kernel trade list on a fixture, and rank agreement with account outcomes on existing full-cell output.</li>
+        <li><span class="chip st-prop">proposed</span> Tuning stays on the account path, one frozen evaluation per candidate and tier. Four studies per strategy, one per regime, sharing one evaluation cache; no multi-objective study.</li>
+        <li><span class="chip st-prop">proposed</span> Route A is a new frozen process edition replacing the 300-attempt roster, not a patch.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h2>Sources behind the chips</h2>
+      <ul>
+        <li><code>pm_signal_opportunities.py</code>: concurrent cash-free opportunities, run_start, first-touch exits.</li>
+        <li><code>pm_core.py</code> 208, 1846, 1866: exit set SL/TP/EOD, entry only when flat, sizing from path equity.</li>
+        <li><code>pm_optuna.py</code> 578: pre-backtest regime gating on the account path.</li>
+        <li><code>docs/FXPM_PROTOTYPE_ARCHITECTURE_DECISIONS_20260917.md</code>: per-strategy studies, percentage checkpoints, no pruning.</li>
+        <li>Bus E4452 (M5 on-demand lifecycle, 5 GiB floor), E4455 and E4457 (this assessment).</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>
+    Prepared by Claude PM on 2026-11-03 from the FxPM-Dev checkout at 529c04f0 and bus events E4452, E4455, E4457. This page describes a proposed flow, Route A, as understood by Claude PM. The status chips separate what is in code from what is directed or proposed. It is not a record of current implementation and confers no authority. Updated the same day after the operator accepted Route A and k = 5; the recommendations await MAIN disposition.
+  </footer>
+</div>
+<script>
+  function setAll(open) {
+    document.querySelectorAll('details.loop').forEach(function (d) { d.open = open; });
+  }
+</script>
+</body>
+</html>

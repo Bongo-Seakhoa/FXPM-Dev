@@ -1,0 +1,48 @@
+{
+  "schema_version": "fxpm.claude-pm-scope-disposition.v1",
+  "answers": "E-00004460",
+  "capsule": {
+    "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_consumer_candidate_001/root_scope_001.json",
+    "bytes": 8083,
+    "sha256": "4a408b49b117aa44f7aac9a6f0d1d03420af22d36d5ed40e6e73de31f493f0c3"
+  },
+  "recorded_utc": "2026-11-03T14:30:00Z",
+  "recorded_by": "claude-pm",
+  "verdict": "ACCEPT_WITH_REQUIRED_MINIMAL_CORRECTIONS",
+  "accepted_as_written": [
+    "Outcome: one coherent M5-backed on-demand consumer path and owned-transient lifecycle serving the existing 2400-case grid; no extra permanent HTF publication milestone.",
+    "API shape pm_m5_job_view.M5JobViews with coverage, acquire, finish, close; reuse of pm_explicit_derived_native.NativeInputs, pm_explicit_derived_history.derive_bars and the observed-clock constructors unchanged.",
+    "Binding names as listed; common job and cell identity excludes a single slot request.",
+    "Source contract: explicit declared-M5 precommit and request schema variant; native V1/V2 field sets, seals and V16 winner transport preserved; no forged or subclassed NativePrefixProduct; no relaxed legacy validators.",
+    "Gap rule: one narrow native-timeframe comparison keyed to unchanged M5 identity and interval; corroborated unavailable stays a gap or typed STOP; never invented bars; never a market-closed or PASS claim.",
+    "Result and release: final result and compact provenance independent of working-spool paths; close consumers, persist, revalidate source, then release only newly owned transients; no old denied cleanup targets through product code.",
+    "Resource copies: the six prepared files differ from HEAD only in the 5 GiB constants (two builders, scheduler DECLARED_CELL_MIN_FREE_BYTES from 1.5 GiB to 5 GiB) and the boundary tests at 5 GiB minus one, equal and plus one; the derived test is unchanged. Accepted for the source review stage."
+  ],
+  "required_minimal_corrections": [
+    {
+      "id": "C1_view_key_independent_of_slot",
+      "text": "The derived view key must bind canonical M5 source identity, symbol, timeframe, interval, cutoff, constructor implementation sha and the attached clock or gap findings, and nothing from a slot request. request_sha256 and slot_id bind only the lease. A Route A search job (operator acceptance E4462) must be able to hold the same view later without re-keying it.",
+      "why": "The capsule's owner_lifetime names one slot job across its unchanged 300 candidates. Route A replaces the 300 roster; the view must outlive that process edition."
+    },
+    {
+      "id": "C2_two_truthful_source_kinds",
+      "text": "Carry two source kinds under source_contract_sha256: NATIVE_HTF where verified native bars exist for the symbol and timeframe, and DERIVED_FROM_M5 where the native cell is technical_error and the symbol's M5 is an evidence candidate. For the prototype, derive only the gap; M5-only retention of history follows after the grid, once derived-equals-native is proven on every control.",
+      "why": "Re-deriving and re-validating 465 cells that already have verified native bars delays the prototype for no information gain."
+    },
+    {
+      "id": "C3_cost_readiness_surface",
+      "text": "Cost readiness for a derived view must flow through the accepted Spread=min method of profile 9fe54 as an edition extension verified per symbol control through the existing spread-profile mechanism. Where the control match fails, the typed COST_UNAVAILABLE STOP stands. Applying the method beyond the 8 cells already cost-ready is a cost policy ruling that only the operator can make; claude-pm requests it today in the side chat.",
+      "why": "Without this, every derived cell outside the 8 published ones STOPs and the batch serves the 2400 grid only marginally."
+    },
+    {
+      "id": "C4_result_reproducibility",
+      "text": "The durable final result for a cell must record the view key and source_contract_sha256 so that a deleted view can be rebuilt from code and canonical M5 alone.",
+      "why": "E4452 permanent elements are code, M5 and end grids; the grid row is the only place the provenance can live."
+    }
+  ],
+  "next_executable_validation": [
+    "One symbol and timeframe through the whole path on a fixture: coverage, acquire, consumer read, finish, close, with the release assertion.",
+    "One real technical_error cell with good M5 through the existing slot path after source review and Root QA, result saved, transients released, free space never below 5 GiB."
+  ],
+  "no_grant": "No run, no product apply, no financial, PAPER, live or order scope, no numerical or cost policy adopted by this disposition; C3 is a request to the operator."
+}
