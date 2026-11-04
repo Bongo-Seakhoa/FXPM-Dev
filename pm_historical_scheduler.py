@@ -1631,6 +1631,57 @@ def _declared_m5_stop_commit_reason(commit, *, context_sha256, precommit_sha256,
     return completion["reason_code"]
 
 
+def _declared_m5_stop_grid_identity(source_session, *, symbol):
+    """Project recorded session DATA; no fresh Native assurance is supplied."""
+    if source_session is None:
+        return {}
+    if type(source_session) is not dict:
+        _fail("DECLARED_M5_STOP_SOURCE_IDENTITY_INVALID")
+    if (source_session.get("failure") is not None or source_session.get("source_state") != "AVAILABLE"
+            or source_session.get("cost_status") != "COST_READY"):
+        return {}
+    import pm_authority_spool as spool
+    if (source_session.get("source_kind") != "m5_derived"
+            or source_session.get("unverified_caller_source_or_fit_accepted") is not False
+            or any(source_session.get(key) is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_M5_STOP_SOURCE_IDENTITY_INVALID")
+    source = source_session.get("m5_source_identity")
+    fields = spool.POST_SOURCE_ABORT_GRID_SOURCE_FIELDS
+    if (type(source) is not dict or any(type(source.get(key)) is not str for key in fields)
+            or source["symbol"] != symbol or source["timeframe"] != "M5" or source["spread_unit"] != "points"
+            or any(not _declared_digest(source[key]) for key in fields if key.endswith("sha256"))):
+        _fail("DECLARED_M5_STOP_SOURCE_IDENTITY_INVALID")
+    return {key: source[key] for key in fields}
+
+
+def _declared_m5_recorded_stop_grid_identity(context, *, commit, precommit, cell, slot):
+    """Read committed provenance, not a fresh source/fit completion check."""
+    _declared_m5_stop_commit_reason(commit, context_sha256=context.context_sha256,
+        precommit_sha256=precommit.receipt_sha256, cell_id=cell["cell_id"], slot=slot)
+    completion = commit["completion"]
+    entry = completion.get("source_session_entry")
+    if entry is None:
+        return {}
+    import pm_authority_spool as spool
+    import pm_historical_production_adapter as adapter
+    body = completion.get("request_body")
+    if (type(body) is not dict or type(entry) is not dict
+            or type(commit.get("artifact_roster")) is not list or entry not in commit["artifact_roster"]
+            or type(body.get("artifact_namespace")) is not str or not body["artifact_namespace"]
+            or type(entry.get("artifact_id")) is not str
+            or not entry["artifact_id"].startswith(body["artifact_namespace"] + "/")
+            or type(entry.get("descriptor")) is not dict
+            or entry["descriptor"].get("format") != spool.CANONICAL_JSON_FORMAT):
+        _fail("DECLARED_M5_STOP_SOURCE_IDENTITY_INVALID")
+    source = adapter._reopen_ascii_json_entry(context, entry,
+        expected_type="declared_slot_source_session", code="DECLARED_SLOT_SOURCE_INVALID")
+    source = adapter._validate_declared_m5_source_session(context, body=body,
+        source_session=source, request_sha256=completion["request_sha256"], parent=precommit.to_dict(),
+        completed_at_utc=completion["completed_at_utc"])
+    return _declared_m5_stop_grid_identity(source, symbol=cell["symbol"])
+
+
 def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, precommit, process,
         frozen, config, contract, row, cell_contract_sha256, resumed, source_attempted, owner_created,
         owner, phase, run_body, abort_report=None):
@@ -1693,13 +1744,21 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
                 binding=binding, workspace_owner_sha256=workspace_sha, result=refusal_result,
                 slot=slot, cell=row["cell"], code_sha256=code, recorded_at_utc=produced)
         refusal = body["refusal"]
+        grid_identity = {} if abort_report is None else _declared_m5_abort_grid_identity(abort_report)
+        if abort_report is None and result["status"] == "TERMINAL_STOP":
+            try:
+                grid_identity = _declared_m5_recorded_stop_grid_identity(context, commit=saved[0],
+                    precommit=precommit, cell=row["cell"], slot=slot)
+            except Exception as identity_error:
+                code_value = getattr(identity_error, "code", type(identity_error).__name__)
+                result["terminal_refusal_source_identity_error"] = (code_value[:256]
+                    if type(code_value) is str else type(identity_error).__name__[:256])
         stopped = grid.build_end_grid_row(symbol=row["cell"]["symbol"], timeframe=row["cell"]["timeframe"],
             regime=row["cell"]["regime"], cycle_start_utc=refusal["cycle_start_utc"],
             cycle_end_utc=refusal["cycle_end_utc"], information_cutoff_utc=refusal["information_cutoff_utc"],
             outcome="STOP", reason_code=refusal["reason_code"], source_kind="m5_derived",
             source_contract_sha256=None, no_trade_run_receipt_sha256=None, view_key=None,
-            view_contract_sha256=None, source_identity=({} if abort_report is None
-                else _declared_m5_abort_grid_identity(abort_report)), cost_tier="NONE",
+            view_contract_sha256=None, source_identity=grid_identity, cost_tier="NONE",
             process_edition_sha256=process.receipt_sha256, code_sha256=code, metrics={},
             strategy_family=None, configuration_sha256=None,
             job_binding_sha256=None if abort_report is None else abort_report["job_binding_sha256"],
