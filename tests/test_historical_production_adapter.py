@@ -1075,7 +1075,7 @@ def build_current_native_case(tmp_path, *, retained_native_root=None, selected_o
         # This fixed synthetic owner is input to the engineering case, not an outcome-selected strategy.
         strategy_id = "EMACrossoverStrategy"
         features = search_execution._build_full_prefix_strategy_surface(frame=fitted._frame,
-            strategy=StrategyRegistry.get(strategy_id), symbol=OBSERVED_SYMBOL, timeframe="D1")
+            strategy=StrategyRegistry.get(strategy_id), fitted=fitted, symbol=OBSERVED_SYMBOL, timeframe="D1")
         labels = features.features["REGIME_LIVE"]
         signal_labels = labels.loc[features.raw_signals.shift(1).fillna(0).ne(0)].value_counts()
         regime = str(signal_labels.index[0])

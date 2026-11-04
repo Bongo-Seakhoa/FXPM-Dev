@@ -348,10 +348,12 @@ def test_path_state_is_computed_once_on_full_prefix_then_sliced(
         index=opens,
     )
     calls = {"features": 0, "signals": 0}
+    unit_fitted_sentinel = object()  # Unit forwarding only; no fitted authority.
 
-    def compute(source, _strategy, **_kwargs):
+    def compute(*, frame, strategy, fitted, symbol, timeframe):
+        assert fitted is unit_fitted_sentinel
         calls["features"] += 1
-        return source.copy(deep=True)
+        return frame.copy(deep=True)
 
     class PathStrategy:
         def generate_signals(self, features, _symbol):
@@ -362,13 +364,14 @@ def test_path_state_is_computed_once_on_full_prefix_then_sliced(
             )
 
     monkeypatch.setattr(
-        execution.FeatureComputer,
-        "compute_for_strategy",
+        execution,
+        "_compute_fitted_strategy_features",
         compute,
     )
     surface = execution._build_full_prefix_strategy_surface(
         frame=frame,
         strategy=PathStrategy(),
+        fitted=unit_fitted_sentinel,
         symbol="EURUSD",
         timeframe="H1",
     )

@@ -2503,10 +2503,34 @@ def _decision_relevant_result(result: Mapping[str, Any], role: str) -> dict[str,
     return json.loads(_canonical_bytes(body).decode("ascii"))
 
 
+def _compute_fitted_strategy_features(*, frame, strategy, fitted, symbol, timeframe):
+    """Use the held authenticated fit recipe when full features are requested."""
+    def full_features():
+        return FeatureComputer.compute_all(frame, symbol=symbol, timeframe=timeframe,
+            regime_params_override=dict(fitted.regime_parameters),
+            regime_params_sha256=fitted.regime_fit_decision.to_dict()["regime_params_sha256"])
+
+    if strategy is None:
+        return full_features()
+    request = set()
+    if hasattr(strategy, "get_feature_request"):
+        request.update(set(strategy.get_feature_request() or set()))
+    elif hasattr(strategy, "get_required_features"):
+        request.update(set(strategy.get_required_features() or set()))
+        if hasattr(strategy, "calculate_stops"):
+            request.add("ATR_14")
+    if not request:
+        return frame.copy()
+    if request & FeatureComputer._REGIME_FEATURE_COLUMNS:
+        return full_features()
+    return FeatureComputer.compute_required(frame, request, symbol=symbol, timeframe=timeframe)
+
+
 def _build_full_prefix_strategy_surface(
     *,
     frame: pd.DataFrame,
     strategy: Any,
+    fitted: FittedNativeSearchTimeframe,
     symbol: str,
     timeframe: str,
 ) -> _FullPrefixStrategySurface:
@@ -2515,12 +2539,9 @@ def _build_full_prefix_strategy_surface(
     if not isinstance(frame, pd.DataFrame) or frame.empty:
         _fail("FULL_PREFIX_FRAME_INVALID")
     try:
-        features = FeatureComputer.compute_for_strategy(
-            frame,
-            strategy,
-            symbol=symbol,
-            timeframe=timeframe,
-        )
+        features = _compute_fitted_strategy_features(
+            frame=frame, strategy=strategy, fitted=fitted,
+            symbol=symbol, timeframe=timeframe)
         if (
             not isinstance(features, pd.DataFrame)
             or not features.index.equals(frame.index)
@@ -2838,7 +2859,7 @@ def _build_planned_attempt_evidence(
             or not isinstance(fitted._entry_spread_observations, pd.Series)):
         _fail("FROZEN_TIER_FITTED_INPUTS_UNAVAILABLE")
     full_prefix_surface = _build_full_prefix_strategy_surface(
-        frame=frame, strategy=strategy, symbol=symbol, timeframe=timeframe)
+        frame=frame, strategy=strategy, fitted=fitted, symbol=symbol, timeframe=timeframe)
     backtester = Backtester(config)
     folds = []
     for fold_ordinal, fold in enumerate(_causal_folds(attempt)):
@@ -5124,7 +5145,7 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                 _fail("SIGNAL_DESIGN_ATTEMPT_DISPOSITION_INVALID")
             strategy, _ = _runtime_strategy(attempt)
             surface = _build_full_prefix_strategy_surface(frame=frame, strategy=strategy,
-                symbol=cell_plan.symbol, timeframe=cell_plan.timeframe)
+                fitted=refreshed, symbol=cell_plan.symbol, timeframe=cell_plan.timeframe)
             _signal_design_frame(surface.features, cap)
             totals["evaluated_attempt_count"] += 1
             config_sha = _sha256({"effective_config_sha256": binding["effective_config_sha256"],
