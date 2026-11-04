@@ -2111,12 +2111,12 @@ DECLARED_M5_SLOT_SOURCE_SESSION_KEYS = frozenset((
 
 def _declared_m5_view_observation(view):
     from dataclasses import asdict
-    return {"view_key": view.view_key, "payload_sha256": view.payload_sha256,
+    return json.loads(_canonical_bytes({"view_key": view.view_key, "payload_sha256": view.payload_sha256,
         "membership_sha256": view.membership_sha256, "source_kind": view.source_kind,
         "timeframe": view.timeframe, "cutoff_utc": view.cutoff_utc,
         "interval": asdict(view.interval), "coverage": asdict(view.coverage),
         "constructor_implementation_sha256": view.constructor_implementation_sha256,
-        "gap_findings_sha256": view.gap_findings_sha256, "cost_status": view.cost_status}
+        "gap_findings_sha256": view.gap_findings_sha256, "cost_status": view.cost_status}).decode("ascii"))
 
 
 DECLARED_M5_REOPEN_CONTEXT_SCHEMA = "fxpm.declared-m5-reopen-context.v1"
