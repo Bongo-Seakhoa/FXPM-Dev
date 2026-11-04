@@ -22,6 +22,8 @@ from typing import Any
 
 __all__ = (
     "build_historical_horizon_plan",
+    "build_m5_derived_historical_horizon_plan",
+    "reopen_m5_derived_historical_horizon_plan",
     "evaluate_historical_horizon_plan",
     "verify_historical_horizon_evidence",
 )
@@ -367,7 +369,7 @@ def _valid_plan(plan: Any) -> bool:
         if plan._seal is not _PLAN_SEAL:
             return False
         body = json.loads(plan._body_json.decode("utf-8"))
-        if type(body) is not dict or body.get("schema_version") not in (_CURRENT_PLAN_SCHEMA, _PLAN_SCHEMA):
+        if type(body) is not dict or body.get("schema_version") not in (_CURRENT_PLAN_SCHEMA, _PLAN_SCHEMA, _M5_PLAN_SCHEMA):
             return False
         return (
             plan._receipt_sha256 == _sha256_bytes(plan._body_json) == _sha256_json(body)
@@ -383,7 +385,7 @@ def _valid_evidence(evidence: Any) -> bool:
         if evidence._seal is not _EVIDENCE_SEAL:
             return False
         body = json.loads(evidence._body_json.decode("utf-8"))
-        if type(body) is not dict or body.get("schema_version") not in (_CURRENT_EVIDENCE_SCHEMA, _EVIDENCE_SCHEMA):
+        if type(body) is not dict or body.get("schema_version") not in (_CURRENT_EVIDENCE_SCHEMA, _EVIDENCE_SCHEMA, _M5_EVIDENCE_SCHEMA):
             return False
         return (
             evidence._receipt_sha256
@@ -1074,9 +1076,91 @@ def _normalize_fold(
     return fold
 
 
-def _normalize_candidate(
+_M5_REQUEST_SCHEMA = "fxpm.m5-derived-historical-horizon-request.v1"
+_M5_PLAN_SCHEMA = "fxpm.m5-derived-historical-horizon-plan.v1"
+_M5_EVIDENCE_SCHEMA = "fxpm.m5-derived-historical-horizon-evidence.v1"
+_M5_WINDOW_SCHEMA = "fxpm.m5-derived-price-window.v1"
+_M5_WINDOW_KEYS = frozenset(("schema_version", "source_kind", "symbol", "timeframe",
+    "m5_view_contract_sha256", "view_key", "view_payload_sha256", "view_membership_sha256",
+    "view_frame_sha256", "view_start_utc", "view_end_exclusive_utc", "view_last_close_utc",
+    "view_rows", "base_native_prefix_index_sha256", "base_native_prefix_content_sha256"))
+
+
+def _m5_window_utc(value, label):
+    _require(type(value) is str, "invalid " + label)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise _HorizonContractError("invalid " + label) from error
+    _require(parsed.tzinfo is not None and parsed.utcoffset() == timedelta(0)
+        and parsed.microsecond == 0
+        and value in (parsed.isoformat(timespec="seconds"), parsed.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        "invalid " + label)
+    return parsed
+
+
+def _normalize_m5_window(value, cell, native, anchor):
+    window = _exact_keys(value, tuple(sorted(_M5_WINDOW_KEYS)), "M5 target view window")
+    _require(window["schema_version"] == _M5_WINDOW_SCHEMA
+        and window["source_kind"] == "m5_derived", "M5 target window schema mismatch")
+    _require(window["symbol"] == cell["symbol"] == native["symbol"]
+        and window["timeframe"] == cell["timeframe"]
+        and cell["timeframe"] in ("M15", "M30", "H1")
+        and native["timeframe"] == "M5" and native["source_state"] == _AVAILABLE,
+        "M5 target/base source identity mismatch")
+    for key in ("m5_view_contract_sha256", "view_key", "view_payload_sha256",
+            "view_membership_sha256", "view_frame_sha256", "base_native_prefix_index_sha256",
+            "base_native_prefix_content_sha256"):
+        _digest(window[key], key)
+    _require(window["base_native_prefix_index_sha256"] == native["prefix_index_sha256"]
+        and window["base_native_prefix_content_sha256"] == native["prefix_content_sha256"],
+        "M5 target/base source digest mismatch")
+    start = _m5_window_utc(window["view_start_utc"], "M5 view start")
+    end = _m5_window_utc(window["view_end_exclusive_utc"], "M5 view end")
+    last = _m5_window_utc(window["view_last_close_utc"], "M5 view last close")
+    rows = _integer(window["view_rows"], "M5 view rows", 1, 10_000_000)
+    base_start = _utc(native["prefix_start_utc"], "M5 prefix start")
+    base_end = _utc(native["prefix_end_exclusive_utc"], "M5 prefix end")
+    cutoff = _utc(anchor["selection_cutoff_utc"], "M5 anchor cutoff")
+    period = timedelta(seconds=_TIMEFRAME_SECONDS[cell["timeframe"]])
+    _require(base_start <= start < last <= end <= cutoff
+        and end - period < base_end <= end and base_end <= cutoff,
+        "M5 target window outside causal base membership")
+    _require(rows <= int((end-start).total_seconds() // _TIMEFRAME_SECONDS[cell["timeframe"]]),
+        "M5 target rows exceed target timeframe capacity")
+    return window
+
+
+def _request_source_binding(request):
+    binding = _source_binding(request["native_prefix"])
+    if request.get("source_kind") == "m5_derived":
+        window = request.get("target_view_window", request.get("m5_view_window"))
+        binding = {**binding, "source_kind": "m5_derived", "base_timeframe": "M5",
+            "view_timeframe": window["timeframe"], "source_snapshot_sha256": window["view_payload_sha256"],
+            "m5_view_window_sha256": _sha256_json(window), "m5_view_window": window}
+    return binding
+
+
+def _request_source_prefix_receipt(request):
+    body = {"cell": request["cell"], "anchor_id": request["anchor"]["anchor_id"],
+        "selection_cutoff_utc": request["anchor"]["selection_cutoff_utc"],
+        "native_prefix": request["native_prefix"]}
+    if request.get("source_kind") == "m5_derived":
+        body.update(source_kind="m5_derived",
+            m5_view_window=request.get("target_view_window", request.get("m5_view_window")))
+    return _sha256_json(body)
+
+
+def _normalize_candidate(value, prefix, anchor, geometry):
+    return _normalize_candidate_bounds(value, prefix["prefix_start_utc"],
+        prefix["prefix_end_exclusive_utc"], prefix["prefix_rows"], anchor, geometry)
+
+
+def _normalize_candidate_bounds(
     value: Any,
-    prefix: dict[str, Any],
+    prefix_start_utc: str,
+    prefix_end_exclusive_utc: str,
+    prefix_rows: int,
     anchor: dict[str, Any],
     geometry: dict[str, int],
 ) -> tuple[dict[str, Any], bool]:
@@ -1111,10 +1195,10 @@ def _normalize_candidate(
         candidate["candidate_definition_sha256"] == _sha256_json(definition),
         "candidate definition digest mismatch",
     )
-    prefix_start = _utc(prefix["prefix_start_utc"], "prefix start")
+    prefix_start = _utc(prefix_start_utc, "prefix start")
     native_row_shortfall = (
         candidate["lookback_kind"] == "NATIVE_OBSERVATIONS"
-        and candidate["lookback_value"] > prefix["prefix_rows"]
+        and candidate["lookback_value"] > prefix_rows
     )
     boundary_shortfall = candidate_start < prefix_start or native_row_shortfall
     if boundary_shortfall:
@@ -1123,7 +1207,7 @@ def _normalize_candidate(
             "boundary-trimmed candidate must not fabricate folds",
         )
         return candidate, True
-    prefix_end = _utc(prefix["prefix_end_exclusive_utc"], "prefix end")
+    prefix_end = _utc(prefix_end_exclusive_utc, "prefix end")
     cutoff = _utc(anchor["selection_cutoff_utc"], "selection cutoff")
     _require(candidate_start < prefix_end, "candidate starts outside historical prefix")
     _require(len(candidate["folds"]) > 0, "eligible candidate requires folds")
@@ -1183,7 +1267,7 @@ def _normalize_candidate(
         )
     _require(
         all(
-            fold["fit_rows"] + fold["validation_rows"] <= prefix["prefix_rows"]
+            fold["fit_rows"] + fold["validation_rows"] <= prefix_rows
             for fold in normalized_folds
         ),
         "declared fold rows exceed activated native prefix backing",
@@ -1315,10 +1399,18 @@ def _paired_fold_axes(candidates: list[dict[str, Any]], boundary_ids: set[str]) 
 
 
 def _normalize_request(request: Any) -> dict[str, Any]:
+    return _normalize_request_source(request, False)
+
+
+def _normalize_m5_request(request: Any) -> dict[str, Any]:
+    return _normalize_request_source(request, True)
+
+
+def _normalize_request_source(request: Any, m5: bool) -> dict[str, Any]:
     normalized = _bounded_snapshot(request, _MAX_REQUEST_BYTES)
     _require(type(normalized) is dict, "request must be an exact mapping")
     request_schema = normalized.get("schema_version")
-    if request_schema in (_CURRENT_REQUEST_SCHEMA, _REQUEST_SCHEMA):
+    if request_schema in (_CURRENT_REQUEST_SCHEMA, _REQUEST_SCHEMA) or (m5 and request_schema == _M5_REQUEST_SCHEMA):
         request_keys = (
             "schema_version",
             "run_id",
@@ -1347,6 +1439,9 @@ def _normalize_request(request: Any) -> dict[str, Any]:
         unobserved_request = True
     else:
         _fail("request schema mismatch")
+    if m5:
+        _require(request_schema == _M5_REQUEST_SCHEMA, "M5 request schema mismatch")
+        request_keys += ("source_kind", "target_view_window")
     root = _exact_keys(
         normalized,
         request_keys,
@@ -1358,11 +1453,16 @@ def _normalize_request(request: Any) -> dict[str, Any]:
     dependency, derived_bars = _normalize_dependency_policy(root["dependency_policy"])
     policy = _normalize_horizon_policy(root["horizon_policy"])
     _require(
-        (request_schema in (_CURRENT_REQUEST_SCHEMA, _CURRENT_UNOBSERVED_REQUEST_SCHEMA))
+        (request_schema in (_CURRENT_REQUEST_SCHEMA, _CURRENT_UNOBSERVED_REQUEST_SCHEMA) or m5)
         == (policy["schema_version"] == _CURRENT_HORIZON_POLICY_SCHEMA),
         "request and horizon policy generations differ",
     )
-    prefix = _normalize_native_prefix(root["native_prefix"], cell, anchor)
+    prefix_cell = {**cell, "timeframe": "M5"} if m5 else cell
+    prefix = _normalize_native_prefix(root["native_prefix"], prefix_cell, anchor)
+    if m5:
+        _require(root["source_kind"] == "m5_derived", "M5 source kind mismatch")
+        window = _normalize_m5_window(root["target_view_window"], cell, prefix, anchor)
+        root["target_view_window"] = window
     geometry = _derived_geometry(cell["timeframe"], derived_bars, dependency["payload"])
     _require(type(root["candidates"]) is list, "candidates must be a list")
     _require(type(root["trials"]) is list, "trials must be a list")
@@ -1399,9 +1499,15 @@ def _normalize_request(request: Any) -> dict[str, Any]:
         )
         _require(len(root["trials"]) > 0, "available source requires trial roster")
         for raw_candidate in root["candidates"]:
-            candidate, boundary = _normalize_candidate(
-                raw_candidate, prefix, anchor, geometry
-            )
+            if m5:
+                candidate, boundary = _normalize_candidate_bounds(raw_candidate,
+                    _m5_window_utc(window["view_start_utc"], "M5 view start").strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    _m5_window_utc(window["view_end_exclusive_utc"], "M5 view end").strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    window["view_rows"], anchor, geometry)
+            else:
+                candidate, boundary = _normalize_candidate(
+                    raw_candidate, prefix, anchor, geometry
+                )
             _require(
                 candidate["candidate_id"] not in candidate_ids, "duplicate candidate id"
             )
@@ -1539,15 +1645,8 @@ def _attempt_id(
         "dependency_policy_receipt_sha256": request["dependency_policy"][
             "signed_policy_receipt_sha256"
         ],
-        "source_prefix_receipt_sha256": _sha256_json(
-            {
-                "cell": request["cell"],
-                "anchor_id": request["anchor"]["anchor_id"],
-                "selection_cutoff_utc": request["anchor"]["selection_cutoff_utc"],
-                "native_prefix": request["native_prefix"],
-            }
-        ),
-        "source_binding": _source_binding(request["native_prefix"]),
+        "source_prefix_receipt_sha256": _request_source_prefix_receipt(request),
+        "source_binding": _request_source_binding(request),
     }
     return _sha256_json(identity)
 
@@ -1593,15 +1692,8 @@ def _evaluation_context(
         "strategy_release_sha256": trial["strategy_release_sha256"],
         "parameter_set_sha256": trial["parameter_set_sha256"],
         "fold": fold_binding,
-        "source_binding": _source_binding(request["native_prefix"]),
-        "source_prefix_receipt_sha256": _sha256_json(
-            {
-                "cell": request["cell"],
-                "anchor_id": request["anchor"]["anchor_id"],
-                "selection_cutoff_utc": request["anchor"]["selection_cutoff_utc"],
-                "native_prefix": request["native_prefix"],
-            }
-        ),
+        "source_binding": _request_source_binding(request),
+        "source_prefix_receipt_sha256": _request_source_prefix_receipt(request),
         "dependency_policy_receipt_sha256": request["dependency_policy"][
             "signed_policy_receipt_sha256"
         ],
@@ -1627,7 +1719,46 @@ def _evaluation_context(
 
 
 def _build_plan_body(request: Any) -> dict[str, Any]:
-    normalized = _normalize_request(request)
+    return _build_normalized_plan_body(_normalize_request(request))
+
+
+def _build_m5_plan_body(request: Any) -> dict[str, Any]:
+    return _build_normalized_plan_body(_normalize_m5_request(request))
+
+
+def _rebuild_m5_stored_plan_body(encoded: bytes, expected_receipt_sha256: str) -> dict[str, Any]:
+    _digest(expected_receipt_sha256, "stored M5 plan receipt")
+    _require(type(encoded) is bytes and 0 < len(encoded) <= _MAX_OUTPUT_BYTES,
+        "stored M5 plan bytes missing or oversized")
+    _require(_sha256_bytes(encoded) == expected_receipt_sha256, "stored M5 plan digest changed")
+    try:
+        body = json.loads(encoded.decode("ascii"))
+    except (ValueError, UnicodeError) as error:
+        raise _HorizonContractError("stored M5 plan JSON invalid") from error
+    _require(type(body) is dict and _canonical_bytes(body) == encoded,
+        "stored M5 plan bytes are not canonical")
+    _require(body.get("schema_version") == _M5_PLAN_SCHEMA and body.get("source_kind") == "m5_derived",
+        "stored M5 plan schema mismatch")
+    request = {"schema_version": _M5_REQUEST_SCHEMA, "source_kind": body["source_kind"],
+        "target_view_window": body.get("m5_view_window"), "run_id": body.get("run_id"),
+        "anchor": body.get("anchor"), "cell": body.get("cell"), "native_prefix": body.get("native_prefix"),
+        "dependency_policy": body.get("dependency_policy"), "horizon_policy": body.get("horizon_policy"),
+        "candidates": body.get("candidates"), "trials": body.get("trials")}
+    rebuilt = _build_m5_plan_body(request)
+    _require(_canonical_bytes(rebuilt) == encoded and _sha256_json(rebuilt) == expected_receipt_sha256,
+        "stored M5 plan replay changed")
+    return rebuilt
+
+
+def _reopen_m5_plan(encoded: bytes, expected_receipt_sha256: str) -> _HistoricalHorizonPlan:
+    return _HistoricalHorizonPlan(_rebuild_m5_stored_plan_body(encoded, expected_receipt_sha256), _PLAN_SEAL)
+
+
+def _build_m5_plan(request: Any) -> _HistoricalHorizonPlan:
+    return _HistoricalHorizonPlan(_build_m5_plan_body(request), _PLAN_SEAL)
+
+
+def _build_normalized_plan_body(normalized: dict[str, Any]) -> dict[str, Any]:
     boundary_ids = set(normalized.pop("_boundary_ids"))
     geometry = normalized.pop("_derived_geometry")
     unobserved_request = normalized.pop("_unobserved_request")
@@ -1764,9 +1895,9 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
         plan_status = "READY_FOR_HISTORICAL_EVIDENCE"
 
     body = {
-        "schema_version": (_CURRENT_PLAN_SCHEMA
+        "schema_version": ((_M5_PLAN_SCHEMA if normalized.get("source_kind") == "m5_derived" else (_CURRENT_PLAN_SCHEMA
                            if normalized["horizon_policy"]["schema_version"] == _CURRENT_HORIZON_POLICY_SCHEMA
-                           else _PLAN_SCHEMA),
+                           else _PLAN_SCHEMA))),
         "authority_scope": _AUTHORITY_SCOPE,
         "trust_class": _TRUST_CLASS,
         "requires_external_exact_artifact_verification": False,
@@ -1779,7 +1910,7 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
         "anchor": normalized["anchor"],
         "cell": normalized["cell"],
         "native_prefix": prefix,
-        "source_binding": _source_binding(prefix),
+        "source_binding": _request_source_binding(normalized),
         "source_prefix_receipt_sha256": None,
         "dependency_policy": normalized["dependency_policy"],
         "derived_dependency_geometry": geometry,
@@ -1807,6 +1938,8 @@ def _build_plan_body(request: Any) -> dict[str, Any]:
             "persistent_storage_written": False,
         },
     }
+    if normalized.get("source_kind") == "m5_derived":
+        body.update(source_kind="m5_derived", m5_view_window=normalized["target_view_window"])
     if prefix["source_state"] == _AVAILABLE:
         body["source_prefix_receipt_sha256"] = _source_prefix_receipt(body)
     if unobserved_request:
@@ -1830,14 +1963,7 @@ def _build_plan(request: Any) -> _HistoricalHorizonPlan:
 
 
 def _source_prefix_receipt(plan_body: dict[str, Any]) -> str:
-    return _sha256_json(
-        {
-            "cell": plan_body["cell"],
-            "anchor_id": plan_body["anchor"]["anchor_id"],
-            "selection_cutoff_utc": plan_body["anchor"]["selection_cutoff_utc"],
-            "native_prefix": plan_body["native_prefix"],
-        }
-    )
+    return _request_source_prefix_receipt(plan_body)
 
 
 def _empty_vectors(shard: dict[str, Any]) -> bool:
@@ -1961,7 +2087,7 @@ def _normalize_shard(
     plan_body: dict[str, Any],
     remaining_points: int,
 ) -> tuple[dict[str, Any], int]:
-    if plan_body["schema_version"] == _CURRENT_PLAN_SCHEMA:
+    if plan_body["schema_version"] in (_CURRENT_PLAN_SCHEMA, _M5_PLAN_SCHEMA):
         return _normalize_tier_shard(value, expected, plan_body, remaining_points)
     shard = _exact_keys(
         value,
@@ -2254,8 +2380,8 @@ def _evidence_body(plan_body: dict[str, Any], raw_shards: Any) -> dict[str, Any]
     else:
         evidence_status = "HISTORICAL_EVIDENCE_COMPLETE"
     body = {
-        "schema_version": (_CURRENT_EVIDENCE_SCHEMA if plan_body["schema_version"] == _CURRENT_PLAN_SCHEMA
-                           else _EVIDENCE_SCHEMA),
+        "schema_version": ((_M5_EVIDENCE_SCHEMA if plan_body["schema_version"] == _M5_PLAN_SCHEMA else (_CURRENT_EVIDENCE_SCHEMA if plan_body["schema_version"] in (_CURRENT_PLAN_SCHEMA, _M5_PLAN_SCHEMA)
+                           else _EVIDENCE_SCHEMA))),
         "authority_scope": _AUTHORITY_SCOPE,
         "trust_class": _TRUST_CLASS,
         "requires_external_exact_artifact_verification": False,
@@ -2393,9 +2519,11 @@ def _verify_evidence(plan: Any, evidence: Any) -> bool:
         return False
 
 
-def _make_public_authority() -> tuple[Any, Any, Any]:
+def _make_public_authority() -> tuple[Any, Any, Any, Any, Any]:
     sha256_impl = hashlib.sha256
     build_impl = _build_plan
+    build_m5_impl = _build_m5_plan
+    reopen_m5_impl = _reopen_m5_plan
     evaluate_impl = _evaluate_plan
     verify_impl = _verify_evidence
     plan_type = _HistoricalHorizonPlan
@@ -2403,6 +2531,18 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
     plan_seal = _PLAN_SEAL
     evidence_seal = _EVIDENCE_SEAL
     critical_names = (
+        "_rebuild_m5_stored_plan_body",
+        "_reopen_m5_plan",
+        "_m5_window_utc",
+        "_normalize_m5_window",
+        "_request_source_binding",
+        "_request_source_prefix_receipt",
+        "_normalize_candidate_bounds",
+        "_normalize_request_source",
+        "_normalize_m5_request",
+        "_build_normalized_plan_body",
+        "_build_m5_plan_body",
+        "_build_m5_plan",
         "_fail",
         "_require",
         "_bounded_snapshot",
@@ -2455,6 +2595,11 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         for name in critical_names
     )
     constants = (
+        ("_M5_REQUEST_SCHEMA", _M5_REQUEST_SCHEMA),
+        ("_M5_PLAN_SCHEMA", _M5_PLAN_SCHEMA),
+        ("_M5_EVIDENCE_SCHEMA", _M5_EVIDENCE_SCHEMA),
+        ("_M5_WINDOW_SCHEMA", _M5_WINDOW_SCHEMA),
+        ("_M5_WINDOW_KEYS", _M5_WINDOW_KEYS),
         ("_CURRENT_REQUEST_SCHEMA", _CURRENT_REQUEST_SCHEMA),
         ("_CURRENT_UNOBSERVED_REQUEST_SCHEMA", _CURRENT_UNOBSERVED_REQUEST_SCHEMA),
         ("_CURRENT_PLAN_SCHEMA", _CURRENT_PLAN_SCHEMA),
@@ -2634,6 +2779,14 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         guard()
         return build_impl(request)
 
+    def build_m5(request: Any) -> _HistoricalHorizonPlan:
+        guard()
+        return build_m5_impl(request)
+
+    def reopen_m5(encoded: bytes, expected_receipt_sha256: str) -> _HistoricalHorizonPlan:
+        guard()
+        return reopen_m5_impl(encoded, expected_receipt_sha256)
+
     def evaluate(plan: Any, evidence_shards: Any) -> _HistoricalHorizonEvidence:
         guard()
         return evaluate_impl(plan, evidence_shards)
@@ -2642,6 +2795,10 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
         guard()
         return verify_impl(plan, evidence)
 
+    reopen_m5.__name__ = "reopen_m5_derived_historical_horizon_plan"
+    reopen_m5.__qualname__ = "reopen_m5_derived_historical_horizon_plan"
+    build_m5.__name__ = "build_m5_derived_historical_horizon_plan"
+    build_m5.__qualname__ = "build_m5_derived_historical_horizon_plan"
     build.__name__ = "build_historical_horizon_plan"
     build.__qualname__ = "build_historical_horizon_plan"
     evaluate.__name__ = "evaluate_historical_horizon_plan"
@@ -2651,15 +2808,19 @@ def _make_public_authority() -> tuple[Any, Any, Any]:
     public_refs.update(
         {
             "build_historical_horizon_plan": (build, build.__code__),
+            "build_m5_derived_historical_horizon_plan": (build_m5, build_m5.__code__),
+            "reopen_m5_derived_historical_horizon_plan": (reopen_m5, reopen_m5.__code__),
             "evaluate_historical_horizon_plan": (evaluate, evaluate.__code__),
             "verify_historical_horizon_evidence": (verify, verify.__code__),
         }
     )
-    return build, evaluate, verify
+    return build, evaluate, verify, build_m5, reopen_m5
 
 
 (
     build_historical_horizon_plan,
     evaluate_historical_horizon_plan,
     verify_historical_horizon_evidence,
+    build_m5_derived_historical_horizon_plan,
+    reopen_m5_derived_historical_horizon_plan,
 ) = _make_public_authority()

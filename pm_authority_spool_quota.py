@@ -31,6 +31,7 @@ QUOTA_STATE_NAME: Final = ".generation-quota.json"
 QUOTA_LOCK_NAME: Final = ".generation-quota.lock"
 QUOTA_TEMP_PREFIX: Final = ".generation-quota."
 QUOTA_RESERVATION_PREFIX: Final = ".generation-quota.reservation."
+GENERATION_TERMINAL_NAME: Final = "generation-retirement.json"
 MAX_STATE_BYTES: Final = 32 * 1024
 MAX_RESCAN_ENTRIES: Final = 1_000_000
 STATE_REPLACE_ATTEMPTS: Final = 6
@@ -844,11 +845,13 @@ def publication_lease(
         allow_zero=True,
     )
     token = uuid.uuid4().hex
-    guard = _ReservationGuard.create(safe_root, token)
+    guard: Optional[_ReservationGuard] = None
     lease: Optional[PublicationLease] = None
     state_recorded = False
     try:
         with _exclusive_file_lock(safe_root / QUOTA_LOCK_NAME):
+            assert_generation_not_terminal(safe_root)
+            guard = _ReservationGuard.create(safe_root, token)
             current = _load_state_locked(
                 safe_root,
                 maximum=maximum,
@@ -887,7 +890,35 @@ def publication_lease(
             not state_recorded
             or (lease is not None and lease._finished)
         )
-        guard.close(remove=remove_guard)
+        if guard is not None:
+            guard.close(remove=remove_guard)
+
+
+def assert_generation_not_terminal(root: Path) -> None:
+    """A terminal control of any shape refuses admission; never repair it here."""
+    try:
+        (Path(root) / GENERATION_TERMINAL_NAME).lstat()
+    except FileNotFoundError:
+        return
+    _fail("SPOOL_GENERATION_TERMINAL")
+
+
+@contextmanager
+def generation_retirement_lock(root: Path, *, max_root_entries: int) -> Iterator[None]:
+    """Quiesce original publication admission; refuse unknown or orphan guards."""
+    safe_root = _root(Path(root))
+    bound = _bound(max_root_entries, "SPOOL_RETIREMENT_ENTRY_BOUND_INVALID", allow_zero=False)
+    with _exclusive_file_lock(safe_root / QUOTA_LOCK_NAME):
+        current = _read_state(safe_root)
+        if current is not None and current["reservations"]:
+            _fail("SPOOL_RETIREMENT_RESERVATIONS_PRESENT")
+        with os.scandir(safe_root) as stream:
+            for index, entry in enumerate(stream, 1):
+                if index > bound:
+                    _fail("SPOOL_RETIREMENT_ENTRY_BOUND_EXCEEDED")
+                if entry.name.startswith(QUOTA_RESERVATION_PREFIX):
+                    _fail("SPOOL_RETIREMENT_GUARDS_PRESENT")
+        yield
 
 
 __all__ = [
@@ -895,6 +926,9 @@ __all__ = [
     "PublicationLease",
     "QUOTA_LOCK_NAME",
     "QUOTA_RESERVATION_PREFIX",
+    "GENERATION_TERMINAL_NAME",
+    "assert_generation_not_terminal",
+    "generation_retirement_lock",
     "QUOTA_STATE_NAME",
     "publication_lease",
 ]

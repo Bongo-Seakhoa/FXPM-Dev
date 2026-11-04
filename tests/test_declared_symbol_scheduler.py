@@ -607,7 +607,7 @@ def test_verified_saved_output_reuse_is_read_only_before_disk_block(tmp_path,ter
 def test_disk_threshold_never_waives_verified_context_reserve_and_headroom(tmp_path):
     import pm_authority_spool as spool
     contract=_contract(tmp_path,("AUDUSD",));row=contract["cells"][0]
-    reserve=2*1024**3
+    reserve=scheduler.DECLARED_CELL_MIN_FREE_BYTES+1024**3
     spool.freeze_generation_context(Path(row["root"]),generation_id=row["run_id"],
         native_universe_sha256=contract["native_universe_sha256"],config_sha256=contract["config_sha256"],
         limits=spool.SpoolLimits(min_free_bytes=reserve))
@@ -618,6 +618,34 @@ def test_disk_threshold_never_waives_verified_context_reserve_and_headroom(tmp_p
     assert not list(Path(row["root"]).glob("declared-slots/*/precommit.json"))
     assert scheduler._declared_disk_requirement({"scheduler_disk_min_free_bytes":1,
         "scheduler_disk_headroom_bytes":5},reserve)==reserve+5
+
+
+@pytest.mark.parametrize("free_bytes,expected_status", [
+    (5 * 1024**3 - 1, "NOT_RUN"),
+    (5 * 1024**3, "COMPLETED"),
+])
+def test_reopened_lower_reserve_context_obeys_five_gib_worker_floor(tmp_path,free_bytes,expected_status):
+    import pm_authority_spool as spool
+    contract,_=scheduler._declared_contract(_contract(tmp_path,("AUDUSD",)))
+    row=contract["cells"][0];root=Path(row["root"])
+    context=spool.freeze_generation_context(root,generation_id=row["run_id"],
+        native_universe_sha256=contract["native_universe_sha256"],config_sha256=contract["config_sha256"],
+        limits=spool.SpoolLimits(min_free_bytes=1536 * 1024**2))
+    context_path=root/spool.CONTEXT_RELATIVE_PATH;frozen_bytes=context_path.read_bytes()
+    assert context.limits.min_free_bytes < free_bytes
+    contract.update(scheduler_disk_min_free_bytes=0,scheduler_disk_headroom_bytes=0,
+        synthetic_child_free_bytes=free_bytes)
+    if expected_status=="NOT_RUN": contract["synthetic_forbid_process_freeze"]=True
+    result=_synthetic_declared_worker(contract,"AUDUSD")
+    assert result["cells"][0]["status"]==expected_status
+    assert context_path.read_bytes()==frozen_bytes
+    if expected_status=="NOT_RUN":
+        assert result["cells"][0]["reason_code"]=="DISK_LOW"
+        assert not list(root.glob("declared-slots/*/precommit.json"))
+        assert not (tmp_path/"board").exists()
+    else:
+        assert result["cells"][0]["run_receipt"] is not None
+        assert (root/"synthetic-account-descriptor.json").exists()
 
 
 def test_parent_disk_probe_error_remains_technical(tmp_path,monkeypatch):
@@ -639,3 +667,16 @@ def test_probe_uses_nearest_existing_target_ancestor_without_creating_root(tmp_p
     assert scheduler._declared_disk_free_bytes(target)==12345
     assert calls==[tmp_path]
     assert not target.exists()
+
+
+@pytest.mark.parametrize("available,expected", [
+    (5 * 1024**3 - 1, False),
+    (5 * 1024**3, True),
+    (5 * 1024**3 + 1, True),
+])
+def test_operator_five_gib_floor_boundary(tmp_path, monkeypatch, available, expected):
+    assert scheduler.DECLARED_CELL_MIN_FREE_BYTES == 5 * 1024**3
+    monkeypatch.setattr(scheduler, "_declared_disk_free_bytes", lambda root: available)
+    for reserve in (0, 1536 * 1024**2, scheduler.DECLARED_CELL_MIN_FREE_BYTES):
+        assert scheduler._declared_disk_ready(tmp_path, {}, reserve) is expected
+    assert scheduler._declared_disk_requirement({"scheduler_disk_headroom_bytes":5},0)==5 * 1024**3 + 5

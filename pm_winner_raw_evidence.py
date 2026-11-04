@@ -96,6 +96,7 @@ CURRENT_CROSS_BINDING_MODE = "CURRENT"
 PARTITION_GEOMETRY_SCHEMA = "fxpm.winner-partition-geometry.v1"
 SIGNAL_VECTOR_SCHEMA = "fxpm.authoritative-search-signal-vector.v1"
 SOURCE_COUNT_RECEIPT_SCHEMA = "fxpm.historical-attempt-source-count.v1"
+M5_SOURCE_COUNT_RECEIPT_SCHEMA = "fxpm.m5-derived-source-count-receipt.v1"
 EXECUTION_SPEC_RECEIPT_SCHEMA = "fxpm.execution-instrument-spec-receipt.v2"
 COST_LADDER_ADVERSITY_PLAN_SCHEMA = (
     "fxpm.winner-cost-ladder-adversity-plan.v1"
@@ -3443,6 +3444,85 @@ def _validated_current_plan_bijection(
         _fail("PROVENANCE_CURRENT_PLAN_ATTEMPT_ORDER_INVALID")
 
 
+_M5_EXECUTION_WINDOW_KEYS = frozenset({
+    "schema_version", "source_kind", "symbol", "timeframe", "m5_view_contract_sha256",
+    "view_key", "view_payload_sha256", "view_membership_sha256", "view_frame_sha256",
+    "view_start_utc", "view_end_exclusive_utc", "view_last_close_utc", "view_rows",
+    "base_native_prefix_index_sha256", "base_native_prefix_content_sha256",
+})
+_M5_SOURCE_COUNT_EXTRA_KEYS = frozenset({
+    "source_kind", "base_timeframe", "view_timeframe", "m5_view_contract_sha256",
+    "view_key", "view_payload_sha256", "view_membership_sha256", "m5_view_window_sha256",
+})
+
+
+def _m5_execution_window_from_descriptors(descriptors, *, symbol, timeframe):
+    """Read target geometry already bound into both frozen cost descriptors."""
+    if (type(descriptors) not in {tuple, list} or len(descriptors) != 2
+            or any(not isinstance(item, Mapping) for item in descriptors)):
+        _fail("PROVENANCE_M5_FROZEN_COST_PAIR_INVALID")
+    marked = any("m5_derived_cost_binding" in item or "m5_execution_view_binding" in item
+                 for item in descriptors)
+    if not marked:
+        return None
+    left, right = descriptors
+    if any(not isinstance(item.get("m5_derived_cost_binding"), Mapping)
+           or item["m5_derived_cost_binding"].get("source_kind") != "m5_derived"
+           or item.get("source_timeframe") != "M5"
+           or item.get("symbol") != symbol or item.get("timeframe") != timeframe
+           for item in descriptors):
+        _fail("PROVENANCE_M5_FROZEN_COST_PAIR_INVALID")
+    window = left.get("m5_execution_view_binding")
+    if (type(window) is not dict or set(window) != _M5_EXECUTION_WINDOW_KEYS
+            or window != right.get("m5_execution_view_binding")
+            or window.get("schema_version") != "fxpm.m5-derived-price-window.v1"
+            or window.get("source_kind") != "m5_derived" or window.get("symbol") != symbol
+            or window.get("timeframe") != timeframe or timeframe not in {"M15", "M30", "H1"}
+            or type(window.get("view_rows")) is not int
+            or not 1 <= window["view_rows"] <= 10_000_000):
+        _fail("PROVENANCE_M5_EXECUTION_VIEW_INVALID")
+    for name in ("m5_view_contract_sha256", "view_key", "view_payload_sha256",
+                 "view_membership_sha256", "view_frame_sha256",
+                 "base_native_prefix_index_sha256", "base_native_prefix_content_sha256"):
+        _hex(window[name], 64, "PROVENANCE_M5_EXECUTION_VIEW_INVALID")
+    start, end, latest = (datetime.fromisoformat(_utc_second(window[name],
+        "PROVENANCE_M5_EXECUTION_VIEW_INVALID").replace("Z", "+00:00")) for name in
+        ("view_start_utc", "view_end_exclusive_utc", "view_last_close_utc"))
+    if not start < latest <= end:
+        _fail("PROVENANCE_M5_EXECUTION_VIEW_INVALID")
+    # Detach the verified value; callers cannot mutate the frozen pair through it.
+    return _decode_object(_canonical_bytes(window), "PROVENANCE_M5_EXECUTION_VIEW_INVALID")
+
+
+def _validate_m5_source_count_view(receipt, window, *, native_index_sha256, horizon_artifact):
+    expected = {
+        "source_kind": "m5_derived", "base_timeframe": "M5",
+        "view_timeframe": window["timeframe"],
+        "m5_view_contract_sha256": window["m5_view_contract_sha256"],
+        "view_key": window["view_key"], "view_payload_sha256": window["view_payload_sha256"],
+        "view_membership_sha256": window["view_membership_sha256"],
+        "m5_view_window_sha256": _sha_json(window),
+    }
+    if (any(receipt.get(key) != value for key, value in expected.items())
+            or native_index_sha256 != window["base_native_prefix_index_sha256"]
+            or receipt.get("native_prefix_index_sha256") != native_index_sha256
+            or receipt.get("native_prefix_content_sha256") != window["base_native_prefix_content_sha256"]
+            or horizon_artifact.get("source_snapshot_sha256") != window["view_payload_sha256"]
+            or type(receipt.get("source_bar_count")) is not int
+            or not 1 <= receipt["source_bar_count"] <= window["view_rows"]):
+        _fail("PROVENANCE_M5_SOURCE_COUNT_VIEW_SPLICE")
+    clocks = {name: datetime.fromisoformat(_utc_second(value,
+        "PROVENANCE_M5_SOURCE_COUNT_VIEW_SPLICE").replace("Z", "+00:00")) for name, value in {
+        "view_start": window["view_start_utc"], "view_end": window["view_end_exclusive_utc"],
+        "view_latest": window["view_last_close_utc"], "fit_start": receipt.get("fit_start_utc"),
+        "fit_end": receipt.get("fit_end_exclusive_utc"),
+        "latest": receipt.get("latest_closed_bar_utc"),
+    }.items()}
+    if (not clocks["view_start"] <= clocks["fit_start"] < clocks["fit_end"]
+            or clocks["fit_end"] != clocks["view_end"] or clocks["latest"] != clocks["view_latest"]):
+        _fail("PROVENANCE_M5_SOURCE_COUNT_VIEW_SPLICE")
+
+
 def _validated_horizon_winner_cross_binding(
     encoded: Any,
     *,
@@ -3491,6 +3571,13 @@ def _validated_horizon_winner_cross_binding(
     schema = binding.get("schema_version")
     current_pair = bool(frozen.frozen_tier_pair_contract_bytes)
     transport_v16 = frozen.selection_generation is winner.V16_GENERATION
+    m5_window = None
+    if current_pair:
+        pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
+        m5_window = _m5_execution_window_from_descriptors(
+            [item["frozen_spread_tier"] for item in pair["tiers"]],
+            symbol=frozen.symbol, timeframe=frozen.timeframe,
+        )
     historical_schema = (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if transport_v16
         else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3 if current_pair else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
     current_schema = (CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 if transport_v16
@@ -3511,6 +3598,8 @@ def _validated_horizon_winner_cross_binding(
             _fail("PROVENANCE_CROSS_BINDING_MODE_INVALID")
     else:
         _fail("PROVENANCE_CROSS_BINDING_SCHEMA_INVALID")
+    if m5_window is not None and (mode != HISTORICAL_CROSS_BINDING_MODE or not transport_v16):
+        _fail("PROVENANCE_M5_CROSS_BINDING_MODE_INVALID")
     if set(binding) != expected_top or (
         binding.get("symbol") != frozen.symbol
         or binding.get("timeframe") != frozen.timeframe
@@ -3681,6 +3770,9 @@ def _validated_horizon_winner_cross_binding(
         "fit_frame_sha256",
         "receipt_sha256",
     }
+    if m5_window is not None:
+        source_count_receipt_keys |= _M5_SOURCE_COUNT_EXTRA_KEYS
+    source_count_schema = M5_SOURCE_COUNT_RECEIPT_SCHEMA if m5_window is not None else SOURCE_COUNT_RECEIPT_SCHEMA
     result: list[dict[str, Any]] = []
     for ordinal, (row, attempt, horizon_contract, artifacts) in enumerate(
         zip(
@@ -3717,6 +3809,10 @@ def _validated_horizon_winner_cross_binding(
         ):
             _fail("PROVENANCE_CROSS_BINDING_SOURCE_COUNT_SCHEMA_INVALID")
         horizon_artifact = artifacts["horizon_process"]
+        if m5_window is not None:
+            _validate_m5_source_count_view(source_count_receipt, m5_window,
+                native_index_sha256=binding.get("native_prefix_index_sha256"),
+                horizon_artifact=horizon_artifact)
         source_count_body = dict(source_count_receipt)
         source_count_sha256 = source_count_body.pop("receipt_sha256", None)
         fit_start = _utc(
@@ -3732,7 +3828,7 @@ def _validated_horizon_winner_cross_binding(
             "PROVENANCE_SOURCE_COUNT_LATEST_CLOSED_INVALID",
         )
         if (
-            source_count_receipt.get("schema_version") != SOURCE_COUNT_RECEIPT_SCHEMA
+            source_count_receipt.get("schema_version") != source_count_schema
             or source_count_sha256 != _sha_json(source_count_body)
             or source_count_receipt.get("anchor_id") != binding_context.get("anchor_id")
             or source_count_receipt.get("symbol") != frozen.symbol
@@ -3743,7 +3839,8 @@ def _validated_horizon_winner_cross_binding(
             or source_count_receipt.get("native_prefix_index_sha256")
             != binding.get("native_prefix_index_sha256")
             or source_count_receipt.get("native_prefix_content_sha256")
-            != horizon_artifact.get("source_snapshot_sha256")
+            != (m5_window["base_native_prefix_content_sha256"] if m5_window is not None
+                else horizon_artifact.get("source_snapshot_sha256"))
             or source_count_receipt.get("horizon_attempt_id")
             != row.get("horizon_attempt_id")
             or source_count_receipt.get("horizon_candidate_id")
@@ -4396,6 +4493,20 @@ def _provenance_specific_keys(*, current: bool, referenced: bool = False) -> dic
     return specific
 
 
+def _validate_oos_source_content_binding(source, horizon_process, m5_window):
+    """Keep genuine base content distinct from a derived price snapshot."""
+    if m5_window is None:
+        valid = source.get("native_prefix_content_sha256") == horizon_process.get("source_snapshot_sha256")
+    else:
+        valid = (
+            source.get("native_prefix_content_sha256") == m5_window["base_native_prefix_content_sha256"]
+            and source.get("native_prefix_index_sha256") == m5_window["base_native_prefix_index_sha256"]
+            and horizon_process.get("source_snapshot_sha256") == m5_window["view_payload_sha256"]
+        )
+    if not valid:
+        _fail("OOS_SOURCE_PROVENANCE_SPLICE")
+
+
 def _validated_provenance(
     *,
     frozen: FrozenWinnerSearchPlan,
@@ -4665,10 +4776,15 @@ def _validated_provenance(
         source_binding, Mapping
     ):
         _fail("OOS_SOURCE_FROZEN_INPUT_INVALID")
+    m5_window = None
+    if current:
+        pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
+        m5_window = _m5_execution_window_from_descriptors(
+            [item["frozen_spread_tier"] for item in pair["tiers"]],
+            symbol=frozen.symbol, timeframe=frozen.timeframe)
+    _validate_oos_source_content_binding(source, horizon_process, m5_window)
     if (
-        source.get("native_prefix_content_sha256")
-        != horizon_process.get("source_snapshot_sha256")
-        or source.get("source_contract_sha256")
+        source.get("source_contract_sha256")
         != frozen.precommitment.get("source_contract_sha256")
         or source.get("native_source_sha256")
         != source_binding.get("target_bars_sha256")

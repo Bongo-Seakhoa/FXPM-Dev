@@ -1,0 +1,47 @@
+{
+  "schema_version": "fxpm.available-data-research-admission.v1",
+  "recorded_at_utc": "2026-11-03T21:58:24.426638+00:00",
+  "status": "AVAILABLE_DATA_ONLY_RESEARCH_ADMISSION",
+  "decision_event": "E-00004594",
+  "decision_event_canonical_sha256": "23f30ed8404ab3cf63660767ffcaba0fbc64ffe76a26fb31758cf8fada40a216",
+  "cell": {
+    "symbol": "XAGUSD",
+    "timeframe": "H1",
+    "regime": "TREND"
+  },
+  "selected_periods": 1,
+  "design_contaminated": true,
+  "pristine_validation": false,
+  "lineage": {
+    "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/explicit_m5_derived_001/spool/objects/sha256/95/957663a6114d370fcda30b46eaf2105396a07b22a50d586e60fa6ccbf2db07d2.canonical-json",
+    "bytes": 4717,
+    "sha256": "957663a6114d370fcda30b46eaf2105396a07b22a50d586e60fa6ccbf2db07d2"
+  },
+  "gap_pattern_observations": {
+    "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/xagusd_h1_gap_classification_001.json",
+    "bytes": 4263,
+    "sha256": "24daacb73b79e598719bd7c90f06b72577d2ecd3984f5d953f65d984a33086c3",
+    "calendar_causal_classifications_adopted": false
+  },
+  "gap_status": "UNCLASSIFIED",
+  "source_availability": {
+    "mt5_initialized": false,
+    "history_queried": false,
+    "terminal_launched": false,
+    "no_existing_terminal_is_not_absence_of_history": true
+  },
+  "financial_consumer_ready": false,
+  "full_native_context_eligibility": false,
+  "qualification_authority": false,
+  "capital_authority": false,
+  "live_authority": false,
+  "order_authority": false,
+  "limits": [
+    "One prospective weakened available-data-only software development period, not case issuance",
+    "No inferred closure, holiday, DST, no-tick or price filling",
+    "Original missing-price, cost, causal, risk and source guards remain",
+    "No >=95% eligibility or STOP-only-multislot rule",
+    "H4/D1 clock remains STOP",
+    "Coherent source, required independent review and separate Root run disposition before execution"
+  ]
+}

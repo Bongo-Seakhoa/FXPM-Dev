@@ -30,6 +30,18 @@ CURRENT_REFIT_MANIFEST_DOMAIN = "CURRENT_REFIT"
 
 CANONICAL_JSON_FORMAT = "canonical-json"
 CONTEXT_RELATIVE_PATH = "generation-context.json"
+WORKSPACE_OWNER_RELATIVE_PATH = "generation-workspace.json"
+RETIREMENT_RELATIVE_PATH = spool_quota.GENERATION_TERMINAL_NAME
+RETIREMENT_INTENT_RELATIVE_PATH = "generation-retirement.intent.json"
+RETIREMENT_COMPLETE_RELATIVE_PATH = "generation-archived.json"
+WORKSPACE_OWNER_SCHEMA = "fxpm.owned-generation-workspace.v1"
+RETIREMENT_SCHEMA = "fxpm.completed-generation-retirement.v1"
+TERMINAL_REFUSAL_FENCE_SCHEMA = "fxpm.declared-m5-terminal-refusal-fence.v1"
+TERMINAL_REFUSAL_RESULT_KIND = "TERMINAL_REFUSAL_SOURCE_NOT_COMPLETED"
+POST_SOURCE_ABORT_FENCE_SCHEMA = "fxpm.declared-m5-post-source-abort-fence.v1"
+POST_SOURCE_ABORT_RESULT_KIND = "POST_SOURCE_ABORT_SOURCE_NOT_COMPLETED"
+POST_SOURCE_ABORT_GRID_SOURCE_FIELDS = ("symbol", "timeframe", "activation_sha256", "bars_sha256",
+    "sidecar_sha256", "provenance_sha256", "request_sha256", "spread_unit")
 DEFAULT_STREAM_CHUNK_BYTES = 1024 * 1024
 _RESERVATION_WINDOW_BYTES = 16 * DEFAULT_STREAM_CHUNK_BYTES
 MAX_CONTEXT_BYTES = 64 * 1024
@@ -886,10 +898,23 @@ def freeze_generation_context(
     native_universe_sha256: str,
     config_sha256: str,
     limits: Optional[SpoolLimits] = None,
+    owned_workspace: Optional[Mapping[str, Any]] = None,
 ) -> GenerationSpoolContext:
     """Create or byte-identically reopen a generation context before workers."""
 
     safe_root = _validate_root(Path(root), create=True)
+    workspace = None
+    workspace_root_identity = None
+    if owned_workspace is not None:
+        if (type(owned_workspace) is not dict
+                or set(owned_workspace) != {"cell_id", "cell_contract_sha256"}
+                or not all(_is_sha256(value) for value in owned_workspace.values())):
+            _fail("WORKSPACE_OWNER_DECLARATION_INVALID")
+        if any(safe_root.iterdir()):
+            _fail("WORKSPACE_ROOT_NOT_EMPTY")
+        workspace = dict(owned_workspace)
+        info = safe_root.stat(follow_symlinks=False)
+        workspace_root_identity = [info.st_dev, info.st_ino]
     generation = _identity(generation_id, "GENERATION_ID")
     native_hash = _sha256(native_universe_sha256, "NATIVE_UNIVERSE_SHA256")
     config_hash = _sha256(config_sha256, "CONFIG_SHA256")
@@ -911,7 +936,17 @@ def freeze_generation_context(
         limits=active_limits,
         writable=True,
     )
+    if workspace is not None:
+        _assert_retirement_root(safe_root, workspace_root_identity)
     _publish_exact_json(bootstrap, CONTEXT_RELATIVE_PATH, payload, MAX_CONTEXT_BYTES)
+    if workspace is not None:
+        _assert_retirement_root(safe_root, workspace_root_identity)
+        _publish_exact_json(bootstrap, WORKSPACE_OWNER_RELATIVE_PATH, {
+            "schema_version": WORKSPACE_OWNER_SCHEMA, "generation_id": generation,
+            "generation_context_sha256": bootstrap.context_sha256,
+            "creation_provenance": "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION", **workspace,
+            "root": str(safe_root), "root_identity": workspace_root_identity,
+        }, MAX_CONTEXT_BYTES)
     return reopen_generation_context(
         safe_root,
         expected_generation_id=generation,
@@ -930,6 +965,10 @@ def reopen_generation_context(
     """Strictly reopen the immutable generation context."""
 
     safe_root = _validate_root(Path(root), create=False)
+    try:
+        spool_quota.assert_generation_not_terminal(safe_root)
+    except spool_quota.AuthoritySpoolQuotaError as exc:
+        raise AuthoritySpoolError("GENERATION_WORKSPACE_TERMINAL") from exc
     digest, _, encoded = _stream_file(
         safe_root,
         CONTEXT_RELATIVE_PATH,
@@ -1408,6 +1447,749 @@ def verify_symbol_receipt(
     return manifest
 
 
+def _retirement_control(root: Path, relative: str, maximum: int) -> tuple[dict, str]:
+    digest, _, encoded = _stream_file(root, relative, maximum_bytes=maximum, collect=True)
+    assert encoded is not None
+    value = _strict_json_bytes(encoded, maximum)
+    if type(value) is not dict or _canonical_json_bytes(value, maximum) != encoded:
+        _fail("RETIREMENT_CONTROL_INVALID")
+    return value, digest
+
+
+def _assert_retirement_root(root: Path, identity: list[int], *, declared_root: Any = ...) -> None:
+    _reject_reparse_chain(root)
+    info = root.stat(follow_symlinks=False)
+    if (not stat.S_ISDIR(info.st_mode) or type(identity) is not list or len(identity) != 2
+            or any(type(value) is not int or value < 0 for value in identity)
+            or identity[1] <= 0 or info.st_ino <= 0
+            or [info.st_dev, info.st_ino] != identity
+            or (declared_root is not ... and (type(declared_root) is not str
+                or not Path(declared_root).is_absolute() or Path(declared_root) != root))):
+        _fail("WORKSPACE_ROOT_IDENTITY_CHANGED")
+
+
+def _retirement_publish(root: Path, relative: str, body: dict, maximum: int,
+        *, root_owner: Optional[dict] = None) -> str:
+    """Operational control only; caller holds the original quota lock."""
+    encoded = _canonical_json_bytes(body, maximum)
+    expected = hashlib.sha256(encoded).hexdigest()
+    if root_owner is not None:
+        root_identity = root_owner["root_identity"]
+        _assert_retirement_root(root, root_identity, declared_root=root_owner["root"])
+    else:
+        info = root.stat(follow_symlinks=False)
+        root_identity = [info.st_dev, info.st_ino]
+    target = _local_path(root, relative)
+    _reject_reparse_chain(target)
+    if not target.exists():
+        _assert_retirement_root(root, root_identity)
+        temporary = _temporary_path(root)
+        descriptor = _open_exclusive(temporary)
+        try:
+            _write_all(descriptor, memoryview(encoded))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        identity = _file_identity(temporary.stat(follow_symlinks=False))
+        try:
+            _assert_retirement_root(root, root_identity)
+            _publish_temp_exclusive(root, temporary, relative)
+        finally:
+            if temporary.exists():
+                _assert_retirement_root(root, root_identity)
+                if _file_identity(temporary.stat(follow_symlinks=False)) != identity:
+                    _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
+                temporary.unlink()
+    observed, digest = _retirement_control(root, relative, maximum)
+    if observed != body or digest != expected:
+        _fail("RETIREMENT_CONTROL_CONFLICT")
+    return digest
+
+
+def read_owned_generation_workspace(context: GenerationSpoolContext) -> tuple[dict, str]:
+    _assert_context_current(context)
+    body, digest = _retirement_control(context.root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    if (set(body) != {"schema_version", "generation_id", "generation_context_sha256", "creation_provenance",
+            "cell_id", "cell_contract_sha256", "root", "root_identity"} or body["schema_version"] != WORKSPACE_OWNER_SCHEMA
+            or body["generation_id"] != context.generation_id
+            or body["generation_context_sha256"] != context.context_sha256
+            or body["creation_provenance"] != "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION"
+            or not _is_sha256(body["cell_id"]) or not _is_sha256(body["cell_contract_sha256"])):
+        _fail("WORKSPACE_OWNER_RECORD_INVALID")
+    _assert_retirement_root(context.root, body["root_identity"], declared_root=body["root"])
+    return body, digest
+
+
+def _retirement_external(path: Path, maximum: int) -> tuple[dict, str]:
+    if not path.is_absolute():
+        _fail("RETIREMENT_EXTERNAL_PATH_INVALID")
+    return _retirement_control(_validate_root(path.parent, create=False), path.name, maximum)
+
+
+def _retirement_terminal_refusal_fence(body: dict, *, context_sha256: str, generation_id: str,
+        cell_id: str, workspace_sha256: str, working_root: Path) -> dict:
+    """Caller-assured fresh refusal, never a source finish or financial capability."""
+    import pm_end_grid as end_grid
+    flags = {"qualification_authority", "capital_authority", "live_authority", "order_authority",
+        "full_native_context_eligibility", "financial_consumer_ready"}
+    if (set(body) != {"schema_version", "workspace_owner_sha256", "binding", "refusal",
+            "source_disposition", "end_grid_rows", "code_sha256"} | flags
+            or body["schema_version"] != TERMINAL_REFUSAL_FENCE_SCHEMA
+            or body["workspace_owner_sha256"] != workspace_sha256
+            or any(body.get(key) is not False for key in flags)):
+        _fail("RETIREMENT_TERMINAL_REFUSAL_INVALID")
+    disposition = body["source_disposition"]
+    if (type(disposition) is not dict or disposition != {
+            "stage": "FRESH_PRE_SOURCE_NO_ACQUISITION", "fresh_workspace": True,
+            "resumed": False, "source_acquisition_attempted": False,
+            "source_owner_created": False, "source_products_acquired": False}
+            or disposition.get("fresh_workspace") is not True
+            or any(disposition.get(key) is not False for key in
+                ("resumed", "source_acquisition_attempted", "source_owner_created", "source_products_acquired"))):
+        _fail("RETIREMENT_REFUSAL_SOURCE_STATE_INVALID")
+    binding = body["binding"]
+    if (type(binding) is not dict or set(binding) != {"generation_context_sha256", "run_id", "cell_id",
+            "cell_contract_sha256", "search_process_receipt_sha256", "precommit_sha256"}
+            or binding["generation_context_sha256"] != context_sha256 or binding["run_id"] != generation_id
+            or binding["cell_id"] != cell_id
+            or any(not _is_sha256(binding[key]) for key in
+                ("generation_context_sha256", "cell_id", "cell_contract_sha256",
+                 "search_process_receipt_sha256", "precommit_sha256"))):
+        _fail("RETIREMENT_REFUSAL_WORKSPACE_BINDING_INVALID")
+    owner, owner_sha = _retirement_control(working_root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    _assert_retirement_root(working_root, owner.get("root_identity"), declared_root=owner.get("root"))
+    if (owner_sha != workspace_sha256 or owner.get("generation_context_sha256") != context_sha256
+            or owner.get("generation_id") != generation_id or owner.get("cell_id") != cell_id
+            or owner.get("cell_contract_sha256") != binding["cell_contract_sha256"]
+            or owner.get("creation_provenance") != "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION"):
+        _fail("RETIREMENT_REFUSAL_WORKSPACE_BINDING_INVALID")
+    refusal = body["refusal"]
+    if (type(refusal) is not dict or set(refusal) != {"status", "scheduler_status", "reason_code",
+            "recorded_at_utc", "slot_id", "symbol", "timeframe", "regime", "cycle_start_utc",
+            "cycle_end_utc", "information_cutoff_utc"}
+            or refusal["status"] != "REFUSED_SOURCE_NOT_COMPLETED"
+            or refusal["scheduler_status"] not in ("NOT_RUN", "FAILED")
+            or type(refusal["slot_id"]) is not str or not refusal["slot_id"]):
+        _fail("RETIREMENT_TERMINAL_REFUSAL_INVALID")
+    codes = body["code_sha256"]
+    if (type(codes) is not dict or set(codes) != {
+            "pm_historical_scheduler.py", "pm_end_grid.py", "pm_authority_spool.py"}
+            or any(not _is_sha256(value) for value in codes.values())):
+        _fail("RETIREMENT_TERMINAL_REFUSAL_INVALID")
+    rows = body["end_grid_rows"]
+    if type(rows) is not dict or set(rows) != {refusal["slot_id"]}:
+        _fail("RETIREMENT_REFUSAL_GRID_READBACK_REQUIRED")
+    reference = rows[refusal["slot_id"]]
+    if (type(reference) is not dict or set(reference) != {"path", "row_sha256"}
+            or type(reference["path"]) is not str or not _is_sha256(reference["row_sha256"])):
+        _fail("RETIREMENT_REFUSAL_GRID_READBACK_REQUIRED")
+    grid_path = Path(reference["path"])
+    if not grid_path.is_absolute() or grid_path.suffix != ".jsonl":
+        _fail("RETIREMENT_REFUSAL_GRID_READBACK_REQUIRED")
+    grid_root = grid_path.parent.resolve()
+    if grid_root.is_relative_to(working_root) or working_root.is_relative_to(grid_root):
+        _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    matched = [row for row in end_grid.read_end_grid(grid_path.parent, grid_path.stem)
+        if row.row_sha256 == reference["row_sha256"]]
+    if len(matched) != 1:
+        _fail("RETIREMENT_REFUSAL_GRID_READBACK_REQUIRED")
+    row = matched[0]
+    if (row.cell_id != cell_id or row.source_kind != "m5_derived" or row.outcome != "STOP"
+            or row.reason_code != refusal["reason_code"] or row.cost_tier != "NONE"
+            or row.process_edition_sha256 != binding["search_process_receipt_sha256"]
+            or row.code_sha256 != codes or row.source_identity != {} or row.metrics != {}
+            or any(getattr(row, key) is not None for key in ("source_contract_sha256", "view_key",
+                "view_contract_sha256", "job_binding_sha256", "consumer_binding_sha256",
+                "no_trade_run_receipt_sha256", "strategy_family", "configuration_sha256"))
+            or any(getattr(row, key) != refusal[key] for key in
+                ("symbol", "timeframe", "regime", "cycle_start_utc", "cycle_end_utc", "information_cutoff_utc"))
+            or row.produced_at_utc != refusal["recorded_at_utc"]):
+        _fail("RETIREMENT_REFUSAL_GRID_READBACK_REQUIRED")
+    return body
+
+
+def _retirement_abort_binding_digest(value: dict) -> str:
+    # Match the original M5 owner's DATA digest, including escaped Unicode.
+    _canonical_json_bytes(value, 4 * 1024**2)
+    return hashlib.sha256(json.dumps(value, allow_nan=False, sort_keys=True,
+        ensure_ascii=True, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def _retirement_abort_summary(report: dict) -> dict:
+    summary = {"schema_version": report["schema_version"], "status": report["status"],
+        "report_sha256": hashlib.sha256(_canonical_json_bytes(report, 4 * 1024**2)).hexdigest(),
+        "job_binding_sha256": report["job_binding_sha256"], "view_plan_sha256": report["view_plan_sha256"],
+        "source_identity": report["source_identity"],
+        "source_identity_sha256": report["product_routes"][0]["source_identity_sha256"],
+        "product_routes_sha256": hashlib.sha256(_canonical_json_bytes(report["product_routes"], 4 * 1024**2)).hexdigest(),
+        "product_route_count": len(report["product_routes"]), "declared_view_count": len(report["declared_view_ids"]),
+        "owner_closed": True, "source_complete": False, "job_complete": False, "retirement_authority": False}
+    _canonical_json_bytes(summary, MAX_CONTEXT_BYTES)
+    return summary
+
+
+def _retirement_post_source_abort_fence(body: dict, *, context_sha256: str, generation_id: str,
+        cell_id: str, workspace_sha256: str, working_root: Path) -> dict:
+    """Validate a caller-earned unused-owner abort, never financial completion."""
+    from datetime import datetime, timedelta
+    import math
+    import pm_end_grid as end_grid
+    flags = {"qualification_authority", "capital_authority", "live_authority", "order_authority",
+        "full_native_context_eligibility", "financial_consumer_ready"}
+    if (set(body) != {"schema_version", "workspace_owner_sha256", "binding", "refusal",
+            "source_disposition", "end_grid_rows", "code_sha256", "abort_report", "bound_fitted_header"} | flags
+            or body["schema_version"] != POST_SOURCE_ABORT_FENCE_SCHEMA
+            or body["workspace_owner_sha256"] != workspace_sha256
+            or any(body.get(key) is not False for key in flags)):
+        _fail("RETIREMENT_POST_SOURCE_ABORT_INVALID")
+    if body["bound_fitted_header"] is not None:
+        _fail("RETIREMENT_ABORT_HEADER_UNSUPPORTED")
+    disposition = body["source_disposition"]
+    expected_disposition = {"stage": "FRESH_POST_SOURCE_PRE_CONTROLLER_ABORT", "fresh_workspace": True,
+        "resumed": False, "source_acquisition_attempted": True, "source_owner_created": True,
+        "source_products_acquired": True, "controller_started": False}
+    if (type(disposition) is not dict or set(disposition) != set(expected_disposition)
+            or any(type(disposition[key]) is not type(value) or disposition[key] != value
+                for key, value in expected_disposition.items())):
+        _fail("RETIREMENT_ABORT_SOURCE_STATE_INVALID")
+    binding = body["binding"]
+    binding_fields = {"generation_context_sha256", "run_id", "cell_id", "cell_contract_sha256",
+        "search_process_receipt_sha256", "precommit_sha256"}
+    if (type(binding) is not dict or set(binding) != binding_fields
+            or binding["generation_context_sha256"] != context_sha256 or binding["run_id"] != generation_id
+            or binding["cell_id"] != cell_id
+            or any(not _is_sha256(binding[key]) for key in binding_fields - {"run_id"})):
+        _fail("RETIREMENT_ABORT_BINDING_INVALID")
+    owner, owner_sha = _retirement_control(working_root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    _assert_retirement_root(working_root, owner.get("root_identity"), declared_root=owner.get("root"))
+    context, context_sha = _retirement_control(working_root, CONTEXT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    if (owner_sha != workspace_sha256 or owner.get("generation_context_sha256") != context_sha256
+            or owner.get("generation_id") != generation_id or owner.get("cell_id") != cell_id
+            or owner.get("cell_contract_sha256") != binding["cell_contract_sha256"]
+            or owner.get("creation_provenance") != "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION"
+            or context_sha != context_sha256):
+        _fail("RETIREMENT_ABORT_BINDING_INVALID")
+    refusal = body["refusal"]
+    if (type(refusal) is not dict or set(refusal) != {"status", "scheduler_status", "reason_code",
+            "recorded_at_utc", "slot_id", "symbol", "timeframe", "regime", "cycle_start_utc",
+            "cycle_end_utc", "information_cutoff_utc"}
+            or refusal["status"] != "REFUSED_SOURCE_NOT_COMPLETED"
+            or refusal["scheduler_status"] not in ("NOT_RUN", "FAILED")
+            or type(refusal["slot_id"]) is not str or not refusal["slot_id"]):
+        _fail("RETIREMENT_POST_SOURCE_ABORT_INVALID")
+    report = body["abort_report"]
+    report_fields = {"schema_version", "status", "reason", "binding", "budgets", "job_binding_sha256",
+        "view_plan_sha256", "source_identity", "product_routes", "declared_view_ids", "requests_all_pending",
+        "active_leases_before_close", "observed_consumer_bindings", "value_cache_empty_before_close",
+        "prefix_routes_revalidated", "job_view_read_observations", "owner_closed", "source_complete",
+        "job_complete", "retirement_authority", "caller_obligations_not_authenticated"} | flags
+    if (type(report) is not dict or set(report) != report_fields
+            or report["schema_version"] != "fxpm.m5-abort-before-consumption.v1"
+            or report["status"] != "ABORTED_SOURCE_BEFORE_CONSUMPTION"
+            or type(report["reason"]) is not str or report["reason"] != refusal["reason_code"]
+            or not 1 <= len(report["reason"]) <= 512
+            or any(report.get(key) is not True for key in ("requests_all_pending", "value_cache_empty_before_close",
+                "prefix_routes_revalidated", "owner_closed"))
+            or type(report["active_leases_before_close"]) is not int or report["active_leases_before_close"] != 0
+            or any(type(report[key]) is not list or report[key] for key in
+                ("observed_consumer_bindings", "job_view_read_observations"))
+            or any(report.get(key) is not False for key in flags | {"source_complete", "job_complete", "retirement_authority"})
+            or report["caller_obligations_not_authenticated"] != ["ORIGINAL_DISPATCH_LEASE_HELD",
+                "FRESH_PRE_CONTROLLER_PHASE", "ACTUAL_STOP_GRID_READBACK_AND_DISTINCT_RETIREMENT_FENCE"]):
+        _fail("RETIREMENT_ABORT_REPORT_INVALID")
+    job = report["binding"]
+    job_fields = {"m5_view_contract_sha256", "generation_context_sha256", "config_sha256", "effective_config_sha256",
+        "search_process_receipt_sha256", "precommit_sha256", "run_id", "cell_id", "view_budgets_sha256",
+        "view_plan_sha256", "required_result_keys", "terminal_result_key"}
+    if (type(job) is not dict or set(job) != job_fields
+            or any(job[key] != binding[key] for key in binding_fields - {"cell_contract_sha256"})
+            or job["config_sha256"] != context.get("config_sha256")
+            or any(not _is_sha256(job[key]) for key in job_fields - {"run_id", "cell_id", "required_result_keys", "terminal_result_key"})
+            or type(job["required_result_keys"]) is not list or not job["required_result_keys"]
+            or any(type(key) is not str or not 1 <= len(key) <= 512 for key in job["required_result_keys"])
+            or len(set(job["required_result_keys"])) != len(job["required_result_keys"])
+            or job["terminal_result_key"] not in job["required_result_keys"]
+            or report["view_plan_sha256"] != job["view_plan_sha256"]
+            or report["job_binding_sha256"] != _retirement_abort_binding_digest(job)):
+        _fail("RETIREMENT_ABORT_BINDING_INVALID")
+    budgets = report["budgets"]
+    budget_fields = {"max_source_rows", "max_source_bytes", "max_view_rows", "max_view_bytes", "max_cache_rows", "max_cache_bytes"}
+    ids = report["declared_view_ids"]
+    if (type(budgets) is not dict or set(budgets) != budget_fields
+            or any(type(value) is not int or value <= 0 for value in budgets.values())
+            or _retirement_abort_binding_digest(budgets) != job["view_budgets_sha256"]
+            or type(ids) is not list or not ids or any(type(value) is not str or not 1 <= len(value) <= 512 for value in ids)
+            or ids != sorted(set(ids))):
+        _fail("RETIREMENT_ABORT_REPORT_INVALID")
+    source = report["source_identity"]
+    source_fields = {"symbol", "timeframe", "activation_id", "activation_sha256", "bars_sha256", "sidecar_sha256",
+        "provenance_sha256", "request_sha256", "point", "spread_unit"}
+    if (type(source) is not dict or set(source) != source_fields
+            or source["symbol"] != refusal["symbol"] or source["timeframe"] != "M5" or source["spread_unit"] != "points"
+            or type(source["activation_id"]) is not str or not 1 <= len(source["activation_id"]) <= 512
+            or any(not _is_sha256(source[key]) for key in source_fields if key.endswith("sha256"))
+            or type(source["point"]) not in (int, float)
+            or (type(source["point"]) is float and not math.isfinite(source["point"])) or source["point"] <= 0):
+        _fail("RETIREMENT_ABORT_SOURCE_IDENTITY_INVALID")
+    routes = report["product_routes"]
+    route_fields = {"cutoff_utc", "source_accessed_at_utc", "index_sha256", "source_identity_sha256",
+        "activation_id", "activation_manifest_sha256", "activation_entry_sha256"}
+    if type(routes) is not list or not routes:
+        _fail("RETIREMENT_ABORT_ROUTE_INVALID")
+    cutoffs = []
+    source_sha = None
+    for route in routes:
+        if (type(route) is not dict or set(route) != route_fields
+                or any(not _is_sha256(route[key]) for key in route_fields if key.endswith("sha256"))
+                or route["activation_id"] != source["activation_id"]
+                or route["activation_manifest_sha256"] != source["activation_sha256"]
+                or (source_sha is not None and source_sha != route["source_identity_sha256"])):
+            _fail("RETIREMENT_ABORT_ROUTE_INVALID")
+        source_sha = route["source_identity_sha256"]
+        stamps = []
+        for key in ("cutoff_utc", "source_accessed_at_utc"):
+            value = route[key]
+            if type(value) is not str or value != value.strip():
+                _fail("RETIREMENT_ABORT_ROUTE_INVALID")
+            try:
+                stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                _fail("RETIREMENT_ABORT_ROUTE_INVALID")
+            if stamp.tzinfo is None or stamp.utcoffset() != timedelta(0):
+                _fail("RETIREMENT_ABORT_ROUTE_INVALID")
+            stamps.append(stamp)
+        cutoffs.append(stamps[0])
+    if cutoffs != sorted(set(cutoffs)):
+        _fail("RETIREMENT_ABORT_ROUTE_INVALID")
+    codes = body["code_sha256"]
+    rows = body["end_grid_rows"]
+    if (type(codes) is not dict or set(codes) != {"pm_historical_scheduler.py", "pm_end_grid.py", "pm_authority_spool.py"}
+            or any(not _is_sha256(value) for value in codes.values())
+            or type(rows) is not dict or set(rows) != {refusal["slot_id"]}):
+        _fail("RETIREMENT_ABORT_GRID_READBACK_REQUIRED")
+    reference = rows[refusal["slot_id"]]
+    if (type(reference) is not dict or set(reference) != {"path", "row_sha256"}
+            or type(reference["path"]) is not str or not _is_sha256(reference["row_sha256"])):
+        _fail("RETIREMENT_ABORT_GRID_READBACK_REQUIRED")
+    grid_path = Path(reference["path"])
+    if not grid_path.is_absolute() or grid_path.suffix != ".jsonl":
+        _fail("RETIREMENT_ABORT_GRID_READBACK_REQUIRED")
+    grid_root = grid_path.parent.resolve()
+    if grid_root.is_relative_to(working_root) or working_root.is_relative_to(grid_root):
+        _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    matched = [row for row in end_grid.read_end_grid(grid_path.parent, grid_path.stem)
+        if row.row_sha256 == reference["row_sha256"]]
+    if len(matched) != 1:
+        _fail("RETIREMENT_ABORT_GRID_READBACK_REQUIRED")
+    row = matched[0]
+    if (row.cell_id != cell_id or row.source_kind != "m5_derived" or row.outcome != "STOP" or row.cost_tier != "NONE"
+            or row.reason_code != refusal["reason_code"] or row.process_edition_sha256 != binding["search_process_receipt_sha256"]
+            or row.code_sha256 != codes or row.metrics != {} or row.job_binding_sha256 != report["job_binding_sha256"]
+            or row.source_identity != {key: source[key] for key in POST_SOURCE_ABORT_GRID_SOURCE_FIELDS}
+            or any(getattr(row, key) is not None for key in ("source_contract_sha256", "view_key", "view_contract_sha256",
+                "consumer_binding_sha256", "no_trade_run_receipt_sha256", "strategy_family", "configuration_sha256"))
+            or any(getattr(row, key) != refusal[key] for key in ("symbol", "timeframe", "regime",
+                "cycle_start_utc", "cycle_end_utc", "information_cutoff_utc"))
+            or row.produced_at_utc != refusal["recorded_at_utc"]):
+        _fail("RETIREMENT_ABORT_GRID_READBACK_REQUIRED")
+    _retirement_abort_summary(report)
+    return body
+
+
+def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generation_id: str,
+        cell_id: str, workspace_sha256: str, working_root: Path) -> dict:
+    import pm_end_grid as end_grid
+    if path.resolve().is_relative_to(working_root):
+        _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    body, digest = _retirement_external(path, 4 * 1024**2)
+    if body.get("schema_version") == POST_SOURCE_ABORT_FENCE_SCHEMA:
+        if digest != expected:
+            _fail("RETIREMENT_POST_SOURCE_ABORT_INVALID")
+        return _retirement_post_source_abort_fence(body, context_sha256=context_sha256,
+            generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
+            working_root=working_root)
+    if body.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA:
+        if digest != expected:
+            _fail("RETIREMENT_TERMINAL_REFUSAL_INVALID")
+        return _retirement_terminal_refusal_fence(body, context_sha256=context_sha256,
+            generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
+            working_root=working_root)
+    summary = body.get("source_summary")
+    if (digest != expected or body.get("schema_version") != "fxpm.declared-m5-development-source-fence.v1"
+            or body.get("workspace_owner_sha256") != workspace_sha256
+            or type(summary) is not dict or summary.get("owned_values_released") is not True
+            or summary.get("release_eligible") is not True
+            or summary.get("full_native_context_eligibility") is not False
+            or summary.get("financial_consumer_ready") is not False
+            or any(body.get(key) is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("RETIREMENT_FINAL_SOURCE_FENCE_INVALID")
+    binding = summary.get("binding")
+    if (type(binding) is not dict or binding.get("generation_context_sha256") != context_sha256
+            or binding.get("run_id") != generation_id or binding.get("cell_id") != cell_id):
+        _fail("RETIREMENT_FINAL_SOURCE_FENCE_INVALID")
+    rows = body.get("end_grid_rows")
+    if type(rows) is not dict or not rows:
+        _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+    job_sha = hashlib.sha256(_canonical_json_bytes(binding, MAX_CONTEXT_BYTES)).hexdigest()
+    for reference in rows.values():
+        if (type(reference) is not dict or set(reference) != {"path", "row_sha256"}
+                or type(reference["path"]) is not str or not _is_sha256(reference["row_sha256"])):
+            _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        grid_path = Path(reference["path"])
+        if not grid_path.is_absolute() or grid_path.suffix != ".jsonl":
+            _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        grid_root = grid_path.parent.resolve()
+        if grid_root.is_relative_to(working_root) or working_root.is_relative_to(grid_root):
+            _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+        matched = [row for row in end_grid.read_end_grid(grid_path.parent, grid_path.stem)
+            if row.row_sha256 == reference["row_sha256"]]
+        if len(matched) != 1 or matched[0].cell_id != cell_id or matched[0].job_binding_sha256 != job_sha:
+            _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        if matched[0].view_contract_sha256 is not None:
+            end_grid.load_view_contract(grid_path.parent, matched[0].view_contract_sha256)
+    return body
+
+
+def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[str] = None) -> Optional[dict]:
+    """Return retained recording metadata, never a writable or cold-fit capability."""
+    root = Path(root)
+    if not root.exists():
+        _reject_reparse_chain(root)
+        return None
+    root = _validate_root(root, create=False)
+    if (root / WORKSPACE_OWNER_RELATIVE_PATH).exists():
+        owner, _ = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+        _assert_retirement_root(root, owner.get("root_identity"), declared_root=owner.get("root"))
+    try:
+        (root / RETIREMENT_RELATIVE_PATH).lstat()
+    except FileNotFoundError:
+        return None
+    marker, _ = _retirement_control(root, RETIREMENT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    marker_fields = {"schema_version", "status", "generation_context_sha256", "generation_id", "cell_id",
+        "intent_sha256", "source_fence_path", "source_fence_sha256", "retirement_receipt_path", "workspace_owner_sha256"}
+    if (set(marker) != marker_fields or marker.get("schema_version") != RETIREMENT_SCHEMA or marker.get("status") != "RETIRING"
+            or not _is_sha256(marker.get("generation_context_sha256"))
+            or any(not _is_sha256(marker.get(key)) for key in
+                ("cell_id", "intent_sha256", "source_fence_sha256", "workspace_owner_sha256"))
+            or any(type(marker.get(key)) is not str or not Path(marker[key]).is_absolute()
+                for key in ("source_fence_path", "retirement_receipt_path"))
+            or (expected_context_sha256 is not None and marker["generation_context_sha256"] != expected_context_sha256)):
+        _fail("RETIREMENT_MARKER_INVALID")
+    context_body, context_sha = _retirement_control(root, CONTEXT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    _, owner_sha = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    if (context_sha != marker["generation_context_sha256"] or context_body.get("generation_id") != marker["generation_id"]
+            or owner_sha != marker["workspace_owner_sha256"]):
+        _fail("RETIREMENT_CONTEXT_CHANGED")
+    try:
+        (root / RETIREMENT_COMPLETE_RELATIVE_PATH).lstat()
+    except FileNotFoundError:
+        return dict(marker)
+    complete, _ = _retirement_control(root, RETIREMENT_COMPLETE_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    receipt, digest = _retirement_external(Path(marker["retirement_receipt_path"]), MAX_CONTEXT_BYTES)
+    if (set(complete) != {"schema_version", "receipt_sha256", "generation_context_sha256"}
+            or complete["schema_version"] != RETIREMENT_SCHEMA or complete["receipt_sha256"] != digest
+            or complete["generation_context_sha256"] != marker["generation_context_sha256"]
+            or receipt.get("schema_version") != RETIREMENT_SCHEMA or receipt.get("status") != "ARCHIVED_RECORD_ONLY"
+            or receipt.get("generation_context_sha256") != marker["generation_context_sha256"]
+            or receipt.get("payloads_retained") is not False or receipt.get("genuine_cold_reopen_available") is not False
+            or any(receipt.get(key) is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("RETIREMENT_COMPLETION_INVALID")
+    fence = _retirement_fence(Path(marker["source_fence_path"]), marker["source_fence_sha256"],
+        context_sha256=marker["generation_context_sha256"], generation_id=marker["generation_id"],
+        cell_id=marker["cell_id"], workspace_sha256=marker["workspace_owner_sha256"], working_root=root)
+    if fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA:
+        if (receipt.get("result_kind") != TERMINAL_REFUSAL_RESULT_KIND
+                or receipt.get("terminal_refusal") != fence["refusal"]):
+            _fail("RETIREMENT_COMPLETION_INVALID")
+    elif fence.get("schema_version") == POST_SOURCE_ABORT_FENCE_SCHEMA:
+        if (receipt.get("result_kind") != POST_SOURCE_ABORT_RESULT_KIND
+                or receipt.get("terminal_refusal") != fence["refusal"]
+                or receipt.get("source_abort") != _retirement_abort_summary(fence["abort_report"])
+                or receipt.get("full_native_context_eligibility") is not False
+                or receipt.get("financial_consumer_ready") is not False):
+            _fail("RETIREMENT_COMPLETION_INVALID")
+    elif "result_kind" in receipt or "terminal_refusal" in receipt:
+        _fail("RETIREMENT_COMPLETION_INVALID")
+    return {**receipt, "retirement_receipt_sha256": digest,
+        "retirement_receipt_path": marker["retirement_receipt_path"]}
+
+
+def _retirement_owned(relative: str, direct: frozenset[str], *, directory: bool) -> bool:
+    if any(name in {"real_control", "STOP", ".git"} for name in PurePosixPath(relative).parts):
+        return False
+    if relative in direct or (directory and any(item.startswith(relative + "/") for item in direct)):
+        return True
+    if directory:
+        return bool(re.fullmatch(r"objects(?:/sha256(?:/[a-f0-9]{2})?)?|symbols(?:/[a-f0-9]{64}(?:/domains(?:/[a-f0-9]{64})?)?)?|tmp", relative))
+    object_path = re.fullmatch(r"objects/sha256/([a-f0-9]{2})/([a-f0-9]{64})\.[a-z0-9][a-z0-9._+\-]{0,63}", relative)
+    if object_path is not None:
+        return object_path[1] == object_path[2][:2]
+    return bool(re.fullmatch(r"symbols/[a-f0-9]{64}/domains/[a-f0-9]{64}/manifest\.json|tmp/[a-f0-9]{32}\.part", relative))
+
+
+def _retirement_inventory(root: Path, direct: frozenset[str], *, max_paths: int, max_nodes: int,
+        max_bytes: int, retained_unit_locks: tuple[str, ...] = ()) -> tuple[list[dict], list[dict], int, int]:
+    keep = {CONTEXT_RELATIVE_PATH, WORKSPACE_OWNER_RELATIVE_PATH, RETIREMENT_RELATIVE_PATH,
+        RETIREMENT_INTENT_RELATIVE_PATH, RETIREMENT_COMPLETE_RELATIVE_PATH,
+        spool_quota.QUOTA_STATE_NAME, spool_quota.QUOTA_LOCK_NAME, "declared-scheduler.lock"}
+    keep.update(retained_unit_locks)
+    records, directories, stack = [], [], [root]
+    nodes, total = 0, 0
+    while stack:
+        parent = stack.pop()
+        with os.scandir(parent) as stream:
+            for entry in stream:
+                nodes += 1
+                if nodes > max_nodes:
+                    _fail("RETIREMENT_NODE_BOUND_EXCEEDED")
+                relative = Path(entry.path).relative_to(root).as_posix()
+                if any(name in {"real_control", "STOP", ".git"} for name in PurePosixPath(relative).parts):
+                    _fail("RETIREMENT_FOREIGN_FILE")
+                path = _local_path(root, relative)
+                info = path.stat(follow_symlinks=False)
+                if _is_reparse(path) or stat.S_ISLNK(info.st_mode):
+                    _fail("RETIREMENT_REPARSE_REFUSED")
+                if stat.S_ISDIR(info.st_mode):
+                    if not _retirement_owned(relative, direct, directory=True):
+                        _fail("RETIREMENT_FOREIGN_DIRECTORY")
+                    directories.append({"relative_path": relative, "identity": [info.st_dev, info.st_ino]})
+                    stack.append(path)
+                elif stat.S_ISREG(info.st_mode):
+                    if info.st_nlink != 1:
+                        _fail("RETIREMENT_HARDLINK_REFUSED")
+                    total += info.st_size
+                    if total > max_bytes:
+                        _fail("RETIREMENT_PAYLOAD_BOUND_EXCEEDED")
+                    if relative in keep:
+                        continue
+                    if not _retirement_owned(relative, direct, directory=False):
+                        _fail("RETIREMENT_FOREIGN_FILE")
+                    records.append({"relative_path": relative, "identity": list(_file_identity(info)), "bytes": info.st_size})
+                    if len(records) > max_paths:
+                        _fail("RETIREMENT_PAYLOAD_BOUND_EXCEEDED")
+                else:
+                    _fail("RETIREMENT_NONREGULAR_REFUSED")
+    return sorted(records, key=lambda item: item["relative_path"]), directories, total, nodes
+
+
+@contextmanager
+def _retirement_unit_locks(root: Path, paths: tuple[str, ...], owner: dict) -> Iterator[None]:
+    from contextlib import ExitStack
+    import pm_native_storage as storage
+    with ExitStack() as handles:
+        for relative in paths:
+            _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+            try:
+                path = _safe_regular_file(root, relative)
+                descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+                handle = handles.enter_context(os.fdopen(descriptor, "r+b", buffering=0))
+                _reject_reparse_chain(path)
+                before, opened = path.stat(follow_symlinks=False), os.fstat(handle.fileno())
+                if (not stat.S_ISREG(opened.st_mode) or opened.st_size != 1 or opened.st_nlink != 1
+                        or _file_identity(before) != _file_identity(opened)):
+                    _fail("RETIREMENT_UNIT_LOCK_UNVERIFIED")
+                if not storage._try_kernel_lock(handle):
+                    _fail("RETIREMENT_UNIT_WRITER_ACTIVE")
+                handles.callback(storage._release_kernel_lock, handle)
+                _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+                _reject_reparse_chain(path)
+                current = path.stat(follow_symlinks=False)
+                handle.seek(0)
+                if _file_identity(current) != _file_identity(opened) or handle.read(1) != b"0":
+                    _fail("RETIREMENT_UNIT_LOCK_UNVERIFIED")
+            except OSError as exc:
+                raise AuthoritySpoolError("RETIREMENT_UNIT_LOCK_UNVERIFIED") from exc
+        yield
+
+
+def retire_completed_generation(root: Path, *, expected_context_sha256: str, workspace_owner_sha256: str,
+        source_fence_path: Path, source_fence_sha256: str, retirement_receipt_path: Path,
+        protected_paths: tuple[Path, ...], owned_direct_files: tuple[str, ...],
+        unit_lock_paths: tuple[str, ...],
+        max_paths: int, max_nodes: int, max_bytes: int) -> dict:
+    """Retire one new owned workspace after actual caller finish and retained readback.
+
+    The fence is caller assurance, not a new financial seal. No native input,
+    result replay, payload hash, cold archive, orphan reaping or case restart.
+    """
+    root = _validate_root(Path(root), create=False)
+    if not (root / WORKSPACE_OWNER_RELATIVE_PATH).exists():
+        _fail("RETIREMENT_OWNER_REQUIRED")
+    owner_before_lock, owner_before_sha = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    _assert_retirement_root(root, owner_before_lock.get("root_identity"), declared_root=owner_before_lock.get("root"))
+    if owner_before_sha != workspace_owner_sha256 or owner_before_lock.get("generation_context_sha256") != expected_context_sha256:
+        _fail("RETIREMENT_OWNER_REQUIRED")
+    for value in (expected_context_sha256, workspace_owner_sha256, source_fence_sha256):
+        _sha256(value, "RETIREMENT_BINDING_INVALID")
+    if (type(protected_paths) is not tuple or not protected_paths
+            or type(owned_direct_files) is not tuple
+            or type(unit_lock_paths) is not tuple
+            or any(type(value) is not int or value <= 0 for value in (max_paths, max_nodes, max_bytes))):
+        _fail("RETIREMENT_BOUNDS_REQUIRED")
+    if any(type(relative) is not str for relative in owned_direct_files):
+        _fail("RETIREMENT_DIRECT_PATH_INVALID")
+    direct = frozenset(owned_direct_files)
+    if len(direct) != len(owned_direct_files) or len(direct) > max_paths:
+        _fail("RETIREMENT_DIRECT_PATH_INVALID")
+    for relative in direct:
+        if type(relative) is not str or len(relative.encode("utf-8")) > 4096:
+            _fail("RETIREMENT_DIRECT_PATH_INVALID")
+        _relative_parts(relative)
+    expected_unit_locks = {relative for relative in direct if PurePosixPath(relative).name.casefold() == "units.lock"}
+    if (len(unit_lock_paths) > max_paths or any(type(relative) is not str for relative in unit_lock_paths)
+            or len(set(unit_lock_paths)) != len(unit_lock_paths)
+            or set(unit_lock_paths) != expected_unit_locks
+            or any(relative not in direct
+                or PurePosixPath(relative).name.casefold() != "units.lock" for relative in unit_lock_paths)):
+        _fail("RETIREMENT_UNIT_LOCK_PATHS_INVALID")
+    source_fence_path, retirement_receipt_path = Path(source_fence_path), Path(retirement_receipt_path)
+    if source_fence_path.resolve() == retirement_receipt_path.resolve():
+        _fail("RETIREMENT_RECEIPT_PATH_CONFLICT")
+    _validate_root(retirement_receipt_path.parent, create=False)
+    for path in (*protected_paths, source_fence_path, retirement_receipt_path):
+        path = Path(path)
+        if not path.is_absolute():
+            _fail("RETIREMENT_PROTECTED_PATH_INVALID")
+        _reject_reparse_chain(path)
+        path = path.resolve()
+        if path == root or path.is_relative_to(root) or root.is_relative_to(path):
+            _fail("RETIREMENT_PROTECTED_PATH_OVERLAP")
+    with spool_quota.generation_retirement_lock(root, max_root_entries=max_nodes), _retirement_unit_locks(root, unit_lock_paths, owner_before_lock):
+        existing = read_generation_retirement(root, expected_context_sha256=expected_context_sha256)
+        if existing is not None:
+            marker, _ = _retirement_control(root, RETIREMENT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+            if (marker["workspace_owner_sha256"] != workspace_owner_sha256
+                    or marker["source_fence_path"] != str(source_fence_path)
+                    or marker["source_fence_sha256"] != source_fence_sha256
+                    or marker["retirement_receipt_path"] != str(retirement_receipt_path)):
+                _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+        if existing is not None and existing["status"] == "ARCHIVED_RECORD_ONLY":
+            if existing.get("retained_unit_locks") != list(unit_lock_paths):
+                _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+            return existing
+        if existing is None and retirement_receipt_path.exists():
+            _fail("RETIREMENT_RECEIPT_ALREADY_EXISTS")
+        context_body, context_sha = _retirement_control(root, CONTEXT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+        if (context_sha != expected_context_sha256 or set(context_body) != _CONTEXT_FIELDS
+                or context_body["schema_version"] != GENERATION_CONTEXT_SCHEMA):
+            _fail("RETIREMENT_CONTEXT_CHANGED")
+        _limits_from_payload(context_body["limits"], legacy=False)
+        _identity(context_body["generation_id"], "GENERATION_ID")
+        _sha256(context_body["native_universe_sha256"], "NATIVE_UNIVERSE_SHA256")
+        _sha256(context_body["config_sha256"], "CONFIG_SHA256")
+        if not (root / WORKSPACE_OWNER_RELATIVE_PATH).exists():
+            _fail("RETIREMENT_OWNER_REQUIRED")
+        owner, owner_sha = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+        if (set(owner) != {"schema_version", "generation_id", "generation_context_sha256", "creation_provenance",
+                    "cell_id", "cell_contract_sha256", "root", "root_identity"}
+                or owner_sha != workspace_owner_sha256 or owner.get("schema_version") != WORKSPACE_OWNER_SCHEMA
+                or owner.get("generation_context_sha256") != context_sha
+                or owner.get("generation_id") != context_body.get("generation_id")
+                or not _is_sha256(owner.get("cell_id")) or not _is_sha256(owner.get("cell_contract_sha256"))
+                or owner.get("creation_provenance") != "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION"):
+            _fail("RETIREMENT_OWNER_REQUIRED")
+        _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+        fence = _retirement_fence(source_fence_path, source_fence_sha256, context_sha256=context_sha,
+            generation_id=owner["generation_id"], cell_id=owner["cell_id"], workspace_sha256=owner_sha, working_root=root)
+        terminal_refusal = fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA
+        post_source_abort = fence.get("schema_version") == POST_SOURCE_ABORT_FENCE_SCHEMA
+        if terminal_refusal and (unit_lock_paths or direct != frozenset({
+                f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
+            _fail("RETIREMENT_REFUSAL_SOURCE_STATE_INVALID")
+        if post_source_abort and (unit_lock_paths or direct != frozenset({
+                f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
+            _fail("RETIREMENT_ABORT_SOURCE_STATE_INVALID")
+        maximum = min(context_body["limits"]["max_json_bytes"], 64 * 1024**2)
+        arguments = {"source_fence_path": str(source_fence_path), "source_fence_sha256": source_fence_sha256,
+            "retirement_receipt_path": str(retirement_receipt_path), "workspace_owner_sha256": owner_sha,
+            "protected_paths": [str(Path(value).resolve()) for value in protected_paths],
+            "owned_direct_files": sorted(direct), "unit_lock_paths": list(unit_lock_paths),
+            "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes}
+        if existing is None:
+            import shutil
+            records, _, root_bytes, nodes = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
+                max_bytes=max_bytes, retained_unit_locks=unit_lock_paths)
+            intent = {"schema_version": RETIREMENT_SCHEMA, "generation_context_sha256": context_sha,
+                "arguments": arguments, "files": records}
+            intent_bytes = len(_canonical_json_bytes(intent, maximum))
+            control_bytes = intent_bytes + 2 * MAX_CONTEXT_BYTES
+            if (nodes + 3 > max_nodes or root_bytes + control_bytes > min(max_bytes, context_body["limits"]["max_generation_bytes"])
+                    or shutil.disk_usage(root).free - control_bytes < context_body["limits"]["min_free_bytes"]):
+                _fail("RETIREMENT_CONTROL_CAPACITY")
+            intent_sha = _retirement_publish(root, RETIREMENT_INTENT_RELATIVE_PATH, intent, maximum, root_owner=owner)
+            marker = {"schema_version": RETIREMENT_SCHEMA, "status": "RETIRING", "generation_context_sha256": context_sha,
+                "generation_id": owner["generation_id"], "cell_id": owner["cell_id"], "intent_sha256": intent_sha,
+                **{key: arguments[key] for key in ("source_fence_path", "source_fence_sha256", "retirement_receipt_path", "workspace_owner_sha256")}}
+            _retirement_publish(root, RETIREMENT_RELATIVE_PATH, marker, MAX_CONTEXT_BYTES, root_owner=owner)
+        else:
+            intent, intent_sha = _retirement_control(root, RETIREMENT_INTENT_RELATIVE_PATH, maximum)
+            if (intent_sha != existing["intent_sha256"] or intent.get("arguments") != arguments
+                    or intent.get("generation_context_sha256") != context_sha):
+                _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+            records = intent["files"]
+        current, _, _, _ = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
+            max_bytes=max_bytes, retained_unit_locks=unit_lock_paths)
+        expected = {record["relative_path"]: record for record in records}
+        if any(expected.get(record["relative_path"]) != record for record in current):
+            _fail("RETIREMENT_PAYLOAD_CHANGED")
+        for record in current:
+            _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+            path = _safe_regular_file(root, record["relative_path"])
+            info = path.stat(follow_symlinks=False)
+            if list(_file_identity(info)) != record["identity"] or info.st_nlink != 1:
+                _fail("RETIREMENT_PAYLOAD_CHANGED")
+            path.unlink()
+        remaining, directories, _, _ = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
+            max_bytes=max_bytes, retained_unit_locks=unit_lock_paths)
+        if remaining:
+            _fail("RETIREMENT_PAYLOAD_REMAINS")
+        retained_directories = {parent.as_posix() for relative in unit_lock_paths for parent in PurePosixPath(relative).parents}
+        for directory in sorted(directories, key=lambda value: len(PurePosixPath(value["relative_path"]).parts), reverse=True):
+            if directory["relative_path"] in retained_directories:
+                continue
+            _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+            path = _local_path(root, directory["relative_path"])
+            _reject_reparse_chain(path)
+            current_directory = path.stat(follow_symlinks=False)
+            if [current_directory.st_dev, current_directory.st_ino] != directory["identity"]:
+                _fail("RETIREMENT_DIRECTORY_CHANGED")
+            path.rmdir()
+        receipt = {"schema_version": RETIREMENT_SCHEMA, "status": "ARCHIVED_RECORD_ONLY",
+            "generation_context_sha256": context_sha, "generation_id": owner["generation_id"],
+            "cell_id": owner["cell_id"], "cell_contract_sha256": owner["cell_contract_sha256"],
+            "workspace_owner_sha256": owner_sha, "intent_sha256": intent_sha,
+            "source_fence": {"path": str(source_fence_path), "sha256": source_fence_sha256},
+            "precommit_sha256": (fence["binding"] if terminal_refusal or post_source_abort
+                else fence["source_summary"]["binding"]).get("precommit_sha256"),
+            "end_grid_rows": fence["end_grid_rows"], "retired_payload_files": len(records),
+            "retired_logical_bytes": sum(record["bytes"] for record in records),
+            "payloads_retained": False, "genuine_cold_reopen_available": False,
+            "descriptor_assurance": "IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE",
+            "retained_unit_locks": list(unit_lock_paths),
+            "qualification_authority": False, "capital_authority": False,
+            "live_authority": False, "order_authority": False}
+        if terminal_refusal:
+            receipt.update(result_kind=TERMINAL_REFUSAL_RESULT_KIND,
+                terminal_refusal=dict(fence["refusal"]))
+        if post_source_abort:
+            receipt.update(result_kind=POST_SOURCE_ABORT_RESULT_KIND, terminal_refusal=dict(fence["refusal"]),
+                source_abort=_retirement_abort_summary(fence["abort_report"]),
+                full_native_context_eligibility=False, financial_consumer_ready=False)
+        external_root = _validate_root(retirement_receipt_path.parent, create=False)
+        _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+        receipt_sha = _retirement_publish(external_root, retirement_receipt_path.name, receipt, MAX_CONTEXT_BYTES)
+        _retirement_publish(root, RETIREMENT_COMPLETE_RELATIVE_PATH, {"schema_version": RETIREMENT_SCHEMA,
+            "generation_context_sha256": context_sha, "receipt_sha256": receipt_sha}, MAX_CONTEXT_BYTES, root_owner=owner)
+        intent_path = _safe_regular_file(root, RETIREMENT_INTENT_RELATIVE_PATH)
+        if _retirement_control(root, RETIREMENT_INTENT_RELATIVE_PATH, maximum)[1] != intent_sha:
+            _fail("RETIREMENT_INTENT_CHANGED")
+        _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+        intent_path.unlink()
+        return read_generation_retirement(root, expected_context_sha256=context_sha)
+
+
 __all__ = [
     "ARTIFACT_DESCRIPTOR_SCHEMA",
     "AuthoritySpoolError",
@@ -1431,4 +2213,7 @@ __all__ = [
     "verify_symbol_receipt",
     "write_canonical_json_artifact",
     "write_opaque_artifact",
+    "read_owned_generation_workspace",
+    "read_generation_retirement",
+    "retire_completed_generation",
 ]

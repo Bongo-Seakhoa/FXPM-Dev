@@ -1901,11 +1901,18 @@ def _read_frozen_tier_raw_accounts(
         raise CausalEvidenceProductionError("FROZEN_TIER_RAW_ACCOUNT_INVALID") from exc
 
 
-def _verify_declared_cell_account_manifest(context, body, descriptor):
+def _verify_declared_cell_account_manifest(context, body, descriptor, *, development=False):
     import pm_forward_oos_replay_producer as forward
 
     try:
-        symbol = forward._declared_cell_transport_symbol(body)
+        if type(development) is not bool:
+            _fail("DECLARED_CELL_RAW_SCHEMA_UNSUPPORTED")
+        if development:
+            if body.get("schema_version") != forward.DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA:
+                _fail("DECLARED_CELL_RAW_SCHEMA_UNSUPPORTED")
+            symbol = forward._declared_development_cell_transport_symbol(body)
+        else:
+            symbol = forward._declared_cell_transport_symbol(body)
         relative_path = authority_spool._manifest_relative_path(
             symbol, authority_spool.GENERAL_MANIFEST_DOMAIN)
         digest, size, _ = authority_spool._stream_file(
@@ -1957,6 +1964,9 @@ def read_declared_cell_account_artifact(
     try:
         descriptor = _descriptor(artifact.descriptor, "DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
         body = _read_descriptor_json(context, descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
+        if body.get("schema_version") == "fxpm.declared-development-m5-cell-raw-account.v1":
+            return _read_declared_development_m5_account(context, body=body, descriptor=descriptor,
+                process=process, frozen_pipeline_config=frozen_pipeline_config)
         if body.get("schema_version") != forward.DECLARED_CELL_RAW_ACCOUNT_SCHEMA:
             _fail("DECLARED_CELL_RAW_SCHEMA_UNSUPPORTED")
         _verify_declared_cell_account_manifest(context, body, descriptor)
@@ -3815,3 +3825,17 @@ __all__ = [
     "evaluate_declared_cell_interval_admission",
     "read_declared_cell_account_artifact",
 ]
+
+
+
+def _read_declared_development_m5_account(context, *, body, descriptor, process, frozen_pipeline_config):
+    import pm_forward_oos_replay_producer as forward
+    _verify_declared_cell_account_manifest(context, body, descriptor, development=True)
+    verified = forward.verify_declared_m5_development_cell_account_transport(context, body,
+        process=process, frozen_pipeline_config=frozen_pipeline_config)
+    if _canonical_bytes(verified, _MAX_RAW_ARTIFACT_BYTES) != _canonical_bytes(body, _MAX_RAW_ARTIFACT_BYTES):
+        _fail("DECLARED_CELL_RAW_ACCOUNT_INVALID")
+    return DeclaredCellRawAccountProjection(cell_id=body["cell"]["cell_id"], descriptor_sha256=descriptor["sha256"],
+        progress_status=body["progress_status"], reason_code=body["reason_code"],
+        slot_schedule=tuple(body["slot_schedule"]), owner_records=tuple(body["owner_records"]),
+        account=body["account"], _verified_body_json=_canonical_bytes(verified, _MAX_RAW_ARTIFACT_BYTES))

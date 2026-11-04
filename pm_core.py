@@ -7918,6 +7918,80 @@ class Backtester:
         happen to match.
         """
         binding = dict(features.attrs.get(NATIVE_SOURCE_BINDING_ATTR) or {})
+        if binding.get("source_kind") == "m5_derived":
+            view_timeframe = binding.get("view_timeframe")
+            view_digest = binding.get("m5_view_contract_sha256")
+            if (
+                type(binding.get("source_kind")) is not str
+                or type(view_timeframe) is not str
+                or view_timeframe not in {"M15", "M30", "H1"}
+                or view_timeframe != str(timeframe or "").upper()
+                or binding.get("timeframe") != "M5"
+                or any(type(binding.get(name)) is not str for name in (
+                    "symbol", "timeframe", "activation_id",
+                    "activation_manifest_sha256", "bars_sha256", "sidecar_sha256",
+                ))
+                or type(view_digest) is not str
+                or len(view_digest) != 64
+                or any(character not in "0123456789abcdef" for character in view_digest)
+            ):
+                raise BrokerTermsError("M5_DERIVED_SWAP_VIEW_BINDING_INVALID")
+            if self._research_swap_context is not None:
+                raise BrokerTermsError("M5_DERIVED_SWAP_RESEARCH_OVERRIDE_REFUSED")
+            # Native fields remain the genuine base-M5 binding; the view is separate.
+            m5_native_root = Path(getattr(self.config, "data_dir", Path("./data"))) / "native"
+            m5_pointer_path = m5_native_root / "terms" / "ACTIVE.json"
+            if not m5_pointer_path.is_file() or m5_pointer_path.is_symlink():
+                raise BrokerTermsError("M5_DERIVED_SWAP_ACTIVE_TERMS_REQUIRED")
+            m5_pointer_sha = broker_terms_sha256_file(m5_pointer_path).lower()
+            if self._swap_terms_pointer_pin is None:
+                self._swap_terms_pointer_pin = m5_pointer_sha
+            elif self._swap_terms_pointer_pin != m5_pointer_sha:
+                raise BrokerTermsError(
+                    "broker terms activation changed during Backtester lifetime"
+                )
+            m5_symbol = str(spec.symbol or binding.get("symbol") or "").upper()
+            m5_key = (m5_pointer_sha, m5_symbol, "M5")
+            m5_resolved = self._swap_contract_cache.get(m5_key)
+            if m5_resolved is None:
+                m5_resolved = resolve_active_swap_contract(m5_native_root, m5_symbol, "M5")
+                m5_resolved_pointer_sha = str(
+                    m5_resolved.get("terms_active_pointer_sha256") or ""
+                ).strip().lower()
+                if (
+                    len(m5_resolved_pointer_sha) != 64
+                    or any(character not in "0123456789abcdef"
+                           for character in m5_resolved_pointer_sha)
+                    or m5_resolved_pointer_sha != m5_pointer_sha
+                ):
+                    raise BrokerTermsError(
+                        "broker terms activation changed during swap contract resolution"
+                    )
+                if len(self._swap_contract_cache) >= self._swap_contract_cache_max:
+                    oldest_key = next(iter(self._swap_contract_cache))
+                    self._swap_contract_cache.pop(oldest_key, None)
+                self._swap_contract_cache[m5_key] = m5_resolved
+            m5_expected_binding = {
+                "symbol": m5_symbol,
+                "timeframe": "M5",
+                "activation_id": str(m5_resolved.get("price_activation_id") or ""),
+                "activation_manifest_sha256": str(
+                    m5_resolved.get("price_activation_manifest_sha256") or ""
+                ).lower(),
+                "bars_sha256": str(m5_resolved.get("target_bars_sha256") or "").lower(),
+                "sidecar_sha256": str(m5_resolved.get("target_sidecar_sha256") or "").lower(),
+            }
+            m5_observed_binding = {
+                "symbol": binding["symbol"].upper(),
+                "timeframe": binding["timeframe"],
+                "activation_id": binding["activation_id"],
+                "activation_manifest_sha256": binding["activation_manifest_sha256"].lower(),
+                "bars_sha256": binding["bars_sha256"].lower(),
+                "sidecar_sha256": binding["sidecar_sha256"].lower(),
+            }
+            if m5_observed_binding != m5_expected_binding:
+                raise BrokerTermsError("M5_DERIVED_SWAP_BASE_BINDING_MISMATCH")
+            return project_session_events(list(m5_resolved.get("events") or []), features), m5_resolved
         if self._research_swap_context is not None:
             if not bool(getattr(self.config, "research_mode", False)):
                 raise BrokerTermsError("RESEARCH_SWAP_CONTEXT_REQUIRES_RESEARCH_MODE")

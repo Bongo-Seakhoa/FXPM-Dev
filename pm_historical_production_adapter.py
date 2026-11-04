@@ -1363,6 +1363,769 @@ def _frame_sha256(frame: pd.DataFrame) -> str:
     return digest.hexdigest()
 
 
+M5_SOURCE_COUNT_RECEIPT_SCHEMA = "fxpm.m5-derived-source-count-receipt.v1"
+
+
+def _declared_m5_plan_window(plan):
+    window, prefix = plan.get("m5_view_window"), plan.get("native_prefix")
+    fields = {"schema_version", "source_kind", "symbol", "timeframe", "m5_view_contract_sha256",
+              "view_key", "view_payload_sha256", "view_membership_sha256", "view_frame_sha256",
+              "view_start_utc", "view_end_exclusive_utc", "view_last_close_utc", "view_rows",
+              "base_native_prefix_index_sha256", "base_native_prefix_content_sha256"}
+    cell = plan.get("cell")
+    if (plan.get("source_kind") != "m5_derived" or type(window) is not dict or set(window) != fields
+            or window["schema_version"] != "fxpm.m5-derived-price-window.v1"
+            or window["source_kind"] != "m5_derived" or type(prefix) is not dict
+            or prefix.get("timeframe") != "M5" or prefix.get("source_state") != native_prefix.AVAILABLE
+            or type(cell) is not dict or window["symbol"] != cell.get("symbol")
+            or window["timeframe"] != cell.get("timeframe") or window["timeframe"] not in ("M15", "M30", "H1")
+            or type(window["view_rows"]) is not int or not 1 <= window["view_rows"] <= 10_000_000
+            or window["base_native_prefix_index_sha256"] != prefix.get("prefix_index_sha256")
+            or window["base_native_prefix_content_sha256"] != prefix.get("prefix_content_sha256")):
+        _fail("M5_ATTEMPT_VIEW_WINDOW_INVALID")
+    for key in ("m5_view_contract_sha256", "view_key", "view_payload_sha256", "view_membership_sha256",
+                "view_frame_sha256", "base_native_prefix_index_sha256", "base_native_prefix_content_sha256"):
+        _hex64(window[key], "M5_ATTEMPT_VIEW_WINDOW_INVALID")
+    start, end, latest = (_utc_seconds(window[key], "M5_ATTEMPT_VIEW_WINDOW_INVALID") for key in
+                          ("view_start_utc", "view_end_exclusive_utc", "view_last_close_utc"))
+    if not start < latest <= end:
+        _fail("M5_ATTEMPT_VIEW_WINDOW_INVALID")
+    return window
+
+
+def _declared_m5_count_fields(window):
+    return {"source_kind": "m5_derived", "base_timeframe": "M5",
+            "view_timeframe": window["timeframe"],
+            "m5_view_contract_sha256": window["m5_view_contract_sha256"],
+            "view_key": window["view_key"], "view_payload_sha256": window["view_payload_sha256"],
+            "view_membership_sha256": window["view_membership_sha256"],
+            "m5_view_window_sha256": _sha256(window)}
+
+
+def _declared_m5_capture_fitted(capture):
+    if type(capture) is not DeclaredSlotSearchCapture or not _declared_slot_is_m5_source(capture.request_body):
+        return None
+    _verify_declared_slot_capture(capture)
+    return capture.source_session._fitted
+
+
+def _strict_m5_attempt_artifacts(
+    raw_attempts: Sequence[Mapping[str, Any]],
+    *,
+    symbol: str,
+    timeframe: str,
+    regime: str,
+    plan_body: Mapping[str, Any],
+    plan_receipt_sha256: str,
+    native_prefix_product: native_prefix.NativePrefixProduct,
+    m5_fitted=None,
+    m5_price_frame=None,
+    m5_price_window=None,
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+    tuple[dict[str, Any], ...],
+]:
+    """Verify derived attempts against an original-owner registered price frame."""
+
+    if type(raw_attempts) not in {list, tuple} or not raw_attempts:
+        _fail("ATTEMPT_ARTIFACT_ROSTER_INVALID")
+    plan = dict(plan_body)
+    prefix = plan.get("native_prefix")
+    candidates = plan.get("candidates")
+    trials = plan.get("trials")
+    planned_attempts = plan.get("attempts")
+    if (
+        type(prefix) is not dict
+        or type(candidates) is not list
+        or type(trials) is not list
+        or type(planned_attempts) is not list
+        or len(planned_attempts) != len(raw_attempts)
+        or type(native_prefix_product) is not native_prefix.NativePrefixProduct
+    ):
+        _fail("ATTEMPT_SOURCE_AUTHORITY_INVALID")
+    import pm_authoritative_search_execution as search_execution
+    if m5_fitted is None:
+        if m5_price_frame is None or type(m5_price_window) is not dict:
+            _fail("M5_ATTEMPT_FITTED_SOURCE_INVALID")
+        frame, actual_window = m5_price_frame, m5_price_window
+    else:
+        if (m5_price_frame is not None or m5_price_window is not None
+                or type(m5_fitted) is not search_execution.FittedNativeSearchTimeframe
+                or m5_fitted.product is not native_prefix_product):
+            _fail("M5_ATTEMPT_FITTED_SOURCE_INVALID")
+        frame, actual_window = search_execution.m5_derived_fitted_frame(m5_fitted)
+    window = _declared_m5_plan_window(plan)
+    if (_canonical_bytes(window) != _canonical_bytes(actual_window)
+            or len(frame) != window["view_rows"] or _frame_sha256(frame) != window["view_frame_sha256"]):
+        _fail("M5_ATTEMPT_VIEW_WINDOW_MISMATCH")
+    if (
+        native_prefix_product.source_state != native_prefix.AVAILABLE
+        or native_prefix_product.index_sha256 != prefix.get("prefix_index_sha256")
+        or dict(native_prefix_product.native_prefix) != prefix
+        or plan.get("cell")
+        != {"symbol": symbol, "timeframe": timeframe, "regime": regime}
+    ):
+        _fail("ATTEMPT_SOURCE_PREFIX_BINDING_INVALID")
+
+    candidate_by_id = {
+        value.get("candidate_id"): value for value in candidates if type(value) is dict
+    }
+    trial_by_id = {
+        value.get("trial_id"): value for value in trials if type(value) is dict
+    }
+    trial_by_identity = {
+        (
+            value.get("strategy_id"),
+            value.get("strategy_release_sha256"),
+            value.get("parameter_set_sha256"),
+        ): value
+        for value in trials
+        if type(value) is dict
+    }
+    plan_attempt_by_pair = {
+        (value.get("candidate_id"), value.get("trial_id")): value
+        for value in planned_attempts
+        if type(value) is dict
+    }
+    if (
+        len(candidate_by_id) != len(candidates)
+        or len(trial_by_id) != len(trials)
+        or len(trial_by_identity) != len(trials)
+        or len(plan_attempt_by_pair) != len(planned_attempts)
+    ):
+        _fail("ATTEMPT_SOURCE_PLAN_ROSTER_INVALID")
+
+    prefix_end = _utc_seconds(
+        window["view_end_exclusive_utc"], "ATTEMPT_SOURCE_PREFIX_END_INVALID"
+    )
+    prefix_latest = _utc_seconds(
+        window["view_last_close_utc"], "ATTEMPT_SOURCE_PREFIX_LATEST_INVALID"
+    )
+    prefix_content_sha256 = _hex64(
+        window["view_payload_sha256"],
+        "ATTEMPT_SOURCE_PREFIX_CONTENT_INVALID",
+    )
+    opens = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="coerce"))
+    closes = pd.DatetimeIndex(
+        pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+    )
+    if opens.isna().any() or closes.isna().any():
+        _fail("ATTEMPT_SOURCE_FRAME_TIMESTAMP_INVALID")
+
+    # This module is imported by the authoritative executor, so keep the
+    # reverse dependency local.  Reusing the executor's helper is intentional:
+    # the planner, executor, and this independent reopen must realize the exact
+    # same cutoff-anchored window rather than duplicating calendar arithmetic.
+    try:
+        import pm_authoritative_search_execution as search_execution
+    except Exception as exc:
+        raise HistoricalProductionAdapterError(
+            "ATTEMPT_SOURCE_CUTOFF_HELPER_UNAVAILABLE"
+        ) from exc
+
+    fit_end_ts = pd.Timestamp(prefix_end)
+    candidate_windows: dict[tuple[str, int], tuple[dict[str, Any], str, int, str]] = {}
+    for candidate in candidates:
+        if type(candidate) is not dict:
+            _fail("ATTEMPT_SOURCE_CANDIDATE_SEMANTIC_IDENTITY_INVALID")
+        identity = (candidate.get("lookback_kind"), candidate.get("lookback_value"))
+        if (
+            type(identity[0]) is not str
+            or type(identity[1]) is not int
+            or identity in candidate_windows
+        ):
+            _fail("ATTEMPT_SOURCE_CANDIDATE_SEMANTIC_IDENTITY_INVALID")
+        try:
+            expected_start_ts, expected_count = (
+                search_execution._realize_cutoff_refit_window(
+                    opens=opens,
+                    closes=closes,
+                    fit_end=fit_end_ts,
+                    lookback_kind=identity[0],
+                    lookback_value=identity[1],
+                    state_context_bars=0,
+                    boundary_limited=True,
+                )
+            )
+        except search_execution.AuthoritativeSearchExecutionError as exc:
+            raise HistoricalProductionAdapterError(
+                "ATTEMPT_SOURCE_CUTOFF_REFIT_WINDOW_INVALID"
+            ) from exc
+        expected_start = _utc_seconds(
+            expected_start_ts.isoformat(),
+            "ATTEMPT_SOURCE_FIT_START_INVALID",
+        )
+        mask = (
+            (opens >= expected_start_ts) & (opens < fit_end_ts) & (closes <= fit_end_ts)
+        )
+        selected = frame.loc[mask].copy(deep=True)
+        source_bar_count = len(selected)
+        if (
+            source_bar_count != expected_count
+            or not 2 <= source_bar_count <= 10_000_000
+            or selected.empty
+            or _utc_seconds(
+                pd.Timestamp(selected["_BAR_CLOSE_TS"].iloc[-1]).isoformat(),
+                "ATTEMPT_SOURCE_SELECTED_LATEST_INVALID",
+            )
+            != prefix_latest
+        ):
+            _fail("ATTEMPT_SOURCE_INTERVAL_BINDING_INVALID")
+        candidate_windows[identity] = (
+            candidate,
+            expected_start,
+            source_bar_count,
+            _frame_sha256(selected),
+        )
+
+    normalized: list[dict[str, Any]] = []
+    execution_contracts: list[dict[str, Any]] = []
+    count_receipts: list[dict[str, Any]] = []
+    mapped_attempt_ids: list[str] = []
+    for ordinal, raw in enumerate(raw_attempts):
+        code = f"ATTEMPT_{ordinal:04d}_EXECUTABLE_ARTIFACT_INVALID"
+        if type(raw) is not dict or set(raw) != _ATTEMPT_ARTIFACT_KEYS:
+            _fail(code)
+        bodies = {name: raw.get(name) for name in _ATTEMPT_ARTIFACT_KEYS}
+        if any(type(body) is not dict for body in bodies.values()):
+            _fail(code)
+        process = bodies["winner_process"]
+        horizon = bodies["horizon_process"]
+        trial_definition = bodies["trial_definition"]
+        recipe = bodies["refit_recipe"]
+        assert isinstance(process, dict)
+        assert isinstance(horizon, dict)
+        assert isinstance(trial_definition, dict)
+        assert isinstance(recipe, dict)
+
+        candidate_window = candidate_windows.get(
+            (horizon.get("lookback_kind"), horizon.get("lookback_value"))
+        )
+        parameter_sha256 = _sha256(trial_definition.get("parameters"))
+        trial = trial_by_identity.get(
+            (
+                process.get("strategy_id"),
+                process.get("strategy_code_sha256"),
+                parameter_sha256,
+            )
+        )
+        if candidate_window is None or trial is None:
+            _fail("ATTEMPT_SOURCE_PLAN_MAPPING_INVALID")
+        candidate, fit_start, source_bar_count, fit_frame_sha256 = candidate_window
+        planned = plan_attempt_by_pair.get(
+            (candidate.get("candidate_id"), trial.get("trial_id"))
+        )
+        if (
+            type(planned) is not dict
+            or planned.get("attempt_id") in mapped_attempt_ids
+            or planned.get("strategy_id") != process.get("strategy_id")
+        ):
+            _fail("ATTEMPT_SOURCE_PLAN_MAPPING_INVALID")
+
+        if (
+            _utc_seconds(
+                horizon.get("fit_start_utc"), "ATTEMPT_SOURCE_FIT_START_INVALID"
+            )
+            != fit_start
+            or _utc_seconds(
+                horizon.get("fit_end_utc"), "ATTEMPT_SOURCE_FIT_END_INVALID"
+            )
+            != prefix_end
+            or _utc_seconds(
+                horizon.get("latest_closed_bar_utc"),
+                "ATTEMPT_SOURCE_LATEST_CLOSED_INVALID",
+            )
+            != prefix_latest
+            or horizon.get("source_snapshot_sha256") != prefix_content_sha256
+            or horizon.get("source_bar_count") != source_bar_count
+        ):
+            _fail("ATTEMPT_SOURCE_CUTOFF_REFIT_WINDOW_INVALID")
+        lookback_kind = candidate.get("lookback_kind")
+        lookback_value = candidate.get("lookback_value")
+        if (
+            type(lookback_kind) is not str
+            or type(lookback_value) is not int
+            or (
+                lookback_kind == "NATIVE_OBSERVATIONS"
+                and lookback_value != source_bar_count
+            )
+        ):
+            _fail("ATTEMPT_SOURCE_LOOKBACK_BINDING_INVALID")
+        contract = {
+            "lookback_kind": lookback_kind,
+            "lookback_value": lookback_value,
+            "source_bar_count": source_bar_count,
+        }
+        receipt_body = {
+            "schema_version": M5_SOURCE_COUNT_RECEIPT_SCHEMA,
+            **_declared_m5_count_fields(window),
+            "anchor_id": plan["anchor"]["anchor_id"],
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "regime": regime,
+            "horizon_plan_receipt_sha256": _hex64(
+                plan_receipt_sha256, "ATTEMPT_SOURCE_PLAN_RECEIPT_INVALID"
+            ),
+            "native_prefix_index_sha256": native_prefix_product.index_sha256,
+            "native_prefix_content_sha256": prefix["prefix_content_sha256"],
+            "horizon_attempt_id": planned["attempt_id"],
+            "horizon_candidate_id": candidate["candidate_id"],
+            "horizon_candidate_definition_sha256": candidate[
+                "candidate_definition_sha256"
+            ],
+            "lookback_kind": lookback_kind,
+            "lookback_value": lookback_value,
+            "fit_start_utc": fit_start,
+            "fit_end_exclusive_utc": prefix_end,
+            "latest_closed_bar_utc": prefix_latest,
+            "source_bar_count": source_bar_count,
+            "fit_frame_sha256": fit_frame_sha256,
+        }
+        receipt = {**receipt_body, "receipt_sha256": _sha256(receipt_body)}
+        try:
+            verified = current_refit.verify_current_refit_search_artifacts_bytes_v2(
+                winner_process_bytes=_canonical_bytes(process),
+                horizon_process_bytes=_canonical_bytes(horizon),
+                trial_definition_bytes=_canonical_bytes(trial_definition),
+                refit_recipe_bytes=_canonical_bytes(recipe),
+                symbol=symbol,
+                timeframe=timeframe,
+                regime=regime,
+                strategy_id=trial.get("strategy_id"),
+                lookback_kind=lookback_kind,
+                lookback_value=lookback_value,
+                fit_start_utc=fit_start,
+                fit_end_utc=prefix_end,
+                latest_closed_bar_utc=prefix_latest,
+                source_snapshot_sha256=prefix_content_sha256,
+                source_bar_count=source_bar_count,
+                seed=recipe.get("seed"),
+            )
+        except Exception as exc:
+            raise HistoricalProductionAdapterError(code) from exc
+        normalized.append(
+            {
+                "winner_process": verified.winner_process,
+                "horizon_process": verified.horizon_process,
+                "trial_definition": verified.trial_definition,
+                "refit_recipe": verified.refit_recipe,
+            }
+        )
+        execution_contracts.append(contract)
+        count_receipts.append(receipt)
+        mapped_attempt_ids.append(planned["attempt_id"])
+    if mapped_attempt_ids != [value.get("attempt_id") for value in planned_attempts]:
+        _fail("ATTEMPT_SOURCE_PLAN_ORDER_OR_COVERAGE_INVALID")
+    return tuple(normalized), tuple(execution_contracts), tuple(count_receipts)
+
+
+def _cross_binding_body_m5(
+    *,
+    plan_body: Mapping[str, Any],
+    plan_receipt_sha256: str,
+    frozen: raw_winner.FrozenWinnerSearchPlan,
+    attempt_artifacts: Sequence[Mapping[str, Any]],
+    producer_request_sha256: str,
+    anchor_id: str,
+    artifact_namespace: str,
+    source_group_decision_sha256: str,
+    regime_fit_decision_sha256: str,
+    horizon_execution_contracts: Sequence[Mapping[str, Any]],
+    source_count_receipts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Bijection between different Horizon and Winner canonical schemas."""
+
+    plan = dict(plan_body)
+    window = _declared_m5_plan_window(plan)
+    roster_fields = {
+        "candidate_registry_sha256": "candidate_registry",
+        "trial_registry_sha256": "trial_registry",
+        "attempt_roster_sha256": "attempts",
+        "evidence_roster_sha256": "expected_evaluations",
+    }
+    for digest_name, roster_name in roster_fields.items():
+        roster = plan.get(roster_name)
+        if type(roster) is not list or plan.get(digest_name) != _sha256(roster):
+            _fail("HORIZON_COMMITMENT_ROSTER_INVALID")
+    if plan.get("plan_status") not in {
+        "READY_FOR_HISTORICAL_EVIDENCE",
+        "HISTORICAL_BOUNDARY_LIMITED",
+    }:
+        _fail("HORIZON_PLAN_NOT_SEARCHABLE")
+    prefix = plan.get("native_prefix")
+    if type(prefix) is not dict or prefix.get("source_state") != "AVAILABLE":
+        _fail("HORIZON_NATIVE_PREFIX_INVALID")
+    try:
+        precommitment = frozen.precommitment
+        attempt_ledger = frozen.attempt_ledger
+    except Exception as exc:
+        raise HistoricalProductionAdapterError(
+            "WINNER_FROZEN_COMMITMENTS_INVALID"
+        ) from exc
+    raw_attempts = attempt_ledger.get("attempts")
+    raw_folds = precommitment.get("causal_fold_plan")
+    horizon_attempts = plan.get("attempts")
+    expected_evaluations = plan.get("expected_evaluations")
+    candidates = plan.get("candidates")
+    trials = plan.get("trials")
+    if (
+        type(raw_attempts) is not list
+        or type(raw_folds) is not list
+        or type(horizon_attempts) is not list
+        or type(expected_evaluations) is not list
+        or type(candidates) is not list
+        or type(trials) is not list
+        or len(raw_attempts) != len(attempt_artifacts)
+        or len(raw_attempts) != len(horizon_attempts)
+        or type(horizon_execution_contracts) not in {list, tuple}
+        or type(source_count_receipts) not in {list, tuple}
+        or len(horizon_execution_contracts) != len(raw_attempts)
+        or len(source_count_receipts) != len(raw_attempts)
+    ):
+        _fail("HORIZON_WINNER_ROSTER_CARDINALITY_MISMATCH")
+    candidate_by_id = {
+        value.get("candidate_id"): value for value in candidates if type(value) is dict
+    }
+    trial_by_id = {
+        value.get("trial_id"): value for value in trials if type(value) is dict
+    }
+    trial_by_identity = {
+        (
+            value.get("strategy_id"),
+            value.get("strategy_release_sha256"),
+            value.get("parameter_set_sha256"),
+        ): value
+        for value in trials
+        if type(value) is dict
+    }
+    candidate_by_identity: dict[tuple[str, int], dict[str, Any]] = {}
+    for value in candidates:
+        if type(value) is not dict:
+            _fail("HORIZON_IDENTITY_ROSTER_INVALID")
+        identity = (value.get("lookback_kind"), value.get("lookback_value"))
+        if (
+            type(identity[0]) is not str
+            or type(identity[1]) is not int
+            or identity in candidate_by_identity
+        ):
+            _fail("HORIZON_IDENTITY_ROSTER_INVALID")
+        candidate_by_identity[identity] = value
+    if (
+        len(candidate_by_id) != len(candidates)
+        or len(candidate_by_identity) != len(candidates)
+        or len(trial_by_id) != len(trials)
+        or len(trial_by_identity) != len(trials)
+    ):
+        _fail("HORIZON_IDENTITY_ROSTER_INVALID")
+    plan_attempt_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for value in horizon_attempts:
+        if type(value) is not dict:
+            _fail("HORIZON_ATTEMPT_ROSTER_INVALID")
+        pair = (value.get("candidate_id"), value.get("trial_id"))
+        if pair in plan_attempt_by_pair:
+            _fail("HORIZON_ATTEMPT_ROSTER_INVALID")
+        plan_attempt_by_pair[pair] = value
+
+    expected_by_attempt: dict[str, list[dict[str, Any]]] = {}
+    for value in expected_evaluations:
+        if type(value) is not dict or type(value.get("attempt_id")) is not str:
+            _fail("HORIZON_EVIDENCE_ROSTER_INVALID")
+        expected_by_attempt.setdefault(value["attempt_id"], []).append(value)
+
+    prefix_end = _utc_seconds(
+        window["view_end_exclusive_utc"], "HORIZON_PREFIX_END_INVALID"
+    )
+    prefix_latest = _utc_seconds(
+        window["view_last_close_utc"], "HORIZON_PREFIX_LATEST_INVALID"
+    )
+    prefix_sha = _hex64(
+        window["view_payload_sha256"], "HORIZON_PREFIX_SHA256_INVALID"
+    )
+    generation = winner_selection.winner_generation_for_precommitment(precommitment)
+    current_costs = not generation.archived
+    pair_field = "frozen_tier_pair_contract_sha256" if current_costs else "cost_ladder_contract_sha256"
+    policy = plan.get("horizon_policy")
+    if (
+        type(policy) is not dict
+        or policy.get("cost_contract_sha256")
+        != precommitment.get("cost_contract_sha256")
+        or policy.get(pair_field) != precommitment.get(pair_field)
+    ):
+        _fail("HORIZON_WINNER_COST_CONTRACT_SPLICE")
+
+    mapping: list[dict[str, Any]] = []
+    mapped_horizon_attempts: list[str] = []
+    for ordinal, (
+        raw_attempt,
+        artifacts,
+        execution_contract,
+        count_receipt,
+    ) in enumerate(
+        zip(
+            raw_attempts,
+            attempt_artifacts,
+            horizon_execution_contracts,
+            source_count_receipts,
+            strict=True,
+        )
+    ):
+        if (
+            type(raw_attempt) is not dict
+            or type(artifacts) is not dict
+            or type(execution_contract) is not dict
+            or set(execution_contract)
+            != {"lookback_kind", "lookback_value", "source_bar_count"}
+            or type(count_receipt) is not dict
+        ):
+            _fail("HORIZON_WINNER_ATTEMPT_INVALID")
+        process = artifacts.get("winner_process")
+        horizon = artifacts.get("horizon_process")
+        trial_definition = artifacts.get("trial_definition")
+        recipe = artifacts.get("refit_recipe")
+        if any(
+            type(value) is not dict
+            for value in (process, horizon, trial_definition, recipe)
+        ):
+            _fail("HORIZON_WINNER_ATTEMPT_INVALID")
+        artifact_hashes = {
+            "process_sha256": _sha256(process),
+            "horizon_process_sha256": _sha256(horizon),
+            "trial_definition_sha256": _sha256(trial_definition),
+            "refit_recipe_sha256": _sha256(recipe),
+        }
+        if any(
+            raw_attempt.get(name) != value for name, value in artifact_hashes.items()
+        ):
+            _fail("HORIZON_WINNER_ATTEMPT_ARTIFACT_SPLICE")
+        if (
+            horizon.get("symbol") != frozen.symbol
+            or horizon.get("timeframe") != frozen.timeframe
+            or _utc_seconds(horizon.get("fit_end_utc"), "WINNER_FIT_END_INVALID")
+            != prefix_end
+            or _utc_seconds(
+                horizon.get("latest_closed_bar_utc"),
+                "WINNER_LATEST_CLOSED_BAR_INVALID",
+            )
+            != prefix_latest
+            or horizon.get("source_snapshot_sha256") != prefix_sha
+        ):
+            _fail("HORIZON_WINNER_SOURCE_PREFIX_SPLICE")
+        fit_start = _utc_seconds(
+            horizon.get("fit_start_utc"), "WINNER_FIT_START_INVALID"
+        )
+        candidate = candidate_by_identity.get(
+            (horizon.get("lookback_kind"), horizon.get("lookback_value"))
+        )
+        if candidate is None:
+            _fail("HORIZON_WINNER_CANDIDATE_MAPPING_INVALID")
+        parameter_sha = _sha256(trial_definition.get("parameters"))
+        trial = trial_by_identity.get(
+            (
+                process.get("strategy_id"),
+                process.get("strategy_code_sha256"),
+                parameter_sha,
+            )
+        )
+        if trial is None:
+            _fail("HORIZON_WINNER_TRIAL_MAPPING_INVALID")
+        planned = plan_attempt_by_pair.get(
+            (candidate.get("candidate_id"), trial.get("trial_id"))
+        )
+        if planned is None or planned.get("attempt_id") in mapped_horizon_attempts:
+            _fail("HORIZON_WINNER_ATTEMPT_MAPPING_INVALID")
+        if planned.get("strategy_id") != process.get("strategy_id"):
+            _fail("HORIZON_WINNER_ATTEMPT_MAPPING_INVALID")
+        count_body = dict(count_receipt)
+        count_sha256 = count_body.pop("receipt_sha256", None)
+        if (
+            count_sha256 != _sha256(count_body)
+            or count_receipt.get("schema_version") != M5_SOURCE_COUNT_RECEIPT_SCHEMA
+            or any(count_receipt.get(key) != value for key, value in _declared_m5_count_fields(window).items())
+            or count_receipt.get("horizon_plan_receipt_sha256") != plan_receipt_sha256
+            or count_receipt.get("native_prefix_index_sha256")
+            != prefix.get("prefix_index_sha256")
+            or count_receipt.get("native_prefix_content_sha256") != prefix["prefix_content_sha256"]
+            or count_receipt.get("horizon_attempt_id") != planned.get("attempt_id")
+            or count_receipt.get("horizon_candidate_id")
+            != candidate.get("candidate_id")
+            or count_receipt.get("horizon_candidate_definition_sha256")
+            != candidate.get("candidate_definition_sha256")
+            or any(
+                count_receipt.get(name) != execution_contract.get(name)
+                for name in (
+                    "lookback_kind",
+                    "lookback_value",
+                    "source_bar_count",
+                )
+            )
+            or horizon.get("lookback_kind") != execution_contract.get("lookback_kind")
+            or horizon.get("lookback_value") != execution_contract.get("lookback_value")
+            or horizon.get("source_bar_count")
+            != execution_contract.get("source_bar_count")
+            or _utc_seconds(
+                count_receipt.get("fit_start_utc"),
+                "HORIZON_WINNER_SOURCE_COUNT_FIT_START_INVALID",
+            )
+            != fit_start
+            or _utc_seconds(
+                count_receipt.get("fit_end_exclusive_utc"),
+                "HORIZON_WINNER_SOURCE_COUNT_FIT_END_INVALID",
+            )
+            != prefix_end
+            or _utc_seconds(
+                count_receipt.get("latest_closed_bar_utc"),
+                "HORIZON_WINNER_SOURCE_COUNT_LATEST_INVALID",
+            )
+            != prefix_latest
+        ):
+            _fail("HORIZON_WINNER_SOURCE_COUNT_RECEIPT_INVALID")
+        planned_evidence = expected_by_attempt.get(planned.get("attempt_id"), [])
+        fold_mapping: list[dict[str, Any]] = []
+        if planned.get("status") == "PLANNED":
+            causal_evidence = [
+                value
+                for value in planned_evidence
+                if value.get("downstream_causal_eligible") is True
+            ]
+            if len(causal_evidence) != len(raw_folds):
+                _fail("HORIZON_WINNER_FOLD_CARDINALITY_MISMATCH")
+            for raw_fold, expected in zip(raw_folds, causal_evidence, strict=True):
+                if type(raw_fold) is not dict:
+                    _fail("HORIZON_WINNER_FOLD_MAPPING_INVALID")
+                start = _utc_seconds(
+                    expected.get("validation_start_utc"),
+                    "HORIZON_VALIDATION_START_INVALID",
+                )
+                end = _utc_seconds(
+                    expected.get("validation_end_exclusive_utc"),
+                    "HORIZON_VALIDATION_END_INVALID",
+                )
+                start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                if (
+                    start_dt.time() != datetime.min.time()
+                    or end_dt.time() != datetime.min.time()
+                    or raw_fold.get("anchor_as_of_utc") != start
+                    or raw_fold.get("oos_start_date_utc") != start_dt.date().isoformat()
+                    or raw_fold.get("oos_end_date_utc")
+                    != (end_dt.date() - timedelta(days=1)).isoformat()
+                    or expected.get("expected_status") != "EVALUATION_REQUIRED"
+                ):
+                    _fail("HORIZON_WINNER_FOLD_MAPPING_INVALID")
+                candidate_fold = next(
+                    (
+                        value
+                        for value in candidate.get("folds", [])
+                        if type(value) is dict
+                        and value.get("fold_id") == expected.get("fold_id")
+                    ),
+                    None,
+                )
+                if type(candidate_fold) is not dict:
+                    _fail("HORIZON_WINNER_FOLD_DEFINITION_MISSING")
+                fold_mapping.append(
+                    {
+                        "horizon_fold_id": expected.get("fold_id"),
+                        "horizon_fold_definition_sha256": candidate_fold.get(
+                            "fold_definition_sha256"
+                        ),
+                        "horizon_context_sha256": expected.get("context_sha256"),
+                        "winner_fold_id": raw_fold.get("fold_id"),
+                        "validation_start_utc": start,
+                        "validation_end_exclusive_utc": end,
+                    }
+                )
+        elif planned.get("status") == "PROCESS_REJECTED":
+            if not planned_evidence or any(
+                value.get("expected_status") != "PROCESS_REJECTED"
+                for value in planned_evidence
+            ):
+                _fail("HORIZON_WINNER_TERMINAL_MAPPING_INVALID")
+        else:
+            _fail("HORIZON_WINNER_ATTEMPT_STATUS_INVALID")
+        mapped_horizon_attempts.append(planned["attempt_id"])
+        mapping.append(
+            {
+                "ordinal": ordinal,
+                "horizon_attempt_id": planned["attempt_id"],
+                "horizon_candidate_id": candidate["candidate_id"],
+                "horizon_candidate_definition_sha256": candidate[
+                    "candidate_definition_sha256"
+                ],
+                "horizon_trial_id": trial["trial_id"],
+                "horizon_trial_definition_sha256": trial["trial_definition_sha256"],
+                "winner_attempt_id": raw_attempt.get("attempt_id"),
+                "winner_process_candidate_id": raw_attempt.get("process_candidate_id"),
+                "horizon_execution_contract": dict(execution_contract),
+                "source_count_receipt": dict(count_receipt),
+                **artifact_hashes,
+                "fold_mapping": fold_mapping,
+                "fold_mapping_sha256": _sha256(fold_mapping),
+            }
+        )
+    expected_order = [value.get("attempt_id") for value in horizon_attempts]
+    if mapped_horizon_attempts != expected_order:
+        _fail("HORIZON_WINNER_ATTEMPT_ORDER_OR_COVERAGE_INVALID")
+
+    horizon_roster = {
+        "plan_receipt_sha256": _hex64(
+            plan_receipt_sha256, "HORIZON_PLAN_RECEIPT_INVALID"
+        ),
+        "source_prefix_receipt_sha256": plan.get("source_prefix_receipt_sha256"),
+        **{name: plan[name] for name in roster_fields},
+    }
+    winner_roster = {
+        "precommitment_sha256": _sha256(precommitment),
+        "attempt_ledger_sha256": _sha256(attempt_ledger),
+        "frozen_receipt_sha256": hashlib.sha256(
+            frozen.frozen_receipt_bytes
+        ).hexdigest(),
+        "process_registry_sha256": precommitment.get("process_registry_sha256"),
+        "horizon_registry_sha256": precommitment.get("horizon_registry_sha256"),
+        "trial_registry_sha256": precommitment.get("trial_registry_sha256"),
+        "attempts_sha256": attempt_ledger.get("attempts_sha256"),
+        "causal_fold_plan_sha256": precommitment.get("causal_fold_plan_sha256"),
+        "source_contract_sha256": precommitment.get("source_contract_sha256"),
+        "cost_contract_sha256": precommitment.get("cost_contract_sha256"),
+        pair_field: precommitment.get(pair_field),
+    }
+    if current_costs:
+        winner_roster["partition_cost_precommitments_sha256"] = precommitment.get("partition_cost_precommitments_sha256")
+    for value in winner_roster.values():
+        _hex64(value, "WINNER_CROSS_BINDING_ROSTER_INVALID")
+    return {
+        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+                           if generation is winner_selection.V16_GENERATION
+                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3
+                           if current_costs else HORIZON_WINNER_CROSS_BINDING_SCHEMA),
+        "producer_request_sha256": producer_request_sha256,
+        "anchor_id": anchor_id,
+        "selection_cutoff_utc": plan["anchor"]["selection_cutoff_utc"],
+        "process_precommit_receipt_sha256": plan["anchor"][
+            "process_precommit_receipt_sha256"
+        ],
+        "source_group_decision_sha256": source_group_decision_sha256,
+        "regime_fit_decision_sha256": regime_fit_decision_sha256,
+        "native_prefix_index_sha256": _hex64(
+            prefix.get("prefix_index_sha256"),
+            "HORIZON_PREFIX_INDEX_SHA256_INVALID",
+        ),
+        "symbol": frozen.symbol,
+        "timeframe": frozen.timeframe,
+        "regime": frozen.regime,
+        "artifact_namespace": artifact_namespace,
+        "horizon_roster": horizon_roster,
+        "winner_roster": winner_roster,
+        "mapping_count": len(mapping),
+        "mapping_sha256": _sha256(mapping),
+        "mapping": mapping,
+        "bijective_coverage": True,
+        "created_before_winner_evidence_access": True,
+        "confers_causal_current_live_or_capital_authority": False,
+    }
+
+
 def _strict_attempt_artifacts(
     raw_attempts: Sequence[Mapping[str, Any]],
     *,
@@ -1372,12 +2135,19 @@ def _strict_attempt_artifacts(
     plan_body: Mapping[str, Any],
     plan_receipt_sha256: str,
     native_prefix_product: native_prefix.NativePrefixProduct,
+    m5_fitted=None,
 ) -> tuple[
     tuple[dict[str, Any], ...],
     tuple[dict[str, Any], ...],
     tuple[dict[str, Any], ...],
 ]:
     """Reopen native bytes and verify every executable attempt before freeze."""
+    if plan_body.get("source_kind") == "m5_derived":
+        return _strict_m5_attempt_artifacts(raw_attempts, symbol=symbol, timeframe=timeframe,
+            regime=regime, plan_body=plan_body, plan_receipt_sha256=plan_receipt_sha256,
+            native_prefix_product=native_prefix_product, m5_fitted=m5_fitted)
+    if m5_fitted is not None:
+        _fail("NATIVE_ATTEMPT_REJECTS_M5_FITTED_SOURCE")
 
     if type(raw_attempts) not in {list, tuple} or not raw_attempts:
         _fail("ATTEMPT_ARTIFACT_ROSTER_INVALID")
@@ -1777,6 +2547,8 @@ def _cross_binding_body(
     source_count_receipts: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Bijection between different Horizon and Winner canonical schemas."""
+    if plan_body.get("source_kind") == "m5_derived":
+        return _cross_binding_body_m5(plan_body=plan_body, plan_receipt_sha256=plan_receipt_sha256, frozen=frozen, attempt_artifacts=attempt_artifacts, producer_request_sha256=producer_request_sha256, anchor_id=anchor_id, artifact_namespace=artifact_namespace, source_group_decision_sha256=source_group_decision_sha256, regime_fit_decision_sha256=regime_fit_decision_sha256, horizon_execution_contracts=horizon_execution_contracts, source_count_receipts=source_count_receipts)
 
     plan = dict(plan_body)
     roster_fields = {
@@ -2916,17 +3688,32 @@ class HistoricalSymbolSearchCapture:
             or int((support.get("counts") or {}).get(regime, 0)) <= 0
         ):
             _fail("CELL_FREEZE_REQUIRES_OBSERVED_REGIME")
-        normalized_attempts, execution_contracts, count_receipts = (
-            _strict_attempt_artifacts(
-                attempt_artifacts,
-                symbol=self.symbol,
-                timeframe=timeframe,
-                regime=regime,
-                plan_body=self._horizon_plan_bodies[key],
-                plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
-                native_prefix_product=native_prefix_product,
+        m5_fitted = _declared_m5_capture_fitted(self)
+        if m5_fitted is None:
+            normalized_attempts, execution_contracts, count_receipts = (
+                _strict_attempt_artifacts(
+                    attempt_artifacts,
+                    symbol=self.symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    plan_body=self._horizon_plan_bodies[key],
+                    plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
+                    native_prefix_product=native_prefix_product,
+                )
             )
-        )
+        else:
+            normalized_attempts, execution_contracts, count_receipts = (
+                _strict_attempt_artifacts(
+                    attempt_artifacts,
+                    symbol=self.symbol,
+                    timeframe=timeframe,
+                    regime=regime,
+                    plan_body=self._horizon_plan_bodies[key],
+                    plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
+                    native_prefix_product=native_prefix_product,
+                m5_fitted=m5_fitted,
+                )
+            )
         precommitted_evidence_roles = _precommitted_evidence_roles(
             self._horizon_plan_bodies[key], len(normalized_attempts)
         )
@@ -3055,19 +3842,36 @@ class HistoricalSymbolSearchCapture:
 
         self._require_active(handle)
         key = (handle.timeframe, handle.regime)
-        (
-            replayed_attempts,
-            replayed_execution_contracts,
-            replayed_count_receipts,
-        ) = _strict_attempt_artifacts(
-            handle._attempt_artifacts,
-            symbol=self.symbol,
-            timeframe=handle.timeframe,
-            regime=handle.regime,
-            plan_body=self._horizon_plan_bodies[key],
-            plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
-            native_prefix_product=handle._native_prefix_product,
-        )
+        m5_fitted = _declared_m5_capture_fitted(self)
+        if m5_fitted is None:
+            (
+                replayed_attempts,
+                replayed_execution_contracts,
+                replayed_count_receipts,
+            ) = _strict_attempt_artifacts(
+                handle._attempt_artifacts,
+                symbol=self.symbol,
+                timeframe=handle.timeframe,
+                regime=handle.regime,
+                plan_body=self._horizon_plan_bodies[key],
+                plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
+                native_prefix_product=handle._native_prefix_product,
+            )
+        else:
+            (
+                replayed_attempts,
+                replayed_execution_contracts,
+                replayed_count_receipts,
+            ) = _strict_attempt_artifacts(
+                handle._attempt_artifacts,
+                symbol=self.symbol,
+                timeframe=handle.timeframe,
+                regime=handle.regime,
+                plan_body=self._horizon_plan_bodies[key],
+                plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
+                native_prefix_product=handle._native_prefix_product,
+                m5_fitted=m5_fitted,
+            )
         if (
             _canonical_bytes(replayed_attempts)
             != _canonical_bytes(handle._attempt_artifacts)
@@ -5860,6 +6664,32 @@ __all__ = [
 
 
 DECLARED_SLOT_COMPLETION_SCHEMA = "fxpm.declared-slot-completion.v1"
+DECLARED_DEVELOPMENT_SLOT_COMPLETION_SCHEMA = "fxpm.declared-development-slot-completion.v1"
+
+
+def declared_slot_completion_schema(request_body):
+    """Choose the wire kind; request authentication remains with orchestration."""
+    if type(request_body) is not dict:
+        _fail("DECLARED_SLOT_COMPLETION_INVALID")
+    scope = orchestration.declared_slot_development_scope(request_body)
+    return (DECLARED_DEVELOPMENT_SLOT_COMPLETION_SCHEMA if scope is not None
+            else DECLARED_SLOT_COMPLETION_SCHEMA)
+
+
+def _declared_development_completion_binding(completion, request_body, parent=None):
+    scope = orchestration.declared_slot_development_scope(request_body)
+    if scope is None:
+        if any(key in completion for key in (
+                "development_scope_sha256", "design_contaminated", "pristine_validation")):
+            _fail("DECLARED_SLOT_DEVELOPMENT_SCOPE_INVALID")
+        return
+    expected = request_body["development_scope_sha256"]
+    if (completion.get("development_scope_sha256") != expected
+            or completion.get("design_contaminated") is not True
+            or completion.get("pristine_validation") is not False
+            or (parent is not None and (orchestration.declared_slot_development_scope(parent) != scope
+                or parent.get("development_scope_sha256") != expected))):
+        _fail("DECLARED_SLOT_DEVELOPMENT_SCOPE_INVALID")
 
 
 class DeclaredSlotSearchCapture(HistoricalSymbolSearchCapture):
@@ -5892,13 +6722,15 @@ class DeclaredSlotSearchCapture(HistoricalSymbolSearchCapture):
             completion=header, parent=self.request._precommit.to_dict(),
             body=self.request_body, request=self.request, plan=plan,
             source=fitted.source_group_decision, fit=fitted.regime_fit_decision,
-            entries=entries, precommit=self.request._precommit)
+            entries=entries, precommit=self.request._precommit,
+            **({"m5_fitted": fitted} if _declared_slot_is_m5_source(self.request_body) else {}))
         key = (self.request_body["timeframe"], self.regime)
         normalized, contracts, counts = _strict_attempt_artifacts(attempt_artifacts,
             symbol=self.symbol, timeframe=key[0], regime=key[1],
             plan_body=self._horizon_plan_bodies[key],
             plan_receipt_sha256=self._bindings[key]["plan_receipt_sha256"],
-            native_prefix_product=native_prefix_product)
+            native_prefix_product=native_prefix_product,
+            **({"m5_fitted": fitted} if _declared_slot_is_m5_source(self.request_body) else {}))
         handle = FrozenHistoricalCell(symbol=self.symbol, timeframe=key[0], regime=key[1],
             frozen=frozen, frozen_receipt_descriptor=header["frozen_plan_receipt"],
             frozen_descriptor_graph=header["frozen_descriptor_graph"],
@@ -6068,7 +6900,8 @@ def _make_declared_slot_capture_authority():
         session = producer._verified_declared_slot_source_session(context,
             request=request, process=process, source_session=source_session)
         sink = request.symbol_sink(body["symbol"])
-        planner.verify_production_cell_search_plan(context, process=process, sink=sink, plan=plan)
+        (planner.verify_m5_derived_production_cell_search_plan if _declared_slot_is_m5_source(body)
+            else planner.verify_production_cell_search_plan)(context, process=process, sink=sink, plan=plan)
         if (plan.mode != "DECLARED_SLOT_UNISSUED" or plan._declared_slot_request is not request
                 or (plan.symbol, plan.timeframe, plan.regime) != (body["symbol"], body["timeframe"], body["regime"])):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
@@ -6111,7 +6944,7 @@ def _declared_capture_completion_body(capture, *, status, reason_code, handle, c
     plan = capture.cell_plan
     horizon_entry = capture.sink.put_json(f"{body['artifact_namespace']}/horizon-plan",
         "declared_slot_horizon_plan", plan.horizon_plan.to_dict())
-    result = {"schema_version": DECLARED_SLOT_COMPLETION_SCHEMA,
+    result = {"schema_version": declared_slot_completion_schema(body),
         "request_body": body, "request_sha256": capture.request.receipt_sha256,
         "precommit_sha256": body["precommit_sha256"],
         "cell_id": body["cell_id"], "slot_id": body["slot_id"],
@@ -6132,6 +6965,10 @@ def _declared_capture_completion_body(capture, *, status, reason_code, handle, c
         "completed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "qualification_authority": False, "capital_authority": False, "live_authority": False,
         "order_authority": False}
+    if "development_scope_sha256" in body:
+        result["development_scope_sha256"] = body["development_scope_sha256"]
+        result["design_contaminated"] = True
+        result["pristine_validation"] = False
     if completed:
         result["winner_request_sha256"] = completed.production.request.request_sha256
         result["winner_decision_sha256"] = completed.production.decision.receipt_sha256
@@ -6185,7 +7022,9 @@ def _declared_owner_from_verified_winner(body, request, decision, frozen, fit):
     tiers = [x for x in frozen.frozen_tier_pair_contract["tiers"] if x["tier"] == tier]
     if len(tiers) != 1:
         _fail("DECLARED_SLOT_PROFILE_INVALID")
-    return {"schema_version": "fxpm.declared-slot-owner.v1",
+    m5_owner = _declared_slot_is_m5_source(body)
+    return {"schema_version": ("fxpm.declared-m5-slot-owner.v1" if m5_owner
+                               else "fxpm.declared-slot-owner.v1"),
         "owner_id": orchestration.declared_slot_owner_id(cell_id=body["cell_id"], slot_id=body["slot_id"],
             winner_decision_sha256=decision.receipt_sha256, process_receipt_sha256=body["search_process_receipt_sha256"]),
         "cell_id": body["cell_id"], "slot_id": body["slot_id"],
@@ -6197,11 +7036,21 @@ def _declared_owner_from_verified_winner(body, request, decision, frozen, fit):
         "selected_artifacts": artifacts, "regime_detector_record": fit["regime_detector_record"],
         "selection_cutoff_utc": body["anchor"]["selection_cutoff_utc"],
         "selected_tier": tier, "selected_tier_contract": tiers[0],
-        "selected_marginal_receipt": marginal}
+        "selected_marginal_receipt": marginal,
+        **({"source_contract_sha256": _hex64(frozen.precommitment.get("source_contract_sha256"),
+                    "DECLARED_M5_OWNER_SOURCE_CONTRACT_INVALID")} if m5_owner else {})}
 
 
-def _restore_declared_slot_plan(context, *, request, process, completion, sink):
+def _restore_declared_slot_plan(context, *, request, process, completion, sink, m5_fitted=None):
     import pm_production_search_planner as planner
+    if _declared_slot_is_m5_source(request.to_dict()):
+        if m5_fitted is None:
+            _fail("DECLARED_M5_VERIFIED_FITTED_SOURCE_REQUIRED")
+        return planner.reopen_declared_slot_m5_derived_observed_cell_plan(context,
+            process=process, request=request, fitted=m5_fitted, sink=sink,
+            plan_transport=completion["plan_transport"], horizon_plan=completion["horizon_plan"])
+    if m5_fitted is not None:
+        _fail("DECLARED_NATIVE_PLAN_REJECTS_M5_FITTED_SOURCE")
     transport = completion["plan_transport"]
     original = transport["spool_entry"]
     if sink._artifacts.get(original["artifact_id"]) != original:
@@ -6224,7 +7073,502 @@ def _restore_declared_slot_plan(context, *, request, process, completion, sink):
     return result
 
 
+DECLARED_M5_SLOT_SOURCE_SESSION_SCHEMA = "fxpm.declared-slot-source-session.m5-derived.v1"
+DECLARED_M5_SLOT_SOURCE_SESSION_KEYS = frozenset((
+    "schema_version", "source_kind", "request_sha256", "generation_context_sha256",
+    "config_sha256", "effective_config_sha256", "spread_profile_identity", "m5_source_pins",
+    "m5_view_contract_sha256", "view_plan_sha256", "m5_reopen_context_entry", "session_opened_at_utc",
+    "source_accessed_at_utc", "selection_cutoff_utc", "source_state", "native_source_route",
+    "native_prefix_index_descriptor", "native_prefix_index_sha256", "native_snapshot_entry",
+    "native_snapshot_errors", "source_group_decision_sha256", "regime_fit_decision_sha256",
+    "m5_source_identity", "m5_request_view_id", "m5_calibration_view_id",
+    "m5_request_view_observation", "m5_calibration_view_observation", "fitted_view_evidence",
+    "cost_status", "failure", "unverified_caller_source_or_fit_accepted",
+    "qualification_authority", "capital_authority", "live_authority", "order_authority"))
+
+
+def _declared_slot_is_m5_source(body):
+    if body.get("schema_version") not in {
+            "fxpm.declared-m5-slot-producer-request.v1",
+            "fxpm.declared-development-m5-slot-producer-request.v1"}:
+        if any(key in body for key in ("source_kind", "m5_source_pins", "m5_view_contract_sha256")):
+            _fail("DECLARED_M5_SOURCE_KIND_INVALID")
+        return False
+    decoder = getattr(orchestration, "declared_slot_source_kind", None)
+    if decoder is None:
+        _fail("DECLARED_M5_SOURCE_DECODER_NOT_AVAILABLE")
+    if decoder(body) != "m5_derived":
+        _fail("DECLARED_M5_SOURCE_KIND_INVALID")
+    return True
+
+
+def _declared_m5_profile_identity(body):
+    pins, profile = body.get("m5_source_pins"), body.get("spread_profile_identity")
+    if (type(pins) is not dict or type(profile) is not dict
+            or set(profile) != {"profile_sha256"}
+            or type(pins.get("cost_edition_identity")) is not dict
+            or profile["profile_sha256"] != pins["cost_edition_identity"].get("profile_sha256")):
+        _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    _hex64(profile["profile_sha256"], "DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    return profile
+
+
+def _declared_m5_observation(value, *, timeframe, cutoff=None):
+    fields = {"view_key", "payload_sha256", "membership_sha256", "source_kind", "timeframe",
+              "cutoff_utc", "interval", "coverage", "constructor_implementation_sha256",
+              "gap_findings_sha256", "cost_status"}
+    if (type(value) is not dict or set(value) != fields or value["source_kind"] != "m5_derived"
+            or value["timeframe"] != timeframe or type(value["coverage"]) is not dict
+            or type(value["interval"]) is not dict
+            or set(value["interval"]) != {"start_utc", "end_exclusive_utc"}
+            or type(value["cost_status"]) is not str):
+        _fail("DECLARED_M5_VIEW_OBSERVATION_INVALID")
+    for key in ("view_key", "payload_sha256", "membership_sha256",
+                "constructor_implementation_sha256", "gap_findings_sha256"):
+        _hex64(value[key], "DECLARED_M5_VIEW_OBSERVATION_INVALID")
+    def instant(text):
+        try:
+            if type(text) is not str or len(text) > 64:
+                raise ValueError()
+            stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if stamp.tzinfo is None or stamp.utcoffset() != timedelta(0) or stamp.microsecond:
+                raise ValueError()
+            return stamp
+        except ValueError as error:
+            raise HistoricalProductionAdapterError("DECLARED_M5_VIEW_OBSERVATION_INVALID") from error
+    if (not instant(value["interval"]["start_utc"]) < instant(value["interval"]["end_exclusive_utc"])
+            <= instant(value["cutoff_utc"])
+            or (cutoff is not None and value["cutoff_utc"] != cutoff)):
+        _fail("DECLARED_M5_VIEW_OBSERVATION_INVALID")
+
+
+def _validate_declared_m5_source_session(context, *, body, source_session, request_sha256,
+                                         parent, completed_at_utc):
+    value = source_session
+    if (type(value) is not dict or set(value) != DECLARED_M5_SLOT_SOURCE_SESSION_KEYS
+            or value["schema_version"] != DECLARED_M5_SLOT_SOURCE_SESSION_SCHEMA
+            or value["source_kind"] != "m5_derived"
+            or not _declared_slot_is_m5_source(body)
+            or body.get("source_kind") != "m5_derived"):
+        _fail("DECLARED_M5_SOURCE_SESSION_INVALID")
+    profile = _declared_m5_profile_identity(body)
+    if (value["request_sha256"] != request_sha256
+            or value["generation_context_sha256"] != context.context_sha256
+            or value["config_sha256"] != context.config_sha256
+            or value["effective_config_sha256"] != parent["effective_config_sha256"]
+            or value["effective_config_sha256"] != body["effective_config_sha256"]
+            or value["selection_cutoff_utc"] != body["anchor"]["selection_cutoff_utc"]
+            or value["spread_profile_identity"] != profile
+            or _canonical_bytes(value["m5_source_pins"]) != _canonical_bytes(body["m5_source_pins"])
+            or value["m5_view_contract_sha256"] != body["m5_view_contract_sha256"]
+            or value["m5_view_contract_sha256"] != _sha256(body["m5_source_pins"])
+            or value["view_plan_sha256"] != body["m5_source_pins"]["view_plan_sha256"]):
+        _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    if (value["unverified_caller_source_or_fit_accepted"] is not False
+            or any(value[key] is not False for key in
+                   ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    opened = orchestration._utc(value["session_opened_at_utc"], "DECLARED_M5_SOURCE_SESSION_INVALID")
+    completed = orchestration._utc(completed_at_utc, "DECLARED_SLOT_COMPLETION_INVALID")
+    precommitted = orchestration._utc(parent["precommitted_at_utc"], "DECLARED_M5_SOURCE_SESSION_INVALID")
+    if not precommitted <= opened <= completed:
+        _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    accessed_text = value["source_accessed_at_utc"]
+    accessed = None
+    source_fields = ("native_source_route", "native_prefix_index_descriptor",
+                     "native_prefix_index_sha256", "m5_source_identity")
+    if accessed_text is None:
+        if value["source_state"] != "FAILED" or any(value[key] is not None for key in source_fields):
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    else:
+        accessed = orchestration._utc(accessed_text, "DECLARED_M5_SOURCE_SESSION_INVALID")
+        window = body["source_access_window_utc"]
+        if (not precommitted <= accessed <= completed
+                or not window["start_utc"] <= accessed_text < window["end_exclusive_utc"]
+                or value["source_state"] != native_prefix.AVAILABLE
+                or any(type(value[key]) is not dict for key in
+                       ("native_source_route", "native_prefix_index_descriptor", "m5_source_identity"))):
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+        route = value["native_source_route"]
+        if (route.get("symbol") != body["symbol"] or route.get("timeframe") != "M5"
+                or route.get("cutoff_utc") != value["selection_cutoff_utc"]
+                or route.get("source_state") != native_prefix.AVAILABLE
+                or route.get("index_sha256") != value["native_prefix_index_sha256"]
+                or route.get("index_descriptor") != value["native_prefix_index_descriptor"]):
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+        _hex64(value["native_prefix_index_sha256"], "DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    for key in ("m5_request_view_id", "m5_calibration_view_id"):
+        if value[key] is not None and (type(value[key]) is not str or not 1 <= len(value[key]) <= 128):
+            _fail("DECLARED_M5_SOURCE_SESSION_INVALID")
+    for key in ("source_group_decision_sha256", "regime_fit_decision_sha256"):
+        if value[key] is not None:
+            _hex64(value[key], "DECLARED_M5_SOURCE_SESSION_INVALID")
+    if ((value["source_group_decision_sha256"] is None) != (value["regime_fit_decision_sha256"] is None)
+            or (value["cost_status"] == "COST_UNAVAILABLE" and
+                any(value[key] is not None for key in
+                    ("source_group_decision_sha256", "regime_fit_decision_sha256", "fitted_view_evidence")))):
+        _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    request_view, calibration_view = value["m5_request_view_observation"], value["m5_calibration_view_observation"]
+    if request_view is not None:
+        _declared_m5_observation(request_view, timeframe=body["timeframe"], cutoff=value["selection_cutoff_utc"])
+    if calibration_view is not None:
+        _declared_m5_observation(calibration_view, timeframe=body["timeframe"])
+    if value["cost_status"] not in ("COST_READY", "COST_UNAVAILABLE"):
+        _fail("DECLARED_M5_SOURCE_SESSION_INVALID")
+    if value["cost_status"] == "COST_READY":
+        if (type(value["m5_reopen_context_entry"]) is not dict
+                or value["m5_reopen_context_entry"].get("artifact_type") != "declared_m5_reopen_context"):
+            _fail("DECLARED_M5_REOPEN_CONTEXT_MISSING")
+        if (accessed is None or request_view is None or calibration_view is None
+                or value["source_group_decision_sha256"] is None or value["regime_fit_decision_sha256"] is None
+                or type(value["fitted_view_evidence"]) is not dict
+                or value["m5_request_view_id"] is None or value["m5_calibration_view_id"] is None):
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+        evidence = value["fitted_view_evidence"]
+        expected = {
+            "source_kind": "m5_derived", "base_timeframe": "M5", "view_timeframe": body["timeframe"],
+            "m5_view_contract_sha256": value["m5_view_contract_sha256"],
+            "view_key": request_view["view_key"], "view_payload_sha256": request_view["payload_sha256"],
+            "view_membership_sha256": request_view["membership_sha256"],
+            "base_native_prefix_index_sha256": value["native_prefix_index_sha256"],
+            "source_accessed_at_utc": value["source_accessed_at_utc"],
+        }
+        if set(evidence) != set(expected) or _canonical_bytes(evidence) != _canonical_bytes(expected):
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    failure = value["failure"]
+    if failure is None:
+        if value["cost_status"] != "COST_READY":
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    else:
+        if (type(failure) is not dict or set(failure) !=
+                {"exception_type", "failure_code", "failure_observed_at_utc", "phase"}
+                or failure["phase"] not in ("PRE_SOURCE", "SOURCE", "FIT", "CAPTURE")
+                or type(failure["exception_type"]) is not str or not 1 <= len(failure["exception_type"]) <= 128):
+            _fail("DECLARED_M5_SOURCE_SESSION_INVALID")
+        _reason(failure["failure_code"], "DECLARED_M5_SOURCE_SESSION_INVALID")
+        observed = orchestration._utc(failure["failure_observed_at_utc"], "DECLARED_M5_SOURCE_SESSION_INVALID")
+        if observed < opened or observed > completed or (accessed is not None and observed < accessed):
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    return json.loads(_canonical_bytes(value))
+
+
+def _reopen_declared_m5_slot_native_source(context, *, body, config, source_session):
+    import pm_historical_search_producer as producer
+    from pathlib import Path
+    product = producer._reopen_prefix_route(route=source_session["native_source_route"],
+        data_dir=Path(config.data_dir), context=context, symbol=body["symbol"],
+        timeframe="M5", include_technical_failure=False, _pin_consumed_activation=True)
+    index = _reopen_worker_json_descriptor(context, source_session["native_prefix_index_descriptor"],
+        maximum_bytes=context.limits.max_json_bytes, code="DECLARED_M5_SOURCE_SESSION_INVALID")
+    if (index != dict(product.index)
+            or source_session["native_prefix_index_descriptor"] != dict(product.index_descriptor)
+            or source_session["native_prefix_index_sha256"] != product.index_sha256
+            or index.get("source_state") != native_prefix.AVAILABLE
+            or source_session["source_state"] != native_prefix.AVAILABLE
+            or index.get("symbol") != body["symbol"] or index.get("timeframe") != "M5"
+            or index.get("cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or index.get("source_accessed_at_utc") != source_session["source_accessed_at_utc"]):
+        _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    identity = source_session["m5_source_identity"]
+    source, activation = index["source"], index["activation"]
+    expected = {
+        "symbol": body["symbol"], "timeframe": "M5", "activation_id": activation["activation_id"],
+        "activation_sha256": activation["manifest_sha256"], "bars_sha256": source["bars_sha256"],
+        "sidecar_sha256": source["audit_sidecar_sha256"], "provenance_sha256": source["provenance_sha256"],
+        "point": product.instrument_snapshot["point"], "spread_unit": "points",
+    }
+    if (type(identity) is not dict or set(identity) != set(expected) | {"request_sha256"}
+            or any(identity[key] != expected_value for key, expected_value in expected.items())):
+        _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    _hex64(identity["request_sha256"], "DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    return product
+
+
+def _verify_declared_m5_slot_post_source_chain(context, *, precommit, process, completion,
+        parent, config, request, sink, entries, body, source_session, fitted):
+    source = _rebuild_source_decision(completion["source_group"])
+    fit = _rebuild_regime_fit_decision(completion["regime_fit"], source)
+    source_body, fit_body = source.to_dict(), fit.to_dict()
+    if (_canonical_bytes(source_body) != _canonical_bytes(fitted.source_group_decision.to_dict())
+            or _canonical_bytes(fit_body) != _canonical_bytes(fitted.regime_fit_decision.to_dict())):
+        _fail("DECLARED_M5_REOPENED_FIT_BINDING_MISMATCH")
+    plan = _restore_declared_slot_plan(context, request=request, process=process, completion=completion, sink=sink, m5_fitted=fitted)
+    if (plan.cell_receipt["source_group_decision_sha256"] != source.receipt_sha256
+            or plan.cell_receipt["regime_fit_decision_sha256"] != fit.receipt_sha256
+            or source_session.get("source_group_decision_sha256") != source.receipt_sha256
+            or source_session.get("regime_fit_decision_sha256") != fit.receipt_sha256):
+        _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+    frozen_fields = ("frozen_plan_receipt", "frozen_descriptor_graph", "horizon_winner_cross_binding")
+    frozen = None
+    if any(completion.get(field) is not None for field in frozen_fields):
+        if any(completion.get(field) is None for field in frozen_fields):
+            _fail("DECLARED_SLOT_FROZEN_INVALID")
+        frozen, cross, cross_bytes, frozen_ids = _verify_declared_slot_frozen_chain(context,
+            completion=completion, parent=parent, body=body, request=request, plan=plan,
+            source=source, fit=fit, entries=entries, precommit=precommit, m5_fitted=fitted)
+    if completion["status"] == "STOP" or (completion["status"] == "NO_TRADE" and completion.get("winner_request_entry") is None):
+        if any(completion.get(field) is not None for field in ("owner", "winner_request_entry",
+                "winner_decision_entry", "raw_production_receipt", "production_descriptor_graph",
+                "winner_request_sha256", "winner_decision_sha256")):
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        if completion["status"] == "STOP":
+            failure = _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries)
+            if frozen is not None and failure["attempted_trials_exact"] != frozen.attempt_ledger["attempt_count"]:
+                _fail("DECLARED_SLOT_FAILURE_INVALID")
+        elif completion.get("technical_failure_entry") is not None:
+            _fail("DECLARED_SLOT_FAILURE_INVALID")
+        if completion["status"] == "NO_TRADE" and (completion.get("reason_code") != "SOURCE_BOUNDARY_SHORTFALL_ALL_CANDIDATES"
+                or any(x.get("status") == "PLANNED" for x in plan.horizon_plan.to_dict().get("attempts", []))):
+            _fail("DECLARED_SLOT_COMPLETION_INVALID")
+        return json.loads(_canonical_bytes(completion))
+    if frozen is None:
+        _fail("DECLARED_SLOT_FROZEN_INVALID")
+    if completion.get("technical_failure_entry") is not None:
+        _fail("DECLARED_SLOT_FAILURE_INVALID")
+    wr, wd = _rebuild_winner_pair(context, {"request": completion["winner_request_entry"]["descriptor"],
+        "request_sha256": completion["winner_request_sha256"],
+        "decision": completion["winner_decision_entry"]["descriptor"],
+        "decision_sha256": completion["winner_decision_sha256"]}, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
+    expected_status = "OWNER" if wd.to_dict().get("winner") is not None else "NO_TRADE"
+    if (completion["status"] != expected_status
+            or completion.get("reason_code") != (None if expected_status == "OWNER" else wd.status)):
+        _fail("DECLARED_SLOT_COMPLETION_BINDING_MISMATCH")
+    namespace = body["artifact_namespace"]
+    prefix = f"{namespace}/winner-search/{body['timeframe']}/{body['regime']}"
+    production_ids = _verify_declared_slot_phase_graph(context, completion=completion,
+        body=body, request=request, entries=entries, phase="PRODUCTION")
+    if {key for key in entries if key.startswith(prefix + "/")} != frozen_ids | production_ids:
+        _fail("DECLARED_SLOT_RAW_GRAPH_BINDING_MISMATCH")
+    if frozen.precommitment != wr.precommitment.to_dict() or frozen.attempt_ledger != wr.attempt_ledger.to_dict():
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    production_bytes = _verify_worker_production_receipt(context=context, descriptor=completion["raw_production_receipt"],
+        cross_descriptor=completion["horizon_winner_cross_binding"], cross_bytes=cross_bytes,
+        request_descriptor=completion["winner_request_entry"]["descriptor"], decision_descriptor=completion["winner_decision_entry"]["descriptor"],
+        request=wr, decision=wd, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
+    production = json.loads(production_bytes)
+    if (set(production) != {"schema_version", "generation_context_sha256", "run_id", "artifact_namespace", "symbol", "timeframe", "regime", "precommitment_sha256", "attempt_ledger_sha256", "provenance_cross_binding_sha256", "evidence_ledger_sha256", "request_sha256", "decision_receipt_sha256", "artifact_roster"}
+            or production.get("schema_version") != (raw_winner.V16_PRODUCTION_SCHEMA
+                if frozen.selection_generation is winner_selection.V16_GENERATION else raw_winner.CURRENT_PRODUCTION_SCHEMA)
+            or production.get("precommitment_sha256") != wr.precommitment.payload_sha256
+            or production.get("attempt_ledger_sha256") != wr.attempt_ledger.payload_sha256
+            or production.get("evidence_ledger_sha256") != wr.evidence_ledger.payload_sha256
+            or production.get("artifact_namespace") != namespace
+            or production.get("run_id") != frozen.precommitment["run_id"]):
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    descriptor_set = {_canonical_bytes(x["descriptor"]) for x in entries.values()}
+    if any(_canonical_bytes(_descriptor(x, "DECLARED_SLOT_RAW_INVALID")) not in descriptor_set
+           for x in production["artifact_roster"].values()):
+        _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    for name in ("evidence-ledger", "winner-request", "winner-decision"):
+        entry = entries.get(f"{prefix}/authority/{name}")
+        if entry is None or production["artifact_roster"].get(name) != entry["descriptor"]:
+            _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    raw_winner.verify_source_observation_reference_closure(context, frozen=frozen,
+        manifest_entries=tuple(entries.values()), production_receipt=production)
+    if wd.to_dict().get("winner") is not None:
+        chosen = wd.to_dict()["winner"]
+        matched = [x for x in cross["mapping"] if x.get("winner_process_candidate_id") == chosen.get("process_candidate_id") and x.get("process_sha256") == chosen.get("process_sha256")]
+        if len(matched) != 1:
+            _fail("DECLARED_SLOT_OWNER_BINDING_MISMATCH")
+        detector_cutoff = _declared_slot_detector_cutoff(fit_body["regime_detector_record"]["fit_cutoff_utc"])
+        source_end = orchestration._utc(matched[0]["source_count_receipt"]["fit_end_exclusive_utc"], "DECLARED_SLOT_DETECTOR_INVALID")
+        selection_cutoff = orchestration._utc(body["anchor"]["selection_cutoff_utc"], "DECLARED_SLOT_DETECTOR_INVALID")
+        if detector_cutoff != source_end or source_end > selection_cutoff:
+            _fail("DECLARED_SLOT_DETECTOR_BINDING_MISMATCH")
+    expected_owner = (_declared_owner_from_verified_winner(body, wr, wd, frozen, fit_body)
+                      if wd.to_dict().get("winner") is not None else None)
+    if completion.get("owner") != expected_owner or (completion["status"] == "OWNER") != (expected_owner is not None):
+        _fail("DECLARED_SLOT_OWNER_BINDING_MISMATCH")
+    return json.loads(_canonical_bytes(completion))
+
+
+def _declared_m5_headerless_shape(completion):
+    forbidden = ("owner", "winner_request_entry", "winner_decision_entry", "winner_request_sha256",
+        "winner_decision_sha256", "frozen_plan_receipt", "frozen_descriptor_graph",
+        "horizon_winner_cross_binding", "raw_production_receipt", "production_descriptor_graph")
+    status = completion.get("status")
+    if (any(completion.get(key) is not None for key in forbidden)
+            or type(completion.get("plan_transport")) is not dict
+            or type(completion.get("horizon_plan")) is not dict
+            or any(completion.get(key) is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))
+            or status not in {"STOP", "NO_TRADE"}
+            or (status == "NO_TRADE" and
+                (completion.get("reason_code") != "SOURCE_BOUNDARY_SHORTFALL_ALL_CANDIDATES"
+                 or completion.get("technical_failure_entry") is not None))
+            or (status == "STOP" and completion.get("technical_failure_entry") is None)):
+        _fail("DECLARED_M5_HEADERLESS_COMPLETION_INVALID")
+
+
+def _read_declared_m5_headerless_plan(context, *, request, process, completion, sink,
+        source, fit, product, frame, window, support):
+    """Validate ORIGINAL stored plan bytes only; no plan/fitted/session capability is issued."""
+    import pm_production_search_planner as planner
+    body = orchestration.verify_declared_slot_producer_request(context, request, process=process)
+    planner.verify_frozen_production_search_process(context, process)
+    planner._require_current_process(process)
+    transport, saved_horizon = completion["plan_transport"], completion["horizon_plan"]
+    if (set(transport) != {"cell_receipt", "spool_entry", "attempt_artifacts", "state_requirements"}
+            or set(saved_horizon) != {"descriptor", "receipt_sha256"}
+            or sink is not request.symbol_sink(body["symbol"])):
+        _fail("DECLARED_M5_HEADERLESS_PLAN_INVALID")
+    artifact_id = f"{body['artifact_namespace']}/search-cell-plan/{body['timeframe']}/{body['regime']}"
+    entry = transport["spool_entry"]
+    if (type(entry) is not dict or entry.get("artifact_id") != artifact_id
+            or entry.get("artifact_type") != planner.CELL_PLAN_ARTIFACT_TYPE
+            or sink._artifacts.get(artifact_id) != entry):
+        _fail("DECLARED_SLOT_PLAN_ORIGINAL_MISSING")
+    _, receipt = planner._read_existing_m5_plan_json(context, entry.get("descriptor"))
+    if (receipt != transport["cell_receipt"] or set(receipt) != planner._M5_CELL_PLAN_FIELDS
+            or receipt.get("schema_version") != planner.M5_DERIVED_CELL_PLAN_SCHEMA
+            or receipt.get("receipt_sha256") != _sha256({key: value for key, value in receipt.items()
+                if key != "receipt_sha256"})):
+        _fail("DECLARED_M5_HEADERLESS_PLAN_INVALID")
+    native = dict(product.native_prefix)
+    expected = {"source_kind": "m5_derived", "mode": "DECLARED_SLOT_UNISSUED",
+        "authority_scope": "FROZEN_CELL_SEARCH_PLAN_ONLY",
+        "artifact_namespace": body["artifact_namespace"], "generation_id": context.generation_id,
+        "generation_context_sha256": context.context_sha256, "run_id": process.to_dict()["run_id"],
+        "causal_process_precommit_receipt_sha256": body["precommit_sha256"],
+        "search_process_receipt_sha256": process.receipt_sha256,
+        "declared_slot_request_sha256": request.receipt_sha256,
+        "cell": {key: body[key] for key in ("symbol", "timeframe", "regime")},
+        "m5_view_window": window, "source_group_decision_sha256": source.receipt_sha256,
+        "regime_fit_decision_sha256": fit.receipt_sha256, "train_regime_support_sha256": support["receipt_sha256"],
+        "native_prefix": {"index_sha256": product.index_sha256, "content_sha256": native["prefix_content_sha256"],
+            "start_utc": native["prefix_start_utc"], "end_exclusive_utc": native["prefix_end_exclusive_utc"],
+            "last_close_utc": native["prefix_last_close_utc"], "rows": native["prefix_rows"]},
+        "development_scope": orchestration.declared_slot_development_scope(body),
+        "development_scope_sha256": body.get("development_scope_sha256"),
+        "current_refit_source_capture_sha256": None}
+    if (any(receipt.get(key) != value for key, value in expected.items())
+            or receipt.get("attempts_frozen_before_search") is not True
+            or receipt.get("state_replay_required_before_scored_partition") is not True
+            or receipt.get("confers_winner_causal_current_capital_publication_or_live_authority") is not False
+            or type(receipt.get("boundary_limited")) is not bool):
+        _fail("DECLARED_M5_HEADERLESS_PLAN_BINDING_MISMATCH")
+    encoded_horizon, horizon_body = planner._read_existing_m5_plan_json(context, saved_horizon["descriptor"])
+    if saved_horizon["descriptor"]["sha256"] != saved_horizon["receipt_sha256"]:
+        _fail("DECLARED_M5_HEADERLESS_HORIZON_INVALID")
+    horizon = training_horizon.reopen_m5_derived_historical_horizon_plan(
+        encoded_horizon, saved_horizon["receipt_sha256"])
+    if (horizon_body.get("native_prefix") != native or horizon_body.get("m5_view_window") != window
+            or receipt["horizon_plan_binding"] != orchestration.historical_horizon_plan_binding(horizon)
+            or type(horizon_body.get("anchor")) is not dict
+            or any(horizon_body["anchor"].get(key) != value for key, value in body["anchor"].items()
+                if key != "evidence_accessed_at_utc")):
+        _fail("DECLARED_M5_HEADERLESS_HORIZON_INVALID")
+    planner._validate_available_prefix_anchor_binding(native=native, prefix_index=product.index,
+        anchor=horizon_body["anchor"], canary_request_body=None)
+    attempts, states = transport["attempt_artifacts"], transport["state_requirements"]
+    if (type(attempts) is not list or type(states) is not list
+            or len(attempts) != planner.ATTEMPT_COUNT or len(states) != planner.ATTEMPT_COUNT
+            or any(type(value) is not dict for value in (*attempts, *states))):
+        _fail("DECLARED_M5_HEADERLESS_ROSTER_INVALID")
+    attempt_hashes = [_sha256(value) for value in attempts]
+    state_hashes = [value.get("requirement_sha256") for value in states]
+    if (receipt["attempt_count"] != planner.ATTEMPT_COUNT
+            or receipt["attempt_artifact_sha256"] != attempt_hashes
+            or receipt["attempt_roster_sha256"] != _sha256(attempt_hashes)
+            or receipt["state_requirement_sha256"] != state_hashes
+            or receipt["state_requirement_roster_sha256"] != _sha256(state_hashes)):
+        _fail("DECLARED_M5_HEADERLESS_ROSTER_INVALID")
+    if (type(receipt.get("state_error_envelope")) is not dict
+            or receipt["state_error_envelope"].get("regime_parameters_sha256") != fit.to_dict()["regime_params_sha256"]):
+        _fail("DECLARED_M5_HEADERLESS_PLAN_BINDING_MISMATCH")
+    # Original pure state replay and actual PRICE-window attempt/count checks; no detector/refit.
+    planner._verify_state_context_plan_binding(process_body=process.to_dict(), receipt=receipt,
+        attempts=attempts, states=states, horizon_plan=horizon,
+        boundary_limited=receipt["boundary_limited"], timeframe=body["timeframe"], m5_view_window=window)
+    _strict_m5_attempt_artifacts(attempts, symbol=body["symbol"], timeframe=body["timeframe"],
+        regime=body["regime"], plan_body=horizon_body, plan_receipt_sha256=horizon.receipt_sha256,
+        native_prefix_product=product, m5_price_frame=frame, m5_price_window=window)
+    return horizon_body
+
+
+def _verify_declared_m5_headerless_completion(context, *, completion, body, request, config,
+        source_session, product, process, m5_source_context, sink, entries):
+    _declared_m5_headerless_shape(completion)
+    source, fit, actual, frame, window, support = _declared_m5_current_source_metadata(context,
+        completion=completion, body=body, request=request, config=config, source_session=source_session,
+        product=product, process=process, m5_source_context=m5_source_context)
+    horizon_body = _read_declared_m5_headerless_plan(context, request=request, process=process,
+        completion=completion, sink=sink, source=source, fit=fit, product=actual, frame=frame,
+        window=window, support=support)
+    if completion["status"] == "STOP":
+        _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries)
+    elif any(value.get("status") == "PLANNED" for value in horizon_body["attempts"]):
+        _fail("DECLARED_M5_HEADERLESS_COMPLETION_INVALID")
+    return json.loads(_canonical_bytes(completion))
+
+
+def _verify_declared_m5_slot_completion_request(context, *, completion, parent, body, request,
+        config, entries, source_session, precommit, process, sink, frozen_pipeline_config,
+        m5_source_context=None, m5_owner=None, m5_cost_edition=None):
+    _declared_m5_completion_reuse_arguments(m5_source_context=m5_source_context,
+        m5_owner=m5_owner, m5_cost_edition=m5_cost_edition)
+    _validate_declared_m5_source_session(context, body=body, source_session=source_session,
+        request_sha256=request.receipt_sha256, parent=parent, completed_at_utc=completion["completed_at_utc"])
+    product = None
+    if source_session["native_source_route"] is not None:
+        product = _reopen_declared_m5_slot_native_source(context, body=body,
+            config=config, source_session=source_session)
+    snapshot, snapshot_status = _reopen_declared_slot_native_snapshot(
+        context, source_session=source_session, entries=entries)
+    if completion.get("plan_transport") is None:
+        if source_session["failure"] is None:
+            if product is None:
+                _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+            _verify_declared_slot_snapshot_product(snapshot, snapshot_status, product)
+            return _verify_declared_m5_unobserved_completion(context, completion=completion, parent=parent,
+                body=body, request=request, config=config, source_session=source_session,
+                product=product, process=process, frozen_pipeline_config=frozen_pipeline_config,
+                m5_source_context=m5_source_context, m5_owner=m5_owner, m5_cost_edition=m5_cost_edition)
+        if (completion.get("status") != "STOP" or completion.get("reason_code") != "DECLARED_SLOT_SOURCE_FAILURE"
+                or any(completion.get(key) is not None for key in
+                       ("owner", "source_group", "regime_fit", "winner_request_entry", "winner_decision_entry",
+                        "frozen_plan_receipt", "frozen_descriptor_graph", "horizon_winner_cross_binding",
+                        "raw_production_receipt", "production_descriptor_graph", "technical_failure_entry",
+                        "horizon_plan", "winner_request_sha256", "winner_decision_sha256"))):
+            _fail("DECLARED_M5_COMPLETION_BINDING_MISMATCH")
+        if product is None and snapshot is not None:
+            _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+        if product is not None and snapshot_status == "MATCH":
+            _verify_declared_slot_snapshot_product(snapshot, snapshot_status, product)
+        return json.loads(_canonical_bytes(completion))
+    if (product is None or source_session["failure"] is not None or source_session["cost_status"] != "COST_READY"):
+        _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
+    _verify_declared_slot_snapshot_product(snapshot, snapshot_status, product)
+    import pm_authoritative_search_execution as search_execution
+    import pm_historical_search_producer as producer
+    own_context = m5_source_context is None
+    if own_context:
+        m5_source_context = producer.reacquire_declared_m5_source(context, request=request,
+            process=process, frozen_pipeline_config=frozen_pipeline_config,
+            source_session_entry=completion["source_session_entry"], m5_owner=m5_owner,
+            cost_edition=m5_cost_edition)
+    try:
+        header = search_execution._read_declared_unit_header(context, body)
+        if header is None:
+            return _verify_declared_m5_headerless_completion(context, completion=completion,
+                body=body, request=request, config=config, source_session=source_session,
+                product=product, process=process, m5_source_context=m5_source_context,
+                sink=sink, entries=entries)
+        fitted, _ = search_execution.reopen_bound_fitted_timeframe(context, request=request,
+            process=process, frozen_pipeline_config=frozen_pipeline_config, header=header,
+            m5_source_context=m5_source_context, verification_only=True)
+        return _verify_declared_m5_slot_post_source_chain(context, precommit=precommit,
+            process=process, completion=completion, parent=parent, config=config, request=request,
+            sink=sink, entries=entries, body=body, source_session=source_session, fitted=fitted)
+    finally:
+        if own_context:
+            producer._release_declared_m5_reacquired_context(m5_source_context, close_owner=m5_owner is None)
+
+
+
 def _reopen_declared_slot_native_source(context, *, body, config, source_session):
+    if _declared_slot_is_m5_source(body):
+        return _reopen_declared_m5_slot_native_source(context, body=body, config=config, source_session=source_session)
     import pm_historical_search_producer as producer
     from pathlib import Path
     product = producer._reopen_prefix_route(route=source_session["native_source_route"],
@@ -6338,7 +7682,12 @@ def _verify_declared_slot_phase_graph(context, *, completion, body, request, ent
 
 
 def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, request,
-                                      plan, source, fit, entries, precommit):
+                                      plan, source, fit, entries, precommit, m5_fitted=None):
+    m5 = _declared_slot_is_m5_source(body)
+    if m5 and m5_fitted is None:
+        _fail("DECLARED_M5_VERIFIED_FITTED_SOURCE_REQUIRED")
+    if not m5 and m5_fitted is not None:
+        _fail("DECLARED_NATIVE_FROZEN_CHAIN_REJECTS_M5_CONTEXT")
     namespace = body["artifact_namespace"]
     prefix = f"{namespace}/winner-search/{body['timeframe']}/{body['regime']}"
     frozen_ids = _verify_declared_slot_phase_graph(context, completion=completion,
@@ -6372,6 +7721,8 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
         "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256},
         symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"], artifact_namespace=namespace,
         manifest_entries=frozen_entries, body_bytes=frozen_bytes)
+    if m5 and frozen.bound_fitted_state_entry is None:
+        _fail("DECLARED_M5_BOUND_FIT_REFERENCE_REQUIRED")
     if frozen.bound_fitted_state_entry is not None:
         import pm_current_refit_artifacts as fit_artifacts
         state, _ = fit_artifacts.read_bound_fitted_state_reference(context, frozen.bound_fitted_state_entry, artifact_namespace=namespace)
@@ -6383,7 +7734,8 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
                 or _canonical_bytes(meta["receipts"]["source_contract_seeds"]) != _canonical_bytes(frozen.source_contract_seeds)
                 or _canonical_bytes(meta["receipts"]["frozen_tier_pair_contract"]) != _canonical_bytes(frozen.frozen_tier_pair_contract)):
             _fail("DECLARED_SLOT_BOUND_FIT_CHAIN_CHANGED")
-    if any(tier["frozen_spread_tier"]["profile_sha256"] != parent["spread_profile_identity"]["profile_sha256"]
+    expected_profile = _declared_m5_profile_identity(body) if m5 else parent["spread_profile_identity"]
+    if any(tier["frozen_spread_tier"]["profile_sha256"] != expected_profile["profile_sha256"]
            for tier in frozen.frozen_tier_pair_contract["tiers"]):
         _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
     cross_bytes = _reopen_worker_descriptor_bytes(context, completion["horizon_winner_cross_binding"],
@@ -6408,11 +7760,33 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
                 or row["source_count_receipt"]["horizon_plan_receipt_sha256"] != binding["plan_receipt_sha256"]
                 for row in cross["mapping"])):
         _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
+    if m5:
+        import pm_authoritative_search_execution as search_execution
+        _, actual_window = search_execution.m5_derived_fitted_frame(m5_fitted)
+        if (meta.get("source_kind") != "m5_derived"
+                or meta.get("schema_version") != "fxpm.bound-fitted-m5-metadata.v1"
+                or _canonical_bytes(actual_window) != _canonical_bytes(meta.get("m5_view_window"))):
+            _fail("DECLARED_M5_FROZEN_VIEW_CHANGED")
+        horizon_body = plan.horizon_plan.to_dict()
+        attempts, contracts, counts = _strict_attempt_artifacts(plan.attempt_artifacts(),
+            symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"],
+            plan_body=horizon_body, plan_receipt_sha256=plan.horizon_plan.receipt_sha256,
+            native_prefix_product=m5_fitted.product, m5_fitted=m5_fitted)
+        expected_cross = _cross_binding_body(plan_body=horizon_body,
+            plan_receipt_sha256=plan.horizon_plan.receipt_sha256, frozen=frozen,
+            attempt_artifacts=attempts, producer_request_sha256=request.receipt_sha256,
+            anchor_id=body["slot_id"], artifact_namespace=namespace,
+            source_group_decision_sha256=source.receipt_sha256, regime_fit_decision_sha256=fit.receipt_sha256,
+            horizon_execution_contracts=contracts, source_count_receipts=counts)
+        if _canonical_bytes(expected_cross) != cross_bytes:
+            _fail("DECLARED_M5_FROZEN_SOURCE_COUNTS_CHANGED")
     return frozen, cross, cross_bytes, frozen_ids
 
 
-def verify_declared_slot_completion(context, *, precommit, process, completion, artifact_roster, frozen_pipeline_config):
+def verify_declared_slot_completion(context, *, precommit, process, completion, artifact_roster, frozen_pipeline_config, m5_source_context=None, m5_owner=None, m5_cost_edition=None):
     """Revalidate committed bytes at the established current-owner assurance level."""
+    _declared_m5_completion_reuse_arguments(m5_source_context=m5_source_context,
+        m5_owner=m5_owner, m5_cost_edition=m5_cost_edition)
     parent = orchestration.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     import pm_production_config_binding as config_binding
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
@@ -6422,12 +7796,17 @@ def verify_declared_slot_completion(context, *, precommit, process, completion, 
     if (frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]
             or config.discovery_risk_per_trade_pct != 1.0):
         _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
-    if (type(completion) is not dict or completion.get("schema_version") != DECLARED_SLOT_COMPLETION_SCHEMA
+    if (type(completion) is not dict or type(completion.get("request_body")) is not dict
+            or completion.get("schema_version") != declared_slot_completion_schema(completion["request_body"])
             or completion.get("status") not in {"OWNER", "NO_TRADE", "MISSING", "STOP"}
             or completion.get("precommit_sha256") != precommit.receipt_sha256
             or any(completion.get(k) is not False for k in ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
         _fail("DECLARED_SLOT_COMPLETION_INVALID")
     body = completion["request_body"]
+    if not _declared_slot_is_m5_source(body) and any(value is not None for value in
+            (m5_source_context, m5_owner, m5_cost_edition)):
+        _fail("DECLARED_NATIVE_COMPLETION_REJECTS_M5_CONTEXT")
+    _declared_development_completion_binding(completion, body, parent)
     sink = authority_spool.open_symbol_sink(context, body["symbol"])
     entries = {}
     for value in artifact_roster:
@@ -6441,14 +7820,17 @@ def verify_declared_slot_completion(context, *, precommit, process, completion, 
     try:
         return _verify_declared_slot_completion_request(context, precommit=precommit,
             process=process, completion=completion, parent=parent, config=config,
-            request=request, sink=sink, entries=entries)
+            request=request, sink=sink, entries=entries, frozen_pipeline_config=frozen_pipeline_config,
+            m5_source_context=m5_source_context, m5_owner=m5_owner, m5_cost_edition=m5_cost_edition)
     finally:
         orchestration._release_declared_slot_producer_request(request, context)
 
 
 def _verify_declared_slot_completion_request(context, *, precommit, process, completion,
-                                            parent, config, request, sink, entries):
+                                            parent, config, request, sink, entries, frozen_pipeline_config=None,
+                                            m5_source_context=None, m5_owner=None, m5_cost_edition=None):
     body = orchestration.verify_declared_slot_producer_request(context, request, precommit=precommit, process=process)
+    _declared_development_completion_binding(completion, body, parent)
     if (completion.get("request_sha256") != request.receipt_sha256
             or completion.get("cell_id") != body["cell_id"] or completion.get("slot_id") != body["slot_id"]):
         _fail("DECLARED_SLOT_COMPLETION_BINDING_MISMATCH")
@@ -6463,6 +7845,14 @@ def _verify_declared_slot_completion_request(context, *, precommit, process, com
     # Source-session bytes precede cell-plan and Winner verification.
     source_session = _reopen_ascii_json_entry(context, completion["source_session_entry"],
         expected_type="declared_slot_source_session", code="DECLARED_SLOT_SOURCE_INVALID")
+    if _declared_slot_is_m5_source(body):
+        if completion["source_session_entry"] not in entries.values():
+            _fail("DECLARED_SLOT_ORIGINAL_ARTIFACT_MISSING")
+        return _verify_declared_m5_slot_completion_request(context, completion=completion,
+            parent=parent, body=body, request=request, config=config, entries=entries,
+            source_session=source_session, precommit=precommit, process=process, sink=sink,
+            frozen_pipeline_config=frozen_pipeline_config, m5_source_context=m5_source_context,
+            m5_owner=m5_owner, m5_cost_edition=m5_cost_edition)
     if (completion["source_session_entry"] not in entries.values()
             or source_session.get("request_sha256") != request.receipt_sha256
             or source_session.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
@@ -6673,3 +8063,147 @@ def _verify_declared_slot_completion_request(context, *, precommit, process, com
 
 __all__ += ["DeclaredSlotSearchCapture", "DECLARED_SLOT_COMPLETION_SCHEMA",
     "open_declared_slot_capture", "verify_declared_slot_completion"]
+
+
+def _declared_m5_completion_reuse_arguments(*, m5_source_context, m5_owner, m5_cost_edition):
+    if ((m5_owner is None) != (m5_cost_edition is None)
+            or (m5_source_context is not None and (m5_owner is not None or m5_cost_edition is not None))):
+        _fail("DECLARED_M5_REUSE_ARGUMENTS_INVALID")
+    if m5_owner is not None:
+        import pm_m5_job_view as job_view
+        import pm_m5_derived_costs as derived_costs
+        if type(m5_owner) is not job_view.M5JobViews or type(m5_cost_edition) is not derived_costs.RecordedDerivedCosts:
+            _fail("DECLARED_M5_REUSE_ARGUMENTS_INVALID")
+
+
+def _declared_m5_unobserved_shape(completion, source_session):
+    """An operational zero-work abstention is not a Winner or financial verdict."""
+    absent = ("owner", "plan_transport", "horizon_plan", "winner_request_entry", "winner_decision_entry",
+        "frozen_plan_receipt", "frozen_descriptor_graph", "horizon_winner_cross_binding",
+        "raw_production_receipt", "production_descriptor_graph", "technical_failure_entry",
+        "winner_request_sha256", "winner_decision_sha256")
+    if (completion.get("status") != "NO_TRADE" or completion.get("reason_code") != "REGIME_UNOBSERVED"
+            or source_session.get("source_kind") != "m5_derived"
+            or source_session.get("failure") is not None or source_session.get("cost_status") != "COST_READY"
+            or type(completion.get("source_group")) is not dict or type(completion.get("regime_fit")) is not dict
+            or any(completion.get(field) is not None for field in absent)
+            or any(completion.get(field) is not False for field in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_M5_UNOBSERVED_BINDING_MISMATCH")
+
+
+def _declared_m5_unobserved_zero_support(body, fit_body):
+    support = fit_body.get("train_regime_support")
+    if (fit_body.get("fit_state") != book.REGIME_FITTED or type(support) is not dict
+            or support.get("symbol") != body["symbol"] or support.get("timeframe") != body["timeframe"]):
+        _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")
+    counts = support.get("counts")
+    states = support.get("support_state_by_regime")
+    observed, unobserved = support.get("observed_regimes"), support.get("unobserved_regimes")
+    if (type(states) is not dict or set(states) != set(book.REGIME_ORDER)
+            or type(observed) is not list or type(unobserved) is not list
+            or type(counts) is not dict or set(counts) != set(book.REGIME_ORDER)
+            or any(type(value) is not int or value < 0 for value in counts.values())
+            or type(support.get("eligible_rows")) is not int
+            or sum(counts.values()) != support["eligible_rows"]
+            or counts.get(body["regime"]) != 0
+            or states != {regime: ("EMPIRICALLY_OBSERVED" if counts[regime] else "UNOBSERVED") for regime in book.REGIME_ORDER}
+            or observed != [regime for regime in book.REGIME_ORDER if counts[regime] > 0]
+            or unobserved != [regime for regime in book.REGIME_ORDER if counts[regime] == 0]):
+        _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")
+    return support
+
+
+def _declared_m5_current_source_metadata(context, *, completion, body, request, config,
+        source_session, product, process, m5_source_context):
+    """Read-only DATA joins; does not issue a fitted frame or search capability."""
+    source = _rebuild_source_decision(completion["source_group"])
+    fit = _rebuild_regime_fit_decision(completion["regime_fit"], source)
+    source_body, fit_body = source.to_dict(), fit.to_dict()
+    support = fit_body.get("train_regime_support")
+    if fit_body.get("fit_state") != book.REGIME_FITTED or type(support) is not dict:
+        _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")
+    native = product.native_prefix
+    if (product.source_state != native_prefix.AVAILABLE or product.index["timeframe"] != "M5"
+            or source_body.get("availability") != book.AVAILABLE
+            or source_body.get("symbol") != body["symbol"] or source_body.get("timeframe") != body["timeframe"]
+            or source_session["source_group_decision_sha256"] != source.receipt_sha256
+            or source_session["regime_fit_decision_sha256"] != fit.receipt_sha256
+            or source_body.get("source_group_evidence_sha256") != product.index_sha256
+            or any(source_body.get(key) != native.get(key) for key in
+                ("activation_id", "activation_manifest_sha256", "activation_entry_sha256"))
+            or source_body.get("native_source_sha256") != native.get("artifact_sha256")):
+        _fail("DECLARED_M5_UNOBSERVED_BINDING_MISMATCH")
+    import pm_authoritative_search_execution as execution
+    actual, frame, window, _, _, _, _, _, derived, _ = execution._m5_bound_source_inputs(context,
+        request=request, process=process, config=config, source_context=m5_source_context,
+        source_session_entry=completion["source_session_entry"],
+        source_session_sha256=_sha256(source_session),
+        source_validation_completed_at_utc=completion["completed_at_utc"])
+    if actual.index_sha256 != product.index_sha256 or support["eligible_rows"] > window["view_rows"]:
+        _fail("DECLARED_M5_UNOBSERVED_BINDING_MISMATCH")
+    bindings = support["bindings"]
+    parameters = execution._default_regime_parameters(body["timeframe"])
+    params_sha = execution.pm_regime.regime_params_sha256(parameters)
+    detector_sha = execution.pm_regime.detector_code_sha256()
+    detector = fit_body["regime_detector_record"]
+    if (bindings.get("symbol") != body["symbol"] or bindings.get("timeframe") != body["timeframe"]
+            or bindings.get("activation_id") != native.get("activation_id")
+            or bindings.get("activation_manifest_sha256") != native.get("activation_manifest_sha256")
+            or bindings.get("source_sha256") != native.get("artifact_sha256")
+            or bindings.get("params_sha256") != params_sha or bindings.get("detector_code_sha256") != detector_sha
+            or fit_body.get("regime_params_sha256") != params_sha
+            or fit_body.get("detector_process_sha256") != detector_sha
+            or detector.get("detector_code_sha256") != detector_sha
+            or detector.get("parameters_sha256") != params_sha
+            or detector.get("parameters_canonical_json") != _canonical_bytes(parameters).decode("ascii")):
+        _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")
+    train_window = execution._train_regime_support_window(frame=frame, product=actual,
+        symbol=body["symbol"], timeframe=body["timeframe"], m5_view_evidence=dict(derived.view_evidence))
+    fit_evidence = execution._regime_fit_evidence(source=source, product=actual, support=support,
+        detector_record=detector, derived_binding=derived)
+    _declared_m5_unobserved_current_view(support=support, fit_body=fit_body, window=window,
+        train_window=train_window, fit_evidence=fit_evidence)
+    return source, fit, actual, frame, window, support
+
+
+def _verify_declared_m5_unobserved_completion(context, *, completion, parent, body, request,
+        config, source_session, product, process, frozen_pipeline_config,
+        m5_source_context=None, m5_owner=None, m5_cost_edition=None):
+    _declared_m5_unobserved_shape(completion, source_session)
+    import pm_historical_search_producer as producer
+    own_context = m5_source_context is None
+    if own_context:
+        m5_source_context = producer.reacquire_declared_m5_source(context, request=request,
+            process=process, frozen_pipeline_config=frozen_pipeline_config,
+            source_session_entry=completion["source_session_entry"], m5_owner=m5_owner,
+            cost_edition=m5_cost_edition)
+    try:
+        _, fit, _, _, _, _ = _declared_m5_current_source_metadata(context,
+            completion=completion, body=body, request=request, config=config,
+            source_session=source_session, product=product, process=process,
+            m5_source_context=m5_source_context)
+        _declared_m5_unobserved_zero_support(body, fit.to_dict())
+        return json.loads(_canonical_bytes(completion))
+    finally:
+        if own_context:
+            producer._release_declared_m5_reacquired_context(m5_source_context, close_owner=m5_owner is None)
+
+
+def _declared_m5_unobserved_current_view(*, support, fit_body, window, train_window, fit_evidence):
+    if (support["bindings"].get("train_window_sha256") != _sha256(train_window)
+            or fit_body.get("regime_fit_evidence_sha256") != _sha256(fit_evidence)
+            or support["eligible_rows"] > window["view_rows"]
+            or _declared_slot_detector_cutoff(fit_body["regime_detector_record"]["fit_cutoff_utc"])
+                != _declared_slot_detector_cutoff(window["view_last_close_utc"])):
+        _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")
+    if support["eligible_rows"] == 0:
+        if support.get("first_ts") is not None or support.get("last_ts") is not None:
+            _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")
+    else:
+        first = _declared_slot_detector_cutoff(support["first_ts"])
+        last = _declared_slot_detector_cutoff(support["last_ts"])
+        start = _declared_slot_detector_cutoff(window["view_start_utc"])
+        end = _declared_slot_detector_cutoff(window["view_end_exclusive_utc"])
+        if not start <= first <= last < end:
+            _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")

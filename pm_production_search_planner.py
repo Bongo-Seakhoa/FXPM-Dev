@@ -1362,6 +1362,7 @@ def _seal_cell_plan(
     bounded_canary_source_session: Any = None,
     bounded_canary_plan_permit: Any = None,
     declared_slot_request: Any = None,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[bytes, bytes]:
     if type(sink) is not authority_spool.SymbolAuthoritySink:
         _fail("CELL_PLAN_SINK_INVALID")
@@ -1402,7 +1403,7 @@ def _seal_cell_plan(
     normalized_namespace = _artifact_namespace(namespace)
     native = dict(fitted.product.native_prefix)
     symbol = str(native["symbol"])
-    timeframe = str(native["timeframe"])
+    timeframe = str(_planning_source_value(native, m5_view_window, "timeframe"))
     plan_binding = historical.historical_horizon_plan_binding(horizon_plan)
     attempt_hashes = [_sha(dict(value)) for value in attempt_artifacts]
     state_hashes = [
@@ -1416,11 +1417,7 @@ def _seal_cell_plan(
         )
         for value in state_domain_records
     ]
-    _verify_state_error_envelope_fitted_binding(
-        state_error_envelope,
-        fitted=fitted,
-        native=native,
-    )
+    _verify_state_error_envelope_fitted_binding(state_error_envelope, fitted=fitted, native=native, m5_view_window=m5_view_window)
     if (
         len(attempt_hashes) != ATTEMPT_COUNT
         or len(state_hashes) != ATTEMPT_COUNT
@@ -1432,7 +1429,7 @@ def _seal_cell_plan(
     ):
         _fail("CELL_PLAN_ROSTER_INVALID")
     body = {
-        "schema_version": CELL_PLAN_SCHEMA,
+        "schema_version": M5_DERIVED_CELL_PLAN_SCHEMA if m5_view_window is not None else CELL_PLAN_SCHEMA,
         "authority_scope": "FROZEN_CELL_SEARCH_PLAN_ONLY",
         "mode": normalized_mode,
         "artifact_namespace": normalized_namespace,
@@ -1505,6 +1502,12 @@ def _seal_cell_plan(
         body["declared_slot_request_sha256"] = declared_slot_request.receipt_sha256
     elif declared_slot_request is not None:
         _fail("DECLARED_SLOT_REQUEST_INVALID")
+    if m5_view_window is not None:
+        if normalized_mode != "DECLARED_SLOT_UNISSUED":
+            _fail("M5_CELL_PLAN_MODE_INVALID")
+        body.update(source_kind="m5_derived", m5_view_window=dict(m5_view_window),
+            development_scope=historical.declared_slot_development_scope(declared),
+            development_scope_sha256=declared.get("development_scope_sha256"))
     receipt_body = {**body, "receipt_sha256": _sha(body)}
     artifact_id = f"{normalized_namespace}/search-cell-plan/{timeframe}/{regime}"
     entry = sink.put_json(artifact_id, CELL_PLAN_ARTIFACT_TYPE, receipt_body)
@@ -1699,6 +1702,7 @@ def _verify_state_context_plan_binding(
     horizon_plan: Any,
     boundary_limited: bool,
     timeframe: str,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> None:
     """Recompute the full state-requirement -> Horizon disposition chain."""
 
@@ -1714,7 +1718,7 @@ def _verify_state_context_plan_binding(
     native_prefix = receipt.get("native_prefix")
     envelope = receipt.get("state_error_envelope")
     initial_error, tolerance, regime_warmup_bars = (
-        _validated_state_error_envelope(envelope, native_prefix=native_prefix)
+        _validated_state_error_envelope(envelope, native_prefix=_planning_source_bounds(native_prefix, m5_view_window))
     )
     carried_domain_records = receipt.get("state_domain_ceiling_records")
     if type(carried_domain_records) is not list:
@@ -1725,6 +1729,7 @@ def _verify_state_context_plan_binding(
             native_prefix=native_prefix,
             cell=receipt.get("cell", {}),
             state_error_envelope=envelope,
+            m5_view_window=m5_view_window,
         )
     )
     record_hashes = [value["record_sha256"] for value in expected_domain_records]
@@ -1822,7 +1827,7 @@ def _verify_state_context_plan_binding(
         )
         if (
             requirement_sha256 != _sha(requirement_body)
-            or state.get("schema_version") != STATE_REQUIREMENT_SCHEMA
+            or state.get("schema_version") != (M5_DERIVED_STATE_REQUIREMENT_SCHEMA if m5_view_window is not None else STATE_REQUIREMENT_SCHEMA)
             or state.get("execution_rule")
             != "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
             or state.get("initial_error_bound_hex") != initial_error.hex()
@@ -1843,7 +1848,7 @@ def _verify_state_context_plan_binding(
             or any(
                 type(value) is not dict
                 or value.get("schema_version")
-                != "fxpm.production-full-prefix-state-replay.v1"
+                != ("fxpm.production-m5-derived-full-prefix-state-replay.v1" if m5_view_window is not None else "fxpm.production-full-prefix-state-replay.v1")
                 or value.get(
                     "requires_executor_full_prefix_replay_before_any_scored_slice"
                 )
@@ -1853,6 +1858,23 @@ def _verify_state_context_plan_binding(
         ):
             _fail("STATE_REQUIREMENT_REPLAY_INVALID")
 
+    if m5_view_window is not None:
+        for state in states:
+            if (state.get("source_kind") != "m5_derived"
+                    or state.get("m5_view_window") != m5_view_window
+                    or state.get("m5_view_window_sha256") != _sha(dict(m5_view_window))
+                    or state.get("regime_surface_source") != "FITTED_FULL_M5_DERIVED_PREFIX_REGIME_LIVE"):
+                _fail("M5_STATE_REQUIREMENT_BINDING_INVALID")
+            for replay in state["state_evidence"]:
+                if (replay.get("source_kind") != "m5_derived"
+                        or replay.get("m5_view_window") != m5_view_window
+                        or replay.get("m5_view_window_sha256") != _sha(dict(m5_view_window))
+                        or replay.get("native_prefix_index_sha256") != native_prefix["index_sha256"]
+                        or replay.get("native_prefix_content_sha256") != native_prefix["content_sha256"]
+                        or replay.get("prefix_start_utc") != native_prefix["start_utc"]
+                        or replay.get("prefix_end_exclusive_utc") != native_prefix["end_exclusive_utc"]
+                        or replay.get("prefix_rows") != native_prefix["rows"]):
+                    _fail("M5_STATE_REPLAY_BINDING_INVALID")
     expected_dispositions = _state_context_dispositions(
         states,
         candidate=candidate,
@@ -1932,6 +1954,28 @@ def verify_production_cell_search_plan(
     sink: authority_spool.SymbolAuthoritySink,
     plan: ProductionCellSearchPlan,
 ) -> bool:
+    return _verify_production_cell_search_plan_source(context, process=process, sink=sink, plan=plan, m5_derived=False)
+
+
+def verify_m5_derived_production_cell_search_plan(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    process: FrozenProductionSearchProcess,
+    sink: authority_spool.SymbolAuthoritySink,
+    plan: ProductionCellSearchPlan,
+) -> bool:
+    return _verify_production_cell_search_plan_source(context, process=process, sink=sink, plan=plan, m5_derived=True)
+
+
+def _verify_production_cell_search_plan_source(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    process: FrozenProductionSearchProcess,
+    sink: authority_spool.SymbolAuthoritySink,
+    plan: ProductionCellSearchPlan,
+    m5_derived: bool,
+    read_only: bool = False,
+) -> bool:
     """Reopen one immutable cell plan and rederive every carried roster hash."""
 
     verify_frozen_production_search_process(context, process)
@@ -1947,7 +1991,7 @@ def verify_production_cell_search_plan(
     if (
         _canonical_bytes(receipt) != plan._cell_receipt_json
         or receipt_sha256 != _sha(body)
-        or receipt.get("schema_version") != CELL_PLAN_SCHEMA
+        or receipt.get("schema_version") != (M5_DERIVED_CELL_PLAN_SCHEMA if m5_derived else CELL_PLAN_SCHEMA)
         or receipt.get("generation_id") != context.generation_id
         or receipt.get("generation_context_sha256") != context.context_sha256
         or receipt.get("run_id") != process.to_dict()["run_id"]
@@ -1964,6 +2008,27 @@ def verify_production_cell_search_plan(
         }
     ):
         _fail("CELL_PLAN_RECEIPT_BINDING_INVALID")
+    m5_view_window = None
+    if m5_derived:
+        if plan.mode != "DECLARED_SLOT_UNISSUED" or plan.fitted_timeframe is None:
+            _fail("M5_CELL_PLAN_MODE_INVALID")
+        _, m5_native, _, _, m5_view_window = _validated_m5_frame(plan.fitted_timeframe)
+        expected_base = {"index_sha256": plan.fitted_timeframe.product.index_sha256,
+            "content_sha256": m5_native["prefix_content_sha256"], "start_utc": m5_native["prefix_start_utc"],
+            "end_exclusive_utc": m5_native["prefix_end_exclusive_utc"],
+            "last_close_utc": m5_native["prefix_last_close_utc"], "rows": m5_native["prefix_rows"]}
+        if receipt.get("native_prefix") != expected_base:
+            _fail("M5_CELL_PLAN_NATIVE_BINDING_INVALID")
+        horizon_body = plan.horizon_plan.to_dict()
+        if (set(receipt) != _M5_CELL_PLAN_FIELDS
+                or receipt.get("source_kind") != "m5_derived"
+                or receipt.get("m5_view_window") != m5_view_window
+                or horizon_body.get("source_kind") != "m5_derived"
+                or horizon_body.get("m5_view_window") != m5_view_window
+                or horizon_body.get("native_prefix") != m5_native
+                or plan.native_prefix_product is not plan.fitted_timeframe.product
+                or plan.timeframe != m5_view_window["timeframe"]):
+            _fail("M5_CELL_PLAN_VIEW_BINDING_INVALID")
     if plan.mode == "DECLARED_SLOT_UNISSUED":
         declared = historical.verify_declared_slot_producer_request(context, plan._declared_slot_request, process=process)
         if (receipt.get("declared_slot_request_sha256") != plan._declared_slot_request.receipt_sha256
@@ -1971,6 +2036,9 @@ def verify_production_cell_search_plan(
                 or declared["cell"] != {"cell_id": declared["cell_id"], "symbol": plan.symbol, "timeframe": plan.timeframe, "regime": plan.regime}
                 or declared["process_precommit_receipt_sha256"] != plan.causal_precommit_receipt_sha256):
             _fail("DECLARED_SLOT_REQUEST_BINDING_MISMATCH")
+        if m5_derived and (receipt.get("development_scope") != historical.declared_slot_development_scope(declared)
+                or receipt.get("development_scope_sha256") != declared.get("development_scope_sha256")):
+            _fail("M5_CELL_PLAN_DEVELOPMENT_SCOPE_MISMATCH")
     elif plan._declared_slot_request is not None:
         _fail("DECLARED_SLOT_REQUEST_INVALID")
     attempts = plan.attempt_artifacts()
@@ -2073,6 +2141,7 @@ def verify_production_cell_search_plan(
             horizon_plan=plan.horizon_plan,
             boundary_limited=plan.boundary_limited,
             timeframe=plan.timeframe,
+            m5_view_window=m5_view_window,
         )
     if terminal:
         product = plan.native_prefix_product
@@ -2171,7 +2240,7 @@ def verify_production_cell_search_plan(
             )
         ):
             _fail("UNOBSERVED_CELL_PLAN_BINDING_INVALID")
-    elif (
+    elif not m5_derived and (
         plan.mode
         not in {
             "HISTORICAL_ANCHOR",
@@ -2185,7 +2254,15 @@ def verify_production_cell_search_plan(
         _fail("CELL_PLAN_MODE_INVALID")
     namespace = _artifact_namespace(receipt.get("artifact_namespace"))
     artifact_id = f"{namespace}/search-cell-plan/{plan.timeframe}/{plan.regime}"
-    expected_entry = sink.put_json(artifact_id, CELL_PLAN_ARTIFACT_TYPE, receipt)
+    if read_only:
+        expected_entry = sink._artifacts.get(artifact_id)
+        if expected_entry is None:
+            _fail("M5_SAVED_PLAN_ORIGINAL_MISSING")
+        stored, _ = _read_existing_m5_plan_json(context, expected_entry.get("descriptor"))
+        if stored != plan._cell_receipt_json:
+            _fail("M5_SAVED_PLAN_ORIGINAL_CHANGED")
+    else:
+        expected_entry = sink.put_json(artifact_id, CELL_PLAN_ARTIFACT_TYPE, receipt)
     observed_entry = plan.spool_entry
     if (
         _canonical_bytes(observed_entry, maximum=256 * 1024) != plan._spool_entry_json
@@ -2407,6 +2484,66 @@ def _attempt_designs(
     return designs
 
 
+M5_DERIVED_CELL_PLAN_SCHEMA = "fxpm.production-m5-derived-cell-search-plan.v1"
+M5_DERIVED_STATE_REQUIREMENT_SCHEMA = "fxpm.production-m5-derived-state-requirement.v1"
+_M5_CELL_PLAN_FIELDS = frozenset(('artifact_namespace', 'attempt_artifact_sha256', 'attempt_count', 'attempt_roster_sha256', 'attempts_frozen_before_search', 'authority_scope', 'boundary_limited', 'candidate', 'causal_process_precommit_receipt_sha256', 'cell', 'confers_winner_causal_current_capital_publication_or_live_authority', 'current_refit_source_capture_sha256', 'declared_slot_request_sha256', 'dependency_geometry', 'dependency_payload', 'development_scope', 'development_scope_sha256', 'generation_context_sha256', 'generation_id', 'horizon_plan_binding', 'm5_view_window', 'mode', 'native_prefix', 'receipt_sha256', 'regime_fit_decision_sha256', 'run_id', 'schema_version', 'search_process_receipt_sha256', 'source_group_decision_sha256', 'source_kind', 'state_context_selection', 'state_domain_ceiling_record_roster_sha256', 'state_domain_ceiling_record_sha256', 'state_domain_ceiling_records', 'state_error_envelope', 'state_replay_required_before_scored_partition', 'state_requirement_roster_sha256', 'state_requirement_sha256', 'train_regime_support_sha256'))
+
+
+def _planning_source_value(native, window, key):
+    if window is None:
+        return native[key]
+    fields = {"timeframe": "timeframe", "prefix_content_sha256": "view_payload_sha256",
+        "prefix_start_utc": "view_start_utc", "prefix_end_exclusive_utc": "view_end_exclusive_utc",
+        "prefix_last_close_utc": "view_last_close_utc", "prefix_rows": "view_rows"}
+    return window[fields[key]]
+
+
+def _planning_source_get(native, window, key):
+    if window is None:
+        return native.get(key)
+    return _planning_source_value(native, window, key)
+
+
+def _planning_source_bounds(native, window):
+    if window is None:
+        return native
+    return {"rows": window["view_rows"], "start_utc": window["view_start_utc"],
+        "end_exclusive_utc": window["view_end_exclusive_utc"],
+        "last_close_utc": window["view_last_close_utc"]}
+
+
+def _m5_state_binding(body, window, schema):
+    if window is None:
+        return body
+    return {**body, "schema_version": schema, "source_kind": "m5_derived",
+        "m5_view_window": dict(window), "m5_view_window_sha256": _sha(dict(window))}
+
+
+def _validated_m5_frame(fitted):
+    frame, window = search_execution.m5_derived_fitted_frame(fitted)
+    native = dict(fitted.product.native_prefix)
+    if (type(window) is not dict or window.get("source_kind") != "m5_derived"
+            or native.get("timeframe") != "M5" or fitted.product.source_state != native_prefix.AVAILABLE
+            or type(frame) is not pd.DataFrame or frame.empty or "_BAR_CLOSE_TS" not in frame):
+        _fail("M5_CELL_PLAN_SOURCE_INVALID")
+    opens = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="coerce"))
+    closes = pd.DatetimeIndex(pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce"))
+    if (opens.hasnans or closes.hasnans or not opens.is_monotonic_increasing
+            or not opens.is_unique or len(opens) != len(closes) or bool((closes <= opens).any())
+            or window["symbol"] != native.get("symbol") or window["timeframe"] not in ("M15", "M30", "H1")
+            or window["view_rows"] != len(frame)
+            or _utc_text(opens[0]) != _utc_text(window["view_start_utc"])
+            or _utc_text(closes[-1]) != _utc_text(window["view_last_close_utc"])
+            or window["base_native_prefix_index_sha256"] != fitted.product.index_sha256
+            or window["base_native_prefix_content_sha256"] != native.get("prefix_content_sha256")):
+        _fail("M5_CELL_PLAN_VIEW_GEOMETRY_INVALID")
+    support = fitted.train_regime_support
+    if type(support) is not dict or support.get("receipt_sha256") != _sha(
+            {key: value for key, value in support.items() if key != "receipt_sha256"}):
+        _fail("REGIME_SUPPORT_RECEIPT_INVALID")
+    return frame, native, opens, closes, window
+
+
 def _validated_frame(
     fitted: search_execution.FittedNativeSearchTimeframe,
 ) -> tuple[pd.DataFrame, dict[str, Any], pd.DatetimeIndex, pd.DatetimeIndex]:
@@ -2556,6 +2693,7 @@ def _preprotected_state_envelope_cutoff(
     opens: pd.DatetimeIndex,
     closes: pd.DatetimeIndex,
     timeframe: str,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[pd.Timestamp, bool]:
     """Choose an index-only cutoff earlier than every possible tuning split.
 
@@ -2567,7 +2705,7 @@ def _preprotected_state_envelope_cutoff(
     """
 
     prefix_end = pd.Timestamp(
-        _utc(native.get("prefix_end_exclusive_utc"), "PREFIX_END_INVALID")
+        _utc(_planning_source_get(native, m5_view_window, "prefix_end_exclusive_utc"), "PREFIX_END_INVALID")
     )
     minimal_payload = _dependency_payload(
         timeframe,
@@ -2576,15 +2714,7 @@ def _preprotected_state_envelope_cutoff(
     )
     minimal_geometry = _derived_dependency_geometry(timeframe, minimal_payload)
     for depth_days in reversed(FIT_CALENDAR_DAY_LADDERS[timeframe]):
-        result = _try_causal_folds(
-            native=native,
-            opens=opens,
-            closes=closes,
-            timeframe=timeframe,
-            depth_days=depth_days,
-            geometry=minimal_geometry,
-            state_context_bars=1,
-        )
+        result = _try_causal_folds(native=native, opens=opens, closes=closes, timeframe=timeframe, depth_days=depth_days, geometry=minimal_geometry, state_context_bars=1, m5_view_window=m5_view_window)
         if result is not None:
             candidate_start, _folds = result
             return candidate_start, True
@@ -2624,22 +2754,18 @@ def _freeze_state_error_envelope(
     native: Mapping[str, Any],
     opens: pd.DatetimeIndex,
     closes: pd.DatetimeIndex,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Seal a pre-protected envelope; later values may only fail it closed."""
 
-    timeframe = str(native.get("timeframe") or "").upper()
+    timeframe = str(_planning_source_get(native, m5_view_window, "timeframe") or "").upper()
     if (
         timeframe not in TIMEFRAMES
         or len(frame) != len(opens)
         or len(frame) != len(closes)
     ):
         _fail("STATE_ERROR_ENVELOPE_INPUT_INVALID")
-    cutoff, four_fold_axis_available = _preprotected_state_envelope_cutoff(
-        native=native,
-        opens=opens,
-        closes=closes,
-        timeframe=timeframe,
-    )
+    cutoff, four_fold_axis_available = _preprotected_state_envelope_cutoff(native=native, opens=opens, closes=closes, timeframe=timeframe, m5_view_window=m5_view_window)
     # When no four-fold axis exists, ``cutoff`` is the prefix end and the whole
     # frame is non-protected planning input.  Otherwise this same mask ends at
     # the largest feasible first-fold fit start, before every tuning observation.
@@ -2677,7 +2803,7 @@ def _freeze_state_error_envelope(
         "regime_warmup_bars": regime_warmup_bars,
     }
     receipt = {**body, "receipt_sha256": _sha(body)}
-    _validated_state_error_envelope(receipt, native_prefix=native)
+    _validated_state_error_envelope(receipt, native_prefix=_planning_source_bounds(native, m5_view_window))
     return receipt
 
 
@@ -2811,11 +2937,12 @@ def _verify_state_error_envelope_fitted_binding(
     *,
     fitted: search_execution.FittedNativeSearchTimeframe,
     native: Mapping[str, Any],
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[float, float, int]:
     """Bind the envelope's non-price terms to the authenticated fit."""
 
     initial_error, tolerance, regime_warmup_bars = (
-        _validated_state_error_envelope(value, native_prefix=native)
+        _validated_state_error_envelope(value, native_prefix=_planning_source_bounds(native, m5_view_window))
     )
     expected_tolerance = _state_tolerance(fitted)
     expected_warmup_bars, expected_parameters_sha256 = _regime_warmup_contract(
@@ -2833,9 +2960,23 @@ def _verify_state_error_envelope_fitted_binding(
 def verify_preprotected_state_error_envelope(
     fitted: search_execution.FittedNativeSearchTimeframe,
     value: Mapping[str, Any],
+    *,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> bool:
     """Independently rederive one envelope from its authenticated full frame."""
 
+    if m5_view_window is not None:
+        frame, native, opens, closes, actual_window = _validated_m5_frame(fitted)
+        if (type(m5_view_window) is not dict
+                or _canonical_bytes(m5_view_window) != _canonical_bytes(actual_window)):
+            _fail("STATE_ERROR_ENVELOPE_M5_WINDOW_INVALID")
+        expected = _freeze_state_error_envelope(
+            frame=frame, fitted=fitted, native=native, opens=opens, closes=closes,
+            m5_view_window=actual_window,
+        )
+        if type(value) is not dict or dict(value) != expected:
+            _fail("STATE_ERROR_ENVELOPE_SOURCE_REPLAY_INVALID")
+        return True
     frame, native, opens, closes = _validated_frame(fitted)
     expected = _freeze_state_error_envelope(
         frame=frame,
@@ -2998,6 +3139,7 @@ def _domain_state_replay_evidence(
     initial_error_bound: float,
     tolerance: float,
     authority: Optional[state_contract.StateContractAuthority] = None,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, state_contract.StateEvidence], list[dict[str, Any]]]:
     parameter_domains = effective_domain.get("parameter_domains")
     requested = effective_domain.get("requested_feature_union")
@@ -3055,6 +3197,7 @@ def _domain_state_replay_evidence(
             ),
             "requires_executor_full_prefix_replay_before_any_scored_slice": True,
         }
+        identity_body = _m5_state_binding(identity_body, m5_view_window, "fxpm.production-m5-derived-domain-full-prefix-state-replay.v1")
         item, receipt = _sealed_state_replay_evidence(
             node=node,
             identity_body=identity_body,
@@ -3072,12 +3215,13 @@ def _state_domain_ceiling_records(
     native_prefix: Mapping[str, Any],
     cell: Mapping[str, Any],
     state_error_envelope: Mapping[str, Any],
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Rebuild all 100 cell ceilings from sealed non-market inputs."""
 
     initial_error, tolerance, regime_warmup_bars = _validated_state_error_envelope(
         state_error_envelope,
-        native_prefix=native_prefix,
+        native_prefix=_planning_source_bounds(native_prefix, m5_view_window),
     )
     symbol = _identity(cell.get("symbol"), "STATE_DOMAIN_SYMBOL_INVALID")
     timeframe = _identity(
@@ -3093,13 +3237,7 @@ def _state_domain_ceiling_records(
     authority = _state_authority_for_candidate(process_body.get("candidate_domain_sha256"))
     records: list[dict[str, Any]] = []
     for ordinal, effective_domain in enumerate(effective_domains):
-        evidence, evidence_bodies = _domain_state_replay_evidence(
-            native_prefix=native_prefix,
-            effective_domain=effective_domain,
-            initial_error_bound=initial_error,
-            tolerance=tolerance,
-            authority=authority,
-        )
+        evidence, evidence_bodies = _domain_state_replay_evidence(native_prefix=native_prefix, effective_domain=effective_domain, initial_error_bound=initial_error, tolerance=tolerance, authority=authority, m5_view_window=m5_view_window)
         try:
             ceiling = authority.resolve_cell_domain_ceiling(
                 effective_domain["strategy_id"],
@@ -3158,6 +3296,7 @@ def _state_replay_requirement(
     initial_error_bound: float,
     tolerance: float,
     state_domain_record: Mapping[str, Any],
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     record_body = {
         key: value
@@ -3224,7 +3363,7 @@ def _state_replay_requirement(
         strategy_name,
         parameters=parameters,
         requested_features=requested,
-        timeframe=str(native["timeframe"]),
+        timeframe=str(_planning_source_value(native, m5_view_window, "timeframe")),
         include_regime_controller=False,
         initial_error_bound=initial_error_bound,
         tolerance=tolerance,
@@ -3252,6 +3391,7 @@ def _state_replay_requirement(
             ),
             "requires_executor_full_prefix_replay_before_any_scored_slice": True,
         }
+        identity_body = _m5_state_binding(identity_body, m5_view_window, "fxpm.production-m5-derived-full-prefix-state-replay.v1")
         item, receipt = _sealed_state_replay_evidence(
             node=node,
             identity_body=identity_body,
@@ -3265,7 +3405,7 @@ def _state_replay_requirement(
         strategy_name,
         parameters=parameters,
         requested_features=requested,
-        timeframe=str(native["timeframe"]),
+        timeframe=str(_planning_source_value(native, m5_view_window, "timeframe")),
         include_regime_controller=False,
         initial_error_bound=initial_error_bound,
         tolerance=tolerance,
@@ -3307,6 +3447,9 @@ def _state_replay_requirement(
             "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
         ),
     }
+    if m5_view_window is not None:
+        body = _m5_state_binding(body, m5_view_window, M5_DERIVED_STATE_REQUIREMENT_SCHEMA)
+        body["regime_surface_source"] = "FITTED_FULL_M5_DERIVED_PREFIX_REGIME_LIVE"
     return {**body, "requirement_sha256": _sha(body)}
 
 
@@ -3317,13 +3460,10 @@ def _state_requirements(
     designs: Sequence[Mapping[str, Any]],
     state_error_envelope: Mapping[str, Any],
     state_domain_records: Sequence[Mapping[str, Any]],
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     initial_error, tolerance, regime_warmup_bars = (
-        _verify_state_error_envelope_fitted_binding(
-            state_error_envelope,
-            fitted=fitted,
-            native=native,
-        )
+        _verify_state_error_envelope_fitted_binding(state_error_envelope, fitted=fitted, native=native, m5_view_window=m5_view_window)
     )
     by_strategy = {
         str(record.get("strategy_id") or ""): record
@@ -3342,15 +3482,7 @@ def _state_requirements(
         if record is None:
             _fail("STATE_DOMAIN_CEILING_MISSING", strategy_name)
         requirements.append(
-            _state_replay_requirement(
-                fitted=fitted,
-                native=native,
-                strategy_name=strategy_name,
-                wire_parameters=dict(design["parameters"]),
-                initial_error_bound=initial_error,
-                tolerance=tolerance,
-                state_domain_record=record,
-            )
+            _state_replay_requirement(fitted=fitted, native=native, strategy_name=strategy_name, wire_parameters=dict(design['parameters']), initial_error_bound=initial_error, tolerance=tolerance, state_domain_record=record, m5_view_window=m5_view_window)
         )
     return requirements, regime_warmup_bars
 
@@ -3648,9 +3780,10 @@ def _try_causal_folds(
     depth_days: int,
     geometry: Mapping[str, int],
     state_context_bars: int,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[pd.Timestamp, list[dict[str, Any]]] | None:
     prefix_end = pd.Timestamp(
-        _utc(native["prefix_end_exclusive_utc"], "PREFIX_END_INVALID")
+        _utc(_planning_source_value(native, m5_view_window, "prefix_end_exclusive_utc"), "PREFIX_END_INVALID")
     )
     midnight_opens = pd.DatetimeIndex([value for value in opens if _midnight(value)])
     midnight_closes = pd.DatetimeIndex([value for value in closes if _midnight(value)])
@@ -3707,7 +3840,7 @@ def _try_causal_folds(
             failure = True
             break
         source_slice = {
-            "prefix_content_sha256": native["prefix_content_sha256"],
+            "prefix_content_sha256": _planning_source_value(native, m5_view_window, "prefix_content_sha256"),
             "fit_start_utc": _utc_text(fit_start),
             "fit_end_exclusive_utc": _utc_text(fit_end),
             "validation_warmup_start_utc": _utc_text(warmup_start),
@@ -3769,23 +3902,16 @@ def _build_causal_folds(
     timeframe: str,
     geometry: Mapping[str, int],
     state_context_bars: int,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> tuple[int, pd.Timestamp, list[dict[str, Any]], bool]:
     ladder = FIT_CALENDAR_DAY_LADDERS[timeframe]
     for depth_days in reversed(ladder):
-        result = _try_causal_folds(
-            native=native,
-            opens=opens,
-            closes=closes,
-            timeframe=timeframe,
-            depth_days=depth_days,
-            geometry=geometry,
-            state_context_bars=state_context_bars,
-        )
+        result = _try_causal_folds(native=native, opens=opens, closes=closes, timeframe=timeframe, depth_days=depth_days, geometry=geometry, state_context_bars=state_context_bars, m5_view_window=m5_view_window)
         if result is not None:
             candidate_start, folds = result
             return depth_days, candidate_start, folds, False
     prefix_start = pd.Timestamp(
-        _utc(native["prefix_start_utc"], "PREFIX_START_INVALID")
+        _utc(_planning_source_value(native, m5_view_window, "prefix_start_utc"), "PREFIX_START_INVALID")
     )
     # Horizon's boundary-limited state is intentionally triggered by the
     # missing bar immediately before the authenticated prefix.  No fold or
@@ -3805,6 +3931,7 @@ def _select_feasible_common_state_context(
     timeframe: str,
     state_domain_records: Sequence[Mapping[str, Any]],
     regime_warmup_bars: int,
+    m5_view_window: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Select geometry from exhaustive domain ceilings, never sampled attempts.
 
@@ -3837,14 +3964,7 @@ def _select_feasible_common_state_context(
             regime_warmup_bars=regime_warmup_bars,
         )
         geometry = _derived_dependency_geometry(timeframe, payload)
-        depth_days, candidate_start, folds, boundary_limited = _build_causal_folds(
-            native=native,
-            opens=opens,
-            closes=closes,
-            timeframe=timeframe,
-            geometry=geometry,
-            state_context_bars=state_context_bars,
-        )
+        depth_days, candidate_start, folds, boundary_limited = _build_causal_folds(native=native, opens=opens, closes=closes, timeframe=timeframe, geometry=geometry, state_context_bars=state_context_bars, m5_view_window=m5_view_window)
         selected = {
             "selected_common_context_bars": state_context_bars,
             "dependency_payload": payload,
@@ -4814,6 +4934,27 @@ def _build_observed_cell_plan(
     bounded_canary_plan_permit: Any = None,
     declared_slot_request: Any = None,
 ) -> ProductionCellSearchPlan:
+    return _build_observed_cell_plan_source(context, process=process, fitted=fitted, regime=regime, anchor=anchor, run_id=run_id, causal_precommit_receipt_sha256=causal_precommit_receipt_sha256, mode=mode, namespace=namespace, sink=sink, bounded_canary_request=bounded_canary_request, bounded_canary_source_session=bounded_canary_source_session, bounded_canary_plan_permit=bounded_canary_plan_permit, declared_slot_request=declared_slot_request, m5_derived=False)
+
+
+def _build_observed_cell_plan_source(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    process: FrozenProductionSearchProcess,
+    fitted: search_execution.FittedNativeSearchTimeframe | None,
+    regime: str | None,
+    anchor: Mapping[str, Any],
+    run_id: str,
+    causal_precommit_receipt_sha256: str,
+    mode: str,
+    namespace: str,
+    sink: authority_spool.SymbolAuthoritySink,
+    m5_derived: bool,
+    bounded_canary_request: Any = None,
+    bounded_canary_source_session: Any = None,
+    bounded_canary_plan_permit: Any = None,
+    declared_slot_request: Any = None,
+) -> ProductionCellSearchPlan:
     """Build one sealed cell plan after its outer authority is verified."""
 
     verify_frozen_production_search_process(context, process)
@@ -4878,9 +5019,15 @@ def _build_observed_cell_plan(
         _fail("REGIME_INVALID")
     if type(fitted) is not search_execution.FittedNativeSearchTimeframe:
         _fail("FITTED_TIMEFRAME_INVALID")
-    frame, native, opens, closes = _validated_frame(fitted)
+    m5_view_window = None
+    if m5_derived:
+        if normalized_mode != "DECLARED_SLOT_UNISSUED":
+            _fail("M5_CELL_PLAN_MODE_INVALID")
+        frame, native, opens, closes, m5_view_window = _validated_m5_frame(fitted)
+    else:
+        frame, native, opens, closes = _validated_frame(fitted)
     symbol = str(native.get("symbol") or "")
-    timeframe = str(native.get("timeframe") or "")
+    timeframe = str(_planning_source_get(native, m5_view_window, "timeframe") or "")
     if symbol not in book.PINNED_SYMBOL_ORDER or timeframe not in TIMEFRAMES:
         _fail("CELL_OUTSIDE_PINNED_ROSTER")
     _validate_available_prefix_anchor_binding(
@@ -4894,13 +5041,7 @@ def _build_observed_cell_plan(
         _fail("REGIME_NOT_EMPIRICALLY_OBSERVED_USE_TERMINAL_PATH")
 
     process_body = process.to_dict()
-    state_error_envelope = _freeze_state_error_envelope(
-        frame=frame,
-        fitted=fitted,
-        native=native,
-        opens=opens,
-        closes=closes,
-    )
+    state_error_envelope = _freeze_state_error_envelope(frame=frame, fitted=fitted, native=native, opens=opens, closes=closes, m5_view_window=m5_view_window)
     cell_identity = {
         "symbol": symbol,
         "timeframe": timeframe,
@@ -4914,20 +5055,8 @@ def _build_observed_cell_plan(
         "last_close_utc": native["prefix_last_close_utc"],
         "rows": native["prefix_rows"],
     }
-    state_domain_records, regime_warmup_bars = _state_domain_ceiling_records(
-        process_body,
-        native_prefix=native_binding,
-        cell=cell_identity,
-        state_error_envelope=state_error_envelope,
-    )
-    state_selection = _select_feasible_common_state_context(
-        native=native,
-        opens=opens,
-        closes=closes,
-        timeframe=timeframe,
-        state_domain_records=state_domain_records,
-        regime_warmup_bars=regime_warmup_bars,
-    )
+    state_domain_records, regime_warmup_bars = _state_domain_ceiling_records(process_body, native_prefix=native_binding, cell=cell_identity, state_error_envelope=state_error_envelope, m5_view_window=m5_view_window)
+    state_selection = _select_feasible_common_state_context(native=native, opens=opens, closes=closes, timeframe=timeframe, state_domain_records=state_domain_records, regime_warmup_bars=regime_warmup_bars, m5_view_window=m5_view_window)
     state_context_bars = state_selection["selected_common_context_bars"]
     payload = state_selection["dependency_payload"]
     dependency_geometry = state_selection["dependency_geometry"]
@@ -4949,13 +5078,7 @@ def _build_observed_cell_plan(
         timeframe=timeframe,
         regime=normalized_regime,
     )
-    state_requirements, exact_regime_warmup_bars = _state_requirements(
-        fitted=fitted,
-        native=native,
-        designs=designs,
-        state_error_envelope=state_error_envelope,
-        state_domain_records=state_domain_records,
-    )
+    state_requirements, exact_regime_warmup_bars = _state_requirements(fitted=fitted, native=native, designs=designs, state_error_envelope=state_error_envelope, state_domain_records=state_domain_records, m5_view_window=m5_view_window)
     if exact_regime_warmup_bars != regime_warmup_bars:
         _fail("STATE_DOMAIN_REGIME_WARMUP_MISMATCH")
     state_dispositions = _state_context_dispositions(
@@ -4970,7 +5093,7 @@ def _build_observed_cell_plan(
         boundary_limited=boundary_limited,
     )
     fit_end = pd.Timestamp(
-        _utc(native["prefix_end_exclusive_utc"], "PREFIX_END_INVALID")
+        _utc(_planning_source_value(native, m5_view_window, "prefix_end_exclusive_utc"), "PREFIX_END_INVALID")
     )
     current_fit_start, source_count = _cutoff_anchored_refit_window(
         opens=opens,
@@ -4989,10 +5112,12 @@ def _build_observed_cell_plan(
         _fail("ATTEMPT_SOURCE_PREFIX_TOO_SHORT")
 
     current_source_capture: dict[str, Any] | None = None
-    artifact_source_sha256 = str(native["prefix_content_sha256"])
+    artifact_source_sha256 = str(_planning_source_value(native, m5_view_window, "prefix_content_sha256"))
     artifact_fit_start_utc = _utc_text(current_fit_start)
-    artifact_fit_end_utc = str(native["prefix_end_exclusive_utc"])
-    artifact_latest_closed_bar_utc = str(native["prefix_last_close_utc"])
+    artifact_fit_end_utc = (str(native["prefix_end_exclusive_utc"]) if m5_view_window is None
+        else _utc_text(_planning_source_value(native, m5_view_window, "prefix_end_exclusive_utc")))
+    artifact_latest_closed_bar_utc = (str(native["prefix_last_close_utc"]) if m5_view_window is None
+        else _utc_text(_planning_source_value(native, m5_view_window, "prefix_last_close_utc")))
     if mode == "CURRENT_REFIT":
         current_source_capture = _write_current_refit_source_capture(
             context,
@@ -5109,8 +5234,12 @@ def _build_observed_cell_plan(
         "candidates": [candidate],
         "trials": trials,
     }
+    if m5_view_window is not None:
+        request_value.update(schema_version="fxpm.m5-derived-historical-horizon-request.v1",
+            source_kind="m5_derived", target_view_window=dict(m5_view_window))
     try:
-        horizon_plan = training_horizon.build_historical_horizon_plan(request_value)
+        horizon_plan = (training_horizon.build_m5_derived_historical_horizon_plan(request_value)
+            if m5_view_window is not None else training_horizon.build_historical_horizon_plan(request_value))
     except Exception as exc:
         raise ProductionSearchPlannerError(
             "HORIZON_PLAN_BUILD_FAILED", (type(exc).__name__, str(exc))
@@ -5129,35 +5258,11 @@ def _build_observed_cell_plan(
     ):
         _fail("HORIZON_PLAN_OUTPUT_BINDING_INVALID")
     encoded_artifacts = tuple(_canonical_bytes(value) for value in artifacts)
-    receipt_json, entry_json = _seal_cell_plan(
-        context,
-        sink=sink,
-        mode=mode,
-        namespace=namespace,
-        process=process,
-        causal_precommit_receipt_sha256=causal_precommit_receipt_sha256,
-        fitted=fitted,
-        regime=normalized_regime,
-        horizon_plan=horizon_plan,
-        candidate=candidate,
-        dependency_payload=payload,
-        dependency_geometry=dependency_geometry,
-        attempt_artifacts=artifacts,
-        state_requirements=state_requirements,
-        state_domain_records=state_domain_records,
-        state_context_selection=state_context_selection,
-        state_error_envelope=state_error_envelope,
-        boundary_limited=boundary_limited,
-        current_refit_source_capture_sha256=(
-            _sha(current_source_capture) if current_source_capture is not None else None
-        ),
-        bounded_canary_request=bounded_canary_request,
-        bounded_canary_source_session=bounded_canary_source_session,
-        bounded_canary_plan_permit=bounded_canary_plan_permit,
-        declared_slot_request=declared_slot_request,
-    )
+    receipt_json, entry_json = _seal_cell_plan(context, sink=sink, mode=mode, namespace=namespace, process=process, causal_precommit_receipt_sha256=causal_precommit_receipt_sha256, fitted=fitted, regime=normalized_regime, horizon_plan=horizon_plan, candidate=candidate, dependency_payload=payload, dependency_geometry=dependency_geometry, attempt_artifacts=artifacts, state_requirements=state_requirements, state_domain_records=state_domain_records, state_context_selection=state_context_selection, state_error_envelope=state_error_envelope, boundary_limited=boundary_limited, current_refit_source_capture_sha256=_sha(current_source_capture) if current_source_capture is not None else None, bounded_canary_request=bounded_canary_request, bounded_canary_source_session=bounded_canary_source_session, bounded_canary_plan_permit=bounded_canary_plan_permit, declared_slot_request=declared_slot_request, m5_view_window=m5_view_window)
     result = ProductionCellSearchPlan(
         mode=mode,
+        native_prefix_product=fitted.product if m5_view_window is not None else None,
+        fitted_timeframe=fitted if m5_view_window is not None else None,
         symbol=symbol,
         timeframe=timeframe,
         regime=normalized_regime,
@@ -5184,7 +5289,7 @@ def _build_observed_cell_plan(
     )
     if result.attempt_count != ATTEMPT_COUNT:
         _fail("CELL_PLAN_ATTEMPT_ROSTER_INCOMPLETE")
-    verify_production_cell_search_plan(
+    (verify_m5_derived_production_cell_search_plan if m5_view_window is not None else verify_production_cell_search_plan)(
         context,
         process=process,
         sink=sink,
@@ -5276,3 +5381,120 @@ def build_declared_slot_observed_cell_plan(context, *, process, request, fitted)
 
 
 __all__ += ["build_declared_slot_observed_cell_plan"]
+
+def build_declared_slot_m5_derived_observed_cell_plan(context, *, process, request, fitted):
+    """Build only from the original declared request and live registered M5 view."""
+    import pm_historical_search_producer as producer
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    session = producer._verified_declared_slot_fitted(context, request=request, process=process, fitted=fitted)
+    search_execution.m5_derived_fitted_frame(fitted)
+    anchor = {**body["anchor"], "evidence_accessed_at_utc": session.to_dict()["source_accessed_at_utc"]}
+    return _build_observed_cell_plan_source(context, process=process, fitted=fitted,
+        regime=body["regime"], anchor=anchor, run_id=body["run_id"],
+        causal_precommit_receipt_sha256=body["precommit_sha256"],
+        mode="DECLARED_SLOT_UNISSUED", namespace=body["artifact_namespace"],
+        sink=request.symbol_sink(body["symbol"]), declared_slot_request=request, m5_derived=True)
+
+def _read_existing_m5_plan_json(context, descriptor):
+    keys = {"schema_version", "relative_path", "sha256", "size_bytes", "format"}
+    if (type(descriptor) is not dict or set(descriptor) != keys
+            or descriptor["schema_version"] != authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA
+            or descriptor["format"] != authority_spool.CANONICAL_JSON_FORMAT
+            or type(descriptor["size_bytes"]) is not int
+            or not 0 < descriptor["size_bytes"] <= context.limits.max_json_bytes):
+        _fail("M5_SAVED_PLAN_DESCRIPTOR_INVALID")
+    expected = _hex64(descriptor["sha256"], "M5_SAVED_PLAN_DESCRIPTOR_INVALID")
+    try:
+        digest, size, encoded = authority_spool._stream_file(context.root, descriptor["relative_path"],
+            maximum_bytes=context.limits.max_json_bytes, expected_size=descriptor["size_bytes"],
+            collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+    except Exception as error:
+        raise ProductionSearchPlannerError("M5_SAVED_PLAN_ORIGINAL_MISSING_OR_CHANGED",
+            (type(error).__name__,)) from error
+    if encoded is None or digest != expected or size != descriptor["size_bytes"]:
+        _fail("M5_SAVED_PLAN_ORIGINAL_CHANGED")
+    try:
+        value = authority_spool._strict_json_bytes(encoded, context.limits.max_json_bytes)
+    except Exception as error:
+        raise ProductionSearchPlannerError("M5_SAVED_PLAN_JSON_INVALID", (type(error).__name__,)) from error
+    if type(value) is not dict or _canonical_bytes(value, maximum=context.limits.max_json_bytes) != encoded:
+        _fail("M5_SAVED_PLAN_JSON_INVALID")
+    return encoded, value
+
+
+def reopen_declared_slot_m5_derived_observed_cell_plan(
+    context, *, process, request, fitted, sink, plan_transport, horizon_plan,
+):
+    """Restore existing bytes only; neither missing headers nor artifacts are created."""
+    if (type(context) is not authority_spool.GenerationSpoolContext
+            or type(sink) is not authority_spool.SymbolAuthoritySink
+            or type(plan_transport) is not dict
+            or set(plan_transport) != {"cell_receipt", "spool_entry", "attempt_artifacts", "state_requirements"}
+            or type(horizon_plan) is not dict or set(horizon_plan) != {"descriptor", "receipt_sha256"}):
+        _fail("M5_SAVED_PLAN_TRANSPORT_INVALID")
+    verify_frozen_production_search_process(context, process)
+    _require_current_process(process)
+    declared = historical.verify_declared_slot_producer_request(context, request, process=process)
+    if sink is not request.symbol_sink(declared["symbol"]):
+        _fail("M5_SAVED_PLAN_SINK_MISMATCH")
+    original = plan_transport["spool_entry"]
+    artifact_id = (f"{_artifact_namespace(declared['artifact_namespace'])}/search-cell-plan/"
+        f"{declared['timeframe']}/{declared['regime']}")
+    if (type(original) is not dict or original.get("artifact_id") != artifact_id
+            or original.get("artifact_type") != CELL_PLAN_ARTIFACT_TYPE
+            or sink._artifacts.get(artifact_id) != original):
+        _fail("M5_SAVED_PLAN_ORIGINAL_MISSING")
+    encoded_cell, receipt = _read_existing_m5_plan_json(context, original.get("descriptor"))
+    if (receipt != plan_transport["cell_receipt"] or set(receipt) != _M5_CELL_PLAN_FIELDS
+            or receipt.get("schema_version") != M5_DERIVED_CELL_PLAN_SCHEMA
+            or receipt.get("source_kind") != "m5_derived"
+            or receipt.get("receipt_sha256") != _sha({key: value for key, value in receipt.items()
+                if key != "receipt_sha256"})
+            or receipt.get("generation_id") != context.generation_id
+            or receipt.get("generation_context_sha256") != context.context_sha256
+            or receipt.get("search_process_receipt_sha256") != process.receipt_sha256
+            or receipt.get("declared_slot_request_sha256") != request.receipt_sha256
+            or receipt.get("cell") != {key: declared[key] for key in ("symbol", "timeframe", "regime")}):
+        _fail("M5_SAVED_PLAN_BINDING_MISMATCH")
+    encoded_horizon, horizon_body = _read_existing_m5_plan_json(context, horizon_plan["descriptor"])
+    if horizon_plan["descriptor"]["sha256"] != horizon_plan["receipt_sha256"]:
+        _fail("M5_SAVED_HORIZON_BINDING_INVALID")
+    restored_horizon = training_horizon.reopen_m5_derived_historical_horizon_plan(
+        encoded_horizon, horizon_plan["receipt_sha256"])
+    frame, native, opens, closes, window = _validated_m5_frame(fitted)
+    fit_context = getattr(getattr(fitted, "_derived_binding", None), "context", None)
+    if (type(fit_context) is not authority_spool.GenerationSpoolContext
+            or fit_context.root != context.root or fit_context.context_sha256 != context.context_sha256
+            or receipt.get("m5_view_window") != window or horizon_body.get("m5_view_window") != window
+            or horizon_body.get("native_prefix") != native
+            or receipt.get("horizon_plan_binding") != historical.historical_horizon_plan_binding(restored_horizon)
+            or receipt.get("source_group_decision_sha256") != fitted.source_group_decision.receipt_sha256
+            or receipt.get("regime_fit_decision_sha256") != fitted.regime_fit_decision.receipt_sha256
+            or receipt.get("train_regime_support_sha256") != fitted.train_regime_support["receipt_sha256"]):
+        _fail("M5_SAVED_PLAN_LIVE_BINDING_MISMATCH")
+    anchor = horizon_body.get("anchor")
+    if type(anchor) is not dict or any(anchor.get(key) != value for key, value in declared["anchor"].items()
+            if key != "evidence_accessed_at_utc"):
+        _fail("M5_SAVED_PLAN_ANCHOR_MISMATCH")
+    _validate_available_prefix_anchor_binding(native=native, prefix_index=fitted.product.index,
+        anchor=anchor, canary_request_body=None)
+    attempts = plan_transport["attempt_artifacts"]
+    states = plan_transport["state_requirements"]
+    if (type(attempts) is not list or type(states) is not list
+            or any(type(value) is not dict for value in (*attempts, *states))
+            or receipt.get("attempt_artifact_sha256") != [_sha(value) for value in attempts]
+            or receipt.get("state_requirement_sha256") != [value.get("requirement_sha256") for value in states]):
+        _fail("M5_SAVED_PLAN_ARTIFACTS_CHANGED")
+    result = ProductionCellSearchPlan(mode="DECLARED_SLOT_UNISSUED", symbol=declared["symbol"],
+        timeframe=declared["timeframe"], regime=declared["regime"],
+        causal_precommit_receipt_sha256=declared["precommit_sha256"],
+        search_process_receipt_sha256=process.receipt_sha256, horizon_plan=restored_horizon,
+        _attempt_artifacts_json=tuple(_canonical_bytes(value) for value in attempts),
+        _state_requirements_json=tuple(_canonical_bytes(value) for value in states),
+        _cell_receipt_json=encoded_cell, _spool_entry_json=_canonical_bytes(original, maximum=256*1024),
+        boundary_limited=receipt["boundary_limited"], _seal=_CELL_PLAN_SEAL,
+        native_prefix_product=fitted.product, fitted_timeframe=fitted, _declared_slot_request=request)
+    _verify_production_cell_search_plan_source(context, process=process, sink=sink, plan=result,
+        m5_derived=True, read_only=True)
+    return result
+

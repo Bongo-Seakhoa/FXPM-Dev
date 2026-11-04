@@ -1969,6 +1969,7 @@ __all__ = [
 
 # One declared cell's search receipts; this is not a trading/account supervisor.
 DECLARED_CELL_RUN_SCHEMA = "fxpm.declared-cell-owner-run.v1"
+DECLARED_DEVELOPMENT_CELL_RUN_SCHEMA = "fxpm.declared-development-cell-owner-run.v1"
 DECLARED_SLOT_COMMIT_SCHEMA = "fxpm.declared-slot-commit.v1"
 _DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA = "fxpm.declared-slot-commit.v2"
 _DECLARED_SLOT_POINTER_SCHEMA = "fxpm.declared-slot-commit-pointer.v1"
@@ -2026,9 +2027,22 @@ class _DeclaredSlotSourceSession:
         return hashlib.sha256(self._body_json).hexdigest()
 
 
+def _declared_completion_schema(body):
+    scope = historical.declared_slot_development_scope(body)
+    if scope is None:
+        return historical_adapter.DECLARED_SLOT_COMPLETION_SCHEMA
+    selector = getattr(historical_adapter, "declared_slot_completion_schema", None)
+    if not callable(selector):
+        _fail("DECLARED_DEVELOPMENT_COMPLETION_NOT_IMPLEMENTED")
+    schema = selector(body)
+    if schema != "fxpm.declared-development-slot-completion.v1":
+        _fail("DECLARED_DEVELOPMENT_COMPLETION_NOT_IMPLEMENTED")
+    return schema
+
+
 def _declared_base_completion(request, *, status, reason_code, source_entry):
     body = request.to_dict()
-    return {"schema_version": historical_adapter.DECLARED_SLOT_COMPLETION_SCHEMA,
+    result = {"schema_version": _declared_completion_schema(body),
         "request_body": body, "request_sha256": request.receipt_sha256,
         "precommit_sha256": body["precommit_sha256"], "cell_id": body["cell_id"], "slot_id": body["slot_id"],
         "status": status, "reason_code": reason_code, "owner": None,
@@ -2039,6 +2053,10 @@ def _declared_base_completion(request, *, status, reason_code, source_entry):
         "raw_production_receipt": None, "production_descriptor_graph": None,
         "completed_at_utc": _now_utc_seconds(), "qualification_authority": False,
         "capital_authority": False, "live_authority": False, "order_authority": False}
+    if historical.declared_slot_development_scope(body) is not None:
+        result.update(development_scope_sha256=body["development_scope_sha256"],
+            design_contaminated=True, pristine_validation=False)
+    return result
 
 
 def _verify_declared_completion_transport(context, *, completion, expected_edition):
@@ -2073,6 +2091,203 @@ def _verify_declared_completion_transport(context, *, completion, expected_editi
         _fail(code)
 
 
+DECLARED_M5_SLOT_SOURCE_SESSION_SCHEMA = "fxpm.declared-slot-source-session.m5-derived.v1"
+_DECLARED_M5_SLOT_REQUEST_SCHEMA = "fxpm.declared-m5-slot-producer-request.v1"
+_DECLARED_M5_SLOT_REQUEST_SCHEMAS = (_DECLARED_M5_SLOT_REQUEST_SCHEMA,
+    "fxpm.declared-development-m5-slot-producer-request.v1")
+DECLARED_M5_SLOT_SOURCE_SESSION_KEYS = frozenset((
+    "schema_version", "source_kind", "request_sha256", "generation_context_sha256",
+    "config_sha256", "effective_config_sha256", "spread_profile_identity", "m5_source_pins",
+    "m5_view_contract_sha256", "view_plan_sha256", "session_opened_at_utc", "source_accessed_at_utc",
+    "selection_cutoff_utc", "source_state", "native_source_route", "native_prefix_index_descriptor",
+    "native_prefix_index_sha256", "native_snapshot_entry", "native_snapshot_errors",
+    "source_group_decision_sha256", "regime_fit_decision_sha256", "m5_source_identity",
+    "m5_request_view_id", "m5_calibration_view_id", "m5_request_view_observation",
+    "m5_calibration_view_observation", "fitted_view_evidence", "cost_status", "failure",
+    "m5_reopen_context_entry",
+    "unverified_caller_source_or_fit_accepted", "qualification_authority", "capital_authority",
+    "live_authority", "order_authority"))
+
+
+def _declared_m5_view_observation(view):
+    from dataclasses import asdict
+    return {"view_key": view.view_key, "payload_sha256": view.payload_sha256,
+        "membership_sha256": view.membership_sha256, "source_kind": view.source_kind,
+        "timeframe": view.timeframe, "cutoff_utc": view.cutoff_utc,
+        "interval": asdict(view.interval), "coverage": asdict(view.coverage),
+        "constructor_implementation_sha256": view.constructor_implementation_sha256,
+        "gap_findings_sha256": view.gap_findings_sha256, "cost_status": view.cost_status}
+
+
+DECLARED_M5_REOPEN_CONTEXT_SCHEMA = "fxpm.declared-m5-reopen-context.v1"
+_DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES = 4 * 1024 * 1024
+_original_reopen_prefix_route = _reopen_prefix_route
+
+
+def _declared_m5_reopen_context_body(*, request, owner, cost_edition,
+                                     request_view_id, calibration_view_id):
+    metadata = owner.reopen_metadata()
+    routes = [_prefix_route(owner.product_at(cutoff)) for cutoff in metadata["product_cutoffs"]]
+    value = {"schema_version": DECLARED_M5_REOPEN_CONTEXT_SCHEMA,
+        "request_sha256": request.receipt_sha256, "m5_request_view_id": request_view_id,
+        "m5_calibration_view_id": calibration_view_id, "owner_metadata": metadata,
+        "cost_edition_route": cost_edition.reopen_route(), "fine_product_routes": routes}
+    return json.loads(_canonical_bytes(value, _DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES))
+
+
+def _read_declared_m5_reopen_entry(context, value, *, body, artifact_type, suffix=None):
+    code = "DECLARED_M5_REOPEN_CONTEXT_INVALID"
+    entry = historical_adapter._artifact_entry(value, code)
+    if (entry["artifact_type"] != artifact_type
+            or not entry["artifact_id"].startswith(body["artifact_namespace"] + "/")
+            or (suffix is not None and entry["artifact_id"] != body["artifact_namespace"] + suffix)
+            or entry["descriptor"]["format"] != authority_spool.CANONICAL_JSON_FORMAT
+            or not 0 < entry["descriptor"]["size_bytes"] <= _DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES):
+        _fail(code)
+    result = historical_adapter._reopen_ascii_json_entry(context, entry,
+        expected_type=artifact_type, code=code)
+    _canonical_bytes(result, _DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES)
+    return result, entry
+
+
+def _declared_m5_reopen_binding(body, context, owner):
+    expected = {"generation_context_sha256": context.context_sha256,
+        "config_sha256": context.config_sha256, "effective_config_sha256": body["effective_config_sha256"],
+        "search_process_receipt_sha256": body["search_process_receipt_sha256"],
+        "precommit_sha256": body["precommit_sha256"], "run_id": body["run_id"],
+        "cell_id": body["cell_id"], "m5_view_contract_sha256": body["m5_view_contract_sha256"]}
+    if (any(getattr(owner.binding, key) != value for key, value in expected.items())
+            or _sha(body["m5_source_pins"]) != owner.binding.m5_view_contract_sha256
+            or owner.view_plan_sha256 != body["m5_source_pins"]["view_plan_sha256"]
+            or owner.binding.view_plan_sha256 != owner.view_plan_sha256):
+        _fail("DECLARED_M5_OWNER_BINDING_MISMATCH")
+
+
+def reacquire_declared_m5_source(context, *, request, process, frozen_pipeline_config,
+                                 source_session_entry, m5_owner=None, cost_edition=None):
+    """Reopen original saved routes and return live owned leases; never issue a prefix or fit."""
+    from dataclasses import asdict
+    import pm_m5_job_view as job_view
+    import pm_m5_derived_costs as derived_costs
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    parent = historical.verify_declared_slot_owner_run_precommit(context, request._precommit, process=process)
+    provided_owner = _declared_m5_reuse_arguments(m5_owner=m5_owner, cost_edition=cost_edition)
+    if (body.get("schema_version") not in _DECLARED_M5_SLOT_REQUEST_SCHEMAS
+            or historical.declared_slot_source_kind(body) != "m5_derived"):
+        _fail("DECLARED_M5_REOPEN_CONTEXT_INVALID")
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    config = frozen_pipeline_config.materialize(context)
+    if (frozen_pipeline_config.effective_config_sha256 != body["effective_config_sha256"]
+            or config.discovery_risk_per_trade_pct != 1.0):
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    session, session_entry = _read_declared_m5_reopen_entry(context, source_session_entry,
+        body=body, artifact_type="declared_slot_source_session")
+    expected = {"schema_version": DECLARED_M5_SLOT_SOURCE_SESSION_SCHEMA, "source_kind": "m5_derived",
+        "request_sha256": request.receipt_sha256, "generation_context_sha256": context.context_sha256,
+        "config_sha256": context.config_sha256, "effective_config_sha256": body["effective_config_sha256"],
+        "spread_profile_identity": body["spread_profile_identity"], "m5_source_pins": body["m5_source_pins"],
+        "m5_view_contract_sha256": body["m5_view_contract_sha256"],
+        "view_plan_sha256": body["m5_source_pins"]["view_plan_sha256"],
+        "selection_cutoff_utc": body["anchor"]["selection_cutoff_utc"]}
+    if (set(session) != DECLARED_M5_SLOT_SOURCE_SESSION_KEYS
+            or any(_canonical_bytes(session.get(key)) != _canonical_bytes(value) for key, value in expected.items())
+            or session["failure"] is not None or session["cost_status"] != "COST_READY"
+            or session["unverified_caller_source_or_fit_accepted"] is not False
+            or any(session[key] is not False for key in
+                   ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_M5_REOPEN_SOURCE_NOT_READY")
+    for key in ("source_group_decision_sha256", "regime_fit_decision_sha256"):
+        _hex64(session[key], "DECLARED_M5_REOPEN_SOURCE_NOT_READY")
+    if any(type(session[key]) is not dict for key in
+           ("fitted_view_evidence", "m5_request_view_observation", "m5_calibration_view_observation")):
+        _fail("DECLARED_M5_REOPEN_SOURCE_NOT_READY")
+    window = body["source_access_window_utc"]
+    start, end = (_utc(window[key], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+                  for key in ("start_utc", "end_exclusive_utc"))
+    opened = _utc(session["session_opened_at_utc"], "DECLARED_M5_REOPEN_CONTEXT_INVALID")
+    accessed = _utc(session["source_accessed_at_utc"], "DECLARED_M5_REOPEN_CONTEXT_INVALID")
+    if not (start <= opened < end and start <= accessed < end
+            and _utc(parent["precommitted_at_utc"], "DECLARED_M5_REOPEN_CONTEXT_INVALID") <= opened):
+        _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    saved, _ = _read_declared_m5_reopen_entry(context, session["m5_reopen_context_entry"],
+        body=body, artifact_type="declared_m5_reopen_context", suffix="/m5-reopen-context")
+    fields = {"schema_version", "request_sha256", "m5_request_view_id", "m5_calibration_view_id",
+              "owner_metadata", "cost_edition_route", "fine_product_routes"}
+    if (set(saved) != fields or saved["schema_version"] != DECLARED_M5_REOPEN_CONTEXT_SCHEMA
+            or saved["request_sha256"] != request.receipt_sha256
+            or any(type(saved[key]) is not str or not 1 <= len(saved[key]) <= 128
+                   or saved[key] != session[key]
+                   for key in ("m5_request_view_id", "m5_calibration_view_id"))):
+        _fail("DECLARED_M5_REOPEN_CONTEXT_INVALID")
+    metadata = job_view._bounded_reopen_plain(saved["owner_metadata"])
+    binding, budgets, requests, cutoffs, source = job_view._decode_m5_reopen_metadata(metadata)
+    expected_binding = {"generation_context_sha256": context.context_sha256,
+        "config_sha256": context.config_sha256, "effective_config_sha256": body["effective_config_sha256"],
+        "search_process_receipt_sha256": body["search_process_receipt_sha256"],
+        "precommit_sha256": body["precommit_sha256"], "run_id": body["run_id"],
+        "cell_id": body["cell_id"], "m5_view_contract_sha256": body["m5_view_contract_sha256"],
+        "view_plan_sha256": body["m5_source_pins"]["view_plan_sha256"]}
+    if (any(getattr(binding, key) != value for key, value in expected_binding.items())
+            or _sha(body["m5_source_pins"]) != binding.m5_view_contract_sha256
+            or _canonical_bytes(asdict(source)) != _canonical_bytes(session["m5_source_identity"])
+            or source.symbol != body["symbol"]):
+        _fail("DECLARED_M5_OWNER_BINDING_MISMATCH")
+    cost_route = saved["cost_edition_route"]
+    if (type(cost_route) is not dict
+            or _canonical_bytes(cost_route.get("cost_edition_identity")) != _canonical_bytes(body["m5_source_pins"]["cost_edition_identity"])):
+        _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    routes = saved["fine_product_routes"]
+    if (type(routes) is not list or len(routes) != len(cutoffs)
+            or any(type(route) is not dict or job_view._utc(route.get("cutoff_utc")) != job_view._utc(cutoff)
+                   or route.get("symbol") != body["symbol"] or route.get("timeframe") != "M5"
+                   for route, cutoff in zip(routes, cutoffs))):
+        _fail("DECLARED_M5_REOPEN_CONTEXT_INVALID")
+    owner = request_lease = calibration_lease = None
+    try:
+        products = tuple(_original_reopen_prefix_route(route=route, data_dir=Path(config.data_dir),
+            context=context, symbol=body["symbol"], timeframe="M5") for route in routes)
+        for product in products:
+            if not start <= _utc(product.index["source_accessed_at_utc"], "DECLARED_M5_REOPEN_CONTEXT_INVALID") < end:
+                _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+        if provided_owner:
+            owner = m5_owner
+            if (_canonical_bytes(owner.reopen_metadata()) != _canonical_bytes(metadata)
+                    or any(_prefix_route(owner.product_at(route["cutoff_utc"])) != route for route in routes)):
+                _fail("DECLARED_M5_OWNER_BINDING_MISMATCH")
+        else:
+            owner = job_view.reopen_m5_job_views(context, canonical_data_dir=Path(config.data_dir),
+                fine_products=products, metadata=metadata)
+        _declared_m5_reopen_binding(body, context, owner)
+        product = owner.product_at(body["anchor"]["selection_cutoff_utc"])
+        if (_prefix_route(product) != session["native_source_route"]
+                or product.index_sha256 != session["native_prefix_index_sha256"]
+                or dict(product.index_descriptor) != session["native_prefix_index_descriptor"]
+                or product.index["source_accessed_at_utc"] != session["source_accessed_at_utc"]
+                or product.source_state != session["source_state"]):
+            _fail("DECLARED_M5_BASE_PRODUCT_MISMATCH")
+        edition = cost_edition if provided_owner else derived_costs.open_recorded_derived_costs_route(cost_route)
+        if not _declared_m5_cost_route_matches(body, cost_route,
+                profile_sha256=edition.sha256, actual_route=edition.reopen_route()):
+            _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+        request_lease = owner.acquire(saved["m5_request_view_id"],
+            consumer=job_view.SlotViewBinding(request.receipt_sha256, body["slot_id"]))
+        calibration_lease = owner.acquire(saved["m5_calibration_view_id"],
+            consumer=job_view.CalibrationViewBinding(edition.sha256))
+        if (_canonical_bytes(_declared_m5_view_observation(owner.view(request_lease))) != _canonical_bytes(session["m5_request_view_observation"])
+                or _canonical_bytes(_declared_m5_view_observation(owner.view(calibration_lease))) != _canonical_bytes(session["m5_calibration_view_observation"])):
+            _fail("DECLARED_M5_REOPEN_VIEW_CHANGED")
+        return {"owner": owner, "request_lease": request_lease, "calibration_lease": calibration_lease,
+            "cost_edition": edition, "source_session": session, "source_session_entry": session_entry}
+    except BaseException:
+        _release_declared_m5_reacquired_context({"owner": owner, "request_lease": request_lease,
+            "calibration_lease": calibration_lease}, close_owner=not provided_owner)
+        raise
+
+
+
+
 def _make_declared_slot_source_authority():
     sessions = {}
 
@@ -2101,9 +2316,219 @@ def _make_declared_slot_source_authority():
             _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
         return verify(context, request=request, process=process, source_session=row[0])
 
-    def execute(context, *, request, process, frozen_pipeline_config):
+    def execute_m5(context, *, request, process, frozen_pipeline_config, config,
+                   body, edition, m5_owner, m5_request_view_id,
+                   m5_calibration_view_id, m5_cost_edition):
+        from dataclasses import asdict
+        import pm_m5_job_view as job_view
+        import pm_m5_derived_costs as derived_costs
+        capture = None
+        phase = "PRE_SOURCE"
+        def finish(completion):
+            _verify_declared_completion_transport(context, completion=completion, expected_edition=edition)
+            return completion
+
+        def run_fitted(fitted, session, entry, restored_plan=None):
+            nonlocal capture, phase
+            if (fitted.source_group_decision.to_dict().get("availability") != book.AVAILABLE
+                    or fitted.regime_fit_decision.to_dict().get("fit_state") != book.REGIME_FITTED):
+                _fail("DECLARED_SLOT_FIT_NOT_READY")
+            counts = _verified_support_counts(fitted)
+            if counts[body["regime"]] == 0:
+                if restored_plan is not None:
+                    _fail("DECLARED_BOUND_FIT_SUPPORT_CHANGED")
+                completion = _declared_base_completion(request, status="NO_TRADE", reason_code="REGIME_UNOBSERVED", source_entry=entry)
+                completion["source_group"] = historical_adapter._owned_decision_envelope(fitted.source_group_decision, "DECLARED_SLOT_SOURCE_INVALID")
+                completion["regime_fit"] = historical_adapter._owned_decision_envelope(fitted.regime_fit_decision, "DECLARED_SLOT_FIT_INVALID")
+                return finish(completion)
+            phase = "CAPTURE"
+            plan = (restored_plan if restored_plan is not None else
+                search_planner.build_declared_slot_m5_derived_observed_cell_plan(context, process=process, request=request, fitted=fitted))
+            if edition != historical.DECLARED_WINNER_TRANSPORT_V16:
+                _fail("DECLARED_M5_TRANSPORT_EDITION_INVALID")
+            capture = historical_adapter.open_transport_declared_slot_capture(
+                context, request=request, process=process, plan=plan, source_session=session)
+            search_execution.execute_transport_historical_observed_cell(capture=capture, fitted=fitted,
+                regime=body["regime"], search_process=process, cell_plan=plan, config=config)
+            return finish(capture.completion)
+
+        saved = _declared_saved_raw_completion(context, request=request, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, m5_owner=m5_owner, cost_edition=m5_cost_edition)
+        if saved is not None:
+            return finish(saved)
+        pending_header = _declared_partial_unit_header(context, body)
+        if pending_header is not None:
+            window = body["source_access_window_utc"]
+            if not window["start_utc"] <= _now_utc_seconds() < window["end_exclusive_utc"]:
+                _fail("DECLARED_UNIT_ORIGINAL_WINDOW_CLOSED")
+            source_context = reacquire_declared_m5_source(context, request=request, process=process,
+                frozen_pipeline_config=frozen_pipeline_config, source_session_entry=pending_header["source_session_entry"],
+                m5_owner=m5_owner, cost_edition=m5_cost_edition)
+            try:
+                fitted, original_source, original_entry, original_plan, validation = _reopen_declared_source_material(
+                    context, request=request, process=process, frozen_pipeline_config=frozen_pipeline_config,
+                    m5_source_context=source_context)
+                session = _DeclaredSlotSourceSession(_canonical_bytes(original_source), fitted, config,
+                    frozen_pipeline_config, original_entry, _canonical_bytes(validation))
+                sessions[request.receipt_sha256] = (session, session._body_json, id(context), request,
+                    fitted, config, _canonical_bytes(original_entry), session._reopen_validation_json,
+                    getattr(fitted, "_bound_fit_owner", None))
+                return run_fitted(fitted, session, original_entry, restored_plan=original_plan)
+            except Exception as exc:
+                if (authority_spool.is_resource_capacity_error(exc)
+                        or getattr(exc, "code", None) == "DECLARED_SLOT_RUN_ACTIVE"):
+                    raise
+                if capture is not None and capture._completion is not None:
+                    raise _DeclaredSlotPostCompletionFailure(capture.completion, _declared_failure_details(exc)) from exc
+                raise
+            finally:
+                sessions.pop(request.receipt_sha256, None)
+                _release_declared_m5_reacquired_context(source_context, close_owner=False)
+
+        sink = request.symbol_sink(body["symbol"])
+        source_body = {"schema_version": DECLARED_M5_SLOT_SOURCE_SESSION_SCHEMA,
+            "source_kind": "m5_derived", "request_sha256": request.receipt_sha256,
+            "generation_context_sha256": context.context_sha256, "config_sha256": context.config_sha256,
+            "effective_config_sha256": body["effective_config_sha256"],
+            "spread_profile_identity": body["spread_profile_identity"],
+            "m5_source_pins": json.loads(_canonical_bytes(body["m5_source_pins"])),
+            "m5_view_contract_sha256": body["m5_view_contract_sha256"],
+            "view_plan_sha256": body["m5_source_pins"]["view_plan_sha256"],
+            "session_opened_at_utc": _now_utc_seconds(), "source_accessed_at_utc": None,
+            "selection_cutoff_utc": body["anchor"]["selection_cutoff_utc"],
+            "source_state": "FAILED", "native_source_route": None,
+            "native_prefix_index_descriptor": None, "native_prefix_index_sha256": None,
+            "native_snapshot_entry": None, "native_snapshot_errors": None,
+            "source_group_decision_sha256": None, "regime_fit_decision_sha256": None,
+            "m5_source_identity": None,
+            "m5_request_view_id": m5_request_view_id if type(m5_request_view_id) is str else None,
+            "m5_calibration_view_id": m5_calibration_view_id if type(m5_calibration_view_id) is str else None,
+            "m5_request_view_observation": None, "m5_calibration_view_observation": None,
+            "fitted_view_evidence": None, "cost_status": "COST_UNAVAILABLE", "failure": None,
+            "m5_reopen_context_entry": None,
+            "unverified_caller_source_or_fit_accepted": False,
+            "qualification_authority": False, "capital_authority": False,
+            "live_authority": False, "order_authority": False}
+        request_lease = calibration_lease = None
+        try:
+            window = body["source_access_window_utc"]
+            opened = source_body["session_opened_at_utc"]
+            if not window["start_utc"] <= opened < window["end_exclusive_utc"]:
+                _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+            if (type(m5_owner) is not job_view.M5JobViews
+                    or type(m5_cost_edition) is not derived_costs.RecordedDerivedCosts
+                    or any(type(value) is not str or not value or len(value) > 128
+                           for value in (m5_request_view_id, m5_calibration_view_id))):
+                _fail("DECLARED_M5_SOURCE_ARGUMENTS_INVALID")
+            binding = m5_owner.binding
+            expected = {"generation_context_sha256": context.context_sha256,
+                "config_sha256": context.config_sha256,
+                "effective_config_sha256": body["effective_config_sha256"],
+                "search_process_receipt_sha256": body["search_process_receipt_sha256"],
+                "precommit_sha256": body["precommit_sha256"], "run_id": body["run_id"],
+                "cell_id": body["cell_id"], "m5_view_contract_sha256": body["m5_view_contract_sha256"]}
+            if (any(getattr(binding, key) != value for key, value in expected.items())
+                    or _sha(body["m5_source_pins"]) != binding.m5_view_contract_sha256
+                    or m5_owner.view_plan_sha256 != body["m5_source_pins"]["view_plan_sha256"]
+                    or binding.view_plan_sha256 != m5_owner.view_plan_sha256):
+                _fail("DECLARED_M5_OWNER_BINDING_MISMATCH")
+            if m5_cost_edition.sha256 != body["spread_profile_identity"]["profile_sha256"]:
+                _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+            cutoff = body["anchor"]["selection_cutoff_utc"]
+            product = m5_owner.product_at(cutoff)
+            product = native_prefix.reverify_activated_native_prefix_product(
+                product, context, require_current_activation=True)
+            if (product.index["symbol"] != body["symbol"] or product.index["timeframe"] != "M5"
+                    or product._data_dir != Path(config.data_dir).resolve(strict=False)
+                    or product.index["cutoff_utc"] != cutoff):
+                _fail("DECLARED_M5_BASE_PRODUCT_MISMATCH")
+            accessed = product.index["source_accessed_at_utc"]
+            if not window["start_utc"] <= accessed < window["end_exclusive_utc"]:
+                _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+            # The actual source clock comes from the original M5 product.
+            source_body.update(source_accessed_at_utc=accessed, source_state=product.source_state,
+                native_source_route=_prefix_route(product),
+                native_prefix_index_descriptor=dict(product.index_descriptor),
+                native_prefix_index_sha256=product.index_sha256,
+                m5_source_identity=asdict(m5_owner.source_identity))
+            phase = "SOURCE"
+            import pm_portfolio_replay as portfolio_replay
+            snapshot, snapshot_errors = portfolio_replay.active_native_portfolio_contract(
+                Path(config.data_dir), book.PINNED_SYMBOL_ORDER, timeframes=book.TIMEFRAME_ORDER)
+            source_body["native_snapshot_entry"] = sink.put_json(
+                f"{body['artifact_namespace']}/native-snapshot", "declared_slot_native_snapshot", snapshot)
+            source_body["native_snapshot_errors"] = snapshot_errors
+            status = historical._declared_slot_native_snapshot_status(context, snapshot, snapshot_errors)
+            if status != "MATCH":
+                _fail("DECLARED_SLOT_NATIVE_SNAPSHOT_" + status)
+            if not historical._declared_slot_consumed_native_snapshot_matches(snapshot, product):
+                _fail("DECLARED_SLOT_CONSUMED_NATIVE_SNAPSHOT_MISMATCH")
+            reopen_body = _declared_m5_reopen_context_body(request=request, owner=m5_owner,
+                cost_edition=m5_cost_edition, request_view_id=m5_request_view_id,
+                calibration_view_id=m5_calibration_view_id)
+            source_body["m5_reopen_context_entry"] = sink.put_json(
+                f"{body['artifact_namespace']}/m5-reopen-context", "declared_m5_reopen_context", reopen_body)
+            request_lease = m5_owner.acquire(m5_request_view_id,
+                consumer=job_view.SlotViewBinding(request.receipt_sha256, body["slot_id"]))
+            calibration_lease = m5_owner.acquire(m5_calibration_view_id,
+                consumer=job_view.CalibrationViewBinding(m5_cost_edition.sha256))
+            view, calibration = m5_owner.view(request_lease), m5_owner.view(calibration_lease)
+            if (view.source.symbol != body["symbol"] or view.timeframe != body["timeframe"]
+                    or view.cutoff_utc != cutoff):
+                _fail("DECLARED_M5_REQUEST_VIEW_MISMATCH")
+            source_body["m5_request_view_observation"] = _declared_m5_view_observation(view)
+            source_body["m5_calibration_view_observation"] = _declared_m5_view_observation(calibration)
+            phase = "FIT"
+            fitted = search_execution.fit_m5_derived_timeframe_for_search(
+                context=context, owner=m5_owner, request_lease=request_lease, calibration_lease=calibration_lease,
+                cost_edition=m5_cost_edition, declared_m5_source_pins=body["m5_source_pins"],
+                config=config, acquisition_attempts_exact=1)
+            derived = fitted._derived_binding
+            if (type(derived) is not search_execution._DerivedSearchBinding
+                    or derived.context is not context
+                    or derived.owner is not m5_owner or derived.request_lease is not request_lease
+                    or derived.calibration_lease is not calibration_lease or derived.cost_edition is not m5_cost_edition
+                    or _canonical_bytes(derived.declared_m5_source_pins) != _canonical_bytes(body["m5_source_pins"])
+                    or type(derived.view_evidence) is not dict):
+                _fail("DECLARED_M5_FITTED_BINDING_MISMATCH")
+            if (set(fitted._spread_tiers) != {"P75", "P95"}
+                    or any(t.descriptor()["profile_sha256"] != m5_cost_edition.sha256
+                           for t in fitted._spread_tiers.values())):
+                _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+            source_body.update(source_group_decision_sha256=fitted.source_group_decision.receipt_sha256,
+                regime_fit_decision_sha256=fitted.regime_fit_decision.receipt_sha256,
+                fitted_view_evidence=json.loads(_canonical_bytes(derived.view_evidence)), cost_status="COST_READY")
+            if set(source_body) != DECLARED_M5_SLOT_SOURCE_SESSION_KEYS:
+                _fail("DECLARED_M5_SOURCE_SESSION_FIELDS_INVALID")
+            entry = sink.put_json(f"{body['artifact_namespace']}/source-session", "declared_slot_source_session", source_body)
+            session = _DeclaredSlotSourceSession(_canonical_bytes(source_body), fitted, config, frozen_pipeline_config, entry)
+            sessions[request.receipt_sha256] = (session, session._body_json, id(context), request,
+                fitted, config, _canonical_bytes(entry))
+            return run_fitted(fitted, session, entry)
+        except Exception as exc:
+            if (authority_spool.is_resource_capacity_error(exc)
+                    or getattr(exc, "code", None) == "DECLARED_SLOT_RUN_ACTIVE"):
+                raise
+            if capture is not None and capture._completion is not None:
+                raise _DeclaredSlotPostCompletionFailure(capture.completion, _declared_failure_details(exc)) from exc
+            source_body["failure"] = {**_declared_failure_details(exc), "phase": phase}
+            if set(source_body) != DECLARED_M5_SLOT_SOURCE_SESSION_KEYS:
+                _fail("DECLARED_M5_SOURCE_SESSION_FIELDS_INVALID")
+            entry = sink.put_json(f"{body['artifact_namespace']}/technical-source-session", "declared_slot_source_session", source_body)
+            return finish(_declared_base_completion(request, status="STOP",
+                reason_code="DECLARED_SLOT_SOURCE_FAILURE", source_entry=entry))
+        finally:
+            sessions.pop(request.receipt_sha256, None)
+            for lease in (calibration_lease, request_lease):
+                if lease is not None:
+                    lease.release()
+
+    def execute(context, *, request, process, frozen_pipeline_config,
+                m5_owner=None, m5_request_view_id=None, m5_calibration_view_id=None,
+                m5_cost_edition=None):
         search_planner._require_current_process(process)
         body = historical.verify_declared_slot_producer_request(context, request, process=process)
+        _declared_completion_schema(body)
         edition = historical.declared_slot_transport_edition(body)
         historical._verify_declared_request_identity(request, context, require_live=True)
 
@@ -2121,6 +2546,21 @@ def _make_declared_slot_source_authority():
         if (frozen_pipeline_config.effective_config_sha256 != body["effective_config_sha256"]
                 or config.discovery_risk_per_trade_pct != 1.0):
             _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+        decoder = getattr(historical, "declared_slot_source_kind", None)
+        if body.get("schema_version") in _DECLARED_M5_SLOT_REQUEST_SCHEMAS and decoder is None:
+            _fail("DECLARED_M5_SOURCE_DECODER_NOT_AVAILABLE")
+        source_kind = decoder(body) if decoder is not None else "broker_native"
+        m5_arguments = (m5_owner, m5_request_view_id, m5_calibration_view_id, m5_cost_edition)
+        if source_kind == "m5_derived":
+            if (body.get("schema_version") not in _DECLARED_M5_SLOT_REQUEST_SCHEMAS
+                    or any(value is None for value in m5_arguments)):
+                _fail("DECLARED_M5_SOURCE_ARGUMENTS_REQUIRED")
+            return execute_m5(context, request=request, process=process,
+                frozen_pipeline_config=frozen_pipeline_config, config=config, body=body, edition=edition,
+                m5_owner=m5_owner, m5_request_view_id=m5_request_view_id,
+                m5_calibration_view_id=m5_calibration_view_id, m5_cost_edition=m5_cost_edition)
+        if source_kind != "broker_native" or any(value is not None for value in m5_arguments):
+            _fail("DECLARED_NATIVE_REQUEST_REJECTS_M5_ARGUMENTS")
         saved = _declared_saved_raw_completion(context, request=request, process=process,
             frozen_pipeline_config=frozen_pipeline_config)
         if saved is not None:
@@ -2426,6 +2866,20 @@ def _declared_run_body(context, *, precommit, cell_id, summaries, declared_slots
         "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False}
     if terminal_failure is not None:
         body["terminal_failure"] = terminal_failure
+    parent = precommit.to_dict()
+    scope = historical.declared_slot_development_scope(parent)
+    if scope is not None:
+        selected = historical.declared_slot_selected_slots(parent)
+        expected_ids = [slot["slot_id"] for slot in selected]
+        if (declared_slots != len(selected) or len(summaries) > len(selected)
+                or [item["slot_id"] for item in summaries] != expected_ids[:len(summaries)]
+                or (not terminal_stop and len(summaries) != len(selected))):
+            _fail("DECLARED_DEVELOPMENT_COMPLETION_PREFIX_INVALID")
+        body.update(schema_version=DECLARED_DEVELOPMENT_CELL_RUN_SCHEMA,
+            result_kind="DEVELOPMENT_PARTIAL", development_scope=scope,
+            development_scope_sha256=parent["development_scope_sha256"],
+            design_contaminated=True, pristine_validation=False, accepted_roster_slots=13,
+            development_status="STOP" if terminal_stop else "DEVELOPMENT_COMPLETE")
     return body
 
 
@@ -2436,7 +2890,9 @@ def _declared_symbol_receipt(context, symbol, descriptor):
         "generation_context_sha256": context.context_sha256, "symbol_manifest": descriptor}
 
 
-def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id, frozen_pipeline_config):
+def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id, frozen_pipeline_config,
+                                        m5_owner=None, slot_view_ids=None, calibration_view_id=None,
+                                        cost_edition=None, cell_contract_sha256=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
         _fail("DECLARED_SLOT_CONFIG_INVALID")
@@ -2447,6 +2903,24 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
     if len(parent["cells"]) != 1 or parent["cells"][0]["cell_id"] != cell_id:
         _fail("DECLARED_SLOT_CELL_INVALID")
     symbol = parent["cells"][0]["symbol"]
+    provided = any(value is not None for value in
+        (m5_owner, slot_view_ids, calibration_view_id, cost_edition, cell_contract_sha256))
+    if provided:
+        _declared_cell_m5_arguments(parent, m5_owner=m5_owner, slot_view_ids=slot_view_ids,
+            calibration_view_id=calibration_view_id, cost_edition=cost_edition,
+            cell_contract_sha256=cell_contract_sha256)
+    cell_source_entry = None
+    if historical.declared_slot_source_kind(parent) == "m5_derived":
+        saved, cell_source_entry = _read_declared_m5_cell_source_context(context, precommit=precommit,
+            parent=parent, cell_id=cell_id, cell_contract_sha256=cell_contract_sha256)
+        if provided:
+            actual = _declared_m5_cell_owner_context(context, precommit=precommit, parent=parent,
+                frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id,
+                cell_contract_sha256=cell_contract_sha256, m5_owner=m5_owner,
+                slot_view_ids=slot_view_ids, calibration_view_id=calibration_view_id, cost_edition=cost_edition)
+            if _canonical_bytes(actual) != _canonical_bytes(saved):
+                _fail("DECLARED_M5_CELL_SOURCE_BINDING_INVALID")
+    reuse = {"m5_owner": m5_owner, "m5_cost_edition": cost_edition} if provided else {}
     manifest_path = authority_spool._manifest_relative_path(symbol, authority_spool.GENERAL_MANIFEST_DOMAIN)
     manifest = _read_declared_record(context, manifest_path, maximum_bytes=context.limits.max_manifest_bytes)
     symbol_receipt, run_receipt, verified_manifest = None, None, None
@@ -2459,7 +2933,7 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
     completed, commit_artifacts, previous = [], [], None
     namespaces = set()
     first, terminal, terminal_failure = None, False, None
-    for slot in parent["slot_roster"]["slots"]:
+    for slot in historical.declared_slot_selected_slots(parent):
         item = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"]))
         if item is None:
             if first is None:
@@ -2484,7 +2958,7 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
         _verify_declared_completion_transport(context, completion=body["completion"],
             expected_edition=historical.declared_slot_transport_edition(parent))
         verified = historical_adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
-            completion=body["completion"], artifact_roster=body["artifact_roster"], frozen_pipeline_config=frozen_pipeline_config)
+            completion=body["completion"], artifact_roster=body["artifact_roster"], frozen_pipeline_config=frozen_pipeline_config, **reuse)
         if verified["slot_id"] != slot["slot_id"] or verified["cell_id"] != cell_id:
             _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
         namespace = verified["request_body"]["artifact_namespace"] + "/"
@@ -2518,14 +2992,16 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
     if manifest is not None:
         if first is not None:
             _fail("DECLARED_SLOT_FINALIZED_INCOMPLETE_PREFIX")
-        if verified_manifest["artifacts"] != commit_artifacts:
+        expected_artifacts = (sorted([cell_source_entry, *commit_artifacts], key=lambda row: row["artifact_id"])
+            if cell_source_entry is not None else commit_artifacts)
+        if verified_manifest["artifacts"] != expected_artifacts:
             _fail("DECLARED_SLOT_FINAL_MANIFEST_BINDING_MISMATCH")
     run = _read_declared_record(context, _declared_run_path(precommit, cell_id))
     if run is not None:
         if symbol_receipt is None:
             _fail("DECLARED_SLOT_FINAL_MANIFEST_MISSING")
         expected = _declared_run_body(context, precommit=precommit, cell_id=cell_id, summaries=completed,
-            declared_slots=len(parent["slot_roster"]["slots"]), terminal_stop=terminal, previous=previous,
+            declared_slots=len(historical.declared_slot_selected_slots(parent)), terminal_stop=terminal, previous=previous,
             symbol_receipt=symbol_receipt, terminal_failure=terminal_failure)
         if run[0] != expected:
             _fail("DECLARED_SLOT_RUN_RECEIPT_BINDING_MISMATCH")
@@ -2536,9 +3012,11 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
 
 def _commit_declared_slot_completion(context, *, precommit, process, cell_id, slot, completion,
                                       artifact_roster, previous_commit_sha256, frozen_pipeline_config,
-                                      post_completion_failure=None):
+                                      post_completion_failure=None, m5_owner=None, cost_edition=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     search_planner._require_current_process(process)
+    if historical.declared_slot_development_scope(parent) is not None and slot not in historical.declared_slot_selected_slots(parent):
+        _fail("DECLARED_DEVELOPMENT_PREFIX_INVALID")
     # Independently reopen the COMPLETE result before publishing an immutable
     # completion marker. The marker, not process memory, commits the slot.
     try:
@@ -2549,8 +3027,10 @@ def _commit_declared_slot_completion(context, *, precommit, process, cell_id, sl
         raise HistoricalSearchProducerError("DECLARED_SLOT_COMMIT_ROSTER_BOUND_EXCEEDED", (str(exc)[:128],)) from exc
     _verify_declared_completion_transport(context, completion=completion,
         expected_edition=historical.declared_slot_transport_edition(parent))
+    provided = _declared_m5_reuse_arguments(m5_owner=m5_owner, cost_edition=cost_edition)
+    reuse = {"m5_owner": m5_owner, "m5_cost_edition": cost_edition} if provided else {}
     verified = historical_adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
-        completion=completion, artifact_roster=artifact_roster, frozen_pipeline_config=frozen_pipeline_config)
+        completion=completion, artifact_roster=artifact_roster, frozen_pipeline_config=frozen_pipeline_config, **reuse)
     if verified["slot_id"] != slot["slot_id"] or verified["cell_id"] != cell_id:
         _fail("DECLARED_SLOT_COMMIT_INVALID")
     namespace = verified["request_body"]["artifact_namespace"] + "/"
@@ -2642,10 +3122,15 @@ def _require_reopened_declared_plan(header, validation_receipt, plan):
         _fail("DECLARED_BOUND_FIT_ORIGINAL_PLAN_CHANGED")
 
 
-def _reopen_declared_source_material(context, *, request, process, frozen_pipeline_config):
+def _reopen_declared_source_material(context, *, request, process, frozen_pipeline_config, m5_source_context=None):
     """Cold-read original durable header, then use the real bound-state verifier."""
     body = historical.verify_declared_slot_producer_request(context, request, process=process)
     historical._verify_declared_request_identity(request, context, require_live=True)
+    if body.get("schema_version") in _DECLARED_M5_SLOT_REQUEST_SCHEMAS:
+        return _reopen_declared_m5_source_material(context, request=request, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, body=body, m5_source_context=m5_source_context)
+    if m5_source_context is not None:
+        _fail("DECLARED_NATIVE_REQUEST_REJECTS_M5_ARGUMENTS")
     header = _declared_partial_unit_header(context, body)
     if header is None:
         _fail("DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE")
@@ -2693,7 +3178,7 @@ def _reopen_declared_source_material(context, *, request, process, frozen_pipeli
     return fitted, source, entry, plan, validation
 
 
-def _declared_saved_raw_completion(context, *, request, process, frozen_pipeline_config):
+def _declared_saved_raw_completion(context, *, request, process, frozen_pipeline_config, m5_owner=None, cost_edition=None):
     """Cold-verify a committed Raw unit before normal original outer publication."""
     body = request.to_dict()
     saved = search_execution._read_declared_unit_json(context,
@@ -2708,22 +3193,41 @@ def _declared_saved_raw_completion(context, *, request, process, frozen_pipeline
             or saved["request_sha256"] != request.receipt_sha256
             or saved["completion"].get("request_body") != body):
         _fail("DECLARED_UNIT_RAW_COMPLETION_INVALID")
+    is_m5 = body.get("schema_version") in _DECLARED_M5_SLOT_REQUEST_SCHEMAS
+    provided = _declared_m5_reuse_arguments(m5_owner=m5_owner, cost_edition=cost_edition)
+    if is_m5 and not provided:
+        _fail("DECLARED_M5_SOURCE_ARGUMENTS_REQUIRED")
+    if not is_m5 and provided:
+        _fail("DECLARED_NATIVE_REQUEST_REJECTS_M5_ARGUMENTS")
     historical_adapter.verify_declared_slot_completion(context,
         precommit=request._precommit, process=process, completion=saved["completion"],
-        artifact_roster=saved["artifact_roster"], frozen_pipeline_config=frozen_pipeline_config)
+        artifact_roster=saved["artifact_roster"], frozen_pipeline_config=frozen_pipeline_config,
+        **({"m5_owner": m5_owner, "m5_cost_edition": cost_edition} if is_m5 else {}))
     sink = request.symbol_sink(body["symbol"])
     for entry in saved["artifact_roster"]:
         sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
     return saved["completion"]
 
 
-def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, frozen_pipeline_config, cell_id):
+def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, frozen_pipeline_config, cell_id,
+                                               m5_owner=None, slot_view_ids=None, calibration_view_id=None,
+                                               cost_edition=None, cell_contract_sha256=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     search_planner._require_current_process(process)
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
     frozen_pipeline_config.verify_current(context)
     if frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]:
         _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
-    progress = reopen_declared_cell_owner_progress(context, precommit=precommit, process=process, cell_id=cell_id, frozen_pipeline_config=frozen_pipeline_config)
+    is_m5 = _declared_cell_m5_arguments(parent, m5_owner=m5_owner, slot_view_ids=slot_view_ids,
+        calibration_view_id=calibration_view_id, cost_edition=cost_edition,
+        cell_contract_sha256=cell_contract_sha256)
+    if is_m5:
+        slot_view_ids = dict(slot_view_ids)
+    arguments = {"m5_owner": m5_owner, "slot_view_ids": slot_view_ids, "calibration_view_id": calibration_view_id,
+        "cost_edition": cost_edition, "cell_contract_sha256": cell_contract_sha256} if is_m5 else {}
+    progress = reopen_declared_cell_owner_progress(context, precommit=precommit, process=process,
+        cell_id=cell_id, frozen_pipeline_config=frozen_pipeline_config, **arguments)
     symbol = parent["cells"][0]["symbol"]
     if progress.run_receipt is not None:
         return DeclaredCellOwnerRunReceipt(_canonical_bytes(progress.run_receipt))
@@ -2733,7 +3237,7 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
     terminal_failure = progress.terminal_failure
     if not progress.terminal_stop and progress.first_uncommitted_slot is not None:
         start = progress.first_uncommitted_slot["ordinal"]
-        for slot in parent["slot_roster"]["slots"][start - 1:]:
+        for slot in historical.declared_slot_selected_slots(parent)[start - 1:]:
             import secrets
             import os
             sink = authority_spool.open_symbol_sink(context, symbol)
@@ -2752,8 +3256,10 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
                         attempt_body, context.limits.max_json_bytes)
                 post_completion_failure = None
                 try:
+                    slot_arguments = ({"m5_owner": m5_owner, "m5_request_view_id": slot_view_ids[slot["slot_id"]],
+                        "m5_calibration_view_id": calibration_view_id, "m5_cost_edition": cost_edition} if is_m5 else {})
                     completion = execute_declared_slot_owner_search(context, request=request, process=process,
-                        frozen_pipeline_config=frozen_pipeline_config)
+                        frozen_pipeline_config=frozen_pipeline_config, **slot_arguments)
                 except _DeclaredSlotPostCompletionFailure as exc:
                     completion, post_completion_failure = exc.completion, exc.failure
                 namespace = request.to_dict()["artifact_namespace"] + "/"
@@ -2761,7 +3267,8 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
                 summary, descriptor = _commit_declared_slot_completion(context, precommit=precommit, process=process,
                     cell_id=cell_id, slot=slot, completion=completion, artifact_roster=roster,
                     previous_commit_sha256=previous, frozen_pipeline_config=frozen_pipeline_config,
-                    post_completion_failure=post_completion_failure)
+                    post_completion_failure=post_completion_failure,
+                    **({"m5_owner": m5_owner, "cost_edition": cost_edition} if is_m5 else {}))
                 previous = descriptor["sha256"]
                 completed.append(summary)
                 commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
@@ -2778,16 +3285,21 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
             if completion["status"] == "STOP":
                 break
     # This first surface precommits exactly one cell, so outer finalization is
-    # reached only after all13 slots or an authenticated terminal technical stop.
+    # reached only after every declared slot or an authenticated terminal technical stop.
     terminal_stop = bool(terminal_failure is not None or (completed and completed[-1]["status"] == "STOP"))
-    if not terminal_stop and len(completed) != len(parent["slot_roster"]["slots"]):
+    if not terminal_stop and len(completed) != len(historical.declared_slot_selected_slots(parent)):
         _fail("DECLARED_SLOT_FINALIZED_INCOMPLETE_PREFIX")
     sink = authority_spool.open_symbol_sink(context, symbol)
+    if is_m5:
+        _, cell_source_entry = _read_declared_m5_cell_source_context(context, precommit=precommit,
+            parent=parent, cell_id=cell_id, cell_contract_sha256=cell_contract_sha256)
+        sink.register_artifact(cell_source_entry["artifact_id"], cell_source_entry["artifact_type"],
+            cell_source_entry["descriptor"])
     for entry in commit_artifacts:
         sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
     symbol_receipt = sink.seal()
     body = _declared_run_body(context, precommit=precommit, cell_id=cell_id, summaries=completed,
-        declared_slots=len(parent["slot_roster"]["slots"]), terminal_stop=terminal_stop, previous=previous,
+        declared_slots=len(historical.declared_slot_selected_slots(parent)), terminal_stop=terminal_stop, previous=previous,
         symbol_receipt=symbol_receipt, terminal_failure=terminal_failure)
     authority_spool._publish_exact_json(context, _declared_run_path(precommit, cell_id), body, context.limits.max_json_bytes)
     return DeclaredCellOwnerRunReceipt(_canonical_bytes(body))
@@ -2798,7 +3310,9 @@ __all__ += ["DECLARED_CELL_RUN_SCHEMA", "DECLARED_SLOT_COMMIT_SCHEMA", "Declared
     "reopen_declared_cell_owner_progress"]
 
 
-def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pipeline_config, cell_id):
+def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pipeline_config, cell_id,
+                                    m5_owner=None, slot_view_ids=None, calibration_view_id=None,
+                                    cost_edition=None, cell_contract_sha256=None):
     """Hold the existing nonblocking OS primitive through restore and commit."""
     import os
     import pm_native_storage as storage
@@ -2806,7 +3320,10 @@ def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pip
             or type(precommit) is not historical.DeclaredSlotRunPrecommit):
         _fail("DECLARED_SLOT_PRECOMMIT_INVALID")
     _hex64(cell_id, "DECLARED_SLOT_CELL_INVALID")
-    historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    _declared_cell_m5_arguments(parent, m5_owner=m5_owner, slot_view_ids=slot_view_ids,
+        calibration_view_id=calibration_view_id, cost_edition=cost_edition,
+        cell_contract_sha256=cell_contract_sha256)
     search_planner._require_current_process(process)
     relative = f"declared-slots/{precommit.receipt_sha256}/{cell_id}"
     authority_spool._ensure_directory(context.root, relative)
@@ -2832,7 +3349,9 @@ def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pip
                     or pinned.st_size != 1):
                 _fail("DECLARED_SLOT_RUN_LOCK_INVALID")
             return _execute_declared_cell_owner_slots_unlocked(context=context, precommit=precommit,
-                process=process, frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id)
+                process=process, frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id,
+                m5_owner=m5_owner, slot_view_ids=slot_view_ids, calibration_view_id=calibration_view_id,
+                cost_edition=cost_edition, cell_contract_sha256=cell_contract_sha256)
         finally:
             storage._release_kernel_lock(handle)
 
@@ -2861,3 +3380,312 @@ def _declared_prior_attempt_starts(context, precommit, cell_id, slot):
         result.append({"relative_path": name, "sha256": digest, "size_bytes": size,
             "state": "NO_COMMIT_OBSERVED_AT_RESUME", "cause": "UNKNOWN"})
     return result
+
+
+__all__ += ["DECLARED_DEVELOPMENT_CELL_RUN_SCHEMA"]
+
+
+__all__ += ["DECLARED_M5_REOPEN_CONTEXT_SCHEMA", "reacquire_declared_m5_source"]
+
+
+DECLARED_M5_CELL_SOURCE_CONTEXT_SCHEMA = "fxpm.declared-m5-cell-source-context.v1"
+_DECLARED_M5_CELL_SOURCE_POINTER_SCHEMA = "fxpm.declared-m5-cell-source-pointer.v1"
+_DECLARED_M5_CELL_SOURCE_TYPE = "declared_m5_cell_source_context"
+
+
+def _declared_m5_cell_source_path(precommit, cell_id):
+    return f"declared-slots/{precommit.receipt_sha256}/{cell_id}/m5-source-context.json"
+
+
+def _declared_m5_cell_source_body(context, *, parent, precommit_sha256, cell_id,
+                                  cell_contract_sha256, owner_metadata, fine_product_routes,
+                                  cost_edition_route, slot_view_ids, calibration_view_id):
+    """Validate documentary joins; original readers authenticate the referenced products."""
+    import pm_m5_job_view as job_view
+    code = "DECLARED_M5_CELL_SOURCE_BINDING_INVALID"
+    _hex64(cell_contract_sha256, code)
+    if (historical.declared_slot_source_kind(parent) != "m5_derived"
+            or len(parent["cells"]) != 1 or parent["cells"][0]["cell_id"] != cell_id):
+        _fail(code)
+    cell = parent["cells"][0]
+    slots = historical.declared_slot_selected_slots(parent)
+    if (type(slot_view_ids) is not dict or set(slot_view_ids) != {slot["slot_id"] for slot in slots}
+            or any(type(value) is not str or not 1 <= len(value) <= 128 for value in slot_view_ids.values())
+            or len(set(slot_view_ids.values())) != len(slot_view_ids)
+            or type(calibration_view_id) is not str or not 1 <= len(calibration_view_id) <= 128
+            or calibration_view_id in slot_view_ids.values()):
+        _fail("DECLARED_M5_CELL_VIEW_IDS_INVALID")
+    metadata = job_view._bounded_reopen_plain(owner_metadata)
+    binding, budgets, requests, cutoffs, source = job_view._decode_m5_reopen_metadata(metadata)
+    expected = {"generation_context_sha256": context.context_sha256, "config_sha256": context.config_sha256,
+        "effective_config_sha256": parent["effective_config_sha256"],
+        "search_process_receipt_sha256": parent["search_process_receipt_sha256"],
+        "precommit_sha256": precommit_sha256, "run_id": parent["run_id"], "cell_id": cell_id,
+        "m5_view_contract_sha256": parent["m5_view_contract_sha256"],
+        "view_plan_sha256": parent["m5_source_pins"]["view_plan_sha256"]}
+    if (any(getattr(binding, key) != value for key, value in expected.items())
+            or _sha(parent["m5_source_pins"]) != binding.m5_view_contract_sha256
+            or source.symbol != cell["symbol"]):
+        _fail(code)
+    by_id = {request.view_id: request for request in requests}
+    if not set(slot_view_ids.values()) | {calibration_view_id} <= set(by_id):
+        _fail("DECLARED_M5_CELL_VIEW_IDS_INVALID")
+    for slot in slots:
+        view = by_id[slot_view_ids[slot["slot_id"]]]
+        if (view.source.symbol != cell["symbol"] or view.timeframe != cell["timeframe"]
+                or view.purpose != "FINANCIAL_INPUT"
+                or job_view._utc(view.cutoff_utc) != job_view._utc(slot["native_cutoff_utc"])):
+            _fail("DECLARED_M5_CELL_VIEW_IDS_INVALID")
+    calibration = by_id[calibration_view_id]
+    if (calibration.purpose != "COST_EDITION_REPRODUCTION_ONLY"
+            or type(calibration.consumer) is not job_view.CalibrationViewBinding
+            or calibration.consumer.profile_sha256 != parent["spread_profile_identity"]["profile_sha256"]):
+        _fail("DECLARED_M5_CELL_VIEW_IDS_INVALID")
+    if (type(cost_edition_route) is not dict
+            or _canonical_bytes(cost_edition_route.get("cost_edition_identity"))
+            != _canonical_bytes(parent["m5_source_pins"]["cost_edition_identity"])):
+        _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    if (type(fine_product_routes) is not list or len(fine_product_routes) != len(cutoffs)
+            or any(type(route) is not dict or route.get("symbol") != cell["symbol"]
+                   or route.get("timeframe") != "M5"
+                   or job_view._utc(route.get("cutoff_utc")) != job_view._utc(cutoff)
+                   for route, cutoff in zip(fine_product_routes, cutoffs))):
+        _fail(code)
+    value = {"schema_version": DECLARED_M5_CELL_SOURCE_CONTEXT_SCHEMA, "source_kind": "m5_derived",
+        "precommit_sha256": precommit_sha256, "generation_context_sha256": context.context_sha256,
+        "cell_id": cell_id, "cell_contract_sha256": cell_contract_sha256,
+        "m5_view_contract_sha256": binding.m5_view_contract_sha256,
+        "view_plan_sha256": binding.view_plan_sha256, "owner_metadata": metadata,
+        "fine_product_routes": fine_product_routes, "cost_edition_route": cost_edition_route,
+        "slot_view_ids": {slot["slot_id"]: slot_view_ids[slot["slot_id"]] for slot in slots},
+        "calibration_view_id": calibration_view_id, "unverified_caller_source_or_fit_accepted": False,
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False}
+    return json.loads(_canonical_bytes(value, _DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES))
+
+
+def _read_declared_m5_cell_source_context(context, *, precommit, parent, cell_id, cell_contract_sha256=None):
+    code = "DECLARED_M5_CELL_SOURCE_CONTEXT_INVALID"
+    item = _read_declared_record(context, _declared_m5_cell_source_path(precommit, cell_id),
+        maximum_bytes=min(context.limits.max_json_bytes, _DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES))
+    if item is None:
+        _fail("DECLARED_M5_CELL_SOURCE_CONTEXT_MISSING")
+    pointer = item[0]
+    if (type(pointer) is not dict or set(pointer) != {"schema_version", "source_context_entry"}
+            or pointer["schema_version"] != _DECLARED_M5_CELL_SOURCE_POINTER_SCHEMA):
+        _fail(code)
+    entry = historical_adapter._artifact_entry(pointer["source_context_entry"], code)
+    if (entry["artifact_id"] != f"declared-cell-source/{precommit.receipt_sha256}/{cell_id}"
+            or entry["artifact_type"] != _DECLARED_M5_CELL_SOURCE_TYPE
+            or entry["descriptor"]["format"] != authority_spool.CANONICAL_JSON_FORMAT
+            or not 0 < entry["descriptor"]["size_bytes"] <= _DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES):
+        _fail(code)
+    value = historical_adapter._reopen_ascii_json_entry(context, entry,
+        expected_type=_DECLARED_M5_CELL_SOURCE_TYPE, code=code)
+    if type(value) is not dict:
+        _fail(code)
+    expected = _declared_m5_cell_source_body(context, parent=parent,
+        precommit_sha256=precommit.receipt_sha256, cell_id=cell_id,
+        cell_contract_sha256=value.get("cell_contract_sha256") if cell_contract_sha256 is None else cell_contract_sha256,
+        owner_metadata=value.get("owner_metadata"), fine_product_routes=value.get("fine_product_routes"),
+        cost_edition_route=value.get("cost_edition_route"), slot_view_ids=value.get("slot_view_ids"),
+        calibration_view_id=value.get("calibration_view_id"))
+    if _canonical_bytes(value) != _canonical_bytes(expected):
+        _fail(code)
+    return value, entry
+
+
+def _declared_cell_m5_arguments(parent, *, m5_owner, slot_view_ids, calibration_view_id,
+                                cost_edition, cell_contract_sha256):
+    values = (m5_owner, slot_view_ids, calibration_view_id, cost_edition, cell_contract_sha256)
+    kind = historical.declared_slot_source_kind(parent)
+    if kind == "broker_native":
+        if any(value is not None for value in values):
+            _fail("DECLARED_NATIVE_REQUEST_REJECTS_M5_ARGUMENTS")
+        return False
+    if kind != "m5_derived" or any(value is None for value in values):
+        _fail("DECLARED_M5_SOURCE_ARGUMENTS_REQUIRED")
+    import pm_m5_job_view as job_view
+    import pm_m5_derived_costs as derived_costs
+    if type(m5_owner) is not job_view.M5JobViews or type(cost_edition) is not derived_costs.RecordedDerivedCosts:
+        _fail("DECLARED_M5_SOURCE_ARGUMENTS_INVALID")
+    _hex64(cell_contract_sha256, "DECLARED_M5_CELL_SOURCE_BINDING_INVALID")
+    return True
+
+
+def _declared_m5_cell_owner_context(context, *, precommit, parent, frozen_pipeline_config,
+                                    cell_id, cell_contract_sha256, m5_owner, slot_view_ids,
+                                    calibration_view_id, cost_edition):
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    if frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]:
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    metadata = m5_owner.reopen_metadata()
+    routes = []
+    for cutoff in metadata["product_cutoffs"]:
+        product = native_prefix.reverify_activated_native_prefix_product(
+            m5_owner.product_at(cutoff), context, require_current_activation=True)
+        accessed = product.index["source_accessed_at_utc"]
+        window = parent["source_access_window_utc"]
+        if not window["start_utc"] <= accessed < window["end_exclusive_utc"]:
+            _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+        routes.append(_prefix_route(product))
+    if cost_edition.sha256 != parent["spread_profile_identity"]["profile_sha256"]:
+        _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
+    return _declared_m5_cell_source_body(context, parent=parent,
+        precommit_sha256=precommit.receipt_sha256, cell_id=cell_id, cell_contract_sha256=cell_contract_sha256,
+        owner_metadata=metadata, fine_product_routes=routes, cost_edition_route=cost_edition.reopen_route(),
+        slot_view_ids=slot_view_ids, calibration_view_id=calibration_view_id)
+
+
+def publish_declared_m5_cell_source_context(context, *, precommit, process, frozen_pipeline_config,
+                                            cell_id, cell_contract_sha256, m5_owner, slot_view_ids,
+                                            calibration_view_id, cost_edition):
+    """Publish ordinary source metadata before any cell attempt; never repair a missing resume header."""
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    if not _declared_cell_m5_arguments(parent, m5_owner=m5_owner, slot_view_ids=slot_view_ids,
+            calibration_view_id=calibration_view_id, cost_edition=cost_edition,
+            cell_contract_sha256=cell_contract_sha256):
+        _fail("DECLARED_M5_SOURCE_ARGUMENTS_REQUIRED")
+    value = _declared_m5_cell_owner_context(context, precommit=precommit, parent=parent,
+        frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id, cell_contract_sha256=cell_contract_sha256,
+        m5_owner=m5_owner, slot_view_ids=slot_view_ids, calibration_view_id=calibration_view_id,
+        cost_edition=cost_edition)
+    path = _declared_m5_cell_source_path(precommit, cell_id)
+    if authority_spool._local_path(context.root, path).exists():
+        saved, entry = _read_declared_m5_cell_source_context(context, precommit=precommit, parent=parent,
+            cell_id=cell_id, cell_contract_sha256=cell_contract_sha256)
+        if _canonical_bytes(saved) != _canonical_bytes(value):
+            _fail("DECLARED_M5_CELL_SOURCE_BINDING_INVALID")
+        return entry
+    base = f"declared-slots/{precommit.receipt_sha256}/{cell_id}"
+    prior = (base + "/attempts", base + "/commits", base + "/run.lock",
+        _declared_run_path(precommit, cell_id), f"declared-slots/{precommit.receipt_sha256}/requests/{cell_id}")
+    if any(authority_spool._local_path(context.root, name).exists() for name in prior):
+        _fail("DECLARED_M5_CELL_SOURCE_CONTEXT_MISSING")
+    sink = authority_spool.open_symbol_sink(context, parent["cells"][0]["symbol"])
+    entry = sink.put_json(f"declared-cell-source/{precommit.receipt_sha256}/{cell_id}",
+        _DECLARED_M5_CELL_SOURCE_TYPE, value)
+    authority_spool._publish_exact_json(context, path,
+        {"schema_version": _DECLARED_M5_CELL_SOURCE_POINTER_SCHEMA, "source_context_entry": entry},
+        min(context.limits.max_json_bytes, _DECLARED_M5_REOPEN_CONTEXT_MAX_BYTES))
+    return entry
+
+
+def reopen_declared_m5_cell_source_context(context, *, precommit, process, frozen_pipeline_config,
+                                           cell_id, cell_contract_sha256):
+    """Reopen existing products and cost metadata through their original readers."""
+    import pm_m5_job_view as job_view
+    import pm_m5_derived_costs as derived_costs
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_SLOT_CONFIG_INVALID")
+    frozen_pipeline_config.verify_current(context)
+    if frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]:
+        _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
+    saved, entry = _read_declared_m5_cell_source_context(context, precommit=precommit, parent=parent,
+        cell_id=cell_id, cell_contract_sha256=cell_contract_sha256)
+    config = frozen_pipeline_config.materialize(context)
+    symbol = parent["cells"][0]["symbol"]
+    products = tuple(_original_reopen_prefix_route(route=route, data_dir=Path(config.data_dir),
+        context=context, symbol=symbol, timeframe="M5") for route in saved["fine_product_routes"])
+    owner = None
+    try:
+        owner = job_view.reopen_m5_job_views(context, canonical_data_dir=Path(config.data_dir),
+            fine_products=products, metadata=saved["owner_metadata"])
+        edition = derived_costs.open_recorded_derived_costs_route(saved["cost_edition_route"])
+        actual = _declared_m5_cell_owner_context(context, precommit=precommit, parent=parent,
+            frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id, cell_contract_sha256=cell_contract_sha256,
+            m5_owner=owner, slot_view_ids=saved["slot_view_ids"],
+            calibration_view_id=saved["calibration_view_id"], cost_edition=edition)
+        if _canonical_bytes(actual) != _canonical_bytes(saved):
+            _fail("DECLARED_M5_CELL_SOURCE_BINDING_INVALID")
+        return {"owner": owner, "slot_view_ids": saved["slot_view_ids"],
+            "calibration_view_id": saved["calibration_view_id"], "cost_edition": edition,
+            "source_context_entry": entry}
+    except BaseException:
+        if owner is not None:
+            owner.close()
+        raise
+
+
+__all__ += ["DECLARED_M5_CELL_SOURCE_CONTEXT_SCHEMA", "publish_declared_m5_cell_source_context", "reopen_declared_m5_cell_source_context"]
+
+
+def _declared_m5_reuse_arguments(*, m5_owner, cost_edition):
+    if (m5_owner is None) != (cost_edition is None):
+        _fail("DECLARED_M5_REUSE_ARGUMENTS_INVALID")
+    if m5_owner is None:
+        return False
+    import pm_m5_job_view as job_view
+    import pm_m5_derived_costs as derived_costs
+    if type(m5_owner) is not job_view.M5JobViews or type(cost_edition) is not derived_costs.RecordedDerivedCosts:
+        _fail("DECLARED_M5_REUSE_ARGUMENTS_INVALID")
+    return True
+
+
+def _release_declared_m5_reacquired_context(source, *, close_owner):
+    try:
+        if source["calibration_lease"] is not None:
+            source["calibration_lease"].release()
+    finally:
+        try:
+            if source["request_lease"] is not None:
+                source["request_lease"].release()
+        finally:
+            if close_owner and source["owner"] is not None:
+                source["owner"].close()
+
+
+def _declared_m5_cost_route_matches(body, cost_route, *, profile_sha256, actual_route):
+    """Metadata equality only; a caller must supply the original typed loaded edition."""
+    return (type(cost_route) is dict
+        and profile_sha256 == body["spread_profile_identity"]["profile_sha256"]
+        and _canonical_bytes(cost_route.get("cost_edition_identity"))
+            == _canonical_bytes(body["m5_source_pins"]["cost_edition_identity"])
+        and _canonical_bytes(actual_route) == _canonical_bytes(cost_route))
+
+
+def _reopen_declared_m5_source_material(context, *, request, process, frozen_pipeline_config,
+                                        body, m5_source_context):
+    header = _declared_partial_unit_header(context, body)
+    if header is None:
+        _fail("DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE")
+    fields = {"owner", "request_lease", "calibration_lease", "cost_edition", "source_session", "source_session_entry"}
+    if (type(m5_source_context) is not dict or set(m5_source_context) != fields
+            or m5_source_context["source_session_entry"] != header["source_session_entry"]):
+        _fail("DECLARED_M5_REOPEN_CONTEXT_INVALID")
+    fitted, validation = search_execution.reopen_bound_fitted_timeframe(context,
+        request=request, process=process, frozen_pipeline_config=frozen_pipeline_config,
+        header=header, m5_source_context=m5_source_context)
+    reference = search_execution.bound_fitted_state_reference(fitted, context=context, request=request)
+    if (reference != header["fitted_state_entry"]
+            or validation.get("schema_version") != "fxpm.bound-fit-m5-reopen-validation.v1"
+            or validation.get("origin") != "REOPENED_BOUND_FIT_M5"
+            or validation.get("producer_request_sha256") != request.receipt_sha256
+            or validation.get("frozen_receipt_sha256") != header["frozen_plan_receipt"]["sha256"]):
+        _fail("DECLARED_BOUND_FIT_REOPEN_BINDING_MISMATCH")
+    source, entry = _read_declared_m5_reopen_entry(context, header["source_session_entry"],
+        body=body, artifact_type="declared_slot_source_session")
+    derived = getattr(fitted, "_derived_binding", None)
+    if (type(derived) is not search_execution._DerivedSearchBinding or derived.context is not context
+            or derived.owner is not m5_source_context["owner"]
+            or derived.request_lease is not m5_source_context["request_lease"]
+            or derived.calibration_lease is not m5_source_context["calibration_lease"]
+            or derived.cost_edition is not m5_source_context["cost_edition"]
+            or _canonical_bytes(source) != _canonical_bytes(m5_source_context["source_session"])
+            or source.get("native_source_route") != _prefix_route(fitted.product)
+            or source.get("source_accessed_at_utc") != fitted.product.index["source_accessed_at_utc"]
+            or source.get("source_group_decision_sha256") != fitted.source_group_decision.receipt_sha256
+            or source.get("regime_fit_decision_sha256") != fitted.regime_fit_decision.receipt_sha256):
+        _fail("DECLARED_BOUND_FIT_SOURCE_CHANGED")
+    roster = header.get("artifact_roster")
+    if type(roster) is not list or entry not in roster:
+        _fail("DECLARED_BOUND_FIT_ORIGINAL_ROSTER_CHANGED")
+    sink = request.symbol_sink(body["symbol"])
+    for original in roster:
+        sink.register_artifact(original["artifact_id"], original["artifact_type"], original["descriptor"])
+    plan = historical_adapter._restore_declared_slot_plan(context, request=request,
+        process=process, completion=header, sink=sink, m5_fitted=fitted)
+    _require_reopened_declared_plan(header, validation, plan)
+    return fitted, source, entry, plan, validation

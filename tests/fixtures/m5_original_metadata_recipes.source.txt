@@ -1,0 +1,31 @@
+"""SOURCE_EXCERPTS_ONLY: original metadata recipes and native verifier call. Never import or execute."""
+from __future__ import annotations
+PROVENANCE = {'label': 'EXACT_SOURCE_AST_EXCERPTS_ONLY_NOT_FULL_PRODUCT_IMPLEMENTATIONS_NO_NATIVE_OR_MODEL_PROOF', 'sources': [{'path': 'C:\\Users\\Bongo\\OneDrive\\Desktop\\FxPM-Dev\\audit_reports\\fxpm_workshop_20261007\\declared_task_efficiency_continuation\\m5_consumer_candidate_001\\adapter\\repair005\\pm_authoritative_search_execution.py', 'bytes': 321770, 'sha256': '971d7be523e0166b2b05e0bbb3f7a6647e5ef30a7624d356763848332de1a911'}, {'path': 'C:\\Users\\Bongo\\OneDrive\\Desktop\\FxPM-Dev\\audit_reports\\fxpm_workshop_20261007\\declared_task_efficiency_continuation\\m5_consumer_candidate_001\\adapter\\repair007\\pm_authoritative_search_execution.py', 'bytes': 323604, 'sha256': '8344744f164afe2bddd6236238462fe0d4052146a886a3a73bdbd97cd994f7ae'}], 'excerpts': [{'name': '_build_train_regime_support', 'original_function_lines': [641, 751], 'selected_statement_lines': [[677, 677], [678, 686], [687, 716]]}, {'name': '_fit_verified_search_frame', 'original_function_lines': [1137, 1278], 'selected_statement_lines': [[1223, 1229], [1230, 1231]]}, {'name': '_reverify_cell_state_error_envelope', 'original_function_lines': [3649, 3670], 'semantics': 'Exact original verifier helper AST; used only to compare native call, never executed'}]}
+
+def _build_train_regime_support(*, frame: pd.DataFrame, surface: pd.DataFrame, product: native_prefix.NativePrefixProduct, symbol: str, timeframe: str, parameters_sha256: str, detector_code_sha256: str, m5_view_evidence: Mapping[str, Any] | None=None) -> dict[str, Any]:
+    native = dict(product.native_prefix)
+    window = {'schema_version': 'fxpm.historical-regime-fit-window.v1', 'symbol': symbol, 'timeframe': timeframe, 'prefix_content_sha256': native['prefix_content_sha256'], 'prefix_start_utc': native['prefix_start_utc'], 'prefix_end_exclusive_utc': native['prefix_end_exclusive_utc'], 'prefix_rows': native['prefix_rows']}
+    if m5_view_evidence is not None:
+        fields = {'source_kind', 'base_timeframe', 'view_timeframe', 'm5_view_contract_sha256', 'view_key', 'view_payload_sha256', 'view_membership_sha256', 'base_native_prefix_index_sha256', 'source_accessed_at_utc'}
+        if type(m5_view_evidence) is not dict or set(m5_view_evidence) != fields or m5_view_evidence['source_kind'] != 'm5_derived' or (m5_view_evidence['base_timeframe'] != 'M5') or (m5_view_evidence['view_timeframe'] != timeframe) or (m5_view_evidence['base_native_prefix_index_sha256'] != product.index_sha256) or (m5_view_evidence['source_accessed_at_utc'] != native['source_accessed_at_utc']) or frame.empty or ('_BAR_CLOSE_TS' not in frame):
+            _fail('M5_DERIVED_REGIME_WINDOW_INVALID')
+        for name in ('m5_view_contract_sha256', 'view_key', 'view_payload_sha256', 'view_membership_sha256', 'base_native_prefix_index_sha256'):
+            _hex64(m5_view_evidence[name], 'M5_DERIVED_REGIME_WINDOW_INVALID')
+        window = {'schema_version': 'fxpm.historical-m5-derived-regime-fit-window.v1', 'symbol': symbol, 'timeframe': timeframe, 'view_start_utc': pd.Timestamp(frame.index[0]).isoformat(), 'view_end_exclusive_utc': pd.Timestamp(frame['_BAR_CLOSE_TS'].iloc[-1]).isoformat(), 'view_rows': len(frame), 'view_frame_sha256': _frame_sha256(frame), 'view_binding': dict(m5_view_evidence), 'base_m5_prefix': {'prefix_content_sha256': native['prefix_content_sha256'], 'prefix_start_utc': native['prefix_start_utc'], 'prefix_end_exclusive_utc': native['prefix_end_exclusive_utc'], 'prefix_rows': native['prefix_rows']}}
+
+def _fit_verified_search_frame(*, product, config, frame, native, symbol, timeframe, instrument_spec, execution_spec_receipt, tiers, observations, fine_product, fine_frame, acquisition_attempts_exact, source_reason_code, fit_cutoff_utc, derived_binding=None):
+    evidence = {'schema_version': REGIME_FIT_EVIDENCE_VERSION, 'source_group_decision_sha256': source.receipt_sha256, 'native_prefix_index_sha256': product.index_sha256, 'train_regime_support_receipt_sha256': support['receipt_sha256'], 'detector_record_sha256': detector_record['record_sha256']}
+    if derived_binding is not None:
+        evidence['m5_view'] = dict(derived_binding.view_evidence)
+
+def _reverify_cell_state_error_envelope(*, cell_plan: Any, fitted: FittedNativeSearchTimeframe) -> None:
+    """Recompute the planner's preprotected envelope before any evaluation."""
+    try:
+        import pm_production_search_planner as planner
+        receipt = cell_plan.cell_receipt
+        verified = planner.verify_preprotected_state_error_envelope(fitted, receipt.get('state_error_envelope') if type(receipt) is dict else None)
+    except Exception as exc:
+        detail = getattr(exc, 'code', type(exc).__name__)
+        raise AuthoritativeSearchExecutionError('STATE_ERROR_ENVELOPE_REVERIFY_FAILED', (str(detail),)) from exc
+    if verified is not True:
+        _fail('STATE_ERROR_ENVELOPE_REVERIFY_FAILED')

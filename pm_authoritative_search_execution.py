@@ -174,6 +174,7 @@ class FittedNativeSearchTimeframe:
     _spread_source_product: native_prefix.NativePrefixProduct | None = None
     _spread_source_frame: pd.DataFrame | None = None
     _bound_fit_owner: Any = field(default=None, repr=False, compare=False)
+    _derived_binding: Any = field(default=None, repr=False, compare=False)
 
     def frame_copy(self) -> pd.DataFrame:
         """Return an isolated copy; callers cannot mutate the bound surface."""
@@ -646,6 +647,7 @@ def _build_train_regime_support(
     timeframe: str,
     parameters_sha256: str,
     detector_code_sha256: str,
+    m5_view_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not surface.index.equals(frame.index) or not {
         "REGIME_LIVE",
@@ -673,15 +675,8 @@ def _build_train_regime_support(
     observed = [label for label in book.REGIME_ORDER if counts[label] > 0]
     unobserved = [label for label in book.REGIME_ORDER if counts[label] == 0]
     native = dict(product.native_prefix)
-    window = {
-        "schema_version": "fxpm.historical-regime-fit-window.v1",
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "prefix_content_sha256": native["prefix_content_sha256"],
-        "prefix_start_utc": native["prefix_start_utc"],
-        "prefix_end_exclusive_utc": native["prefix_end_exclusive_utc"],
-        "prefix_rows": native["prefix_rows"],
-    }
+    window = _train_regime_support_window(frame=frame, product=product, symbol=symbol,
+        timeframe=timeframe, m5_view_evidence=m5_view_evidence)
     body = {
         "schema_version": book.REGIME_TRAIN_SUPPORT_SCHEMA_VERSION,
         "symbol": symbol,
@@ -1091,6 +1086,22 @@ def fit_native_timeframe_for_search(
     tiers, observations, fine_product, fine_frame = _native_spread_inputs(
         product=product, config=config, frame=frame, spec=instrument_spec,
     )
+    return _fit_verified_search_frame(
+        product=product, config=config, frame=frame, native=native, symbol=symbol,
+        timeframe=timeframe, instrument_spec=instrument_spec,
+        execution_spec_receipt=execution_spec_receipt, tiers=tiers,
+        observations=observations, fine_product=fine_product, fine_frame=fine_frame,
+        acquisition_attempts_exact=acquisition_attempts_exact,
+        source_reason_code="AUTHENTICATED_NATIVE_PREFIX_AVAILABLE",
+        fit_cutoff_utc=native["prefix_end_exclusive_utc"],
+    )
+
+
+def _fit_verified_search_frame(*, product, config, frame, native, symbol, timeframe,
+        instrument_spec, execution_spec_receipt, tiers, observations, fine_product,
+        fine_frame, acquisition_attempts_exact, source_reason_code, fit_cutoff_utc,
+        derived_binding=None):
+    """Shared original probe/regime calculations after each source branch verifies inputs."""
     probe_backtester = Backtester(config)
     try:
         probes = {tier: probe_backtester.build_evidence_source_seed_result(
@@ -1113,7 +1124,7 @@ def fit_native_timeframe_for_search(
         symbol=symbol,
         timeframe=timeframe,
         availability=book.AVAILABLE,
-        reason_code="AUTHENTICATED_NATIVE_PREFIX_AVAILABLE",
+        reason_code=source_reason_code,
         source_contract_sha256=source_contract_sha256,
         source_group_evidence_sha256=product.index_sha256,
         acquisition_attempts_exact=acquisition_attempts_exact,
@@ -1148,11 +1159,12 @@ def fit_native_timeframe_for_search(
         timeframe=timeframe,
         parameters_sha256=parameters_sha256,
         detector_code_sha256=detector_code_sha256,
+        m5_view_evidence=None if derived_binding is None else dict(derived_binding.view_evidence),
     )
     detector_record = book.create_regime_detector_record(
         source_group_decision=source,
         fit_cutoff_utc=_book_canonical_utc(
-            native["prefix_end_exclusive_utc"],
+            fit_cutoff_utc,
             "REGIME_DETECTOR_CUTOFF_INVALID",
         ),
         detector_version=REGIME_FIT_POLICY_VERSION,
@@ -1171,13 +1183,8 @@ def fit_native_timeframe_for_search(
         "detector_code_sha256": detector_code_sha256,
         "parameters_sha256": parameters_sha256,
     }
-    evidence = {
-        "schema_version": REGIME_FIT_EVIDENCE_VERSION,
-        "source_group_decision_sha256": source.receipt_sha256,
-        "native_prefix_index_sha256": product.index_sha256,
-        "train_regime_support_receipt_sha256": support["receipt_sha256"],
-        "detector_record_sha256": detector_record["record_sha256"],
-    }
+    evidence = _regime_fit_evidence(source=source, product=product, support=support,
+        detector_record=detector_record, derived_binding=derived_binding)
     mapping = {
         "schema_version": "fxpm.four-regime-mapping.v1",
         "label_order": list(book.REGIME_ORDER),
@@ -1223,7 +1230,148 @@ def fit_native_timeframe_for_search(
         _entry_spread_observations=observations.copy(deep=True),
         _spread_source_product=fine_product,
         _spread_source_frame=fine_frame,
+        _derived_binding=derived_binding,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedSearchBinding:
+    context: Any
+    owner: Any
+    request_lease: Any
+    calibration_lease: Any
+    cost_edition: Any
+    declared_m5_source_pins: Mapping[str, Any]
+    view_evidence: Mapping[str, Any]
+
+
+def fit_m5_derived_timeframe_for_search(*, context, owner, request_lease, calibration_lease,
+        cost_edition, declared_m5_source_pins, config, acquisition_attempts_exact=1):
+    """Use a registered M5 view and recorded costs; the product remains genuine base M5."""
+    from pm_m5_job_view import M5JobViews
+    from pm_m5_derived_costs import RecordedDerivedCosts
+    import pm_historical_anchor_orchestration as orchestration
+    if (type(context) is not authority_spool.GenerationSpoolContext
+            or type(owner) is not M5JobViews or type(cost_edition) is not RecordedDerivedCosts
+            or not isinstance(config, PipelineConfig)
+            or owner.binding.generation_context_sha256 != context.context_sha256
+            or owner.binding.config_sha256 != context.config_sha256):
+        _fail("M5_DERIVED_SEARCH_INPUT_INVALID")
+    if type(acquisition_attempts_exact) is not int or not 1 <= acquisition_attempts_exact <= 1_000_000:
+        _fail("ACQUISITION_ATTEMPT_COUNT_INVALID")
+    view = owner.view(request_lease)
+    declared_digest = orchestration._validate_declared_m5_source_pins(
+        declared_m5_source_pins, {"timeframe": view.timeframe})
+    if (declared_digest != owner.binding.m5_view_contract_sha256
+            or declared_m5_source_pins["view_plan_sha256"] != owner.view_plan_sha256):
+        _fail("M5_DERIVED_DECLARED_VIEW_PLAN_MISMATCH")
+    frame = owner.frame(request_lease)
+    product = owner.product_at(view.cutoff_utc)
+    replayed = native_prefix.reverify_activated_native_prefix_product(
+        product, context, require_current_activation=True)
+    if replayed.index_sha256 != product.index_sha256:
+        _fail("M5_DERIVED_SEARCH_SOURCE_REVERIFY_MISMATCH")
+    native = dict(product.native_prefix)
+    if (product.source_state != native_prefix.AVAILABLE or product.index["timeframe"] != "M5"
+            or view.timeframe not in {"M15", "M30", "H1"}
+            or not 1 <= len(frame) <= MAX_PREFIX_ROWS
+            or Path(config.data_dir).resolve() != product._data_dir):
+        _fail("M5_DERIVED_SEARCH_IDENTITY_INVALID")
+    marker = frame.attrs.get(pm_core.NATIVE_SOURCE_BINDING_ATTR)
+    if (type(marker) is not dict or marker.get("source_kind") != "m5_derived"
+            or marker.get("timeframe") != "M5" or marker.get("view_timeframe") != view.timeframe
+            or marker.get("m5_view_contract_sha256") != owner.binding.m5_view_contract_sha256):
+        _fail("M5_DERIVED_SEARCH_VIEW_BINDING_INVALID")
+    instrument_spec, execution_spec_receipt = _freeze_bound_execution_spec(product=product, config=config)
+    if str(config.backtest_spread_mode).lower() != "conservative_max":
+        _fail("BASE_SPREAD_POLICY_NOT_PRODUCTION_CONSERVATIVE")
+    bound = cost_edition.bind_view(owner, context=context, calibration_lease=calibration_lease,
+                                  request_lease=request_lease, point=instrument_spec.point)
+    tiers = {tier: bound.resolve(native["symbol"], view.timeframe, tier,
+                point=instrument_spec.point,
+                source_identity_sha256=native["source_identity_sha256"])
+             for tier in ("P75", "P95")}
+    expected_cost = declared_m5_source_pins["cost_edition_identity"]
+    for tier in tiers.values():
+        descriptor = tier.descriptor()
+        if (descriptor.get("profile_sha256") != expected_cost["profile_sha256"]
+                or descriptor.get("m5_derived_cost_binding", {}).get("cost_edition_identity") != expected_cost):
+            _fail("M5_DERIVED_DECLARED_COST_EDITION_MISMATCH")
+    fine_frame = native_prefix.open_verified_prefix_frame(product)
+    observations = spread_profile.align_prior_completed_spreads(frame.index, fine_frame, "M5")
+    view_evidence = {
+        "source_kind": "m5_derived", "base_timeframe": "M5", "view_timeframe": view.timeframe,
+        "m5_view_contract_sha256": owner.binding.m5_view_contract_sha256,
+        "view_key": view.view_key, "view_payload_sha256": view.payload_sha256,
+        "view_membership_sha256": view.membership_sha256,
+        "base_native_prefix_index_sha256": product.index_sha256,
+        "source_accessed_at_utc": product.index["source_accessed_at_utc"],
+    }
+    binding = _DerivedSearchBinding(context, owner, request_lease, calibration_lease, cost_edition,
+        json.loads(_canonical_bytes(declared_m5_source_pins).decode("ascii")),
+        json.loads(_canonical_bytes(view_evidence).decode("ascii")))
+    return _fit_verified_search_frame(
+        product=product, config=config, frame=frame, native=native, symbol=native["symbol"],
+        timeframe=view.timeframe, instrument_spec=instrument_spec,
+        execution_spec_receipt=execution_spec_receipt, tiers=tiers,
+        observations=observations, fine_product=product, fine_frame=fine_frame,
+        acquisition_attempts_exact=acquisition_attempts_exact,
+        source_reason_code="AUTHENTICATED_BASE_M5_DERIVED_PREFIX_AVAILABLE",
+        fit_cutoff_utc=pd.Timestamp(frame["_BAR_CLOSE_TS"].iloc[-1]).isoformat(),
+        derived_binding=binding,
+    )
+
+
+def m5_view_price_frame(*, context, owner, lease):
+    """Reopen one registered target view without calling a detector or a fitter."""
+    from pm_m5_job_view import M5JobViews
+    if (type(context) is not authority_spool.GenerationSpoolContext or type(owner) is not M5JobViews
+            or owner.binding.generation_context_sha256 != context.context_sha256
+            or owner.binding.config_sha256 != context.config_sha256):
+        _fail("M5_DERIVED_PRICE_OWNER_INVALID")
+    view = owner.view(lease)
+    frame = owner.frame(lease)
+    product = owner.product_at(view.cutoff_utc)
+    reopened = native_prefix.reverify_activated_native_prefix_product(
+        product, context, require_current_activation=True)
+    if (reopened.source_state != native_prefix.AVAILABLE
+            or reopened.index_sha256 != product.index_sha256
+            or reopened.index["timeframe"] != "M5"
+            or reopened.index["symbol"] != view.source.symbol or frame.empty):
+        _fail("M5_DERIVED_PRICE_SOURCE_CHANGED")
+    base = dict(reopened.native_prefix)
+    end = pd.Timestamp(frame["_BAR_CLOSE_TS"].iloc[-1]).isoformat()
+    window = {
+        "schema_version": "fxpm.m5-derived-price-window.v1", "source_kind": "m5_derived",
+        "symbol": view.source.symbol, "timeframe": view.timeframe,
+        "m5_view_contract_sha256": owner.binding.m5_view_contract_sha256,
+        "view_key": view.view_key, "view_payload_sha256": view.payload_sha256,
+        "view_membership_sha256": view.membership_sha256,
+        "view_frame_sha256": _frame_sha256(frame),
+        "view_start_utc": pd.Timestamp(frame.index[0]).isoformat(),
+        "view_end_exclusive_utc": end, "view_last_close_utc": end,
+        "view_rows": len(frame), "base_native_prefix_index_sha256": reopened.index_sha256,
+        "base_native_prefix_content_sha256": base["prefix_content_sha256"],
+    }
+    return frame, window
+
+
+def m5_derived_fitted_frame(fitted):
+    """Join an actual live fitted binding to its price-only frame and target window."""
+    if type(fitted) is not FittedNativeSearchTimeframe or type(fitted._derived_binding) is not _DerivedSearchBinding:
+        _fail("M5_DERIVED_FITTED_BINDING_INVALID")
+    binding = fitted._derived_binding
+    frame, window = m5_view_price_frame(context=binding.context, owner=binding.owner,
+                                       lease=binding.request_lease)
+    evidence = binding.view_evidence
+    if (window["base_native_prefix_index_sha256"] != fitted.product.index_sha256
+            or any(window[key] != evidence[key] for key in (
+                "m5_view_contract_sha256", "view_key", "view_payload_sha256", "view_membership_sha256"))
+            or not set(frame.columns).issubset(fitted._frame.columns)
+            or _frame_sha256(fitted._frame.loc[:, frame.columns]) != window["view_frame_sha256"]
+            or _frame_sha256(fitted._frame) != fitted.frame_sha256):
+        _fail("M5_DERIVED_FITTED_PRICE_FRAME_CHANGED")
+    return frame, window
 
 
 def _terminal_field(native: Mapping[str, Any], name: str, code: str) -> Any:
@@ -1564,6 +1712,14 @@ def _verify_attempt_roster(
     source_body = fitted.source_group_decision.to_dict()
     symbol = source_body["symbol"]
     timeframe = source_body["timeframe"]
+    m5_window = None
+    if fitted._derived_binding is not None:
+        _, m5_window = m5_derived_fitted_frame(fitted)
+        if (plan_body.get("source_kind") != "m5_derived"
+                or plan_body.get("m5_view_window") != m5_window):
+            _fail("HORIZON_PLAN_M5_VIEW_MISMATCH")
+    elif plan_body.get("source_kind", "broker_native") != "broker_native":
+        _fail("HORIZON_PLAN_NATIVE_SOURCE_KIND_MISMATCH")
     normalized_regime = str(regime or "").strip().upper()
     if (
         binding.get("cell")
@@ -1617,6 +1773,12 @@ def _verify_attempt_roster(
         attempt_by_pair[pair] = item
 
     prefix = dict(fitted.product.native_prefix)
+    target_end = (m5_window["view_end_exclusive_utc"] if m5_window is not None
+                  else prefix["prefix_end_exclusive_utc"])
+    target_latest = (m5_window["view_last_close_utc"] if m5_window is not None
+                     else prefix["prefix_last_close_utc"])
+    target_snapshot = (m5_window["view_payload_sha256"] if m5_window is not None
+                       else prefix["prefix_content_sha256"])
     policy = plan_body.get("horizon_policy")
     try:
         pair = pm_core.validate_backtest_frozen_tier_pair_contract(fitted.frozen_tier_pair_contract)
@@ -1644,7 +1806,7 @@ def _verify_attempt_roster(
     ):
         _fail("ATTEMPT_CUTOFF_REFIT_FRAME_INVALID")
     prefix_fit_end = pd.Timestamp(
-        _utc(prefix["prefix_end_exclusive_utc"], "PREFIX_END_INVALID")
+        _utc(target_end, "PREFIX_END_INVALID")
     )
     frame_closes = pd.DatetimeIndex(
         pd.to_datetime(
@@ -1741,13 +1903,13 @@ def _verify_attempt_roster(
         horizon_body = verified.horizon_process
         if (
             _utc(horizon_body["fit_end_utc"], "ATTEMPT_FIT_END_INVALID")
-            != _utc(prefix["prefix_end_exclusive_utc"], "PREFIX_END_INVALID")
+            != _utc(target_end, "PREFIX_END_INVALID")
             or _utc(
                 horizon_body["latest_closed_bar_utc"],
                 "ATTEMPT_LATEST_CLOSE_INVALID",
             )
-            != _utc(prefix["prefix_last_close_utc"], "PREFIX_LAST_CLOSE_INVALID")
-            or horizon_body["source_snapshot_sha256"] != prefix["prefix_content_sha256"]
+            != _utc(target_latest, "PREFIX_LAST_CLOSE_INVALID")
+            or horizon_body["source_snapshot_sha256"] != target_snapshot
         ):
             _fail("ATTEMPT_NATIVE_PREFIX_SPLICE", ordinal)
         parameter_sha256 = _sha256(verified.trial_definition["parameters"])
@@ -2740,11 +2902,20 @@ def _reverify_fitted_timeframe(
     attempts = source.get("acquisition_attempts_exact")
     if type(attempts) is not int or attempts <= 0:
         _fail("SOURCE_ACQUISITION_ATTEMPT_COUNT_INVALID")
-    refreshed = fit_native_timeframe_for_search(
-        product=fitted.product,
-        config=config,
-        acquisition_attempts_exact=attempts,
-    )
+    derived = fitted._derived_binding
+    if derived is None:
+        refreshed = fit_native_timeframe_for_search(
+            product=fitted.product, config=config, acquisition_attempts_exact=attempts)
+    else:
+        if type(derived) is not _DerivedSearchBinding:
+            _fail("M5_DERIVED_FITTED_BINDING_INVALID")
+        refreshed = fit_m5_derived_timeframe_for_search(
+            context=derived.context, owner=derived.owner, request_lease=derived.request_lease,
+            calibration_lease=derived.calibration_lease, cost_edition=derived.cost_edition,
+            declared_m5_source_pins=derived.declared_m5_source_pins,
+            config=config, acquisition_attempts_exact=attempts)
+        if _canonical_bytes(derived.view_evidence) != _canonical_bytes(refreshed._derived_binding.view_evidence):
+            _fail("M5_DERIVED_FITTED_VIEW_CHANGED")
     comparisons = (
         (source, refreshed.source_group_decision.to_dict()),
         (fitted.regime_fit_decision.to_dict(), refreshed.regime_fit_decision.to_dict()),
@@ -2783,7 +2954,7 @@ class _FreshFitOwner:
 
 
 class _BoundFitOwner:
-    __slots__ = ("seal", "fitted", "context_id", "request_sha256", "header_bytes", "reference_bytes", "validation_receipt")
+    __slots__ = ("seal", "fitted", "context_id", "request_sha256", "header_bytes", "reference_bytes", "validation_receipt", "verification_only")
     def __new__(cls, *args, **kwargs):
         _fail("BOUND_FIT_OWNER_PRIVATE")
 
@@ -2893,7 +3064,164 @@ def bound_fitted_state_reference(fitted, *, context, request):
     return json.loads(owner.reference_bytes.decode("ascii"))
 
 
+def _m5_bound_source_inputs(context, *, request, process, config, source_context,
+                            source_session_entry, source_session_sha256, snapshot_issued_at_utc=None,
+                            source_validation_completed_at_utc=None):
+    if source_validation_completed_at_utc is None:
+        source_validation_completed_at_utc = snapshot_issued_at_utc
+    elif snapshot_issued_at_utc is not None:
+        _fail("BOUND_M5_VALIDATION_TIME_AMBIGUOUS")
+    from pm_m5_job_view import M5JobViews, SlotViewBinding, CalibrationViewBinding
+    from pm_m5_derived_costs import RecordedDerivedCosts
+    import pm_historical_search_producer as producer
+    from dataclasses import asdict
+    keys = {"owner", "request_lease", "calibration_lease", "cost_edition",
+            "source_session", "source_session_entry"}
+    if type(source_context) is not dict or set(source_context) != keys:
+        _fail("BOUND_M5_REACQUIRED_SOURCE_REQUIRED")
+    owner, cost = source_context["owner"], source_context["cost_edition"]
+    if (type(owner) is not M5JobViews or type(cost) is not RecordedDerivedCosts
+            or _canonical_bytes(source_context["source_session_entry"]) != _canonical_bytes(source_session_entry)):
+        _fail("BOUND_M5_REACQUIRED_SOURCE_CHANGED")
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    session = authority_spool._strict_json_bytes(_bound_fit_entry_bytes(context, source_session_entry),
+                                               context.limits.max_json_bytes)
+    if (_sha256(session) != source_session_sha256
+            or _canonical_bytes(session) != _canonical_bytes(source_context["source_session"])):
+        _fail("BOUND_M5_SOURCE_SESSION_CHANGED")
+    historical_adapter._validate_declared_m5_source_session(context, body=body, source_session=session,
+        request_sha256=request.receipt_sha256, parent=request._precommit.to_dict(),
+        completed_at_utc=source_validation_completed_at_utc)
+    if session["failure"] is not None or session["cost_status"] != "COST_READY":
+        _fail("BOUND_M5_SOURCE_NOT_FITTED")
+    entry = session.get("m5_reopen_context_entry")
+    if type(entry) is not dict or entry.get("artifact_type") != "declared_m5_reopen_context":
+        _fail("BOUND_M5_REOPEN_CONTEXT_MISSING")
+    saved = authority_spool._strict_json_bytes(_bound_fit_entry_bytes(context, entry),
+                                               min(context.limits.max_json_bytes, 4 * 1024 * 1024))
+    if (type(saved) is not dict or set(saved) != {"schema_version", "request_sha256",
+            "m5_request_view_id", "m5_calibration_view_id", "owner_metadata", "cost_edition_route", "fine_product_routes"}
+            or saved["schema_version"] != "fxpm.declared-m5-reopen-context.v1"
+            or saved["request_sha256"] != request.receipt_sha256
+            or saved["m5_request_view_id"] != session["m5_request_view_id"]
+            or saved["m5_calibration_view_id"] != session["m5_calibration_view_id"]
+            or _canonical_bytes(owner.reopen_metadata()) != _canonical_bytes(saved["owner_metadata"])
+            or _canonical_bytes(cost.reopen_route()) != _canonical_bytes(saved["cost_edition_route"])):
+        _fail("BOUND_M5_REOPEN_CONTEXT_CHANGED")
+    expected_binding = {"generation_context_sha256": context.context_sha256, "config_sha256": context.config_sha256,
+        "effective_config_sha256": body["effective_config_sha256"], "precommit_sha256": body["precommit_sha256"],
+        "search_process_receipt_sha256": process.receipt_sha256, "run_id": body["run_id"], "cell_id": body["cell_id"],
+        "m5_view_contract_sha256": body["m5_view_contract_sha256"],
+        "view_plan_sha256": body["m5_source_pins"]["view_plan_sha256"]}
+    if (any(getattr(owner.binding, key) != value for key, value in expected_binding.items())
+            or cost.sha256 != body["spread_profile_identity"]["profile_sha256"]
+            or _canonical_bytes(asdict(owner.source_identity)) != _canonical_bytes(session["m5_source_identity"])):
+        _fail("BOUND_M5_OWNER_BINDING_CHANGED")
+    routes = [producer._prefix_route(owner.product_at(cutoff))
+              for cutoff in saved["owner_metadata"]["product_cutoffs"]]
+    if _canonical_bytes(routes) != _canonical_bytes(saved["fine_product_routes"]):
+        _fail("BOUND_M5_ORIGINAL_ROUTES_CHANGED")
+    request_lease, calibration_lease = source_context["request_lease"], source_context["calibration_lease"]
+    if (owner.consumer_binding(request_lease) != SlotViewBinding(request.receipt_sha256, body["slot_id"])
+            or owner.consumer_binding(calibration_lease) != CalibrationViewBinding(cost.sha256)):
+        _fail("BOUND_M5_CONSUMER_BINDING_CHANGED")
+    view, calibration = owner.view(request_lease), owner.view(calibration_lease)
+    if (_canonical_bytes(producer._declared_m5_view_observation(view))
+            != _canonical_bytes(session["m5_request_view_observation"])
+            or _canonical_bytes(producer._declared_m5_view_observation(calibration))
+            != _canonical_bytes(session["m5_calibration_view_observation"])):
+        _fail("BOUND_M5_VIEW_OBSERVATIONS_CHANGED")
+    product = owner.product_at(body["anchor"]["selection_cutoff_utc"])
+    if (product.index_sha256 != session["native_prefix_index_sha256"]
+            or product.index["source_accessed_at_utc"] != session["source_accessed_at_utc"]
+            or product.index["timeframe"] != "M5" or product.index["symbol"] != body["symbol"]
+            or product._data_dir != Path(config.data_dir).resolve(strict=False)):
+        _fail("BOUND_M5_BASE_PRODUCT_CHANGED")
+    spec, spec_receipt = _freeze_bound_execution_spec(product=product, config=config)
+    bound = cost.bind_view(owner, context=context, calibration_lease=calibration_lease,
+                           request_lease=request_lease, point=spec.point)
+    base, window = m5_view_price_frame(context=context, owner=owner, lease=request_lease)
+    tiers = {tier: bound.resolve(body["symbol"], body["timeframe"], tier, point=spec.point,
+        source_identity_sha256=product.native_prefix["source_identity_sha256"]) for tier in ("P75", "P95")}
+    fine_frame = native_prefix.open_verified_prefix_frame(product)
+    observations = spread_profile.align_prior_completed_spreads(base.index, fine_frame, "M5")
+    evidence = {"source_kind": "m5_derived", "base_timeframe": "M5", "view_timeframe": body["timeframe"],
+        "m5_view_contract_sha256": owner.binding.m5_view_contract_sha256,
+        "view_key": view.view_key, "view_payload_sha256": view.payload_sha256,
+        "view_membership_sha256": view.membership_sha256,
+        "base_native_prefix_index_sha256": product.index_sha256,
+        "source_accessed_at_utc": product.index["source_accessed_at_utc"]}
+    if _canonical_bytes(evidence) != _canonical_bytes(session["fitted_view_evidence"]):
+        _fail("BOUND_M5_FITTED_VIEW_CHANGED")
+    derived = _DerivedSearchBinding(context, owner, request_lease, calibration_lease,
+        cost, json.loads(_canonical_bytes(body["m5_source_pins"])), evidence)
+    return product, base, window, tiers, observations, fine_frame, spec, spec_receipt, derived, session
+
+
+def _publish_declared_m5_bound_fit(capture, fitted, fold_plan, issue_owner):
+    _require_executable_bound_fit(fitted)
+    if not historical_adapter._verify_declared_slot_capture(capture):
+        _fail("BOUND_FIT_CAPTURE_INVALID")
+    normalized_folds, _ = raw_winner._normalize_fold_plan(fold_plan, symbol=capture.symbol,
+        timeframe=capture.request_body["timeframe"], regime=capture.regime)
+    original = getattr(fitted, "_bound_fit_owner", None)
+    if original is not None:
+        reference = bound_fitted_state_reference(fitted, context=capture.context, request=capture.request)
+        state, _ = current_refit.read_bound_fitted_state_reference(capture.context, reference,
+            artifact_namespace=capture.raw_artifact_namespace)
+        if _canonical_bytes(state["metadata"]["fold_plan"]) != _canonical_bytes(normalized_folds):
+            _fail("BOUND_FIT_FOLD_PLAN_CHANGED")
+        return reference
+    if (type(issue_owner) is not _FreshFitOwner or issue_owner.seal is not _BOUND_FIT_OWNER_SEAL
+            or issue_owner.fitted is not fitted or issue_owner.context_id != id(capture.context)
+            or issue_owner.request_sha256 != capture.request.receipt_sha256
+            or issue_owner.original_fitted is not capture.verified_fitted_timeframe
+            or issue_owner.config is not capture.verified_pipeline_config):
+        _fail("BOUND_FIT_SUCCESSFUL_REVERIFY_REQUIRED")
+    frozen_config = capture.source_session._frozen_config
+    frozen_config.verify_current(capture.context)
+    receipts = {"source_group_decision": fitted.source_group_decision.to_dict(),
+        "regime_fit_decision": fitted.regime_fit_decision.to_dict(),
+        "source_contract_seed": dict(fitted.source_contract_seed), "cost_ladder_contract": dict(fitted.cost_ladder_contract),
+        "source_contract_seeds": fitted.source_contract_seeds, "frozen_tier_pair_contract": fitted.frozen_tier_pair_contract,
+        "regime_parameters": dict(fitted.regime_parameters), "train_regime_support": dict(fitted.train_regime_support),
+        "instrument_spec": asdict(fitted.instrument_spec), "execution_spec_receipt": dict(fitted.execution_spec_receipt)}
+    metadata = {"binding": {"generation_context_sha256": capture.context.context_sha256,
+        "producer_request_sha256": capture.request.receipt_sha256, "precommit_sha256": capture.request_body["precommit_sha256"],
+        "process_sha256": capture.process.receipt_sha256, "artifact_namespace": capture.raw_artifact_namespace,
+        "effective_config_sha256": frozen_config.effective_config_sha256,
+        "horizon_plan_receipt_sha256": capture.cell_plan.horizon_plan.receipt_sha256,
+        "cell_plan_receipt_sha256": capture.cell_plan.receipt_sha256},
+        "snapshot_issued_at_utc": _now_utc_seconds(), "runtime": _bound_fit_runtime(fitted.regime_parameters),
+        "frame_sha256": fitted.frame_sha256, "receipts": receipts, "fold_plan": normalized_folds,
+        "source_session_entry": dict(capture.source_session._entry),
+        "source_session_receipt_sha256": capture.source_session.receipt_sha256,
+        "target_carrier": _bound_fit_carrier(fitted.product), "fine_carrier": _bound_fit_carrier(fitted._spread_source_product),
+        "base_columns": [{"name": name, "dtype": str(dtype)} for name, dtype in fitted._frame.dtypes.items() if name not in _REGIME_COLUMNS],
+        "entry_observations_sha256": hashlib.sha256(pd.util.hash_pandas_object(
+            fitted._entry_spread_observations, index=True).values.tobytes()).hexdigest(),
+        "spread_profile_sha256": capture.request_body["spread_profile_identity"]["profile_sha256"]}
+    derived = fitted._derived_binding
+    if type(derived) is not _DerivedSearchBinding or derived.context is not capture.context:
+        _fail("BOUND_M5_LIVE_BINDING_REQUIRED")
+    actual_context = {"owner": derived.owner, "request_lease": derived.request_lease,
+        "calibration_lease": derived.calibration_lease, "cost_edition": derived.cost_edition,
+        "source_session": capture.source_session.to_dict(), "source_session_entry": dict(capture.source_session._entry)}
+    _, _, window, _, _, _, _, _, checked, session = _m5_bound_source_inputs(capture.context,
+        request=capture.request, process=capture.process, config=capture.pipeline_config,
+        source_context=actual_context, source_session_entry=metadata["source_session_entry"],
+        source_session_sha256=metadata["source_session_receipt_sha256"],
+        snapshot_issued_at_utc=metadata["snapshot_issued_at_utc"])
+    if _canonical_bytes(checked.view_evidence) != _canonical_bytes(derived.view_evidence):
+        _fail("BOUND_M5_LIVE_BINDING_CHANGED")
+    metadata.update(schema_version="fxpm.bound-fitted-m5-metadata.v1", source_kind="m5_derived",
+        m5_view_window=window, m5_reopen_context_entry=session["m5_reopen_context_entry"])
+    return current_refit.spool_bound_fitted_state(capture.sink, frame=fitted._frame, metadata=metadata)
+
+
 def _publish_declared_bound_fit(capture, fitted, fold_plan, issue_owner):
+    if historical.declared_slot_source_kind(capture.request_body) == "m5_derived":
+        return _publish_declared_m5_bound_fit(capture, fitted, fold_plan, issue_owner)
     if not historical_adapter._verify_declared_slot_capture(capture):
         _fail("BOUND_FIT_CAPTURE_INVALID")
     normalized_folds, _ = raw_winner._normalize_fold_plan(fold_plan, symbol=capture.symbol,
@@ -2938,8 +3266,198 @@ def _publish_declared_bound_fit(capture, fitted, fold_plan, issue_owner):
     return current_refit.spool_bound_fitted_state(capture.sink, frame=fitted._frame, metadata=metadata)
 
 
-def reopen_bound_fitted_timeframe(context, *, request, process, frozen_pipeline_config, header):
+def _check_m5_bound_reopen_window(body, *, verification_only):
+    if type(verification_only) is not bool:
+        _fail("BOUND_FIT_VERIFICATION_MODE_INVALID")
+    if verification_only is False:
+        window = body["source_access_window_utc"]
+        if not window["start_utc"] <= _now_utc_seconds() < window["end_exclusive_utc"]:
+            _fail("BOUND_FIT_ORIGINAL_WINDOW_CLOSED")
+
+
+def _require_executable_bound_fit(fitted):
+    owner = getattr(fitted, "_bound_fit_owner", None)
+    if owner is not None and getattr(owner, "verification_only", False) is not False:
+        _fail("BOUND_FIT_VERIFICATION_ONLY_NOT_EXECUTABLE")
+
+
+def _reopen_m5_bound_fitted_timeframe(context, *, request, process, frozen_pipeline_config, header, m5_source_context, verification_only=False):
     """Original run-owned hash chain only; this is not whole-chain signature authentication."""
+    started = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    if (type(header) is not dict or header.get("schema_version") != "fxpm.declared-attempt-unit-header.v2"
+            or _canonical_bytes(header.get("request_body")) != _canonical_bytes(body)
+            or "source_access_renewal_sha256" in body):
+        _fail("BOUND_FIT_ORIGINAL_HEADER_REQUIRED")
+    frozen_pipeline_config.verify_current(context)
+    if frozen_pipeline_config.effective_config_sha256 != body["effective_config_sha256"]:
+        _fail("BOUND_FIT_CONFIG_CHANGED")
+    config = frozen_pipeline_config.materialize(context)
+    _check_m5_bound_reopen_window(body, verification_only=verification_only)
+    frozen, cross = _bound_fit_frozen_chain(context, body, header)
+    reference = frozen.bound_fitted_state_entry
+    state, delta = current_refit.read_bound_fitted_state_reference(context, reference,
+        artifact_namespace=body["artifact_namespace"])
+    meta = state["metadata"]
+    required = {"schema_version", "source_kind", "m5_view_window", "m5_reopen_context_entry", "binding", "snapshot_issued_at_utc", "runtime", "frame_sha256", "receipts", "fold_plan",
+        "source_session_entry", "source_session_receipt_sha256", "target_carrier", "fine_carrier", "base_columns",
+        "entry_observations_sha256", "spread_profile_sha256"}
+    if (type(meta) is not dict or set(meta) != required
+            or meta["schema_version"] != "fxpm.bound-fitted-m5-metadata.v1" or meta["source_kind"] != "m5_derived"):
+        _fail("BOUND_FIT_METADATA_INVALID")
+    binding, receipts = meta["binding"], meta["receipts"]
+    if (type(binding) is not dict or set(binding) != {"generation_context_sha256", "producer_request_sha256", "precommit_sha256",
+            "process_sha256", "artifact_namespace", "effective_config_sha256", "horizon_plan_receipt_sha256", "cell_plan_receipt_sha256"}
+            or type(receipts) is not dict or set(receipts) != {"source_group_decision", "regime_fit_decision", "source_contract_seed",
+                "cost_ladder_contract", "source_contract_seeds", "frozen_tier_pair_contract", "regime_parameters", "train_regime_support",
+                "instrument_spec", "execution_spec_receipt"}):
+        _fail("BOUND_FIT_METADATA_INVALID")
+    if (binding.get("producer_request_sha256") != request.receipt_sha256
+            or binding.get("precommit_sha256") != body["precommit_sha256"]
+            or binding.get("process_sha256") != process.receipt_sha256
+            or binding.get("effective_config_sha256") != frozen_pipeline_config.effective_config_sha256
+            or cross.get("producer_request_sha256") != request.receipt_sha256
+            or cross.get("process_precommit_receipt_sha256") != body["precommit_sha256"]
+            or cross.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or cross.get("anchor_id") != body["slot_id"]
+            or cross["horizon_roster"]["plan_receipt_sha256"] != binding.get("horizon_plan_receipt_sha256")
+            or binding["horizon_plan_receipt_sha256"] != header["binding"].get("horizon_plan_receipt_sha256")
+            or binding["cell_plan_receipt_sha256"] != header["binding"].get("cell_plan_receipt_sha256")
+            or _canonical_bytes(meta["fold_plan"]) != _canonical_bytes(frozen.precommitment["causal_fold_plan"])
+            or _canonical_bytes(receipts["source_contract_seeds"]) != _canonical_bytes(frozen.source_contract_seeds)
+            or _canonical_bytes(receipts["frozen_tier_pair_contract"]) != _canonical_bytes(frozen.frozen_tier_pair_contract)
+            or meta["spread_profile_sha256"] != body["spread_profile_identity"]["profile_sha256"]):
+        _fail("BOUND_FIT_ORIGINAL_CHAIN_CHANGED")
+    issued = _utc(meta["snapshot_issued_at_utc"], "BOUND_FIT_ISSUED_TIME_INVALID")
+    if issued > frozen.precommitment["precommitted_at_utc"]:
+        _fail("BOUND_FIT_SNAPSHOT_AFTER_FREEZE")
+    source = _bound_fit_decision(receipts["source_group_decision"], book.HistoricalSourceGroupDecision)
+    fit = _bound_fit_decision(receipts["regime_fit_decision"], book.RegimeFitDecision)
+    book._source_body(source);fit_body = book._regime_fit_body(fit, source)
+    if (cross.get("source_group_decision_sha256") != source.receipt_sha256
+            or cross.get("regime_fit_decision_sha256") != fit.receipt_sha256
+            or meta["runtime"] != _bound_fit_runtime(receipts["regime_parameters"])):
+        _fail("BOUND_FIT_CODE_RUNTIME_OR_RECEIPT_CHANGED")
+    if any(entry not in header["artifact_roster"] for entry in
+           (meta["source_session_entry"], meta["m5_reopen_context_entry"])):
+        _fail("BOUND_M5_ORIGINAL_CONTEXT_ARTIFACT_MISSING")
+    target, base, window, tiers, observations, fine_frame, spec, spec_receipt, derived, source_session = _m5_bound_source_inputs(
+        context, request=request, process=process, config=config, source_context=m5_source_context,
+        source_session_entry=meta["source_session_entry"], source_session_sha256=meta["source_session_receipt_sha256"],
+        snapshot_issued_at_utc=meta["snapshot_issued_at_utc"])
+    fine = verified_fine = target
+    if (_canonical_bytes(_bound_fit_carrier(target)) != _canonical_bytes(meta["target_carrier"])
+            or _canonical_bytes(_bound_fit_carrier(fine)) != _canonical_bytes(meta["fine_carrier"])
+            or _canonical_bytes(window) != _canonical_bytes(meta["m5_view_window"])
+            or _canonical_bytes(source_session["m5_reopen_context_entry"]) != _canonical_bytes(meta["m5_reopen_context_entry"])):
+        _fail("BOUND_M5_ORIGINAL_SOURCE_CHANGED")
+    if ([{"name": name, "dtype": str(dtype)} for name, dtype in base.dtypes.items()] != meta["base_columns"]
+            or not base.index.equals(delta.index) or base.index.name != delta.index.name):
+        _fail("BOUND_FIT_NATIVE_FRAME_CHANGED")
+    for label in ("REGIME_RAW", "REGIME", "REGIME_LIVE"):
+        if (list(delta[label].cat.categories) != list(pm_regime.REGIME_DTYPE.categories)
+                or delta[label].cat.ordered is not False):
+            _fail("BOUND_FIT_CATEGORY_CHANGED")
+    frame = base.copy(deep=True)
+    for name in _REGIME_COLUMNS:
+        frame[name] = delta[name]
+    if _frame_sha256(frame) != meta["frame_sha256"]:
+        _fail("BOUND_FIT_FRAME_CHANGED")
+    profile = derived.cost_edition
+    if (profile.sha256 != meta["spread_profile_sha256"] or verified_fine.index_sha256 != meta["fine_carrier"]["index_sha256"]
+            or hashlib.sha256(pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest() != meta["entry_observations_sha256"]
+            or _canonical_bytes(spec_receipt) != _canonical_bytes(receipts["execution_spec_receipt"])
+            or _canonical_bytes(asdict(spec)) != _canonical_bytes(receipts["instrument_spec"])):
+        _fail("BOUND_FIT_COST_OR_OBSERVATIONS_CHANGED")
+    seeds, pair, pair_hashes = raw_winner._current_pair_inputs(receipts["source_contract_seeds"], receipts["frozen_tier_pair_contract"])
+    if any(row["frozen_spread_tier"] != tiers[row["tier"]].descriptor() for row in pair["tiers"]):
+        _fail("BOUND_FIT_FROZEN_TIERS_CHANGED")
+    native = target.native_prefix
+    rebuilt_source = book.create_historical_source_group_decision(symbol=body["symbol"], timeframe=body["timeframe"],
+        availability=book.AVAILABLE, reason_code="AUTHENTICATED_BASE_M5_DERIVED_PREFIX_AVAILABLE",
+        source_contract_sha256=pair_hashes["source_contract_sha256"], source_group_evidence_sha256=target.index_sha256,
+        acquisition_attempts_exact=source.to_dict()["acquisition_attempts_exact"], activation_id=native["activation_id"],
+        activation_manifest_sha256=native["activation_manifest_sha256"], activation_entry_sha256=native["activation_entry_sha256"],
+        native_source_sha256=native["artifact_sha256"])
+    parameters = _default_regime_parameters(body["timeframe"])
+    if rebuilt_source is None or _canonical_bytes(rebuilt_source.to_dict()) != _canonical_bytes(source.to_dict()) or _canonical_bytes(parameters) != _canonical_bytes(receipts["regime_parameters"]):
+        _fail("BOUND_FIT_SOURCE_OR_PARAMETERS_CHANGED")
+    detector_sha = pm_regime.detector_code_sha256();params_sha = pm_regime.regime_params_sha256(parameters)
+    support = _build_train_regime_support(frame=base, surface=delta, product=target, symbol=body["symbol"],
+        timeframe=body["timeframe"], parameters_sha256=params_sha, detector_code_sha256=detector_sha,
+        m5_view_evidence=dict(derived.view_evidence))
+    detector = book.create_regime_detector_record(source_group_decision=source,
+        fit_cutoff_utc=_book_canonical_utc(window["view_last_close_utc"], "REGIME_DETECTOR_CUTOFF_INVALID"),
+        detector_version=REGIME_FIT_POLICY_VERSION, detector_code_sha256=detector_sha, parameters=parameters)
+    policy = {"schema_version": REGIME_FIT_POLICY_VERSION, "parameter_source": "PINNED_TIMEFRAME_DEFAULT_NO_POSTHOC_TUNING",
+        "timeframe": body["timeframe"], "label_order": list(book.REGIME_ORDER), "surface": "REGIME_LIVE",
+        "warmup_policy": book.REGIME_TRAIN_SUPPORT_WARMUP_POLICY, "detector_code_sha256": detector_sha, "parameters_sha256": params_sha}
+    evidence = {"schema_version": REGIME_FIT_EVIDENCE_VERSION, "source_group_decision_sha256": source.receipt_sha256,
+        "native_prefix_index_sha256": target.index_sha256, "train_regime_support_receipt_sha256": support["receipt_sha256"],
+        "detector_record_sha256": detector["record_sha256"], "m5_view": dict(derived.view_evidence)}
+    mapping = {"schema_version": "fxpm.four-regime-mapping.v1", "label_order": list(book.REGIME_ORDER),
+        "unobserved_regimes_are_explicit": True, "all_regimes_are_not_required": True}
+    rebuilt_fit = book.create_regime_fit_decision(source_group_decision=source, fit_state=book.REGIME_FITTED,
+        reason_code="ANCHOR_LOCAL_CAUSAL_REGIME_FIT_COMPLETE", regime_fit_policy_sha256=_sha256(policy),
+        detector_process_sha256=detector_sha, regime_fit_evidence_sha256=_sha256(evidence),
+        four_regime_mapping_sha256=_sha256(mapping), regime_params_sha256=params_sha,
+        regime_detector_record=detector, train_regime_support=support)
+    if (rebuilt_fit is None or _canonical_bytes(rebuilt_fit.to_dict()) != _canonical_bytes(fit.to_dict())
+            or _canonical_bytes(support) != _canonical_bytes(receipts["train_regime_support"])
+            or receipts["source_contract_seed"] != {} or receipts["cost_ladder_contract"] != {}):
+        _fail("BOUND_FIT_FULL_RECEIPT_COMPARISON_FAILED")
+    source_raw = _bound_fit_entry_bytes(context, meta["source_session_entry"])
+    source_session = authority_spool._strict_json_bytes(source_raw, context.limits.max_json_bytes)
+    if (_sha256(source_session) != meta["source_session_receipt_sha256"]
+            or source_session.get("source_state") != native_prefix.AVAILABLE
+            or source_session.get("generation_context_sha256") != context.context_sha256
+            or source_session.get("config_sha256") != context.config_sha256
+            or source_session.get("effective_config_sha256") != body["effective_config_sha256"]
+            or source_session.get("selection_cutoff_utc") != body["anchor"]["selection_cutoff_utc"]
+            or source_session.get("spread_profile_identity") != body["spread_profile_identity"]
+            or source_session.get("native_prefix_index_descriptor") != target.index_descriptor
+            or meta["source_session_entry"] != header.get("source_session_entry")
+            or source_session.get("request_sha256") != request.receipt_sha256
+            or source_session.get("source_group_decision_sha256") != source.receipt_sha256
+            or source_session.get("regime_fit_decision_sha256") != fit.receipt_sha256
+            or source_session.get("native_prefix_index_sha256") != target.index_sha256
+            or source_session.get("source_accessed_at_utc") != target.index["source_accessed_at_utc"]):
+        _fail("BOUND_FIT_ORIGINAL_SOURCE_SESSION_CHANGED")
+    fitted = FittedNativeSearchTimeframe(product=target, source_group_decision=source, regime_fit_decision=fit,
+        source_contract_seed={}, cost_ladder_contract={}, regime_parameters=parameters, train_regime_support=support,
+        instrument_spec=spec, execution_spec_receipt=spec_receipt, frame_sha256=meta["frame_sha256"], _frame=frame,
+        source_contract_seeds=seeds, frozen_tier_pair_contract=pair, _spread_tiers=tiers,
+        _entry_spread_observations=observations, _spread_source_product=verified_fine, _spread_source_frame=fine_frame,
+        _derived_binding=derived)
+    receipt = {"schema_version": "fxpm.bound-fit-m5-reopen-validation.v1", "origin": "REOPENED_BOUND_FIT_M5",
+        "producer_request_sha256": request.receipt_sha256, "fitted_state_receipt_sha256": state["receipt_sha256"],
+        "frozen_receipt_sha256": header["frozen_plan_receipt"]["sha256"],
+        "original_horizon_plan_receipt_sha256": binding["horizon_plan_receipt_sha256"],
+        "original_cell_plan_receipt_sha256": binding["cell_plan_receipt_sha256"],
+        "validation_started_at_utc": started,
+        "validation_completed_at_utc": datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")}
+    if context.writable is True and verification_only is False:
+        # Separate current validation record in the existing original-request unit domain.
+        # Never rewrite historical acquisition/freeze/source-session clocks.
+        unit_root = _declared_unit_relative(body, "header.json").rsplit("/", 1)[0]
+        authority_spool._publish_exact_json(context, unit_root + "/fit-reopens/" + _sha256(receipt) + ".json",
+            receipt, context.limits.max_json_bytes)
+    owner = object.__new__(_BoundFitOwner)
+    owner.seal, owner.fitted, owner.context_id, owner.request_sha256 = _BOUND_FIT_OWNER_SEAL, fitted, id(context), request.receipt_sha256
+    owner.header_bytes, owner.reference_bytes, owner.validation_receipt = _canonical_bytes(header), _canonical_bytes(reference), receipt
+    owner.verification_only = verification_only
+    object.__setattr__(fitted, "_bound_fit_owner", owner)
+    return fitted, dict(receipt)
+
+
+def reopen_bound_fitted_timeframe(context, *, request, process, frozen_pipeline_config, header, m5_source_context=None, verification_only=False):
+    """Original run-owned hash chain only; this is not whole-chain signature authentication."""
+    body_kind = historical.declared_slot_source_kind(request.to_dict())
+    if body_kind == "m5_derived":
+        return _reopen_m5_bound_fitted_timeframe(context, request=request, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, header=header, m5_source_context=m5_source_context, verification_only=verification_only)
+    if m5_source_context is not None or verification_only is not False:
+        _fail("BOUND_FIT_NATIVE_REJECTS_M5_CONTEXT")
     started = datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
     body = historical.verify_declared_slot_producer_request(context, request, process=process)
     if (type(header) is not dict or header.get("schema_version") != "fxpm.declared-attempt-unit-header.v2"
@@ -3102,6 +3620,7 @@ def reopen_bound_fitted_timeframe(context, *, request, process, frozen_pipeline_
 
 
 def _declared_fitted_for_execution(capture, fitted, config):
+    _require_executable_bound_fit(fitted)
     owner = getattr(fitted, "_bound_fit_owner", None)
     if owner is None:
         # Replaces the one existing call; this is not an additional fit/replay.
@@ -3112,6 +3631,15 @@ def _declared_fitted_for_execution(capture, fitted, config):
         issued.original_fitted, issued.config = fitted, config
         return refreshed, issued
     bound_fitted_state_reference(fitted, context=capture.context, request=capture.request)
+    if type(fitted._derived_binding) is _DerivedSearchBinding:
+        derived = fitted._derived_binding
+        source_context = {"owner": derived.owner, "request_lease": derived.request_lease,
+            "calibration_lease": derived.calibration_lease, "cost_edition": derived.cost_edition,
+            "source_session": capture.source_session.to_dict(), "source_session_entry": dict(capture.source_session._entry)}
+        reopened, _ = reopen_bound_fitted_timeframe(capture.context, request=capture.request, process=capture.process,
+            frozen_pipeline_config=capture.source_session._frozen_config,
+            header=json.loads(owner.header_bytes.decode("ascii")), m5_source_context=source_context)
+        return reopened, reopened._bound_fit_owner
     reopened, _ = reopen_bound_fitted_timeframe(capture.context, request=capture.request, process=capture.process,
         frozen_pipeline_config=capture.source_session._frozen_config,
         header=json.loads(owner.header_bytes.decode("ascii")))
@@ -3129,10 +3657,23 @@ def _reverify_cell_state_error_envelope(
         import pm_production_search_planner as planner
 
         receipt = cell_plan.cell_receipt
-        verified = planner.verify_preprotected_state_error_envelope(
-            fitted,
-            receipt.get("state_error_envelope") if type(receipt) is dict else None,
-        )
+        declared_request = getattr(cell_plan, "_declared_slot_request", None)
+        if (type(declared_request) is historical.DeclaredSlotProducerRequest
+                and historical.declared_slot_source_kind(declared_request.to_dict()) == "m5_derived"):
+            if (type(receipt) is not dict or receipt.get("source_kind") != "m5_derived"
+                    or type(receipt.get("m5_view_window")) is not dict):
+                _fail("STATE_ERROR_ENVELOPE_M5_WINDOW_INVALID")
+            verified = planner.verify_preprotected_state_error_envelope(
+                fitted, receipt.get("state_error_envelope"),
+                m5_view_window=receipt["m5_view_window"],
+            )
+        else:
+            if type(receipt) is dict and receipt.get("source_kind") == "m5_derived":
+                _fail("STATE_ERROR_ENVELOPE_M5_WINDOW_INVALID")
+            verified = planner.verify_preprotected_state_error_envelope(
+                fitted,
+                receipt.get("state_error_envelope") if type(receipt) is dict else None,
+            )
     except Exception as exc:
         detail = getattr(exc, "code", type(exc).__name__)
         raise AuthoritativeSearchExecutionError(
@@ -3391,6 +3932,7 @@ def _declared_unit_binding(capture: Any, fitted: Any, cell_plan: Any,
 def _make_declared_unit_header(capture: Any, fitted: Any, cell_plan: Any,
         attempts: Sequence[Any], fold_plan: Any, handle: Any, references: Any,
         evidence_started: str) -> dict[str, Any]:
+    _require_executable_bound_fit(fitted)
     reference = handle.frozen.bound_fitted_state_entry
     if type(reference) is not dict or not reference:
         _fail("DECLARED_UNIT_FITTED_STATE_REOPEN_UNAVAILABLE")
@@ -4724,6 +5266,7 @@ def _execute_current_observed_cell(
     precommitted source-boundary shortfall can return without raw production.
     """
 
+    _require_executable_bound_fit(fitted)
     stage: Path | None = None
     staged: list[_StagedAttemptEvidence] = []
     stage_reservation: Any = None
@@ -5023,7 +5566,11 @@ def _verified_historical_cell_plan_inputs(
     try:
         import pm_production_search_planner as production_planner
 
-        verified = production_planner.verify_production_cell_search_plan(
+        plan_verifier = (production_planner.verify_m5_derived_production_cell_search_plan
+            if type(capture) is historical_adapter.DeclaredSlotSearchCapture
+            and historical.declared_slot_source_kind(capture.request_body) == "m5_derived"
+            else production_planner.verify_production_cell_search_plan)
+        verified = plan_verifier(
             capture.context,
             process=search_process,
             sink=capture.sink,
@@ -5088,6 +5635,7 @@ def execute_historical_observed_cell(
     raw builder is allowed to consume the first attempt.
     """
 
+    _require_executable_bound_fit(fitted)
     if type(capture) not in {
         historical_adapter.HistoricalSymbolSearchCapture,
         historical_adapter.BoundedRawWinnerCanaryCapture,
@@ -6126,3 +6674,60 @@ __all__ = [
 ]
 
 __all__ += ["reopen_bound_fitted_timeframe", "bound_fitted_state_reference"]
+
+
+def _train_regime_support_window(*, frame, product, symbol, timeframe, m5_view_evidence=None):
+    native = dict(product.native_prefix)
+    window = {
+        "schema_version": "fxpm.historical-regime-fit-window.v1",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "prefix_content_sha256": native["prefix_content_sha256"],
+        "prefix_start_utc": native["prefix_start_utc"],
+        "prefix_end_exclusive_utc": native["prefix_end_exclusive_utc"],
+        "prefix_rows": native["prefix_rows"],
+    }
+    if m5_view_evidence is not None:
+        fields = {"source_kind", "base_timeframe", "view_timeframe",
+                  "m5_view_contract_sha256", "view_key", "view_payload_sha256",
+                  "view_membership_sha256", "base_native_prefix_index_sha256",
+                  "source_accessed_at_utc"}
+        if (type(m5_view_evidence) is not dict or set(m5_view_evidence) != fields
+                or m5_view_evidence["source_kind"] != "m5_derived"
+                or m5_view_evidence["base_timeframe"] != "M5"
+                or m5_view_evidence["view_timeframe"] != timeframe
+                or m5_view_evidence["base_native_prefix_index_sha256"] != product.index_sha256
+                or m5_view_evidence["source_accessed_at_utc"] != native["source_accessed_at_utc"]
+                or frame.empty or "_BAR_CLOSE_TS" not in frame):
+            _fail("M5_DERIVED_REGIME_WINDOW_INVALID")
+        for name in ("m5_view_contract_sha256", "view_key", "view_payload_sha256",
+                     "view_membership_sha256", "base_native_prefix_index_sha256"):
+            _hex64(m5_view_evidence[name], "M5_DERIVED_REGIME_WINDOW_INVALID")
+        window = {
+            "schema_version": "fxpm.historical-m5-derived-regime-fit-window.v1",
+            "symbol": symbol, "timeframe": timeframe,
+            "view_start_utc": pd.Timestamp(frame.index[0]).isoformat(),
+            "view_end_exclusive_utc": pd.Timestamp(frame["_BAR_CLOSE_TS"].iloc[-1]).isoformat(),
+            "view_rows": len(frame), "view_frame_sha256": _frame_sha256(frame),
+            "view_binding": dict(m5_view_evidence),
+            "base_m5_prefix": {
+                "prefix_content_sha256": native["prefix_content_sha256"],
+                "prefix_start_utc": native["prefix_start_utc"],
+                "prefix_end_exclusive_utc": native["prefix_end_exclusive_utc"],
+                "prefix_rows": native["prefix_rows"],
+            },
+        }
+    return window
+
+
+def _regime_fit_evidence(*, source, product, support, detector_record, derived_binding=None):
+    evidence = {
+        "schema_version": REGIME_FIT_EVIDENCE_VERSION,
+        "source_group_decision_sha256": source.receipt_sha256,
+        "native_prefix_index_sha256": product.index_sha256,
+        "train_regime_support_receipt_sha256": support["receipt_sha256"],
+        "detector_record_sha256": detector_record["record_sha256"],
+    }
+    if derived_binding is not None:
+        evidence["m5_view"] = dict(derived_binding.view_evidence)
+    return evidence

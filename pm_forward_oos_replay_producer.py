@@ -3576,6 +3576,8 @@ def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline
         _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
     try:
         parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        if historical.declared_slot_source_kind(parent) != "broker_native" or historical.declared_slot_development_scope(parent) is not None:
+            _fail("DECLARED_NATIVE_ACCOUNT_SOURCE_KIND_REQUIRED")
         config = frozen_pipeline_config.materialize(context)
         _declared_cell_measured_config(config)
         _declared_cell_measurement(parent)
@@ -3629,7 +3631,6 @@ def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline
     return {"parent": parent, "config": config, "progress": progress, "commits": commits,
         "owner_records": records, "slot_schedule": schedule, "progress_status": status,
         "reason_code": None if status == "COMPLETE" else "DECLARED_CELL_OWNER_PREFIX_" + status}
-
 
 def _declared_cell_transport_symbol(body):
     identity = {"schema_version": DECLARED_CELL_RAW_ACCOUNT_SCHEMA,
@@ -4127,6 +4128,8 @@ def declared_cell_account_native_request(context, *, precommit, process,
         _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
     try:
         parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        if historical.declared_slot_source_kind(parent) != "broker_native" or historical.declared_slot_development_scope(parent) is not None:
+            _fail("DECLARED_NATIVE_ACCOUNT_SOURCE_KIND_REQUIRED")
         config = frozen_pipeline_config.materialize(context)
         _declared_cell_measured_config(config)
         measurement = _declared_cell_measurement(parent)
@@ -4157,7 +4160,6 @@ def declared_cell_account_native_request(context, *, precommit, process,
     except Exception as exc:
         raise ForwardOOSReplayProductionError("DECLARED_CELL_NATIVE_REQUEST_INVALID",
             (type(exc).__name__, getattr(exc, "code", ""))) from exc
-
 
 def produce_declared_cell_account_artifact(context, *, precommit, process, frozen_pipeline_config,
         execution_product=None, spread_source_product=None, frozen_profile_path=None):
@@ -5054,3 +5056,642 @@ __all__ = [
     "verify_declared_cell_account_transport",
     "verify_forward_oos_replay_product",
 ]
+
+
+# Partial development is a distinct raw-account contract, never a full H364 result.
+DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA = "fxpm.declared-development-m5-cell-raw-account.v1"
+_DECLARED_M5_ACCOUNT_CONTEXT_SCHEMA = "fxpm.declared-m5-account-source-context.v1"
+_DECLARED_M5_ACCOUNT_CONTEXT_MAX_BYTES = 4 * 1024 * 1024
+_DECLARED_DEVELOPMENT_MARKET_FIELDS = _DECLARED_CELL_MARKET_FIELDS + (
+    "m5_source_context", "m5_account_consumer_bindings", "m5_account_view_window",
+    "m5_selected_tier_views", "terminal_consumer_binding_sha256",
+)
+_DECLARED_DEVELOPMENT_CELL_FIELDS = _DECLARED_CELL_FIELDS | frozenset({
+    "source_kind", "result_kind", "development_scope", "development_scope_sha256",
+    "design_contaminated", "pristine_validation", "saved_cell_run_receipt_sha256",
+    "m5_source_context", "m5_account_consumer_bindings", "m5_account_view_window",
+    "m5_selected_tier_views", "terminal_consumer_binding_sha256",
+})
+
+
+def _declared_development_cell_measurement(parent):
+    scope = historical.declared_slot_development_scope(parent)
+    if scope is None or historical.declared_slot_source_kind(parent) != "m5_derived":
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_SCOPE_REQUIRED")
+    slots = historical.declared_slot_selected_slots(parent)
+    if not 1 <= len(slots) <= 3:
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_GEOMETRY_INVALID")
+    previous = None
+    for ordinal, slot in enumerate(slots, 1):
+        start = _timestamp(slot["activation_utc"], "DECLARED_CELL_SLOT_TIME_INVALID")
+        end = _timestamp(slot["end_exclusive_utc"], "DECLARED_CELL_SLOT_TIME_INVALID")
+        if (slot["ordinal"] != ordinal or end-start != pd.Timedelta(days=28)
+                or (previous is not None and start != previous)):
+            _fail("DECLARED_DEVELOPMENT_ACCOUNT_GEOMETRY_INVALID")
+        previous = end
+    return {"result_kind": "DEVELOPMENT_PARTIAL", "calendar_days": 28*len(slots),
+        "refit_cycles": len(slots), "cycle_days": 28, "risk_per_trade_pct": 0.25,
+        "terminal_policy": "MARK_OPEN", "start_utc": slots[0]["activation_utc"],
+        "end_exclusive_utc": slots[-1]["end_exclusive_utc"],
+        "development_scope_sha256": parent["development_scope_sha256"],
+        "design_contaminated": True, "pristine_validation": False}
+
+
+def _reopen_declared_development_cell_inputs(context, *, precommit, process, frozen_pipeline_config):
+    import pm_historical_search_producer as producer
+
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
+    try:
+        parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        if historical.declared_slot_development_scope(parent) is None or historical.declared_slot_source_kind(parent) != "m5_derived":
+            _fail("DECLARED_DEVELOPMENT_ACCOUNT_SCOPE_REQUIRED")
+        config = frozen_pipeline_config.materialize(context)
+        _declared_cell_measured_config(config)
+        _declared_development_cell_measurement(parent)
+        cell = parent["cells"][0]
+        progress = producer.reopen_declared_cell_owner_progress(context, precommit=precommit,
+            process=process, cell_id=cell["cell_id"], frozen_pipeline_config=frozen_pipeline_config)
+    except ForwardOOSReplayProductionError:
+        raise
+    except Exception as exc:
+        raise ForwardOOSReplayProductionError("DECLARED_CELL_OWNER_PROGRESS_INVALID",
+            (type(exc).__name__, getattr(exc, "code", ""))) from exc
+    if len(progress.slot_commit_artifacts) != len(progress.slot_summaries):
+        _fail("DECLARED_CELL_COMMIT_ROSTER_INVALID")
+    commits, records, schedule = [], [], []
+    for summary, entry in zip(progress.slot_summaries, progress.slot_commit_artifacts, strict=True):
+        commit = _read_descriptor_json(context, entry["descriptor"], code="DECLARED_CELL_COMMIT")
+        if (entry["descriptor"]["sha256"] != summary["commit_sha256"]
+                or commit["cell_id"] != cell["cell_id"] or commit["slot_id"] != summary["slot_id"]
+                or commit["ordinal"] != summary["ordinal"]
+                or commit["completion"]["status"] != summary["status"]):
+            _fail("DECLARED_CELL_COMMIT_BINDING_MISMATCH")
+        completion = commit["completion"]
+        if completion["status"] == "OWNER":
+            owner = completion["owner"]
+            cross = _read_descriptor_json(context, completion["horizon_winner_cross_binding"],
+                code="DECLARED_CELL_OWNER_CROSS_BINDING")
+            selected = owner["selected_attempt"]
+            matches = [row for row in cross["mapping"]
+                if row.get("winner_process_candidate_id") == selected["process_candidate_id"]
+                and row.get("process_sha256") == selected["process_sha256"]]
+            if len(matches) != 1 or type(matches[0].get("source_count_receipt")) is not dict:
+                _fail("DECLARED_CELL_OWNER_SOURCE_COUNT_INVALID")
+            count = matches[0]["source_count_receipt"]
+            if count.get("receipt_sha256") != _sha({k: v for k, v in count.items() if k != "receipt_sha256"}):
+                _fail("DECLARED_CELL_OWNER_SOURCE_COUNT_INVALID")
+            records.append({"owner": owner, "source_count_receipt": count})
+        commits.append(commit)
+    by_slot = {commit["slot_id"]: commit["completion"] for commit in commits}
+    for slot in historical.declared_slot_selected_slots(parent):
+        completion = by_slot.get(slot["slot_id"])
+        schedule.append({"slot_id": slot["slot_id"], "ordinal": slot["ordinal"],
+            "start_utc": slot["activation_utc"], "end_exclusive_utc": slot["end_exclusive_utc"],
+            "status": "MISSING" if completion is None else completion["status"],
+            "owner_id": completion["owner"]["owner_id"]
+                if completion is not None and completion["status"] == "OWNER" else None})
+    status = "STOP" if progress.terminal_stop else "DEVELOPMENT_INCOMPLETE" if (
+        progress.first_uncommitted_slot is not None or len(commits) != len(historical.declared_slot_selected_slots(parent))
+        or any(row["status"] == "MISSING" for row in schedule)) else "DEVELOPMENT_COMPLETE"
+    if status == "DEVELOPMENT_COMPLETE" and any(row["status"] not in ("OWNER", "NO_TRADE") for row in schedule):
+        _fail("DECLARED_CELL_COMPLETED_SCHEDULE_INVALID")
+    return {"parent": parent, "config": config, "progress": progress, "commits": commits,
+        "owner_records": records, "slot_schedule": schedule, "progress_status": status,
+        "reason_code": None if status == "DEVELOPMENT_COMPLETE" else "DECLARED_DEVELOPMENT_OWNER_PREFIX_" + status}
+
+
+
+def _declared_development_cell_body(context, *, precommit, process, frozen_pipeline_config, inputs):
+    result = {"schema_version": DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA,
+        "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
+        "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
+        "declared_precommit_sha256": precommit.receipt_sha256,
+        "search_process_receipt_sha256": process.receipt_sha256, "cell": inputs["parent"]["cells"][0],
+        "pipeline_config_binding": {"active_config_path": str(frozen_pipeline_config.active_config_path),
+            "config_sha256": frozen_pipeline_config.config_sha256,
+            "effective_config_sha256": frozen_pipeline_config.effective_config_sha256},
+        "declared_commit_artifacts": list(inputs["progress"].slot_commit_artifacts),
+        "slot_summaries": list(inputs["progress"].slot_summaries),
+        "slot_schedule": inputs["slot_schedule"], "progress_status": inputs["progress_status"],
+        "reason_code": inputs["reason_code"], "measurement": _declared_development_cell_measurement(inputs["parent"]),
+        "genesis": {"mode": NEW_SIMULATED_FLAT_GENESIS, "initial_cash": 10000.0, "initial_inventory": []},
+        "owner_records": inputs["owner_records"], **{name: None for name in _DECLARED_DEVELOPMENT_MARKET_FIELDS},
+        "account": None, "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+
+    parent = inputs["parent"]
+    result.update(source_kind="m5_derived", result_kind="DEVELOPMENT_PARTIAL",
+        development_scope=historical.declared_slot_development_scope(parent),
+        development_scope_sha256=parent["development_scope_sha256"],
+        design_contaminated=True, pristine_validation=False,
+        saved_cell_run_receipt_sha256=(None if inputs["progress"].run_receipt is None
+                                      else _sha(inputs["progress"].run_receipt)))
+    return result
+
+
+def _declared_development_cell_transport_symbol(body):
+    identity = {"schema_version": DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA,
+        "precommit_sha256": body["declared_precommit_sha256"], "cell_id": body["cell"]["cell_id"],
+        "commit_sha256s": [row["commit_sha256"] for row in body["slot_summaries"]],
+        "progress_status": body["progress_status"], "development_scope_sha256": body["development_scope_sha256"]}
+    return "DECLARED_DEV_M5_ACCOUNT:" + _sha(identity)
+
+
+
+def _discover_declared_development_cell_account_output(context, *, expected, process, frozen_pipeline_config):
+    """Read only the canonical publication; unsealed content objects are not output."""
+    try:
+        root = authority_spool._validate_root(context.root, create=False)
+        relative = authority_spool._manifest_relative_path(
+            _declared_development_cell_transport_symbol(expected), authority_spool.GENERAL_MANIFEST_DOMAIN)
+        path = authority_spool._local_path(root, relative)
+        authority_spool._reject_reparse_chain(path)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        if authority_spool._is_reparse(path) or not stat.S_ISREG(info.st_mode):
+            _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_NOT_REGULAR")
+        _, _, encoded = authority_spool._stream_file(
+            root, relative, maximum_bytes=context.limits.max_manifest_bytes,
+            collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+        manifest = authority_spool._strict_json_bytes(encoded, context.limits.max_manifest_bytes)
+        entries = manifest.get("artifacts") if type(manifest) is dict else None
+        if (type(entries) is not list or len(entries) != 1
+                or type(entries[0]) is not dict
+                or set(entries[0]) != {"artifact_id", "artifact_type", "descriptor"}
+                or entries[0]["artifact_id"] != "declared-cell-account"
+                or entries[0]["artifact_type"] != "declared_cell_raw_account"):
+            _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_ROSTER")
+        descriptor = _descriptor(entries[0]["descriptor"], "DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
+        artifact = causal_producer.DeclaredCellRawAccountArtifact(descriptor)
+        projection = causal_producer.read_declared_cell_account_artifact(
+            context, artifact, process=process, frozen_pipeline_config=frozen_pipeline_config)
+        verified = json.loads(projection._verified_body_json)
+        for name in _DECLARED_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
+            if verified[name] != expected[name]:
+                _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "CALLER_BINDING", name)
+        return artifact
+    except ForwardOOSReplayProductionError:
+        raise
+    except (authority_spool.AuthoritySpoolError, causal_producer.CausalEvidenceProductionError,
+            OSError, KeyError, TypeError, ValueError, ArithmeticError, RecursionError) as exc:
+        raise ForwardOOSReplayProductionError(
+            "DECLARED_CELL_EXISTING_OUTPUT_INVALID", (type(exc).__name__, getattr(exc, "code", ""))) from exc
+
+
+
+
+def discover_declared_m5_development_cell_account_artifact(context, *, precommit, process,
+                                                          frozen_pipeline_config):
+    inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen_pipeline_config)
+    expected = _declared_development_cell_body(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    return _discover_declared_development_cell_account_output(context, expected=expected,
+        process=process, frozen_pipeline_config=frozen_pipeline_config)
+
+
+def declared_m5_development_cell_account_request(context, *, precommit, process, frozen_pipeline_config):
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
+    frozen_pipeline_config.verify_current(context)
+    _declared_cell_measured_config(frozen_pipeline_config.materialize(context))
+    measurement = _declared_development_cell_measurement(parent)
+    return {"schema_version": "fxpm.declared-development-m5-account-request.v1",
+        "source_kind": "m5_derived", "cell": parent["cells"][0], "measurement": measurement,
+        "cutoff_utc": measurement["end_exclusive_utc"], "m5_view_contract_sha256": parent["m5_view_contract_sha256"],
+        "profile_sha256": parent["spread_profile_identity"]["profile_sha256"],
+        "development_scope_sha256": parent["development_scope_sha256"],
+        "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+
+
+def _declared_m5_account_consumers(inputs, *, precommit_sha256):
+    """Build ordinary bindings only after the caller reopened the real selected prefix."""
+    from pm_m5_job_view import AccountViewBinding, NoTradeAccountViewBinding
+    parent = inputs["parent"]
+    measurement = _declared_development_cell_measurement(parent)
+    slots = historical.declared_slot_selected_slots(parent)
+    schedule = inputs["slot_schedule"]
+    if (inputs["progress_status"] != "DEVELOPMENT_COMPLETE" or type(schedule) is not list
+            or len(schedule) != len(slots)
+            or any(row.get("slot_id") != slot["slot_id"] or row.get("ordinal") != slot["ordinal"]
+                   or row.get("status") not in ("OWNER", "NO_TRADE")
+                   for row, slot in zip(schedule, slots))):
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_INPUTS_INCOMPLETE")
+    run = inputs["progress"].run_receipt
+    if type(run) is not dict:
+        _fail("DECLARED_DEVELOPMENT_RUN_RECEIPT_REQUIRED")
+    cell = parent["cells"][0]
+    if (run.get("schema_version") != "fxpm.declared-development-cell-owner-run.v1"
+            or run.get("precommit_sha256") != precommit_sha256 or run.get("cell_id") != cell["cell_id"]
+            or type(run.get("declared_slots")) is not int or run["declared_slots"] != len(slots)
+            or type(run.get("completed_slots")) is not int or run["completed_slots"] != len(slots)
+            or run.get("terminal_stop") is not False
+            or run.get("slot_commits") != [{"slot_id": row["slot_id"], "status": row["status"]} for row in schedule]):
+        _fail("DECLARED_DEVELOPMENT_RUN_BINDING_MISMATCH")
+    _hex(precommit_sha256, "DECLARED_DEVELOPMENT_RUN_BINDING_MISMATCH")
+    if all(row["status"] == "NO_TRADE" for row in schedule):
+        if inputs["owner_records"]:
+            _fail("DECLARED_M5_ACCOUNT_OWNER_BINDING_INVALID")
+        return (NoTradeAccountViewBinding("DEVELOPMENT_PARTIAL_ACCOUNT",
+            measurement["end_exclusive_utc"], _sha(run), precommit_sha256),)
+    owners = {record["owner"].get("slot_id"): record["owner"] for record in inputs["owner_records"]}
+    expected_ids = {row["slot_id"] for row in schedule if row["status"] == "OWNER"}
+    if set(owners) != expected_ids or len(owners) != len(inputs["owner_records"]):
+        _fail("DECLARED_M5_ACCOUNT_OWNER_BINDING_INVALID")
+    result = []
+    for row in schedule:
+        if row["status"] != "OWNER":
+            continue
+        owner = owners[row["slot_id"]]
+        if (owner.get("schema_version") != "fxpm.declared-m5-slot-owner.v1"
+                or owner.get("cell_id") != cell["cell_id"] or owner.get("owner_id") != row["owner_id"]):
+            _fail("DECLARED_M5_ACCOUNT_OWNER_BINDING_INVALID")
+        contract = _hex(owner.get("source_contract_sha256"), "DECLARED_M5_ACCOUNT_OWNER_BINDING_INVALID")
+        result.append(AccountViewBinding("DEVELOPMENT_PARTIAL_ACCOUNT", measurement["end_exclusive_utc"],
+            _sha(owner), contract))
+    return tuple(result)
+
+
+def _validate_declared_m5_account_owner(context, *, precommit, process, inputs, owner, cost_edition):
+    from pm_m5_job_view import M5JobViews
+    from pm_m5_derived_costs import RecordedDerivedCosts
+    parent = inputs["parent"]
+    if type(owner) is not M5JobViews or type(cost_edition) is not RecordedDerivedCosts:
+        _fail("DECLARED_M5_ACCOUNT_SOURCE_REQUIRED")
+    expected = {"generation_context_sha256": context.context_sha256, "config_sha256": context.config_sha256,
+        "effective_config_sha256": parent["effective_config_sha256"], "precommit_sha256": precommit.receipt_sha256,
+        "search_process_receipt_sha256": process.receipt_sha256, "run_id": parent["run_id"],
+        "cell_id": parent["cells"][0]["cell_id"], "m5_view_contract_sha256": parent["m5_view_contract_sha256"],
+        "view_plan_sha256": parent["m5_source_pins"]["view_plan_sha256"]}
+    if (any(getattr(owner.binding, key) != value for key, value in expected.items())
+            or owner.view_plan_sha256 != parent["m5_source_pins"]["view_plan_sha256"]
+            or _sha(parent["m5_source_pins"]) != owner.binding.m5_view_contract_sha256
+            or cost_edition.sha256 != parent["spread_profile_identity"]["profile_sha256"]
+            or cost_edition.reopen_route()["cost_edition_identity"] != parent["m5_source_pins"]["cost_edition_identity"]):
+        _fail("DECLARED_M5_ACCOUNT_SOURCE_BINDING_MISMATCH")
+    measurement = _declared_development_cell_measurement(parent)
+    product = owner.product_at(measurement["end_exclusive_utc"])
+    product = native_prefix.reverify_activated_native_prefix_product(product, context, require_current_activation=True)
+    if (product.source_state != native_prefix.AVAILABLE or product.index["timeframe"] != "M5"
+            or product.index["symbol"] != parent["cells"][0]["symbol"]
+            or product._data_dir != Path(inputs["config"].data_dir).resolve(strict=False)):
+        _fail("DECLARED_M5_ACCOUNT_SOURCE_BINDING_MISMATCH")
+
+
+def _declared_m5_account_slot_inputs(context, *, inputs, owner, cost_edition):
+    import pm_historical_search_producer as producer
+    records = []
+    for commit in inputs["commits"]:
+        completion = commit["completion"]
+        body = completion["request_body"]
+        session, _ = producer._read_declared_m5_reopen_entry(context, completion["source_session_entry"],
+            body=body, artifact_type="declared_slot_source_session")
+        saved, _ = producer._read_declared_m5_reopen_entry(context, session["m5_reopen_context_entry"],
+            body=body, artifact_type="declared_m5_reopen_context", suffix="/m5-reopen-context")
+        if (session["request_sha256"] != completion["request_sha256"]
+                or _canonical_bytes(saved["owner_metadata"]) != _canonical_bytes(owner.reopen_metadata())
+                or _canonical_bytes(saved["cost_edition_route"]) != _canonical_bytes(cost_edition.reopen_route())
+                or _canonical_bytes(saved["fine_product_routes"]) != _canonical_bytes([
+                    producer._prefix_route(owner.product_at(cutoff)) for cutoff in saved["owner_metadata"]["product_cutoffs"]])
+                or saved["m5_request_view_id"] != session["m5_request_view_id"]
+                or saved["m5_calibration_view_id"] != session["m5_calibration_view_id"]):
+            _fail("DECLARED_M5_ACCOUNT_SLOT_SOURCE_CHANGED")
+        records.append({"slot_id": body["slot_id"], "request_sha256": completion["request_sha256"],
+            "request_view_id": saved["m5_request_view_id"],
+            "calibration_view_id": saved["m5_calibration_view_id"],
+            "request_observation": session["m5_request_view_observation"],
+            "calibration_observation": session["m5_calibration_view_observation"]})
+    if len(records) != len(historical.declared_slot_selected_slots(inputs["parent"])):
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_INPUTS_INCOMPLETE")
+    return records
+
+
+def _declared_m5_account_source_context(owner, cost_edition, *, account_view_id, calibration_view_id):
+    import pm_historical_search_producer as producer
+    metadata = owner.reopen_metadata()
+    value = {"schema_version": _DECLARED_M5_ACCOUNT_CONTEXT_SCHEMA, "owner_metadata": metadata,
+        "cost_edition_route": cost_edition.reopen_route(),
+        "fine_product_routes": [producer._prefix_route(owner.product_at(cutoff))
+                                for cutoff in metadata["product_cutoffs"]],
+        "account_view_id": account_view_id, "account_calibration_view_id": calibration_view_id}
+    return json.loads(_canonical_bytes(value, _DECLARED_M5_ACCOUNT_CONTEXT_MAX_BYTES))
+
+
+def _reopen_declared_m5_account_source(context, *, precommit, process, source_context, inputs):
+    import pm_historical_search_producer as producer
+    import pm_m5_job_view as job_view
+    from pm_m5_derived_costs import open_recorded_derived_costs_route
+    value = json.loads(_canonical_bytes(source_context, _DECLARED_M5_ACCOUNT_CONTEXT_MAX_BYTES))
+    fields = {"schema_version", "owner_metadata", "cost_edition_route", "fine_product_routes",
+              "account_view_id", "account_calibration_view_id"}
+    if (type(value) is not dict or set(value) != fields or value["schema_version"] != _DECLARED_M5_ACCOUNT_CONTEXT_SCHEMA
+            or any(type(value[key]) is not str or not 1 <= len(value[key]) <= 128
+                   for key in ("account_view_id", "account_calibration_view_id"))):
+        _fail("DECLARED_M5_ACCOUNT_CONTEXT_INVALID")
+    metadata = job_view._bounded_reopen_plain(value["owner_metadata"])
+    binding, _, _, cutoffs, source = job_view._decode_m5_reopen_metadata(metadata)
+    parent = inputs["parent"]
+    expected = {"generation_context_sha256": context.context_sha256, "config_sha256": context.config_sha256,
+        "effective_config_sha256": parent["effective_config_sha256"], "run_id": parent["run_id"],
+        "precommit_sha256": precommit.receipt_sha256, "search_process_receipt_sha256": process.receipt_sha256,
+        "cell_id": parent["cells"][0]["cell_id"], "m5_view_contract_sha256": parent["m5_view_contract_sha256"],
+        "view_plan_sha256": parent["m5_source_pins"]["view_plan_sha256"]}
+    if (any(getattr(binding, key) != value for key, value in expected.items())
+            or source.symbol != parent["cells"][0]["symbol"]
+            or _sha(parent["m5_source_pins"]) != binding.m5_view_contract_sha256
+            or type(value["cost_edition_route"]) is not dict
+            or _canonical_bytes(value["cost_edition_route"].get("cost_edition_identity"))
+                != _canonical_bytes(parent["m5_source_pins"]["cost_edition_identity"])):
+        _fail("DECLARED_M5_ACCOUNT_SOURCE_BINDING_MISMATCH")
+    routes = value["fine_product_routes"]
+    cell = inputs["parent"]["cells"][0]
+    if (type(routes) is not list or len(routes) != len(cutoffs)
+            or any(type(route) is not dict or route.get("symbol") != cell["symbol"]
+                   or route.get("timeframe") != "M5"
+                   or job_view._utc(route.get("cutoff_utc")) != job_view._utc(cutoff)
+                   for route, cutoff in zip(routes, cutoffs))):
+        _fail("DECLARED_M5_ACCOUNT_CONTEXT_INVALID")
+    products = tuple(producer._original_reopen_prefix_route(route=route,
+        data_dir=Path(inputs["config"].data_dir), context=context,
+        symbol=cell["symbol"], timeframe="M5") for route in routes)
+    window = parent["source_access_window_utc"]
+    start = historical._utc(window["start_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    end = historical._utc(window["end_exclusive_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    if any(not start <= historical._utc(product.index["source_accessed_at_utc"], "DECLARED_SLOT_SOURCE_WINDOW_INVALID") < end
+           for product in products):
+        _fail("DECLARED_SLOT_SOURCE_WINDOW_INVALID")
+    owner = job_view.reopen_m5_job_views(context, canonical_data_dir=Path(inputs["config"].data_dir),
+        fine_products=products, metadata=metadata)
+    try:
+        cost = open_recorded_derived_costs_route(value["cost_edition_route"])
+        if _canonical_bytes(owner.reopen_metadata()) != _canonical_bytes(metadata):
+            _fail("DECLARED_M5_ACCOUNT_CONTEXT_INVALID")
+        return owner, cost
+    except BaseException:
+        owner.close()
+        raise
+
+
+def _release_declared_m5_account_leases(leases):
+    failure = None
+    for lease in reversed(leases):
+        try:
+            lease.release()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+    if failure is not None:
+        raise failure
+
+
+def _declared_m5_account_frame_inputs(context, *, precommit, process, inputs, owner,
+                                      account_view_id, cost_edition):
+    from dataclasses import asdict
+    import pm_m5_job_view as job_view
+    import pm_historical_search_producer as producer
+    parent, config = inputs["parent"], inputs["config"]
+    _validate_declared_m5_account_owner(context, precommit=precommit, process=process,
+        inputs=inputs, owner=owner, cost_edition=cost_edition)
+    measurement = _declared_development_cell_measurement(parent)
+    consumers = _declared_m5_account_consumers(inputs, precommit_sha256=precommit.receipt_sha256)
+    slot_sources = _declared_m5_account_slot_inputs(context, inputs=inputs, owner=owner, cost_edition=cost_edition)
+    if type(account_view_id) is not str or not 1 <= len(account_view_id) <= 128:
+        _fail("DECLARED_M5_ACCOUNT_VIEW_REQUIRED")
+    leases = []
+    try:
+        account_leases = []
+        bindings = []
+        for consumer in consumers:
+            lease = owner.acquire(account_view_id, consumer=consumer, result_key=owner.binding.terminal_result_key)
+            leases.append(lease); account_leases.append(lease)
+            bindings.append({"consumer": asdict(consumer),
+                "consumer_kind": "no_trade_account" if type(consumer) is job_view.NoTradeAccountViewBinding else "account",
+                "consumer_binding_sha256": lease.consumer_binding_sha256})
+        account = owner.view(account_leases[0])
+        cell = parent["cells"][0]
+        if (account.source.symbol != cell["symbol"] or account.timeframe != cell["timeframe"]
+                or _timestamp(account.cutoff_utc, "DECLARED_CELL_WINDOW_INVALID")
+                    != _timestamp(measurement["end_exclusive_utc"], "DECLARED_CELL_WINDOW_INVALID")
+                or any(owner.view(lease).view_key != account.view_key for lease in account_leases)):
+            _fail("DECLARED_M5_ACCOUNT_VIEW_BINDING_MISMATCH")
+        calibration_id = slot_sources[0]["calibration_view_id"]
+        calibration = owner.acquire(calibration_id, consumer=job_view.CalibrationViewBinding(cost_edition.sha256),
+            result_key=owner.binding.terminal_result_key)
+        leases.append(calibration)
+        product = owner.product_at(account.cutoff_utc)
+        execution_identity = _native_product_identity(product, expected_symbol=cell["symbol"], expected_timeframe="M5",
+            expected_cutoff_utc=measurement["end_exclusive_utc"], role="DECLARED_M5_ACCOUNT_BASE")
+        product = _reopen_bound_native_product(context=context, product=product,
+            expected_identity=execution_identity, config=config, production_contract_required=not config.research_mode)
+        deployment = _deployment_config(config, declared_research_account=True)
+        spec, spec_receipt = _freeze_execution_spec(product=product, config=config, deployment=deployment)
+        account_costs = cost_edition.bind_view(owner, context=context, calibration_lease=calibration,
+            request_lease=account_leases[0], point=spec.point)
+        account_tiers = {level: account_costs.resolve(cell["symbol"], cell["timeframe"], level,
+            point=spec.point, source_identity_sha256=product.native_prefix["source_identity_sha256"])
+            for level in ("P75", "P95")}
+        frame, window = search_execution.m5_view_price_frame(context=context, owner=owner, lease=account_leases[0])
+        start = _timestamp(measurement["start_utc"], "DECLARED_CELL_WINDOW_INVALID")
+        end = _timestamp(measurement["end_exclusive_utc"], "DECLARED_CELL_WINDOW_INVALID")
+        _, closes = _frame_interval(frame)
+        if frame.empty or closes[-1] != end or bool((closes > end).any()):
+            _fail("DECLARED_CELL_TERMINAL_BOUNDARY_UNAVAILABLE")
+        opens, _ = _frame_interval(frame)
+        warmup = int(opens.searchsorted(start, side="left"))
+        if not 1 <= warmup < len(frame):
+            _fail("DECLARED_CELL_SCORING_WINDOW_EMPTY")
+        selection_inputs = {}
+        for source in slot_sources:
+            selection = owner.acquire(source["request_view_id"],
+                consumer=job_view.SlotViewBinding(source["request_sha256"], source["slot_id"]),
+                result_key=source["slot_id"])
+            leases.append(selection)
+            selected_calibration = owner.acquire(source["calibration_view_id"],
+                consumer=job_view.CalibrationViewBinding(cost_edition.sha256), result_key=owner.binding.terminal_result_key)
+            leases.append(selected_calibration)
+            if (_canonical_bytes(producer._declared_m5_view_observation(owner.view(selection)))
+                    != _canonical_bytes(source["request_observation"])
+                    or _canonical_bytes(producer._declared_m5_view_observation(owner.view(selected_calibration)))
+                    != _canonical_bytes(source["calibration_observation"])):
+                _fail("DECLARED_M5_ACCOUNT_SLOT_VIEW_CHANGED")
+            selected_costs = cost_edition.bind_view(owner, context=context, calibration_lease=selected_calibration,
+                request_lease=selection, point=spec.point)
+            selection_inputs[source["slot_id"]] = (source, selection, selected_costs)
+        owners, tier_views = [], []
+        for record in inputs["owner_records"]:
+            saved_owner = record["owner"]
+            source, selection, selected_costs = selection_inputs[saved_owner["slot_id"]]
+            selected_product = owner.product_at(saved_owner["selection_cutoff_utc"])
+            tier = selected_costs.from_descriptor(saved_owner["selected_tier_contract"]["frozen_spread_tier"],
+                symbol=cell["symbol"], timeframe=cell["timeframe"], point=spec.point,
+                source_identity_sha256=selected_product.native_prefix["source_identity_sha256"])
+            if tier.tier != saved_owner["selected_tier"]:
+                _fail("DECLARED_CELL_OWNER_TIER_BINDING_MISMATCH")
+            selection_frame, selection_window = search_execution.m5_view_price_frame(context=context, owner=owner, lease=selection)
+            if _canonical_bytes(tier.descriptor().get("m5_execution_view_binding")) != _canonical_bytes(selection_window):
+                _fail("DECLARED_M5_SELECTED_TIER_WINDOW_CHANGED")
+            specialist = _declared_cell_specialist(record, cell)
+            _selection_prefix_match(frame, specialist)
+            own_features, own_signals = _features_and_prefix_parity(frame, [specialist])
+            owners.append(ContinuousEntryOwner(saved_owner["owner_id"], _strategy(specialist),
+                own_features, own_signals[cell["cell_id"]], tier))
+            tier_views.append({"owner_id": saved_owner["owner_id"], "slot_id": source["slot_id"],
+                "selection_view_window": selection_window,
+                "frozen_spread_tier": dict(saved_owner["selected_tier_contract"]["frozen_spread_tier"])})
+        features = owners[0].features if owners else frame
+        feature_bytes = sum(int(value.features.memory_usage(index=True, deep=True).sum()) for value in owners)
+        if max(feature_bytes, int(features.memory_usage(index=True, deep=True).sum())) > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
+            _fail("FORWARD_ACTIVE_SYMBOL_FEATURE_MEMORY_BOUND_EXCEEDED")
+        fine_frame = native_prefix.open_verified_prefix_frame(product)
+        observations, matched = spread_profile.align_prior_completed_spreads(features.index, fine_frame,
+            account_tiers["P75"].source_timeframe, include_matched_closes=True)
+        schedule = ContinuousEntrySchedule(tuple(owners), tuple(ContinuousEntrySlot(
+            row["slot_id"], _timestamp(row["start_utc"], "DECLARED_CELL_SLOT_TIME_INVALID"),
+            _timestamp(row["end_exclusive_utc"], "DECLARED_CELL_SLOT_TIME_INVALID"), row["owner_id"])
+            for row in inputs["slot_schedule"]))
+        return {"frame": features, "owners": tuple(owners), "schedule": schedule,
+            "observations": observations, "matched": matched, "warmup": warmup, "spec": spec,
+            "execution_identity": execution_identity, "spread_identity": _native_product_identity(product, expected_symbol=cell["symbol"], expected_timeframe="M5",
+                expected_cutoff_utc=measurement["end_exclusive_utc"], role="DECLARED_M5_ACCOUNT_FINE"),
+            "spec_receipt": spec_receipt, "deployment": deployment, "leases": leases,
+            "source_context": _declared_m5_account_source_context(owner, cost_edition,
+                account_view_id=account_view_id, calibration_view_id=calibration_id),
+            "account_bindings": bindings, "window": window, "selected_tier_views": tier_views,
+            "terminal_consumers": list(owner.consumer_bindings_for(owner.binding.terminal_result_key))}
+    except BaseException:
+        _release_declared_m5_account_leases(leases)
+        raise
+
+
+def _declared_m5_account_observations(material, *, config, measured):
+    return {"execution_source": material["execution_identity"], "spread_source": material["spread_identity"],
+        "execution_spec_receipt": material["spec_receipt"],
+        "spread_source_execution_spec_receipt": material["spec_receipt"],
+        "frozen_profile_descriptor": None,
+        "m5_source_context": material["source_context"],
+        "m5_account_consumer_bindings": material["account_bindings"],
+        "m5_account_view_window": material["window"], "m5_selected_tier_views": material["selected_tier_views"],
+        "terminal_consumer_binding_sha256": material["terminal_consumers"],
+        "original_config_identity": _pipeline_config_identity(config),
+        "measured_config_identity": _pipeline_config_identity(measured)}
+
+
+def produce_declared_m5_development_cell_account_artifact(context, *, precommit, process,
+        frozen_pipeline_config, m5_owner=None, account_view_id=None, cost_edition=None):
+    """Produce one explicit partial development account using the original account engine."""
+    inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config)
+    body = _declared_development_cell_body(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    existing = _discover_declared_development_cell_account_output(context, expected=body,
+        process=process, frozen_pipeline_config=frozen_pipeline_config)
+    if existing is not None:
+        return existing
+    if inputs["progress_status"] == "DEVELOPMENT_COMPLETE":
+        material = _declared_m5_account_frame_inputs(context, precommit=precommit, process=process,
+            inputs=inputs, owner=m5_owner, account_view_id=account_view_id, cost_edition=cost_edition)
+        try:
+            config, cell = inputs["config"], body["cell"]
+            measured = _declared_cell_measured_config(config)
+            body.update(_declared_m5_account_observations(material, config=config, measured=measured))
+            body["deployment_source_descriptors"] = _persist_deployment_sources(context, material["deployment"])
+            result = _raw_json(_run_declared_cell_account(config=measured, features=material["frame"],
+                symbol=cell["symbol"], timeframe=cell["timeframe"], spec=material["spec"],
+                warmup_bars=material["warmup"], entry_schedule=material["schedule"],
+                entry_spread_observations=material["observations"]))
+            account = _declared_account_payload(result=result, frame=material["frame"], owner_inputs=material["owners"],
+                spec=material["spec"], config=measured, observations=material["observations"],
+                matched_closes=material["matched"], timeframe=cell["timeframe"], warmup_bars=material["warmup"])
+            _reconcile_declared_cell_account(account, frame=material["frame"], owner_inputs=material["owners"],
+                spec=material["spec"], config=measured, observations=material["observations"],
+                matched_closes=material["matched"], timeframe=cell["timeframe"], schedule=material["schedule"])
+            body["account"] = account
+            _assert_deployment_config_unchanged(material["deployment"], config, declared_research_account=True)
+        finally:
+            _release_declared_m5_account_leases(material["leases"])
+    _canonical_bytes(body, _DECLARED_CELL_MAX_RAW_BYTES)
+    sink = authority_spool.open_symbol_sink(context, _declared_development_cell_transport_symbol(body),
+        manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
+    entry = sink.put_json("declared-cell-account", "declared_cell_raw_account", body)
+    sink.seal()
+    return causal_producer.DeclaredCellRawAccountArtifact(dict(entry["descriptor"]))
+
+
+def verify_declared_m5_development_cell_account_transport(context, body, *, process,
+        frozen_pipeline_config, m5_owner=None, cost_edition=None):
+    """Reopen actual source and reconcile stored arithmetic; never rerun the account engine."""
+    if (type(body) is not dict or set(body) != _DECLARED_DEVELOPMENT_CELL_FIELDS
+            or body.get("schema_version") != DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA
+            or body.get("source_kind") != "m5_derived" or body.get("result_kind") != "DEVELOPMENT_PARTIAL"
+            or body.get("design_contaminated") is not True or body.get("pristine_validation") is not False
+            or any(body.get(key) is not False for key in
+                   ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_FIELDS_INVALID")
+    precommit = historical.reopen_declared_slot_owner_run_precommit(context,
+        receipt_sha256=body["declared_precommit_sha256"], process=process, frozen_pipeline_config=frozen_pipeline_config)
+    inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config)
+    expected = _declared_development_cell_body(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    for name in _DECLARED_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
+        if _canonical_bytes(body[name]) != _canonical_bytes(expected[name]):
+            _fail("DECLARED_CELL_TRANSPORT_BINDING_MISMATCH", name)
+    if inputs["progress_status"] != "DEVELOPMENT_COMPLETE":
+        if body["account"] is not None or any(body[name] is not None for name in _DECLARED_DEVELOPMENT_MARKET_FIELDS):
+            _fail("DECLARED_CELL_INCOMPLETE_ACCOUNT_FORBIDDEN")
+        return body
+    if (type(body["account"]) is not dict or body["frozen_profile_descriptor"] is not None
+            or type(body["m5_source_context"]) is not dict):
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_REQUIRED")
+    own_source = m5_owner is None
+    if own_source:
+        if cost_edition is not None:
+            _fail("DECLARED_M5_ACCOUNT_SOURCE_REQUIRED")
+        m5_owner, cost_edition = _reopen_declared_m5_account_source(context, precommit=precommit, process=process,
+            source_context=body["m5_source_context"], inputs=inputs)
+    material = None
+    try:
+        material = _declared_m5_account_frame_inputs(context, precommit=precommit, process=process,
+            inputs=inputs, owner=m5_owner, account_view_id=body["m5_source_context"]["account_view_id"],
+            cost_edition=cost_edition)
+        config = inputs["config"]; measured = _declared_cell_measured_config(config)
+        observations = _declared_m5_account_observations(material, config=config, measured=measured)
+        for name, value in observations.items():
+            if _canonical_bytes(body[name]) != _canonical_bytes(value):
+                _fail("DECLARED_M5_ACCOUNT_OBSERVATIONS_CHANGED", name)
+        deployment = material["deployment"]
+        sources = body["deployment_source_descriptors"]
+        if type(sources) is not dict or set(sources) != {"config", "broker"}:
+            _fail("DECLARED_CELL_DEPLOYMENT_SOURCES_INVALID")
+        for role, digest, size in (("config", deployment.config_sha256, deployment.config_size_bytes),
+                                  ("broker", deployment.broker_sha256, deployment.broker_size_bytes)):
+            descriptor = _descriptor(sources[role], "DECLARED_CELL_DEPLOYMENT_DESCRIPTOR_INVALID")
+            observed, actual_size, _ = authority_spool._stream_file(context.root, descriptor["relative_path"],
+                maximum_bytes=size, expected_size=size, collect=False)
+            if (descriptor["format"] != "json-"+role or descriptor["sha256"] != digest
+                    or descriptor["size_bytes"] != size or observed != digest or actual_size != size):
+                _fail("DECLARED_CELL_DEPLOYMENT_SOURCES_CHANGED")
+        if body["account"]["warmup_bars"] != material["warmup"]:
+            _fail("DECLARED_CELL_ACCOUNT_WARMUP_INVALID")
+        _reconcile_declared_cell_account(body["account"], frame=material["frame"], owner_inputs=material["owners"],
+            spec=material["spec"], config=measured, observations=material["observations"],
+            matched_closes=material["matched"], timeframe=body["cell"]["timeframe"], schedule=material["schedule"])
+        _assert_deployment_config_unchanged(deployment, config, declared_research_account=True)
+        return body
+    finally:
+        try:
+            if material is not None:
+                _release_declared_m5_account_leases(material["leases"])
+        finally:
+            if own_source:
+                m5_owner.close()
+
+
+__all__ += ["DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA",
+    "declared_m5_development_cell_account_request", "produce_declared_m5_development_cell_account_artifact",
+    "discover_declared_m5_development_cell_account_artifact", "verify_declared_m5_development_cell_account_transport"]
