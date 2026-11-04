@@ -1,0 +1,29 @@
+{
+  "schema_version": "fxpm.claude-source-review.v1",
+  "reviewer": "claude-pm (third seat)",
+  "recorded_at_utc": "2026-11-03T22:50:00Z",
+  "request": "E-00004616",
+  "finding_reviewed": "E-00004615",
+  "scope": "Narrow route split in reopen_declared_slot_owner_run_precommit: the native spread-profile file compare is skipped for m5_derived precommits, whose profile is the recorded derived edition bound in the pins. Source only; no tests run, no imports beyond py_compile of the postimage, no edits.",
+  "verdict": "ACCEPT_FOR_QA_WITH_ONE_CONCRETE_REWORK",
+  "pins_verified": {
+    "postimage": {"path": "m5_consumer_candidate_001/consumer_integration/reopen005/pm_historical_anchor_orchestration.py", "bytes": 185651, "sha256": "6d5d82526b7570fdcd8a2734756283f6e13f1d5c78ee0302e99351d690458e4d", "compiles": true},
+    "base_closure004": {"sha256_prefix": "7a776f03", "found_at": ["m5_public_metadata_source_001/pm_historical_anchor_orchestration.py", "m5_consumer_candidate_001/consumer_integration/closure004/pm_historical_anchor_orchestration.py"]},
+    "patch": {"path": "m5_consumer_candidate_001/consumer_integration/reopen005/m5_recorded_profile_reopen005.patch", "bytes": 1198, "sha256": "22df85b67c7d178ea6e17fc0ca122c6825ae4621af69877036e0f784eca315b7"},
+    "original_review_pin": {"sha256_prefix": "cc3020db", "found_at": ["m5_coherent_source_002/consumer_integration/pm_historical_anchor_orchestration.py", "m5_coherent_unit_qa_001/source/pm_historical_anchor_orchestration.py", "m5_consumer_candidate_001/consumer_integration/pm_historical_anchor_orchestration.py"]}
+  },
+  "checks": [
+    "The patch moves the three native-profile statements under `if body.get(\"source_kind\") != \"m5_derived\":` and changes nothing else (4 added lines, 3 removed, one comment).",
+    "Order inside reopen_declared_slot_owner_run_precommit (postimage 4061 to 4089): stream and canonical-recheck the stored precommit, _validate_declared_precommit_body(context, body), config binding checks, then the profile block, then seal, register and verify_declared_slot_owner_run_precommit. So the validator runs before the skipped block.",
+    "_validate_declared_precommit_body for m5_derived: _validate_declared_m5_source_pins(pins, cell) must equal m5_view_contract_sha256, then _validate_declared_m5_profile_binding(pins, spread_profile_identity) requires spread_profile_identity == {profile_sha256} and profile_sha256 == pins.cost_edition_identity.profile_sha256. declared_slot_source_kind(body) runs inside it and refuses a legacy schema carrying source_kind and the clock kind (DECLARED_SLOT_M5_CONTROL_CLOCK_UNAVAILABLE), so by the time the raw source_kind key is tested it is absent or exactly m5_derived.",
+    "C6 consumption-time authentication exists in pm_m5_derived_costs.py: open_recorded_derived_costs(pins) checks the recorded profile digest against pins.profile_sha256 (COST_PROFILE_IDENTITY_MISMATCH, line 116), the policy (COST_PROFILE_POLICY_MISMATCH, 125) and the activation profile descriptor (150).",
+    "The native branch statements are byte-identical to closure004 inside the new guard.",
+    "The removed compare was not merely unreachable on the invented fixture: on real M5 the native file (b6) never equals the recorded derived edition (9fe), so every M5 cold reopen would have failed DECLARED_SLOT_PROFILE_BINDING_MISMATCH. The M5 cold reopen was a never-run positive path until the public metadata QA reached it, which is the class E4580 F1 asked the first integration QA nodes to cover.",
+    "closure004 differs from the Original review pin cc3020db only by adding pm_authority_spool.py and pm_authority_spool_quota.py to _DECLARED_M5_CONSTRUCTORS; _declared_m5_constructor_identity resolves each name with Path(__file__).with_name, so the flat-installation condition before any issuer stands."
+  ],
+  "findings": [
+    {"id": "F1", "severity": "concrete_rework_same_class_second_site", "text": "issue_declared_slot_source_access_renewal (postimage 3372) keeps the identical unconditional native profile load compared against parent[\"spread_profile_identity\"]. Its parent comes from _declared_renewal_parent, which reopens and verifies the precommit, so the same two-line guard applies. Without it any M5 source-access renewal fails with the misleading profile-mismatch code. Not blocking for a development run that finishes inside its access window; blocking before any M5 run that can outlive it."},
+    {"id": "F2", "severity": "style_non_blocking", "text": "declared_slot_source_kind(body) in place of body.get(\"source_kind\") would state the dependency the comment relies on; equivalent today because the validator ran first."}
+  ],
+  "not_claimed": ["No test was run; the QA record and the failed positive are Root's.", "No statement about the rest of the twelve-file batch, which the Original session reviews under E4601.", "No financial, case or batch acceptance."]
+}

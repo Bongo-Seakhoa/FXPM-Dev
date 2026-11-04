@@ -1,0 +1,55 @@
+{
+  "schema_version": "fxpm.claude-gap-classification.v1",
+  "recorded_at_utc": "2026-11-03T21:35:00Z",
+  "answers": "E-00004583",
+  "author": "claude-pm",
+  "method": "Read-only pass over the published native M5 file. Expected grid of 5-minute slots over the note's available interval; a slot-of-week position missing in at least 95 percent of the weeks it occurs in is a fixed closure; a weekday with every open slot missing is a full-day closure; the remainder is grouped into contiguous runs. Scripts: classify_xagusd_gaps.py and break_hours.py beside this record.",
+  "input": {
+    "path": "data/native/runs/production_native_v5r2_20260714/XAGUSD/M5/bars.csv",
+    "bytes": 106951312,
+    "rows_in_file": 716348,
+    "file_first_bar_utc": "2016-05-12T07:50:00+00:00",
+    "file_last_bar_utc": "2026-07-14T08:00:00+00:00",
+    "interval_start_utc": "2016-05-12T08:00:00+00:00",
+    "interval_end_exclusive_utc": "2024-07-14T08:00:00+00:00",
+    "note_reviewed": "m5_consumer_candidate_001/worker/prospective_xagusd_h1_input_note_001.json"
+  },
+  "counts": {
+    "expected_slots": 859680,
+    "present_bars": 575853,
+    "missing_slots": 283827,
+    "note_reported_missing": 283442,
+    "fixed_weekly_closure_positions": 580,
+    "fixed_closure_description": "Sat 00:00 to Mon 00:00 UTC (576 slots) plus the 23:55 slot on Mon, Tue, Wed and Thu",
+    "missing_at_fixed_closure_positions": 247462,
+    "full_day_closures_days": 21,
+    "full_day_closure_slots": 6038,
+    "full_day_closure_dates": ["2017-04-14", "2017-12-25", "2018-01-01", "2018-03-30", "2018-12-25", "2019-01-01", "2019-04-19", "2019-12-25", "2020-01-01", "2020-04-10", "2020-12-25", "2021-01-01", "2021-04-02", "2021-12-24", "2022-04-15", "2022-12-26", "2023-01-02", "2023-04-07", "2023-12-25", "2024-01-01", "2024-03-29"],
+    "residual_slots": 30327,
+    "residual_runs": 2889,
+    "residual_runs_by_length": {"1_slot": 587, "2_to_6": 56, "7_to_12": 2009, "13_to_288": 237, "over_288": 0},
+    "weekday_runs_7_to_13_slots": 1934,
+    "weekday_run_start_times_utc": {"23:55": 1396, "00:00": 385, "22:55": 143, "other": 10},
+    "weekday_run_start_mode_by_month": "23:55 every month except March, 22:55 in March",
+    "weekday_run_lengths": {"12": 365, "13": 1565, "7_to_10": 4},
+    "longest_residual_runs": ["2017-01-02 05:20 to 23:55 UTC (223 slots)", "2016-12-26 00:00 to 10:05 UTC (121)", "2016-12-26 14:40 to 23:15 UTC (103)", "2016-05-30 19:00 to 23:55 UTC (59)", "2018-07-03 and 2018-07-04 19:50 to 23:55 UTC (49 each)", "late-May Mondays 2021, 2022, 2023 19:50 to 23:55 UTC (49 each)"],
+    "residual_slots_by_year": {"2016": 2806, "2017": 3826, "2018": 3721, "2019": 3621, "2020": 3529, "2021": 3478, "2022": 3473, "2023": 3497, "2024": 2376},
+    "h1_targets_with_any_m5_bar": 48235,
+    "h1_targets_missing_exact_prior_m5_close": 2148,
+    "note_reported_missing_exact_prior": 2147,
+    "of_which_at_fixed_closure_position": 151,
+    "of_which_after_the_daily_break": 1997
+  },
+  "reading": [
+    "The missing slots are calendar closures: weekend, a daily break of 60 to 65 minutes beginning at the 23:55 UTC slot (22:55 in March, the daylight-saving month), 21 full-day holidays, and holiday early closes.",
+    "587 single-slot gaps over eight years, about 72 a year, are the only candidates for genuine no-tick intervals; none is a multi-hour data hole.",
+    "The 2,148 hourly targets without an exact-prior M5 close are the first hour after the daily break; the prior slot was closed, not missing.",
+    "The small differences from the note's figures (283,442 and 2,147) come from the interval edge and are immaterial."
+  ],
+  "ruling_basis": "Operator ladder E4568: source first, then weakened treatment, then escalation. The source rung is satisfied for this cell by the data itself; nothing is missing that a broker pull could supply. The weakened label still applies because the period is design-contaminated development, not pristine validation.",
+  "limitations": [
+    "This classifies gaps in the M5 slot grid; it does not inspect prices, spreads or the derived view.",
+    "The 95 percent rule is a description of this file; the worker's calendar rule should be explicit per symbol class.",
+    "No run, context, precommit or profile was created or changed."
+  ]
+}

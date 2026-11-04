@@ -1,0 +1,61 @@
+{
+  "schema_version": "fxpm.claude-source-review.v1",
+  "reviewer": "claude-pm",
+  "recorded_at_utc": "2026-11-03T21:05:00Z",
+  "request": "E-00004574",
+  "authority_refs": ["E-00004571", "E-00004564"],
+  "scope": "Exact source review of the two-file development-scope delta: consumer_integration/pm_historical_anchor_orchestration.py and consumer_integration/tests/test_m5_declared_source_schemas.py, read from development_scope_source_001.patch against the manifest preimages. Policy and metadata only; no issuance, no runtime grant.",
+  "verdict": "ACCEPT",
+  "pins_verified": {
+    "orchestration_postimage": {"bytes": 185342, "sha256": "52e0cf1f3dec84ef33769db747cfbaa3da818a5eb818c3366a4c570b91e80f87", "matches_manifest": true},
+    "orchestration_preimage": {"bytes": 177237, "sha256_prefix": "8ff11226b7bedef3", "matches_manifest": true},
+    "schema_tests_postimage": {"bytes": 14539, "sha256": "ba19ef6f25ae4cea961a5f510b5f32460c85b9f90891a951ab70e8f25f436ddd", "matches_manifest": true},
+    "schema_tests_preimage": {"bytes": 7052, "sha256_prefix": "bc8f2fc1858f3077", "matches_manifest": true},
+    "patch": {"bytes": 45880, "sha256_prefix": "5fdf926d998a9a31", "matches_manifest": true},
+    "producer_postimage": {"bytes_now": 165135, "sha256_prefix_now": "6a1fcd7c5740086d", "manifest_bytes": 153148, "manifest_sha256_prefix": "b67f78e1653c6d94", "matches_manifest": false, "note": "outside the two-file scope; see F4"}
+  },
+  "checks": [
+    "Patch hunks for the two files read in full; the producer hunks read for context only.",
+    "Pure-AST call-binding check over 15 added or changed symbols: 155 call sites in the orchestration postimage, the schema-test postimage and the producer working copy; no positional overflow, unknown keyword, missing required argument or duplicate binding.",
+    "Load-before-store scan of _precommit_declared_slot_owner_run for roster, cell, source_kind, development_scope and m5_digest: none; roster is derived at line 3703 and cell at 3713 before the development block at 3738.",
+    "_hex(value, code) is the module's two-argument form (line 392); the development hash check binds.",
+    "declared_slot_source_kind under the two development schemas: m5_derived returns, m5_derived_control_clock.v1 fails DECLARED_SLOT_M5_CONTROL_CLOCK_UNAVAILABLE, anything else fails; the clock kind cannot enter a development precommit.",
+    "DECLARED_DEVELOPMENT_SYMBOLS equals the ten-symbol development set in docs/FXPM_PROTOTYPE_LANDING_PLAN_20261103.md (EURUSD, GBPAUD, USDJPY, USDZAR, USDNOK, XAUUSD, XAGUSD, BTCUSD, US500, APPLE) and every name exists under data/native/runs/production_native_v5r2_20260714.",
+    "Legacy schemas cannot carry development_scope or development_scope_sha256 (declared_slot_development_scope refuses before the schema branch); a development request on a legacy parent fails the request-schema cross-check; a legacy request on a development parent fails the field-set and binding checks.",
+    "_declared_development_scope_body refuses empty, foreign, duplicate, over-length, gapped and non-prefix selections and any roster that is not the accepted 13; the decoded scope is a detached copy and the parent prefix is rechecked on every selection.",
+    "_declared_roster is a verify-and-return through pm_production_anchor_plan.verify_declared_owner_slot_roster, and the builder binds slot_roster_sha256 over that derived roster, so the hash recheck in declared_slot_selected_slots is the same digest the precommit carries; the fixture test proves idempotence on an anchor-derived roster.",
+    "Eight new methods and 24 subtests passed in m5_development_scope_unit_qa_001 (exit 0, pins unchanged); the names match the patch."
+  ],
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "qa_gap_before_issuance",
+      "text": "Never-run positive paths: precommit_declared_development_m5_slot_owner_run into _precommit_declared_slot_owner_run with development_slot_ids, _validate_declared_precommit_body on a development-schema body, and the request-side binding in declared_slot_producer_request and verify_declared_slot_producer_request with a development parent. The eight methods validate hand-built parents through declared_slot_selected_slots and the schema selectors only. Name these as the first nodes of the integration QA once a context exists; no source change asked."
+    },
+    {
+      "id": "F2",
+      "severity": "cheap_to_close_now",
+      "text": "declared_slot_selected_slots now sits on the legacy request path at two sites (slot lookup in declared_slot_producer_request and verify_declared_slot_producer_request) and repeats the roster verification and hash that _validate_declared_precommit_body already ran. Semantics are equal for verified bodies, but the prior nine schema methods were not rerun and no test in this batch sends a legacy body through the new helper. Rerun the nine with the batch QA; the file runs in about half a second."
+    },
+    {
+      "id": "F3",
+      "severity": "efficiency_non_blocking",
+      "text": "The scope is re-decoded and re-hashed at every declared_slot_source_kind call and the roster re-verified at every declared_slot_selected_slots call: about three per verification and once per slot in the producer loop. Milliseconds, but against the hash-once rule recorded in docs/FXPM_EFFICIENCY_AUDIT_20261103.md section 11; a later edition should carry the decoded scope and the selected tuple from the verified parent."
+    },
+    {
+      "id": "F4",
+      "severity": "manifest_drift_outside_scope",
+      "text": "The manifest pins producer/pm_historical_search_producer.py at 153,148 bytes b67f78e1; the folder now holds 165,135 bytes 6a1fcd7c after later Source006 work. The four-target manifest no longer describes the folder. Re-pin the batch before any landing manifest; the two files under this review are unchanged."
+    }
+  ],
+  "not_claimed": [
+    "No test was run by this review; the QA outcome is Root's.",
+    "No statement about the producer, adapter, planner or execution copies beyond the pin drift in F4.",
+    "No issuance, context, run, data, model, account or financial claim."
+  ],
+  "artifacts": {
+    "scratch_copies": "session scratchpad ref4574 (preimage and postimage copies, split patch, ast_binding_check.py)",
+    "manifest": "m5_consumer_candidate_001/producer/development_scope_source_001.manifest.json",
+    "qa_outcome": "m5_development_scope_unit_qa_001/outcome.json"
+  }
+}

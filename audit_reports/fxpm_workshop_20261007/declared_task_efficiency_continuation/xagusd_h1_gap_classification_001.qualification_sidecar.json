@@ -1,0 +1,31 @@
+{
+ "schema_version": "fxpm.claude-gap-record-qualification-sidecar.v1",
+ "recorded_at_utc": "2026-11-04T10:24:41Z",
+ "qualifies": {
+  "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/xagusd_h1_gap_classification_001.json",
+  "bytes": 4263,
+  "sha256": "24daacb73b79e598719bd7c90f06b72577d2ecd3984f5d953f65d984a33086c3"
+ },
+ "scripts": [
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/xagusd_h1_gap_classification_001.classify_xagusd_gaps.py",
+   "bytes": 5181,
+   "sha256": "29873cf75248f41a8d1317a0335473c58b6477d615c021e4aa8ce02329d1a59d"
+  },
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/xagusd_h1_gap_classification_001.break_hours.py",
+   "bytes": 1968,
+   "sha256": "b6a86d130687d286f621d2b4e9fd795129a3e60cd2569b3709b04aa0c2168688"
+  }
+ ],
+ "status": "ARCHIVED_UNADOPTED_HEURISTIC_OBSERVATIONS",
+ "council_state": "E4594 adopted by Root, E4595 refinement accepted at E4600: the XAGUSD M5 gaps remain UNCLASSIFIED in the worker's record, with the observed pattern classes carried beside that status as observations only. No calendar, holiday, daylight-saving, no-tick, eligibility or no-source-pull rule was adopted. The one-time broker history verification for the 587 single slots and 237 longer runs is a future W1.3 item when an authorized non-interactive route exists; it has not run.",
+ "what_the_record_overstates": [
+  "/method and /reading 0 to 3 present slot-of-week regularity, full-day absence and run shapes as closures, holidays and a daily break; they are observed absence patterns in one file and prove nothing about market state or broker history.",
+  "/ruling_basis says the source rung is satisfied by the data itself; that wording was withdrawn at E4595, since a file cannot show what a broker pull would or would not supply.",
+  "The two scripts read the native M5 CSV at module top level and apply a 95 percent slot-of-week heuristic; they are archived as the computation behind the counts, carry no execution grant, and are not part of any pipeline, test or QA."
+ ],
+ "what_stands": "The counts themselves (859,680 slots, 575,853 present, 283,827 missing, 2,148 hourly targets without an exact-prior M5 close) as a read of that file on 2026-11-03; the record is kept byte for byte as recorded.",
+ "effect_on_documents": "The landing plan's data-gap note and the readiness audit's gap passages are reworded to this state in the same landing; the record and scripts are unchanged.",
+ "authority": "None. This sidecar changes no product, numerical policy, admission or eligibility rule."
+}

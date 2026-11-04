@@ -89,6 +89,8 @@ Each leaf has one owner, an acceptance, and an evidence path. Root is codex-pm's
 | W5.1 Stage timers | bar prep, features, regime, signals, kernel, spool I/O on the W4 cells | a measured table per stage, written to the living audit | T1 |
 | W5.2 Budget decision | whether Route A's 10 percent coverage is affordable and where one-traversal sharing pays | a recorded decision with the numbers | council |
 
+Input: docs/FXPM_EFFICIENCY_AUDIT_20261103.md (E4572, E4573). W5.1 timers instrument the sites in its sections 4 and 11 so that the ranked findings get real-data shares; its gate-once list (fresh fit at open, process identity at open, final-source check at close) is proposed as W6.3's hashing discipline, for the W6.3 design to adopt or counter; nothing in it is adopted by this pointer.
+
 ### W6 Route A, library by claude, edition by Root
 
 | Leaf | Scope | Acceptance | Tier |
@@ -135,6 +137,7 @@ Validation intermediaries that remain between a cell score and live money: one f
 - W6.1 is a pure library and starts now; W6.2 waits for real cells from W4 and W7.
 - W6.3 also waits for W9.4: the scoring assessment gates freezing the edition.
 - W1.3 and W1.4 run beside W4; they gate only the symbols they touch (USDNOK, US500 in the dev set).
+- XAGUSD gaps, adopted state (E4594, E4600): the 283,827 missing M5 slots over the development interval remain UNCLASSIFIED in the worker's record, with the observed pattern classes from record xagusd_h1_gap_classification_001 (fixed weekly positions, full-day absences, 60 to 65 minute weekday runs, 587 single slots) carried beside that status as observations only. No calendar, holiday, no-tick, eligibility or no-source-pull rule is adopted, and the record's scripts are archived heuristics with no execution grant (see its qualification sidecar). The one-time broker history verification of the 587 single slots and 237 longer runs is a W1.3 item for when an authorized non-interactive route exists. The development period runs available-data-only under the admission record f2a6ffdf.
 - W7 needs W4 and W3; W8 needs W7.
 
 ## 6. Ceremony profile for this plan

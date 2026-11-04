@@ -1,0 +1,36 @@
+{
+  "schema_version": "fxpm.claude-source-review.v1",
+  "reviewer": "claude-pm (third seat)",
+  "recorded_at_utc": "2026-11-04T01:20:00Z",
+  "request": "E-00004651",
+  "handoff": "m5_consumer_candidate_001/landing_tests_001/test_landing_review_handoff_001.json",
+  "scope": "Static review of the 26 permanent test adapters and 2 fixtures applied under tests/, and of the canonical software QA outcome. No test run, no import of any product or test module; AST parsing and byte comparison only. The 15 products are outside this review (Original seat, E4646).",
+  "verdict": "ACCEPT_BOUNDED_TEST_SOURCE_AND_SOFTWARE_QA",
+  "method": "scratchpad ref4651/review_landing_tests.py: for each file verify the working-tree bytes against the handoff pin and the landing copy; parse imports and path tokens; count named test methods, parametrize decorators, subTest sites, env opt-ins and skip calls; map every exception.code read to its assertRaises class; find the component original by file name under the candidate tree and compare every function and class method by AST dump; for the one MODIFY compare against HEAD. ref4651/diff_methods.py printed the source diff of every changed method.",
+  "results": {
+    "pins": "28 of 28 working-tree files equal the handoff sha256 and byte count and are byte-identical to the landing_tests_001 copies.",
+    "named_test_methods": 237,
+    "parametrize_decorators": 9,
+    "subtest_sites": 75,
+    "junit_reported": "602 entries = 251 parametrized cases + 351 subtests, 0 failures, 0 errors, 0 skipped, stderr 0, 65 pm modules all from the repository (m5_canonical_integration_qa_001)",
+    "count_reading": "237 named methods is the inventory; 251 cases is consistent with the nine parametrize decorators, all in tests/test_declared_symbol_scheduler.py; 351 subtests is consistent with 75 subTest sites. JUnit 602 is the sum.",
+    "import_origins": "Every adapter root is Path(__file__).resolve().parents[1], the repository root from tests/, and each file guards the imported module's __file__ against that root (RuntimeError otherwise). The names _CANDIDATE, _CANDIDATE_ROOT and CANDIDATE_ROOT and the messages 'requires the candidate ... source' are legacy wording over repository paths. tests/test_m5_public_development_precommit.py takes its source root from FXPM_M5_PUBLIC_SOURCE_ROOT with a skipTest when unset and accepts module origins only from that root or the repository. No audit_reports path appears in any applied test.",
+    "test_method_ast_exceptions": [
+      "tests/test_declared_development_completion.py test_adapter_rejects_mixed_live_context_and_partial_provided_owner_pair: path literal adapter/pm_historical_production_adapter.py became pm_historical_production_adapter.py (the disclosed producer path exception).",
+      "tests/test_m5_derived_costs.py test_actual_financial_consumer_type_guard_includes_no_trade_without_mock_verification: the job_view sys.path insert is removed and the origin assertion points at the repository pm_m5_job_view.py (the disclosed C6 import/path exception).",
+      "tests/test_m5_completion_readonly.py test_headerless_shape_rejects_frozen_owner_raw_and_wrong_terminal_labels: caught.exception.code became str(caught.exception), the E4634/E4635 correction; test_actual_dispatch_expressions_select_m5_only_for_declared_m5_kind is identical to the corrected selector copy b5691808.",
+      "tests/test_declared_symbol_scheduler.py (MODIFY against HEAD 906fbb6e): test_disk_threshold_never_waives_verified_context_reserve_and_headroom uses DECLARED_CELL_MIN_FREE_BYTES + 1 GiB instead of a 2 GiB literal; two parametrized floor tests added (five cases at 5 GiB - 1, 5 GiB, 5 GiB + 1); 23 old methods retained, none removed."
+    ],
+    "setup_and_helper_adapters": "Path-only: _helpers, _cell_source_helpers, _cell_source_fixture (producer and job_view paths to the root), _forward_helpers (forward path to the root), setUpClass in the envelope-entry and path-state tests (the env-gated repair root replaced by the repository root, message reworded), declaration (admission fixture path under tests/fixtures with the env override kept), _original_recipes (reads the compact fixture file). No assertion or oracle changed in any of them.",
+    "legacy_schema_bodies": "tests/test_m5_declared_source_schemas.py is byte-identical to the development-scope postimage ba19ef6f reviewed at E4580; 17 methods, the nine legacy methods unchanged by that delta's manifest.",
+    "bare_error_attribute_reads": "No exception.code read against HistoricalProductionAdapterError or HistoricalAnchorOrchestrationError. The two reads in tests/test_completed_generation_retirement.py are on AuthoritySpoolQuotaError, which sets the attribute.",
+    "env_opt_ins": "FXPM_DERIVED_QA_ROOT (retirement, development scheduler), FXPM_RESEARCH_ADMISSION_RECORD (development scheduler, optional override), FXPM_M5_PUBLIC_SOURCE_ROOT (public precommit); each gated by skipTest when absent. The canonical run reports zero skips, so all were supplied.",
+    "fixtures": "tests/fixtures/m5_development/available_data_research_admission_001.json is the adopted admission record f2a6ffdf byte for byte. tests/fixtures/m5_original_metadata_recipes.source.txt is a 4,998-byte SOURCE_EXCERPTS_ONLY oracle: exact statement excerpts of three execution helpers with the source hashes they were cut from (adapter repair005 971d7be5 and repair007 8344744f); tests/test_m5_unobserved_current_view.py and tests/test_m5_state_error_envelope.py compare it against the live repository execution module, so it is an oracle, not an import."
+  },
+  "findings": [
+    {"id": "F1", "severity": "non_blocking_for_tests_material_before_the_walk", "text": "From E4646: a terminal STOP cell writes no end-grid row and keeps its workspace. Under the lifecycle a typed STOP is a RESULT, and pm_end_grid has the honest STOP shape for it (cost tier NONE, no receipt, source identity as known). Without the row the grid is silent on the cell for that cycle and Core005 cannot retire the workspace, because its fence requires a grid row readback. The worker should append the STOP row before leaving the workspace; this is a worker delta, not a test change."},
+    {"id": "F2", "severity": "hygiene_non_blocking", "text": "Adapter names _CANDIDATE, _CANDIDATE_ROOT, CANDIDATE_ROOT and the 'requires the candidate ... source' messages now point at the repository; rename to _REPO in a later tidy so a reader does not conclude the audit folders are needed to run the suite."},
+    {"id": "F3", "severity": "provenance_note", "text": "The recipes oracle was cut from candidate execution copies, with hashes recorded. It passed against the landed module, so the excerpts match today; when the execution module changes, the oracle must be re-extracted or the test fails, which is the intended behaviour."}
+  ],
+  "not_claimed": ["No test was run by this review; counts beyond the 237 named methods are consistency checks against the JUnit record, not recounts.", "No statement about the 15 products.", "No case, run, publication or landing approval; the applied files are uncommitted in the working tree."]
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": "fxpm.claude-source-preparation.v1",
+  "lane": "lane-000215",
+  "answers": ["E-00004584"],
+  "scope_events": ["E-00004586"],
+  "recorded_at_utc": "2026-11-03T21:40:00Z",
+  "status": "SOURCE_READY_IN_WORKING_COPY_UNCOMMITTED_PENDING_PEER_SCOPE_AND_REVIEW",
+  "base_commit": "41aaf28111",
+  "targets": [
+    {
+      "path": "pm_end_grid.py",
+      "preimage": {"bytes": 28767, "sha256": "1a94c732a7a381aa993addd2cc94fc06a3d41ed28b2017db67e5c8036ec3fbb9"},
+      "postimage": {"bytes": 32007, "sha256": "b38efd2141990e68d149ed380930adf86e9a5865382a2019d23cecc0de5ed64c"},
+      "changes": [
+        "END_GRID_SCHEMA_VERSION is fxpm.end-grid-row.v2; END_GRID_SCHEMA_VERSION_V1 and END_GRID_SCHEMA_VERSIONS added",
+        "_ROW_KEYS_V1 is the published key set; _ROW_KEYS adds no_trade_run_receipt_sha256; _REPRODUCIBILITY_KEYS includes it",
+        "EndGridRow gains no_trade_run_receipt_sha256; body() drops the v2-only key for a v1 row so a stored v1 line keeps its hash",
+        "build_end_grid_row takes no_trade_run_receipt_sha256 and schema_version; v2 rules: NO_TRADE requires the receipt, WINNER refuses it and requires the trade contract, STOP and UNAVAILABLE refuse it; v1 rules unchanged and the receipt refused",
+        "row_from_dict validates the key set per schema version",
+        "EndGridWriter.append refuses a row whose schema is not current",
+        "__all__ exports the version constants"
+      ],
+      "new_refusal_codes": ["NO_TRADE_RUN_RECEIPT_SHA_INVALID", "NO_TRADE_RUN_RECEIPT_NOT_IN_V1", "WINNER_WITH_NO_TRADE_RUN_RECEIPT", "NO_TRADE_WITHOUT_RUN_RECEIPT", "NO_TRADE_RUN_RECEIPT_REQUIRES_NO_TRADE", "ROW_SCHEMA_VERSION_NOT_CURRENT"]
+    },
+    {
+      "path": "tests/test_end_grid.py",
+      "preimage": {"bytes": 29543, "sha256": "945470aac23461fc449665ee803ac8cb6c1ecc46542b0de8e13cc7520512bb88"},
+      "postimage": {"bytes": 37089, "sha256": "e3caa96baeb5690367ba6ef79638c8413c9c050969a6b6af9b6895da48570408"},
+      "changes": [
+        "fixture H gains a receipt value; base_fields sets the receipt only for NO_TRADE; derived_fields passes overrides through so the receipt follows the final outcome",
+        "test_honest_stops asserts RESULT_WITHOUT_SOURCE_CONTRACT on a WINNER and allows a NO_TRADE without a trade contract",
+        "WriterReaderTests.test_writer_appends_only_the_current_schema_and_reads_mixed_files",
+        "SchemaVersionTests: receipt required on NO_TRADE with the trade contract optional, receipt refused elsewhere, v1 line built by hand reads under v1 keys and hash and round-trips byte-equal, seven refusal cases across versions"
+      ],
+      "methods_total": 33
+    }
+  ],
+  "patch": {"path": "end_grid_v2_source_001.patch", "bytes": 19950, "sha256": "13b7c94440d22ce88436ce7f49c30ce3b0d28398cd55e053bdf52f7fbe41d8b5"},
+  "local_run": {"command": "python -B -m pytest -p no:cacheprovider tests/test_end_grid.py -q", "result": "33 passed, 7 subtests passed in 3.94s", "note": "my own run on the working copy; Root's independent QA is the record"},
+  "not_claimed": ["No caller is wired to the new field; the account reader and the W6.3 edition decide what receipt they pass.", "No row has been written to any grid; nothing is committed."]
+}

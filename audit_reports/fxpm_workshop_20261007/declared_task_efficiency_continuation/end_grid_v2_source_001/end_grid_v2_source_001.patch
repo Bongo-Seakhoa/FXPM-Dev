@@ -1,0 +1,359 @@
+diff --git a/pm_end_grid.py b/pm_end_grid.py
+index 0112c5bf0b..5fa28a9bdb 100644
+--- a/pm_end_grid.py
++++ b/pm_end_grid.py
+@@ -9,6 +9,15 @@ rebuilt from code and canonical M5 alone: the frozen process edition, the
+ source contract and view key, the producing module hashes and the chosen
+ configuration.  Rows never reference a working spool path.
+ 
++Schema v2 adds one named field, ``no_trade_run_receipt_sha256``: the saved
++producer cell-run receipt that proves every selected slot ended NO_TRADE.  It
++is required on a NO_TRADE row and refused on every other outcome, so a cell
++that selected nothing is evidenced by its own receipt and never by a trade
++contract it did not have.  ``source_contract_sha256`` keeps its meaning as the
++per-cell tier-pair trade evidence contract: required on a WINNER, optional on
++a NO_TRADE (present only when a verified trade source existed).  A stored v1
++line still reads under the v1 key set, hash and rules; the writer appends v2.
++
+ The row is a record of a decision that was made elsewhere.  Writing one grants
+ no qualification, capital, live or order authority, and a row's hash is a
+ reproducibility checksum, not a signature.
+@@ -36,7 +45,9 @@ else:
+ import pm_book_multiplicity as book
+ 
+ 
+-END_GRID_SCHEMA_VERSION: Final = "fxpm.end-grid-row.v1"
++END_GRID_SCHEMA_VERSION_V1: Final = "fxpm.end-grid-row.v1"
++END_GRID_SCHEMA_VERSION: Final = "fxpm.end-grid-row.v2"
++END_GRID_SCHEMA_VERSIONS: Final = (END_GRID_SCHEMA_VERSION_V1, END_GRID_SCHEMA_VERSION)
+ OUTCOMES: Final = ("WINNER", "NO_TRADE", "STOP", "UNAVAILABLE")
+ # Canonical engine source kinds live in the hashed row.  The human-facing
+ # labels are rendered outside the hashed body by source_kind_label().
+@@ -61,7 +72,7 @@ _SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}")
+ AUTHORITY_FLAGS: Final = ("qualification_authority", "capital_authority",
+                           "live_authority", "order_authority")
+ MAX_SOURCE_IDENTITY_ENTRIES: Final = 8
+-_ROW_KEYS: Final = frozenset({
++_ROW_KEYS_V1: Final = frozenset({
+     "schema_version", "cell_id", "symbol", "timeframe", "regime",
+     "cycle_start_utc", "cycle_end_utc", "information_cutoff_utc",
+     "outcome", "reason_code", "strategy_family", "configuration_sha256",
+@@ -70,9 +81,13 @@ _ROW_KEYS: Final = frozenset({
+     "process_edition_sha256", "code_sha256", "metrics", "produced_at_utc",
+     *AUTHORITY_FLAGS, "row_sha256",
+ })
++# v2 adds the named NO_TRADE evidence field; a v1 line must not carry it.
++_V2_ONLY_KEYS: Final = frozenset({"no_trade_run_receipt_sha256"})
++_ROW_KEYS: Final = _ROW_KEYS_V1 | _V2_ONLY_KEYS
+ _REPRODUCIBILITY_KEYS: Final = (
+     "cell_id", "cycle_start_utc", "cycle_end_utc", "information_cutoff_utc",
+     "process_edition_sha256", "source_kind", "source_contract_sha256",
++    "no_trade_run_receipt_sha256",
+     "view_key", "view_contract_sha256", "source_identity", "job_binding_sha256",
+     "consumer_binding_sha256", "cost_tier", "strategy_family",
+     "configuration_sha256", "code_sha256",
+@@ -237,6 +252,10 @@ class EndGridRow:
+     # WINNER or NO_TRADE; None for an UNAVAILABLE row and for a STOP that
+     # happened before a trade source was seeded.
+     source_contract_sha256: str | None
++    # v2: the saved producer cell-run receipt proving every selected slot ended
++    # NO_TRADE.  Required on a NO_TRADE row, refused on every other outcome,
++    # and never derived from or written into source_contract_sha256.
++    no_trade_run_receipt_sha256: str | None
+     # Value identity of the view the row was produced from, and the retained
+     # reconstruction body under contracts/.  Present together when a view
+     # existed, absent together before one did.  Required for a result row.
+@@ -257,8 +276,12 @@ class EndGridRow:
+     schema_version: str = END_GRID_SCHEMA_VERSION
+ 
+     def body(self) -> dict[str, Any]:
+-        """Every field except the row hash, in canonical form."""
+-        return {f.name: getattr(self, f.name) for f in fields(self)}
++        """Every field of this row's schema except the row hash, in canonical form."""
++        out = {f.name: getattr(self, f.name) for f in fields(self)}
++        if self.schema_version == END_GRID_SCHEMA_VERSION_V1:
++            for key in _V2_ONLY_KEYS:
++                out.pop(key, None)
++        return out
+ 
+     @property
+     def row_sha256(self) -> str:
+@@ -275,7 +298,7 @@ class EndGridRow:
+     def reproducibility_identity(self) -> dict[str, Any]:
+         """The subset from which the decision is rebuilt from code and M5."""
+         body = self.body()
+-        subset = {key: body[key] for key in _REPRODUCIBILITY_KEYS}
++        subset = {key: body[key] for key in _REPRODUCIBILITY_KEYS if key in body}
+         subset["identity_sha256"] = _sha256(canonical_bytes(subset))
+         return subset
+ 
+@@ -304,8 +327,15 @@ def build_end_grid_row(
+     job_binding_sha256: Any = None,
+     consumer_binding_sha256: Any = None,
+     produced_at_utc: Any = None,
++    no_trade_run_receipt_sha256: Any = None,
++    schema_version: Any = END_GRID_SCHEMA_VERSION,
+ ) -> EndGridRow:
+-    """Validate every field and bind the family cell identity.  Fail closed."""
++    """Validate every field and bind the family cell identity.  Fail closed.
++
++    ``schema_version`` is v2 for every new row; v1 is accepted only so that a
++    stored v1 line re-verifies under the rules it was written with.
++    """
++    schema = _choice(schema_version, END_GRID_SCHEMA_VERSIONS, "ROW_SCHEMA_VERSION_INVALID")
+     cell_id = book.compute_cell_id(symbol, timeframe, regime)
+     if cell_id is None:
+         _fail("CELL_NOT_IN_FAMILY")
+@@ -356,8 +386,26 @@ def build_end_grid_row(
+     if (view_key_value is None) != (view_contract is None):
+         _fail("VIEW_KEY_AND_CONTRACT_MUST_PAIR")
+     result = outcome_value in ("WINNER", "NO_TRADE")
+-    if result and source_contract is None:
+-        _fail("RESULT_WITHOUT_SOURCE_CONTRACT")
++    receipt = _optional_hex64(no_trade_run_receipt_sha256, "NO_TRADE_RUN_RECEIPT_SHA_INVALID")
++    if schema == END_GRID_SCHEMA_VERSION_V1:
++        # The rules the v1 line was written with: a result needs the trade
++        # contract, and the v2 field does not exist.
++        if receipt is not None:
++            _fail("NO_TRADE_RUN_RECEIPT_NOT_IN_V1")
++        if result and source_contract is None:
++            _fail("RESULT_WITHOUT_SOURCE_CONTRACT")
++    elif outcome_value == "WINNER":
++        if source_contract is None:
++            _fail("RESULT_WITHOUT_SOURCE_CONTRACT")
++        if receipt is not None:
++            _fail("WINNER_WITH_NO_TRADE_RUN_RECEIPT")
++    elif outcome_value == "NO_TRADE":
++        # Evidenced by its own saved cell-run receipt; the trade contract is
++        # present only when a verified trade source existed.
++        if receipt is None:
++            _fail("NO_TRADE_WITHOUT_RUN_RECEIPT")
++    elif receipt is not None:
++        _fail("NO_TRADE_RUN_RECEIPT_REQUIRES_NO_TRADE")
+     if result and view_key_value is None:
+         _fail("RESULT_WITHOUT_VIEW")
+     if outcome_value == "UNAVAILABLE":
+@@ -372,6 +420,7 @@ def build_end_grid_row(
+         strategy_family=family, configuration_sha256=configuration,
+         source_kind=kind,
+         source_contract_sha256=source_contract,
++        no_trade_run_receipt_sha256=receipt,
+         view_key=view_key_value,
+         view_contract_sha256=view_contract,
+         source_identity=_source_identity(dict(source_identity), kind, required=result),
+@@ -382,6 +431,7 @@ def build_end_grid_row(
+         code_sha256=_code_identity(dict(code_sha256)),
+         metrics=_metrics(dict(metrics or {})),
+         produced_at_utc=produced,
++        schema_version=schema,
+     )
+ 
+ 
+@@ -402,10 +452,14 @@ def render_row(row: EndGridRow) -> dict[str, Any]:
+ 
+ def row_from_dict(value: Any) -> EndGridRow:
+     """Rebuild and re-verify a stored row; the stored hash must match."""
+-    if type(value) is not dict or frozenset(value) != _ROW_KEYS:
++    if type(value) is not dict or "schema_version" not in value:
+         _fail("ROW_KEYS_INVALID")
+-    if value["schema_version"] != END_GRID_SCHEMA_VERSION:
++    version = value["schema_version"]
++    if version not in END_GRID_SCHEMA_VERSIONS:
+         _fail("ROW_SCHEMA_VERSION_INVALID")
++    expected = _ROW_KEYS_V1 if version == END_GRID_SCHEMA_VERSION_V1 else _ROW_KEYS
++    if frozenset(value) != expected:
++        _fail("ROW_KEYS_INVALID")
+     for flag in AUTHORITY_FLAGS:
+         if value[flag] is not False:
+             _fail("AUTHORITY_FLAG_SET")
+@@ -418,6 +472,8 @@ def row_from_dict(value: Any) -> EndGridRow:
+         configuration_sha256=value["configuration_sha256"],
+         source_kind=value["source_kind"],
+         source_contract_sha256=value["source_contract_sha256"],
++        no_trade_run_receipt_sha256=value.get("no_trade_run_receipt_sha256"),
++        schema_version=version,
+         view_key=value["view_key"], view_contract_sha256=value["view_contract_sha256"],
+         source_identity=value["source_identity"],
+         job_binding_sha256=value["job_binding_sha256"],
+@@ -575,6 +631,8 @@ class EndGridWriter:
+     def append(self, row: EndGridRow) -> dict[str, Any]:
+         if type(row) is not EndGridRow:
+             _fail("ROW_TYPE_INVALID")
++        if row.schema_version != END_GRID_SCHEMA_VERSION:
++            _fail("ROW_SCHEMA_VERSION_NOT_CURRENT")
+         # Re-validate from bytes: a frozen dataclass still holds mutable dicts,
+         # and a flag flipped after construction must not reach the file.
+         try:
+@@ -673,7 +731,8 @@ def grid_summary(rows: Iterable[EndGridRow]) -> dict[str, Any]:
+ 
+ 
+ __all__ = [
+-    "END_GRID_SCHEMA_VERSION", "OUTCOMES", "SOURCE_KINDS", "SOURCE_KIND_LABELS",
++    "END_GRID_SCHEMA_VERSION", "END_GRID_SCHEMA_VERSION_V1", "END_GRID_SCHEMA_VERSIONS",
++    "OUTCOMES", "SOURCE_KINDS", "SOURCE_KIND_LABELS",
+     "STOP_ONLY_SOURCE_KINDS", "COST_TIERS", "AUTHORITY_FLAGS",
+     "SOURCE_IDENTITY_REQUIRED", "CONTRACTS_DIR", "MAX_CONTRACT_BYTES",
+     "EndGridError", "EndGridRow", "EndGridWriter", "build_end_grid_row",
+diff --git a/tests/test_end_grid.py b/tests/test_end_grid.py
+index 83d31d3dc7..8b9a3b0d67 100644
+--- a/tests/test_end_grid.py
++++ b/tests/test_end_grid.py
+@@ -18,8 +18,8 @@ import pm_end_grid as grid
+ 
+ 
+ H = {name: pair * 32 for name, pair in zip(
+-    ("source", "view", "process", "config", "core", "exec", "other"),
+-    ("a1", "b2", "c3", "d4", "e5", "f6", "a7"))}
++    ("source", "view", "process", "config", "core", "exec", "other", "receipt"),
++    ("a1", "b2", "c3", "d4", "e5", "f6", "a7", "b8"))}
+ T0 = "2024-06-02T00:00:00+00:00"
+ T1 = "2024-06-30T00:00:00+00:00"
+ CUTOFF = "2024-06-02T00:00:00+00:00"
+@@ -48,6 +48,10 @@ def base_fields(**overrides):
+         produced_at_utc="2024-07-01T10:00:00+00:00",
+     )
+     value.update(overrides)
++    # v2: a NO_TRADE row is evidenced by its own cell-run receipt; every other
++    # outcome carries none unless a test sets it on purpose.
++    value.setdefault("no_trade_run_receipt_sha256",
++                     H["receipt"] if value["outcome"] == "NO_TRADE" else None)
+     return value
+ 
+ 
+@@ -72,10 +76,10 @@ def derived_identity():
+ 
+ 
+ def derived_fields(**overrides):
+-    value = base_fields(source_kind="m5_derived", source_identity=derived_identity(),
+-                        job_binding_sha256=H["process"], consumer_binding_sha256=H["config"])
+-    value.update(overrides)
+-    return value
++    # Overrides reach base_fields so the receipt default follows the final outcome.
++    defaults = dict(source_kind="m5_derived", source_identity=derived_identity(),
++                    job_binding_sha256=H["process"], consumer_binding_sha256=H["config"])
++    return base_fields(**{**defaults, **overrides})
+ 
+ 
+ class RowShapeTests(unittest.TestCase):
+@@ -179,7 +183,11 @@ class RefusalTests(unittest.TestCase):
+             source_contract_sha256=None))
+         self.assertIsNone(after_view.source_contract_sha256)
+         self.assertEqual(after_view.view_contract_sha256, CONTRACT_SHA)
+-        self.refuse("RESULT_WITHOUT_SOURCE_CONTRACT", source_contract_sha256=None)
++        # v2: only a WINNER needs the trade contract; a NO_TRADE may predate any trade source.
++        self.refuse("RESULT_WITHOUT_SOURCE_CONTRACT", outcome="WINNER", reason_code="QUALIFIED",
++                    strategy_family="ema_ribbon_adx", configuration_sha256=H["config"],
++                    source_contract_sha256=None)
++        self.assertIsNone(grid.build_end_grid_row(**base_fields(source_contract_sha256=None)).source_contract_sha256)
+         self.refuse("RESULT_WITHOUT_VIEW", view_key=None, view_contract_sha256=None)
+         with self.assertRaises(grid.EndGridError) as caught:
+             grid.build_end_grid_row(**unavailable_fields(source_contract_sha256=H["source"]))
+@@ -514,6 +522,108 @@ class WriterReaderTests(unittest.TestCase):
+         with self.assertRaises(grid.EndGridError):
+             grid.EndGridWriter(Path(self._tmp.name) / "EURUSD.jsonl")
+ 
++    def test_writer_appends_only_the_current_schema_and_reads_mixed_files(self):
++        writer = grid.EndGridWriter(self.root)
++        v2_row = grid.build_end_grid_row(**base_fields())
++        v1_dict = {key: value for key, value in v2_row.to_dict().items()
++                   if key not in ("row_sha256", "no_trade_run_receipt_sha256")}
++        v1_dict.update(schema_version=grid.END_GRID_SCHEMA_VERSION_V1, regime="RANGE",
++                       cell_id=book.compute_cell_id("EURUSD", "H1", "RANGE"))
++        v1_dict["row_sha256"] = hashlib.sha256(grid.canonical_bytes(v1_dict)).hexdigest()
++        v1_row = grid.row_from_dict(v1_dict)
++        with self.assertRaises(grid.EndGridError) as caught:
++            writer.append(v1_row)
++        self.assertEqual(str(caught.exception), "ROW_SCHEMA_VERSION_NOT_CURRENT")
++        # A v1 line already on disk keeps reading beside new v2 lines.
++        with (self.root / "EURUSD.jsonl").open("wb") as handle:
++            handle.write(grid.canonical_bytes(v1_dict) + b"\n")
++        self.assertTrue(writer.append(v2_row)["appended"])
++        rows = grid.read_end_grid(self.root, "EURUSD")
++        self.assertEqual([row.schema_version for row in rows],
++                         [grid.END_GRID_SCHEMA_VERSION_V1, grid.END_GRID_SCHEMA_VERSION])
++        self.assertEqual(rows[0], v1_row)
++        self.assertEqual(rows[0].to_bytes(), grid.canonical_bytes(v1_dict))
++        self.assertEqual(set(grid.latest_rows_by_cell(rows)), {v1_row.cell_id, v2_row.cell_id})
++        self.assertEqual(grid.grid_summary(rows)["by_outcome"]["NO_TRADE"], 2)
++
++
++class SchemaVersionTests(unittest.TestCase):
++    """v2 adds the NO_TRADE evidence field; v1 lines keep their own keys, hash and rules."""
++
++    def refuse(self, code, **overrides):
++        with self.assertRaises(grid.EndGridError) as caught:
++            grid.build_end_grid_row(**base_fields(**overrides))
++        self.assertEqual(str(caught.exception), code)
++
++    @staticmethod
++    def rehash(body):
++        body = {key: value for key, value in body.items() if key != "row_sha256"}
++        return dict(body, row_sha256=hashlib.sha256(grid.canonical_bytes(body)).hexdigest())
++
++    def test_no_trade_needs_its_run_receipt_and_the_trade_contract_is_optional(self):
++        row = grid.build_end_grid_row(**base_fields())
++        self.assertEqual(row.schema_version, grid.END_GRID_SCHEMA_VERSION)
++        self.assertEqual(row.no_trade_run_receipt_sha256, H["receipt"])
++        self.assertEqual(row.source_contract_sha256, H["source"])
++        self.assertEqual(row.reproducibility_identity()["no_trade_run_receipt_sha256"], H["receipt"])
++        unseeded = grid.build_end_grid_row(**base_fields(source_contract_sha256=None))
++        self.assertIsNone(unseeded.source_contract_sha256)
++        self.assertEqual(unseeded.no_trade_run_receipt_sha256, H["receipt"])
++        self.assertNotEqual(unseeded.row_sha256, row.row_sha256)
++        self.refuse("NO_TRADE_WITHOUT_RUN_RECEIPT", no_trade_run_receipt_sha256=None)
++        self.refuse("NO_TRADE_WITHOUT_RUN_RECEIPT", no_trade_run_receipt_sha256=None,
++                    source_contract_sha256=None)
++        self.refuse("NO_TRADE_RUN_RECEIPT_SHA_INVALID", no_trade_run_receipt_sha256="abc")
++        self.refuse("NO_TRADE_RUN_RECEIPT_SHA_INVALID", no_trade_run_receipt_sha256=H["receipt"].upper())
++        self.assertEqual(set(grid._ROW_KEYS) - set(grid._ROW_KEYS_V1), {"no_trade_run_receipt_sha256"})
++
++    def test_run_receipt_is_refused_outside_no_trade(self):
++        self.refuse("WINNER_WITH_NO_TRADE_RUN_RECEIPT", outcome="WINNER", reason_code="QUALIFIED",
++                    strategy_family="ema_ribbon_adx", configuration_sha256=H["config"],
++                    no_trade_run_receipt_sha256=H["receipt"])
++        self.refuse("NO_TRADE_RUN_RECEIPT_REQUIRES_NO_TRADE", outcome="STOP", reason_code="COST_UNAVAILABLE",
++                    cost_tier="NONE", no_trade_run_receipt_sha256=H["receipt"])
++        with self.assertRaises(grid.EndGridError) as caught:
++            grid.build_end_grid_row(**unavailable_fields(no_trade_run_receipt_sha256=H["receipt"]))
++        self.assertEqual(str(caught.exception), "NO_TRADE_RUN_RECEIPT_REQUIRES_NO_TRADE")
++        winner = grid.build_end_grid_row(**winner_fields())
++        self.assertIsNone(winner.no_trade_run_receipt_sha256)
++        self.assertIn("no_trade_run_receipt_sha256", winner.to_dict())
++        self.assertIsNone(winner.reproducibility_identity()["no_trade_run_receipt_sha256"])
++
++    def test_v1_lines_read_under_v1_rules_and_v2_lines_under_v2(self):
++        v2 = grid.build_end_grid_row(**base_fields()).to_dict()
++        # Exactly what the published v1 writer wrote: v1 keys and a hash over them.
++        v1 = self.rehash(dict({key: value for key, value in v2.items()
++                               if key != "no_trade_run_receipt_sha256"},
++                              schema_version=grid.END_GRID_SCHEMA_VERSION_V1))
++        row = grid.row_from_dict(v1)
++        self.assertEqual(row.schema_version, grid.END_GRID_SCHEMA_VERSION_V1)
++        self.assertIsNone(row.no_trade_run_receipt_sha256)
++        self.assertEqual(row.to_dict(), v1)
++        self.assertEqual(row.to_bytes(), grid.canonical_bytes(v1))
++        self.assertNotIn("no_trade_run_receipt_sha256", row.reproducibility_identity())
++        self.assertEqual(grid.row_from_dict(json.loads(row.to_bytes().decode("ascii"))), row)
++        cases = (
++            (self.rehash(dict(v1, no_trade_run_receipt_sha256=H["receipt"])), "ROW_KEYS_INVALID"),
++            (self.rehash(dict(v1, source_contract_sha256=None)), "RESULT_WITHOUT_SOURCE_CONTRACT"),
++            (self.rehash({key: value for key, value in v2.items()
++                          if key != "no_trade_run_receipt_sha256"}), "ROW_KEYS_INVALID"),
++            (self.rehash(dict(v2, no_trade_run_receipt_sha256=None)), "NO_TRADE_WITHOUT_RUN_RECEIPT"),
++            (self.rehash(dict(v2, schema_version=grid.END_GRID_SCHEMA_VERSION_V1)), "ROW_KEYS_INVALID"),
++            (dict(v2, schema_version="fxpm.end-grid-row.v3"), "ROW_SCHEMA_VERSION_INVALID"),
++            ({key: value for key, value in v2.items() if key != "schema_version"}, "ROW_KEYS_INVALID"),
++        )
++        for stored, code in cases:
++            with self.subTest(code=code), self.assertRaises(grid.EndGridError) as caught:
++                grid.row_from_dict(stored)
++            self.assertEqual(str(caught.exception), code)
++        self.refuse("ROW_SCHEMA_VERSION_INVALID", schema_version="fxpm.end-grid-row.v3")
++        self.refuse("NO_TRADE_RUN_RECEIPT_NOT_IN_V1", schema_version=grid.END_GRID_SCHEMA_VERSION_V1)
++        legacy = grid.build_end_grid_row(**base_fields(schema_version=grid.END_GRID_SCHEMA_VERSION_V1,
++                                                       no_trade_run_receipt_sha256=None))
++        self.assertEqual(legacy.to_dict(), v1)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
