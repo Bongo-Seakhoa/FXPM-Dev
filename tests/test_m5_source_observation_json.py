@@ -19,7 +19,8 @@ SOURCE = ROOT / "pm_historical_search_producer.py"
 def source_parts():
     tree = ast.parse(SOURCE.read_bytes(), filename=str(SOURCE))
     names = {"HistoricalSearchProducerError", "_fail", "_canonical_bytes",
-        "_declared_m5_view_observation", "_declared_failure_details", "_now_utc_seconds"}
+        "_declared_m5_view_observation", "_declared_failure_details", "_now_utc_seconds",
+        "_declared_m5_failure_message"}
     selected = [node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
     if {node.name for node in selected} != names:

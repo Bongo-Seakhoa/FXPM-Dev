@@ -7240,11 +7240,18 @@ def _validate_declared_m5_source_session(context, *, body, source_session, reque
         if value["cost_status"] != "COST_READY":
             _fail("DECLARED_M5_SOURCE_BINDING_MISMATCH")
     else:
-        if (type(failure) is not dict or set(failure) !=
-                {"exception_type", "failure_code", "failure_observed_at_utc", "phase"}
+        fields = {"exception_type", "failure_code", "failure_observed_at_utc", "phase"}
+        if (type(failure) is not dict or set(failure) not in (fields, fields | {"message"})
                 or failure["phase"] not in ("PRE_SOURCE", "SOURCE", "FIT", "CAPTURE")
                 or type(failure["exception_type"]) is not str or not 1 <= len(failure["exception_type"]) <= 128):
             _fail("DECLARED_M5_SOURCE_SESSION_INVALID")
+        if "message" in failure:
+            if type(failure["message"]) is not str or len(failure["message"]) > 200:
+                _fail("DECLARED_M5_SOURCE_SESSION_INVALID")
+            try:
+                failure["message"].encode("utf-8")
+            except UnicodeError:
+                _fail("DECLARED_M5_SOURCE_SESSION_INVALID")
         _reason(failure["failure_code"], "DECLARED_M5_SOURCE_SESSION_INVALID")
         observed = orchestration._utc(failure["failure_observed_at_utc"], "DECLARED_M5_SOURCE_SESSION_INVALID")
         if observed < opened or observed > completed or (accessed is not None and observed < accessed):

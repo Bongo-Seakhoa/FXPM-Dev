@@ -2109,6 +2109,14 @@ DECLARED_M5_SLOT_SOURCE_SESSION_KEYS = frozenset((
     "live_authority", "order_authority"))
 
 
+def _declared_m5_failure_message(exc):
+    """Diagnostic text only; never a status, outcome or selection input."""
+    try:
+        return str.encode(str(exc)[:200], "utf-8", "backslashreplace").decode("utf-8")[:200]
+    except Exception:
+        return "<exception message unavailable>"
+
+
 def _declared_m5_view_observation(view):
     from dataclasses import asdict
     return json.loads(_canonical_bytes({"view_key": view.view_key, "payload_sha256": view.payload_sha256,
@@ -2511,7 +2519,8 @@ def _make_declared_slot_source_authority():
                 raise
             if capture is not None and capture._completion is not None:
                 raise _DeclaredSlotPostCompletionFailure(capture.completion, _declared_failure_details(exc)) from exc
-            source_body["failure"] = {**_declared_failure_details(exc), "phase": phase}
+            source_body["failure"] = {**_declared_failure_details(exc), "phase": phase,
+                "message": _declared_m5_failure_message(exc)}
             if set(source_body) != DECLARED_M5_SLOT_SOURCE_SESSION_KEYS:
                 _fail("DECLARED_M5_SOURCE_SESSION_FIELDS_INVALID")
             entry = sink.put_json(f"{body['artifact_namespace']}/technical-source-session", "declared_slot_source_session", source_body)
