@@ -39,7 +39,7 @@ def test_missing_native_tier_retains_recorded_account_before_window(monkeypatch)
     payload = root / "retained-fixture.json"
     payload.write_bytes(b"synthetic saved payload")
 
-    limits = spool.SpoolLimits(min_free_bytes=scheduler.DECLARED_CELL_MIN_FREE_BYTES)
+    limits = spool.SpoolLimits(**scheduler._DECLARED_NATIVE_FINALIZATION_LIMITS)
     context = SimpleNamespace(root=root, limits=limits, config_sha256="2" * 64)
     digest = "3" * 64
     cell = {"cell_id": "4" * 64, "symbol": "XAGUSD", "timeframe": "H1", "regime": "TREND"}
@@ -170,3 +170,219 @@ def test_native_retirement_preflight_refuses_unowned_inventory_and_renewal(monke
     assert saved.read_bytes() == b"synthetic renewal namespace"
     assert not fence.exists() and not Path(retirement["receipt_path"]).exists()
     assert not (root / spool.RETIREMENT_RELATIVE_PATH).exists()
+
+
+# E4193 authorized the eight values in full13_research_bindings_002.draft.json:218.
+_EXPECTED_NATIVE_LIMITS = {
+    "max_artifact_bytes": 1073741824,
+    "max_symbol_bytes": 8589934592,
+    "max_generation_bytes": 8589934592,
+    "max_artifacts_per_symbol": 100000,
+    "max_manifest_bytes": 134217728,
+    "max_json_bytes": 67108864,
+    "stream_chunk_bytes": 1048576,
+    "min_free_bytes": 17179869184,
+}
+
+
+def _native_limit_fixture(tmp_path):
+    row = {
+        "descriptor_index": 0, "root": str(tmp_path / "working"), "run_id": "INVENTED_LIMIT_BINDING",
+        "cell": {"cell_id": "4" * 64, "symbol": "XAGUSD", "timeframe": "H1", "regime": "TREND"},
+        "native_finalization": {
+            "end_grid_root": str(tmp_path / "grid"),
+            "source_fence_path": str(tmp_path / "fence.json"),
+            "retirement": {"receipt_path": str(tmp_path / "retirement.json")},
+        },
+    }
+    contract = {
+        "schema_version": scheduler.DECLARED_SCHEDULER_SCHEMA, "cells": [row],
+        "active_config_path": str(tmp_path / "config.json"),
+        "native_universe_sha256": "5" * 64, "config_sha256": "6" * 64, "profile_sha256": "7" * 64,
+    }
+    return contract, row
+
+
+def test_native_opt_in_limit_values_match_original_authorization():
+    actual = scheduler._DECLARED_NATIVE_FINALIZATION_LIMITS
+    assert actual == _EXPECTED_NATIVE_LIMITS
+    assert spool.validate_spool_limits(spool.SpoolLimits(**actual)) == spool.SpoolLimits(**_EXPECTED_NATIVE_LIMITS)
+
+
+@pytest.mark.parametrize("free_delta", [-1, 0], ids=["below-floor", "at-floor"])
+def test_native_opt_in_fresh_floor_and_exact_freeze_limits(tmp_path, monkeypatch, free_delta):
+    contract, row = _native_limit_fixture(tmp_path)
+    root = Path(row["root"])
+    limits = spool.SpoolLimits(**_EXPECTED_NATIVE_LIMITS)
+    digest = scheduler._declared_native_cell_contract_sha256(contract, row, limits)
+    calls = []
+    config = object()
+    marker = root / spool.WORKSPACE_OWNER_RELATIVE_PATH
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("fresh limit routing must not reopen context or freeze pipeline configuration")
+
+    def free_probe(path):
+        assert path == root
+        calls.append("disk")
+        return limits.min_free_bytes + free_delta
+
+    def load_config(path):
+        assert path == Path(contract["active_config_path"])
+        calls.append("config")
+        return {}, config
+
+    def preflight(actual_contract, actual_row, actual_config, actual_limits, *, fresh):
+        assert (actual_contract, actual_row, actual_config, actual_limits, fresh) == (contract, row, config, limits, True)
+        calls.append("preflight")
+
+    def freeze(path, **kwargs):
+        assert path == root
+        assert kwargs == {
+            "generation_id": row["run_id"], "native_universe_sha256": contract["native_universe_sha256"],
+            "config_sha256": contract["config_sha256"], "limits": limits,
+            "owned_workspace": {"cell_id": row["cell"]["cell_id"], "cell_contract_sha256": digest},
+        }
+        calls.append("freeze")
+        # This marker exercises ownership routing without invoking real freeze or quota I/O.
+        root.mkdir()
+        marker.write_bytes(b"invented workspace marker")
+        return SimpleNamespace(root=root, limits=kwargs["limits"])
+
+    def read_owner(context):
+        assert context.root == root
+        calls.append("owner")
+        return {"cell_id": row["cell"]["cell_id"], "cell_contract_sha256": digest}, "8" * 64
+
+    def held(context):
+        assert context.root == root
+        calls.append("lease")
+        return nullcontext(False)
+
+    monkeypatch.setattr(spool, "read_generation_retirement", lambda *args, **kwargs: None)
+    monkeypatch.setattr(spool, "reopen_generation_context", forbidden)
+    monkeypatch.setattr(spool, "freeze_generation_context", freeze)
+    monkeypatch.setattr(spool, "read_owned_generation_workspace", read_owner)
+    monkeypatch.setattr(binding, "load_effective_pipeline_config", load_config)
+    monkeypatch.setattr(binding, "freeze_production_pipeline_config", forbidden)
+    monkeypatch.setattr(scheduler, "_declared_disk_free_bytes", free_probe)
+    monkeypatch.setattr(scheduler, "_declared_native_finalization_preflight", preflight)
+    monkeypatch.setattr(scheduler, "_declared_dispatch_lease", held)
+
+    result = scheduler._declared_run_one_cell(contract, row)
+    assert result["status"] == "NOT_RUN"
+    if free_delta:
+        assert result["reason_code"] == "DISK_LOW"
+        assert calls == ["disk"]
+        assert not root.exists()
+    else:
+        assert result["reason_code"] == "BUSY"
+        assert calls == ["disk", "config", "preflight", "freeze", "owner", "lease"]
+        assert list(root.iterdir()) == [marker]
+
+
+@pytest.mark.parametrize(("saved_state", "expected_reason"), [
+    ("missing-owner", "DECLARED_NATIVE_FINALIZATION_OWNED_WORKSPACE_REQUIRED"),
+    ("wrong-limits", "DECLARED_NATIVE_WORKSPACE_OWNER_CHANGED"),
+    ("wrong-digest", "DECLARED_NATIVE_WORKSPACE_OWNER_CHANGED"),
+], ids=["missing-owner", "wrong-limits", "wrong-digest"])
+def test_native_opt_in_reopen_rejects_invalid_ownership_before_work(tmp_path, monkeypatch, saved_state, expected_reason):
+    contract, row = _native_limit_fixture(tmp_path)
+    root = Path(row["root"])
+    root.mkdir()
+    context_path = root / spool.CONTEXT_RELATIVE_PATH
+    context_path.write_bytes(b"invented saved context")
+    marker = root / spool.WORKSPACE_OWNER_RELATIVE_PATH
+    if saved_state != "missing-owner":
+        marker.write_bytes(b"invented saved owner")
+    limits = spool.SpoolLimits(**_EXPECTED_NATIVE_LIMITS)
+    digest = scheduler._declared_native_cell_contract_sha256(contract, row, limits)
+    saved_limits = (spool.SpoolLimits(**{**_EXPECTED_NATIVE_LIMITS, "min_free_bytes": 5 * 1024**3})
+                    if saved_state == "wrong-limits" else limits)
+    context = SimpleNamespace(root=root, limits=saved_limits)
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid saved native ownership must refuse before lease, config or new context")
+
+    def reopen(path, **kwargs):
+        assert path == root
+        assert kwargs == {
+            "expected_generation_id": row["run_id"],
+            "expected_native_universe_sha256": contract["native_universe_sha256"],
+            "expected_config_sha256": contract["config_sha256"],
+        }
+        calls.append("reopen")
+        return context
+
+    def read_owner(actual):
+        assert actual is context
+        calls.append("owner")
+        return {"cell_id": row["cell"]["cell_id"],
+                "cell_contract_sha256": "0" * 64 if saved_state == "wrong-digest" else digest}, "8" * 64
+
+    monkeypatch.setattr(spool, "read_generation_retirement", lambda *args, **kwargs: None)
+    monkeypatch.setattr(spool, "reopen_generation_context", reopen)
+    monkeypatch.setattr(spool, "read_owned_generation_workspace", read_owner)
+    monkeypatch.setattr(spool, "freeze_generation_context", forbidden)
+    monkeypatch.setattr(scheduler, "_declared_dispatch_lease", forbidden)
+    monkeypatch.setattr(binding, "load_effective_pipeline_config", forbidden)
+    monkeypatch.setattr(binding, "freeze_production_pipeline_config", forbidden)
+
+    result = scheduler._declared_run_one_cell(contract, row)
+    assert (result["status"], result["reason_code"]) == ("FAILED", expected_reason)
+    assert calls == (["reopen"] if saved_state == "missing-owner" else ["reopen", "owner"])
+    assert context_path.read_bytes() == b"invented saved context"
+    if saved_state == "missing-owner":
+        assert not marker.exists()
+    else:
+        assert marker.read_bytes() == b"invented saved owner"
+
+
+def test_native_opt_in_archive_reopen_and_confirmation_bind_same_exact_limits(tmp_path, monkeypatch):
+    contract, row = _native_limit_fixture(tmp_path)
+    root = Path(row["root"])
+    limits = spool.SpoolLimits(**_EXPECTED_NATIVE_LIMITS)
+    record = {
+        "status": "ARCHIVED_RECORD_ONLY", "generation_id": row["run_id"],
+        "cell_id": row["cell"]["cell_id"], "generation_context_sha256": "9" * 64,
+        "cell_contract_sha256": scheduler._declared_native_cell_contract_sha256(contract, row, limits),
+        "retirement_receipt_path": row["native_finalization"]["retirement"]["receipt_path"],
+        "retirement_receipt_sha256": "a" * 64, "precommit_sha256": "b" * 64,
+        "source_fence": {"path": row["native_finalization"]["source_fence_path"], "sha256": "c" * 64},
+        "end_grid_rows": {},
+    }
+    calls = []
+    bound_limits = []
+    cell_digest = scheduler._declared_native_cell_contract_sha256
+
+    def capture_digest(actual_contract, actual_row, actual_limits):
+        assert actual_contract is contract and actual_row is row
+        bound_limits.append(actual_limits)
+        return cell_digest(actual_contract, actual_row, actual_limits)
+
+    def read_archive(path, *, expected_context_sha256=None, expected_completed_fence_schema):
+        assert path == root
+        assert expected_completed_fence_schema == spool.NATIVE_COMPLETION_FENCE_SCHEMA
+        calls.append(expected_context_sha256)
+        return record
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("archived native identity must confirm before opening a working context or config")
+
+    monkeypatch.setattr(scheduler, "_declared_native_cell_contract_sha256", capture_digest)
+    monkeypatch.setattr(spool, "read_generation_retirement", read_archive)
+    monkeypatch.setattr(spool, "reopen_generation_context", forbidden)
+    monkeypatch.setattr(spool, "freeze_generation_context", forbidden)
+    monkeypatch.setattr(binding, "load_effective_pipeline_config", forbidden)
+
+    result = scheduler._declared_run_one_cell(contract, row)
+    assert (result["status"], result["source_kind"]) == ("ARCHIVED", "broker_native")
+    assert result["archive_record"] == {
+        "path": record["retirement_receipt_path"], "sha256": record["retirement_receipt_sha256"],
+    }
+    assert scheduler._declared_confirm_receipt(contract, result) is None
+    assert result["archive_record_confirmed"] is True
+    assert calls == [None, record["generation_context_sha256"]]
+    assert bound_limits == [limits, limits]
+    assert not root.exists()

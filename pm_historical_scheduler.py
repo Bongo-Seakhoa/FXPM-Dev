@@ -116,6 +116,13 @@ __all__ = [
 
 DECLARED_SCHEDULER_SCHEMA: Final = "fxpm.declared-symbol-scheduler.v1"
 DECLARED_CELL_MIN_FREE_BYTES: Final = 5 * 1024**3
+# E4193 binds these limits in full13_research_bindings_002.draft.json.
+_DECLARED_NATIVE_FINALIZATION_LIMITS: Final = {
+    "max_artifact_bytes": 1024**3, "max_symbol_bytes": 8 * 1024**3,
+    "max_generation_bytes": 8 * 1024**3, "max_artifacts_per_symbol": 100000,
+    "max_manifest_bytes": 128 * 1024**2, "max_json_bytes": 64 * 1024**2,
+    "stream_chunk_bytes": 1024**2, "min_free_bytes": 16 * 1024**3,
+}
 DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA: Final = "fxpm.declared-m5-development-symbol-scheduler.v1"
 _DECLARED_CELL_STATUSES: Final = frozenset({
     "COMPLETED", "REOPENED", "TERMINAL_STOP", "FAILED", "NOT_RUN", "UNRESOLVED_CRASH", "ARCHIVED",
@@ -826,8 +833,9 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
     loaded_config = None
     try:
         context_root = Path(row["root"])
-        limits = spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES) if finalize_native else None
+        limits = None
         if finalize_native:
+            limits = spool.validate_spool_limits(spool.SpoolLimits(**_DECLARED_NATIVE_FINALIZATION_LIMITS))
             digest = _declared_native_cell_contract_sha256(contract, row, limits)
             archived = spool.read_generation_retirement(context_root,
                 expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
@@ -842,7 +850,8 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
             context = spool.reopen_generation_context(context_root, expected_generation_id=row["run_id"],
                 expected_native_universe_sha256=contract["native_universe_sha256"], expected_config_sha256=contract["config_sha256"])
         else:
-            if not _declared_disk_ready(context_root, contract, DECLARED_CELL_MIN_FREE_BYTES):
+            reserve = limits.min_free_bytes if finalize_native else DECLARED_CELL_MIN_FREE_BYTES
+            if not _declared_disk_ready(context_root, contract, reserve):
                 result.update(status="NOT_RUN", reason_code="DISK_LOW")
                 return result
             ownership = {}
@@ -854,6 +863,13 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                 native_universe_sha256=contract["native_universe_sha256"], config_sha256=contract["config_sha256"],
                 limits=limits if finalize_native else spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES),
                 **ownership)
+        if finalize_native:
+            if not (context.root / spool.WORKSPACE_OWNER_RELATIVE_PATH).exists():
+                _fail("DECLARED_NATIVE_FINALIZATION_OWNED_WORKSPACE_REQUIRED")
+            workspace, native_workspace_sha = spool.read_owned_generation_workspace(context)
+            if (context.limits != limits or workspace["cell_id"] != row["cell"]["cell_id"]
+                    or workspace["cell_contract_sha256"] != digest):
+                _fail("DECLARED_NATIVE_WORKSPACE_OWNER_CHANGED")
         with _declared_dispatch_lease(context) as acquired:
             if not acquired:
                 result.update(status="NOT_RUN", reason_code="BUSY")
@@ -863,11 +879,6 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
             frozen = binding.freeze_production_pipeline_config(context, active_config_path=Path(contract["active_config_path"]),
                 config_payload=payload, supplied_config=supplied)
             config = frozen.materialize(context)
-            if finalize_native and (context.root / spool.WORKSPACE_OWNER_RELATIVE_PATH).exists():
-                workspace, native_workspace_sha = spool.read_owned_generation_workspace(context)
-                if (context.limits != limits or workspace["cell_id"] != row["cell"]["cell_id"]
-                        or workspace["cell_contract_sha256"] != digest):
-                    _fail("DECLARED_NATIVE_WORKSPACE_OWNER_CHANGED")
             records = sorted((context.root / "declared-slots").glob("*/precommit.json"))
             if len(records) > 1:
                 _fail("DECLARED_SCHEDULER_MULTIPLE_PRECOMMITS")
@@ -1095,7 +1106,7 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
             expected = next(cell for cell in contract["cells"] if cell["descriptor_index"] == row["descriptor_index"])
             if "native_finalization" not in expected:
                 _fail("DECLARED_NATIVE_ARCHIVED_RESULT_INVALID")
-            limits = spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES)
+            limits = spool.validate_spool_limits(spool.SpoolLimits(**_DECLARED_NATIVE_FINALIZATION_LIMITS))
             record = spool.read_generation_retirement(Path(row["root"]),
                 expected_context_sha256=row["generation_context_sha256"],
                 expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
