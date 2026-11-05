@@ -1451,6 +1451,25 @@ def _declared_m5_source_abort_paths_clear(context, precommit, cell_id):
     return True
 
 
+def _declared_m5_exception_reason(error):
+    """Keep diagnostic exception text outside the canonical STOP reason."""
+    import re
+    import pm_authority_spool as spool
+    import pm_end_grid as grid
+    diagnostics = {"exception_type": type(error).__name__[:256]}
+    try:
+        candidate = getattr(error, "code", None)
+        if candidate is None and isinstance(error, (spool.AuthoritySpoolError, grid.EndGridError)):
+            candidate = str(error).split(":", 1)[0]
+    except Exception:
+        candidate = None
+    if type(candidate) is str and re.fullmatch(r"[A-Z0-9][A-Z0-9_:.\-]{0,127}", candidate) is not None:
+        return candidate, diagnostics
+    diagnostics["rejected_reason_candidate"] = candidate[:256] if type(candidate) is str else None
+    diagnostics["rejected_reason_candidate_type"] = type(candidate).__name__[:256]
+    return "UNEXPECTED_EXCEPTION", diagnostics
+
+
 def _declared_m5_capture_source_abort(*, owner, context, precommit, process, cell_id,
         source_error, resumed, source_attempted, owner_created, controller_started,
         dispatch_lease_held, phase):
@@ -1465,9 +1484,7 @@ def _declared_m5_capture_source_abort(*, owner, context, precommit, process, cel
         _fail("DECLARED_M5_ABORT_ORIGINAL_OWNER_REQUIRED")
     if not _declared_m5_source_abort_paths_clear(context, precommit, cell_id):
         _fail("DECLARED_M5_ABORT_PROGRESS_OR_HEADER_PRESENT")
-    code = str(getattr(source_error, "code",
-        str(source_error) if isinstance(source_error, spool.AuthoritySpoolError)
-        else type(source_error).__name__))[:256]
+    code, _ = _declared_m5_exception_reason(source_error)
     reason = ("DISK_LOW" if spool.is_resource_capacity_error(source_error)
         or code == "DECLARED_M5_DISK_LOW" else "BUSY" if code == "DECLARED_SLOT_RUN_ACTIVE" else code)
     if reason == "BUSY":
@@ -1996,7 +2013,8 @@ def _declared_m5_run_one_cell(contract, row):
                     result["source_abort_error"] = str(getattr(abort_error, "code", str(abort_error)))[:256]
                 raise
     except Exception as exc:
-        code = str(getattr(exc, "code", str(exc) if isinstance(exc, spool.AuthoritySpoolError) else type(exc).__name__))[:256]
+        code, diagnostics = _declared_m5_exception_reason(exc)
+        result["exception_diagnostics"] = diagnostics
         if spool.is_resource_capacity_error(exc) or code == "DECLARED_M5_DISK_LOW":
             result.update(status="NOT_RUN", reason_code="DISK_LOW")
         elif code == "DECLARED_SLOT_RUN_ACTIVE":

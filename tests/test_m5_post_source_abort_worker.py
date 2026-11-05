@@ -21,7 +21,7 @@ def definitions():
     names = {"HistoricalSchedulerError", "_fail", "_declared_digest", "_declared_m5_utc",
         "_declared_m5_grid_utc", "_declared_m5_refusal_eligible", "_declared_m5_refusal_body",
         "_declared_m5_refusal_archived_row", "_declared_m5_source_abort_eligible",
-        "_declared_m5_source_abort_paths_clear", "_declared_m5_capture_source_abort",
+        "_declared_m5_source_abort_paths_clear", "_declared_m5_exception_reason", "_declared_m5_capture_source_abort",
         "_declared_m5_source_abort_body", "_declared_m5_abort_grid_identity"}
     selected = [node for node in tree.body
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names]
