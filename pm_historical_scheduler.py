@@ -1266,9 +1266,11 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
             baseline = None
         else:
             request_sha = commits[key]["completion"]["request_sha256"]
-            with owner.acquire(dev["slot_view_ids"][key], consumer=views.SlotViewBinding(request_sha, key), result_key=key) as request_lease:
-                with owner.acquire(dev["calibration_view_id"], consumer=views.CalibrationViewBinding(edition.sha256),
-                        result_key=owner.binding.terminal_result_key) as calibration_lease:
+            request_lease = owner.acquire(dev["slot_view_ids"][key], consumer=views.SlotViewBinding(request_sha, key), result_key=key)
+            with request_lease:
+                calibration_lease = owner.acquire(dev["calibration_view_id"], consumer=views.CalibrationViewBinding(edition.sha256),
+                    result_key=owner.binding.terminal_result_key)
+                with calibration_lease:
                     live_view = owner.view(request_lease)
                     bound = edition.bind_view(owner, context=context, calibration_lease=calibration_lease,
                         request_lease=request_lease, point=owner.source_identity.point)
