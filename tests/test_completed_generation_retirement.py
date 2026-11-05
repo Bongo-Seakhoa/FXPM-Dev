@@ -104,6 +104,139 @@ class CompletedGenerationRetirementTests(unittest.TestCase):
             "max_paths": 100, "max_nodes": 300, "max_bytes": 4 * 1024**2}
         return context, entries, args
 
+    def native_completion_fixture(self, *, mismatched_run=False):
+        from datetime import datetime, timedelta, timezone
+
+        context, entries, args = self.fixture()
+        retained = args["source_fence_path"].parent
+        grid_root = retained / "native-grid"
+        grid_root.mkdir()
+        cell = book.compute_cell_id("XAGUSD", "H1", "TREND")
+        precommit_sha, process_sha, run_sha = "1" * 64, "2" * 64, "3" * 64
+        start = datetime(2023, 6, 24, tzinfo=timezone.utc)
+        selected_slots = []
+        rows = []
+        for ordinal in range(13):
+            cycle_start = start + timedelta(days=28 * ordinal)
+            cycle_end = cycle_start + timedelta(days=28)
+            cutoff = cycle_start - timedelta(hours=1)
+            slot_id = f"owner-slot-{ordinal + 1:02d}-{cycle_start:%Y%m%dT%H%M%SZ}"
+            winner = ordinal == 0
+            outcome = "WINNER" if winner else "NO_TRADE"
+            reason = "SOFTWARE_WINNER_ONLY" if winner else "SOFTWARE_NO_TRADE_ONLY"
+            selected_slots.append({
+                "slot_id": slot_id,
+                "cycle_start_utc": cycle_start.isoformat(),
+                "cycle_end_utc": cycle_end.isoformat(),
+                "information_cutoff_utc": cutoff.isoformat(),
+                "outcome": outcome,
+            })
+            view = {
+                "schema_version": "fxpm.broker-native-end-grid-view.v1",
+                "symbol": "XAGUSD", "timeframe": "H1",
+                "cutoff_utc": cutoff.isoformat(),
+                "activation_id": "INVENTED_SOFTWARE_ACTIVATION",
+                "activation_manifest_sha256": "4" * 64,
+                "activation_entry_sha256": "5" * 64,
+                "native_bars_sha256": "6" * 64,
+                "continuity_policy_sha256": "7" * 64,
+                "continuity_geometry_sha256": "8" * 64,
+            }
+            result = {
+                "precommit_sha256": precommit_sha, "cell_id": cell,
+                "slot_id": slot_id, "ordinal": ordinal + 1,
+                "cycle_start_utc": cycle_start.isoformat(),
+                "cycle_end_utc": cycle_end.isoformat(),
+                "completion_status": "OWNER" if winner else "NO_TRADE",
+                "reason_code": reason, "request_sha256": "9" * 64,
+                "slot_commit_sha256": _sha({"fixture": LABEL, "slot": slot_id}),
+                "source_session_sha256": "a" * 64,
+                "native_prefix_index_sha256": "b" * 64,
+                "source_accessed_at_utc": cutoff.isoformat(),
+                "saved_cell_run_receipt_sha256": run_sha,
+            }
+            tier_evidence = {
+                "semantics": "VERIFIED_SELECTED_OWNER_TIER", "tier": "P75",
+                "selected_tier_contract": {"fixture_provenance": LABEL},
+            } if winner else {
+                "semantics": "BOUND_BASELINE_DESCRIPTOR_NO_SELECTED_WINNER", "tier": "P75",
+                "bound_baseline_descriptor": {"fixture_provenance": LABEL},
+            }
+            contract = grid.store_view_contract(grid_root, {
+                "schema_version": "fxpm.broker-native-end-grid-reconstruction.v1",
+                "view": view, "result": result, "cost_tier_evidence": tier_evidence,
+            })
+            rows.append(grid.build_end_grid_row(
+                symbol="XAGUSD", timeframe="H1", regime="TREND",
+                cycle_start_utc=cycle_start.isoformat(), cycle_end_utc=cycle_end.isoformat(),
+                information_cutoff_utc=cutoff.isoformat(), outcome=outcome,
+                reason_code=reason, source_kind="broker_native",
+                source_identity={key: view[key] for key in (
+                    "activation_id", "activation_manifest_sha256",
+                    "activation_entry_sha256", "native_bars_sha256")},
+                strategy_family="SOFTWARE_FIXTURE" if winner else None,
+                configuration_sha256="c" * 64 if winner else None,
+                source_contract_sha256="d" * 64 if winner else None,
+                no_trade_run_receipt_sha256=None if winner else (
+                    "e" * 64 if mismatched_run and ordinal == 1 else run_sha),
+                view_key=_sha(view), view_contract_sha256=contract,
+                cost_tier="P75", process_edition_sha256=process_sha,
+                code_sha256={"software-fixture": "f" * 64}, metrics={},
+                produced_at_utc=cycle_end.isoformat(),
+            ))
+        appended = grid.EndGridWriter(grid_root).append_many_same_symbol(rows)
+        fence = retained / "native-completion-fence.json"
+        fence_sha = _write(fence, {
+            "schema_version": spool.NATIVE_COMPLETION_FENCE_SCHEMA,
+            "workspace_owner_sha256": args["workspace_owner_sha256"],
+            "binding": {
+                "generation_context_sha256": context.context_sha256,
+                "run_id": context.generation_id,
+                "cell_id": cell, "cell_contract_sha256": "c" * 64,
+                "search_process_receipt_sha256": process_sha,
+                "precommit_sha256": precommit_sha,
+            },
+            "completion": {"cell_run_receipt_sha256": run_sha,
+                           "account_artifact_sha256": "0" * 64},
+            "selected_slots": selected_slots,
+            "end_grid_rows": {slot["slot_id"]: {"path": item["path"],
+                                               "row_sha256": item["row_sha256"]}
+                              for slot, item in zip(selected_slots, appended, strict=True)},
+            "qualification_authority": False, "capital_authority": False,
+            "live_authority": False, "order_authority": False,
+        })
+        args.update(source_fence_path=fence, source_fence_sha256=fence_sha)
+        return context, entries, args, grid_root, tuple(rows)
+
+    def test_native_completion_archives_owned_payload_and_retains_exact_full_grid(self):
+        context, entries, args, grid_root, rows = self.native_completion_fixture()
+        result = spool.retire_completed_generation(context.root, **args)
+        self.assertEqual(result["status"], "ARCHIVED_RECORD_ONLY")
+        self.assertIs(result["payloads_retained"], False)
+        self.assertIs(result["genuine_cold_reopen_available"], False)
+        self.assertEqual(grid.read_end_grid(grid_root, "XAGUSD"), rows)
+        self.assertEqual(spool.read_generation_retirement(
+            context.root, expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA
+        ), result)
+        for entry in entries:
+            self.assertFalse((context.root / entry["descriptor"]["relative_path"]).exists())
+        with self.assertRaisesRegex(spool.AuthoritySpoolError, "GENERATION_WORKSPACE_TERMINAL"):
+            spool.reopen_generation_context(context.root)
+
+    def test_native_no_trade_receipt_mismatch_refuses_before_owned_payload_release(self):
+        context, entries, args, grid_root, rows = self.native_completion_fixture(mismatched_run=True)
+        payloads = {context.root / entry["descriptor"]["relative_path"]:
+                    (context.root / entry["descriptor"]["relative_path"]).read_bytes()
+                    for entry in entries}
+        with self.assertRaisesRegex(spool.AuthoritySpoolError, "RETIREMENT_GRID_READBACK_REQUIRED"):
+            spool.retire_completed_generation(context.root, **args)
+        self.assertFalse(args["retirement_receipt_path"].exists())
+        self.assertFalse((context.root / "generation-archived.json").exists())
+        self.assertFalse((context.root / "generation-retirement.json").exists())
+        self.assertEqual(grid.read_end_grid(grid_root, "XAGUSD"), rows)
+        for path, data in payloads.items():
+            self.assertEqual(path.read_bytes(), data)
+
     def test_default_context_schema_and_hash_are_unchanged(self):
         context, _, _ = self.fixture(owned=False)
         encoded = (context.root / spool.CONTEXT_RELATIVE_PATH).read_bytes()

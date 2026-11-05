@@ -34,6 +34,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import tempfile
 import time
 from typing import Any, Final, Iterable, Iterator, Mapping
 
@@ -673,6 +674,94 @@ class EndGridWriter:
                 _fail("GRID_READBACK_MISMATCH")
         return {"path": str(path), "row_sha256": verified.row_sha256, "appended": True,
                 "rows_in_file": len(rows)}
+
+    def append_many_same_symbol(self, rows: Iterable[EndGridRow]) -> list[dict[str, Any]]:
+        """Validate a complete same-symbol batch before publishing it atomically."""
+
+        def cycle_key(row: EndGridRow) -> tuple[str, str, str]:
+            return row.cell_id, row.cycle_start_utc, row.process_edition_sha256
+
+        pending: dict[tuple[str, str, str], tuple[EndGridRow, bytes]] = {}
+        symbol = None
+        batch_bytes = 0
+        for row in rows:
+            if type(row) is not EndGridRow:
+                _fail("ROW_TYPE_INVALID")
+            if row.schema_version != END_GRID_SCHEMA_VERSION:
+                _fail("ROW_SCHEMA_VERSION_NOT_CURRENT")
+            try:
+                serialized = row.to_bytes()
+            except (TypeError, ValueError):
+                _fail("ROW_NOT_SERIALIZABLE")
+            verified = row_from_dict(json.loads(serialized.decode("ascii")))
+            if symbol is None:
+                symbol = verified.symbol
+            if verified.symbol != symbol:
+                _fail("GRID_BATCH_SYMBOL_MISMATCH")
+            key = cycle_key(verified)
+            if key in pending:
+                _fail("GRID_BATCH_DUPLICATE_CYCLE")
+            raw = verified.to_bytes()
+            if len(raw) > MAX_ROW_BYTES:
+                _fail("ROW_TOO_LARGE")
+            batch_bytes += len(raw) + 1
+            if batch_bytes > MAX_FILE_BYTES:
+                _fail("GRID_FILE_TOO_LARGE")
+            pending[key] = verified, raw + b"\n"
+
+        if symbol is None:
+            _fail("GRID_BATCH_EMPTY")
+        path = _symbol_file(self.root, symbol)
+        lock_path = path.with_name(path.name + ".lock")
+        _refuse_reparse(lock_path)
+        with _locked(lock_path):
+            _refuse_reparse(path)
+            existing = read_end_grid(self.root, symbol)
+            existing_by_cycle = {cycle_key(row): row for row in existing}
+            if len(existing_by_cycle) != len(existing):
+                _fail("GRID_EXISTING_DUPLICATE_CYCLE")
+            additions = []
+            descriptors = []
+            for key, (row, raw) in pending.items():
+                if row.view_contract_sha256 is not None:
+                    load_view_contract(self.root, row.view_contract_sha256)
+                prior = existing_by_cycle.get(key)
+                if prior is not None and prior.to_bytes() != row.to_bytes():
+                    _fail("CELL_CYCLE_ALREADY_RECORDED")
+                if prior is None:
+                    additions.append(raw)
+                descriptors.append({"path": str(path), "row_sha256": row.row_sha256,
+                                    "appended": prior is None})
+
+            if additions:
+                before = b""
+                if path.exists():
+                    with path.open("rb") as handle:
+                        before = handle.read(MAX_FILE_BYTES + 1)
+                if len(before) + sum(map(len, additions)) > MAX_FILE_BYTES:
+                    _fail("GRID_FILE_TOO_LARGE")
+                expected = before + b"".join(additions)
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False,
+                    ) as handle:
+                        temporary = Path(handle.name)
+                        if handle.write(expected) != len(expected):
+                            _fail("GRID_TEMPORARY_WRITE_INCOMPLETE")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temporary, path)
+                    temporary = None
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                with path.open("rb") as handle:
+                    if handle.read(len(expected) + 1) != expected:
+                        _fail("GRID_READBACK_MISMATCH")
+
+            final_count = len(existing) + len(additions)
+            return [{**descriptor, "rows_in_file": final_count} for descriptor in descriptors]
 
 
 def read_end_grid(root: Any, symbol: str | None = None) -> tuple[EndGridRow, ...]:

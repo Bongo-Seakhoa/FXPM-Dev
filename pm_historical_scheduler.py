@@ -155,6 +155,7 @@ def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dic
         _fail("DECLARED_SCHEDULER_CONTRACT_INVALID")
     groups: dict[str, list[dict[str, Any]]] = {}
     roots: list[Path] = []
+    native_outputs = []
     runs: set[str] = set()
     for index, row in enumerate(owned["cells"]):
         if (type(row) is not dict or type(row.get("root")) is not str or not row["root"]
@@ -173,14 +174,32 @@ def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dic
                 or type(policy["lead_seconds"]) is not int or policy["lead_seconds"] < 0
                 or type(policy["validity_seconds"]) is not int or policy["validity_seconds"] <= 0):
             _fail("DECLARED_SCHEDULER_WINDOW_POLICY_REQUIRED", index)
-        root = Path(row["root"]).resolve()
+        supplied_root = Path(row["root"])
+        if "native_finalization" in row:
+            import pm_authority_spool as spool
+
+            if ("m5_development" in row or not supplied_root.is_absolute() or ".." in supplied_root.parts
+                    or any(part in {"real_control", "STOP", ".git"} for part in supplied_root.parts)):
+                _fail("DECLARED_NATIVE_FINALIZATION_PATH_INVALID")
+            spool._reject_reparse_chain(supplied_root)
+        root = supplied_root.resolve()
         if row["run_id"] in runs or any(root == prior or root in prior.parents or prior in root.parents for prior in roots):
             _fail("DECLARED_SCHEDULER_CELL_NAMESPACE_COLLISION", index)
         runs.add(row["run_id"])
         roots.append(root)
         row["root"] = str(root)
         row["descriptor_index"] = index
+        if "native_finalization" in row:
+            policy = row["native_finalization"]
+            grid_root, fence_path, receipt_path = _declared_native_finalization_paths(policy)
+            policy.update(end_grid_root=str(grid_root), source_fence_path=str(fence_path))
+            policy["retirement"]["receipt_path"] = str(receipt_path)
+            native_outputs.extend((grid_root, fence_path, receipt_path))
         groups.setdefault(row["cell"]["symbol"], []).append(row)
+    for ordinal, path in enumerate(native_outputs):
+        if any(path == other or path in other.parents or other in path.parents
+               for other in (*roots, *native_outputs[:ordinal])):
+            _fail("DECLARED_NATIVE_FINALIZATION_PATH_OVERLAP")
     return owned, groups
 
 
@@ -370,6 +389,424 @@ def _declared_reopen_process(context, precommit_path):
         expected_receipt_sha256=hint)
 
 
+def _declared_native_finalization_paths(policy):
+    from pathlib import Path
+    import pm_authority_spool as spool
+
+    if (type(policy) is not dict or set(policy) != {"end_grid_root", "source_fence_path", "retirement"}
+            or type(policy["retirement"]) is not dict
+            or set(policy["retirement"]) != {"receipt_path", "max_paths", "max_nodes", "max_bytes"}
+            or any(type(policy["retirement"][key]) is not int or policy["retirement"][key] <= 0
+                   for key in ("max_paths", "max_nodes", "max_bytes"))):
+        _fail("DECLARED_NATIVE_FINALIZATION_POLICY_INVALID")
+    paths = []
+    for value in (policy["end_grid_root"], policy["source_fence_path"], policy["retirement"]["receipt_path"]):
+        if (type(value) is not str or not Path(value).is_absolute() or ".." in Path(value).parts
+                or any(part in {"real_control", "STOP", ".git"} for part in Path(value).parts)):
+            _fail("DECLARED_NATIVE_FINALIZATION_PATH_INVALID")
+        path = Path(value)
+        spool._reject_reparse_chain(path)
+        paths.append(path.resolve())
+    return tuple(paths)
+
+
+def _declared_native_cell_contract_sha256(contract, row, limits):
+    from dataclasses import asdict
+
+    return _declared_m5_hash({"schema_version": contract["schema_version"],
+        "native_universe_sha256": contract["native_universe_sha256"], "config_sha256": contract["config_sha256"],
+        "profile_sha256": contract["profile_sha256"], "active_config_path": contract["active_config_path"],
+        "spool_limits": asdict(limits),
+        "cell": {key: value for key, value in row.items() if key != "descriptor_index"}})
+
+
+def _declared_native_finalization_preflight(contract, row, config, limits, *, fresh):
+    from pathlib import Path
+    import sys
+    import pm_authority_spool as spool
+    import pm_end_grid as grid
+
+    policy = row["native_finalization"]
+    grid_root, fence_path, receipt_path = _declared_native_finalization_paths(policy)
+    source_modules = ("pm_authority_spool_quota", "pm_historical_search_producer", "pm_historical_production_adapter",
+        "pm_authoritative_search_execution", "pm_forward_oos_replay_producer", "pm_causal_evidence_producer",
+        "pm_historical_anchor_orchestration", "pm_production_search_planner", "pm_production_config_binding",
+        "pm_training_horizon", "pm_winner_raw_evidence", "pm_core", "pm_native_prefix_production", "pm_spread_profile")
+    source_paths = tuple(Path(file).resolve() for name in source_modules
+        if type(file := getattr(sys.modules.get(name), "__file__", None)) is str)
+    protected = (Path(config.data_dir).resolve(), Path(contract["active_config_path"]).resolve(),
+                 Path(__file__).resolve(), Path(spool.__file__).resolve(), Path(grid.__file__).resolve(), *source_paths)
+    root = Path(row["root"])
+    if (any(part in {"real_control", "STOP", ".git"} for part in root.parts)
+            or any(path == held or path in held.parents or held in path.parents
+                   for path in (root, grid_root, fence_path, receipt_path) for held in protected)
+            or policy["retirement"]["max_bytes"] > limits.max_generation_bytes):
+        _fail("DECLARED_NATIVE_FINALIZATION_PATH_OVERLAP")
+    spool._reject_reparse_chain(root)
+    grid._grid_root(grid_root)
+    if not fence_path.parent.is_dir() or not receipt_path.parent.is_dir():
+        _fail("DECLARED_NATIVE_FINALIZATION_PARENT_REQUIRED")
+    if fresh and ((root.exists() and (not root.is_dir() or any(root.iterdir())))
+                  or any(grid_root.iterdir()) or fence_path.exists() or receipt_path.exists()):
+        _fail("DECLARED_NATIVE_FINALIZATION_FRESH_PATH_REQUIRED")
+    return (*protected, grid_root, fence_path)
+
+
+def _declared_native_archive_binding(record, row, digest):
+    policy = row["native_finalization"]
+    if (type(record) is not dict or record.get("status") != "ARCHIVED_RECORD_ONLY"
+            or record.get("generation_id") != row["run_id"] or record.get("cell_id") != row["cell"]["cell_id"]
+            or record.get("cell_contract_sha256") != digest
+            or record.get("retirement_receipt_path") != policy["retirement"]["receipt_path"]
+            or type(record.get("source_fence")) is not dict
+            or record["source_fence"].get("path") != policy["source_fence_path"]):
+        _fail("DECLARED_NATIVE_ARCHIVE_CONTRACT_CHANGED")
+
+
+def _declared_native_completed_records(context, *, row, precommit, process, artifact, run_body, profile_sha):
+    """Join original saved bytes after the native ACCOUNT producer or verifier returns."""
+    import pm_authority_spool as spool
+    import pm_causal_evidence_producer as causal
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_historical_search_producer as producer
+
+    parent = precommit.to_dict()
+    slots = orchestration.declared_slot_selected_slots(parent)
+    cell_id, symbol = row["cell"]["cell_id"], row["cell"]["symbol"]
+    if (len(slots) != 13 or type(run_body) is not dict
+            or run_body.get("schema_version") != producer.DECLARED_CELL_RUN_SCHEMA
+            or run_body.get("terminal_stop") is not False or "terminal_failure" in run_body
+            or run_body.get("completed_slots") != len(slots) or run_body.get("declared_slots") != len(slots)
+            or run_body.get("generation_context_sha256") != context.context_sha256
+            or run_body.get("precommit_sha256") != precommit.receipt_sha256
+            or run_body.get("cell_id") != cell_id):
+        _fail("DECLARED_NATIVE_FINALIZATION_SAVED_RUN_REQUIRED")
+    run = _declared_run_descriptor(precommit, row, run_body)
+    saved = producer._read_declared_record(context, run["relative_path"])
+    if saved is None or saved[0] != run_body or saved[1] != run["sha256"] or saved[2]["size_bytes"] != run["size_bytes"]:
+        _fail("DECLARED_NATIVE_FINALIZATION_SAVED_RUN_REQUIRED")
+    account = causal._read_descriptor_json(context, artifact.descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
+    causal._verify_declared_cell_account_manifest(context, account, artifact.descriptor)
+    if (account.get("progress_status") != "COMPLETE" or type(account.get("account")) is not dict
+            or account.get("generation_context_sha256") != context.context_sha256
+            or account.get("declared_precommit_sha256") != precommit.receipt_sha256
+            or account.get("search_process_receipt_sha256") != process.receipt_sha256
+            or account.get("cell") != row["cell"]
+            or any(account.get(key) is not False for key in
+                   ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_NATIVE_FINALIZATION_ACCOUNT_BINDING_INVALID")
+    entries, summaries = account["declared_commit_artifacts"], account["slot_summaries"]
+    manifest = producer._read_declared_record(context,
+        spool._manifest_relative_path(symbol, spool.GENERAL_MANIFEST_DOMAIN),
+        maximum_bytes=context.limits.max_manifest_bytes)
+    if (type(entries) is not list or type(summaries) is not list or len(entries) != len(slots)
+            or len(summaries) != len(slots) or manifest is None
+            or producer._declared_symbol_receipt(context, symbol, manifest[2]) != run_body.get("symbol_receipt")
+            or manifest[0].get("artifacts") != entries):
+        _fail("DECLARED_NATIVE_FINALIZATION_RUN_MANIFEST_INVALID")
+    proofs, schedule, outcomes, owners = {}, [], [], []
+    previous = None
+    for ordinal, (slot, entry, summary) in enumerate(zip(slots, entries, summaries, strict=True), 1):
+        stored = producer._read_declared_commit(context, producer._declared_commit_path(precommit, cell_id, ordinal))
+        if stored is None:
+            _fail("DECLARED_NATIVE_FINALIZATION_SLOT_PROOF_REQUIRED")
+        commit, commit_sha, descriptor = stored
+        key = slot["slot_id"]
+        if (slot["ordinal"] != ordinal or key in proofs
+                or entry != producer._declared_commit_artifact(slot, descriptor)
+                or summary != producer._declared_slot_summary(commit, commit_sha)
+                or commit.get("schema_version") != producer.DECLARED_SLOT_COMMIT_SCHEMA
+                or commit.get("generation_context_sha256") != context.context_sha256
+                or commit.get("precommit_sha256") != precommit.receipt_sha256
+                or commit.get("previous_commit_sha256") != previous
+                or commit.get("cell_id") != cell_id or commit.get("slot_id") != key or commit.get("ordinal") != ordinal):
+            _fail("DECLARED_NATIVE_FINALIZATION_SLOT_PROOF_REQUIRED")
+        completion = commit["completion"]
+        status, owner = completion["status"], completion.get("owner")
+        if ((status == "OWNER" and (type(owner) is not dict or owner.get("schema_version") != "fxpm.declared-slot-owner.v1"
+                                   or owner.get("cell_id") != cell_id or owner.get("slot_id") != key))
+                or (status == "NO_TRADE" and owner is not None) or status not in ("OWNER", "NO_TRADE")):
+            _fail("DECLARED_NATIVE_FINALIZATION_SLOT_PROOF_REQUIRED")
+        if owner is not None:
+            owners.append(owner)
+        outcomes.append({"slot_id": key, "status": status})
+        schedule.append({"slot_id": key, "ordinal": ordinal, "start_utc": slot["activation_utc"],
+            "end_exclusive_utc": slot["end_exclusive_utc"], "status": status,
+            "owner_id": None if owner is None else owner["owner_id"]})
+        proofs[key] = _declared_native_grid_proof(context, row=row, slot=slot, commit=commit, profile_sha=profile_sha)
+        previous = commit_sha
+    if (run_body.get("last_commit_sha256") != previous or run_body.get("slot_commits") != outcomes
+            or account.get("slot_schedule") != schedule
+            or [entry["owner"] for entry in account["owner_records"]] != owners):
+        _fail("DECLARED_NATIVE_FINALIZATION_RUN_BINDING_INVALID")
+    return parent, slots, proofs, summaries, run
+
+
+def _declared_native_grid_proof(context, *, row, slot, commit, profile_sha):
+    import hashlib
+    import pm_historical_production_adapter as adapter
+
+    cell, completion = row["cell"], commit["completion"]
+    if completion.get("frozen_plan_receipt") is None:
+        _fail("DECLARED_NATIVE_FINALIZATION_TIER_PROOF_REQUIRED")
+    request = completion["request_body"]
+    cutoff = request["anchor"]["selection_cutoff_utc"]
+    source_entry = completion["source_session_entry"]
+    entries = {entry["artifact_id"]: entry for entry in commit["artifact_roster"]}
+    if (len(entries) != len(commit["artifact_roster"]) or source_entry not in entries.values()
+            or _declared_m5_utc(cutoff) != _declared_m5_utc(slot["native_cutoff_utc"])):
+        _fail("DECLARED_NATIVE_FINALIZATION_SOURCE_PROOF_REQUIRED")
+    session = adapter._reopen_ascii_json_entry(context, source_entry,
+        expected_type="declared_slot_source_session", code="DECLARED_NATIVE_FINALIZATION_SOURCE_PROOF_REQUIRED")
+    index_descriptor = session["native_prefix_index_descriptor"]
+    index = adapter._reopen_worker_json_descriptor(context, index_descriptor,
+        maximum_bytes=context.limits.max_json_bytes, code="DECLARED_NATIVE_FINALIZATION_SOURCE_PROOF_REQUIRED")
+    source = adapter._rebuild_source_decision(completion["source_group"])
+    source_body = source.to_dict()
+    activation, native, continuity = index["activation"], index["source"], index["continuity"]
+    view = {"schema_version": "fxpm.broker-native-end-grid-view.v1", "symbol": cell["symbol"],
+        "timeframe": cell["timeframe"], "cutoff_utc": cutoff, "activation_id": activation["activation_id"],
+        "activation_manifest_sha256": activation["manifest_sha256"], "activation_entry_sha256": activation["entry_sha256"],
+        "native_bars_sha256": native["bars_sha256"], "continuity_policy_sha256": continuity["policy"]["sha256"],
+        "continuity_geometry_sha256": continuity["geometry_sha256"]}
+    if (session.get("request_sha256") != completion["request_sha256"]
+            or session.get("selection_cutoff_utc") != cutoff or index["cutoff_utc"] != cutoff
+            or session.get("source_state") != "AVAILABLE" or index["source_state"] != "AVAILABLE"
+            or session.get("source_accessed_at_utc") != index["source_accessed_at_utc"]
+            or session.get("native_prefix_index_sha256") != index_descriptor["sha256"]
+            or session.get("source_group_decision_sha256") != source.receipt_sha256
+            or source_body.get("source_group_evidence_sha256") != index_descriptor["sha256"]
+            or any(index[key] != cell[key] or source_body[key] != cell[key] for key in ("symbol", "timeframe"))
+            or any(source_body[key] != view[key] for key in
+                   ("activation_id", "activation_manifest_sha256", "activation_entry_sha256"))
+            or source_body["native_source_sha256"] != view["native_bars_sha256"]
+            or not all(_declared_digest(view[key]) for key in view if key.endswith("_sha256"))):
+        _fail("DECLARED_NATIVE_FINALIZATION_SOURCE_PROOF_REQUIRED")
+    prefix = f"{request['artifact_namespace']}/winner-search/{cell['timeframe']}/{cell['regime']}/frozen/"
+    receipt, pair_entry, commitment_entry = (entries.get(prefix + name) for name in
+        ("receipt", "frozen_tier_pair_contract", "precommitment"))
+    if (receipt is None or receipt["artifact_type"] != "winner_frozen_search_plan_receipt"
+            or receipt["descriptor"] != completion.get("frozen_plan_receipt")
+            or pair_entry is None or pair_entry["artifact_type"] != "winner_frozen_tier_pair_contract"
+            or commitment_entry is None or commitment_entry["artifact_type"] != "winner_precommitment"):
+        _fail("DECLARED_NATIVE_FINALIZATION_TIER_PROOF_REQUIRED")
+    code = "DECLARED_NATIVE_FINALIZATION_TIER_PROOF_REQUIRED"
+    pair, pair_bytes = adapter._reopen_worker_ascii_json_descriptor(context, pair_entry["descriptor"],
+        maximum_bytes=context.limits.max_json_bytes, code=code)
+    commitment, _ = adapter._reopen_worker_ascii_json_descriptor(context, commitment_entry["descriptor"],
+        maximum_bytes=context.limits.max_json_bytes, code=code)
+    source_contract = source_body["source_contract_sha256"]
+    levels = pair["tiers"]
+    if (not _declared_digest(source_contract) or commitment.get("source_contract_sha256") != source_contract
+            or commitment.get("frozen_tier_pair_contract") != pair
+            or commitment.get("frozen_tier_pair_contract_sha256") != hashlib.sha256(pair_bytes).hexdigest()
+            or [level["tier"] for level in levels] != ["P75", "P95"]
+            or any(level["frozen_spread_tier"]["profile_sha256"] != profile_sha for level in levels)):
+        _fail(code)
+    owner = completion.get("owner")
+    if owner is None:
+        outcome, reason, tier = "NO_TRADE", completion["reason_code"], "P75"
+        evidence = {"semantics": "BOUND_BASELINE_DESCRIPTOR_NO_SELECTED_WINNER", "tier": tier,
+            "bound_baseline_descriptor": levels[0]["frozen_spread_tier"]}
+        family = configuration = None
+    else:
+        outcome, reason, tier = "WINNER", "DECLARED_NATIVE_VERIFIED_OWNER", owner["selected_tier"]
+        selected, artifacts = owner["selected_attempt"], owner["selected_artifacts"]
+        trial, winner_process = artifacts["trial_definition"], artifacts["winner_process"]
+        if (selected["trial_definition_sha256"] != _declared_m5_hash(trial)
+                or selected["encoded_parameters"] != trial["parameters"]
+                or selected["process_sha256"] != _declared_m5_hash(winner_process)
+                or selected["strategy_id"] != winner_process["strategy_id"]
+                or _declared_m5_utc(owner["selection_cutoff_utc"]) != _declared_m5_utc(cutoff)
+                or tier != owner["selected_marginal_receipt"]["validated_cost_ladder_tolerance"]["tier"]
+                or [level for level in levels if level["tier"] == tier] != [owner["selected_tier_contract"]]):
+            _fail("DECLARED_NATIVE_FINALIZATION_OWNER_PROOF_REQUIRED")
+        evidence = {"semantics": "VERIFIED_SELECTED_OWNER_TIER", "tier": tier,
+            "selected_tier_contract": owner["selected_tier_contract"]}
+        family, configuration = winner_process["strategy_family"], selected["trial_definition_sha256"]
+    return view, evidence, source_entry["descriptor"]["sha256"], index_descriptor["sha256"], session["source_accessed_at_utc"], {
+        "outcome": outcome, "reason_code": reason, "cost_tier": tier, "source_contract_sha256": source_contract,
+        "strategy_family": family, "configuration_sha256": configuration}
+
+
+def _declared_native_retirement_preflight(context, workspace_sha, *, protected, direct, locks,
+        fence_path, fence_sha, retirement):
+    """Check retirement bounds without publishing intent or taking write locks."""
+    from pathlib import Path, PurePosixPath
+    import shutil
+    import pm_authority_spool as spool
+
+    fence_path = Path(fence_path)
+    receipt_path = Path(retirement["receipt_path"])
+    spool._relative_parts(fence_path.name)
+    spool._relative_parts(receipt_path.name)
+    owned = frozenset(direct)
+    max_paths, max_nodes, max_bytes = (retirement[key] for key in ("max_paths", "max_nodes", "max_bytes"))
+    if len(owned) != len(direct) or len(owned) > max_paths:
+        _fail("RETIREMENT_DIRECT_PATH_INVALID")
+    for relative in owned:
+        if len(relative.encode("utf-8")) > 4096:
+            _fail("RETIREMENT_DIRECT_PATH_INVALID")
+        spool._relative_parts(relative)
+    expected_locks = {relative for relative in owned if PurePosixPath(relative).name.casefold() == "units.lock"}
+    if len(locks) > max_paths or len(set(locks)) != len(locks) or set(locks) != expected_locks:
+        _fail("RETIREMENT_UNIT_LOCK_PATHS_INVALID")
+    for relative in locks:
+        _, size, value = spool._stream_file(context.root, relative, maximum_bytes=1, collect=True)
+        if size != 1 or value != b"0":
+            _fail("RETIREMENT_UNIT_LOCK_UNVERIFIED")
+    quota = spool.spool_quota._read_state(context.root)
+    if quota is not None and quota["reservations"]:
+        _fail("SPOOL_RETIREMENT_RESERVATIONS_PRESENT")
+    if receipt_path.exists():
+        _fail("RETIREMENT_RECEIPT_ALREADY_EXISTS")
+    records, _, root_bytes, nodes = spool._retirement_inventory(context.root, owned,
+        max_paths=max_paths, max_nodes=max_nodes, max_bytes=max_bytes, retained_unit_locks=locks)
+    # Match the serialized intent that the locked retirement will validate again.
+    arguments = {"source_fence_path": str(fence_path), "source_fence_sha256": fence_sha,
+        "retirement_receipt_path": str(receipt_path), "workspace_owner_sha256": workspace_sha,
+        "protected_paths": [str(Path(path).resolve()) for path in protected],
+        "owned_direct_files": sorted(owned), "unit_lock_paths": list(locks),
+        "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes}
+    intent = {"schema_version": spool.RETIREMENT_SCHEMA, "generation_context_sha256": context.context_sha256,
+        "arguments": arguments, "files": records}
+    maximum = min(context.limits.max_json_bytes, 64 * 1024**2)
+    control_bytes = len(spool._canonical_json_bytes(intent, maximum)) + 2 * spool.MAX_CONTEXT_BYTES
+    if (nodes + 3 > max_nodes or root_bytes + control_bytes > min(max_bytes, context.limits.max_generation_bytes)
+            or shutil.disk_usage(context.root).free - control_bytes < context.limits.min_free_bytes):
+        _fail("RETIREMENT_CONTROL_CAPACITY")
+
+
+def _declared_native_finalize_account(result, *, context, contract, row, config, precommit, process,
+        artifact, run_body, workspace_sha, cell_contract_sha256):
+    import hashlib
+    import os
+    from pathlib import Path
+    import pm_authority_spool as spool
+    import pm_end_grid as grid
+
+    writing = False
+    policy = row["native_finalization"]
+    try:
+        if result["run_receipt"] is None:
+            _fail("DECLARED_NATIVE_FINALIZATION_SAVED_RUN_REQUIRED")
+        if workspace_sha is None:
+            _fail("DECLARED_NATIVE_FINALIZATION_OWNED_WORKSPACE_REQUIRED")
+        protected = _declared_native_finalization_preflight(contract, row, config, context.limits, fresh=False)
+        renewal = context.root / "declared-slots" / precommit.receipt_sha256 / "source-access-renewal"
+        if os.path.lexists(renewal):
+            _fail("DECLARED_NATIVE_FINALIZATION_RENEWAL_NOT_OWNED")
+        parent, slots, proofs, summaries, run = _declared_native_completed_records(context, row=row,
+            precommit=precommit, process=process, artifact=artifact, run_body=run_body,
+            profile_sha=contract["profile_sha256"])
+        if result["run_receipt"] != run:
+            _fail("DECLARED_NATIVE_FINALIZATION_SAVED_RUN_REQUIRED")
+        grid_root = policy["end_grid_root"]
+        symbol = row["cell"]["symbol"]
+        retained = grid.read_end_grid(grid_root, symbol)
+        code = dict(parent["source_identity"])
+        for file in (__file__, spool.__file__, grid.__file__):
+            path = Path(file)
+            code[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        planned, contracts, selected_slots = [], {}, []
+        produced = _declared_m5_grid_utc(_declared_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"))
+        for slot, summary in zip(slots, summaries, strict=True):
+            key = slot["slot_id"]
+            view, evidence, session_sha, index_sha, accessed, selection = proofs[key]
+            start, end, cutoff = (_declared_m5_grid_utc(slot[name]) for name in
+                ("activation_utc", "end_exclusive_utc", "native_cutoff_utc"))
+            reconstruction = {"schema_version": "fxpm.broker-native-end-grid-reconstruction.v1", "view": view,
+                "result": {"precommit_sha256": precommit.receipt_sha256, "cell_id": row["cell"]["cell_id"],
+                    "slot_id": key, "ordinal": slot["ordinal"], "cycle_start_utc": start, "cycle_end_utc": end,
+                    "completion_status": summary["status"], "reason_code": selection["reason_code"],
+                    "request_sha256": summary["request_sha256"], "slot_commit_sha256": summary["commit_sha256"],
+                    "source_session_sha256": session_sha, "native_prefix_index_sha256": index_sha,
+                    "source_accessed_at_utc": accessed,
+                    "saved_cell_run_receipt_sha256": run["sha256"]}, "cost_tier_evidence": evidence}
+            encoded = grid.canonical_bytes(reconstruction)
+            if len(encoded) > grid.MAX_CONTRACT_BYTES:
+                _fail("DECLARED_NATIVE_FINALIZATION_VIEW_CONTRACT_BOUND")
+            contract_sha = hashlib.sha256(encoded).hexdigest()
+            contracts[contract_sha] = reconstruction
+            prior = [item for item in retained if item.cell_id == row["cell"]["cell_id"]
+                and item.cycle_start_utc == start and item.process_edition_sha256 == process.receipt_sha256]
+            if len(prior) > 1:
+                _fail("DECLARED_NATIVE_FINALIZATION_GRID_CONFLICT")
+            record = grid.build_end_grid_row(symbol=symbol, timeframe=row["cell"]["timeframe"],
+                regime=row["cell"]["regime"], cycle_start_utc=start, cycle_end_utc=end, information_cutoff_utc=cutoff,
+                source_kind="broker_native", view_key=hashlib.sha256(grid.canonical_bytes(view)).hexdigest(),
+                view_contract_sha256=contract_sha,
+                source_identity={name: view[name] for name in
+                    ("activation_id", "activation_manifest_sha256", "activation_entry_sha256", "native_bars_sha256")},
+                no_trade_run_receipt_sha256=run["sha256"] if selection["outcome"] == "NO_TRADE" else None,
+                process_edition_sha256=process.receipt_sha256, code_sha256=code, metrics={},
+                produced_at_utc=prior[0].produced_at_utc if prior else produced, **selection)
+            if prior and prior[0].to_bytes() != record.to_bytes():
+                _fail("DECLARED_NATIVE_FINALIZATION_GRID_CONFLICT")
+            planned.append(record)
+            selected_slots.append({"slot_id": key, "cycle_start_utc": start, "cycle_end_utc": end,
+                "information_cutoff_utc": cutoff, "outcome": selection["outcome"]})
+        retirement = policy["retirement"]
+        fence_path = policy["source_fence_path"]
+        symbol_file = grid._symbol_file(grid._grid_root(grid_root), symbol)
+        rows = {slot["slot_id"]: {"path": str(symbol_file), "row_sha256": record.row_sha256}
+            for slot, record in zip(slots, planned, strict=True)}
+        fence_body = {"schema_version": spool.NATIVE_COMPLETION_FENCE_SCHEMA,
+            "workspace_owner_sha256": workspace_sha,
+            "binding": {"generation_context_sha256": context.context_sha256, "run_id": row["run_id"],
+                "cell_id": row["cell"]["cell_id"], "cell_contract_sha256": cell_contract_sha256,
+                "search_process_receipt_sha256": process.receipt_sha256, "precommit_sha256": precommit.receipt_sha256},
+            "completion": {"cell_run_receipt_sha256": run["sha256"], "account_artifact_sha256": artifact.descriptor["sha256"]},
+            "selected_slots": selected_slots, "end_grid_rows": rows,
+            "qualification_authority": False, "capital_authority": False,
+            "live_authority": False, "order_authority": False}
+        fence_maximum = 4 * 1024**2
+        fence_sha = hashlib.sha256(spool._canonical_json_bytes(fence_body, fence_maximum)).hexdigest()
+        if fence_sha != _declared_m5_hash(fence_body):
+            _fail("DECLARED_NATIVE_FINALIZATION_FENCE_ENCODING_UNSUPPORTED")
+        direct, locks, _ = _declared_owned_direct_files(context, precommit, row, max_paths=retirement["max_paths"])
+        _declared_native_retirement_preflight(context, workspace_sha, protected=protected,
+            direct=direct, locks=locks, fence_path=fence_path, fence_sha=fence_sha, retirement=retirement)
+        if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
+            _fail("DECLARED_NATIVE_FINALIZATION_DISK_LOW")
+        writing = True
+        for contract_sha, body in contracts.items():
+            if grid.store_view_contract(grid_root, body) != contract_sha or grid.load_view_contract(grid_root, contract_sha) != body:
+                _fail("DECLARED_NATIVE_FINALIZATION_VIEW_READBACK_MISMATCH")
+        receipts = grid.EndGridWriter(grid_root).append_many_same_symbol(planned)
+        observed = grid.read_end_grid(grid_root, symbol)
+        readback = {item.row_sha256: item.to_bytes() for item in observed}
+        if len(readback) != len(observed):
+            _fail("DECLARED_NATIVE_FINALIZATION_GRID_READBACK_MISMATCH")
+        for slot, record, receipt in zip(slots, planned, receipts, strict=True):
+            if ({name: receipt[name] for name in ("path", "row_sha256")} != rows[slot["slot_id"]]
+                    or readback.get(record.row_sha256) != record.to_bytes()):
+                _fail("DECLARED_NATIVE_FINALIZATION_GRID_READBACK_MISMATCH")
+        fence = _declared_m5_external_record(fence_path, fence_body, maximum_bytes=fence_maximum)
+        if fence["sha256"] != fence_sha:
+            _fail("DECLARED_NATIVE_FINALIZATION_FENCE_READBACK_MISMATCH")
+        record = spool.retire_completed_generation(context.root, expected_context_sha256=context.context_sha256,
+            workspace_owner_sha256=workspace_sha, source_fence_path=Path(fence_path),
+            source_fence_sha256=fence_sha, retirement_receipt_path=Path(retirement["receipt_path"]),
+            protected_paths=protected, owned_direct_files=direct, unit_lock_paths=locks,
+            max_paths=retirement["max_paths"], max_nodes=retirement["max_nodes"], max_bytes=retirement["max_bytes"])
+        _declared_native_archive_binding(record, row, cell_contract_sha256)
+        result["source_kind"] = "broker_native"
+        return _declared_m5_archived_row(result, record)
+    except Exception as exc:
+        if (context.root / spool.RETIREMENT_RELATIVE_PATH).exists():
+            result.update(status="NOT_RUN", reason_code="RETIREMENT_INCOMPLETE", run_receipt=None, account_descriptor=None,
+                descriptor_assurance="IDENTITY_ONLY_RETIREMENT_INCOMPLETE", genuine_cold_reopen_available=False)
+        else:
+            reason, diagnostics = _declared_m5_exception_reason(exc)
+            result.update(native_finalization_status="INCOMPLETE_RETAINED" if writing else "REFUSED_RETAINED",
+                native_finalization_reason_code=reason,
+                native_finalization_error_type=diagnostics["exception_type"])
+            if result["run_receipt"] is None:
+                result.update(status="NOT_RUN", reason_code=reason, native_account_status=result["status"])
+        return result
+
+
 def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, Any]:
     from datetime import datetime, timedelta
     from pathlib import Path
@@ -384,8 +821,23 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
     import pm_production_search_planner as planner
     import pm_spread_profile as spread
     result = _declared_cell_row(row, "FAILED", pid=os.getpid())
+    finalize_native = row.get("native_finalization") is not None
+    native_workspace_sha = None
+    loaded_config = None
     try:
         context_root = Path(row["root"])
+        limits = spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES) if finalize_native else None
+        if finalize_native:
+            digest = _declared_native_cell_contract_sha256(contract, row, limits)
+            archived = spool.read_generation_retirement(context_root,
+                expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
+            if archived is not None:
+                if archived["status"] != "ARCHIVED_RECORD_ONLY":
+                    result.update(status="NOT_RUN", reason_code="RETIREMENT_INCOMPLETE")
+                    return result
+                _declared_native_archive_binding(archived, row, digest)
+                result.update(source_kind="broker_native", recorded_before_dispatch=True)
+                return _declared_m5_archived_row(result, archived)
         if (context_root / spool.CONTEXT_RELATIVE_PATH).exists():
             context = spool.reopen_generation_context(context_root, expected_generation_id=row["run_id"],
                 expected_native_universe_sha256=contract["native_universe_sha256"], expected_config_sha256=contract["config_sha256"])
@@ -393,17 +845,29 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
             if not _declared_disk_ready(context_root, contract, DECLARED_CELL_MIN_FREE_BYTES):
                 result.update(status="NOT_RUN", reason_code="DISK_LOW")
                 return result
+            ownership = {}
+            if finalize_native:
+                loaded_config = binding.load_effective_pipeline_config(Path(contract["active_config_path"]))
+                _declared_native_finalization_preflight(contract, row, loaded_config[1], limits, fresh=True)
+                ownership["owned_workspace"] = {"cell_id": row["cell"]["cell_id"], "cell_contract_sha256": digest}
             context = spool.freeze_generation_context(context_root, generation_id=row["run_id"],
                 native_universe_sha256=contract["native_universe_sha256"], config_sha256=contract["config_sha256"],
-                limits=spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES))
+                limits=limits if finalize_native else spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES),
+                **ownership)
         with _declared_dispatch_lease(context) as acquired:
             if not acquired:
                 result.update(status="NOT_RUN", reason_code="BUSY")
                 return result
-            payload, supplied = binding.load_effective_pipeline_config(Path(contract["active_config_path"]))
+            payload, supplied = (loaded_config if loaded_config is not None
+                else binding.load_effective_pipeline_config(Path(contract["active_config_path"])))
             frozen = binding.freeze_production_pipeline_config(context, active_config_path=Path(contract["active_config_path"]),
                 config_payload=payload, supplied_config=supplied)
             config = frozen.materialize(context)
+            if finalize_native and (context.root / spool.WORKSPACE_OWNER_RELATIVE_PATH).exists():
+                workspace, native_workspace_sha = spool.read_owned_generation_workspace(context)
+                if (context.limits != limits or workspace["cell_id"] != row["cell"]["cell_id"]
+                        or workspace["cell_contract_sha256"] != digest):
+                    _fail("DECLARED_NATIVE_WORKSPACE_OWNER_CHANGED")
             records = sorted((context.root / "declared-slots").glob("*/precommit.json"))
             if len(records) > 1:
                 _fail("DECLARED_SCHEDULER_MULTIPLE_PRECOMMITS")
@@ -458,6 +922,7 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
             result["recorded_before_dispatch"] = recorded
             if progress.run_receipt is not None:
                 result["run_receipt"] = _declared_run_descriptor(precommit, row, progress.run_receipt)
+            run_body = progress.run_receipt
             if progress.terminal_stop:
                 result.update(status="TERMINAL_STOP", reason_code="RECORDED_TERMINAL_STOP")
                 return result
@@ -468,6 +933,10 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                     process=process, frozen_pipeline_config=frozen)
                 if existing is not None:
                     result.update(status="REOPENED", account_descriptor=dict(existing.descriptor))
+                    if finalize_native:
+                        return _declared_native_finalize_account(result, context=context, contract=contract, row=row,
+                            config=config, precommit=precommit, process=process, artifact=existing, run_body=run_body,
+                            workspace_sha=native_workspace_sha, cell_contract_sha256=digest)
                     return result
             if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
                 result.update(status="NOT_RUN", reason_code="DISK_LOW")
@@ -506,6 +975,10 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                 return result
             artifact, reopened = _declared_account(context, precommit, process, frozen, config)
             result.update(status="REOPENED" if reopened else "COMPLETED", account_descriptor=dict(artifact.descriptor))
+            if finalize_native:
+                return _declared_native_finalize_account(result, context=context, contract=contract, row=row,
+                    config=config, precommit=precommit, process=process, artifact=artifact, run_body=run_body,
+                    workspace_sha=native_workspace_sha, cell_contract_sha256=digest)
             return result
     except Exception as exc:
         if spool.is_resource_capacity_error(exc):
@@ -542,7 +1015,8 @@ def declared_symbol_worker(contract: Mapping[str, Any], symbol: str) -> dict[str
         if row["status"] == "NOT_RUN" and row["reason_code"] == "DISK_LOW":
             stop_reason = "DISK_LOW"
             stopped = True
-        if (contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
+        if ((contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
+                or "native_finalization" in cell)
                 and row["status"] == "NOT_RUN" and row["reason_code"].startswith(
                     ("RETIREMENT_", "SPOOL_RETIREMENT_", "WORKSPACE_ROOT_"))):
             stop_reason = row["reason_code"]
@@ -582,7 +1056,9 @@ def _declared_validate_result(value: Any, cells: Sequence[Mapping[str, Any]], sy
             _fail("DECLARED_SCHEDULER_CELL_PRECOMMIT_INVALID")
         if row["status"] == "ARCHIVED":
             archive = row.get("archive_record")
-            if ("m5_development" not in expected or row.get("source_kind") != "m5_derived"
+            source_kind = ("m5_derived" if "m5_development" in expected else
+                "broker_native" if "native_finalization" in expected else None)
+            if (source_kind is None or row.get("source_kind") != source_kind
                     or row.get("descriptor_assurance") != "IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE"
                     or row.get("genuine_cold_reopen_available") is not False
                     or not _declared_digest(row.get("generation_context_sha256"))
@@ -590,7 +1066,8 @@ def _declared_validate_result(value: Any, cells: Sequence[Mapping[str, Any]], sy
                     or type(archive["path"]) is not str or not _declared_digest(archive["sha256"])
                     or not Path(archive["path"]).is_absolute()
                     or row.get("run_receipt") is not None or row.get("account_descriptor") is not None):
-                _fail("DECLARED_M5_ARCHIVED_RESULT_INVALID")
+                _fail("DECLARED_NATIVE_ARCHIVED_RESULT_INVALID" if source_kind == "broker_native"
+                    else "DECLARED_M5_ARCHIVED_RESULT_INVALID")
         receipt = row.get("run_receipt")
         if receipt is not None:
             if (type(receipt) is not dict or set(receipt) != {"relative_path","sha256","size_bytes"}
@@ -614,6 +1091,24 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
     from pathlib import Path
     import pm_authority_spool as spool
     if row.get("status") == "ARCHIVED":
+        if contract.get("schema_version") == DECLARED_SCHEDULER_SCHEMA and row.get("source_kind") == "broker_native":
+            expected = next(cell for cell in contract["cells"] if cell["descriptor_index"] == row["descriptor_index"])
+            if "native_finalization" not in expected:
+                _fail("DECLARED_NATIVE_ARCHIVED_RESULT_INVALID")
+            limits = spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES)
+            record = spool.read_generation_retirement(Path(row["root"]),
+                expected_context_sha256=row["generation_context_sha256"],
+                expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
+            _declared_native_archive_binding(record, expected, _declared_native_cell_contract_sha256(contract, expected, limits))
+            if (record["retirement_receipt_sha256"] != row["archive_record"]["sha256"]
+                    or record["retirement_receipt_path"] != row["archive_record"]["path"]
+                    or record["source_fence"] != row["archived_result_reference"]
+                    or record["end_grid_rows"] != row["retained_end_grid_rows"]
+                    or record["precommit_sha256"] != row["precommit_sha256"]):
+                _fail("DECLARED_NATIVE_ARCHIVE_RECORD_CHANGED")
+            if type(row) is dict:
+                row["archive_record_confirmed"] = True
+            return None
         if contract.get("schema_version") != DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA:
             _fail("DECLARED_M5_ARCHIVED_RESULT_INVALID")
         record = spool.read_generation_retirement(Path(row["root"]),
@@ -2091,7 +2586,30 @@ def _declared_m5_no_plan_shape(verified):
 
 def _declared_m5_owned_direct_files(context, precommit, row, *, process, frozen, m5_owner,
         cost_edition, commits):
-    """Classify original request/unit metadata; never open their Raw payloads."""
+    import pm_historical_search_producer as producer
+    import pm_historical_production_adapter as adapter
+
+    def verified_no_plan(slot):
+        commit = commits[slot["slot_id"]]
+        completion = commit["completion"]
+        if not _declared_m5_no_plan_shape(completion):
+            return None
+        verified = adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
+            completion=completion, artifact_roster=commit["artifact_roster"], frozen_pipeline_config=frozen,
+            m5_owner=m5_owner, m5_cost_edition=cost_edition)
+        if not _declared_m5_no_plan_shape(verified):
+            _fail("RETIREMENT_NO_PLAN_VERIFICATION_REQUIRED")
+        return verified
+
+    cell = row["cell"]["cell_id"]
+    return _declared_owned_direct_files(context, precommit, row,
+        max_paths=row["m5_development"]["retirement"]["max_paths"], verified_no_plan=verified_no_plan,
+        additional_direct=(producer._declared_terminal_path(precommit, cell),
+                           producer._declared_m5_cell_source_path(precommit, cell)))
+
+
+def _declared_owned_direct_files(context, precommit, row, *, max_paths, verified_no_plan=None, additional_direct=()):
+    """Classify original request/unit metadata without opening Raw payloads."""
     from pathlib import Path
     import re
     import os
@@ -2099,26 +2617,13 @@ def _declared_m5_owned_direct_files(context, precommit, row, *, process, frozen,
     import pm_authoritative_search_execution as execution
     import pm_historical_anchor_orchestration as orchestration
     import pm_historical_search_producer as producer
-    import pm_historical_production_adapter as adapter
     cell = row["cell"]["cell_id"]
     base = f"declared-slots/{precommit.receipt_sha256}/{cell}"
     direct = {f"declared-slots/{precommit.receipt_sha256}/precommit.json", base + "/run.lock",
-        producer._declared_run_path(precommit, cell), producer._declared_terminal_path(precommit, cell),
-        producer._declared_m5_cell_source_path(precommit, cell)}
+        producer._declared_run_path(precommit, cell), *additional_direct}
     unit_locks, observations = set(), []
     for slot in orchestration.declared_slot_selected_slots(precommit.to_dict()):
-        commit = commits[slot["slot_id"]]
-        completion = commit["completion"]
-        no_plan = False
-        if _declared_m5_no_plan_shape(completion):
-            verified = adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
-                completion=completion, artifact_roster=commit["artifact_roster"], frozen_pipeline_config=frozen,
-                m5_owner=m5_owner, m5_cost_edition=cost_edition)
-            if not _declared_m5_no_plan_shape(verified):
-                _fail("RETIREMENT_NO_PLAN_VERIFICATION_REQUIRED")
-            # Verifier006 checks the real source failure=None, COST_READY and
-            # zero-support receipts. This metadata test is not that proof.
-            no_plan = True
+        verified = None if verified_no_plan is None else verified_no_plan(slot)
         direct.add(producer._declared_commit_path(precommit, cell, slot["ordinal"]))
         starts = producer._declared_prior_attempt_starts(context, precommit, cell, slot)
         if not starts:
@@ -2137,7 +2642,7 @@ def _declared_m5_owned_direct_files(context, precommit, row, *, process, frozen,
                 _fail("RETIREMENT_REQUEST_OWNERSHIP_UNRESOLVED")
             unit_base = str(Path(execution._declared_unit_relative(request, "header.json")).parent).replace("\\", "/")
             directory = spool._local_path(context.root, unit_base)
-            if no_plan:
+            if verified is not None:
                 if _declared_m5_hash(request) != verified.get("request_sha256"):
                     _fail("RETIREMENT_NO_PLAN_VERIFICATION_REQUIRED")
                 try:
@@ -2165,7 +2670,7 @@ def _declared_m5_owned_direct_files(context, precommit, row, *, process, frozen,
             names = []
             with os.scandir(directory) as stream:
                 for item in stream:
-                    if len(names) >= row["m5_development"]["retirement"]["max_paths"]:
+                    if len(names) >= max_paths:
                         _fail("RETIREMENT_UNIT_OWNERSHIP_BOUND")
                     names.append(item.name)
             fixed = {"header.json", "evidence-completed.json", "raw-completion.json", "units.lock"}

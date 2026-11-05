@@ -40,6 +40,7 @@ TERMINAL_REFUSAL_FENCE_SCHEMA = "fxpm.declared-m5-terminal-refusal-fence.v1"
 TERMINAL_REFUSAL_RESULT_KIND = "TERMINAL_REFUSAL_SOURCE_NOT_COMPLETED"
 POST_SOURCE_ABORT_FENCE_SCHEMA = "fxpm.declared-m5-post-source-abort-fence.v1"
 POST_SOURCE_ABORT_RESULT_KIND = "POST_SOURCE_ABORT_SOURCE_NOT_COMPLETED"
+NATIVE_COMPLETION_FENCE_SCHEMA = "fxpm.declared-broker-native-completion-fence.v1"
 POST_SOURCE_ABORT_GRID_SOURCE_FIELDS = ("symbol", "timeframe", "activation_sha256", "bars_sha256",
     "sidecar_sha256", "provenance_sha256", "request_sha256", "spread_unit")
 DEFAULT_STREAM_CHUNK_BYTES = 1024 * 1024
@@ -1796,8 +1797,149 @@ def _retirement_post_source_abort_fence(body: dict, *, context_sha256: str, gene
     return body
 
 
+def _retirement_native_view_contract(contract: dict, row: Any, *, binding: dict,
+        completion: dict, slot_id: str, ordinal: int) -> None:
+    from datetime import datetime, timedelta
+
+    import pm_end_grid as end_grid
+
+    invalid = "RETIREMENT_NATIVE_VIEW_CONTRACT_INVALID"
+    if (set(contract) != {"schema_version", "view", "result", "cost_tier_evidence"}
+            or contract["schema_version"] != "fxpm.broker-native-end-grid-reconstruction.v1"):
+        _fail(invalid)
+    view, result, evidence = contract["view"], contract["result"], contract["cost_tier_evidence"]
+    source_keys = ("activation_id", "activation_manifest_sha256", "activation_entry_sha256", "native_bars_sha256")
+    view_sha_fields = {"activation_manifest_sha256", "activation_entry_sha256", "native_bars_sha256",
+        "continuity_policy_sha256", "continuity_geometry_sha256"}
+    if (type(view) is not dict or set(view) != {
+            "schema_version", "symbol", "timeframe", "cutoff_utc", "activation_id"} | view_sha_fields
+            or view["schema_version"] != "fxpm.broker-native-end-grid-view.v1"
+            or (view["symbol"], view["timeframe"]) != (row.symbol, row.timeframe)
+            or row.source_identity != {key: view[key] for key in source_keys}
+            or any(not _is_sha256(view[key]) for key in view_sha_fields)
+            or hashlib.sha256(end_grid.canonical_bytes(view)).hexdigest() != row.view_key):
+        _fail(invalid)
+    expected_result = {"precommit_sha256": binding["precommit_sha256"], "cell_id": row.cell_id,
+        "slot_id": slot_id, "ordinal": ordinal, "cycle_start_utc": row.cycle_start_utc,
+        "cycle_end_utc": row.cycle_end_utc,
+        "completion_status": "OWNER" if row.outcome == "WINNER" else "NO_TRADE",
+        "reason_code": row.reason_code, "saved_cell_run_receipt_sha256": completion["cell_run_receipt_sha256"]}
+    result_sha_fields = {"request_sha256", "slot_commit_sha256", "source_session_sha256", "native_prefix_index_sha256"}
+    if (type(result) is not dict or set(result) != set(expected_result) | result_sha_fields | {"source_accessed_at_utc"}
+            or type(result["ordinal"]) is not int
+            or any(result[key] != value for key, value in expected_result.items())
+            or any(not _is_sha256(result[key]) for key in result_sha_fields)):
+        _fail(invalid)
+    try:
+        cutoff = datetime.fromisoformat(view["cutoff_utc"])
+        accessed_at = datetime.fromisoformat(result["source_accessed_at_utc"])
+    except (TypeError, ValueError):
+        _fail(invalid)
+    if (cutoff.utcoffset() != timedelta(0) or accessed_at.utcoffset() != timedelta(0)
+            or cutoff != datetime.fromisoformat(row.information_cutoff_utc)):
+        _fail(invalid)
+    if row.outcome == "WINNER":
+        semantics, descriptor_key = "VERIFIED_SELECTED_OWNER_TIER", "selected_tier_contract"
+    else:
+        semantics, descriptor_key = "BOUND_BASELINE_DESCRIPTOR_NO_SELECTED_WINNER", "bound_baseline_descriptor"
+        if row.cost_tier != "P75":
+            _fail(invalid)
+    if (type(evidence) is not dict or set(evidence) != {"semantics", "tier", descriptor_key}
+            or evidence["semantics"] != semantics or evidence["tier"] != row.cost_tier
+            or type(evidence[descriptor_key]) is not dict or not evidence[descriptor_key]):
+        _fail(invalid)
+
+
+def _retirement_native_completion_fence(body: dict, *, context_sha256: str, generation_id: str,
+        cell_id: str, workspace_sha256: str, working_root: Path, owner: Optional[dict]) -> dict:
+    """Join caller-verified native completion identities to retained Grid evidence."""
+    from datetime import datetime, timedelta
+
+    import pm_end_grid as end_grid
+
+    invalid = "RETIREMENT_NATIVE_COMPLETION_FENCE_INVALID"
+    if (set(body) != {"schema_version", "workspace_owner_sha256", "binding", "completion",
+            "selected_slots", "end_grid_rows"} | set(end_grid.AUTHORITY_FLAGS)
+            or body["schema_version"] != NATIVE_COMPLETION_FENCE_SCHEMA
+            or body["workspace_owner_sha256"] != workspace_sha256
+            or any(body[key] is not False for key in end_grid.AUTHORITY_FLAGS)):
+        _fail(invalid)
+    binding = body["binding"]
+    if (type(binding) is not dict or set(binding) != {"generation_context_sha256", "run_id", "cell_id",
+            "cell_contract_sha256", "search_process_receipt_sha256", "precommit_sha256"}
+            or (binding["generation_context_sha256"], binding["run_id"], binding["cell_id"])
+                != (context_sha256, generation_id, cell_id)
+            or any(not _is_sha256(binding[key]) for key in binding if key != "run_id")
+            or type(owner) is not dict or owner.get("schema_version") != WORKSPACE_OWNER_SCHEMA
+            or owner.get("creation_provenance") != "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION"
+            or (owner.get("generation_context_sha256"), owner.get("generation_id"), owner.get("cell_id"),
+                owner.get("cell_contract_sha256")) != (context_sha256, generation_id, cell_id, binding["cell_contract_sha256"])):
+        _fail(invalid)
+    completion = body["completion"]
+    if (type(completion) is not dict or set(completion) != {"cell_run_receipt_sha256", "account_artifact_sha256"}
+            or any(not _is_sha256(value) for value in completion.values())):
+        _fail(invalid)
+    slots, references = body["selected_slots"], body["end_grid_rows"]
+    if type(slots) is not list or len(slots) != 13 or type(references) is not dict:
+        _fail(invalid)
+    time_keys = ("cycle_start_utc", "cycle_end_utc", "information_cutoff_utc")
+    slot_ids, starts, grid_path = set(), set(), None
+    previous_end = None
+    for slot in slots:
+        if (type(slot) is not dict or set(slot) != {"slot_id", "outcome", *time_keys}
+                or slot["outcome"] not in ("WINNER", "NO_TRADE")
+                or any(type(slot[key]) is not str for key in time_keys)):
+            _fail(invalid)
+        try:
+            start = datetime.fromisoformat(slot["cycle_start_utc"])
+            end = datetime.fromisoformat(slot["cycle_end_utc"])
+        except ValueError:
+            _fail(invalid)
+        if (start.utcoffset() != timedelta(0) or end.utcoffset() != timedelta(0)
+                or end - start != timedelta(days=28) or (previous_end is not None and start != previous_end)):
+            _fail(invalid)
+        previous_end = end
+        slot_id = _identity(slot["slot_id"], "RETIREMENT_NATIVE_SLOT_ID")
+        if slot_id in slot_ids:
+            _fail(invalid)
+        slot_ids.add(slot_id)
+        starts.add(slot["cycle_start_utc"])
+        reference = references.get(slot_id)
+        if (type(reference) is not dict or set(reference) != {"path", "row_sha256"}
+                or type(reference["path"]) is not str or not _is_sha256(reference["row_sha256"])):
+            _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        path = Path(reference["path"])
+        if not path.is_absolute() or path.suffix != ".jsonl" or (grid_path is not None and path != grid_path):
+            _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        grid_path = path
+    if set(references) != slot_ids:
+        _fail(invalid)
+    grid_root = grid_path.parent.resolve()
+    if grid_root.is_relative_to(working_root) or working_root.is_relative_to(grid_root):
+        _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    rows_by_start = {}
+    for row in end_grid.read_end_grid(grid_path.parent, grid_path.stem):
+        if row.cell_id == cell_id and row.process_edition_sha256 == binding["search_process_receipt_sha256"]:
+            if row.cycle_start_utc not in starts or row.cycle_start_utc in rows_by_start:
+                _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+            rows_by_start[row.cycle_start_utc] = row
+    for ordinal, slot in enumerate(slots, start=1):
+        row = rows_by_start.get(slot["cycle_start_utc"])
+        if (row is None or row.row_sha256 != references[slot["slot_id"]]["row_sha256"]
+                or row.schema_version != end_grid.END_GRID_SCHEMA_VERSION or row.source_kind != "broker_native"
+                or row.outcome != slot["outcome"] or any(getattr(row, key) != slot[key] for key in time_keys)
+                or row.job_binding_sha256 is not None or row.consumer_binding_sha256 is not None
+                or row.view_contract_sha256 is None
+                or (row.outcome == "NO_TRADE" and row.no_trade_run_receipt_sha256 != completion["cell_run_receipt_sha256"])):
+            _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        contract = end_grid.load_view_contract(grid_path.parent, row.view_contract_sha256)
+        _retirement_native_view_contract(contract, row, binding=binding, completion=completion,
+            slot_id=slot["slot_id"], ordinal=ordinal)
+    return body
+
+
 def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generation_id: str,
-        cell_id: str, workspace_sha256: str, working_root: Path) -> dict:
+        cell_id: str, workspace_sha256: str, working_root: Path, owner: Optional[dict] = None) -> dict:
     import pm_end_grid as end_grid
     if path.resolve().is_relative_to(working_root):
         _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
@@ -1814,6 +1956,12 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
         return _retirement_terminal_refusal_fence(body, context_sha256=context_sha256,
             generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
             working_root=working_root)
+    if body.get("schema_version") == NATIVE_COMPLETION_FENCE_SCHEMA:
+        if digest != expected:
+            _fail("RETIREMENT_NATIVE_COMPLETION_FENCE_INVALID")
+        return _retirement_native_completion_fence(body, context_sha256=context_sha256,
+            generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
+            working_root=working_root, owner=owner)
     summary = body.get("source_summary")
     if (digest != expected or body.get("schema_version") != "fxpm.declared-m5-development-source-fence.v1"
             or body.get("workspace_owner_sha256") != workspace_sha256
@@ -1851,8 +1999,9 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
     return body
 
 
-def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[str] = None) -> Optional[dict]:
-    """Return retained recording metadata, never a writable or cold-fit capability."""
+def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[str] = None,
+        expected_completed_fence_schema: Optional[str] = None) -> Optional[dict]:
+    """Return recording metadata, optionally requiring a particular completed fence schema."""
     root = Path(root)
     if not root.exists():
         _reject_reparse_chain(root)
@@ -1877,7 +2026,7 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
             or (expected_context_sha256 is not None and marker["generation_context_sha256"] != expected_context_sha256)):
         _fail("RETIREMENT_MARKER_INVALID")
     context_body, context_sha = _retirement_control(root, CONTEXT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
-    _, owner_sha = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    owner, owner_sha = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
     if (context_sha != marker["generation_context_sha256"] or context_body.get("generation_id") != marker["generation_id"]
             or owner_sha != marker["workspace_owner_sha256"]):
         _fail("RETIREMENT_CONTEXT_CHANGED")
@@ -1898,7 +2047,9 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
         _fail("RETIREMENT_COMPLETION_INVALID")
     fence = _retirement_fence(Path(marker["source_fence_path"]), marker["source_fence_sha256"],
         context_sha256=marker["generation_context_sha256"], generation_id=marker["generation_id"],
-        cell_id=marker["cell_id"], workspace_sha256=marker["workspace_owner_sha256"], working_root=root)
+        cell_id=marker["cell_id"], workspace_sha256=marker["workspace_owner_sha256"], working_root=root, owner=owner)
+    if expected_completed_fence_schema is not None and fence["schema_version"] != expected_completed_fence_schema:
+        _fail("RETIREMENT_COMPLETED_FENCE_SCHEMA_MISMATCH")
     if fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA:
         if (receipt.get("result_kind") != TERMINAL_REFUSAL_RESULT_KIND
                 or receipt.get("terminal_refusal") != fence["refusal"]):
@@ -1912,6 +2063,15 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
             _fail("RETIREMENT_COMPLETION_INVALID")
     elif "result_kind" in receipt or "terminal_refusal" in receipt:
         _fail("RETIREMENT_COMPLETION_INVALID")
+    if fence["schema_version"] == NATIVE_COMPLETION_FENCE_SCHEMA:
+        expected_receipt = {"generation_id": marker["generation_id"], "cell_id": marker["cell_id"],
+            "cell_contract_sha256": fence["binding"]["cell_contract_sha256"],
+            "workspace_owner_sha256": marker["workspace_owner_sha256"], "intent_sha256": marker["intent_sha256"],
+            "precommit_sha256": fence["binding"]["precommit_sha256"], "end_grid_rows": fence["end_grid_rows"],
+            "source_fence": {"path": marker["source_fence_path"], "sha256": marker["source_fence_sha256"]},
+            "descriptor_assurance": "IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE"}
+        if any(receipt.get(key) != value for key, value in expected_receipt.items()):
+            _fail("RETIREMENT_COMPLETION_INVALID")
     return {**receipt, "retirement_receipt_sha256": digest,
         "retirement_receipt_path": marker["retirement_receipt_path"]}
 
@@ -2092,9 +2252,11 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             _fail("RETIREMENT_OWNER_REQUIRED")
         _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
         fence = _retirement_fence(source_fence_path, source_fence_sha256, context_sha256=context_sha,
-            generation_id=owner["generation_id"], cell_id=owner["cell_id"], workspace_sha256=owner_sha, working_root=root)
+            generation_id=owner["generation_id"], cell_id=owner["cell_id"], workspace_sha256=owner_sha,
+            working_root=root, owner=owner)
         terminal_refusal = fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA
         post_source_abort = fence.get("schema_version") == POST_SOURCE_ABORT_FENCE_SCHEMA
+        native_completion = fence.get("schema_version") == NATIVE_COMPLETION_FENCE_SCHEMA
         if terminal_refusal and (unit_lock_paths or direct != frozenset({
                 f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
             _fail("RETIREMENT_REFUSAL_SOURCE_STATE_INVALID")
@@ -2161,7 +2323,7 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             "cell_id": owner["cell_id"], "cell_contract_sha256": owner["cell_contract_sha256"],
             "workspace_owner_sha256": owner_sha, "intent_sha256": intent_sha,
             "source_fence": {"path": str(source_fence_path), "sha256": source_fence_sha256},
-            "precommit_sha256": (fence["binding"] if terminal_refusal or post_source_abort
+            "precommit_sha256": (fence["binding"] if terminal_refusal or post_source_abort or native_completion
                 else fence["source_summary"]["binding"]).get("precommit_sha256"),
             "end_grid_rows": fence["end_grid_rows"], "retired_payload_files": len(records),
             "retired_logical_bytes": sum(record["bytes"] for record in records),
@@ -2201,6 +2363,7 @@ __all__ = [
     "GenerationSpoolContext",
     "HISTORICAL_ANCHOR_MANIFEST_DOMAIN",
     "LEGACY_GENERATION_CONTEXT_SCHEMA",
+    "NATIVE_COMPLETION_FENCE_SCHEMA",
     "SYMBOL_MANIFEST_SCHEMA",
     "SpoolLimits",
     "SymbolAuthoritySink",
