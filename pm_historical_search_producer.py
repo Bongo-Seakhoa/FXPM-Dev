@@ -2606,7 +2606,29 @@ def _make_declared_slot_source_authority():
                 completion = _declared_base_completion(request, status="NO_TRADE", reason_code="REGIME_UNOBSERVED", source_entry=entry)
                 completion["source_group"] = historical_adapter._owned_decision_envelope(fitted.source_group_decision, "DECLARED_SLOT_SOURCE_INVALID")
                 completion["regime_fit"] = historical_adapter._owned_decision_envelope(fitted.regime_fit_decision, "DECLARED_SLOT_FIT_INVALID")
-                return finish(completion)
+                pair = fitted.frozen_tier_pair_contract
+                levels = pair.get("tiers") if type(pair) is dict else None
+                if (type(levels) is not list or len(levels) != 2
+                        or set(fitted._spread_tiers) != {"P75", "P95"}
+                        or any(type(level) is not dict or level.get("tier") != tier
+                               or level.get("frozen_spread_tier") != fitted._spread_tiers[tier].descriptor()
+                               for tier, level in zip(("P75", "P95"), levels, strict=True))):
+                    _fail("DECLARED_NATIVE_UNOBSERVED_TIER_WITNESS_INVALID")
+                completion = finish(completion)
+                suffix = historical_adapter._DECLARED_NATIVE_UNOBSERVED_WITNESS_SUFFIX
+                sink.put_json(f"{body['artifact_namespace']}/{suffix}",
+                    historical_adapter._DECLARED_NATIVE_UNOBSERVED_WITNESS_TYPE, {
+                        "schema_version": historical_adapter._DECLARED_NATIVE_UNOBSERVED_WITNESS_SCHEMA,
+                        "request_sha256": request.receipt_sha256,
+                        "source_session_sha256": entry["descriptor"]["sha256"],
+                        "native_prefix_index_sha256": fitted.product.index_sha256,
+                        "source_group_decision_sha256": fitted.source_group_decision.receipt_sha256,
+                        "regime_fit_decision_sha256": fitted.regime_fit_decision.receipt_sha256,
+                        "profile_sha256": body["spread_profile_identity"]["profile_sha256"],
+                        "source_contract_seeds": fitted.source_contract_seeds,
+                        "frozen_tier_pair_contract": pair,
+                    })
+                return completion
             plan = restored_plan if restored_plan is not None else search_planner.build_declared_slot_observed_cell_plan(
                 context, process=process, request=request, fitted=fitted)
             open_capture = (historical_adapter.open_transport_declared_slot_capture

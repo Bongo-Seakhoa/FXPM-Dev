@@ -475,6 +475,7 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
     import pm_authority_spool as spool
     import pm_causal_evidence_producer as causal
     import pm_historical_anchor_orchestration as orchestration
+    import pm_historical_production_adapter as adapter
     import pm_historical_search_producer as producer
 
     parent = precommit.to_dict()
@@ -512,6 +513,7 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
             or manifest[0].get("artifacts") != entries):
         _fail("DECLARED_NATIVE_FINALIZATION_RUN_MANIFEST_INVALID")
     proofs, schedule, outcomes, owners = {}, [], [], []
+    no_plan_requests = {}
     previous = None
     for ordinal, (slot, entry, summary) in enumerate(zip(slots, entries, summaries, strict=True), 1):
         stored = producer._read_declared_commit(context, producer._declared_commit_path(precommit, cell_id, ordinal))
@@ -540,21 +542,26 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
         schedule.append({"slot_id": key, "ordinal": ordinal, "start_utc": slot["activation_utc"],
             "end_exclusive_utc": slot["end_exclusive_utc"], "status": status,
             "owner_id": None if owner is None else owner["owner_id"]})
-        proofs[key] = _declared_native_grid_proof(context, row=row, slot=slot, commit=commit, profile_sha=profile_sha)
+        # The exact commit digest came from the original verified ACCOUNT path.
+        no_plan = adapter._declared_native_unobserved_no_plan(completion)
+        proofs[key] = _declared_native_grid_proof(context, row=row, slot=slot, commit=commit,
+            profile_sha=profile_sha, no_plan=no_plan)
+        if no_plan:
+            no_plan_requests[key] = {"request_sha256": completion["request_sha256"]}
         previous = commit_sha
     if (run_body.get("last_commit_sha256") != previous or run_body.get("slot_commits") != outcomes
             or account.get("slot_schedule") != schedule
             or [entry["owner"] for entry in account["owner_records"]] != owners):
         _fail("DECLARED_NATIVE_FINALIZATION_RUN_BINDING_INVALID")
-    return parent, slots, proofs, summaries, run
+    return parent, slots, proofs, summaries, run, no_plan_requests
 
 
-def _declared_native_grid_proof(context, *, row, slot, commit, profile_sha):
+def _declared_native_grid_proof(context, *, row, slot, commit, profile_sha, no_plan):
     import hashlib
     import pm_historical_production_adapter as adapter
 
     cell, completion = row["cell"], commit["completion"]
-    if completion.get("frozen_plan_receipt") is None:
+    if not no_plan and completion.get("frozen_plan_receipt") is None:
         _fail("DECLARED_NATIVE_FINALIZATION_TIER_PROOF_REQUIRED")
     request = completion["request_body"]
     cutoff = request["anchor"]["selection_cutoff_utc"]
@@ -589,6 +596,21 @@ def _declared_native_grid_proof(context, *, row, slot, commit, profile_sha):
             or source_body["native_source_sha256"] != view["native_bars_sha256"]
             or not all(_declared_digest(view[key]) for key in view if key.endswith("_sha256"))):
         _fail("DECLARED_NATIVE_FINALIZATION_SOURCE_PROOF_REQUIRED")
+    source_contract = source_body["source_contract_sha256"]
+    source_refs = (source_entry["descriptor"]["sha256"], index_descriptor["sha256"], session["source_accessed_at_utc"])
+    if no_plan:
+        try:
+            fit = adapter._rebuild_regime_fit_decision(completion["regime_fit"], source)
+            witness = adapter._declared_native_unobserved_witness_entry(request, completion, entries)
+            baseline = adapter._reopen_declared_native_unobserved_p75(context, entry=witness,
+                completion=completion, session=session, index=index, source=source, fit=fit, profile_sha256=profile_sha)
+        except adapter.HistoricalProductionAdapterError as exc:
+            raise HistoricalSchedulerError("DECLARED_NATIVE_FINALIZATION_TIER_PROOF_REQUIRED", (str(exc),)) from exc
+        evidence = {"semantics": "BOUND_BASELINE_DESCRIPTOR_NO_SELECTED_WINNER", "tier": "P75",
+            "bound_baseline_descriptor": baseline}
+        return view, evidence, *source_refs, {
+            "outcome": "NO_TRADE", "reason_code": completion["reason_code"], "cost_tier": "P75",
+            "source_contract_sha256": source_contract, "strategy_family": None, "configuration_sha256": None}
     prefix = f"{request['artifact_namespace']}/winner-search/{cell['timeframe']}/{cell['regime']}/frozen/"
     receipt, pair_entry, commitment_entry = (entries.get(prefix + name) for name in
         ("receipt", "frozen_tier_pair_contract", "precommitment"))
@@ -602,7 +624,6 @@ def _declared_native_grid_proof(context, *, row, slot, commit, profile_sha):
         maximum_bytes=context.limits.max_json_bytes, code=code)
     commitment, _ = adapter._reopen_worker_ascii_json_descriptor(context, commitment_entry["descriptor"],
         maximum_bytes=context.limits.max_json_bytes, code=code)
-    source_contract = source_body["source_contract_sha256"]
     levels = pair["tiers"]
     if (not _declared_digest(source_contract) or commitment.get("source_contract_sha256") != source_contract
             or commitment.get("frozen_tier_pair_contract") != pair
@@ -631,7 +652,7 @@ def _declared_native_grid_proof(context, *, row, slot, commit, profile_sha):
         evidence = {"semantics": "VERIFIED_SELECTED_OWNER_TIER", "tier": tier,
             "selected_tier_contract": owner["selected_tier_contract"]}
         family, configuration = winner_process["strategy_family"], selected["trial_definition_sha256"]
-    return view, evidence, source_entry["descriptor"]["sha256"], index_descriptor["sha256"], session["source_accessed_at_utc"], {
+    return view, evidence, *source_refs, {
         "outcome": outcome, "reason_code": reason, "cost_tier": tier, "source_contract_sha256": source_contract,
         "strategy_family": family, "configuration_sha256": configuration}
 
@@ -703,7 +724,7 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
         renewal = context.root / "declared-slots" / precommit.receipt_sha256 / "source-access-renewal"
         if os.path.lexists(renewal):
             _fail("DECLARED_NATIVE_FINALIZATION_RENEWAL_NOT_OWNED")
-        parent, slots, proofs, summaries, run = _declared_native_completed_records(context, row=row,
+        parent, slots, proofs, summaries, run, no_plan_requests = _declared_native_completed_records(context, row=row,
             precommit=precommit, process=process, artifact=artifact, run_body=run_body,
             profile_sha=contract["profile_sha256"])
         if result["run_receipt"] != run:
@@ -771,7 +792,8 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
         fence_sha = hashlib.sha256(spool._canonical_json_bytes(fence_body, fence_maximum)).hexdigest()
         if fence_sha != _declared_m5_hash(fence_body):
             _fail("DECLARED_NATIVE_FINALIZATION_FENCE_ENCODING_UNSUPPORTED")
-        direct, locks, _ = _declared_owned_direct_files(context, precommit, row, max_paths=retirement["max_paths"])
+        direct, locks, _ = _declared_owned_direct_files(context, precommit, row, max_paths=retirement["max_paths"],
+            verified_no_plan=lambda slot: no_plan_requests.get(slot["slot_id"]))
         _declared_native_retirement_preflight(context, workspace_sha, protected=protected,
             direct=direct, locks=locks, fence_path=fence_path, fence_sha=fence_sha, retirement=retirement)
         if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):

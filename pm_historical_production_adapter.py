@@ -7102,6 +7102,97 @@ def _declared_slot_is_m5_source(body):
     return True
 
 
+_DECLARED_NATIVE_UNOBSERVED_WITNESS_SUFFIX = "native-regime-unobserved-tier-witness"
+_DECLARED_NATIVE_UNOBSERVED_WITNESS_TYPE = "declared_native_regime_unobserved_tier_witness"
+_DECLARED_NATIVE_UNOBSERVED_WITNESS_SCHEMA = "fxpm.declared-native-regime-unobserved-tier-witness.v1"
+
+
+def _declared_native_unobserved_no_plan(completion):
+    body = completion.get("request_body") if type(completion) is dict else None
+    return (type(body) is dict
+            and body.get("schema_version") in (orchestration.DECLARED_SLOT_REQUEST_SCHEMA,
+                                               orchestration.DECLARED_SLOT_REQUEST_SCHEMA_V2)
+            and completion.get("status") == "NO_TRADE"
+            and completion.get("reason_code") == "REGIME_UNOBSERVED"
+            and completion.get("plan_transport") is None)
+
+
+def _declared_native_unobserved_witness_entry(body, completion, entries):
+    """Check witness placement before registering any roster artifact."""
+    matches = [entry for key, entry in entries.items()
+        if (key.rsplit("/", 1)[-1] == _DECLARED_NATIVE_UNOBSERVED_WITNESS_SUFFIX
+            or entry["artifact_type"] == _DECLARED_NATIVE_UNOBSERVED_WITNESS_TYPE)]
+    if not _declared_native_unobserved_no_plan(completion):
+        if matches:
+            _fail("DECLARED_NATIVE_UNOBSERVED_WITNESS_FORBIDDEN")
+        return None
+    if not matches:
+        _fail("DECLARED_NATIVE_UNOBSERVED_WITNESS_REQUIRED")
+    namespace = body.get("artifact_namespace")
+    entry = matches[0]
+    if (len(matches) != 1 or type(namespace) is not str or not namespace
+            or entry["artifact_id"] != f"{namespace}/{_DECLARED_NATIVE_UNOBSERVED_WITNESS_SUFFIX}"
+            or entry["artifact_type"] != _DECLARED_NATIVE_UNOBSERVED_WITNESS_TYPE
+            or entry["descriptor"]["format"] != authority_spool.CANONICAL_JSON_FORMAT):
+        _fail("DECLARED_NATIVE_UNOBSERVED_WITNESS_INVALID")
+    return entry
+
+
+def _reopen_declared_native_unobserved_p75(context, *, entry, completion, session, index, source, fit, profile_sha256):
+    """Join the saved tier evidence to the already verified native source."""
+    code = "DECLARED_NATIVE_UNOBSERVED_WITNESS_INVALID"
+    entry = _artifact_entry(entry, code)
+    body = completion["request_body"]
+    if (not _declared_native_unobserved_no_plan(completion)
+            or entry["artifact_id"] != f"{body['artifact_namespace']}/{_DECLARED_NATIVE_UNOBSERVED_WITNESS_SUFFIX}"
+            or entry["artifact_type"] != _DECLARED_NATIVE_UNOBSERVED_WITNESS_TYPE):
+        _fail(code)
+    witness = _reopen_worker_json_descriptor(context, entry["descriptor"],
+        maximum_bytes=min(context.limits.max_artifact_bytes, context.limits.max_json_bytes), code=code)
+    try:
+        expected = {
+            "schema_version": _DECLARED_NATIVE_UNOBSERVED_WITNESS_SCHEMA,
+            "request_sha256": completion["request_sha256"],
+            "source_session_sha256": completion["source_session_entry"]["descriptor"]["sha256"],
+            "native_prefix_index_sha256": session["native_prefix_index_sha256"],
+            "source_group_decision_sha256": source.receipt_sha256,
+            "regime_fit_decision_sha256": fit.receipt_sha256,
+            "profile_sha256": profile_sha256,
+        }
+        if (set(witness) != set(expected) | {"source_contract_seeds", "frozen_tier_pair_contract"}
+                or any(witness[key] != value for key, value in expected.items())):
+            _fail(code)
+        for key, value in expected.items():
+            if key != "schema_version":
+                _hex64(value, code)
+        source_body = source.to_dict()
+        index_source = index["source"]
+        if (session["request_sha256"] != expected["request_sha256"]
+                or session["native_prefix_index_descriptor"]["sha256"] != expected["native_prefix_index_sha256"]
+                or source_body["source_group_evidence_sha256"] != expected["native_prefix_index_sha256"]
+                or session["source_group_decision_sha256"] != expected["source_group_decision_sha256"]
+                or session["regime_fit_decision_sha256"] != expected["regime_fit_decision_sha256"]
+                or session["spread_profile_identity"]["profile_sha256"] != profile_sha256
+                or source_body["native_source_sha256"] != index_source["bars_sha256"]):
+            _fail(code)
+        _, pair, hashes = raw_winner._current_pair_inputs(
+            witness["source_contract_seeds"], witness["frozen_tier_pair_contract"])
+        descriptors = [level["frozen_spread_tier"] for level in pair["tiers"]]
+        if (hashes["source_contract_sha256"] != source_body["source_contract_sha256"]
+                or any(descriptor["symbol"] != body["symbol"]
+                       or descriptor["timeframe"] != body["timeframe"]
+                       or descriptor["profile_sha256"] != profile_sha256
+                       or descriptor["source_identity_sha256"] != index_source["source_identity_sha256"]
+                       or descriptor["source_binding"]["target_bars_sha256"] != index_source["bars_sha256"]
+                       for descriptor in descriptors)):
+            _fail(code)
+    except HistoricalProductionAdapterError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise HistoricalProductionAdapterError(code) from exc
+    return descriptors[0]
+
+
 def _declared_m5_profile_identity(body):
     pins, profile = body.get("m5_source_pins"), body.get("spread_profile_identity")
     if (type(pins) is not dict or type(profile) is not dict
@@ -7820,8 +7911,13 @@ def verify_declared_slot_completion(context, *, precommit, process, completion, 
         entry = _artifact_entry(dict(value), "DECLARED_SLOT_COMPLETION_INVALID")
         if entry["artifact_id"] in entries:
             _fail("DECLARED_SLOT_COMPLETION_INVALID")
-        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
         entries[entry["artifact_id"]] = entry
+    witness_entry = _declared_native_unobserved_witness_entry(body, completion, entries)
+    if (witness_entry is not None and witness_entry["descriptor"]["size_bytes"]
+            > min(context.limits.max_artifact_bytes, context.limits.max_json_bytes)):
+        _fail("DECLARED_NATIVE_UNOBSERVED_WITNESS_INVALID")
+    for entry in entries.values():
+        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
     request = orchestration.DeclaredSlotProducerRequest(_canonical_bytes(body), precommit, sink, orchestration._DECLARED_SLOT_SEAL)
     orchestration._register_declared_request(request, context, live=False)
     try:
@@ -7961,6 +8057,10 @@ def _verify_declared_slot_completion_request(context, *, precommit, process, com
                     or fit_body.get("fit_state") != book.REGIME_FITTED or type(support) is not int or support != 0
                     or completion["status"] != "NO_TRADE"):
                 _fail("DECLARED_SLOT_SOURCE_BINDING_MISMATCH")
+            witness_entry = _declared_native_unobserved_witness_entry(body, completion, entries)
+            _reopen_declared_native_unobserved_p75(context, entry=witness_entry, completion=completion,
+                session=source_session, index=product.index, source=source, fit=fit,
+                profile_sha256=parent["spread_profile_identity"]["profile_sha256"])
         else:
             expected = {native_prefix.SOURCE_UNAVAILABLE: ("MISSING", "SOURCE_UNAVAILABLE"),
                 native_prefix.TECHNICAL_TERMINAL: ("MISSING", "TERMINAL_TECHNICAL"),
