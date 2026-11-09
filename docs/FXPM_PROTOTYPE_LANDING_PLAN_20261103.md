@@ -95,6 +95,8 @@ Status 2026-11-05: case 007 ran XAGUSD H1 TREND K1 (not the H4 cell named above)
 
 Input: docs/FXPM_EFFICIENCY_AUDIT_20261103.md (E4572, E4573). W5.1 timers instrument the sites in its sections 4 and 11 so that the ranked findings get real-data shares; its gate-once list (fresh fit at open, process identity at open, final-source check at close) is proposed as W6.3's hashing discipline, for the W6.3 design to adopt or counter; nothing in it is adopted by this pointer.
 
+On 2026-11-09, W5.1 software landed as `3501a48a` (design C stage monitor at the governor child entry, opt-in by `FXPM_STAGE_TIMERS_DIR`, 98 top-level QA nodes plus 52 subtests; E4978, E4982, E4985). The measured table requires a separately authorized instrumented run. The native FULL13 path remains held on F1 to F3. Use exclusive seconds and same-stage edges to interpret the table. W5.2 waits on that table.
+
 ### W6 Route A, library by claude, edition by Root
 
 | Leaf | Scope | Acceptance | Tier |
@@ -165,4 +167,4 @@ Council requests: route each scope question to one claude seat, not two; record 
 - MetaTrader availability for W1.3: needs the terminal and account that produced the native run.
 - Throughput: unmeasured; the one measured cell took over fifteen hours with setup. W5 decides the search budget.
 - Two Claude channels: Root drives a managed Claude session by pointers while this seat works in the side chat. Duplicate reviews waste effort; council should route each question once.
-- Disk: 23 GB free after the spool removal; the 5 GiB floor applies.
+- Disk. E4944 reported 85.73 GB free after the operator-approved cleanup. Use the 5 GiB floor where that scope specifies it. The prospective native FULL13 run keeps its separate 16 GiB floor (E4939).
