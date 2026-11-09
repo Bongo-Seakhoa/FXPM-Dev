@@ -1,0 +1,122 @@
+{
+ "schema_version": "fxpm.claude-case-outcome-reading.v1",
+ "recorded_at_utc": "2026-11-04T13:22:50Z",
+ "case": "m5-available-xagusd-h1-k1-005",
+ "reads": "Root's root_outcome_assessment_001.json (E4759) and the retained record; nothing executed except one parameter-table comparison through pm_regime on the current working tree.",
+ "concurs_with_root": "FAILED_TECHNICAL, TERMINAL_STOP, DEVELOPMENT_PARTIAL, no research or financial weight; exit 1 at 12:51:45Z after 7079.969 s; stdout 211 B, stderr 0; run receipt completed_slots 1 means one STOP ledger completion; source session 0cea78 persisted with failure null; STOP commit 4e5a63; fence 2af0; end-grid row 7635 read back equal; spool retained.",
+ "attempt_progress": {
+  "planned_attempt_evidence_objects": 29,
+  "completed_ordinals": "0-28 by the horizon-winner cross binding d2d0 mapping order, written 12:20:41Z to 12:33:39Z",
+  "technical_failure_object": "91a0 at 12:33:44Z",
+  "plan_statuses": "60f9860b carries 600 PLANNED and no PROCESS_REJECTED",
+  "failing_unit": {
+   "ordinal": 29,
+   "strategy_id": "RegimeTransitionBreakoutStrategy",
+   "winner_process_candidate_id_prefix": "70c9b210"
+  }
+ },
+ "static_chain": [
+  "pm_authoritative_search_execution.py 2821-2840: _build_planned_attempt_evidence calls _build_full_prefix_strategy_surface(frame=fitted._frame, strategy=_runtime_strategy(attempt)).",
+  "pm_authoritative_search_execution.py 2518-2530: FeatureComputer.compute_for_strategy, then one guard over four terms (type, index equality, column subset, .equals on the original columns); _fail carries no details.",
+  "pm_strategies.py 3184-3189: RegimeTransitionBreakoutStrategy.get_required_features = {REGIME_LIVE, REGIME_GAP, ADX, EMA_n}; the only roster strategy naming a regime column.",
+  "pm_core.py 6885-6891: a request meeting _REGIME_FEATURE_COLUMNS routes to compute_all; 7198-7220: _append_regime_features overwrites every REGIME_OUTPUT_COLUMN with MarketRegimeDetector(load_regime_params(symbol, timeframe, regime_params.json)).",
+  "pm_regime.py 1070-1108, 1111-1118: load_regime_params falls to DEFAULT_PARAMS_BY_TIMEFRAME[tf] then applies the asset-class adx_trend_threshold; regime_params.json has XAGUSD H4 only.",
+  "pm_authoritative_search_execution.py 633-638 and 1139-1148: the anchor-local fit uses _default_regime_parameters(tf), the timeframe default with no asset-class step, and writes _REGIME_COLUMNS into the fitted frame (1211-1213)."
+ ],
+ "parameter_comparison_on_working_tree": {
+  "XAGUSD_H1": {
+   "fit_default_adx_trend_threshold": 25.0,
+   "feature_computer_lookup": 22.0,
+   "asset_class": "metal"
+  },
+  "EURUSD_D1": "equal",
+  "EURUSD_H1": "equal",
+  "thresholds_by_asset_class": {
+   "fx": 25.0,
+   "metal": 22.0,
+   "crypto": 30.0,
+   "index": 25.0
+  }
+ },
+ "reading": "On XAGUSD the recomputed regime columns differ from the fitted ones, so guard term 4 refuses with FULL_PREFIX_FEATURE_AXIS_CHANGED at the first regime-requesting attempt. The chain is route-independent; the native full13 cell was EURUSD D1, where the two parameter sets agree, so it could not show it. Predicts the same STOP at ordinal 29 for XAUUSD and BTCUSD on either route.",
+ "not_established": [
+  "Confirmation needs one compute_all on the retained fitted frame compared with its regime columns; not run.",
+  "Which parameter set is the policy is a council question; no numerical choice is made here."
+ ],
+ "end_grid_observation": "pm_historical_scheduler.py 1696-1704 passes source_identity {} and job_binding None for every STOP without an abort report; this post-source STOP therefore carries no activation_id, m5_source_sha256 or view_key although session 0cea78 and view 16dc59 were known. Valid under v2; a later scheduler delta could pass the session identity when completion.source_session_entry exists. No pm_end_grid change.",
+ "evidence_pins": [
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_available_data_xagusd_h1_k1_005/external_phase_receipts/cli_001/exit.json",
+   "bytes": 252,
+   "sha256": "370e634fe5e9348d26f88c4719bdff56927fcbb9917e83604fbf2e0340be5c86"
+  },
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_available_data_xagusd_h1_k1_005/external_phase_receipts/cli_001/root_outcome_assessment_001.json",
+   "bytes": 8767,
+   "sha256": "21e972f7e790e871122df58524894de4aad0af9aef3af871ad5199a8d925e9ed"
+  },
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_available_data_xagusd_h1_k1_005/end_grid/XAGUSD.jsonl",
+   "bytes": 1287,
+   "sha256": "f759139bfc58b4445930e2100e671ce0c45153c1fd8ed18da1f9c3a541417a6a"
+  },
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_available_data_xagusd_h1_k1_005/source_fence.json",
+   "bytes": 2065,
+   "sha256": "2af0867bc3c880f7146c3466a0af22ed738932d4d431763416858c792d975e5b"
+  },
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_available_data_xagusd_h1_k1_005/spool/objects/sha256/91/91a042759bcb4498bbba727d23d8792d54a4eacfd94200e422e73a98d9b36ed2.canonical-json",
+   "bytes": 693,
+   "sha256": "91a042759bcb4498bbba727d23d8792d54a4eacfd94200e422e73a98d9b36ed2"
+  },
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_available_data_xagusd_h1_k1_005/spool/objects/sha256/60/60f9860bb540699663ca1fce55c7bd2a2d8f5f099430436bbdaee54013c48491.canonical-json",
+   "bytes": 1192903,
+   "sha256": "60f9860bb540699663ca1fce55c7bd2a2d8f5f099430436bbdaee54013c48491"
+  },
+  {
+   "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_available_data_xagusd_h1_k1_005/spool/objects/sha256/d2/d2d0371f946e4e9f11c2594ba56cc57063bdbffdd340a5e1cbb8878c9cb72e97.fxpm-ascii-json-v1",
+   "bytes": 1285844,
+   "sha256": "d2d0371f946e4e9f11c2594ba56cc57063bdbffdd340a5e1cbb8878c9cb72e97"
+  }
+ ],
+ "source_pins": [
+  {
+   "path": "pm_authoritative_search_execution.py",
+   "bytes": 324472,
+   "sha256": "e9d221bf7e3f595fd7ff5aab3acd84283794508969bad4139dd951c959964a7d"
+  },
+  {
+   "path": "pm_core.py",
+   "bytes": 522459,
+   "sha256": "02e9a85391f2e4cdaf1bcc997b90977a14aecb1f9fbc9c79147beef3f600b815"
+  },
+  {
+   "path": "pm_regime.py",
+   "bytes": 81612,
+   "sha256": "32c4688e7effbaddd5db2b367496294ad04eefa870a952e33b46082b2654177b"
+  },
+  {
+   "path": "pm_strategies.py",
+   "bytes": 302948,
+   "sha256": "11a14733b32e20408ba6177523e3282d10285ee6c7198b3e8f3293399f42d625"
+  },
+  {
+   "path": "pm_historical_scheduler.py",
+   "bytes": 131617,
+   "sha256": "679d35509020258060dc89b9237baf97db77f9dcea098ee6411b394173c65225"
+  },
+  {
+   "path": "pm_end_grid.py",
+   "bytes": 32007,
+   "sha256": "b38efd2141990e68d149ed380930adf86e9a5865382a2019d23cecc0de5ed64c"
+  },
+  {
+   "path": "regime_params.json",
+   "bytes": 109122,
+   "sha256": "23d40107cc92ab70da018c4c6c67b6bbcbb5ba5e2665ccf5ab573b27454c54d8"
+  }
+ ],
+ "authority": "None. No product, policy, admission or eligibility change; no run started."
+}

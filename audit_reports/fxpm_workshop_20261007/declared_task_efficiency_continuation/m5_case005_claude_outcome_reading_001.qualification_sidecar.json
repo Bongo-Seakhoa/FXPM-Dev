@@ -1,0 +1,18 @@
+{
+ "schema_version": "fxpm.claude-case-outcome-reading-qualification-sidecar.v1",
+ "recorded_at_utc": "2026-11-04T13:53:39Z",
+ "qualifies": {
+  "path": "audit_reports/fxpm_workshop_20261007/declared_task_efficiency_continuation/m5_case005_claude_outcome_reading_001.json",
+  "bytes": 7051,
+  "sha256": "27f21915432c8d46e6b074724d32cb796e008cfa3d7459be9664880314566744"
+ },
+ "root_qualification_request": "E-00004764: the parameter-table product import disclosed in the record exceeded the E4760 no-import scope; qualify separately, not pure static, no runtime proof.",
+ "what_was_done": "One process imported pm_regime from the working tree (no data, no feature, fit, cache or model call) to diff DEFAULT_PARAMS_BY_TIMEFRAME[tf].to_dict() against load_regime_params(symbol, tf, regime_params.json).to_dict() for XAGUSD H1, EURUSD D1 and EURUSD H1. It read regime_params.json through the product loader.",
+ "qualification": [
+  "The comparison is a working-tree observation made by executing product code, not a static read; it is not pure static and carries no runtime proof about case 005.",
+  "The static chain in the record (feature request, compute_all route, _append_regime_features, load_regime_params asset-class step, _default_regime_parameters in the fit, guard term 4) stands without it.",
+  "The failing ordinal 29 is read from the order of the 29 retained evidence objects against the cross-binding mapping; it is a retained-evidence inference pending adoption, not a measurement; the technical record's ordinal is null."
+ ],
+ "council_state": "E-00004764 accepted the reading as a static inconsistency between the authenticated anchor-fit recipe and the later file lookup; E-00004765 decided the T4 source prep: the executor carries fitted.regime_parameters and the recorded sha into compute_all's direct-override API on the regime-request branch; no threshold choice; diagnostics E4761 parked; the STOP-row source join is prepped separately. The record itself is unchanged.",
+ "authority": "None."
+}
