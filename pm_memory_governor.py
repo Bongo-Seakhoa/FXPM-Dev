@@ -26,6 +26,7 @@ from __future__ import annotations
 import ctypes
 import copy
 from dataclasses import dataclass, field
+import importlib
 import math
 import multiprocessing
 import os
@@ -571,6 +572,49 @@ def is_memory_failure(value: Any) -> bool:
     return any(marker in text for marker in _MEMORY_ERROR_MARKERS)
 
 
+_STAGE_MONITOR_DIRECTORY_VARIABLE = "FXPM_STAGE_TIMERS_DIR"
+# W5.1 telemetry (E4961, E4962, E4965, E4968) is opt-in for the declared symbol worker only.  Workers are matched by
+# object identity against the loaded module attribute, never by name; every other governor user is untouched.
+_STAGE_MONITOR_WORKER_REFS: Tuple[Tuple[str, str], ...] = (("pm_historical_scheduler", "declared_symbol_worker"),)
+
+
+def _stage_monitor_allows(worker: Any) -> bool:
+    import sys
+    for module_name, attribute in _STAGE_MONITOR_WORKER_REFS:
+        module = sys.modules.get(module_name)
+        if module is not None and getattr(module, attribute, None) is worker:
+            return True
+    return False
+
+
+def _start_stage_monitor(worker: Any, task_key: Any) -> Any:
+    """Opt in by environment and exact worker identity, keeping ordinary telemetry faults local."""
+    try:
+        directory = os.environ.get(_STAGE_MONITOR_DIRECTORY_VARIABLE)
+        if not directory or not _stage_monitor_allows(worker):
+            return None
+        module = importlib.import_module("pm_stage_monitor")
+        return module.start(str(task_key), directory)
+    except Exception:
+        return None
+
+
+def _stop_stage_monitor(monitor: Any, started: float) -> None:
+    """Always attempt teardown. Ordinary telemetry faults stay local and process stops propagate."""
+    if monitor is None:
+        return
+    duration: float | None = None
+    try:
+        duration = max(0.0, time.monotonic() - started)
+    except Exception:
+        pass
+    finally:
+        try:
+            monitor.stop(task_duration_seconds=duration)
+        except Exception:
+            pass
+
+
 def _measured_worker_call(worker: Callable[..., Any], task: MemoryTask) -> WorkerEnvelope:
     started = time.monotonic()
     current, peak = _process_memory_bytes()
@@ -579,6 +623,7 @@ def _measured_worker_call(worker: Callable[..., Any], task: MemoryTask) -> Worke
     error_type = ""
     error_message = ""
     traceback_text = ""
+    stage_monitor = _start_stage_monitor(worker, task.key)
     try:
         value = worker(*task.args, **dict(task.kwargs))
     except BaseException as exc:
@@ -587,6 +632,8 @@ def _measured_worker_call(worker: Callable[..., Any], task: MemoryTask) -> Worke
         traceback_text = "".join(
             traceback.format_exception(type(exc), exc, exc.__traceback__)
         )[-12000:]
+    finally:
+        _stop_stage_monitor(stage_monitor, started)
     current, lifetime_peak = _process_memory_bytes()
     peak = max(peak, current, lifetime_peak)
     return WorkerEnvelope(
