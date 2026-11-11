@@ -103,7 +103,7 @@ On 2026-11-09, W5.1 software landed as `3501a48a` (design C stage monitor at the
 |---|---|---|---|
 | W6.1 Chain builder | `pm_signal_chain.py`: per regime, non-overlapping chain from the opportunity tape; chain statistics; lower-bound total R | chain trade list byte-equal to the kernel trade list on a fixture | T2 |
 | W6.2 Rank agreement | chain statistic versus account outcomes on the W4 and W7 real cells | agreement measured and recorded before any selector authority | T1 |
-| W6.3 Process edition | per-regime studies sharing one evaluation cache keyed by source, config, cutoff, tier and params; shortlist 5 with family quota; account path on the 5; economic floor gate on mean net R per trade on the BASE lane at the operator's declared level (ruling 2026-11-03, candidate 0.25R); stated tie-break rule | new frozen process edition; planner and precommit re-keyed; QA | T2 |
+| W6.3 Process edition | per-regime studies sharing evaluation identities bound to source/window, strategy/family/domain and parameters, configuration, cutoff, fold/partition, tier/spread model, regime gate and process/code edition; shortlist 5 with a recorded family-quota policy; account path on the 5; E4535 cost-relative floor: mean net R over completed BASE trades must meet mean modelled STRESS spread cost in R over the same trade identities, unavailable while that STRESS evidence is missing; E4535 tie-break; P75 required, qualified P95 preferred, otherwise qualified P75 | W9.4 consistency confirmed before a new frozen process edition; planner and precommit re-keyed; QA | T2 |
 
 ### W7 Development set and walk-forward, joint
 
