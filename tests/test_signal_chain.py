@@ -689,5 +689,100 @@ class ChainAccountReconciliationTests(unittest.TestCase):
             self.assertIs(outcome[name], False)
 
 
+class ChainAccountWindowBoundaryTests(unittest.TestCase):
+    """INVENTED window fixtures test refusals, never market or run evidence."""
+
+    def setUp(self):
+        self.diagnostic_chain, self.result, self.binding, self.probe = _invented_reconciliation_fixture()
+        self.assertEqual(self.reconcile()["status"], "RECONCILED")
+
+    def reconcile(self, *, diagnostic_chain=None, result=None, binding=None, probe=None):
+        identity = (self.probe if probe is None else probe).source_contract
+        return chain.reconcile_chain_account(
+            self.diagnostic_chain if diagnostic_chain is None else diagnostic_chain,
+            backtester_result=self.result if result is None else result,
+            expected_source_contract_sha256=identity.source_contract_sha256,
+            source_window_binding=self.binding if binding is None else binding,
+        )
+
+    def assert_refused(self, code, **kwargs):
+        with self.assertRaises(chain.SignalChainError) as caught:
+            self.reconcile(**kwargs)
+        self.assertEqual(str(caught.exception), "CHAIN_ACCOUNT_" + code)
+
+    def test_valid_chain_cutoff_before_axis_end_refuses(self):
+        """Published guards 389-390 reject a valid one-bar-earlier cutoff."""
+        from dataclasses import replace
+
+        earlier = pd.Timestamp(self.diagnostic_chain.cutoff_utc) - pd.Timedelta(days=1)
+        diagnostic_chain = replace(self.diagnostic_chain, cutoff_utc=earlier.isoformat())
+        self.assert_refused("WINDOW_MISMATCH", diagnostic_chain=diagnostic_chain)
+
+    def test_valid_utc_trade_times_outside_axis_refuse(self):
+        """Published guards 475-476 reject valid UTC times outside the axis."""
+        from copy import deepcopy
+        from pm_core import build_backtest_trade_identity_pnl_evidence
+
+        axis = self.binding["partition_axis"]
+        start, end = pd.Timestamp(axis["start_utc"]), pd.Timestamp(axis["end_utc"])
+        cases = (
+            ("entry_before_start", 0, "entry_time", start - pd.Timedelta(seconds=1)),
+            ("exit_at_end", -1, "exit_time", end),
+            ("exit_after_protected", -1, "exit_time", pd.Timestamp("2024-07-14T08:05:01+00:00")),
+        )
+        for label, ordinal, field, value in cases:
+            with self.subTest(boundary=label):
+                result = deepcopy(self.result)
+                result["trades"][ordinal][field] = value
+                if field == "entry_time":
+                    result["trades"][ordinal]["signal_time"] = start - pd.Timedelta(days=1)
+                projected = build_backtest_trade_identity_pnl_evidence(result["trades"])
+                self.assertEqual(len(projected), len(result["trades"]))
+                self.assert_refused("WINDOW_MISMATCH", result=result)
+
+    def test_valid_different_partition_axes_refuse(self):
+        """Published guards 386-387 reject distinct public-builder axes."""
+        from copy import deepcopy
+
+        other_chain, other_result, other_binding, other_probe = _invented_reconciliation_fixture(
+            end_utc="2024-01-14T00:00:00+00:00")
+        self.assertEqual(self.reconcile(diagnostic_chain=other_chain, result=other_result,
+                                       binding=other_binding, probe=other_probe)["status"], "RECONCILED")
+        binding = deepcopy(self.binding)
+        binding["partition_axis"] = deepcopy(other_binding["partition_axis"])
+        self.assertNotEqual(binding["partition_axis"], self.result["trade_power_partition_axis"])
+        self.assert_refused("WINDOW_MISMATCH", binding=binding)
+
+    def test_train_heldout_future_expected_axis_refuses(self):
+        """Published guards 369-370 reject the future expected axis first."""
+        from copy import deepcopy
+
+        protected = pd.Timestamp("2024-07-14T08:05:00+00:00")
+        _, _, future_binding, _ = _invented_reconciliation_fixture(
+            end_utc="2024-07-14T08:05:01+00:00")
+        binding = deepcopy(self.binding)
+        binding["comparison_scope"] = "TRAIN_HELDOUT_CANDIDATE_COMPARISON"
+        binding["partition_axis"] = deepcopy(future_binding["partition_axis"])
+        self.assertLess(pd.Timestamp(self.diagnostic_chain.cutoff_utc), protected)
+        self.assertGreater(pd.Timestamp(binding["partition_axis"]["end_utc"]), protected)
+        self.assert_refused("PROTECTED_CUTOFF_EXCEEDED", binding=binding)
+
+    def test_train_heldout_future_observed_axis_refuses(self):
+        """Published guards 369-370 reject the future observed axis second."""
+        from copy import deepcopy
+
+        protected = pd.Timestamp("2024-07-14T08:05:00+00:00")
+        _, future_result, _, future_probe = _invented_reconciliation_fixture(
+            end_utc="2024-07-14T08:05:01+00:00")
+        binding = deepcopy(self.binding)
+        binding["comparison_scope"] = "TRAIN_HELDOUT_CANDIDATE_COMPARISON"
+        binding["partition_source_contract_sha256"] = future_probe.source_contract.partition_source_contract_sha256
+        self.assertLess(pd.Timestamp(self.diagnostic_chain.cutoff_utc), protected)
+        self.assertLess(pd.Timestamp(binding["partition_axis"]["end_utc"]), protected)
+        self.assertGreater(pd.Timestamp(future_result["trade_power_partition_axis"]["end_utc"]), protected)
+        self.assert_refused("PROTECTED_CUTOFF_EXCEEDED", result=future_result,
+                            binding=binding, probe=future_probe)
+
+
 if __name__ == "__main__":
     unittest.main()
