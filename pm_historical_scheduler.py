@@ -411,10 +411,17 @@ def _declared_native_finalization_paths(policy):
 
     if (type(policy) is not dict or set(policy) != {"end_grid_root", "source_fence_path", "retirement"}
             or type(policy["retirement"]) is not dict
-            or set(policy["retirement"]) != {"receipt_path", "max_paths", "max_nodes", "max_bytes"}
+            or set(policy["retirement"]) not in (
+                {"receipt_path", "max_paths", "max_nodes", "max_bytes"},
+                {"receipt_path", "max_paths", "max_nodes", "max_bytes", "segment_max_records"},
+            )
             or any(type(policy["retirement"][key]) is not int or policy["retirement"][key] <= 0
                    for key in ("max_paths", "max_nodes", "max_bytes"))):
         _fail("DECLARED_NATIVE_FINALIZATION_POLICY_INVALID")
+    if "segment_max_records" in policy["retirement"]:
+        segment_max_records = policy["retirement"]["segment_max_records"]
+        if type(segment_max_records) is not int or not 1 <= segment_max_records <= 181_817:
+            _fail("DECLARED_NATIVE_FINALIZATION_POLICY_INVALID")
     paths = []
     for value in (policy["end_grid_root"], policy["source_fence_path"], policy["retirement"]["receipt_path"]):
         if (type(value) is not str or not Path(value).is_absolute() or ".." in Path(value).parts
@@ -459,8 +466,11 @@ def _declared_native_finalization_preflight(contract, row, config, limits, *, fr
         "pm_authoritative_search_execution", "pm_forward_oos_replay_producer", "pm_causal_evidence_producer",
         "pm_historical_anchor_orchestration", "pm_production_search_planner", "pm_production_config_binding",
         "pm_training_horizon", "pm_winner_raw_evidence", "pm_core", "pm_native_prefix_production", "pm_spread_profile")
-    source_paths = tuple(Path(file).resolve() for name in source_modules
-        if type(file := getattr(sys.modules.get(name), "__file__", None)) is str)
+    if "segment_max_records" in policy["retirement"]:
+        source_paths = tuple(Path(__file__).resolve().with_name(name + ".py").resolve() for name in source_modules)
+    else:
+        source_paths = tuple(Path(file).resolve() for name in source_modules
+            if type(file := getattr(sys.modules.get(name), "__file__", None)) is str)
     protected = (Path(config.data_dir).resolve(), Path(contract["active_config_path"]).resolve(),
                  Path(__file__).resolve(), Path(spool.__file__).resolve(), Path(grid.__file__).resolve(), *source_paths)
     root = Path(row["root"])
@@ -677,6 +687,16 @@ def _declared_native_grid_proof(context, *, row, slot, commit, profile_sha, no_p
         "strategy_family": family, "configuration_sha256": configuration}
 
 
+def _declared_native_retirement_intent_present(root, retirement):
+    """Intent presence defers five-key dispatch to explicit public recovery."""
+    import os
+    from pathlib import Path
+    import pm_authority_spool as spool
+
+    return ("segment_max_records" in retirement
+        and os.path.lexists(Path(root) / spool.RETIREMENT_INTENT_RELATIVE_PATH))
+
+
 def _declared_native_retirement_preflight(context, workspace_sha, *, protected, direct, locks,
         fence_path, fence_sha, retirement):
     """Check retirement bounds without publishing intent or taking write locks."""
@@ -684,6 +704,8 @@ def _declared_native_retirement_preflight(context, workspace_sha, *, protected, 
     import shutil
     import pm_authority_spool as spool
 
+    if _declared_native_retirement_intent_present(context.root, retirement):
+        _fail("RETIREMENT_INCOMPLETE")
     fence_path = Path(fence_path)
     receipt_path = Path(retirement["receipt_path"])
     spool._relative_parts(fence_path.name)
@@ -716,11 +738,20 @@ def _declared_native_retirement_preflight(context, workspace_sha, *, protected, 
         "protected_paths": [str(Path(path).resolve()) for path in protected],
         "owned_direct_files": sorted(owned), "unit_lock_paths": list(locks),
         "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes}
-    intent = {"schema_version": spool.RETIREMENT_SCHEMA, "generation_context_sha256": context.context_sha256,
-        "arguments": arguments, "files": records}
     maximum = min(context.limits.max_json_bytes, 64 * 1024**2)
-    control_bytes = len(spool._canonical_json_bytes(intent, maximum)) + 2 * spool.MAX_CONTEXT_BYTES
-    if (nodes + 3 > max_nodes or root_bytes + control_bytes > min(max_bytes, context.limits.max_generation_bytes)
+    control_nodes = 3
+    if "segment_max_records" in retirement:
+        arguments["segment_max_records"] = retirement["segment_max_records"]
+        plan = spool.plan_segmented_retirement(records, generation_context_sha256=context.context_sha256,
+            arguments=arguments, maximum_bytes=maximum, segment_max_records=retirement["segment_max_records"])
+        control_bytes = (plan["intent_size_bytes"] + sum(segment["size_bytes"] for segment in plan["segments"])
+            + 2 * spool.MAX_CONTEXT_BYTES)
+        control_nodes += len(plan["segments"])
+    else:
+        intent = {"schema_version": spool.RETIREMENT_SCHEMA, "generation_context_sha256": context.context_sha256,
+            "arguments": arguments, "files": records}
+        control_bytes = len(spool._canonical_json_bytes(intent, maximum)) + 2 * spool.MAX_CONTEXT_BYTES
+    if (nodes + control_nodes > max_nodes or root_bytes + control_bytes > min(max_bytes, context.limits.max_generation_bytes)
             or shutil.disk_usage(context.root).free - control_bytes < context.limits.min_free_bytes):
         _fail("RETIREMENT_CONTROL_CAPACITY")
 
@@ -836,16 +867,21 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
         fence = _declared_m5_external_record(fence_path, fence_body, maximum_bytes=fence_maximum)
         if fence["sha256"] != fence_sha:
             _fail("DECLARED_NATIVE_FINALIZATION_FENCE_READBACK_MISMATCH")
+        retirement_options = {}
+        if "segment_max_records" in retirement:
+            retirement_options["segment_max_records"] = retirement["segment_max_records"]
         record = spool.retire_completed_generation(context.root, expected_context_sha256=context.context_sha256,
             workspace_owner_sha256=workspace_sha, source_fence_path=Path(fence_path),
             source_fence_sha256=fence_sha, retirement_receipt_path=Path(retirement["receipt_path"]),
             protected_paths=protected, owned_direct_files=direct, unit_lock_paths=locks,
-            max_paths=retirement["max_paths"], max_nodes=retirement["max_nodes"], max_bytes=retirement["max_bytes"])
+            max_paths=retirement["max_paths"], max_nodes=retirement["max_nodes"], max_bytes=retirement["max_bytes"],
+            **retirement_options)
         _declared_native_archive_binding(record, row, cell_contract_sha256)
         result["source_kind"] = "broker_native"
         return _declared_m5_archived_row(result, record)
     except Exception as exc:
-        if (context.root / spool.RETIREMENT_RELATIVE_PATH).exists():
+        if ((context.root / spool.RETIREMENT_RELATIVE_PATH).exists()
+                or _declared_native_retirement_intent_present(context.root, policy["retirement"])):
             result.update(status="NOT_RUN", reason_code="RETIREMENT_INCOMPLETE", run_receipt=None, account_descriptor=None,
                 descriptor_assurance="IDENTITY_ONLY_RETIREMENT_INCOMPLETE", genuine_cold_reopen_available=False)
         else:
@@ -896,6 +932,10 @@ def _declared_run_one_cell(
                 _declared_native_archive_binding(archived, row, digest)
                 result.update(source_kind="broker_native", recorded_before_dispatch=True)
                 return _declared_m5_archived_row(result, archived)
+            if _declared_native_retirement_intent_present(
+                    context_root, row["native_finalization"]["retirement"]):
+                result.update(status="NOT_RUN", reason_code="RETIREMENT_INCOMPLETE")
+                return result
         if (context_root / spool.CONTEXT_RELATIVE_PATH).exists():
             context = spool.reopen_generation_context(context_root, expected_generation_id=row["run_id"],
                 expected_native_universe_sha256=contract["native_universe_sha256"], expected_config_sha256=contract["config_sha256"])

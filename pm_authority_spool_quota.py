@@ -63,15 +63,49 @@ _LIVE_GUARDS_LOCK = threading.Lock()
 class AuthoritySpoolQuotaError(RuntimeError):
     """Typed operational storage failure."""
 
-    def __init__(self, code: str, *details: Any) -> None:
+    def __init__(
+        self,
+        code: str,
+        *details: Any,
+        diagnostics: Optional[dict[str, Any]] = None,
+    ) -> None:
         self.code = str(code)
         self.details = tuple(str(value)[:512] for value in details[:12])
+        self.diagnostics = dict(diagnostics or {})
         suffix = ":" + "|".join(self.details) if self.details else ""
         super().__init__(self.code + suffix)
 
 
 def _fail(code: str, *details: Any) -> None:
     raise AuthoritySpoolQuotaError(code, *details)
+
+
+def _io_error(
+    code: str,
+    error: BaseException,
+    *,
+    step: str,
+) -> AuthoritySpoolQuotaError:
+    """Keep OS diagnostics bounded without copying paths or error messages."""
+    diagnostics: dict[str, Any] = {
+        "step": step,
+        "exception_type": type(error).__name__[:64],
+    }
+    for field in ("errno", "winerror"):
+        value = getattr(error, field, None)
+        diagnostics[field] = (
+            value
+            if type(value) is int and -(2**63) <= value < 2**63
+            else None
+        )
+    return AuthoritySpoolQuotaError(
+        code,
+        diagnostics["exception_type"],
+        f"step={step}",
+        f"errno={diagnostics['errno']}",
+        f"winerror={diagnostics['winerror']}",
+        diagnostics=diagnostics,
+    )
 
 
 def _bound(value: Any, code: str, *, allow_zero: bool) -> int:
@@ -99,10 +133,10 @@ def _root(path: Path) -> Path:
     try:
         info = target.lstat()
     except OSError as exc:
-        raise AuthoritySpoolQuotaError(
+        raise _io_error(
             "SPOOL_QUOTA_ROOT_UNAVAILABLE",
-            type(exc).__name__,
-            str(target),
+            exc,
+            step="root_stat",
         ) from exc
     if _is_reparse(target) or not stat.S_ISDIR(info.st_mode):
         _fail("SPOOL_QUOTA_ROOT_INVALID", target)
@@ -121,9 +155,10 @@ def _canonical_without_digest(value: dict[str, Any]) -> bytes:
             allow_nan=False,
         ).encode("ascii")
     except (TypeError, ValueError, UnicodeError) as exc:
-        raise AuthoritySpoolQuotaError(
+        raise _io_error(
             "SPOOL_QUOTA_STATE_CANONICAL_INVALID",
-            type(exc).__name__,
+            exc,
+            step="canonical_encode",
         ) from exc
 
 
@@ -229,25 +264,39 @@ def _write_state(root: Path, value: dict[str, Any]) -> None:
     ).encode("ascii")
     target = root / QUOTA_STATE_NAME
     temporary = root / f"{QUOTA_TEMP_PREFIX}{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    step = "open"
     try:
         with temporary.open("xb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
+            try:
+                step = "write"
+                stream.write(encoded)
+                step = "flush"
+                stream.flush()
+                step = "fsync"
+                os.fsync(stream.fileno())
+            except OSError as exc:
+                raise _io_error(
+                    "SPOOL_QUOTA_STATE_WRITE_FAILED", exc, step=step
+                ) from exc
+            finally:
+                step = "close"
         for attempt in range(STATE_REPLACE_ATTEMPTS):
             try:
+                step = "replace"
                 os.replace(temporary, target)
                 break
             except PermissionError:
                 if attempt + 1 >= STATE_REPLACE_ATTEMPTS:
                     raise
+                step = "replace_retry_delay"
                 time.sleep(
                     STATE_REPLACE_INITIAL_DELAY_SECONDS * (2**attempt)
                 )
     except OSError as exc:
-        raise AuthoritySpoolQuotaError(
+        raise _io_error(
             "SPOOL_QUOTA_STATE_WRITE_FAILED",
-            type(exc).__name__,
+            exc,
+            step=step,
         ) from exc
     finally:
         try:
@@ -260,6 +309,7 @@ def _read_state(root: Path) -> Optional[dict[str, Any]]:
     path = root / QUOTA_STATE_NAME
     if not path.exists():
         return None
+    step = "stat_before"
     try:
         before = path.lstat()
         if (
@@ -268,19 +318,25 @@ def _read_state(root: Path) -> Optional[dict[str, Any]]:
             or not 0 < before.st_size <= MAX_STATE_BYTES
         ):
             _fail("SPOOL_QUOTA_STATE_FILE_INVALID")
+        step = "read"
         raw = path.read_bytes()
+        step = "stat_after"
         after = path.lstat()
+        step = "decode"
+        decoded = raw.decode("ascii")
+        step = "parse"
         value = json.loads(
-            raw.decode("ascii"),
+            decoded,
             object_pairs_hook=_unique_pairs,
             parse_constant=_reject_constant,
         )
     except AuthoritySpoolQuotaError:
         raise
     except (OSError, UnicodeError, ValueError) as exc:
-        raise AuthoritySpoolQuotaError(
+        raise _io_error(
             "SPOOL_QUOTA_STATE_READ_FAILED",
-            type(exc).__name__,
+            exc,
+            step=step,
         ) from exc
     if (
         before.st_dev != after.st_dev
@@ -349,11 +405,12 @@ def _scan_committed_bytes(root: Path) -> int:
         try:
             entries = os.scandir(directory)
         except OSError as exc:
-            raise AuthoritySpoolQuotaError(
+            raise _io_error(
                 "SPOOL_QUOTA_RESCAN_FAILED",
-                type(exc).__name__,
-                str(directory),
+                exc,
+                step="rescan_open",
             ) from exc
+        step = "rescan_iteration"
         try:
             with entries:
                 for entry in entries:
@@ -366,10 +423,10 @@ def _scan_committed_bytes(root: Path) -> int:
                     try:
                         info = entry.stat(follow_symlinks=False)
                     except OSError as exc:
-                        raise AuthoritySpoolQuotaError(
+                        raise _io_error(
                             "SPOOL_QUOTA_RESCAN_FAILED",
-                            type(exc).__name__,
-                            str(path),
+                            exc,
+                            step="rescan_entry_stat",
                         ) from exc
                     if entry.is_symlink() or _is_reparse(path):
                         _fail("SPOOL_QUOTA_REPARSE_ENTRY_FORBIDDEN", path)
@@ -381,10 +438,10 @@ def _scan_committed_bytes(root: Path) -> int:
                     try:
                         file_info = os.stat(path, follow_symlinks=False)
                     except OSError as exc:
-                        raise AuthoritySpoolQuotaError(
+                        raise _io_error(
                             "SPOOL_QUOTA_RESCAN_FAILED",
-                            type(exc).__name__,
-                            str(path),
+                            exc,
+                            step="rescan_file_stat",
                         ) from exc
                     reparse_marker = int(
                         getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
@@ -405,10 +462,10 @@ def _scan_committed_bytes(root: Path) -> int:
         except AuthoritySpoolQuotaError:
             raise
         except OSError as exc:
-            raise AuthoritySpoolQuotaError(
+            raise _io_error(
                 "SPOOL_QUOTA_RESCAN_FAILED",
-                type(exc).__name__,
-                str(directory),
+                exc,
+                step=step,
             ) from exc
     return total
 
@@ -458,12 +515,18 @@ class _ReservationGuard:
     @classmethod
     def create(cls, root: Path, token: str) -> "_ReservationGuard":
         path = _guard_path(root, token)
+        step = "guard_open"
         try:
             handle = path.open("x+b")
+            step = "guard_write"
             handle.write(b"\0")
+            step = "guard_flush"
             handle.flush()
+            step = "guard_fsync"
             os.fsync(handle.fileno())
+            step = "guard_inheritability"
             os.set_inheritable(handle.fileno(), False)
+            step = "guard_lock"
             if not _try_lock_guard(handle):
                 _fail("SPOOL_QUOTA_RESERVATION_GUARD_CONFLICT")
         except AuthoritySpoolQuotaError:
@@ -485,9 +548,10 @@ class _ReservationGuard:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
-            raise AuthoritySpoolQuotaError(
+            raise _io_error(
                 "SPOOL_QUOTA_RESERVATION_GUARD_CREATE_FAILED",
-                type(exc).__name__,
+                exc,
+                step=step,
             ) from exc
         with _LIVE_GUARDS_LOCK:
             _LIVE_GUARDS.add(token)
@@ -520,6 +584,7 @@ def _guard_is_live(root: Path, token: str) -> bool:
     path = _guard_path(root, token)
     if not path.exists():
         return False
+    step = "guard_stat"
     try:
         before = path.lstat()
         if (
@@ -528,20 +593,26 @@ def _guard_is_live(root: Path, token: str) -> bool:
             or before.st_size != 1
         ):
             _fail("SPOOL_QUOTA_RESERVATION_GUARD_INVALID", token)
+        step = "guard_open"
         with path.open("r+b") as handle:
+            step = "guard_inheritability"
             os.set_inheritable(handle.fileno(), False)
+            step = "guard_lock"
             acquired = _try_lock_guard(handle)
             if acquired:
+                step = "guard_unlock"
                 _unlock_guard(handle)
+                step = "guard_close"
                 return False
+            step = "guard_close"
             return True
     except AuthoritySpoolQuotaError:
         raise
     except OSError as exc:
-        raise AuthoritySpoolQuotaError(
+        raise _io_error(
             "SPOOL_QUOTA_RESERVATION_GUARD_READ_FAILED",
-            type(exc).__name__,
-            token,
+            exc,
+            step=step,
         ) from exc
 
 
@@ -549,9 +620,10 @@ def _disk_free(root: Path) -> int:
     try:
         return int(shutil.disk_usage(root).free)
     except OSError as exc:
-        raise AuthoritySpoolQuotaError(
+        raise _io_error(
             "SPOOL_QUOTA_FREE_SPACE_UNAVAILABLE",
-            type(exc).__name__,
+            exc,
+            step="disk_usage",
         ) from exc
 
 

@@ -36,6 +36,9 @@ RETIREMENT_INTENT_RELATIVE_PATH = "generation-retirement.intent.json"
 RETIREMENT_COMPLETE_RELATIVE_PATH = "generation-archived.json"
 WORKSPACE_OWNER_SCHEMA = "fxpm.owned-generation-workspace.v1"
 RETIREMENT_SCHEMA = "fxpm.completed-generation-retirement.v1"
+RETIREMENT_SCHEMA_V2 = "fxpm.completed-generation-retirement.v2"
+RETIREMENT_SEGMENT_SCHEMA = "fxpm.completed-generation-retirement-segment.v1"
+MAX_RETIREMENT_SEGMENT_RECORDS = 181_817
 TERMINAL_REFUSAL_FENCE_SCHEMA = "fxpm.declared-m5-terminal-refusal-fence.v1"
 TERMINAL_REFUSAL_RESULT_KIND = "TERMINAL_REFUSAL_SOURCE_NOT_COMPLETED"
 POST_SOURCE_ABORT_FENCE_SCHEMA = "fxpm.declared-m5-post-source-abort-fence.v1"
@@ -2017,7 +2020,8 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
     marker, _ = _retirement_control(root, RETIREMENT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
     marker_fields = {"schema_version", "status", "generation_context_sha256", "generation_id", "cell_id",
         "intent_sha256", "source_fence_path", "source_fence_sha256", "retirement_receipt_path", "workspace_owner_sha256"}
-    if (set(marker) != marker_fields or marker.get("schema_version") != RETIREMENT_SCHEMA or marker.get("status") != "RETIRING"
+    if (set(marker) != marker_fields or marker.get("schema_version") not in {RETIREMENT_SCHEMA, RETIREMENT_SCHEMA_V2}
+            or marker.get("status") != "RETIRING"
             or not _is_sha256(marker.get("generation_context_sha256"))
             or any(not _is_sha256(marker.get(key)) for key in
                 ("cell_id", "intent_sha256", "source_fence_sha256", "workspace_owner_sha256"))
@@ -2037,13 +2041,16 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
     complete, _ = _retirement_control(root, RETIREMENT_COMPLETE_RELATIVE_PATH, MAX_CONTEXT_BYTES)
     receipt, digest = _retirement_external(Path(marker["retirement_receipt_path"]), MAX_CONTEXT_BYTES)
     if (set(complete) != {"schema_version", "receipt_sha256", "generation_context_sha256"}
-            or complete["schema_version"] != RETIREMENT_SCHEMA or complete["receipt_sha256"] != digest
+            or complete["schema_version"] != marker["schema_version"] or complete["receipt_sha256"] != digest
             or complete["generation_context_sha256"] != marker["generation_context_sha256"]
-            or receipt.get("schema_version") != RETIREMENT_SCHEMA or receipt.get("status") != "ARCHIVED_RECORD_ONLY"
+            or receipt.get("schema_version") != marker["schema_version"] or receipt.get("status") != "ARCHIVED_RECORD_ONLY"
             or receipt.get("generation_context_sha256") != marker["generation_context_sha256"]
             or receipt.get("payloads_retained") is not False or receipt.get("genuine_cold_reopen_available") is not False
             or any(receipt.get(key) is not False for key in
                 ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("RETIREMENT_COMPLETION_INVALID")
+    if (marker["schema_version"] == RETIREMENT_SCHEMA_V2
+            and (type(receipt.get("intent_segment_count")) is not int or receipt["intent_segment_count"] < 0)):
         _fail("RETIREMENT_COMPLETION_INVALID")
     fence = _retirement_fence(Path(marker["source_fence_path"]), marker["source_fence_sha256"],
         context_sha256=marker["generation_context_sha256"], generation_id=marker["generation_id"],
@@ -2089,12 +2096,367 @@ def _retirement_owned(relative: str, direct: frozenset[str], *, directory: bool)
     return bool(re.fullmatch(r"symbols/[a-f0-9]{64}/domains/[a-f0-9]{64}/manifest\.json|tmp/[a-f0-9]{32}\.part", relative))
 
 
+def _retirement_record(record: Any) -> dict:
+    if (type(record) is not dict or set(record) != {"relative_path", "identity", "bytes"}
+            or type(record["relative_path"]) is not str
+            or len(record["relative_path"].encode("utf-8")) > 4096
+            or type(record["identity"]) is not list or len(record["identity"]) != 4
+            or any(type(value) is not int for value in record["identity"])
+            or record["identity"][0] < 0 or record["identity"][1] <= 0
+            or type(record["bytes"]) is not int or record["bytes"] < 0
+            or record["identity"][2] != record["bytes"]):
+        _fail("RETIREMENT_SEGMENTS_INVALID")
+    _relative_parts(record["relative_path"])
+    return record
+
+
+def _retirement_segment_descriptor(body: dict, maximum_bytes: int) -> dict:
+    encoded = _canonical_json_bytes(body, maximum_bytes)
+    digest = hashlib.sha256(encoded).hexdigest()
+    records = body["files"]
+    return {"relative_path": f"generation-retirement.segment.{digest}.json",
+        "sha256": digest, "size_bytes": len(encoded), "count": len(records),
+        "bytes": sum(record["bytes"] for record in records),
+        "first_path": records[0]["relative_path"], "last_path": records[-1]["relative_path"]}
+
+
+def plan_segmented_retirement(records: Iterable[dict], *, generation_context_sha256: str,
+        arguments: dict, maximum_bytes: int, segment_max_records: int) -> dict:
+    """Encode a deterministic, bounded retirement intent without filesystem access."""
+    _sha256(generation_context_sha256, "RETIREMENT_BINDING_INVALID")
+    if (type(segment_max_records) is not int
+            or not 1 <= segment_max_records <= MAX_RETIREMENT_SEGMENT_RECORDS
+            or type(maximum_bytes) is not int or maximum_bytes <= 0
+            or type(arguments) is not dict
+            or arguments.get("segment_max_records") != segment_max_records
+            or any(type(arguments.get(key)) is not int or arguments[key] <= 0
+                for key in ("max_paths", "max_nodes", "max_bytes"))):
+        _fail("RETIREMENT_BOUNDS_REQUIRED")
+    maximum_bytes = min(maximum_bytes, 64 * 1024**2)
+    empty = {"schema_version": RETIREMENT_SEGMENT_SCHEMA,
+        "generation_context_sha256": generation_context_sha256, "files": []}
+    overhead = len(_canonical_json_bytes(empty, maximum_bytes))
+    # Each unchanged V1 file record contributes eleven JSON nodes; the envelope seven.
+    record_limit = min(segment_max_records, (MAX_JSON_NODES - 7) // 11)
+    segments, pending = [], []
+    pending_bytes, count, total_bytes, previous = overhead, 0, 0, ""
+
+    def finish_segment() -> None:
+        body = {**empty, "files": list(pending)}
+        descriptor = _retirement_segment_descriptor(body, maximum_bytes)
+        segments.append({**descriptor, "body": body})
+
+    for value in records:
+        record = _retirement_record(value)
+        relative = record["relative_path"]
+        if relative <= previous:
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        previous = relative
+        count += 1
+        total_bytes += record["bytes"]
+        if count > arguments["max_paths"] or total_bytes > arguments["max_bytes"]:
+            _fail("RETIREMENT_PAYLOAD_BOUND_EXCEEDED")
+        encoded_size = len(_canonical_json_bytes(record, maximum_bytes))
+        extra = encoded_size + bool(pending)
+        if pending and (len(pending) >= record_limit or pending_bytes + extra > maximum_bytes):
+            finish_segment()
+            pending = []
+            pending_bytes = overhead
+            extra = encoded_size
+        if pending_bytes + extra > maximum_bytes:
+            _fail("JSON_SIZE_BOUND_EXCEEDED")
+        pending.append(record)
+        pending_bytes += extra
+    if pending:
+        finish_segment()
+    intent = {"schema_version": RETIREMENT_SCHEMA_V2,
+        "generation_context_sha256": generation_context_sha256, "arguments": arguments,
+        "segments": [{key: value for key, value in segment.items() if key != "body"}
+            for segment in segments],
+        "retired_payload_files": count, "retired_logical_bytes": total_bytes}
+    encoded = _canonical_json_bytes(intent, maximum_bytes)
+    return {"intent": intent, "intent_sha256": hashlib.sha256(encoded).hexdigest(),
+        "intent_size_bytes": len(encoded), "segments": tuple(segments)}
+
+
+def _retirement_segment_records(segments: Iterable[dict]) -> Iterator[dict]:
+    previous = ""
+    context_sha = None
+    for segment in segments:
+        if type(segment) is not dict or "body" not in segment:
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        body = segment["body"]
+        if (type(body) is not dict or set(body) != {"schema_version", "generation_context_sha256", "files"}
+                or body["schema_version"] != RETIREMENT_SEGMENT_SCHEMA
+                or not _is_sha256(body["generation_context_sha256"])
+                or type(body["files"]) is not list or not body["files"]
+                or len(body["files"]) > MAX_RETIREMENT_SEGMENT_RECORDS):
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        if context_sha is not None and context_sha != body["generation_context_sha256"]:
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        context_sha = body["generation_context_sha256"]
+        for record in body["files"]:
+            _retirement_record(record)
+        descriptor = _retirement_segment_descriptor(body, 64 * 1024**2)
+        if set(segment) != {*descriptor, "body"} or any(segment[key] != value for key, value in descriptor.items()):
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        for value in body["files"]:
+            record = _retirement_record(value)
+            if record["relative_path"] <= previous:
+                _fail("RETIREMENT_SEGMENTS_INVALID")
+            previous = record["relative_path"]
+            yield record
+
+
+def verify_segmented_retirement_inventory(current_records: Iterable[dict], segments: Iterable[dict]) -> None:
+    """Accept only an unchanged, ordered survivor subset of the saved inventory."""
+    expected = iter(_retirement_segment_records(segments))
+    saved = next(expected, None)
+    previous = ""
+    for value in current_records:
+        record = _retirement_record(value)
+        relative = record["relative_path"]
+        if relative <= previous:
+            _fail("RETIREMENT_PAYLOAD_CHANGED")
+        previous = relative
+        while saved is not None and saved["relative_path"] < relative:
+            saved = next(expected, None)
+        if saved != record:
+            _fail("RETIREMENT_PAYLOAD_CHANGED")
+        saved = next(expected, None)
+    for _ in expected:
+        pass
+
+
+def _retirement_v2_intent(root: Path, expected_sha: Optional[str], arguments: dict, maximum: int) -> tuple[dict, str]:
+    intent, digest = _retirement_control(root, RETIREMENT_INTENT_RELATIVE_PATH, maximum)
+    fields = {"schema_version", "generation_context_sha256", "arguments", "segments",
+        "retired_payload_files", "retired_logical_bytes"}
+    if (set(intent) != fields or intent["schema_version"] != RETIREMENT_SCHEMA_V2
+            or not _is_sha256(intent["generation_context_sha256"])
+            or intent["arguments"] != arguments or type(intent["segments"]) is not list
+            or (expected_sha is not None and digest != expected_sha)
+            or any(type(intent[key]) is not int or intent[key] < 0
+                for key in ("retired_payload_files", "retired_logical_bytes"))):
+        _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+    previous, count, total = "", 0, 0
+    segment_fields = {"relative_path", "sha256", "size_bytes", "count", "bytes", "first_path", "last_path"}
+    for segment in intent["segments"]:
+        if (type(segment) is not dict or set(segment) != segment_fields
+                or not _is_sha256(segment["sha256"])
+                or segment["relative_path"] != f"generation-retirement.segment.{segment['sha256']}.json"
+                or type(segment["size_bytes"]) is not int or not 0 < segment["size_bytes"] <= maximum
+                or type(segment["count"]) is not int or not 1 <= segment["count"] <= arguments["segment_max_records"]
+                or type(segment["bytes"]) is not int or segment["bytes"] < 0
+                or any(type(segment[key]) is not str for key in ("first_path", "last_path"))
+                or not previous < segment["first_path"] <= segment["last_path"]):
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        _relative_parts(segment["first_path"])
+        _relative_parts(segment["last_path"])
+        previous = segment["last_path"]
+        count += segment["count"]
+        total += segment["bytes"]
+    if (count != intent["retired_payload_files"] or total != intent["retired_logical_bytes"]
+            or count > arguments["max_paths"] or total > arguments["max_bytes"]):
+        _fail("RETIREMENT_SEGMENTS_INVALID")
+    return intent, digest
+
+
+def _retirement_v2_segments(root: Path, intent: dict, maximum: int) -> Iterator[dict]:
+    for descriptor in intent["segments"]:
+        body, digest = _retirement_control(root, descriptor["relative_path"], maximum)
+        if (digest != descriptor["sha256"] or set(body) != {"schema_version", "generation_context_sha256", "files"}
+                or body.get("schema_version") != RETIREMENT_SEGMENT_SCHEMA
+                or body.get("generation_context_sha256") != intent["generation_context_sha256"]
+                or type(body.get("files")) is not list or not body["files"]):
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        for record in body["files"]:
+            _retirement_record(record)
+        if _retirement_segment_descriptor(body, maximum) != descriptor:
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+        yield {**descriptor, "body": body}
+
+
+def _retirement_control_os_error(exc: OSError, step: str) -> AuthoritySpoolError:
+    diagnostics = {"step": step, "exception_type": type(exc).__name__[:80],
+        "errno": exc.errno if type(exc.errno) is int else None,
+        "winerror": getattr(exc, "winerror", None)}
+    if type(diagnostics["winerror"]) is not int:
+        diagnostics["winerror"] = None
+    error = AuthoritySpoolError("RETIREMENT_CONTROL_WRITE_FAILED")
+    error.diagnostics = diagnostics
+    return error
+
+
+def _retirement_publish_v2(root: Path, relative: str, body: dict, maximum: int,
+        *, root_owner: Optional[dict] = None) -> str:
+    encoded = _canonical_json_bytes(body, maximum)
+    expected = hashlib.sha256(encoded).hexdigest()
+    temporary, descriptor, identity = None, None, None
+    step = "target_check"
+    try:
+        info = root.stat(follow_symlinks=False)
+        root_identity = root_owner["root_identity"] if root_owner is not None else [info.st_dev, info.st_ino]
+        declared_root = root_owner["root"] if root_owner is not None else str(root)
+        _assert_retirement_root(root, root_identity, declared_root=declared_root)
+        target = _local_path(root, relative)
+        _reject_reparse_chain(target)
+        if not target.exists():
+            step = "temporary_open"
+            temporary = _temporary_path(root)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | int(getattr(os, "O_BINARY", 0))
+            descriptor = os.open(temporary, flags, 0o600)
+            try:
+                step = "temporary_identity"
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    _fail("TEMPORARY_FILE_NOT_REGULAR")
+                step = "temporary_write"
+                _write_all(descriptor, memoryview(encoded))
+                step = "temporary_fsync"
+                os.fsync(descriptor)
+            finally:
+                try:
+                    try:
+                        identity = _file_identity(os.fstat(descriptor))
+                    except OSError:
+                        step = "temporary_identity"
+                        raise
+                finally:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        step = "temporary_close"
+                        raise
+                    finally:
+                        descriptor = None
+            step = "temporary_publish"
+            _assert_retirement_root(root, root_identity, declared_root=declared_root)
+            info = temporary.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or _file_identity(info) != identity):
+                _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
+            _publish_temp_exclusive(root, temporary, relative)
+            step = "temporary_cleanup"
+            _assert_retirement_root(root, root_identity, declared_root=declared_root)
+            if _file_identity(temporary.stat(follow_symlinks=False)) != identity:
+                _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
+            temporary.unlink()
+            temporary = None
+        step = "readback"
+        _assert_retirement_root(root, root_identity, declared_root=declared_root)
+        observed, digest = _retirement_control(root, relative, maximum)
+        if observed != body or digest != expected:
+            _fail("RETIREMENT_CONTROL_CONFLICT")
+        return digest
+    except OSError as exc:
+        raise _retirement_control_os_error(exc, step) from exc
+    except AuthoritySpoolError as exc:
+        if isinstance(exc.__cause__, OSError):
+            raise _retirement_control_os_error(exc.__cause__, step) from exc.__cause__
+        raise
+    finally:
+        if temporary is not None and identity is not None and temporary.exists():
+            try:
+                _assert_retirement_root(root, root_identity, declared_root=declared_root)
+                info = temporary.stat(follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or _file_identity(info) != identity:
+                    _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
+                temporary.unlink()
+            except OSError as exc:
+                raise _retirement_control_os_error(exc, "temporary_cleanup") from exc
+
+
+def _retirement_v2_cleanup(root: Path, intent_sha: str, arguments: dict, maximum: int, owner: dict) -> None:
+    intent_path = _local_path(root, RETIREMENT_INTENT_RELATIVE_PATH)
+    if not intent_path.exists():
+        with os.scandir(root) as entries:
+            if any(entry.name.startswith("generation-retirement.segment.") for entry in entries):
+                _fail("RETIREMENT_SEGMENTS_INVALID")
+        return
+    intent, _ = _retirement_v2_intent(root, intent_sha, arguments, maximum)
+    allowed = {segment["relative_path"] for segment in intent["segments"]}
+    with os.scandir(root) as entries:
+        if any(entry.name.startswith("generation-retirement.segment.") and entry.name not in allowed for entry in entries):
+            _fail("RETIREMENT_SEGMENTS_INVALID")
+    remaining = []
+    for segment in intent["segments"]:
+        path = _local_path(root, segment["relative_path"])
+        if not path.exists():
+            _reject_reparse_chain(path)
+            continue
+        safe = _safe_regular_file(root, segment["relative_path"])
+        identity = _file_identity(safe.stat(follow_symlinks=False))
+        _, digest = _retirement_control(root, segment["relative_path"], maximum)
+        if digest != segment["sha256"]:
+            _fail("RETIREMENT_INTENT_CHANGED")
+        remaining.append((segment["relative_path"], identity))
+    safe = _safe_regular_file(root, RETIREMENT_INTENT_RELATIVE_PATH)
+    remaining.append((RETIREMENT_INTENT_RELATIVE_PATH, _file_identity(safe.stat(follow_symlinks=False))))
+    for relative, identity in remaining:
+        _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
+        path = _safe_regular_file(root, relative)
+        if _file_identity(path.stat(follow_symlinks=False)) != identity:
+            _fail("RETIREMENT_INTENT_CHANGED")
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise _retirement_control_os_error(exc, "intent_cleanup") from exc
+
+
+def _retirement_v2_prepare(root: Path, *, existing: Optional[dict], context_body: dict,
+        context_sha: str, owner: dict, arguments: dict, direct: frozenset[str],
+        unit_lock_paths: tuple[str, ...], maximum: int) -> tuple[dict, str, tuple[str, ...]]:
+    import shutil
+
+    saved = None
+    controls = ()
+    intent_path = _local_path(root, RETIREMENT_INTENT_RELATIVE_PATH)
+    if intent_path.exists():
+        saved, saved_sha = _retirement_v2_intent(root,
+            existing["intent_sha256"] if existing is not None else None, arguments, maximum)
+        if saved["generation_context_sha256"] != context_sha:
+            _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+        controls = tuple(segment["relative_path"] for segment in saved["segments"])
+    elif existing is not None:
+        _fail("RETIREMENT_INTENT_CHANGED")
+    if existing is not None:
+        return saved, saved_sha, controls
+    records, _, root_bytes, nodes = _retirement_inventory(root, direct,
+        max_paths=arguments["max_paths"], max_nodes=arguments["max_nodes"], max_bytes=arguments["max_bytes"],
+        retained_unit_locks=unit_lock_paths, retained_controls=controls)
+    plan = plan_segmented_retirement(records, generation_context_sha256=context_sha,
+        arguments=arguments, maximum_bytes=maximum, segment_max_records=arguments["segment_max_records"])
+    if saved is not None and plan["intent_sha256"] != saved_sha:
+        _fail("RETIREMENT_PAYLOAD_CHANGED")
+    present_bytes, present_nodes = 0, 0
+    for relative in (RETIREMENT_INTENT_RELATIVE_PATH, *controls):
+        path = _local_path(root, relative)
+        if path.exists():
+            present_bytes += _safe_regular_file(root, relative).stat(follow_symlinks=False).st_size
+            present_nodes += 1
+    control_bytes = plan["intent_size_bytes"] + sum(segment["size_bytes"] for segment in plan["segments"]) + 2 * MAX_CONTEXT_BYTES
+    if (nodes + 3 + len(plan["segments"]) - present_nodes > arguments["max_nodes"]
+            or root_bytes - present_bytes + control_bytes > min(arguments["max_bytes"], context_body["limits"]["max_generation_bytes"])
+            or shutil.disk_usage(root).free - (control_bytes - present_bytes) < context_body["limits"]["min_free_bytes"]):
+        _fail("RETIREMENT_CONTROL_CAPACITY")
+    intent_sha = _retirement_publish_v2(root, RETIREMENT_INTENT_RELATIVE_PATH, plan["intent"], maximum, root_owner=owner)
+    for segment in plan["segments"]:
+        _retirement_publish_v2(root, segment["relative_path"], segment["body"], maximum, root_owner=owner)
+    marker = {"schema_version": RETIREMENT_SCHEMA_V2, "status": "RETIRING", "generation_context_sha256": context_sha,
+        "generation_id": owner["generation_id"], "cell_id": owner["cell_id"], "intent_sha256": intent_sha,
+        **{key: arguments[key] for key in ("source_fence_path", "source_fence_sha256", "retirement_receipt_path", "workspace_owner_sha256")}}
+    _retirement_publish_v2(root, RETIREMENT_RELATIVE_PATH, marker, MAX_CONTEXT_BYTES, root_owner=owner)
+    return plan["intent"], intent_sha, tuple(segment["relative_path"] for segment in plan["segments"])
+
+
 def _retirement_inventory(root: Path, direct: frozenset[str], *, max_paths: int, max_nodes: int,
-        max_bytes: int, retained_unit_locks: tuple[str, ...] = ()) -> tuple[list[dict], list[dict], int, int]:
+        max_bytes: int, retained_unit_locks: tuple[str, ...] = (),
+        retained_controls: tuple[str, ...] = ()) -> tuple[list[dict], list[dict], int, int]:
     keep = {CONTEXT_RELATIVE_PATH, WORKSPACE_OWNER_RELATIVE_PATH, RETIREMENT_RELATIVE_PATH,
         RETIREMENT_INTENT_RELATIVE_PATH, RETIREMENT_COMPLETE_RELATIVE_PATH,
         spool_quota.QUOTA_STATE_NAME, spool_quota.QUOTA_LOCK_NAME, "declared-scheduler.lock"}
     keep.update(retained_unit_locks)
+    keep.update(retained_controls)
     records, directories, stack = [], [], [root]
     nodes, total = 0, 0
     while stack:
@@ -2168,13 +2530,17 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
         source_fence_path: Path, source_fence_sha256: str, retirement_receipt_path: Path,
         protected_paths: tuple[Path, ...], owned_direct_files: tuple[str, ...],
         unit_lock_paths: tuple[str, ...],
-        max_paths: int, max_nodes: int, max_bytes: int) -> dict:
+        max_paths: int, max_nodes: int, max_bytes: int, segment_max_records: Optional[int] = None) -> dict:
     """Retire one new owned workspace after actual caller finish and retained readback.
 
     The fence is caller assurance, not a new financial seal. No native input,
     result replay, payload hash, cold archive, orphan reaping or case restart.
     """
     root = _validate_root(Path(root), create=False)
+    if (segment_max_records is not None and (type(segment_max_records) is not int
+            or not 1 <= segment_max_records <= MAX_RETIREMENT_SEGMENT_RECORDS)):
+        _fail("RETIREMENT_BOUNDS_REQUIRED")
+    retirement_schema = RETIREMENT_SCHEMA if segment_max_records is None else RETIREMENT_SCHEMA_V2
     if not (root / WORKSPACE_OWNER_RELATIVE_PATH).exists():
         _fail("RETIREMENT_OWNER_REQUIRED")
     owner_before_lock, owner_before_sha = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
@@ -2216,11 +2582,18 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
         path = path.resolve()
         if path == root or path.is_relative_to(root) or root.is_relative_to(path):
             _fail("RETIREMENT_PROTECTED_PATH_OVERLAP")
+    v2_arguments = {"source_fence_path": str(source_fence_path), "source_fence_sha256": source_fence_sha256,
+        "retirement_receipt_path": str(retirement_receipt_path), "workspace_owner_sha256": workspace_owner_sha256,
+        "protected_paths": [str(Path(value).resolve()) for value in protected_paths],
+        "owned_direct_files": sorted(direct), "unit_lock_paths": list(unit_lock_paths),
+        "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes,
+        "segment_max_records": segment_max_records}
     with spool_quota.generation_retirement_lock(root, max_root_entries=max_nodes), _retirement_unit_locks(root, unit_lock_paths, owner_before_lock):
         existing = read_generation_retirement(root, expected_context_sha256=expected_context_sha256)
         if existing is not None:
             marker, _ = _retirement_control(root, RETIREMENT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
-            if (marker["workspace_owner_sha256"] != workspace_owner_sha256
+            if (marker["schema_version"] != retirement_schema
+                    or marker["workspace_owner_sha256"] != workspace_owner_sha256
                     or marker["source_fence_path"] != str(source_fence_path)
                     or marker["source_fence_sha256"] != source_fence_sha256
                     or marker["retirement_receipt_path"] != str(retirement_receipt_path)):
@@ -2228,6 +2601,10 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
         if existing is not None and existing["status"] == "ARCHIVED_RECORD_ONLY":
             if existing.get("retained_unit_locks") != list(unit_lock_paths):
                 _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+            if segment_max_records is not None:
+                context_body, _ = _retirement_control(root, CONTEXT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+                maximum = min(context_body["limits"]["max_json_bytes"], 64 * 1024**2)
+                _retirement_v2_cleanup(root, marker["intent_sha256"], v2_arguments, maximum, owner_before_lock)
             return existing
         if existing is None and retirement_receipt_path.exists():
             _fail("RETIREMENT_RECEIPT_ALREADY_EXISTS")
@@ -2269,7 +2646,13 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             "protected_paths": [str(Path(value).resolve()) for value in protected_paths],
             "owned_direct_files": sorted(direct), "unit_lock_paths": list(unit_lock_paths),
             "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes}
-        if existing is None:
+        controls = ()
+        if segment_max_records is not None:
+            arguments = v2_arguments
+            intent, intent_sha, controls = _retirement_v2_prepare(root, existing=existing,
+                context_body=context_body, context_sha=context_sha, owner=owner,
+                arguments=arguments, direct=direct, unit_lock_paths=unit_lock_paths, maximum=maximum)
+        elif existing is None:
             import shutil
             records, _, root_bytes, nodes = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
                 max_bytes=max_bytes, retained_unit_locks=unit_lock_paths)
@@ -2291,11 +2674,15 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                     or intent.get("generation_context_sha256") != context_sha):
                 _fail("RETIREMENT_RESUME_BINDING_CHANGED")
             records = intent["files"]
+        inventory_options = {"retained_controls": controls} if segment_max_records is not None else {}
         current, _, _, _ = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
-            max_bytes=max_bytes, retained_unit_locks=unit_lock_paths)
-        expected = {record["relative_path"]: record for record in records}
-        if any(expected.get(record["relative_path"]) != record for record in current):
-            _fail("RETIREMENT_PAYLOAD_CHANGED")
+            max_bytes=max_bytes, retained_unit_locks=unit_lock_paths, **inventory_options)
+        if segment_max_records is not None:
+            verify_segmented_retirement_inventory(current, _retirement_v2_segments(root, intent, maximum))
+        else:
+            expected = {record["relative_path"]: record for record in records}
+            if any(expected.get(record["relative_path"]) != record for record in current):
+                _fail("RETIREMENT_PAYLOAD_CHANGED")
         for record in current:
             _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
             path = _safe_regular_file(root, record["relative_path"])
@@ -2304,7 +2691,7 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                 _fail("RETIREMENT_PAYLOAD_CHANGED")
             path.unlink()
         remaining, directories, _, _ = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
-            max_bytes=max_bytes, retained_unit_locks=unit_lock_paths)
+            max_bytes=max_bytes, retained_unit_locks=unit_lock_paths, **inventory_options)
         if remaining:
             _fail("RETIREMENT_PAYLOAD_REMAINS")
         retained_directories = {parent.as_posix() for relative in unit_lock_paths for parent in PurePosixPath(relative).parents}
@@ -2318,20 +2705,23 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             if [current_directory.st_dev, current_directory.st_ino] != directory["identity"]:
                 _fail("RETIREMENT_DIRECTORY_CHANGED")
             path.rmdir()
-        receipt = {"schema_version": RETIREMENT_SCHEMA, "status": "ARCHIVED_RECORD_ONLY",
+        receipt = {"schema_version": retirement_schema, "status": "ARCHIVED_RECORD_ONLY",
             "generation_context_sha256": context_sha, "generation_id": owner["generation_id"],
             "cell_id": owner["cell_id"], "cell_contract_sha256": owner["cell_contract_sha256"],
             "workspace_owner_sha256": owner_sha, "intent_sha256": intent_sha,
             "source_fence": {"path": str(source_fence_path), "sha256": source_fence_sha256},
             "precommit_sha256": (fence["binding"] if terminal_refusal or post_source_abort or native_completion
                 else fence["source_summary"]["binding"]).get("precommit_sha256"),
-            "end_grid_rows": fence["end_grid_rows"], "retired_payload_files": len(records),
-            "retired_logical_bytes": sum(record["bytes"] for record in records),
+            "end_grid_rows": fence["end_grid_rows"],
+            "retired_payload_files": intent["retired_payload_files"] if segment_max_records is not None else len(records),
+            "retired_logical_bytes": intent["retired_logical_bytes"] if segment_max_records is not None else sum(record["bytes"] for record in records),
             "payloads_retained": False, "genuine_cold_reopen_available": False,
             "descriptor_assurance": "IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE",
             "retained_unit_locks": list(unit_lock_paths),
             "qualification_authority": False, "capital_authority": False,
             "live_authority": False, "order_authority": False}
+        if segment_max_records is not None:
+            receipt["intent_segment_count"] = len(intent["segments"])
         if terminal_refusal:
             receipt.update(result_kind=TERMINAL_REFUSAL_RESULT_KIND,
                 terminal_refusal=dict(fence["refusal"]))
@@ -2341,9 +2731,13 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                 full_native_context_eligibility=False, financial_consumer_ready=False)
         external_root = _validate_root(retirement_receipt_path.parent, create=False)
         _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
-        receipt_sha = _retirement_publish(external_root, retirement_receipt_path.name, receipt, MAX_CONTEXT_BYTES)
-        _retirement_publish(root, RETIREMENT_COMPLETE_RELATIVE_PATH, {"schema_version": RETIREMENT_SCHEMA,
+        publish = _retirement_publish if segment_max_records is None else _retirement_publish_v2
+        receipt_sha = publish(external_root, retirement_receipt_path.name, receipt, MAX_CONTEXT_BYTES)
+        publish(root, RETIREMENT_COMPLETE_RELATIVE_PATH, {"schema_version": retirement_schema,
             "generation_context_sha256": context_sha, "receipt_sha256": receipt_sha}, MAX_CONTEXT_BYTES, root_owner=owner)
+        if segment_max_records is not None:
+            _retirement_v2_cleanup(root, intent_sha, arguments, maximum, owner)
+            return read_generation_retirement(root, expected_context_sha256=context_sha)
         intent_path = _safe_regular_file(root, RETIREMENT_INTENT_RELATIVE_PATH)
         if _retirement_control(root, RETIREMENT_INTENT_RELATIVE_PATH, maximum)[1] != intent_sha:
             _fail("RETIREMENT_INTENT_CHANGED")
@@ -2364,6 +2758,9 @@ __all__ = [
     "HISTORICAL_ANCHOR_MANIFEST_DOMAIN",
     "LEGACY_GENERATION_CONTEXT_SCHEMA",
     "NATIVE_COMPLETION_FENCE_SCHEMA",
+    "RETIREMENT_SCHEMA_V2",
+    "RETIREMENT_SEGMENT_SCHEMA",
+    "MAX_RETIREMENT_SEGMENT_RECORDS",
     "SYMBOL_MANIFEST_SCHEMA",
     "SpoolLimits",
     "SymbolAuthoritySink",
@@ -2379,4 +2776,6 @@ __all__ = [
     "read_owned_generation_workspace",
     "read_generation_retirement",
     "retire_completed_generation",
+    "plan_segmented_retirement",
+    "verify_segmented_retirement_inventory",
 ]
