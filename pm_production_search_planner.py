@@ -5498,3 +5498,190 @@ def reopen_declared_slot_m5_derived_observed_cell_plan(
         m5_derived=True, read_only=True)
     return result
 
+
+def describe_route_a_evaluation_design(*, frozen_domains: Any,
+                                     configurations: Any) -> dict[str, Any]:
+    """Describe legal evaluation identities without issuing or executing a process.
+
+    Supplied process, source and fitted-state bindings remain caller assertions.
+    Equal keys describe potential reuse, never an actual evaluation or decision.
+    Use per-fold or per-tier design calls if the unchanged result codec limit is reached.
+    """
+    prefix = "ROUTE_A_DESIGN_"
+
+    def encode(value, suffix, *, final_result=False):
+        try:
+            return _canonical_bytes(value)
+        except ProductionSearchPlannerError as exc:
+            if final_result and exc.code == "CANONICAL_JSON_SIZE_INVALID":
+                raise ProductionSearchPlannerError(prefix + "RESULT_TOO_LARGE") from exc
+            raise ProductionSearchPlannerError(prefix + suffix) from exc
+        except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+            raise ProductionSearchPlannerError(prefix + suffix) from exc
+
+    def snapshot(value, suffix, *, final_result=False):
+        encoded = encode(value, suffix, final_result=final_result)
+        try:
+            return json.loads(encoded)
+        except (ValueError, TypeError, OverflowError, RecursionError) as exc:
+            raise ProductionSearchPlannerError(prefix + suffix) from exc
+
+    def canonical_hash(value, suffix):
+        return hashlib.sha256(encode(value, suffix)).hexdigest()
+
+    def timestamp(value):
+        if (type(value) is not str or len(value) not in {20, 25}
+                or value[4] != "-" or value[7] != "-" or value[10] != "T"
+                or value[13] != ":" or value[16] != ":"
+                or value[19:] not in {"Z", "+00:00"}
+                or not all(value[index].isascii() and value[index].isdigit()
+                           for index in (0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18))):
+            _fail(prefix + "BINDING_INVALID")
+        return _utc(value, prefix + "BINDING_INVALID")
+
+    unit_fields = {"generation_context_sha256", "producer_request_sha256",
+        "executor_release_sha256", "producer_source_sha256", "horizon_plan_receipt_sha256",
+        "cell_plan_receipt_sha256", "source_group_sha256", "regime_fit_sha256", "frame_sha256",
+        "fitted_state_reference_sha256", "execution_spec_sha256", "frozen_receipt_sha256",
+        "cost_precommitments_sha256", "fold_plan_sha256", "attempt_roster_sha256"}
+    hash_fields = {"search_process_receipt_sha256", "config_sha256", "effective_config_sha256",
+        "source_contract_sha256", "partition_source_contract_sha256", "spread_model_sha256"}
+    binding_fields = hash_fields | {"declared_unit_binding", "symbol", "timeframe", "regime",
+        "anchor_id", "selection_cutoff_utc", "fold_id", "fold_ordinal", "partition_geometry",
+        "spread_tier"}
+    geometry_fields = {"schema_version", "role", "frame_start_utc", "scored_start_utc",
+        "end_exclusive_utc", "warmup_bars", "scored_bars", "frame_rows", "frame_sha256",
+        "receipt_sha256"}
+    protected = datetime(2024, 7, 14, 8, 5, tzinfo=UTC)
+
+    def evaluation_binding(value):
+        if type(value) is not dict or set(value) != binding_fields:
+            _fail(prefix + "BINDING_INVALID")
+        geometry = value["partition_geometry"]
+        if type(geometry) is not dict or set(geometry) != geometry_fields:
+            _fail(prefix + "BINDING_INVALID")
+        if type(geometry["role"]) is not str:
+            _fail(prefix + "BINDING_INVALID")
+        if geometry["role"] == "final_lockbox":
+            _fail(prefix + "LOCKBOX_REFUSED")
+        if geometry["role"] not in {"optimizer_train", "tuning_validation"}:
+            _fail(prefix + "BINDING_INVALID")
+        cutoff = timestamp(value["selection_cutoff_utc"])
+        start = timestamp(geometry["frame_start_utc"])
+        scored = timestamp(geometry["scored_start_utc"])
+        end = timestamp(geometry["end_exclusive_utc"])
+        if max(cutoff, start, scored, end) > protected:
+            _fail(prefix + "PROTECTED_CUTOFF_EXCEEDED")
+        if not start <= scored < end <= cutoff:
+            _fail(prefix + "BINDING_INVALID")
+        if (type(geometry["schema_version"]) is not str
+                or geometry["schema_version"] != "fxpm.winner-partition-geometry.v1"
+                or type(geometry["warmup_bars"]) is not int or geometry["warmup_bars"] < 0
+                or type(geometry["scored_bars"]) is not int or geometry["scored_bars"] <= 0
+                or type(geometry["frame_rows"]) is not int
+                or geometry["frame_rows"] != geometry["warmup_bars"] + geometry["scored_bars"]):
+            _fail(prefix + "BINDING_INVALID")
+        for field in ("frame_sha256", "receipt_sha256"):
+            _hex64(geometry[field], prefix + "BINDING_INVALID")
+        if geometry["receipt_sha256"] != canonical_hash(
+                {key: item for key, item in geometry.items() if key != "receipt_sha256"},
+                "BINDING_INVALID"):
+            _fail(prefix + "BINDING_INVALID")
+        unit = value["declared_unit_binding"]
+        if type(unit) is not dict or set(unit) != unit_fields:
+            _fail(prefix + "BINDING_INVALID")
+        for field in unit_fields:
+            _hex64(unit[field], prefix + "BINDING_INVALID")
+        for field in hash_fields:
+            _hex64(value[field], prefix + "BINDING_INVALID")
+        for field in ("symbol", "timeframe", "anchor_id", "fold_id"):
+            _identity(value[field], prefix + "BINDING_INVALID")
+        if (value["timeframe"] not in TIMEFRAMES
+                or (value["regime"] is not None
+                    and (type(value["regime"]) is not str or value["regime"] not in REGIMES))
+                or type(value["spread_tier"]) is not str or value["spread_tier"] not in {"P75", "P95"}
+                or type(value["fold_ordinal"]) is not int
+                or not 0 <= value["fold_ordinal"] < CAUSAL_FOLD_COUNT):
+            _fail(prefix + "BINDING_INVALID")
+        result = snapshot(value, "BINDING_INVALID")
+        result["selection_cutoff_utc"] = _utc_text(cutoff)
+        return result
+
+    if type(frozen_domains) not in {list, tuple} or not frozen_domains:
+        _fail(prefix + "INPUT_INVALID")
+    if type(configurations) not in {list, tuple}:
+        _fail(prefix + "INPUT_INVALID")
+    domains = {}
+    for supplied in frozen_domains:
+        if (type(supplied) is not dict
+                or not {"strategy_id", "strategy_family", "parameter_domain", "domain_sha256"} <= set(supplied)):
+            _fail(prefix + "DOMAIN_INVALID")
+        strategy = _identity(supplied["strategy_id"], prefix + "DOMAIN_INVALID")
+        _identity(supplied["strategy_family"], prefix + "DOMAIN_INVALID")
+        _hex64(supplied["domain_sha256"], prefix + "DOMAIN_INVALID")
+        if strategy in domains or type(supplied["parameter_domain"]) is not dict:
+            _fail(prefix + "DOMAIN_INVALID")
+        domain = snapshot(supplied, "DOMAIN_INVALID")
+        if domain["domain_sha256"] != canonical_hash(
+                {key: value for key, value in domain.items() if key != "domain_sha256"},
+                "DOMAIN_INVALID"):
+            _fail(prefix + "DOMAIN_INVALID")
+        parameter_domain = domain["parameter_domain"]
+        try:
+            validate_parameter_domain_member(parameter_domain, parameter_domain.get("defaults"))
+        except ValueError as exc:
+            raise ProductionSearchPlannerError(prefix + "DOMAIN_INVALID") from exc
+        domains[strategy] = domain
+
+    rows = []
+    first_requests = {}
+    for ordinal, supplied in enumerate(configurations):
+        required = {"strategy_id", "parameters", "evaluation_binding"}
+        if (type(supplied) is not dict or not required <= set(supplied)
+                or not set(supplied) <= required | {"bookkeeping"}):
+            _fail(prefix + "INPUT_INVALID")
+        strategy = _identity(supplied["strategy_id"], prefix + "DOMAIN_INVALID")
+        if strategy not in domains:
+            _fail(prefix + "DOMAIN_INVALID")
+        bookkeeping = supplied.get("bookkeeping", {})
+        if (type(bookkeeping) is not dict
+                or not set(bookkeeping) <= {"request_ordinal", "attempt_ordinal", "horizon_attempt_id"}):
+            _fail(prefix + "INPUT_INVALID")
+        for field, value in bookkeeping.items():
+            if field == "horizon_attempt_id":
+                _identity(value, prefix + "INPUT_INVALID")
+            elif type(value) is not int or value < 0:
+                _fail(prefix + "INPUT_INVALID")
+        binding = evaluation_binding(supplied["evaluation_binding"])
+        domain = domains[strategy]
+        try:
+            parameters = validate_parameter_domain_member(domain["parameter_domain"], supplied["parameters"])
+        except ValueError as exc:
+            raise ProductionSearchPlannerError(prefix + "PARAMETERS_INVALID") from exc
+        key = {"strategy_id": strategy, "strategy_family": domain["strategy_family"],
+            "domain_sha256": domain["domain_sha256"], "parameters": parameters,
+            "evaluation_binding": binding}
+        encoded_key = encode(key, "INPUT_INVALID")
+        previous = first_requests.get(encoded_key)
+        if previous is None:
+            first_requests[encoded_key] = ordinal
+        rows.append({"request_ordinal": ordinal, "strategy_id": strategy,
+            "strategy_family": domain["strategy_family"],
+            "domain_cardinality": domain["parameter_domain"]["point_count"],
+            "parameters": parameters, "shared_evaluation_key": key,
+            "same_identity_as_request_ordinal": previous,
+            "bookkeeping": snapshot(bookkeeping, "INPUT_INVALID")})
+    return snapshot({"schema_version": "fxpm.route-a-evaluation-design.v1",
+        "status": "DESIGN_ONLY", "execution_ready": False,
+        "provenance_scope": "CALLER_BOUND_METADATA_ONLY", "requests": rows,
+        "policy_reference": "E-00004535",
+        "shortlist": {"target_size": 5, "status": "UNAVAILABLE", "reason_code": "SELECTION_NOT_IMPLEMENTED"},
+        "family_quota": {"status": "UNAVAILABLE", "reason_code": "FAMILY_QUOTA_AUTHORITY_UNAVAILABLE"},
+        "stress_on_base_cost": {"status": "UNAVAILABLE", "reason_code": "STRESS_ON_BASE_COST_EVIDENCE_UNAVAILABLE"},
+        "sharing_status": "IDENTITY_ONLY_NO_SHARING_DECISION",
+        "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}, "INPUT_INVALID", final_result=True)
+
+
+__all__.append("describe_route_a_evaluation_design")
+

@@ -1987,7 +1987,7 @@ def test_terminal_plan_is_zero_attempt_and_not_a_market_verdict(
         config_sha256="b" * 64,
     )
     process = planner.FrozenProductionSearchProcess(
-        planner._canonical_bytes({"run_id": "terminal-run"}),
+        planner._canonical_bytes({"run_id": "terminal-run", "schema_version": planner.PROCESS_SCHEMA}),
         planner._canonical_bytes({"unused": True}),
         planner._PROCESS_SEAL,
     )
@@ -2048,7 +2048,7 @@ def test_authenticated_terminal_technical_plan_is_zero_attempt_abstention(
         config_sha256="b" * 64,
     )
     process = planner.FrozenProductionSearchProcess(
-        planner._canonical_bytes({"run_id": "terminal-run"}),
+        planner._canonical_bytes({"run_id": "terminal-run", "schema_version": planner.PROCESS_SCHEMA}),
         planner._canonical_bytes({"unused": True}),
         planner._PROCESS_SEAL,
     )
@@ -2231,7 +2231,7 @@ def test_unobserved_plan_binds_exact_support_and_has_zero_attempts(
         config_sha256="b" * 64,
     )
     process = planner.FrozenProductionSearchProcess(
-        planner._canonical_bytes({"run_id": "unobserved-run"}),
+        planner._canonical_bytes({"run_id": "unobserved-run", "schema_version": planner.PROCESS_SCHEMA}),
         planner._canonical_bytes({"unused": True}),
         planner._PROCESS_SEAL,
     )
@@ -2447,3 +2447,533 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
             sink=sink,
             plan=replace(plan, _attempt_artifacts_json=tuple(changed)),
         )
+
+
+# INVENTED finite-domain metadata only; these are not source or evaluation receipts.
+_ROUTE_A_INVENTED_UNIT_FIELDS = (
+    "generation_context_sha256", "producer_request_sha256", "executor_release_sha256",
+    "producer_source_sha256", "horizon_plan_receipt_sha256", "cell_plan_receipt_sha256",
+    "source_group_sha256", "regime_fit_sha256", "frame_sha256", "fitted_state_reference_sha256",
+    "execution_spec_sha256", "frozen_receipt_sha256", "cost_precommitments_sha256",
+    "fold_plan_sha256", "attempt_roster_sha256",
+)
+
+
+def _invented_route_a_design_fixture():
+    from copy import deepcopy
+    from pm_current_refit_parameters import build_parameter_domain
+
+    label = "INVENTED_ROUTE_A_DESIGN_ONLY_NOT_EVALUATION_OR_MARKET_EVIDENCE"
+    defaults = {"fast": 2, "slow": 5, "scale": 1.0, "fixture_label": label}
+    parameter_domain = build_parameter_domain(
+        defaults, {"fast": [2, 3], "slow": [5, 7], "scale": [1.0, 2.0]},
+        coupled_groups=[{"names": ["fast", "slow"], "choices": [[2, 5], [3, 7]]}],
+    )
+    domains = []
+    for suffix in ("A", "B"):
+        body = {"strategy_id": "INVENTED_STRATEGY_" + suffix,
+                "strategy_family": "INVENTED_FAMILY_" + suffix,
+                "fixture_provenance": label, "parameter_domain": deepcopy(parameter_domain)}
+        domains.append({**body, "domain_sha256": planner._sha(body)})
+    unit = {name: planner._sha({"fixture": label, "unit_role": name})
+            for name in _ROUTE_A_INVENTED_UNIT_FIELDS}
+    geometry = {
+        "schema_version": "fxpm.winner-partition-geometry.v1", "role": "optimizer_train",
+        "frame_start_utc": "2024-01-01T00:00:00+00:00",
+        "scored_start_utc": "2024-01-02T00:00:00+00:00",
+        "end_exclusive_utc": "2024-01-06T00:00:00+00:00",
+        "warmup_bars": 1, "scored_bars": 4, "frame_rows": 5,
+        "frame_sha256": planner._sha({"fixture": label, "partition_slice": True}),
+    }
+    geometry["receipt_sha256"] = planner._sha(geometry)
+    binding = {
+        name: planner._sha({"fixture": label, "binding_role": name}) for name in (
+            "search_process_receipt_sha256", "config_sha256", "effective_config_sha256",
+            "source_contract_sha256", "partition_source_contract_sha256", "spread_model_sha256",
+        )
+    }
+    binding.update({"declared_unit_binding": unit, "symbol": "INVENTED", "timeframe": "D1",
+                    "regime": "TREND", "anchor_id": "INVENTED_ANCHOR_0",
+                    "selection_cutoff_utc": "2024-01-07T00:00:00+00:00",
+                    "fold_id": "INVENTED_FOLD_0", "fold_ordinal": 0,
+                    "partition_geometry": geometry, "spread_tier": "P75"})
+    requests = [{"strategy_id": domains[0]["strategy_id"], "parameters": deepcopy(defaults),
+                 "evaluation_binding": deepcopy(binding),
+                 "bookkeeping": {"request_ordinal": 7, "attempt_ordinal": 100,
+                                 "horizon_attempt_id": "INVENTED_ATTEMPT_100"}}]
+    duplicate = deepcopy(requests[0])
+    duplicate["parameters"] = dict(reversed(list(defaults.items())))
+    duplicate["bookkeeping"] = {"request_ordinal": 8, "attempt_ordinal": 101,
+                               "horizon_attempt_id": "INVENTED_ATTEMPT_101"}
+    requests.append(duplicate)
+    distinct = deepcopy(requests[0])
+    distinct["parameters"].update(fast=3, slow=7, scale=2.0)
+    requests.append(distinct)
+    other_strategy = deepcopy(requests[0])
+    other_strategy["strategy_id"] = domains[1]["strategy_id"]
+    requests.append(other_strategy)
+    return domains, requests
+
+
+def _route_a_reseal_geometry(geometry):
+    geometry["receipt_sha256"] = planner._sha(
+        {name: value for name, value in geometry.items() if name != "receipt_sha256"})
+
+
+def _route_a_assert_refused(suffix, domains, requests):
+    with pytest.raises(planner.ProductionSearchPlannerError) as caught:
+        planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)
+    assert caught.value.code == "ROUTE_A_DESIGN_" + suffix
+
+
+def test_route_a_design_preserves_requests_and_only_aliases_identical_semantic_keys():
+    domains, requests = _invented_route_a_design_fixture()
+    result = planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)
+    assert result["status"] == "DESIGN_ONLY"
+    assert result["execution_ready"] is False
+    assert result["provenance_scope"] == "CALLER_BOUND_METADATA_ONLY"
+    assert result["sharing_status"] == "IDENTITY_ONLY_NO_SHARING_DECISION"
+    rows = result["requests"]
+    assert len(rows) == len(requests) == 4
+    assert [row["request_ordinal"] for row in rows] == [0, 1, 2, 3]
+    assert [row["same_identity_as_request_ordinal"] for row in rows] == [None, 0, None, None]
+    assert rows[0]["shared_evaluation_key"] == rows[1]["shared_evaluation_key"]
+    assert rows[0]["bookkeeping"] != rows[1]["bookkeeping"]
+    for row, request in zip(rows, requests):
+        domain = next(item for item in domains if item["strategy_id"] == request["strategy_id"])
+        assert "INVENTED" in domain["fixture_provenance"]
+        assert row["strategy_family"] == domain["strategy_family"]
+        assert row["domain_cardinality"] == 4
+        assert row["parameters"] == validate_parameter_domain_member(
+            domain["parameter_domain"], request["parameters"])
+        assert row["bookkeeping"] == request["bookkeeping"]
+        key = row["shared_evaluation_key"]
+        assert key["domain_sha256"] == domain["domain_sha256"]
+        expected_binding = dict(request["evaluation_binding"])
+        expected_binding["selection_cutoff_utc"] = "2024-01-07T00:00:00Z"
+        assert key["evaluation_binding"] == expected_binding
+        assert request["evaluation_binding"]["selection_cutoff_utc"] == "2024-01-07T00:00:00+00:00"
+        assert "bookkeeping" not in key
+        assert "request_ordinal" not in key
+    for forbidden in ("evaluated_count", "model_count", "model_call_count", "cache_hit_count",
+                      "actual_evaluations", "actual_shared_evaluations"):
+        assert forbidden not in result
+
+
+@pytest.mark.parametrize("location,field", [
+    *( ("declared_unit_binding", field) for field in _ROUTE_A_INVENTED_UNIT_FIELDS ),
+    *( ("evaluation_binding", field) for field in (
+        "search_process_receipt_sha256", "config_sha256", "effective_config_sha256",
+        "source_contract_sha256", "partition_source_contract_sha256", "spread_model_sha256")),
+])
+def test_route_a_design_complete_bound_hash_identity_separation(location, field):
+    from copy import deepcopy
+    domains, requests = _invented_route_a_design_fixture()
+    pair = [deepcopy(requests[0]), deepcopy(requests[0])]
+    target = pair[1]["evaluation_binding"]
+    if location == "declared_unit_binding":
+        target = target[location]
+    target[field] = planner._sha({"fixture": "INVENTED_DISTINCT_BOUND_INPUT", "field": field})
+    result = planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=pair)
+    assert result["requests"][0]["shared_evaluation_key"] != result["requests"][1]["shared_evaluation_key"]
+    assert result["requests"][1]["same_identity_as_request_ordinal"] is None
+
+
+@pytest.mark.parametrize("dimension", [
+    "symbol", "timeframe", "regime", "anchor_id", "cutoff", "fold_id", "fold_ordinal",
+    "partition_role", "window", "partition_frame", "warmup", "spread_tier",
+])
+def test_route_a_design_causal_geometry_and_gate_identity_separation(dimension):
+    from copy import deepcopy
+    domains, requests = _invented_route_a_design_fixture()
+    pair = [deepcopy(requests[0]), deepcopy(requests[0])]
+    binding = pair[1]["evaluation_binding"]
+    geometry = binding["partition_geometry"]
+    changes = {"symbol": "INVENTED_OTHER", "timeframe": "H4", "regime": None,
+               "anchor_id": "INVENTED_ANCHOR_1", "fold_id": "INVENTED_FOLD_1",
+               "fold_ordinal": 1, "spread_tier": "P95"}
+    if dimension in changes:
+        binding[dimension] = changes[dimension]
+    elif dimension == "cutoff":
+        binding["selection_cutoff_utc"] = "2024-01-08T00:00:00+00:00"
+    elif dimension == "partition_role":
+        geometry["role"] = "tuning_validation"
+    elif dimension == "window":
+        for field in ("frame_start_utc", "scored_start_utc", "end_exclusive_utc"):
+            geometry[field] = (pd.Timestamp(geometry[field]) - pd.Timedelta(days=1)).isoformat()
+    elif dimension == "partition_frame":
+        geometry["frame_sha256"] = planner._sha({"fixture": "INVENTED_OTHER_PARTITION_FRAME"})
+    elif dimension == "warmup":
+        geometry.update(warmup_bars=2, scored_bars=3, scored_start_utc="2024-01-03T00:00:00+00:00")
+    _route_a_reseal_geometry(geometry)
+    result = planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=pair)
+    assert result["requests"][0]["shared_evaluation_key"] != result["requests"][1]["shared_evaluation_key"]
+    assert result["requests"][1]["same_identity_as_request_ordinal"] is None
+
+
+@pytest.mark.parametrize("dimension", ["strategy_id", "strategy_family", "finite_domain"])
+def test_route_a_design_strategy_family_and_frozen_domain_identity_separation(dimension):
+    from copy import deepcopy
+    domains, requests = _invented_route_a_design_fixture()
+    original = planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests[:1])
+    altered_domains, altered_requests = deepcopy(domains), deepcopy(requests[:1])
+    domain = altered_domains[0]
+    if dimension == "strategy_id":
+        domain["strategy_id"] = "INVENTED_OTHER_STRATEGY"
+        altered_requests[0]["strategy_id"] = domain["strategy_id"]
+    elif dimension == "strategy_family":
+        domain["strategy_family"] = "INVENTED_OTHER_FAMILY"
+    else:
+        domain["parameter_domain"]["axes"][-1]["choices"][1] = [3.0]
+    domain["domain_sha256"] = planner._sha({key: value for key, value in domain.items() if key != "domain_sha256"})
+    altered = planner.describe_route_a_evaluation_design(frozen_domains=altered_domains, configurations=altered_requests)
+    assert original["requests"][0]["shared_evaluation_key"] != altered["requests"][0]["shared_evaluation_key"]
+
+
+@pytest.mark.parametrize("case", ["illegal_coupling", "outside_domain", "missing_fixed",
+                                  "extra_parameter", "integer_for_float", "nan", "bool_for_integer"])
+def test_route_a_design_illegal_finite_configuration_refuses(case):
+    domains, requests = _invented_route_a_design_fixture()
+    params = requests[0]["parameters"]
+    if case == "illegal_coupling":
+        params.update(fast=2, slow=7)
+    elif case == "outside_domain":
+        params["fast"] = 999
+    elif case == "missing_fixed":
+        params.pop("fixture_label")
+    elif case == "extra_parameter":
+        params["undeclared"] = 1
+    elif case == "integer_for_float":
+        params["scale"] = 1
+    elif case == "nan":
+        params["scale"] = float("nan")
+    else:
+        params["fast"] = True
+    _route_a_assert_refused("PARAMETERS_INVALID", domains, requests)
+
+
+@pytest.mark.parametrize("case", ["missing_family", "tampered_digest", "false_point_count",
+                                  "duplicate_strategy", "unknown_strategy"])
+def test_route_a_design_missing_or_corrupt_domain_refuses(case):
+    from copy import deepcopy
+    domains, requests = _invented_route_a_design_fixture()
+    if case == "missing_family":
+        domains[0].pop("strategy_family")
+        domains[0]["domain_sha256"] = planner._sha({key: value for key, value in domains[0].items() if key != "domain_sha256"})
+    elif case == "tampered_digest":
+        domains[0]["domain_sha256"] = "f" * 64
+    elif case == "false_point_count":
+        domains[0]["parameter_domain"]["point_count"] = 5
+        domains[0]["domain_sha256"] = planner._sha({key: value for key, value in domains[0].items() if key != "domain_sha256"})
+    elif case == "duplicate_strategy":
+        domains.append(deepcopy(domains[0]))
+    else:
+        requests[0]["strategy_id"] = "INVENTED_UNKNOWN_STRATEGY"
+    _route_a_assert_refused("DOMAIN_INVALID", domains, requests)
+
+
+@pytest.mark.parametrize("location,field", [
+    *( ("declared_unit_binding", field) for field in _ROUTE_A_INVENTED_UNIT_FIELDS ),
+    *( ("evaluation_binding", field) for field in (
+        "source_contract_sha256", "partition_source_contract_sha256", "spread_model_sha256",
+        "search_process_receipt_sha256", "config_sha256", "effective_config_sha256", "regime",
+        "anchor_id", "fold_id", "fold_ordinal", "selection_cutoff_utc", "partition_geometry", "spread_tier")),
+])
+def test_route_a_design_missing_result_changing_binding_refuses(location, field):
+    domains, requests = _invented_route_a_design_fixture()
+    target = requests[0]["evaluation_binding"]
+    if location == "declared_unit_binding":
+        target = target[location]
+    target.pop(field)
+    _route_a_assert_refused("BINDING_INVALID", domains, requests)
+
+
+@pytest.mark.parametrize("case", ["bad_geometry_receipt", "bad_rows", "bool_fold", "naive_cutoff",
+                                  "offset_cutoff", "fractional_cutoff", "object_cutoff", "unknown_tier",
+                                  "unknown_regime", "unknown_role"])
+def test_route_a_design_invalid_geometry_or_key_types_refuse(case):
+    domains, requests = _invented_route_a_design_fixture()
+    binding = requests[0]["evaluation_binding"]
+    geometry = binding["partition_geometry"]
+    if case == "bad_geometry_receipt":
+        geometry["receipt_sha256"] = "f" * 64
+    elif case == "bad_rows":
+        geometry["frame_rows"] += 1
+        _route_a_reseal_geometry(geometry)
+    elif case == "bool_fold":
+        binding["fold_ordinal"] = True
+    elif case == "naive_cutoff":
+        binding["selection_cutoff_utc"] = "2024-01-07T00:00:00"
+    elif case == "offset_cutoff":
+        binding["selection_cutoff_utc"] = "2024-01-07T01:00:00+01:00"
+    elif case == "fractional_cutoff":
+        binding["selection_cutoff_utc"] = "2024-01-07T00:00:00.000000001Z"
+    elif case == "object_cutoff":
+        binding["selection_cutoff_utc"] = pd.Timestamp("2024-01-07T00:00:00Z")
+    elif case == "unknown_tier":
+        binding["spread_tier"] = "BASE"
+    elif case == "unknown_regime":
+        binding["regime"] = "OTHER"
+    else:
+        geometry["role"] = "UNKNOWN"
+        _route_a_reseal_geometry(geometry)
+    _route_a_assert_refused("BINDING_INVALID", domains, requests)
+
+
+def test_route_a_design_lockbox_and_later_cutoff_refuse_but_exact_boundary_is_allowed():
+    from copy import deepcopy
+    domains, requests = _invented_route_a_design_fixture()
+    locked = deepcopy(requests)
+    locked[0]["evaluation_binding"]["partition_geometry"]["role"] = "final_lockbox"
+    _route_a_reseal_geometry(locked[0]["evaluation_binding"]["partition_geometry"])
+    _route_a_assert_refused("LOCKBOX_REFUSED", domains, locked)
+    for cutoff in ("2024-07-14T08:05:01+00:00", "2024-07-15T08:05:00+00:00"):
+        later = deepcopy(requests)
+        later[0]["evaluation_binding"]["selection_cutoff_utc"] = cutoff
+        _route_a_assert_refused("PROTECTED_CUTOFF_EXCEEDED", domains, later)
+    requests[0]["evaluation_binding"]["selection_cutoff_utc"] = "2024-07-14T08:05:00+00:00"
+    assert planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)["status"] == "DESIGN_ONLY"
+
+
+@pytest.mark.parametrize("extra", ["family_quota", "pnl_dollars", "evaluated_count"])
+def test_route_a_design_caller_quota_and_outcomes_are_not_accepted_configuration_fields(extra):
+    domains, requests = _invented_route_a_design_fixture()
+    requests[0][extra] = 2
+    _route_a_assert_refused("INPUT_INVALID", domains, requests)
+    requests[0].pop(extra)
+    requests[0]["bookkeeping"][extra] = 2
+    _route_a_assert_refused("INPUT_INVALID", domains, requests)
+
+
+def test_route_a_design_is_deterministic_detached_and_leaves_legacy_300_semantics_unchanged():
+    from copy import deepcopy
+    domains, requests = _invented_route_a_design_fixture()
+    before_domains, before_requests = deepcopy(domains), deepcopy(requests)
+    before_semantics = planner._process_semantics(domains)
+    first = planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)
+    second = planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)
+    assert first == second
+    assert domains == before_domains and requests == before_requests
+    first["requests"][0]["shared_evaluation_key"]["evaluation_binding"]["symbol"] = "MUTATED_OUTPUT"
+    assert requests == before_requests
+    assert planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests) == second
+    assert planner._process_semantics(domains) == before_semantics
+    assert planner.BASELINE_ATTEMPTS == 100
+    assert planner.ATTEMPT_COUNT == 300
+    assert before_semantics["attempt_policy"]["attempt_count_per_observed_cell"] == 300
+
+
+def test_route_a_design_policy_is_reference_only_with_quota_stress_floor_and_selection_unavailable():
+    domains, requests = _invented_route_a_design_fixture()
+    result = planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)
+    assert result["policy_reference"] == "E-00004535"
+    assert result["shortlist"] == {"target_size": 5, "status": "UNAVAILABLE",
+                                   "reason_code": "SELECTION_NOT_IMPLEMENTED"}
+    assert result["family_quota"] == {"status": "UNAVAILABLE", "reason_code": "FAMILY_QUOTA_AUTHORITY_UNAVAILABLE"}
+    assert result["stress_on_base_cost"] == {"status": "UNAVAILABLE",
+                                            "reason_code": "STRESS_ON_BASE_COST_EVIDENCE_UNAVAILABLE"}
+    for authority in ("qualification_authority", "capital_authority", "live_authority", "order_authority"):
+        assert result[authority] is False
+    assert "floor_passed" not in result
+    assert "winner" not in result
+
+
+# INVENTED boundary cases; no retained inputs, evaluation, or capacity evidence.
+_ROUTE_A_BOUNDARY_CASES = (
+    ("empty_domains", "INPUT_INVALID"), ("domain_container", "INPUT_INVALID"),
+    ("configuration_container", "INPUT_INVALID"), ("domain_record", "DOMAIN_INVALID"),
+    ("domain_missing_id", "DOMAIN_INVALID"), ("domain_bad_id", "DOMAIN_INVALID"),
+    ("domain_bad_family", "DOMAIN_INVALID"), ("domain_nonhex", "DOMAIN_INVALID"),
+    ("domain_parameter_shape", "DOMAIN_INVALID"), ("configuration_record", "INPUT_INVALID"),
+    ("configuration_missing_id", "INPUT_INVALID"), ("configuration_bad_id", "DOMAIN_INVALID"),
+    ("bookkeeping_shape", "INPUT_INVALID"), ("bookkeeping_request_negative", "INPUT_INVALID"),
+    ("bookkeeping_attempt_bool", "INPUT_INVALID"), ("bookkeeping_request_float", "INPUT_INVALID"),
+    ("bookkeeping_blank_horizon", "INPUT_INVALID"), ("geometry_shape", "BINDING_INVALID"),
+    ("geometry_missing_key", "BINDING_INVALID"), ("geometry_extra_key", "BINDING_INVALID"),
+    ("geometry_schema", "BINDING_INVALID"), ("start_after_scored", "BINDING_INVALID"),
+    ("scored_equals_end", "BINDING_INVALID"), ("end_after_cutoff", "BINDING_INVALID"),
+    ("geometry_after_protected", "PROTECTED_CUTOFF_EXCEEDED"),
+    ("negative_warmup", "BINDING_INVALID"), ("bool_warmup", "BINDING_INVALID"),
+    ("float_warmup", "BINDING_INVALID"), ("zero_scored", "BINDING_INVALID"),
+    ("bool_scored", "BINDING_INVALID"), ("float_scored", "BINDING_INVALID"),
+    ("bool_rows", "BINDING_INVALID"), ("float_rows", "BINDING_INVALID"),
+    ("geometry_nonhex", "BINDING_INVALID"), ("unit_shape", "BINDING_INVALID"),
+    ("unit_nonhex", "BINDING_INVALID"), ("binding_nonhex", "BINDING_INVALID"),
+    ("symbol_type", "BINDING_INVALID"), ("anchor_type", "BINDING_INVALID"),
+    ("fold_id_type", "BINDING_INVALID"), ("unknown_timeframe", "BINDING_INVALID"),
+    ("negative_fold", "BINDING_INVALID"), ("fold_outside_count", "BINDING_INVALID"),
+    ("invalid_calendar", "BINDING_INVALID"),
+)
+
+
+@pytest.mark.parametrize("case,code", _ROUTE_A_BOUNDARY_CASES, ids=[row[0] for row in _ROUTE_A_BOUNDARY_CASES])
+def test_route_a_boundary_reachable_refusals(case, code):
+    domains, requests = _invented_route_a_design_fixture()
+    binding = requests[0]["evaluation_binding"]
+    geometry = binding["partition_geometry"]
+    if case == "empty_domains":
+        domains = []
+    elif case == "domain_container":
+        domains = {"not": "a frozen-domain sequence"}
+    elif case == "configuration_container":
+        requests = {"not": "a configuration sequence"}
+    elif case == "domain_record":
+        domains[0] = None
+    elif case == "domain_missing_id":
+        domains[0].pop("strategy_id")
+    elif case == "domain_bad_id":
+        domains[0]["strategy_id"] = None
+    elif case == "domain_bad_family":
+        domains[0]["strategy_family"] = ""
+    elif case == "domain_nonhex":
+        domains[0]["domain_sha256"] = "g" * 64
+    elif case == "domain_parameter_shape":
+        domains[0]["parameter_domain"] = None
+    elif case == "configuration_record":
+        requests[0] = []
+    elif case == "configuration_missing_id":
+        requests[0].pop("strategy_id")
+    elif case == "configuration_bad_id":
+        requests[0]["strategy_id"] = None
+    elif case == "bookkeeping_shape":
+        requests[0]["bookkeeping"] = []
+    elif case == "bookkeeping_request_negative":
+        requests[0]["bookkeeping"]["request_ordinal"] = -1
+    elif case == "bookkeeping_attempt_bool":
+        requests[0]["bookkeeping"]["attempt_ordinal"] = True
+    elif case == "bookkeeping_request_float":
+        requests[0]["bookkeeping"]["request_ordinal"] = 1.0
+    elif case == "bookkeeping_blank_horizon":
+        requests[0]["bookkeeping"]["horizon_attempt_id"] = ""
+    elif case == "geometry_shape":
+        binding["partition_geometry"] = []
+    elif case == "geometry_missing_key":
+        geometry.pop("frame_sha256")
+    elif case == "geometry_extra_key":
+        geometry["unexpected"] = "INVENTED_EXTRA_FIELD"
+    elif case == "geometry_schema":
+        geometry["schema_version"] = "INVENTED_UNKNOWN_SCHEMA"
+    elif case == "start_after_scored":
+        geometry["frame_start_utc"] = "2024-01-03T00:00:00+00:00"
+    elif case == "scored_equals_end":
+        geometry["scored_start_utc"] = geometry["end_exclusive_utc"]
+    elif case == "end_after_cutoff":
+        geometry["end_exclusive_utc"] = "2024-01-08T00:00:00+00:00"
+    elif case == "geometry_after_protected":
+        binding["selection_cutoff_utc"] = "2024-07-14T08:05:00+00:00"
+        geometry["end_exclusive_utc"] = "2024-07-14T08:05:01+00:00"
+    elif case == "negative_warmup":
+        geometry.update(warmup_bars=-1, scored_bars=4, frame_rows=3)
+    elif case == "bool_warmup":
+        geometry.update(warmup_bars=False, scored_bars=4, frame_rows=4)
+    elif case == "float_warmup":
+        geometry.update(warmup_bars=1.0, scored_bars=4, frame_rows=5)
+    elif case == "zero_scored":
+        geometry.update(warmup_bars=1, scored_bars=0, frame_rows=1)
+    elif case == "bool_scored":
+        geometry.update(warmup_bars=1, scored_bars=True, frame_rows=2)
+    elif case == "float_scored":
+        geometry.update(warmup_bars=1, scored_bars=4.0, frame_rows=5)
+    elif case == "bool_rows":
+        geometry.update(warmup_bars=0, scored_bars=1, frame_rows=True)
+    elif case == "float_rows":
+        geometry.update(warmup_bars=1, scored_bars=4, frame_rows=5.0)
+    elif case == "geometry_nonhex":
+        geometry["frame_sha256"] = "g" * 64
+    elif case == "unit_shape":
+        binding["declared_unit_binding"] = []
+    elif case == "unit_nonhex":
+        binding["declared_unit_binding"]["fitted_state_reference_sha256"] = "g" * 64
+    elif case == "binding_nonhex":
+        binding["source_contract_sha256"] = "g" * 64
+    elif case == "symbol_type":
+        binding["symbol"] = 1
+    elif case == "anchor_type":
+        binding["anchor_id"] = None
+    elif case == "fold_id_type":
+        binding["fold_id"] = []
+    elif case == "unknown_timeframe":
+        binding["timeframe"] = "H2"
+    elif case == "negative_fold":
+        binding["fold_ordinal"] = -1
+    elif case == "fold_outside_count":
+        binding["fold_ordinal"] = planner.CAUSAL_FOLD_COUNT
+    elif case == "invalid_calendar":
+        binding["selection_cutoff_utc"] = "2024-02-30T00:00:00+00:00"
+    else:
+        raise AssertionError("unnamed boundary case")
+    # Keep independent receipts/sums valid so the intended refusal is reached.
+    if case.startswith("domain_") and case not in {"domain_container", "domain_record", "domain_nonhex"}:
+        domains[0]["domain_sha256"] = planner._sha(
+            {key: value for key, value in domains[0].items() if key != "domain_sha256"})
+    if isinstance(geometry, dict):
+        _route_a_reseal_geometry(geometry)
+    _route_a_assert_refused(code, domains, requests)
+
+
+@pytest.mark.parametrize("case,code", [
+    ("huge_geometry_integer", "BINDING_INVALID"),
+    ("role_numpy_array", "BINDING_INVALID"), ("schema_numpy_array", "BINDING_INVALID"),
+    ("deep_domain_metadata", "DOMAIN_INVALID"), ("non_json_domain_metadata", "DOMAIN_INVALID"),
+    ("huge_bookkeeping_integer", "INPUT_INVALID"),
+])
+def test_route_a_boundary_serialization_refuses_with_typed_context(case, code):
+    domains, requests = _invented_route_a_design_fixture()
+    geometry = requests[0]["evaluation_binding"]["partition_geometry"]
+    if case == "huge_geometry_integer":
+        # Construct inside the test: pytest must never stringify this as an id.
+        huge = 10 ** 5000
+        geometry.update(warmup_bars=huge, scored_bars=1, frame_rows=huge + 1)
+    elif case in {"role_numpy_array", "schema_numpy_array"}:
+        import numpy as np
+        geometry["role" if case == "role_numpy_array" else "schema_version"] = np.array(["a", "b"])
+    elif case == "deep_domain_metadata":
+        # Depth 4096 actually refused in the retained native-codec diagnostic.
+        # Keep prior fields valid; never pre-encode this fixture or change limits.
+        nested = "INVENTED_DEEP_METADATA"
+        for _ in range(4096):
+            nested = {"nested": nested}
+        domains[0]["invented_extra_metadata"] = nested
+    elif case == "non_json_domain_metadata":
+        domains[0]["invented_extra_metadata"] = object()
+    else:
+        requests[0]["bookkeeping"]["request_ordinal"] = 10 ** 5000
+    # Deliberately do not encode these fixtures before the API under test.
+    with pytest.raises(planner.ProductionSearchPlannerError) as caught:
+        planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)
+    assert caught.value.code == "ROUTE_A_DESIGN_" + code
+    if case not in {"role_numpy_array", "schema_numpy_array"}:
+        assert caught.value.__cause__ is not None
+        assert isinstance(caught.value.__cause__, (ValueError, TypeError, OverflowError, RecursionError))
+        if case == "deep_domain_metadata":
+            assert isinstance(caught.value.__cause__, RecursionError)
+
+
+@pytest.mark.parametrize("fault,expected", [
+    ("size", "RESULT_TOO_LARGE"), ("value", "INPUT_INVALID"), ("type", "INPUT_INVALID"),
+    ("overflow", "INPUT_INVALID"), ("recursion", "INPUT_INVALID"),
+])
+def test_route_a_boundary_injected_final_codec_error_translation(monkeypatch, fault, expected):
+    """INJECTED codec errors test translation, not actual result capacity."""
+    domains, requests = _invented_route_a_design_fixture()
+    original = planner._canonical_bytes
+    injected = []
+    faults = {"size": planner.ProductionSearchPlannerError("CANONICAL_JSON_SIZE_INVALID"),
+              "value": ValueError("INVENTED_INJECTED_VALUE_ERROR"),
+              "type": TypeError("INVENTED_INJECTED_TYPE_ERROR"),
+              "overflow": OverflowError("INVENTED_INJECTED_OVERFLOW_ERROR"),
+              "recursion": RecursionError("INVENTED_INJECTED_RECURSION_ERROR")}
+    error = faults[fault]
+
+    def final_result_only(value, **kwargs):
+        if type(value) is dict and value.get("schema_version") == "fxpm.route-a-evaluation-design.v1":
+            injected.append(True)
+            raise error
+        return original(value, **kwargs)
+
+    monkeypatch.setattr(planner, "_canonical_bytes", final_result_only)
+    with pytest.raises(planner.ProductionSearchPlannerError) as caught:
+        planner.describe_route_a_evaluation_design(frozen_domains=domains, configurations=requests)
+    assert injected == [True]
+    assert caught.value.code == "ROUTE_A_DESIGN_" + expected
+    assert caught.value.__cause__ is error
