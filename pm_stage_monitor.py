@@ -1,9 +1,10 @@
 """W5.1 stage monitor, design C (Original E4961 and E4974): exact counts and
 exclusive seconds per stage, telemetry only.
 
-Each symbol job runs in one spawned child through ``pm_memory_governor._measured_worker_call``.  That function is bound
+Ordinary symbol jobs run in one spawned child through ``pm_memory_governor._measured_worker_call``.  That function is bound
 by no release, declared source identity, execution contract or row code map, so one guarded opt-in start and stop
 there, plus this unhashed module, measures the stages without editing any hashed module and without re-keying anything.
+Slot-parallel jobs measure the scheduler parent and each slot child separately; their times are not a joint wall clock.
 The mechanism is ``sys.monitoring`` (Python 3.12): local PY_START and PY_RETURN events on the code objects of a fixed
 (module, qualname) stage map, and the global PY_UNWIND event for exits by exception.  The worker thread's stack turns
 the events into inclusive and exclusive seconds and exact call counts; a nested stage's time is subtracted from its
@@ -16,11 +17,11 @@ Rules from the council's prechecks and reviews:
 * Ordinary telemetry faults stay inside the observer. Process-control exceptions escape callbacks, leaving the observer
   inert for the caller's teardown. Interrupted start and stop attempt cleanup before propagating the exception.
 * No import system changes and no imports of its own.  Targets whose module is already loaded resolve at start.  The
-  others are discovered only at the two named post-import checkpoints of the actual cell routes,
+  others are discovered only at the named post-import checkpoint of the active route. The ordinary cell routes use
   ``_declared_native_cell_contract_sha256`` (native route) and ``_declared_m5_cell_contract_sha256`` (M5 route), whose
   PY_START fires after the route's own imports and before any stage work. Native measurement requires native-finalization
-  rows to reach the checkpoint. Cell entry (the two route functions) is
-  tracked separately and only counts cells.  Each target's coverage is disclosed: RESOLVED_AT_START,
+  rows to reach the checkpoint. Slot children use ``_declared_slot_worker_checkpoint`` after their own bootstrap.
+  Entry hooks count route invocations separately. Each target's coverage is disclosed: RESOLVED_AT_START,
   RESOLVED_AT_CHECKPOINT with the checkpoint and the cell ordinal in which it fired, UNRESOLVED with its reason,
   LOADED_AFTER_LAST_CHECKPOINT, or MODULE_NEVER_IMPORTED.  Coverage is full from the first cell only when every target
   resolved at start or at a checkpoint in cell 1; otherwise the summary names the first fully covered cell, and when a
@@ -33,7 +34,7 @@ Rules from the council's prechecks and reviews:
   from other threads are counted and ignored.  A negative or non-finite interval is never clamped: it is counted as an
   invalid interval, the sample is discarded and the timing is marked incomplete.  The observation interval uses the
   same clock between start and stop. Open frames, stack mismatches and callback faults also make timing incomplete.
-* One fresh exclusive bounded file per child.  One ``os.write`` per line with its actual return counted; a short, zero
+* One fresh exclusive bounded file per writer. One ``os.write`` per line with its actual return counted; a short, zero
   or failed write marks the tail corrupt, stops output and suppresses the footer.  Cumulative rows are written only
   between top-level stage calls on the worker thread, serialized by a lock, at most once per interval.  The footer,
   written once by ``stop`` into space reserved from its exact shape, carries the roster, coverage, timing, faults and
@@ -67,6 +68,8 @@ TOOL_NAME: Final = "fxpm-stage-monitor"
 ENV_DIRECTORY: Final = "FXPM_STAGE_TIMERS_DIR"
 CLOCK: Final = "time.perf_counter"
 _SCHEDULER: Final = "pm_historical_scheduler"
+_PRODUCER: Final = "pm_historical_search_producer"
+SLOT_CHILD_ROLE: Final = "SLOT_CHILD"
 
 # The fixed stage map (E4961 stage_map_sites): (stage, module, qualname).  Tests pass (stage, function) targets and
 # bind their own expected map to the reader.
@@ -103,6 +106,15 @@ CHECKPOINTS: Final[tuple[tuple[str, str, str], ...]] = (
     ("NATIVE", _SCHEDULER, "_declared_native_cell_contract_sha256"),
     ("M5", _SCHEDULER, "_declared_m5_cell_contract_sha256"),
 )
+# A native slot child performs source/search work; the scheduler parent owns account/finalization.
+SLOT_CHILD_STAGE_MAP: Final = tuple(
+    target for target in STAGE_MAP
+    if target[0] != "ACCOUNT_FINALIZATION" and target[2] not in (
+        "_reopen_m5_bound_fitted_timeframe", "fit_m5_derived_timeframe_for_search",
+    )
+)
+SLOT_CHILD_ENTRIES: Final = (("SLOT_CELL", _PRODUCER, "declared_slot_worker"),)
+SLOT_CHILD_CHECKPOINTS: Final = (("SLOT", _PRODUCER, "_declared_slot_worker_checkpoint"),)
 STAGES: Final = tuple(dict.fromkeys(stage for stage, _, _ in STAGE_MAP))
 UNATTRIBUTED: Final = "UNATTRIBUTED"
 
@@ -329,20 +341,25 @@ class _BoundedWriter:
 
 # -- the monitor -----------------------------------------------------------------------------------------------------
 class StageMonitor:
-    """Exact per-stage counts and exclusive seconds for one child process.  Construct, start, stop."""
+    """Exact per-stage counts and exclusive seconds for one monitored thread."""
 
     def __init__(self, label: str, directory: str, *, targets: Any = None, cell_entries: Any = None,
-                 checkpoints: Any = None, max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+                 checkpoints: Any = None, role: str | None = None, max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
                  row_interval_seconds: float = DEFAULT_ROW_INTERVAL_SECONDS,
                  clock: Callable[[], float] = time.perf_counter) -> None:
         if not _finite(row_interval_seconds) or row_interval_seconds < 0:
             _fail("STAGE_MONITOR_ROW_INTERVAL_INVALID")
+        if role is not None:
+            if role != SLOT_CHILD_ROLE or any(value is not None for value in (targets, cell_entries, checkpoints)):
+                _fail("STAGE_MONITOR_ROLE_INVALID")
+            targets, cell_entries, checkpoints = SLOT_CHILD_STAGE_MAP, SLOT_CHILD_ENTRIES, SLOT_CHILD_CHECKPOINTS
         self._targets = tuple(tuple(t) for t in (STAGE_MAP if targets is None else targets))
         self._cell_entries = tuple(tuple(t) for t in (CELL_ENTRIES if cell_entries is None else cell_entries))
         self._checkpoints = tuple(tuple(t) for t in (CHECKPOINTS if checkpoints is None else checkpoints))
         if not self._targets:
             _fail("STAGE_MONITOR_EMPTY_ROSTER")
         self.label = label
+        self._role = role
         self.pid = os.getpid()
         self._clock = clock
         self._writer = _BoundedWriter(directory, label, max_file_bytes)
@@ -661,9 +678,12 @@ class StageMonitor:
                 "scope": "WORKER_THREAD_ONLY"}
 
     def _row_body(self, now: float) -> dict[str, Any]:
-        return {"schema_version": SCHEMA_VERSION, "kind": ROW_KIND, "writer": self.label, "pid": self.pid,
-                "at_utc": _utc(), "monitor_elapsed_seconds": round(max(0.0, now - (self._start_clock or now)), 6),
-                "cells_started": self.cells_started, "stages": self._stage_table()}
+        row = {"schema_version": SCHEMA_VERSION, "kind": ROW_KIND, "writer": self.label, "pid": self.pid,
+               "at_utc": _utc(), "monitor_elapsed_seconds": round(max(0.0, now - (self._start_clock or now)), 6),
+               "cells_started": self.cells_started, "stages": self._stage_table()}
+        if self._role is not None:
+            row["monitor_role"] = self._role
+        return row
 
     def _footer_body(self, *, template: bool = False, task_duration_seconds: Any = None) -> dict[str, Any]:
         wide = _COUNTER_TEMPLATE
@@ -678,7 +698,7 @@ class StageMonitor:
             teardown = {"complete": not self.teardown_failed_steps, "failed_steps": list(self.teardown_failed_steps),
                         "tool_id_released": self.tool_id_released}
         active = True if template else (self._active_at_stop if self._active_at_stop is not None else self.active)
-        return {
+        footer = {
             "schema_version": SCHEMA_VERSION, "kind": FOOTER_KIND, "writer": self.label, "pid": self.pid,
             "worker_thread_ident": wide if template else self.worker_thread_ident,
             "file_name": self._writer.file_name, "directory": self._writer.directory,
@@ -698,6 +718,9 @@ class StageMonitor:
             "faults": faults, "teardown": teardown, "writer_counters": counters,
             "closed_at_utc": "2000-01-01T00:00:00+00:00" if template else _utc(),
         }
+        if self._role is not None:
+            footer["monitor_role"] = self._role
+        return footer
 
     # -- lifecycle -----------------------------------------------------------------------------------------------
     def start(self) -> bool:
@@ -1021,6 +1044,8 @@ def _check_footer(row: dict[str, Any], expected: dict[str, str], rows: int, offs
     entry_counts, checkpoint_counts = _route_counts(hooks)
     if row["cells_started"] != sum(entry_counts.values()) or row["cells_completed"] > row["cells_started"]:
         _fail("STAGE_MONITOR_FOOTER_CELL_COUNTS_INVALID")
+    if row.get("monitor_role") == SLOT_CHILD_ROLE and row["cells_started"] > 1:
+        _fail("STAGE_MONITOR_FOOTER_SLOT_COUNT_INVALID")
     if any(count > entry_counts.get(role, 0) for role, count in checkpoint_counts.items()):
         _fail("STAGE_MONITOR_FOOTER_CHECKPOINT_COUNTS_INVALID")
     for name, info in coverage.items():
@@ -1046,17 +1071,15 @@ def _route_counts(hooks: dict[str, dict[str, Any]]) -> tuple[dict[str, int], dic
 
 def read_monitor_file(path: str, expected: dict[str, str] | None = None,
                       max_read_bytes: int = MAX_READ_BYTES) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
-    """Parse one monitor file into (cumulative rows, footer or None) against the expected target-to-stage map (the
-    production map by default).  Bounded; any defect refuses the whole file."""
+    """Parse one bounded monitor file against its production role or an explicitly supplied test map."""
     production_map = expected_map(STAGE_MAP)
-    if expected is None:
-        expected = production_map
-    if type(expected) is not dict or not expected or any(not isinstance(k, str) or not isinstance(v, str) for k, v in expected.items()):
+    slot_map = expected_map(SLOT_CHILD_STAGE_MAP)
+    if expected is not None and (type(expected) is not dict or not expected
+                                 or any(not isinstance(k, str) or not isinstance(v, str) for k, v in expected.items())):
         _fail("STAGE_MONITOR_EXPECTED_MAP_INVALID")
-    expected_hooks = None
-    if expected == production_map:
-        expected_hooks = {target_name(entry): ("CELL_ENTRY", entry[0]) for entry in CELL_ENTRIES}
-        expected_hooks.update({target_name(cp): ("CHECKPOINT", cp[0]) for cp in CHECKPOINTS})
+    expected_hooks: dict[str, tuple[str, str]] | None = None
+    selected_map = production_map if expected is None else expected
+    monitor_role = None
     if type(max_read_bytes) is not int or max_read_bytes < MAX_LINE_BYTES or max_read_bytes > MAX_READ_BYTES:
         _fail("STAGE_MONITOR_READ_BOUND_INVALID")
     if os.path.getsize(path) > max_read_bytes:
@@ -1082,13 +1105,30 @@ def read_monitor_file(path: str, expected: dict[str, str] | None = None,
             _fail(f"STAGE_MONITOR_LINE_INVALID:{number}")
         if type(row) is not dict or row.get("schema_version") != SCHEMA_VERSION:
             _fail(f"STAGE_MONITOR_RECORD_INVALID:{number}")
+        role = row.get("monitor_role")
+        if ("monitor_role" in row and role != SLOT_CHILD_ROLE) or (number > 1 and role != monitor_role):
+            _fail(f"STAGE_MONITOR_RECORD_ROLE_INVALID:{number}")
+        if number == 1:
+            monitor_role = role
+            if role == SLOT_CHILD_ROLE:
+                if expected is not None and expected != slot_map:
+                    _fail("STAGE_MONITOR_EXPECTED_ROLE_MISMATCH")
+                selected_map = slot_map
+                entries, checkpoints = SLOT_CHILD_ENTRIES, SLOT_CHILD_CHECKPOINTS
+            elif selected_map == slot_map:
+                _fail("STAGE_MONITOR_EXPECTED_ROLE_MISMATCH")
+            else:
+                entries, checkpoints = CELL_ENTRIES, CHECKPOINTS
+            if role == SLOT_CHILD_ROLE or selected_map == production_map:
+                expected_hooks = {target_name(entry): ("CELL_ENTRY", entry[0]) for entry in entries}
+                expected_hooks.update({target_name(cp): ("CHECKPOINT", cp[0]) for cp in checkpoints})
         kind = row.get("kind")
         if kind == FOOTER_KIND:
-            _check_footer(row, expected, len(rows), offset, number, expected_hooks)
+            _check_footer(row, selected_map, len(rows), offset, number, expected_hooks)
             footer = row
             footer_length = len(raw) + 1
         elif kind == ROW_KIND:
-            _check_row(row, expected, number)
+            _check_row(row, selected_map, number)
             rows.append(row)
         else:
             _fail(f"STAGE_MONITOR_RECORD_INVALID:{number}")
@@ -1129,6 +1169,7 @@ def summarize(footer: dict[str, Any] | None) -> dict[str, Any]:
     checkpoints_unarmed = sorted(n for n, i in hooks.items() if i["kind"] == "CHECKPOINT" and i["status"] != "ARMED")
     entries_unarmed = sorted(n for n, i in hooks.items() if i["kind"] == "CELL_ENTRY" and i["status"] != "ARMED")
     entries, checkpoints = _route_counts(hooks)
+    slot_child = footer.get("monitor_role") == SLOT_CHILD_ROLE
     checkpoint_routes_missed = sorted(role for role, count in entries.items() if count > checkpoints.get(role, 0))
     full_from_cell = None
     if footer["cells_started"] and not (not_covered or checkpoints_unarmed or entries_unarmed or checkpoint_routes_missed):
@@ -1144,20 +1185,25 @@ def summarize(footer: dict[str, Any] | None) -> dict[str, Any]:
         ("TIMING_" + str(timing.get("timing_incomplete_reason")), timing["timing_complete"] is True),
         ("CHECKPOINT_UNAVAILABLE", not checkpoints_unarmed),
         ("CELL_ENTRY_UNAVAILABLE", not entries_unarmed),
-        ("NO_CELLS", footer["cells_started"] > 0 or footer["roster_stages"] != expected_map(STAGE_MAP)),
+        ("NO_SLOTS" if slot_child else "NO_CELLS", footer["cells_started"] > 0
+         or (not slot_child and footer["roster_stages"] != expected_map(STAGE_MAP))),
         ("CHECKPOINT_UNREACHED", not checkpoint_routes_missed),
+        ("SLOT_UNFINISHED", not slot_child or footer["cells_completed"] == footer["cells_started"]),
         ("INCOMPLETE_COVERAGE", not not_covered),
         ("LATE_COVERAGE", not late),
     ]
     failed = [name for name, ok in checks if not ok]
+    counts = ({"monitor_role": SLOT_CHILD_ROLE, "slots_started": footer["cells_started"],
+               "slots_returned": footer["cells_completed"], "fully_covered_from_slot_ordinal": full_from_cell}
+              if slot_child else {"cells_started": footer["cells_started"], "cells_completed": footer["cells_completed"],
+                                  "fully_covered_from_cell_ordinal": full_from_cell})
     return {"schema_version": SCHEMA_VERSION + ".summary", "writer": footer["writer"], "pid": footer["pid"],
             "observation_interval_seconds": timing.get("observation_interval_seconds"),
             "task_duration_seconds": timing.get("task_duration_seconds"),
             "attributed_exclusive_seconds": attributed, UNATTRIBUTED: timing.get(UNATTRIBUTED),
-            "cells_started": footer["cells_started"], "cells_completed": footer["cells_completed"],
+             **counts,
             "stages": table, "stage_nesting": footer["stage_nesting"], "not_covered": not_covered, "late_coverage": late,
             "checkpoints_unarmed": checkpoints_unarmed,
-            "fully_covered_from_cell_ordinal": full_from_cell,
             "checkpoint_routes_missed": checkpoint_routes_missed,
             "coverage": {"footer_present": True, "complete": not failed, "incomplete_reason": failed[0] if failed else None,
                          "failed_checks": failed, "faults": footer["faults"], "writer_counters": counters,
@@ -1167,6 +1213,6 @@ def summarize(footer: dict[str, Any] | None) -> dict[str, Any]:
 
 
 __all__ = ["SCHEMA_VERSION", "STAGE_MAP", "CELL_ENTRIES", "CHECKPOINTS", "STAGES", "UNATTRIBUTED", "ENV_DIRECTORY",
-           "StageMonitorError", "StageMonitor", "resolve_targets", "target_name", "expected_map", "start",
+           "StageMonitorError", "StageMonitor", "resolve_targets", "target_name", "expected_map", "start", "SLOT_CHILD_ROLE",
            "read_monitor_file", "summarize", "RESOLVED_AT_START", "RESOLVED_AT_CHECKPOINT", "UNRESOLVED",
            "LOADED_AFTER_LAST_CHECKPOINT", "MODULE_NEVER_IMPORTED", "PENDING"]

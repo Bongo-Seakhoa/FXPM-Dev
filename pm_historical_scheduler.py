@@ -116,6 +116,7 @@ __all__ = [
 
 DECLARED_SCHEDULER_SCHEMA: Final = "fxpm.declared-symbol-scheduler.v1"
 DECLARED_CELL_MIN_FREE_BYTES: Final = 5 * 1024**3
+_DECLARED_SLOT_PARALLEL_WORKER_COUNTS: Final = (2, 4)
 # E4193 binds these limits in full13_research_bindings_002.draft.json.
 _DECLARED_NATIVE_FINALIZATION_LIMITS: Final = {
     "max_artifact_bytes": 1024**3, "max_symbol_bytes": 8 * 1024**3,
@@ -181,6 +182,14 @@ def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dic
                 or type(policy["lead_seconds"]) is not int or policy["lead_seconds"] < 0
                 or type(policy["validity_seconds"]) is not int or policy["validity_seconds"] <= 0):
             _fail("DECLARED_SCHEDULER_WINDOW_POLICY_REQUIRED", index)
+        if "slot_parallel_workers" in row and (
+            type(row["slot_parallel_workers"]) is not int
+            or row["slot_parallel_workers"] not in _DECLARED_SLOT_PARALLEL_WORKER_COUNTS
+            or len(owned["cells"]) != 1
+            or "native_finalization" not in row
+            or "m5_development" in row
+        ):
+            _fail("DECLARED_SLOT_PARALLEL_CONTRACT_INVALID")
         supplied_root = Path(row["root"])
         if "native_finalization" in row:
             import pm_authority_spool as spool
@@ -425,6 +434,17 @@ def _declared_native_cell_contract_sha256(contract, row, limits):
         "profile_sha256": contract["profile_sha256"], "active_config_path": contract["active_config_path"],
         "spool_limits": asdict(limits),
         "cell": {key: value for key, value in row.items() if key != "descriptor_index"}})
+
+
+def _declared_native_spool_limits(row):
+    import pm_authority_spool as spool
+
+    values = dict(_DECLARED_NATIVE_FINALIZATION_LIMITS)
+    if "slot_parallel_workers" in row:
+        # Use ordinary storage bounds without the special historical disk policy.
+        for name in ("max_symbol_bytes", "max_generation_bytes", "min_free_bytes"):
+            del values[name]
+    return spool.validate_spool_limits(spool.SpoolLimits(**values))
 
 
 def _declared_native_finalization_preflight(contract, row, config, limits, *, fresh):
@@ -706,7 +726,7 @@ def _declared_native_retirement_preflight(context, workspace_sha, *, protected, 
 
 
 def _declared_native_finalize_account(result, *, context, contract, row, config, precommit, process,
-        artifact, run_body, workspace_sha, cell_contract_sha256):
+                                      artifact, run_body, workspace_sha, cell_contract_sha256, parallel_files=()):
     import hashlib
     import os
     from pathlib import Path
@@ -793,10 +813,12 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
         if fence_sha != _declared_m5_hash(fence_body):
             _fail("DECLARED_NATIVE_FINALIZATION_FENCE_ENCODING_UNSUPPORTED")
         direct, locks, _ = _declared_owned_direct_files(context, precommit, row, max_paths=retirement["max_paths"],
-            verified_no_plan=lambda slot: no_plan_requests.get(slot["slot_id"]))
+            verified_no_plan=lambda slot: no_plan_requests.get(slot["slot_id"]), additional_direct=parallel_files)
         _declared_native_retirement_preflight(context, workspace_sha, protected=protected,
             direct=direct, locks=locks, fence_path=fence_path, fence_sha=fence_sha, retirement=retirement)
-        if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
+        if "slot_parallel_workers" not in row and not _declared_disk_ready(
+            context.root, contract, context.limits.min_free_bytes
+        ):
             _fail("DECLARED_NATIVE_FINALIZATION_DISK_LOW")
         writing = True
         for contract_sha, body in contracts.items():
@@ -836,7 +858,10 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
         return result
 
 
-def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, Any]:
+def _declared_run_one_cell(
+    contract: Mapping[str, Any], row: Mapping[str, Any], *,
+    slot_dispatch=None, slot_worker_limit: int = 1,
+) -> dict[str, Any]:
     from datetime import datetime, timedelta
     from pathlib import Path
     import os
@@ -849,6 +874,9 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
     import pm_production_config_binding as binding
     import pm_production_search_planner as planner
     import pm_spread_profile as spread
+
+    if (slot_dispatch is not None) != ("slot_parallel_workers" in row):
+        _fail("DECLARED_SLOT_PARALLEL_CONTRACT_INVALID")
     result = _declared_cell_row(row, "FAILED", pid=os.getpid())
     finalize_native = row.get("native_finalization") is not None
     native_workspace_sha = None
@@ -857,7 +885,7 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
         context_root = Path(row["root"])
         limits = None
         if finalize_native:
-            limits = spool.validate_spool_limits(spool.SpoolLimits(**_DECLARED_NATIVE_FINALIZATION_LIMITS))
+            limits = _declared_native_spool_limits(row)
             digest = _declared_native_cell_contract_sha256(contract, row, limits)
             archived = spool.read_generation_retirement(context_root,
                 expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
@@ -873,7 +901,7 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                 expected_native_universe_sha256=contract["native_universe_sha256"], expected_config_sha256=contract["config_sha256"])
         else:
             reserve = limits.min_free_bytes if finalize_native else DECLARED_CELL_MIN_FREE_BYTES
-            if not _declared_disk_ready(context_root, contract, reserve):
+            if slot_dispatch is None and not _declared_disk_ready(context_root, contract, reserve):
                 result.update(status="NOT_RUN", reason_code="DISK_LOW")
                 return result
             ownership = {}
@@ -909,7 +937,7 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                 precommit = orchestration.reopen_declared_slot_owner_run_precommit(context,
                     receipt_sha256=records[0].parent.name, process=process, frozen_pipeline_config=frozen)
             else:
-                if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
+                if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
                     result.update(status="NOT_RUN", reason_code="DISK_LOW")
                     return result
                 process = planner.freeze_production_search_process(context, run_id=row["run_id"])
@@ -917,10 +945,12 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                     frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs={"config_sha256":context.config_sha256,
                         "effective_config_sha256":frozen.effective_config_sha256},
                     extend_frozen_clock_backward=row["extend_frozen_clock_backward"], protected_end_exclusive_utc=row["protected_end_exclusive_utc"])
+                if slot_dispatch is not None and len(roster["slots"]) != 13:
+                    _fail("DECLARED_SLOT_PARALLEL_FULL_ROSTER_REQUIRED")
                 profile = spread.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
                 if profile.sha256 != contract["profile_sha256"]:
                     _fail("DECLARED_SCHEDULER_PROFILE_CHANGED")
-                if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
+                if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
                     result.update(status="NOT_RUN", reason_code="DISK_LOW")
                     return result
                 now = _declared_utc_now()
@@ -946,6 +976,12 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
             if (parent["cells"] != [row["cell"]] or parent["run_id"] != row["run_id"]
                     or parent["spread_profile_identity"]["profile_sha256"] != contract["profile_sha256"]):
                 _fail("DECLARED_SCHEDULER_PRECOMMIT_BINDING_MISMATCH")
+            if slot_dispatch is not None:
+                if len(parent["slot_roster"]["slots"]) != 13:
+                    _fail("DECLARED_SLOT_PARALLEL_FULL_ROSTER_REQUIRED")
+                renewal = context.root / "declared-slots" / precommit.receipt_sha256 / "source-access-renewal"
+                if os.path.lexists(renewal):
+                    _fail("DECLARED_NATIVE_FINALIZATION_RENEWAL_NOT_OWNED")
             result["precommit_sha256"] = precommit.receipt_sha256
             progress, busy = _declared_progress_or_busy(context, precommit, process, frozen, row["cell"]["cell_id"])
             if busy:
@@ -959,6 +995,10 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
             if progress.terminal_stop:
                 result.update(status="TERMINAL_STOP", reason_code="RECORDED_TERMINAL_STOP")
                 return result
+            parallel_files = ()
+            if slot_dispatch is not None and run_body is not None:
+                parallel_files = producer.verify_declared_parallel_slot_files(context, precommit=precommit,
+                    process=process, cell_id=row["cell"]["cell_id"], frozen_pipeline_config=frozen)
             existing = None
             if recorded:
                 import pm_forward_oos_replay_producer as forward
@@ -969,9 +1009,9 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                     if finalize_native:
                         return _declared_native_finalize_account(result, context=context, contract=contract, row=row,
                             config=config, precommit=precommit, process=process, artifact=existing, run_body=run_body,
-                            workspace_sha=native_workspace_sha, cell_contract_sha256=digest)
+                            workspace_sha=native_workspace_sha, cell_contract_sha256=digest, parallel_files=parallel_files)
                     return result
-            if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
+            if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
                 result.update(status="NOT_RUN", reason_code="DISK_LOW")
                 return result
             # Any unfinished work, including account production after all slots,
@@ -987,23 +1027,23 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
                 result.update(status="NOT_RUN", reason_code="NATIVE_DRIFT")
                 return result
             if progress.run_receipt is None:
-                if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
+                if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
                     result.update(status="NOT_RUN", reason_code="DISK_LOW")
                     return result
-                try:
-                    run = producer.execute_declared_cell_owner_slots(context=context, precommit=precommit, process=process,
-                        frozen_pipeline_config=frozen, cell_id=row["cell"]["cell_id"])
-                except Exception as exc:
-                    if getattr(exc, "code", "") == "DECLARED_SLOT_RUN_ACTIVE":
-                        result.update(status="NOT_RUN", reason_code="BUSY")
-                        return result
-                    raise
+                parallel = {} if slot_dispatch is None else {
+                    "slot_dispatch": slot_dispatch, "slot_worker_limit": slot_worker_limit,
+                }
+                run = producer.execute_declared_cell_owner_slots(context=context, precommit=precommit, process=process,
+                    frozen_pipeline_config=frozen, cell_id=row["cell"]["cell_id"], **parallel)
                 run_body = run.to_dict()
                 result["run_receipt"] = _declared_run_descriptor(precommit, row, run_body)
                 if run_body["terminal_stop"]:
                     result.update(status="TERMINAL_STOP", reason_code="NEW_TERMINAL_STOP", recorded_before_dispatch=False)
                     return result
-            if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
+                if slot_dispatch is not None and not parallel_files:
+                    parallel_files = producer.verify_declared_parallel_slot_files(context, precommit=precommit,
+                        process=process, cell_id=row["cell"]["cell_id"], frozen_pipeline_config=frozen)
+            if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
                 result.update(status="NOT_RUN", reason_code="DISK_LOW")
                 return result
             artifact, reopened = _declared_account(context, precommit, process, frozen, config)
@@ -1011,16 +1051,28 @@ def _declared_run_one_cell(contract: Mapping[str, Any], row: Mapping[str, Any]) 
             if finalize_native:
                 return _declared_native_finalize_account(result, context=context, contract=contract, row=row,
                     config=config, precommit=precommit, process=process, artifact=artifact, run_body=run_body,
-                    workspace_sha=native_workspace_sha, cell_contract_sha256=digest)
+                    workspace_sha=native_workspace_sha, cell_contract_sha256=digest, parallel_files=parallel_files)
             return result
     except Exception as exc:
         if spool.is_resource_capacity_error(exc):
             result.update(status="NOT_RUN", reason_code="DISK_LOW")
-        elif getattr(exc,"code","") == "DECLARED_SLOT_RUN_ACTIVE":
+        elif getattr(exc, "code", "") in {"DECLARED_SLOT_RUN_ACTIVE", "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE"}:
             result.update(status="NOT_RUN", reason_code="BUSY")
         else:
             result.update(status="FAILED", reason_code=str(getattr(exc,"code",type(exc).__name__))[:256])
         return result
+
+
+def _declared_cell_deferral(contract, cell, result):
+    if result["status"] != "NOT_RUN":
+        return None
+    reason = result["reason_code"]
+    if reason == "DISK_LOW" or (
+        (contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA or "native_finalization" in cell)
+        and reason.startswith(("RETIREMENT_", "SPOOL_RETIREMENT_", "WORKSPACE_ROOT_"))
+    ):
+        return reason
+    return None
 
 
 def declared_symbol_worker(contract: Mapping[str, Any], symbol: str) -> dict[str, Any]:
@@ -1045,14 +1097,8 @@ def declared_symbol_worker(contract: Mapping[str, Any], symbol: str) -> dict[str
             row = _declared_cell_row(cell, "FAILED", str(getattr(exc, "code", type(exc).__name__)), pid=os.getpid())
             stopped = True
         rows.append(row)
-        if row["status"] == "NOT_RUN" and row["reason_code"] == "DISK_LOW":
-            stop_reason = "DISK_LOW"
-            stopped = True
-        if ((contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
-                or "native_finalization" in cell)
-                and row["status"] == "NOT_RUN" and row["reason_code"].startswith(
-                    ("RETIREMENT_", "SPOOL_RETIREMENT_", "WORKSPACE_ROOT_"))):
-            stop_reason = row["reason_code"]
+        if deferred := _declared_cell_deferral(contract, cell, row):
+            stop_reason = deferred
             stopped = True
         stopped = stopped or row["status"] in {"FAILED", "UNRESOLVED_CRASH"} or (row["status"] == "TERMINAL_STOP" and not row["recorded_before_dispatch"])
         if not stopped:
@@ -1128,7 +1174,7 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
             expected = next(cell for cell in contract["cells"] if cell["descriptor_index"] == row["descriptor_index"])
             if "native_finalization" not in expected:
                 _fail("DECLARED_NATIVE_ARCHIVED_RESULT_INVALID")
-            limits = spool.validate_spool_limits(spool.SpoolLimits(**_DECLARED_NATIVE_FINALIZATION_LIMITS))
+            limits = _declared_native_spool_limits(expected)
             record = spool.read_generation_retirement(Path(row["root"]),
                 expected_context_sha256=row["generation_context_sha256"],
                 expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
@@ -1182,12 +1228,23 @@ def run_declared_symbol_scheduler(
     """Drain one symbol-grouped dispatch, retaining exactly one row per cell."""
     from dataclasses import asdict, is_dataclass
     import json
+    import os
     from pathlib import Path
+    from time import monotonic
     if not callable(worker):
         _fail("DECLARED_SCHEDULER_WORKER_INVALID")
+    is_m5 = type(contract) is dict and contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
+    if is_m5 and type(contract.get("cells")) is list and any(
+        type(cell) is dict and "slot_parallel_workers" in cell for cell in contract["cells"]
+    ):
+        _fail("DECLARED_SLOT_PARALLEL_CONTRACT_INVALID")
     owned, groups = (_declared_m5_contract(contract)
-        if type(contract) is dict and contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
-        else _declared_contract(contract))
+        if is_m5 else _declared_contract(contract))
+    slot_workers = owned["cells"][0].get("slot_parallel_workers")
+    if slot_workers is not None and (
+        worker is not declared_symbol_worker or type(requested_workers) is not int or requested_workers != slot_workers
+    ):
+        _fail("DECLARED_SLOT_PARALLEL_CONTRACT_INVALID")
     owned.update(scheduler_disk_min_free_bytes=disk_min_free_bytes,
         scheduler_disk_headroom_bytes=disk_headroom_bytes)
     _declared_disk_requirement(owned, DECLARED_CELL_MIN_FREE_BYTES)
@@ -1196,7 +1253,7 @@ def run_declared_symbol_scheduler(
     destination = Path(telemetry_path)
     if destination.suffix != ".jsonl":
         _fail("DECLARED_SCHEDULER_TELEMETRY_PATH_INVALID")
-    worker_limit = memory_governor.recommended_worker_count(requested_workers, len(groups))
+    worker_limit = memory_governor.recommended_worker_count(requested_workers, 13 if slot_workers else len(groups))
     governor = memory_governor.MemoryGovernor(requested_workers=worker_limit, termination_grace_seconds=TERMINATION_GRACE_SECONDS)
     policy = memory_governor.GovernorResourcePolicy(soft_ram_hold=soft_ram_hold,
         soft_ram_target_fraction=soft_ram_target_fraction, sample_interval_seconds=telemetry_interval_seconds, disk_path=str(destination.parent))
@@ -1238,10 +1295,60 @@ def run_declared_symbol_scheduler(
             gate["reason"] = "DISK_PROBE_ERROR"
             retain_error("DISK_PROBE:"+type(exc).__name__)
         return gate["open"]
-    outcomes = governor.iter_completed(worker, tasks(), admission_gate=admission_open,
-        resource_policy=policy, telemetry_callback=telemetry)
+
+    def retain_result(value, cells, symbol, worker_pid):
+        value = _declared_validate_result(value, cells, symbol, worker_pid=worker_pid)
+        result_rows = value["cells"]
+        disk_deferred = any(row["status"] == "NOT_RUN" and row["reason_code"] == "DISK_LOW"
+            for row in result_rows)
+        failed = any(row["status"] in {"FAILED","UNRESOLVED_CRASH"}
+            or row.get("cleanup_failure") or (row["status"]=="TERMINAL_STOP" and not row["recorded_before_dispatch"])
+            for row in result_rows)
+        if failed or (value["closes_admission"] and not disk_deferred):
+            retain_error("CELL_FAILURE:"+symbol)
+        elif disk_deferred:
+            gate.update(open=False, reason="DISK_LOW")
+        return result_rows
+
+    outcomes = None
+    if slot_workers is None:
+        outcomes = governor.iter_completed(worker, tasks(), admission_gate=admission_open,
+            resource_policy=policy, telemetry_callback=telemetry)
+    else:
+        cell = owned["cells"][0]
+        symbol = cell["cell"]["symbol"]
+
+        def slot_dispatch(slot_tasks, slot_admission, task_ready):
+            from pm_historical_search_producer import declared_slot_worker
+
+            def admit_slot():
+                return gate["open"] and slot_admission()
+
+            return governor.iter_completed(declared_slot_worker, slot_tasks, admission_gate=admit_slot,
+                task_ready=task_ready, resource_policy=policy, telemetry_callback=telemetry)
+
+        try:
+            observer = memory_governor._ResourceObserver(policy, telemetry, governor.resource_stats)
+            observer.observe((), force=True)
+            if gate["open"]:
+                started = monotonic()
+                monitor = memory_governor._start_stage_monitor(declared_symbol_worker, symbol + ".parent")
+                try:
+                    row = _declared_run_one_cell(owned, cell, slot_dispatch=slot_dispatch, slot_worker_limit=worker_limit)
+                finally:
+                    memory_governor._stop_stage_monitor(monitor, started)
+            else:
+                row = _declared_cell_row(cell, "NOT_RUN", gate["reason"])
+            value = {"schema_version": DECLARED_SCHEDULER_SCHEMA, "symbol": symbol, "cells": [row],
+                "closes_admission": not gate["open"] or _declared_cell_deferral(owned, cell, row) is not None}
+            rows[cell["descriptor_index"]], = retain_result(value, [cell], symbol, os.getpid())
+        except Exception as exc:
+            retain_error("RESULT:"+symbol+":"+type(exc).__name__)
+            rows[cell["descriptor_index"]] = _declared_cell_row(
+                cell, "UNRESOLVED_CRASH", "INVALID_WORKER_RESULT", pid=os.getpid())
+
     try:
-        for outcome in outcomes:
+        for outcome in () if outcomes is None else outcomes:
             symbol = outcome.task_key
             try:
                 if symbol not in groups or symbol in seen:
@@ -1253,17 +1360,7 @@ def run_declared_symbol_scheduler(
                     retain_error("WORKER:"+symbol+":"+outcome.status)
                     result_rows = [_declared_cell_row(cell,"UNRESOLVED_CRASH",outcome.error_type or outcome.status,pid=outcome.worker_pid or None) for cell in groups[symbol]]
                 else:
-                    value = _declared_validate_result(outcome.value, groups[symbol], symbol, worker_pid=outcome.worker_pid)
-                    result_rows = value["cells"]
-                    disk_deferred = any(row["status"] == "NOT_RUN" and row["reason_code"] == "DISK_LOW"
-                        for row in result_rows)
-                    failed = any(row["status"] in {"FAILED","UNRESOLVED_CRASH"}
-                        or row.get("cleanup_failure") or (row["status"]=="TERMINAL_STOP" and not row["recorded_before_dispatch"])
-                        for row in result_rows)
-                    if failed or (value["closes_admission"] and not disk_deferred):
-                        retain_error("CELL_FAILURE:"+symbol)
-                    elif disk_deferred:
-                        gate.update(open=False, reason="DISK_LOW")
+                    result_rows = retain_result(outcome.value, groups[symbol], symbol, outcome.worker_pid)
                 for row in result_rows:
                     rows[row["descriptor_index"]] = row
             except Exception as exc:
@@ -1274,7 +1371,8 @@ def run_declared_symbol_scheduler(
     except Exception as exc:
         retain_error("GOVERNOR:"+type(exc).__name__)
     except BaseException:
-        outcomes.close()
+        if outcomes is not None:
+            outcomes.close()
         raise
     # The iterator is exhausted: no in-flight process can still change a receipt.
     for cell in owned["cells"]:

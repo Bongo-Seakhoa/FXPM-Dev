@@ -521,6 +521,71 @@ def test_task_iterator_exception_is_raised_only_after_active_job_finishes(tmp_pa
     assert (tmp_path / "STARTED.finished").read_text(encoding="ascii") == "done"
 
 
+def _slot_refill_witness(directory: str, ordinal: int) -> int:
+    root = Path(directory)
+    (root / f"{ordinal}.started").write_text(str(os.getpid()), encoding="ascii")
+    deadline = time.monotonic() + 15
+    while any(not (root / f"{initial}.started").is_file() for initial in range(4)):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("SYNTHETIC_FOUR_WORKER_BARRIER_NOT_REACHED")
+        time.sleep(0.01)
+    release = {0: "release-first", 3: "release-fourth"}.get(ordinal)
+    while release is not None and not (root / release).is_file():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("SYNTHETIC_FIRST_SLOT_NOT_RELEASED")
+        time.sleep(0.01)
+    return ordinal
+
+
+@MULTIPROCESS
+@pytest.mark.parametrize("readiness_failure", [False, True])
+def test_slot_refill_waits_for_prefix_or_drains_on_readiness_failure(tmp_path, readiness_failure) -> None:
+    governor = _governor(requested_workers=4)
+    tasks = [MemoryTask(key=str(ordinal), args=(str(tmp_path), ordinal)) for ordinal in range(6)]
+    completed = {}
+    deferred = []
+    blocked_checks = []
+
+    def task_ready(task):
+        ordinal = int(task.key)
+        if ordinal < 4 or 0 in completed:
+            return True
+        blocked_checks.append(ordinal)
+        (tmp_path / "release-fourth").touch()
+        if readiness_failure:
+            raise ValueError("SYNTHETIC_CLAIM_PUBLICATION_FAILURE")
+        return False
+
+    def consume():
+        for outcome in governor.iter_completed(
+            _slot_refill_witness, tasks, admission_gate=lambda: True, task_ready=task_ready,
+        ):
+            ordinal = int(outcome.task_key)
+            if outcome.status == "NOT_RUN":
+                deferred.append(ordinal)
+            else:
+                assert outcome.status == "COMPLETED"
+                assert outcome.value == ordinal
+                completed[ordinal] = outcome.worker_pid
+            if {1, 2, 3} <= completed.keys() or deferred:
+                if not (tmp_path / "release-first").exists():
+                    assert not (tmp_path / "4.started").exists()
+                    (tmp_path / "release-first").touch()
+
+    if readiness_failure:
+        with pytest.raises(ValueError, match="SYNTHETIC_CLAIM_PUBLICATION_FAILURE"):
+            consume()
+        assert set(completed) == {0, 1, 2, 3}
+        assert deferred == [4, 5]
+    else:
+        consume()
+        assert set(completed) == set(range(6))
+        assert deferred == []
+    assert blocked_checks and set(blocked_checks) == {4}
+    assert governor.stats.peak_inflight == 4
+    assert len({completed[i] for i in range(4)}) == 4
+
+
 def _invented_system_sample(**updates):
     sample = dict(
         physical_ram_bytes=1000, available_ram_bytes=0, system_commit_bytes=900,

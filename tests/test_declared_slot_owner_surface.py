@@ -1384,8 +1384,9 @@ def _structural_driver_trace(env, monkeypatch, *, stop_at=None, interrupt_at=Non
     def materialize(context, *, request, process, frozen_pipeline_config):
         assert state.seals == [], "A shared symbol sink was sealed before slot work ended"
         body = orchestration.verify_declared_slot_producer_request(
-            context, request, precommit=env.precommit, process=process,
+            context, request, process=process,
         )
+        assert body["precommit_sha256"] == env.precommit.receipt_sha256
         ordinal = body["anchor"]["ordinal"]
         state.calls.append(ordinal)
         state.namespaces.append(body["artifact_namespace"])
@@ -1566,6 +1567,309 @@ def test_declared_structural_terminal_stop_forbids_all_later_slot_calls(declared
     assert _execute(env).to_dict() == receipt
     assert state.calls == [1, 2, 3, 4]
     assert _committed_snapshot(env, _progress(env)) == before
+
+
+def _execute_structural_parallel(env, dispatch):
+    return producer.execute_declared_cell_owner_slots(
+        context=env.context, precommit=env.precommit, process=env.process,
+        frozen_pipeline_config=env.frozen, cell_id=CELL_ID,
+        slot_dispatch=dispatch, slot_worker_limit=4,
+    )
+
+
+def test_declared_parallel_out_of_order_stops_close_admission_and_commit_only_the_earliest_prefix(
+    declared_env, monkeypatch,
+):
+    """Inline software dispatch with real claim, result, commit and reopen custody."""
+    from pm_memory_governor import TaskOutcome
+
+    env = declared_env
+    _structural_readonly_profile_metadata(monkeypatch)
+    state = _structural_driver_trace(env, monkeypatch, stop_at=4)
+    materialize = producer.execute_declared_slot_owner_search
+
+    def with_earlier_stop(context, *, request, process, frozen_pipeline_config):
+        completion = materialize(context, request=request, process=process, frozen_pipeline_config=frozen_pipeline_config)
+        if completion["slot_id"] == SLOT_IDS[1]:
+            return _structural_completion(request, "STOP", "DECLARED_TECHNICAL_FAILURE")
+        return completion
+
+    monkeypatch.setattr(producer, "execute_declared_slot_owner_search", with_earlier_stop)
+    parallel_root = producer._parallel_slot_root(env.precommit.receipt_sha256, CELL_ID)
+
+    def commit_path(ordinal):
+        return env.context.root / producer._declared_commit_path(env.precommit, CELL_ID, ordinal)
+
+    def dispatch(tasks, admission_open, task_ready):
+        pending = iter(tasks)
+        admitted = {ordinal: next(pending) for ordinal in range(1, 5)}
+        for ordinal, task in admitted.items():
+            assert task.key == f"{ordinal:02d}" and admission_open() and task_ready(task)
+        fifth = next(pending)
+        assert fifth.key == "05" and not task_ready(fifth)
+        for ordinal, prefix in ((4, []), (3, []), (1, [1]), (2, [1, 2])):
+            task = admitted[ordinal]
+            digest = producer.declared_slot_worker(*task.args)
+            yield TaskOutcome(task_key=task.key, status="COMPLETED", value=digest)
+            assert not admission_open()
+            assert [index for index in range(1, 14) if commit_path(index).exists()] == prefix
+        for task in (fifth, *pending):
+            assert not task_ready(task)
+            yield TaskOutcome(task_key=task.key, status="NOT_RUN")
+
+    receipt = _execute_structural_parallel(env, dispatch).to_dict()
+    assert state.calls == [4, 3, 1, 2] and state.seals == [4]
+    assert receipt["terminal_stop"] is True and receipt["completed_slots"] == 2
+    assert receipt["slot_commits"] == [
+        {"slot_id": SLOT_IDS[0], "status": "NO_TRADE"},
+        {"slot_id": SLOT_IDS[1], "status": "STOP"},
+    ]
+    progress = _progress(env)
+    assert progress.run_receipt == receipt
+    assert progress.terminal_stop and progress.first_uncommitted_slot is None
+    first, second = _committed_rows(env, progress)
+    first_record = producer._read_declared_commit(env.context, commit_path(1).relative_to(env.context.root).as_posix())
+    assert first["previous_commit_sha256"] is None
+    assert second["previous_commit_sha256"] == first_record[1]
+    assert second["completion"]["reason_code"] == "DECLARED_TECHNICAL_FAILURE"
+    for kind in ("claims", "results"):
+        assert {path.name for path in (env.context.root / parallel_root / kind).iterdir()} == {
+            "01.json", "02.json", "03.json", "04.json",
+        }
+    with pytest.raises(producer.HistoricalSearchProducerError) as caught:
+        producer.verify_declared_parallel_slot_files(env.context, precommit=env.precommit,
+            process=env.process, cell_id=CELL_ID, frozen_pipeline_config=env.frozen)
+    assert caught.value.code == "DECLARED_PARALLEL_SLOT_CUSTODY_INVALID"
+
+    def forbidden_dispatch(*args):
+        pytest.fail("Reopening a recorded terminal prefix started new slots")
+
+    assert _execute_structural_parallel(env, forbidden_dispatch).to_dict() == receipt
+    assert state.calls == [4, 3, 1, 2]
+
+
+def test_declared_parallel_reentry_refuses_a_durable_claim_without_a_result(declared_env, monkeypatch):
+    env = declared_env
+    state = _structural_driver_trace(env, monkeypatch)
+
+    def interrupt_after_claim(tasks, admission_open, task_ready):
+        first = next(iter(tasks))
+        assert first.key == "01" and admission_open() and task_ready(first)
+        raise _InterruptedStructuralAttempt()
+
+    with pytest.raises(_InterruptedStructuralAttempt):
+        _execute_structural_parallel(env, interrupt_after_claim)
+    parallel_root = producer._parallel_slot_root(env.precommit.receipt_sha256, CELL_ID)
+    claim = env.context.root / producer._parallel_slot_path(parallel_root, "claims", 1)
+    before = claim.read_bytes()
+    assert not (env.context.root / producer._parallel_slot_path(parallel_root, "results", 1)).exists()
+
+    def forbidden_dispatch(*args):
+        pytest.fail("Reentry relaunched a claimed slot with no durable result")
+
+    with pytest.raises(producer.HistoricalSearchProducerError) as caught:
+        _execute_structural_parallel(env, forbidden_dispatch)
+    assert caught.value.code == "DECLARED_PARALLEL_SLOT_ORPHAN_UNRESOLVED"
+    assert claim.read_bytes() == before
+    assert not (env.context.root / producer._declared_commit_path(env.precommit, CELL_ID, 1)).exists()
+    assert not (env.context.root / producer._declared_run_path(env.precommit, CELL_ID)).exists()
+    assert state.calls == state.seals == []
+
+
+def test_declared_parallel_reentry_commits_earlier_stop_before_resultless_later_claim(declared_env, monkeypatch):
+    env = declared_env
+    _structural_readonly_profile_metadata(monkeypatch)
+    state = _structural_driver_trace(env, monkeypatch, stop_at=1)
+
+    def interrupt_after_earlier_stop(tasks, admission_open, task_ready):
+        pending = iter(tasks)
+        first, second = next(pending), next(pending)
+        assert admission_open()
+        assert first.key == "01" and task_ready(first)
+        assert second.key == "02" and task_ready(second)
+        producer.declared_slot_worker(*first.args)
+        raise _InterruptedStructuralAttempt()
+
+    with pytest.raises(_InterruptedStructuralAttempt):
+        _execute_structural_parallel(env, interrupt_after_earlier_stop)
+    parallel_root = producer._parallel_slot_root(env.precommit.receipt_sha256, CELL_ID)
+    second_claim = producer._parallel_slot_path(parallel_root, "claims", 2)
+    second_result = producer._parallel_slot_path(parallel_root, "results", 2)
+    claim_path = env.context.root / second_claim
+    run_path = env.context.root / producer._declared_run_path(env.precommit, CELL_ID)
+    before = claim_path.read_bytes()
+    assert (env.context.root / producer._parallel_slot_path(parallel_root, "results", 1)).is_file()
+    assert not (env.context.root / second_result).exists()
+    assert not run_path.exists()
+
+    def forbidden_dispatch(*args):
+        pytest.fail("Recovering a durable terminal result admitted more work")
+
+    with producer._locked_parallel_slot_claim(env.context, second_claim):
+        with pytest.raises(producer.HistoricalSearchProducerError) as caught:
+            _execute_structural_parallel(env, forbidden_dispatch)
+        assert caught.value.code == "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE"
+        assert not run_path.exists()
+
+    receipt = _execute_structural_parallel(env, forbidden_dispatch).to_dict()
+    assert receipt["terminal_stop"] is True and receipt["completed_slots"] == 1
+    assert receipt["slot_commits"] == [{"slot_id": SLOT_IDS[0], "status": "STOP"}]
+    assert _progress(env).run_receipt == receipt
+    assert _execute_structural_parallel(env, forbidden_dispatch).to_dict() == receipt
+    assert state.calls == state.seals == [1]
+    assert claim_path.read_bytes() == before
+    assert not (env.context.root / second_result).exists()
+    assert not (env.context.root / producer._declared_commit_path(env.precommit, CELL_ID, 2)).exists()
+
+
+def test_declared_parallel_reentry_commits_a_durable_result_without_reexecuting_it(declared_env, monkeypatch):
+    from pm_memory_governor import TaskOutcome
+
+    env = declared_env
+    _structural_readonly_profile_metadata(monkeypatch)
+    state = _structural_driver_trace(env, monkeypatch)
+
+    def interrupt_after_result(tasks, admission_open, task_ready):
+        first = next(iter(tasks))
+        assert first.key == "01" and admission_open() and task_ready(first)
+        producer.declared_slot_worker(*first.args)
+        raise _InterruptedStructuralAttempt()
+
+    with pytest.raises(_InterruptedStructuralAttempt):
+        _execute_structural_parallel(env, interrupt_after_result)
+    assert _progress(env).slot_summaries == ()
+    assert state.calls == [1]
+
+    def finish_remaining(tasks, admission_open, task_ready):
+        for ordinal, task in enumerate(tasks, 2):
+            assert task.key == f"{ordinal:02d}" and admission_open() and task_ready(task)
+            result = producer.declared_slot_worker(*task.args)
+            yield TaskOutcome(task_key=task.key, status="COMPLETED", value=result)
+
+    receipt = _execute_structural_parallel(env, finish_remaining).to_dict()
+    assert receipt["completed_slots"] == receipt["declared_slots"] == 13
+    assert not receipt["terminal_stop"]
+    assert receipt["slot_commits"][1]["status"] == "MISSING"
+    assert state.calls == list(range(1, 14))
+    assert state.seals == [13]
+    paths = producer.verify_declared_parallel_slot_files(
+        env.context, precommit=env.precommit, process=env.process, cell_id=CELL_ID,
+        frozen_pipeline_config=env.frozen,
+    )
+    assert len(set(paths)) == 26
+    assert all((env.context.root / path).is_file() for path in paths)
+    parallel_root = producer._parallel_slot_root(env.precommit.receipt_sha256, CELL_ID)
+    claim = producer._parallel_slot_path(parallel_root, "claims", 1)
+    assert claim in paths
+
+    def forbidden_dispatch(*args):
+        pytest.fail("Reentry of a completed cell admitted new work")
+
+    with producer._locked_parallel_slot_claim(env.context, claim):
+        with pytest.raises(producer.HistoricalSearchProducerError) as caught:
+            _execute_structural_parallel(env, forbidden_dispatch)
+        assert caught.value.code == "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE"
+        with pytest.raises(producer.HistoricalSearchProducerError) as caught:
+            producer.verify_declared_parallel_slot_files(
+                env.context, precommit=env.precommit, process=env.process, cell_id=CELL_ID,
+                frozen_pipeline_config=env.frozen,
+            )
+        assert caught.value.code == "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE"
+    assert state.calls == list(range(1, 14)) and state.seals == [13]
+
+
+def test_declared_parallel_commits_no_trade_through_original_verifier(tmp_path, monkeypatch):
+    """Invented source and fit inputs, with original completion verification and commit."""
+    from pm_memory_governor import TaskOutcome
+    from test_native_regime_unobserved_witness_001 import _install_invented_unobserved_source
+
+    monkeypatch.chdir(tmp_path)
+    snapshot = _structural_native_snapshot()
+    env = _declared_environment(tmp_path, monkeypatch, native_snapshot=snapshot)
+    _structural_readonly_profile_metadata(monkeypatch)
+    execute = producer.execute_declared_slot_owner_search
+    verify = adapter.verify_declared_slot_completion
+
+    def execute_with_invented_source(context, *, request, process, frozen_pipeline_config):
+        _install_invented_unobserved_source(request, snapshot, monkeypatch)
+        return execute(context, request=request, process=process, frozen_pipeline_config=frozen_pipeline_config)
+
+    monkeypatch.setattr(producer, "execute_declared_slot_owner_search", execute_with_invented_source)
+
+    def one_slot(tasks, admission_open, task_ready):
+        first = next(iter(tasks))
+        assert first.key == "01" and admission_open() and task_ready(first)
+        result = producer.declared_slot_worker(*first.args)
+        yield TaskOutcome(task_key=first.key, status="COMPLETED", value=result)
+        assert admission_open()
+        raise _InterruptedStructuralAttempt()
+
+    with pytest.raises(_InterruptedStructuralAttempt):
+        _execute_structural_parallel(env, one_slot)
+    assert adapter.verify_declared_slot_completion is verify
+    progress = _progress(env)
+    committed, = _committed_rows(env, progress)
+    completion = committed["completion"]
+    assert (completion["status"], completion["reason_code"]) == ("NO_TRADE", "REGIME_UNOBSERVED")
+    assert completion["owner"] is None
+    assert all(completion[name] is False for name in (
+        "qualification_authority", "capital_authority", "live_authority", "order_authority",
+    ))
+    assert progress.run_receipt is None and progress.first_uncommitted_slot["ordinal"] == 2
+
+
+def test_declared_parallel_real_spawn_reopens_bindings_and_refuses_expired_source_window(tmp_path, monkeypatch):
+    """The real spawned worker sees only an invented profile and an already-closed window."""
+    from os import getpid
+    from pm_memory_governor import MemoryGovernor
+
+    # The existing synthetic config has relative constructor paths.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FXPM_STAGE_TIMERS_DIR", raising=False)
+    env = _declared_environment(tmp_path, monkeypatch, issue=False)
+    data_dir = env.frozen.materialize(env.context).data_dir
+    assert data_dir == tmp_path.resolve() / "data"
+    profile_path = data_dir / "native" / "terms" / "spread_profile.json"
+    profile_path.parent.mkdir(parents=True)
+    profile_bytes = _canonical({
+        "schema_version": execution.spread_profile.PROFILE_SCHEMA,
+        "status": "COMPLETE_CALIBRATION_WITH_EXPLICIT_UNAVAILABLE_GROUPS",
+        "calculation_policy": "ONE_TIME_OFFLINE_NO_RUNTIME_RECALCULATION",
+        "source_convention": "FINEST_ACTIVATED_CANDIDATE_FIXED_PER_SYMBOL_EXACT_PRIOR_CLOSE_AT_TARGET_OPEN",
+        "production_authority": False,
+        "classification": "INVENTED_EMPTY_PROFILE_FOR_EXPIRED_SLOT_SOFTWARE_TEST",
+        "cells": [],
+    })
+    profile_path.write_bytes(profile_bytes)
+    issued = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=1)
+    monkeypatch.setattr(_DeclaredClock, "value", issued)
+    env.precommit = orchestration.precommit_declared_slot_owner_run(env.context, **dict(env.arguments,
+        spread_profile_identity={"profile_sha256": hashlib.sha256(profile_bytes).hexdigest()},
+        source_access_window_utc={
+            "start_utc": issued.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_exclusive_utc": (issued + timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }))
+    monkeypatch.setattr(orchestration, "datetime", datetime)
+    monkeypatch.setattr(producer, "datetime", datetime)
+
+    def dispatch(tasks, admission_open, task_ready):
+        first = next(iter(tasks))
+        assert first.key == "01" and admission_open() and task_ready(first)
+        outcome, = MemoryGovernor(requested_workers=1).iter_completed(producer.declared_slot_worker, [first])
+        assert outcome.status == "COMPLETED" and outcome.worker_pid > 0 and outcome.worker_pid != getpid()
+        yield outcome
+        assert not admission_open()
+
+    receipt = _execute_structural_parallel(env, dispatch).to_dict()
+    assert receipt["completed_slots"] == 1 and receipt["terminal_stop"] is True
+    committed, = _committed_rows(env, _progress(env))
+    completion = committed["completion"]
+    assert completion["status"] == "STOP" and completion["reason_code"] == "DECLARED_SLOT_SOURCE_FAILURE"
+    session = adapter._reopen_ascii_json_entry(env.context, completion["source_session_entry"],
+        expected_type="declared_slot_source_session", code="DECLARED_SLOT_SOURCE_INVALID")
+    assert session["failure_phase"] == "PRE_SOURCE"
+    assert session["failure_code"] == "DECLARED_SLOT_SOURCE_WINDOW_INVALID"
+    assert session["source_accessed_at_utc"] is session["native_source_route"] is None
 
 
 def test_declared_structural_completed_slot_then_error_is_durably_terminal(declared_env, monkeypatch):

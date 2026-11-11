@@ -97,12 +97,8 @@ def _fit_decisions(product, request, source_contract_sha256):
     return source, fit, support
 
 
-@pytest.mark.parametrize("scenario", ["exact", "descriptor-mismatch", "missing-witness", "repointed-witness"])
-def test_native_unobserved_producer_and_public_verifier(tmp_path, monkeypatch, scenario):
-    mismatch = scenario == "descriptor-mismatch"
-    snapshot = _structural_native_snapshot()
-    env = _declared_environment(tmp_path, monkeypatch, native_snapshot=snapshot)
-    request = _request(env)
+def _install_invented_unobserved_source(request, snapshot, monkeypatch, *, mismatch=False):
+    """Install the invented source and fit boundaries for one real issued request."""
     body = request.to_dict()
     namespace = body["artifact_namespace"]
     native = producer.native_prefix
@@ -117,7 +113,8 @@ def test_native_unobserved_producer_and_public_verifier(tmp_path, monkeypatch, s
                            "manifest_sha256": snapshot["activation_manifest_sha256"], "entry_sha256": "d" * 64},
             "source": {"bars_sha256": _BARS, "source_identity_sha256": _SOURCE_ID},
         }
-        descriptor = env.sink.put_json(namespace + "/invented-index", "invented_native_index", index)["descriptor"]
+        sink = request.symbol_sink(body["symbol"])
+        descriptor = sink.put_json(namespace + "/invented-index", "invented_native_index", index)["descriptor"]
         seen.product = native.NativePrefixProduct(
             source_state=native.AVAILABLE, index=index, index_descriptor=descriptor, index_sha256=descriptor["sha256"],
             native_prefix={"activation_id": index["activation"]["activation_id"],
@@ -157,6 +154,17 @@ def test_native_unobserved_producer_and_public_verifier(tmp_path, monkeypatch, s
     monkeypatch.setattr(producer.search_execution, "fit_native_timeframe_for_search", fitted)
     monkeypatch.setattr(producer.search_planner, "build_declared_slot_observed_cell_plan", forbidden)
     monkeypatch.setattr(producer.search_execution, "execute_historical_observed_cell", forbidden)
+    return seen, seeds, pair
+
+
+@pytest.mark.parametrize("scenario", ["exact", "descriptor-mismatch", "missing-witness", "repointed-witness"])
+def test_native_unobserved_producer_and_public_verifier(tmp_path, monkeypatch, scenario):
+    mismatch = scenario == "descriptor-mismatch"
+    snapshot = _structural_native_snapshot()
+    env = _declared_environment(tmp_path, monkeypatch, native_snapshot=snapshot)
+    request = _request(env)
+    namespace = request.to_dict()["artifact_namespace"]
+    seen, seeds, pair = _install_invented_unobserved_source(request, snapshot, monkeypatch, mismatch=mismatch)
 
     completion = producer.execute_declared_slot_owner_search(
         env.context, request=request, process=env.process, frozen_pipeline_config=env.frozen,

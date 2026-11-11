@@ -573,9 +573,12 @@ def is_memory_failure(value: Any) -> bool:
 
 
 _STAGE_MONITOR_DIRECTORY_VARIABLE = "FXPM_STAGE_TIMERS_DIR"
-# W5.1 telemetry (E4961, E4962, E4965, E4968) is opt-in for the declared symbol worker only.  Workers are matched by
-# object identity against the loaded module attribute, never by name; every other governor user is untouched.
-_STAGE_MONITOR_WORKER_REFS: Tuple[Tuple[str, str], ...] = (("pm_historical_scheduler", "declared_symbol_worker"),)
+_SLOT_MONITOR_WORKER_REF = ("pm_historical_search_producer", "declared_slot_worker")
+# Match declared workers by object identity against the loaded module attribute.
+_STAGE_MONITOR_WORKER_REFS: Tuple[Tuple[str, str], ...] = (
+    ("pm_historical_scheduler", "declared_symbol_worker"),
+    _SLOT_MONITOR_WORKER_REF,
+)
 
 
 def _stage_monitor_allows(worker: Any) -> bool:
@@ -589,11 +592,16 @@ def _stage_monitor_allows(worker: Any) -> bool:
 
 def _start_stage_monitor(worker: Any, task_key: Any) -> Any:
     """Opt in by environment and exact worker identity, keeping ordinary telemetry faults local."""
+    import sys
+
     try:
         directory = os.environ.get(_STAGE_MONITOR_DIRECTORY_VARIABLE)
         if not directory or not _stage_monitor_allows(worker):
             return None
         module = importlib.import_module("pm_stage_monitor")
+        slot_module, slot_entry = _SLOT_MONITOR_WORKER_REF
+        if getattr(sys.modules.get(slot_module), slot_entry, None) is worker:
+            return module.start(str(task_key), directory, role=module.SLOT_CHILD_ROLE)
         return module.start(str(task_key), directory)
     except Exception:
         return None
@@ -808,6 +816,7 @@ class MemoryGovernor:
         self.termination_grace_seconds = float(termination_grace_seconds)
         self.process_context = process_context or multiprocessing.get_context("spawn")
         self.stats = GovernorStats()
+        self.resource_stats = ResourceStats()
 
     def _record(self, outcome: TaskOutcome) -> None:
         self.stats.completed += 1
@@ -856,17 +865,21 @@ class MemoryGovernor:
         tasks: Iterable[MemoryTask],
         *,
         admission_gate: Optional[Callable[[], bool]] = None,
+        task_ready: Optional[Callable[[MemoryTask], bool]] = None,
         resource_policy: Optional[GovernorResourcePolicy] = None,
         telemetry_callback: Optional[Callable[[Mapping[str, Any]], None]] = None,
     ) -> Iterator[TaskOutcome]:
         """Yield before refill; opt-in consumers close admission and drain, not close().
 
+        A task readiness check can pause refill while an earlier task is active.
         Telemetry callbacks must overwrite or bound their own retained rows. Sampling
         pauses while this generator is yielded; peaks are sampled, not continuous.
         """
 
         if admission_gate is not None and not callable(admission_gate):
             raise TypeError("admission_gate must be callable or None")
+        if task_ready is not None and (not callable(task_ready) or admission_gate is None):
+            raise TypeError("task_ready requires a callable admission_gate")
         if resource_policy is not None and type(resource_policy) is not GovernorResourcePolicy:
             raise TypeError("resource_policy must be GovernorResourcePolicy or None")
         if telemetry_callback is not None and not callable(telemetry_callback):
@@ -1055,6 +1068,20 @@ class MemoryGovernor:
                             break
                     if not admission_open():
                         break
+                    if task_ready is not None:
+                        try:
+                            ready = task_ready(pending)
+                            if type(ready) is not bool:
+                                raise TypeError("task_ready must return bool")
+                            if not ready and not active:
+                                raise RuntimeError("pending task cannot become ready without an active task")
+                        except Exception as exc:
+                            task_iterator_error = exc
+                            admission_stopped = True
+                            self.resource_stats.admission_stop_reason = "TASK_READINESS_" + type(exc).__name__
+                            break
+                        if not ready:
+                            break
                     started_at = time.monotonic()
                     try:
                         process, connection = _launch_task_process(

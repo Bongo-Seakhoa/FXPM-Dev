@@ -969,6 +969,68 @@ class ReaderTests(_Base):
                 with self.assertRaisesRegex(monitor.StageMonitorError, "HOOKS_INVALID"):
                     monitor.read_monitor_file(path)
 
+    def test_slot_child_checkpoint_discovers_native_work_and_reports_slots(self):
+        producer = types.ModuleType("pm_historical_search_producer")
+        producer.declared_slot_worker = native_cell
+        producer._declared_slot_worker_checkpoint = native_checkpoint
+        search = types.ModuleType("pm_authoritative_search_execution")
+        search.fit_native_timeframe_for_search = leaf
+
+        def bootstrap():
+            sys.modules[search.__name__] = search
+
+        with mock.patch.dict(sys.modules, {producer.__name__: producer}):
+            sys.modules.pop(search.__name__, None)
+            item = monitor.StageMonitor("EURUSD.slot.01", str(self.root), role=monitor.SLOT_CHILD_ROLE,
+                                        row_interval_seconds=1, clock=FakeClock())
+            self.monitors.append(item)
+            self.assertTrue(item.start())
+            self.assertEqual(producer.declared_slot_worker(lambda: leaf(3), before=bootstrap), 6)
+            self.assertTrue(self.finish(item, duration=None)["footer_written"])
+
+        rows, footer = monitor.read_monitor_file(item._writer.path)
+        self.assertTrue(rows)
+        self.assertTrue(all(row["monitor_role"] == monitor.SLOT_CHILD_ROLE for row in rows))
+        stage = footer["coverage"][f"{search.__name__}.fit_native_timeframe_for_search"]
+        self.assertEqual((stage["status"], stage["checkpoint"], stage["cells_started_at_resolution"]),
+                         (monitor.RESOLVED_AT_CHECKPOINT, "SLOT", 1))
+        self.assertEqual(footer["stages"]["BAR_PREP"]["count"], 1)
+        self.assertNotIn("ACCOUNT_FINALIZATION", footer["stages"])
+        self.assertNotIn(f"{search.__name__}.fit_m5_derived_timeframe_for_search", footer["roster"])
+        summary = monitor.summarize(footer)
+        self.assertEqual((summary["monitor_role"], summary["slots_started"], summary["slots_returned"]),
+                         (monitor.SLOT_CHILD_ROLE, 1, 1))
+        self.assertNotIn("cells_completed", summary)
+        self.assertIn("INCOMPLETE_COVERAGE", summary["coverage"]["failed_checks"])
+        unmarked_footer = dict(footer)
+        unmarked_footer.pop("monitor_role")
+        path = self.write([*(monitor._encode(row) for row in rows), monitor._encode(unmarked_footer)])
+        with self.assertRaisesRegex(monitor.StageMonitorError, "RECORD_ROLE_INVALID"):
+            monitor.read_monitor_file(path)
+
+    def test_slot_child_missing_checkpoint_is_incomplete_and_hook_identity_is_checked(self):
+        producer = types.ModuleType("pm_historical_search_producer")
+        producer.declared_slot_worker = lambda: None
+        producer._declared_slot_worker_checkpoint = native_checkpoint
+        with mock.patch.dict(sys.modules, {producer.__name__: producer}):
+            item = monitor.StageMonitor("EURUSD.slot.02", str(self.root), role=monitor.SLOT_CHILD_ROLE)
+            self.monitors.append(item)
+            self.assertTrue(item.start())
+            producer.declared_slot_worker()
+            self.assertTrue(self.finish(item)["footer_written"])
+
+        rows, footer = monitor.read_monitor_file(item._writer.path)
+        self.assertEqual(rows, [])
+        summary = monitor.summarize(footer)
+        self.assertIn("CHECKPOINT_UNREACHED", summary["coverage"]["failed_checks"])
+        self.assertEqual(summary["checkpoint_routes_missed"], ["SLOT"])
+        name = f"{producer.__name__}._declared_slot_worker_checkpoint"
+        hooks = dict(footer["hooks"])
+        hooks[name] = dict(hooks[name], role="NATIVE")
+        path = self.write([monitor._encode(dict(footer, hooks=hooks))])
+        with self.assertRaisesRegex(monitor.StageMonitorError, "HOOKS_INVALID"):
+            monitor.read_monitor_file(path)
+
     def test_reader_rejects_malformed_footers(self):
         row = self.good_row()
         base = self.good_footer(len(row))
