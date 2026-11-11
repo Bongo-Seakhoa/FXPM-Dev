@@ -3319,3 +3319,264 @@ def test_reopened_plan_join_is_a_non_authorising_equality_check():
          "original_cell_plan_receipt_sha256": cell},
         SimpleNamespace(receipt_sha256=cell,
                         horizon_plan=SimpleNamespace(receipt_sha256=expected))) is None
+
+
+# INVENTED software wiring only. Source envelopes below are not native authentication.
+def _invented_admission_executor_case():
+    import numpy as np
+    label = "INVENTED_ADMISSION_EXECUTOR_ENVELOPE_NOT_NATIVE_AUTHENTICATION"
+    index = pd.date_range("2024-01-01T00:00:00Z", periods=7, freq="h")
+    frame = pd.DataFrame({"Open": [1.1000, 1.1000, 1.0988, 1.1000, 1.1000, 1.1000, 1.1000],
+                          "High": [1.1000, 1.1005, 1.0990, 1.1000, 1.1013, 1.1000, 1.1000],
+                          "Low": [1.1000, 1.0995, 1.0985, 1.1000, 1.0997, 1.1000, 1.1000],
+                          "Close": [1.1000, 1.1000, 1.0988, 1.1000, 1.1010, 1.1000, 1.1000],
+                          "Volume": 100.0, "ATR_14": 0.0005, "SpreadOpen": 9, "SpreadMax": 12,
+                          "REGIME_LIVE": "TREND", "_BAR_CLOSE_TS": index + pd.Timedelta(hours=1)}, index=index)
+    frame.attrs["fixture_provenance"] = label
+    observations = pd.Series(9.0, index=index)
+    signals = pd.Series([1, 0, 0, 1, 0, 0, 0], index=index, dtype=np.int32)
+    config = execution.PipelineConfig(initial_capital=10000.0, discovery_risk_per_trade_pct=1.0,
+                                      risk_per_trade_pct=1.0, use_spread=True,
+                                      backtest_spread_mode="conservative_max", swap_model_enabled=True,
+                                      research_mode=True)
+    spec = execution.InstrumentSpec("EURUSD", pip_position=4, pip_value=10.0, point=0.00001,
+                                    tick_size=0.00001, tick_value=1.0, swap_long=-2.0, swap_short=1.0)
+    tiers = {}
+    for tier, points in (("P75", 9), ("P95", 16)):
+        descriptor = {"schema_version": execution.spread_profile.TIER_SCHEMA, "symbol": "EURUSD",
+                      "timeframe": "H1", "tier": tier, "source_timeframe": "H1", "point_price": spec.point,
+                      "spread_points": points, "full_spread_price": points * spec.point,
+                      "profile_sha256": execution._sha256([label, "profile"]),
+                      "source_identity_sha256": execution._sha256([label, "source"]),
+                      "source_binding": {"fixture_provenance": label}, "qualification_authority": False}
+        tiers[tier] = execution.spread_profile.FrozenSpreadTier(execution._canonical_bytes(descriptor).decode("ascii"))
+    swap = {"fixture_provenance": label, "contract_version": "causal_swap_accrual_v1",
+            "status": "AVAILABLE", "provenance_status": "AUTHENTICATED",
+            "source_provenance_authenticated": True, "historical_rates_authenticated": True,
+            "execution_state_compounding": True, "timestamp_source": "_BAR_CLOSE_TS",
+            "projection_contract": "fxpm-swap-preopen-close-projection-v1",
+            "projection_sha256": execution._sha256([label, "projection"])}
+    for name in ("price_activation_manifest_sha256", "terms_activation_manifest_sha256", "terms_snapshot_sha256",
+                 "schedule_sha256", "target_bars_sha256", "target_sidecar_sha256", "historical_rates_sha256"):
+        swap[name] = execution._sha256([label, name])
+
+    class CountingStrategy:
+        name = "INVENTED_ADMISSION_FIXED_STOPS"
+        params = {}
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        def calculate_stops(self, *args, **kwargs):
+            self.stop_calls += 1
+            return 10.0, 10.0
+
+    class InventedSourceBacktester(execution.pm_core.Backtester):
+        def __init__(self, supplied_config):
+            super().__init__(supplied_config)
+            self.binding_calls = []
+            self.results = []
+            self.fail_run = False
+
+        def _partition_entry_admission_reuse(self, preparation):
+            self.binding_calls.append(preparation)
+            return super()._partition_entry_admission_reuse(preparation)
+
+        def run(self, *args, **kwargs):
+            if self.fail_run:
+                raise RuntimeError("INVENTED_BACKTEST_FAILURE")
+            result = super().run(*args, **kwargs)
+            # Only the test provenance envelope is invented; cost validators stay real.
+            result["fixture_provenance"] = label
+            result["swap_accrual_contract"] = copy.deepcopy(swap)
+            self.results.append(result)
+            return result
+
+    ordinary = execution.pm_core.Backtester(config)
+    seeds = {tier: ordinary.build_evidence_source_seed_result(
+        frame, "EURUSD", spec=spec, timeframe="H1", spread_tier=bound,
+        entry_spread_observations=observations) for tier, bound in tiers.items()}
+    for seed in seeds.values():
+        seed["swap_accrual_contract"] = copy.deepcopy(swap)
+    sources = {tier: execution.raw_winner.build_trade_source_contract_from_backtester_result(seed)
+               for tier, seed in seeds.items()}
+    identities = {tier: execution._source_identity(source) for tier, source in sources.items()}
+    pair = execution.pm_core.build_backtest_frozen_tier_pair_contract(seeds, spec=spec, use_spread=True)
+    partitions = {}
+    rows, references = [], {}
+    for role in ("optimizer_train", "tuning_validation", "final_lockbox"):
+        geometry = {"receipt_sha256": execution._sha256([label, role, "geometry"]),
+                    "frame_sha256": execution._sha256([label, role, "frame"])}
+        partitions[role] = execution._PartitionSlice(role=role, frame=frame, warmup_bars=0,
+            scored_start_utc=index[0].isoformat(), end_exclusive_utc=(index[-1] + pd.Timedelta(hours=1)).isoformat(),
+            geometry_receipt=geometry)
+        source_observation = execution._sha256([label, role, "observation"])
+        references[geometry["receipt_sha256"]] = {"source_observation_receipt_sha256": source_observation}
+        for ordinal in (0, 1):
+            rows.append({"attempt_ordinal": ordinal, "fold_ordinal": 0, "partition": role,
+                         "partition_geometry_receipt_sha256": geometry["receipt_sha256"],
+                         "partition_frame_sha256": geometry["frame_sha256"],
+                         "source_observation_receipt_sha256": source_observation,
+                         "tiers": {tier: {"numerical_execution_cost_attestation": seed["numerical_execution_cost_attestation"],
+                                          "entry_observations_sha256": seed["spread_admission"]["entry_observations_sha256"],
+                                          "entry_admission_mask_sha256": seed["spread_admission"]["entry_admission_mask_sha256"]}
+                                   for tier, seed in seeds.items()}})
+    precommitments = execution.raw_winner.build_partition_cost_precommitments(rows, pair=pair)
+    fitted = SimpleNamespace(_frame=frame, source_contract_seeds=sources, frozen_tier_pair_contract=pair,
+                             _spread_tiers=tiers, _entry_spread_observations=observations, instrument_spec=spec)
+    surface = execution._FullPrefixStrategySurface(features=frame, raw_signals=signals)
+    return SimpleNamespace(label=label, frame=frame, observations=observations, config=config, spec=spec,
+                           tiers=tiers, identities=identities, partitions=partitions, fitted=fitted,
+                           pair=pair, references=references, precommitments=precommitments, surface=surface,
+                           Strategy=CountingStrategy, Backtester=InventedSourceBacktester)
+
+
+def _admission_executor_counter():
+    from contextlib import contextmanager
+    import inspect
+    import sys
+    codes = {"scalar": execution.pm_core.spread_admission.__code__,
+             "run": inspect.unwrap(execution.pm_core.Backtester.run).__code__,
+             "cost": execution._verify_result_cost_attestation.__code__,
+             "source": execution.raw_winner.build_trade_source_contract_from_backtester_result.__code__,
+             "precommit": execution._verify_partition_precommitment.__code__}
+
+    @contextmanager
+    def observe():
+        counts = {name: 0 for name in codes}
+        previous = sys.getprofile()
+
+        def profile(frame, event, arg):
+            if event == "call":
+                for name, code in codes.items():
+                    if frame.f_code is code:
+                        counts[name] += 1
+
+        sys.setprofile(profile)
+        try:
+            yield counts
+        finally:
+            sys.setprofile(previous)
+    return observe()
+
+
+def _admission_executor_run(case, backtester, strategy, role, preparation=None):
+    kwargs = dict(partition=case.partitions[role], full_prefix_surface=case.surface, backtester=backtester,
+                  strategy=strategy, symbol="EURUSD", timeframe="H1", regime="TREND", config=case.config,
+                  spec=case.spec, expected_source_contract_sha256=case.identities["P75"],
+                  spread_tier=case.tiers["P75"], entry_spread_observations=case.observations)
+    if preparation is not None:
+        kwargs["_entry_admission_preparation"] = preparation
+    return execution._run_tier_partition(**kwargs)
+
+
+@pytest.mark.parametrize("role", ["optimizer_train", "tuning_validation"])
+def test_entry_admission_partition_real_callbacks_and_validation_repeat(role):
+    case = _invented_admission_executor_case()
+    backtester, strategy = case.Backtester(case.config), case.Strategy()
+    with execution.pm_core._EntryAdmissionPreparation(case.observations) as preparation:
+        with _admission_executor_counter() as counts:
+            first = _admission_executor_run(case, backtester, strategy, role, preparation)
+            stop_calls = strategy.stop_calls
+            second = _admission_executor_run(case, backtester, strategy, role, preparation)
+        assert counts["run"] == counts["cost"] == counts["source"] == 2
+        assert counts["scalar"] == 1  # Identical native bits share one prepared scalar result.
+        assert stop_calls > 0 and strategy.stop_calls == 2 * stop_calls
+        assert backtester.binding_calls == [preparation, preparation]
+        assert "_entry_admission_preparation" not in backtester.__dict__
+        assert preparation._labels_by_tier
+    assert first[0]["trades"] == second[0]["trades"]
+    assert first[0]["spread_admission"] == second[0]["spread_admission"]
+    assert first[0]["numerical_execution_cost_attestation"] == second[0]["numerical_execution_cost_attestation"]
+    assert first[0]["numerical_execution_cost_attestation"] is not second[0]["numerical_execution_cost_attestation"]
+
+
+def test_entry_admission_opted_final_lockbox_suppresses_and_restores_outer_binding():
+    case = _invented_admission_executor_case()
+    backtester, strategy = case.Backtester(case.config), case.Strategy()
+    with execution.pm_core._EntryAdmissionPreparation(case.observations) as outer:
+        with execution.pm_core._EntryAdmissionPreparation(case.observations) as inner:
+            execution.pm_core.Backtester._entry_spread_admission_inputs(
+                case.frame, case.tiers["P75"], case.observations, _preparation=outer)
+            with backtester._partition_entry_admission_reuse(outer):
+                with _admission_executor_counter() as counts:
+                    _admission_executor_run(case, backtester, strategy, "final_lockbox", inner)
+                assert counts["scalar"] == len(case.observations)
+                assert backtester._entry_admission_preparation is outer
+                assert backtester.binding_calls[-1] is None
+                assert inner._labels_by_tier == {}
+            assert outer._labels_by_tier
+    assert "_entry_admission_preparation" not in backtester.__dict__
+
+
+def test_entry_admission_default_partition_does_not_require_binding_api():
+    case = _invented_admission_executor_case()
+    backtester, strategy = case.Backtester(case.config), case.Strategy()
+    with _admission_executor_counter() as counts:
+        returned = _admission_executor_run(case, backtester, strategy, "optimizer_train")
+    assert returned[3] is backtester
+    assert backtester.binding_calls == []
+    assert counts["run"] == counts["cost"] == counts["source"] == 1
+    assert counts["scalar"] == len(case.observations)
+
+
+def test_entry_admission_partition_exception_restores_outer_binding():
+    case = _invented_admission_executor_case()
+    backtester, strategy = case.Backtester(case.config), case.Strategy()
+    backtester.fail_run = True
+    with execution.pm_core._EntryAdmissionPreparation(case.observations) as outer:
+        with execution.pm_core._EntryAdmissionPreparation(case.observations) as inner:
+            with backtester._partition_entry_admission_reuse(outer):
+                with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+                    _admission_executor_run(case, backtester, strategy, "optimizer_train", inner)
+                assert caught.value.code == "BACKTEST_PARTITION_EXECUTION_FAILED"
+                assert backtester._entry_admission_preparation is outer
+                assert inner._labels_by_tier == {}
+    assert "_entry_admission_preparation" not in backtester.__dict__
+
+
+def test_entry_admission_shared_pool_across_planned_attempts_keeps_real_checks(monkeypatch):
+    case = _invented_admission_executor_case()
+    backtesters, strategies = [], []
+
+    def runtime_strategy(_attempt):
+        strategy = case.Strategy()
+        strategies.append(strategy)
+        return strategy, {}
+
+    def backtester(config):
+        instance = case.Backtester(config)
+        backtesters.append(instance)
+        return instance
+
+    # Only upstream feature/fold/provenance carriers are invented. Validators remain real.
+    monkeypatch.setattr(execution, "_runtime_strategy", runtime_strategy)
+    monkeypatch.setattr(execution, "Backtester", backtester)
+    monkeypatch.setattr(execution, "_build_full_prefix_strategy_surface", lambda **kwargs: case.surface)
+    monkeypatch.setattr(execution, "_causal_folds", lambda attempt: ({"fixture_provenance": case.label},))
+    monkeypatch.setattr(execution, "_fold_partitions", lambda **kwargs: tuple(case.partitions.values()))
+    monkeypatch.setattr(execution, "_fold_provenance", lambda **kwargs: {"fixture_provenance": case.label})
+    plan = {"cell": {"symbol": "EURUSD", "timeframe": "H1", "regime": "TREND"},
+            "derived_dependency_geometry": {"warmup_bars": 0}}
+    outputs = []
+    with execution.pm_core._EntryAdmissionPreparation(case.observations) as preparation:
+        with _admission_executor_counter() as counts:
+            for ordinal in (0, 1):
+                outputs.append(execution._build_planned_attempt_evidence(
+                    attempt=SimpleNamespace(ordinal=ordinal, plan_attempt={"status": "PLANNED"}),
+                    raw_attempt_id="INVENTED_ATTEMPT_" + str(ordinal), plan_body=plan,
+                    plan_receipt_sha256=execution._sha256([case.label, "plan"]), fitted=case.fitted,
+                    config=case.config, partition_cost_precommitments=case.precommitments,
+                    source_observation_references=case.references,
+                    _entry_admission_preparation=preparation))
+        assert counts["run"] == counts["cost"] == counts["source"] == counts["precommit"] == 12
+        assert counts["scalar"] == 2 + 4 * len(case.observations)  # Two representatives; final paths stay rowwise.
+        assert len(backtesters) == len(strategies) == 2
+        for instance, strategy in zip(backtesters, strategies):
+            assert len(instance.results) == 6 and strategy.stop_calls > 0
+            assert instance.binding_calls == [preparation, preparation, preparation, preparation, None, None]
+            assert "_entry_admission_preparation" not in instance.__dict__
+            assert len({id(result["numerical_execution_cost_attestation"]) for result in instance.results}) == 6
+        assert preparation._labels_by_tier
+    assert preparation._closed and preparation._labels_by_tier == {}
+    assert [output["attempt_id"] for output in outputs] == ["INVENTED_ATTEMPT_0", "INVENTED_ATTEMPT_1"]

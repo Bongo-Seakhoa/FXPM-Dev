@@ -33,6 +33,7 @@ import secrets
 import stat
 import tempfile
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2614,6 +2615,7 @@ def _run_tier_partition(
     spread_tier: spread_profile.FrozenSpreadTier,
     entry_spread_observations: pd.Series,
     decision_result_out: dict[str, Any] | None = None,
+    _entry_admission_preparation: Any = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.Series, Backtester]:
     try:
         features, raw_signals = _slice_full_prefix_strategy_surface(
@@ -2624,17 +2626,24 @@ def _run_tier_partition(
         if labels.isna().iloc[partition.warmup_bars :].any():
             _fail("REGIME_SIGNAL_SURFACE_MISSING", partition.role)
         signals = raw_signals.where(labels == regime, 0).astype(np.int32)
-        result = backtester.run(
-            features,
-            signals,
-            symbol,
-            strategy,
-            spec=spec,
-            timeframe=timeframe,
-            warmup_bars=partition.warmup_bars,
-            spread_tier=spread_tier,
-            entry_spread_observations=entry_spread_observations.loc[features.index],
+        admission_scope = (
+            backtester._partition_entry_admission_reuse(
+                _entry_admission_preparation
+                if partition.role in {"optimizer_train", "tuning_validation"} else None)
+            if _entry_admission_preparation is not None else nullcontext()
         )
+        with admission_scope:
+            result = backtester.run(
+                features,
+                signals,
+                symbol,
+                strategy,
+                spec=spec,
+                timeframe=timeframe,
+                warmup_bars=partition.warmup_bars,
+                spread_tier=spread_tier,
+                entry_spread_observations=entry_spread_observations.loc[features.index],
+            )
     except AuthoritativeSearchExecutionError:
         raise
     except Exception as exc:
@@ -2845,6 +2854,7 @@ def _build_planned_attempt_evidence(
     fitted: FittedNativeSearchTimeframe, config: PipelineConfig,
     partition_cost_precommitments: Mapping[str, Any],
     source_observation_references: Mapping[str, Mapping[str, Any]] | None,
+    _entry_admission_preparation: Any = None,
 ) -> dict[str, Any]:
     strategy, _parameters = _runtime_strategy(attempt)
     frame = fitted._frame
@@ -2879,6 +2889,8 @@ def _build_planned_attempt_evidence(
                     spread_tier=fitted._spread_tiers[tier],
                     entry_spread_observations=fitted._entry_spread_observations,
                     decision_result_out=decision_result,
+                    **({"_entry_admission_preparation": _entry_admission_preparation}
+                       if _entry_admission_preparation is not None else {}),
                 )
                 _verify_partition_precommitment(precommitments=partition_cost_precommitments,
                     attempt=attempt, fold_ordinal=fold_ordinal, partition=partition,
@@ -5827,9 +5839,12 @@ def execute_historical_observed_cell(
                     raw_attempt_id=unit["raw_attempt_id"], plan_body=plan_body,
                     plan_receipt_sha256=plan_receipt_sha256, fitted=refreshed, config=config,
                     partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
-                    source_observation_references=source_observation_references)
-            declared_records, evidence_completed = _continue_declared_attempt_units(
-                capture.context, request_body, declared_binding_sha256, declared_units, produce_unit)
+                    source_observation_references=source_observation_references,
+                    _entry_admission_preparation=entry_admission_preparation)
+            with pm_core._EntryAdmissionPreparation(
+                    refreshed._entry_spread_observations) as entry_admission_preparation:
+                declared_records, evidence_completed = _continue_declared_attempt_units(
+                    capture.context, request_body, declared_binding_sha256, declared_units, produce_unit)
         else:
             reservation_scope = authority_spool.reserve_transient_publication(
                 capture.context

@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import logging
 from functools import wraps
+from contextlib import contextmanager
 from collections import OrderedDict
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -7484,6 +7485,109 @@ class DataSplitter:
 # BACKTESTING ENGINE
 # =============================================================================
 
+_ENTRY_ADMISSION_SOURCE_CALLABLE = spread_admission
+_ENTRY_ADMISSION_SOURCE_TIER = FrozenSpreadTier
+
+
+class _EntryAdmissionPreparation:
+    """Own one unit's lazy admission labels over an immutable numeric snapshot."""
+
+    def __init__(self, full_observations):
+        self._closed = False
+        self._eligible = False
+        self._source_callable = _ENTRY_ADMISSION_SOURCE_CALLABLE
+        self._labels_by_tier = {}
+        self._observations = None
+        self._index = None
+        self._raw_values = None
+        if (spread_admission is not _ENTRY_ADMISSION_SOURCE_CALLABLE
+                or FrozenSpreadTier is not _ENTRY_ADMISSION_SOURCE_TIER
+                or type(full_observations) is not pd.Series
+                or type(full_observations.index) is not pd.DatetimeIndex
+                or not full_observations.index.is_unique
+                or full_observations.index.hasnans
+                or not isinstance(full_observations.dtype, np.dtype)
+                or not full_observations.dtype.isnative
+                or full_observations.dtype.kind not in "iuf"):
+            return
+        snapshot = full_observations.copy(deep=True)
+        snapshot.index = full_observations.index.copy(deep=True)
+        self._observations = snapshot
+        self._index = snapshot.index
+        self._raw_values = snapshot.to_numpy(copy=False)
+        self._eligible = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.clear()
+        return False
+
+    def clear(self):
+        self._closed = True
+        self._eligible = False
+        self._labels_by_tier.clear()
+        self._observations = None
+        self._index = None
+        self._raw_values = None
+
+    def _usable(self):
+        return (not self._closed and self._eligible
+                and self._source_callable is _ENTRY_ADMISSION_SOURCE_CALLABLE
+                and spread_admission is _ENTRY_ADMISSION_SOURCE_CALLABLE
+                and FrozenSpreadTier is _ENTRY_ADMISSION_SOURCE_TIER)
+
+    def _states_for(self, spread_tier, observations):
+        if (not self._usable()
+                or type(spread_tier) is not _ENTRY_ADMISSION_SOURCE_TIER
+                or type(observations) is not pd.Series
+                or type(observations.index) is not pd.DatetimeIndex
+                or observations.dtype != self._raw_values.dtype
+                or observations.index.dtype != self._index.dtype):
+            return None
+        positions = self._index.get_indexer(observations.index)
+        if (np.any(positions < 0)
+                or not self._index.take(positions).equals(observations.index)
+                or self._raw_values[positions].tobytes(order="C")
+                != observations.to_numpy(copy=False).tobytes(order="C")):
+            return None
+        if not len(positions):
+            return np.array([])
+        tier_json = getattr(spread_tier, "_json", None)
+        if type(tier_json) is not str:
+            return None
+        try:
+            cap = spread_tier.spread_points
+        except (KeyError, TypeError, ValueError, RecursionError):
+            return None
+        if type(cap) is not int:
+            return None
+        key = (tier_json, cap, self._source_callable)
+        entry = self._labels_by_tier.get(key)
+        if entry is None:
+            entry = (np.empty(len(self._raw_values), dtype=object),
+                     np.zeros(len(self._raw_values), dtype=bool))
+            self._labels_by_tier[key] = entry
+        labels, seen = entry
+        missing = np.unique(positions[~seen[positions]])
+        if len(missing):
+            raw_missing = self._raw_values[missing]
+            _, first, inverse = np.unique(
+                raw_missing.view(np.dtype((np.void, raw_missing.dtype.itemsize))),
+                return_index=True, return_inverse=True)
+            representatives = np.array([
+                self._source_callable(spread_tier, value)
+                for value in raw_missing[first].tolist()], dtype=object)
+            labels[missing] = representatives[inverse]
+            seen[missing] = True
+        # Infer width from this slice, just as the original comprehension does.
+        return np.array(labels[positions].tolist())
+
+
+_ENTRY_ADMISSION_PREPARATION_TYPE = _EntryAdmissionPreparation
+
+
 class Backtester:
     """
     Full backtesting engine with complete performance metrics.
@@ -7537,6 +7641,19 @@ class Backtester:
         self._swap_terms_pointer_pin: Optional[str] = None
         # Discovery/backtest scoring must not use live-only regime TP overlays.
         # Stage 2 can still search `tp_atr_mult` normally via strategy grids.
+
+    @contextmanager
+    def _partition_entry_admission_reuse(self, preparation):
+        absent = object()
+        previous = self.__dict__.get("_entry_admission_preparation", absent)
+        self._entry_admission_preparation = preparation
+        try:
+            yield
+        finally:
+            if previous is absent:
+                self.__dict__.pop("_entry_admission_preparation", None)
+            else:
+                self._entry_admission_preparation = previous
 
     def _discovery_risk_per_trade_pct(self) -> float:
         try:
@@ -8707,9 +8824,20 @@ class Backtester:
             )
             admission_states = None
         if spread_tier is not None:
-            admission_states, admission_binding = self._entry_spread_admission_inputs(
-                features, spread_tier, entry_spread_observations,
-            )
+            admission_helper = self._entry_spread_admission_inputs
+            preparation = getattr(self, "_entry_admission_preparation", None)
+            if (type(preparation) is _ENTRY_ADMISSION_PREPARATION_TYPE
+                    and preparation._usable()
+                    and admission_helper is _ENTRY_ADMISSION_SOURCE_HELPER
+                    and Backtester._entry_spread_admission_inputs is _ENTRY_ADMISSION_SOURCE_HELPER):
+                admission_states, admission_binding = admission_helper(
+                    features, spread_tier, entry_spread_observations,
+                    _preparation=preparation,
+                )
+            else:
+                admission_states, admission_binding = admission_helper(
+                    features, spread_tier, entry_spread_observations,
+                )
             spread_meta.update(admission_binding)
         
         if 'ATR_14' in features.columns:
@@ -9218,7 +9346,7 @@ class Backtester:
         return result
 
     @staticmethod
-    def _entry_spread_admission_inputs(features, spread_tier, observations):
+    def _entry_spread_admission_inputs(features, spread_tier, observations, *, _preparation=None):
         if observations is None:
             observations = pd.Series(np.nan, index=features.index)
         elif (not isinstance(observations, pd.Series)
@@ -9227,7 +9355,11 @@ class Backtester:
         numeric = pd.to_numeric(observations, errors="raise").to_numpy(dtype=float)
         if np.any(np.isfinite(numeric) & (numeric != np.floor(numeric))):
             raise ValueError("ENTRY_SPREAD_OBSERVATION_INVALID")
-        states = np.array([spread_admission(spread_tier, x) for x in observations])
+        states = None
+        if type(_preparation) is _ENTRY_ADMISSION_PREPARATION_TYPE:
+            states = _preparation._states_for(spread_tier, observations)
+        if states is None:
+            states = np.array([spread_admission(spread_tier, x) for x in observations])
         if (states == "INVALID").any():
             raise ValueError("ENTRY_SPREAD_OBSERVATION_INVALID")
         return states, {
@@ -10826,6 +10958,9 @@ class Backtester:
             'equity_curve': [self.config.initial_capital],
             'trades': [],
         }
+
+
+_ENTRY_ADMISSION_SOURCE_HELPER = Backtester._entry_spread_admission_inputs
 
 
 # =============================================================================
