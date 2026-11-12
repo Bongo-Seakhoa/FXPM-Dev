@@ -6767,3 +6767,228 @@ def _regime_fit_evidence(*, source, product, support, detector_record, derived_b
     if derived_binding is not None:
         evidence["m5_view"] = dict(derived_binding.view_evidence)
     return evidence
+
+
+_ROUTE_A_SINGLE_REQUEST_RECIPE = "ROUTE_A_APPLIED_SPREAD_POLICY_V1"
+_ROUTE_A_SINGLE_REQUEST_POLICY_DOMAIN = b"FXPM_ROUTE_A_APPLIED_SPREAD_POLICY_V1\x00"
+
+
+def _execute_route_a_single_request(*, descriptor_request, metadata_recipe,
+        capture, fitted, search_process, cell_plan, config, handle):
+    """Evaluate one issued train/tuning request without completing an attempt.
+
+    Reserved for the future W6 unique-evaluation-sharing consumer; this does
+    not share evaluations. Retire this unused adapter if that design changes.
+    """
+    import pm_production_search_planner as planner
+
+    def refuse(suffix, *details):
+        _fail("ROUTE_A_SINGLE_REQUEST_" + suffix, *details)
+
+    def same(left, right):
+        return _canonical_bytes(left) == _canonical_bytes(right)
+
+    def source_identity(result):
+        contract = raw_winner.build_trade_source_contract_from_backtester_result(result)
+        sample = trade_power.build_trade_sample_evidence([], source_contract=contract,
+            minimum_observations=raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS)
+        if sample.source_contract is None:
+            refuse("SOURCE_CONTRACT_UNAVAILABLE")
+        return sample.source_contract
+
+    if metadata_recipe != _ROUTE_A_SINGLE_REQUEST_RECIPE or type(metadata_recipe) is not str:
+        refuse("RECIPE_INVALID")
+    row_fields = {"request_ordinal", "strategy_id", "strategy_family", "domain_cardinality",
+        "parameters", "shared_evaluation_key", "same_identity_as_request_ordinal", "bookkeeping"}
+    if type(descriptor_request) is not dict or set(descriptor_request) != row_fields:
+        refuse("REQUEST_INVALID")
+    row = descriptor_request
+    ordinal, previous = row["request_ordinal"], row["same_identity_as_request_ordinal"]
+    if (type(ordinal) is not int or ordinal < 0
+            or (previous is not None and (type(previous) is not int or not 0 <= previous < ordinal))
+            or type(row["shared_evaluation_key"]) is not dict):
+        refuse("REQUEST_INVALID")
+    binding = row["shared_evaluation_key"].get("evaluation_binding")
+    geometry = binding.get("partition_geometry") if type(binding) is dict else None
+    if type(geometry) is not dict:
+        refuse("REQUEST_INVALID")
+    if geometry.get("role") == "final_lockbox":
+        refuse("LOCKBOX_REFUSED")
+    if geometry.get("role") not in ("optimizer_train", "tuning_validation"):
+        refuse("ROLE_INVALID")
+    if (type(capture) is not historical_adapter.DeclaredSlotSearchCapture
+            or type(fitted) is not FittedNativeSearchTimeframe
+            or not isinstance(config, PipelineConfig)):
+        refuse("CONTEXT_INVALID")
+    if (historical_adapter._verify_declared_slot_capture(capture) is not True
+            or fitted is not capture.verified_fitted_timeframe
+            or config is not capture.verified_pipeline_config
+            or search_process is not capture.process or cell_plan is not capture.cell_plan):
+        refuse("CONTEXT_INVALID")
+    capture._require_active(handle)
+    request_body = capture.request.to_dict()
+    window = request_body["source_access_window_utc"]
+    window_code = "ROUTE_A_SINGLE_REQUEST_SOURCE_WINDOW_INVALID"
+    window_start = _utc(window["start_utc"], window_code)
+    window_end = _utc(window["end_exclusive_utc"], window_code)
+    observed = _utc(_now_utc_seconds(), window_code)
+    if not window_start <= observed < window_end:
+        refuse("SOURCE_WINDOW_CLOSED")
+    header = _read_declared_unit_header(capture.context, request_body)
+    if header is None:
+        refuse("ORIGINAL_HEADER_REQUIRED")
+    if (not same(header.get("frozen_plan_receipt"), handle.frozen_receipt_descriptor)
+            or not same(header.get("frozen_descriptor_graph"), handle.frozen_descriptor_graph)
+            or not same(header.get("horizon_winner_cross_binding"), handle.cross_binding_descriptor)
+            or not same(header.get("source_session_entry"), dict(capture.source_session._entry))):
+        refuse("ORIGINAL_HANDLE_MISMATCH")
+
+    source = fitted.source_group_decision.to_dict()
+    symbol, timeframe, regime = source["symbol"], source["timeframe"], capture.regime
+    horizon_plan, artifacts = _verified_historical_cell_plan_inputs(capture,
+        search_process=search_process, cell_plan=cell_plan, symbol=symbol,
+        timeframe=timeframe, regime=regime)
+    _verify_capture_horizon_plan_identity(capture, timeframe=timeframe,
+        regime=regime, horizon_plan=horizon_plan)
+    refreshed, _ = _declared_fitted_for_execution(capture, fitted, config)
+    _reverify_cell_state_error_envelope(cell_plan=cell_plan, fitted=refreshed)
+    plan_body, attempts = _verify_attempt_roster(plan=horizon_plan,
+        attempt_artifacts=artifacts, fitted=refreshed, regime=regime)
+    fold_plan = _winner_fold_plan(attempts)
+    unit_binding = _declared_unit_binding(capture, refreshed, cell_plan, attempts, fold_plan, handle)
+    if not same(header.get("binding"), unit_binding):
+        refuse("UNIT_BINDING_MISMATCH")
+
+    registered = {}
+    for entry in capture.sink.artifact_roster():
+        if entry["artifact_id"] in registered:
+            refuse("ORIGINAL_HANDLE_MISMATCH")
+        registered[entry["artifact_id"]] = entry
+    entries = {}
+    roster = header.get("artifact_roster")
+    if type(roster) is not list:
+        refuse("ORIGINAL_HANDLE_MISMATCH")
+    for entry in roster:
+        if (type(entry) is not dict or type(entry.get("artifact_id")) is not str
+                or entry["artifact_id"] in entries
+                or not same(registered.get(entry["artifact_id"]), entry)):
+            refuse("ORIGINAL_HANDLE_MISMATCH")
+        entries[entry["artifact_id"]] = entry
+    frozen, _cross, cross_bytes, _ = historical_adapter._verify_declared_slot_frozen_chain(
+        capture.context, completion=header, parent=capture.request._precommit.to_dict(),
+        body=request_body, request=capture.request, plan=cell_plan,
+        source=refreshed.source_group_decision, fit=refreshed.regime_fit_decision,
+        entries=entries, precommit=capture.request._precommit,
+        **({"m5_fitted": refreshed}
+           if historical.declared_slot_source_kind(request_body) == "m5_derived" else {}))
+    if frozen != handle.frozen or cross_bytes != handle._cross_binding_bytes:
+        refuse("ORIGINAL_HANDLE_MISMATCH")
+
+    process_body = search_process.to_dict()
+    domains = process_body.get("semantics", {}).get("strategy_domains")
+    if type(domains) is not list:
+        refuse("PROCESS_BINDING_MISMATCH")
+    described = planner.describe_route_a_evaluation_design(frozen_domains=domains,
+        configurations=[{"strategy_id": row["strategy_id"], "parameters": row["parameters"],
+            "evaluation_binding": binding, "bookkeeping": row["bookkeeping"]}])["requests"][0]
+    for field in ("strategy_id", "strategy_family", "domain_cardinality", "parameters",
+                  "shared_evaluation_key", "bookkeeping"):
+        if not same(row[field], described[field]):
+            refuse("REQUEST_INVALID", field)
+    key = described["shared_evaluation_key"]
+    binding = key["evaluation_binding"]
+    expected_context = {"symbol": symbol, "timeframe": timeframe, "regime": regime,
+        "anchor_id": plan_body["anchor"]["anchor_id"],
+        "search_process_receipt_sha256": search_process.receipt_sha256,
+        "config_sha256": capture.context.config_sha256,
+        "effective_config_sha256": capture.source_session._frozen_config.effective_config_sha256,
+        "declared_unit_binding": unit_binding}
+    if (any(not same(binding[field], expected) for field, expected in expected_context.items())
+            or _utc(binding["selection_cutoff_utc"], "ROUTE_A_SINGLE_REQUEST_REQUEST_INVALID")
+            != _utc(plan_body["anchor"]["selection_cutoff_utc"],
+                    "ROUTE_A_SINGLE_REQUEST_REQUEST_INVALID")):
+        refuse("UNIT_BINDING_MISMATCH")
+    domain = next(value for value in domains if value["strategy_id"] == row["strategy_id"])
+    defaults = StrategyRegistry.get(row["strategy_id"]).get_default_params()
+    matches = []
+    for attempt in attempts:
+        if attempt.plan_attempt["status"] != "PLANNED":
+            continue
+        if attempt.artifacts.winner_process["strategy_id"] != row["strategy_id"]:
+            continue
+        parameters = decode_parameter_mapping(attempt.artifacts.trial_definition["parameters"], defaults)
+        parameters = planner.validate_parameter_domain_member(domain["parameter_domain"], parameters)
+        if not same(parameters, described["parameters"]):
+            continue
+        folds = _causal_folds(attempt)
+        if binding["fold_ordinal"] >= len(folds):
+            continue
+        fold = folds[binding["fold_ordinal"]]
+        if fold["fold_id"] != binding["fold_id"]:
+            continue
+        partitions = _fold_partitions(frame=refreshed._frame, fold=fold, attempt=attempt,
+            dependency_warmup_bars=plan_body["derived_dependency_geometry"]["warmup_bars"])
+        for partition in partitions:
+            if (partition.role == binding["partition_geometry"]["role"]
+                    and same(partition.geometry_receipt, binding["partition_geometry"])):
+                matches.append((attempt, partition))
+    if not matches:
+        refuse("ATTEMPT_BINDING_UNAVAILABLE")
+    if len(matches) != 1:
+        refuse("ATTEMPT_BINDING_AMBIGUOUS")
+    attempt, partition = matches[0]
+    tier = binding["spread_tier"]
+    stable_source = _source_identity(refreshed.source_contract_seeds[tier])
+    if binding["source_contract_sha256"] != stable_source:
+        refuse("SOURCE_IDENTITY_MISMATCH")
+    if (not same(frozen.source_contract_seeds, refreshed.source_contract_seeds)
+            or not same(frozen.frozen_tier_pair_contract, refreshed.frozen_tier_pair_contract)):
+        refuse("SOURCE_IDENTITY_MISMATCH")
+
+    probe_backtester = Backtester(config)
+    probe = probe_backtester.build_evidence_source_seed_result(partition.frame, symbol,
+        spec=refreshed.instrument_spec, timeframe=timeframe,
+        spread_tier=refreshed._spread_tiers[tier],
+        entry_spread_observations=refreshed._entry_spread_observations.loc[partition.frame.index])
+    _verify_partition_precommitment(precommitments=frozen.partition_cost_precommitments,
+        attempt=attempt, fold_ordinal=binding["fold_ordinal"], partition=partition,
+        tier=tier, result=probe, pair=refreshed.frozen_tier_pair_contract)
+    probe_identity = source_identity(probe)
+    if probe_identity.source_contract_sha256 != stable_source:
+        refuse("SOURCE_IDENTITY_MISMATCH")
+    if binding["partition_source_contract_sha256"] != probe_identity.partition_source_contract_sha256:
+        refuse("PARTITION_SOURCE_IDENTITY_MISMATCH")
+    applied_policy = hashlib.sha256(_ROUTE_A_SINGLE_REQUEST_POLICY_DOMAIN
+        + pm_core.build_backtest_spread_mode(probe["spread_model"]).encode("ascii")).hexdigest()
+    if binding["spread_model_sha256"] != applied_policy:
+        refuse("SPREAD_POLICY_IDENTITY_MISMATCH")
+
+    strategy, _ = _runtime_strategy(attempt)
+    surface = _build_full_prefix_strategy_surface(frame=refreshed._frame, strategy=strategy,
+        fitted=refreshed, symbol=symbol, timeframe=timeframe)
+    decision = {}
+    result, _features, signals, _ = _run_tier_partition(partition=partition,
+        full_prefix_surface=surface, backtester=Backtester(config), strategy=strategy,
+        symbol=symbol, timeframe=timeframe, regime=regime, config=config,
+        spec=refreshed.instrument_spec, expected_source_contract_sha256=stable_source,
+        spread_tier=refreshed._spread_tiers[tier],
+        entry_spread_observations=refreshed._entry_spread_observations,
+        decision_result_out=decision)
+    _verify_partition_precommitment(precommitments=frozen.partition_cost_precommitments,
+        attempt=attempt, fold_ordinal=binding["fold_ordinal"], partition=partition,
+        tier=tier, result=result, pair=refreshed.frozen_tier_pair_contract)
+    actual_identity = source_identity(result)
+    if (actual_identity.source_contract_sha256 != probe_identity.source_contract_sha256
+            or actual_identity.partition_source_contract_sha256
+            != probe_identity.partition_source_contract_sha256):
+        refuse("REALIZED_PARTITION_SOURCE_IDENTITY_MISMATCH")
+    return {"schema_version": "fxpm.route-a-single-request-diagnostic.v1",
+        "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
+        "request_ordinal": ordinal, "shared_evaluation_key": key,
+        "matched_attempt_ordinal": attempt.ordinal,
+        "matched_horizon_attempt_id": attempt.plan_attempt["attempt_id"],
+        "decision_lane": decision, "signal_vector": signals.copy(deep=True),
+        "signal_comparison": "UNAVAILABLE_SINGLE_TIER_NO_CROSS_TIER_COMPARISON",
+        "overall_execution_ready": False, "qualification_authority": False,
+        "capital_authority": False, "paper_authority": False,
+        "live_authority": False, "order_authority": False, "live_order_authority": False}
