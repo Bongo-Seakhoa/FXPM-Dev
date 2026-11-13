@@ -4044,48 +4044,6 @@ def _route_a_recorded_calls():
     return recorded()
 
 
-def _route_a_invented_request(witness, attempt, fold_ordinal, role, tier):
-    """Metadata preparation from the real software-issued, INVENTED source graph."""
-    capture, fitted = witness["capture"], witness["refreshed"]
-    plan = witness["cell_plan"].horizon_plan.to_dict()
-    fold = execution._causal_folds(attempt)[fold_ordinal]
-    partitions = execution._fold_partitions(frame=fitted._frame, fold=fold, attempt=attempt,
-        dependency_warmup_bars=plan["derived_dependency_geometry"]["warmup_bars"])
-    partition = next(value for value in partitions if value.role == role)
-    seed = execution.Backtester(witness["config"]).build_evidence_source_seed_result(
-        partition.frame, capture.symbol, spec=fitted.instrument_spec,
-        timeframe=plan["cell"]["timeframe"], spread_tier=fitted._spread_tiers[tier],
-        entry_spread_observations=fitted._entry_spread_observations.loc[partition.frame.index])
-    contract = execution.raw_winner.build_trade_source_contract_from_backtester_result(seed)
-    sample = execution.trade_power.build_trade_sample_evidence([], source_contract=contract,
-        minimum_observations=execution.raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS)
-    assert sample.source_contract is not None
-    process = witness["search_process"].to_dict()
-    strategy_id = attempt.artifacts.winner_process["strategy_id"]
-    parameters = execution.decode_parameter_mapping(attempt.artifacts.trial_definition["parameters"],
-        execution.StrategyRegistry.get(strategy_id).get_default_params())
-    binding = {"search_process_receipt_sha256": witness["search_process"].receipt_sha256,
-        "config_sha256": capture.context.config_sha256,
-        "effective_config_sha256": capture.source_session._frozen_config.effective_config_sha256,
-        "source_contract_sha256": execution._source_identity(fitted.source_contract_seeds[tier]),
-        "partition_source_contract_sha256": sample.source_contract.partition_source_contract_sha256,
-        "spread_model_sha256": hashlib.sha256(b"FXPM_ROUTE_A_APPLIED_SPREAD_POLICY_V1\x00"
-            + execution.pm_core.build_backtest_spread_mode(seed["spread_model"]).encode("ascii")).hexdigest(),
-        "declared_unit_binding": copy.deepcopy(witness["declared_header"]["binding"]),
-        "symbol": capture.symbol, "timeframe": plan["cell"]["timeframe"], "regime": capture.regime,
-        "anchor_id": plan["anchor"]["anchor_id"],
-        "selection_cutoff_utc": plan["anchor"]["selection_cutoff_utc"],
-        "fold_id": fold["fold_id"], "fold_ordinal": fold_ordinal,
-        "partition_geometry": copy.deepcopy(partition.geometry_receipt), "spread_tier": tier}
-    design = search_planner.describe_route_a_evaluation_design(
-        frozen_domains=process["semantics"]["strategy_domains"],
-        configurations=[{"strategy_id": strategy_id, "parameters": parameters,
-            "evaluation_binding": binding, "bookkeeping": {"attempt_ordinal": attempt.ordinal,
-                "horizon_attempt_id": attempt.plan_attempt["attempt_id"]}}])
-    assert design["status"] == "DESIGN_ONLY" and design["execution_ready"] is False
-    return design["requests"][0], partition
-
-
 def _route_a_unambiguous_issued_attempt(witness):
     """Choose by issued metadata only, before any model result or score exists."""
     from collections import Counter
@@ -4123,313 +4081,1019 @@ def _route_a_unambiguous_issued_attempt(witness):
     return selected[0], selected[1]
 
 
-@pytest.mark.parametrize("damage, expected", (
-    ("recipe", "ROUTE_A_SINGLE_REQUEST_RECIPE_INVALID"),
-    ("shape", "ROUTE_A_SINGLE_REQUEST_REQUEST_INVALID"),
-    ("lockbox", "ROUTE_A_SINGLE_REQUEST_LOCKBOX_REFUSED"),
-    ("role", "ROUTE_A_SINGLE_REQUEST_ROLE_INVALID"),
-    ("context", "ROUTE_A_SINGLE_REQUEST_CONTEXT_INVALID"),
-), ids=("recipe", "shape", "lockbox", "role", "context"))
-def test_route_a_single_request_structural_guards_are_typed(damage, expected):
-    # This intentionally invalid row proves only early guards, never issued authority.
-    row = {"request_ordinal": 0, "strategy_id": "INVENTED_INVALID_STRUCTURAL_ROW",
-        "strategy_family": "INVENTED", "domain_cardinality": 1, "parameters": {},
-        "shared_evaluation_key": {"evaluation_binding": {"partition_geometry": {
-            "role": "final_lockbox" if damage == "lockbox" else (
-                "INVENTED_INVALID_ROLE" if damage == "role" else "optimizer_train")}}},
-        "same_identity_as_request_ordinal": None, "bookkeeping": {}}
-    args = {"descriptor_request": {} if damage == "shape" else row,
-        "metadata_recipe": "INVENTED_WRONG_RECIPE" if damage == "recipe" else "ROUTE_A_APPLIED_SPREAD_POLICY_V1",
-        "capture": None, "fitted": None, "search_process": None,
-        "cell_plan": None, "config": None, "handle": None}
-    before = copy.deepcopy(args)
-    with _route_a_recorded_calls() as calls:
-        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
-            execution._execute_route_a_single_request(**args)
-    assert caught.value.code == expected
-    assert args == before
-    assert all(calls.counts[name] == 0 for name in
-        ("model_run", "runtime_strategy", "partition", "surface", "probe"))
+def _route_a_batch_specification(witness, attempt, *, tier,
+        role="optimizer_train", fold_ordinal=0):
+    """INVENTED software input; the production owner derives every authority binding."""
+    strategy_id = attempt.artifacts.winner_process["strategy_id"]
+    parameters = execution.decode_parameter_mapping(attempt.artifacts.trial_definition["parameters"],
+        execution.StrategyRegistry.get(strategy_id).get_default_params())
+    return {"strategy_id": strategy_id,
+        "parameters": parameters, "fold_ordinal": fold_ordinal,
+        "partition_role": role, "spread_tier": tier,
+        "bookkeeping": {"attempt_ordinal": attempt.ordinal,
+            "horizon_attempt_id": attempt.plan_attempt["attempt_id"]}}
 
 
-def test_route_a_single_request_issued_construction_only(tmp_path, monkeypatch, _route_a_owned_invented_native_source):
-    """Authentic SOFTWARE issuance over INVENTED owned data; no model execution."""
-    def observe(**values):
-        assert execution.historical_adapter._verify_declared_slot_capture(values["capture"]) is True
-        values["capture"]._require_active(values["handle"])
-        refreshed, _ = execution._declared_fitted_for_execution(
-            values["capture"], values["fitted"], values["config"])
-        assert values["declared_header"]["binding"] == execution._declared_unit_binding(
-            values["capture"], refreshed, values["cell_plan"], values["attempts"],
-            values["fold_plan"], values["handle"])
-        assert any(value.plan_attempt["status"] == "PLANNED" for value in values["attempts"])
-
-    with _route_a_recorded_calls() as calls:
-        observed = _run_owned_invented_issued_observation(tmp_path, monkeypatch,
-            source_access_window_utc=_route_a_owned_utc_window(), observe=observe,
-            native_fixture=_route_a_owned_invented_native_source)
-    assert observed["live_boundary_observed"] is True
-    assert all(calls.counts[name] == 0 for name in ("model_run", "runtime_strategy", "partition", "surface"))
-
-
-def test_route_a_single_request_issued_two_fold_oracle(tmp_path, monkeypatch, _route_a_owned_invented_native_source, record_property):
-    """Full INVENTED two-fold oracle; its synthetic final roles are QA-only."""
-    from datetime import datetime, timezone
+def _route_a_batch_progress(path):
     import json
     import os
+    import time
+    from datetime import datetime, timezone
 
-    progress_path = tmp_path / "route_a_oracle_progress.jsonl"
-    record_property("route_a_oracle_progress_path", str(progress_path))
-
-    def progress(phase, label):
-        row = {"recorded_utc": datetime.now(timezone.utc).isoformat(),
-               "phase": phase, "label": label}
-        with progress_path.open("a", encoding="utf-8") as stream:
+    def progress(phase, label, **details):
+        row = {"phase": phase, "label": label,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "monotonic_ns": time.perf_counter_ns(),
+            "fixture_provenance": "INVENTED_SOFTWARE_ONLY_NOT_FINANCIAL_OR_PERFORMANCE_EVIDENCE",
+            **details}
+        with path.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+    return progress
 
-    progress("STARTED", "oracle")
-    completed, callback_receipts = [], []
 
-    def observe(**values):
-        from dataclasses import replace
-        witness = dict(values)
-        assert execution.historical_adapter._verify_declared_slot_capture(witness["capture"]) is True
-        refreshed, _ = execution._declared_fitted_for_execution(
-            witness["capture"], witness["fitted"], witness["config"])
-        witness["refreshed"] = refreshed
-        attempt, folds = _route_a_unambiguous_issued_attempt(witness)
-        # Only this QA oracle gets a two-fold INVENTED carrier. Issued roster stays untouched.
-        candidate = copy.deepcopy(attempt.candidate)
-        candidate["folds"] = copy.deepcopy(list(folds[:2]))
-        candidate["fixture_provenance"] = "INVENTED_TWO_FOLD_ORACLE_NOT_ISSUED_ATTEMPT"
-        oracle_attempt = replace(attempt, candidate=candidate)
-        plan = witness["cell_plan"].horizon_plan.to_dict()
-        before = (copy.deepcopy(witness["declared_header"]), copy.deepcopy(attempt.candidate),
-                  copy.deepcopy(witness["capture"].sink.artifact_roster()))
-        progress("STARTED_REFERENCE", "ordinary-two-fold-reference")
-        with _route_a_recorded_calls() as oracle_calls:
-            oracle = execution._build_planned_attempt_evidence(attempt=oracle_attempt,
-                raw_attempt_id="INVENTED_TWO_FOLD_ORDINARY_ORACLE", plan_body=plan,
-                plan_receipt_sha256=witness["cell_plan"].horizon_plan.receipt_sha256,
-                fitted=refreshed, config=witness["config"],
-                partition_cost_precommitments=witness["handle"].frozen.partition_cost_precommitments,
-                source_observation_references=None)
-        assert len(oracle["folds"]) == 2 and oracle_calls.counts["model_run"] == 12
-        assert oracle_calls.counts["runtime_strategy"] == oracle_calls.counts["surface"] == 1
-        assert oracle_calls.counts["pool_lookup"] == 0
-        progress("COMPLETED_REFERENCE", "ordinary-two-fold-reference")
-        rows, adapter_instances = {}, []
+def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
+        source_access_window_utc, native_fixture, observe, progress,
+        restore_first=False, refuse_outer_consumer=False):
+    """Prove owner control flow and finish entry, never completed financial evidence."""
+    from collections import Counter
+    import sys
+    import time
+    import pm_authority_spool as spool
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_historical_search_producer as producer
 
-        def run(row, **overrides):
-            arguments = dict(descriptor_request=row, metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1",
-                capture=witness["capture"], fitted=witness["fitted"],
-                search_process=witness["search_process"], cell_plan=witness["cell_plan"],
-                config=witness["config"], handle=witness["handle"])
-            arguments.update(overrides)
-            return execution._execute_route_a_single_request(**arguments)
+    class BeforeInventedOrdinaryLoop(BaseException):
+        pass
 
-        for fold_ordinal in range(2):
-            for role in ("optimizer_train", "tuning_validation"):
-                for tier in ("P75", "P95"):
-                    row, partition = _route_a_invented_request(witness, attempt, fold_ordinal, role, tier)
-                    row_before = copy.deepcopy(row)
-                    lane = partition.geometry_receipt["receipt_sha256"], tier
-                    lane_label = f"fold:{fold_ordinal}/role:{role}/tier:{tier}"
-                    progress("STARTED_LANE", lane_label)
-                    with _route_a_recorded_calls() as calls:
-                        actual = run(row)
-                    expected = oracle["folds"][fold_ordinal]["lanes"][f"{role}_{tier.lower()}"]
-                    assert execution._canonical_bytes(actual["decision_lane"]) == execution._canonical_bytes(expected)
-                    assert actual["signal_vector"].equals(oracle_calls.outputs[lane]["signals"])
-                    assert calls.callbacks[lane] == oracle_calls.callbacks[lane]
-                    assert calls.surface_callbacks == oracle_calls.surface_callbacks
-                    assert calls.surface_callbacks, "Full-prefix callback observer must be nonvacuous"
-                    callback_receipts.append({"fold_ordinal": fold_ordinal, "role": role,
-                        "tier": tier, "partition_geometry_sha256": lane[0],
-                        "surface_callback_sequence": list(calls.surface_callbacks),
-                        "partition_callback_sequence": list(calls.callbacks[lane]),
-                        "oracle_surface_callback_sequence": list(oracle_calls.surface_callbacks),
-                        "oracle_partition_callback_sequence": list(oracle_calls.callbacks[lane]),
-                        "partition_nonempty_coverage": "PROVEN_NONEMPTY" if calls.callbacks[lane]
-                            else "UNPROVEN_EMPTY_SEQUENCE", "fixture_provenance": "INVENTED_SOFTWARE_ONLY"})
-                    assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == calls.counts["surface"] == 1
-                    assert calls.counts["partition"] == calls.counts["cost"] == 1
-                    assert calls.counts["precommit"] == 2 and calls.counts["source"] >= 2
-                    assert calls.counts["probe"] >= 1 and calls.counts["pool_lookup"] == 0
-                    assert len(calls.instances) == 1 and calls.instances[0][2] is None
-                    adapter_instances.extend(calls.instances)
-                    assert row == row_before
-                    assert actual["shared_evaluation_key"] == row["shared_evaluation_key"]
-                    assert actual["matched_attempt_ordinal"] == attempt.ordinal
-                    assert actual["matched_horizon_attempt_id"] == attempt.plan_attempt["attempt_id"]
-                    assert actual["signal_comparison"] == "UNAVAILABLE_SINGLE_TIER_NO_CROSS_TIER_COMPARISON"
-                    for authority in ("overall_execution_ready", "qualification_authority",
-                                      "capital_authority", "paper_authority", "live_authority",
-                                      "order_authority", "live_order_authority"):
-                        assert actual[authority] is False
-                    rows[fold_ordinal, role, tier] = (row, partition, actual)
-                    progress("COMPLETED_LANE", lane_label)
-        assert len({id(value[0]) for value in adapter_instances}) == 8
-        assert len({id(value[1]) for value in adapter_instances}) == 8
+    class ObservedOriginalFinishEntry(BaseException):
+        pass
 
-        base, partition, expected = rows[0, "optimizer_train", "P75"]
-        bookkeeping = copy.deepcopy(base)
-        bookkeeping["bookkeeping"] = {"request_ordinal": 999999, "attempt_ordinal": 999999,
-                                      "horizon_attempt_id": "INVENTED_BOOKKEEPING_NEVER_SELECTS"}
-        progress("STARTED_BOOKKEEPING", "caller-bookkeeping-replay")
-        with _route_a_recorded_calls() as calls:
-            changed = run(bookkeeping)
-        assert execution._canonical_bytes(changed["decision_lane"]) == execution._canonical_bytes(expected["decision_lane"])
-        assert changed["matched_attempt_ordinal"] == attempt.ordinal
-        assert changed["matched_horizon_attempt_id"] == attempt.plan_attempt["attempt_id"]
-        assert (changed["matched_attempt_ordinal"], changed["matched_horizon_attempt_id"]) != (
-            bookkeeping["bookkeeping"]["attempt_ordinal"], bookkeeping["bookkeeping"]["horizon_attempt_id"])
-        assert calls.counts["model_run"] == 1 and calls.counts["pool_lookup"] == 0
-        progress("COMPLETED_BOOKKEEPING", "caller-bookkeeping-replay")
+    with _invented_fixture_external_io_guard(monkeypatch) as external_io_attempts:
+        env = _build_owned_invented_declared_inputs(tmp_path,
+            source_access_window_utc=source_access_window_utc, native_fixture=native_fixture)
+        committed = orchestration.verify_declared_slot_owner_run_precommit(
+            env.context, env.precommit, process=env.process)
+        cells = [cell for cell in committed["cells"] if cell["cell_id"] == env.cell_id]
+        assert len(cells) == 1
+        sink = spool.open_symbol_sink(env.context, cells[0]["symbol"])
+        request = orchestration.declared_slot_producer_request(env.context,
+            precommit=env.precommit, process=env.process, cell_id=env.cell_id,
+            slot_id=env.slot_id, attempt_id="invented-route-a-unit-consumer", sink=sink)
+        assert execution._read_declared_unit_header(env.context, request.to_dict()) is None
+        saved, reached, failure, finish_entries = {}, [], [], []
+        observations, consumer_entries, containment_events, normal_returns = [], [], [], []
+        observation_order = 0
+        callback_active = False
+        diagnostic_recording_failures = []
+        original_containment = execution._route_a_contain_consumer_failure
+        original_header = execution._make_declared_unit_header
+        original_unit_binding = execution._declared_unit_binding
+        entrypoints = ((execution, "_declared_fitted_for_execution"),
+            (execution, "_reverify_cell_state_error_envelope"),
+            (execution, "_verify_attempt_roster"),
+            (execution, "_verified_historical_cell_plan_inputs"),
+            (execution, "_verify_capture_horizon_plan_identity"),
+            (execution.historical_adapter, "_verify_declared_slot_frozen_chain"))
+        counts = {name: 0 for _, name in entrypoints}
+        auth_codes = {name: getattr(owner, name).__code__ for owner, name in entrypoints}
+        pool_type = execution.pm_core._EntryAdmissionPreparation
+        model_codes = {name: function.__code__ for name, function in (
+            ("model_run", execution.Backtester.run), ("runtime_strategy", execution._runtime_strategy),
+            ("partition", execution._run_tier_partition),
+            ("surface", execution._build_full_prefix_strategy_surface),
+            ("pool_lookup", pool_type._states_for), ("pool_enter", pool_type.__enter__),
+            ("pool_exit", pool_type.__exit__),
+            ("full_capture", execution.historical_adapter._verify_declared_slot_capture),
+            ("unit_binding", original_unit_binding),
+            ("source_reopen", producer._reopen_declared_source_material),
+            ("original_freeze", execution.historical_adapter.DeclaredSlotSearchCapture.freeze_observed_cell))}
+        dispatch = _route_a_callback_identity_dispatch(tuple(auth_codes.items()) + tuple(model_codes.items()))
+        coordinator_code = execution._route_a_evaluate_prepared_request.__code__
+        restore_code = execution.historical_adapter.DeclaredSlotSearchCapture.restore_completed_unit_handle.__code__
+        executor_code = execution.execute_historical_observed_cell.__code__
+        calls = SimpleNamespace(counts=Counter(), instances=[], unique_intervals=[], auth_snapshots=[],
+            executor_admission_before=[], loop_invocations=0,
+            pool_depth=0, restore_returns=0, header_creations=0, outputs={})
+        active_unique = []
 
-        def altered_hash(value):
-            return "0" * 64 if value != "0" * 64 else "1" * 64
+        def observation(stage, *, error=None, returned=None):
+            nonlocal observation_order
+            observation_order += 1
+            row = {"order": observation_order, "monotonic_ns": time.monotonic_ns(),
+                "stage": stage, "error": error, "returned": returned}
+            observations.append(row)
+            return row
 
-        refusals = []
-        row = copy.deepcopy(base)
-        binding = row["shared_evaluation_key"]["evaluation_binding"]
-        binding["config_sha256"] = altered_hash(binding["config_sha256"])
-        refusals.append(("config_sha256", row, "ROUTE_A_SINGLE_REQUEST_UNIT_BINDING_MISMATCH"))
-        row = copy.deepcopy(base)
-        unit = row["shared_evaluation_key"]["evaluation_binding"]["declared_unit_binding"]
-        unit["generation_context_sha256"] = altered_hash(unit["generation_context_sha256"])
-        refusals.append(("unit:generation_context_sha256", row, "ROUTE_A_SINGLE_REQUEST_UNIT_BINDING_MISMATCH"))
-        for field, code in (("source_contract_sha256", "SOURCE_IDENTITY_MISMATCH"),
-                            ("partition_source_contract_sha256", "PARTITION_SOURCE_IDENTITY_MISMATCH"),
-                            ("spread_model_sha256", "SPREAD_POLICY_IDENTITY_MISMATCH")):
-            row = copy.deepcopy(base)
-            binding = row["shared_evaluation_key"]["evaluation_binding"]
-            binding[field] = altered_hash(binding[field])
-            refusals.append((field, row, "ROUTE_A_SINGLE_REQUEST_" + code))
-        row = copy.deepcopy(base)
-        row["shared_evaluation_key"]["evaluation_binding"]["fold_id"] = "INVENTED_OTHER_ID"
-        refusals.append(("fold_id", row, "ROUTE_A_SINGLE_REQUEST_ATTEMPT_BINDING_UNAVAILABLE"))
-        row = copy.deepcopy(base)
-        row["shared_evaluation_key"]["evaluation_binding"]["partition_geometry"] = copy.deepcopy(
-            rows[1, "optimizer_train", "P75"][0]["shared_evaluation_key"]["evaluation_binding"]["partition_geometry"])
-        refusals.append(("other-valid-geometry", row, "ROUTE_A_SINGLE_REQUEST_ATTEMPT_BINDING_UNAVAILABLE"))
-        row = copy.deepcopy(base)
-        row["shared_evaluation_key"]["evaluation_binding"]["selection_cutoff_utc"] = "2024-07-14T08:05:01Z"
-        refusals.append(("protected-cutoff", row, "ROUTE_A_DESIGN_PROTECTED_CUTOFF_EXCEEDED"))
-        row = copy.deepcopy(base)
-        row["shared_evaluation_key"]["evaluation_binding"]["partition_geometry"]["role"] = "final_lockbox"
-        refusals.append(("lockbox", row, "ROUTE_A_SINGLE_REQUEST_LOCKBOX_REFUSED"))
-        row = copy.deepcopy(base)
-        row["strategy_family"] = row["shared_evaluation_key"]["strategy_family"] = "INVENTED_OTHER_FAMILY"
-        refusals.append(("family", row, "ROUTE_A_SINGLE_REQUEST_REQUEST_INVALID"))
-        row = copy.deepcopy(base)
-        row["shared_evaluation_key"]["domain_sha256"] = altered_hash(row["shared_evaluation_key"]["domain_sha256"])
-        refusals.append(("domain", row, "ROUTE_A_SINGLE_REQUEST_REQUEST_INVALID"))
-        row = copy.deepcopy(base)
-        row["parameters"] = {}
-        refusals.append(("parameters", row, "ROUTE_A_DESIGN_PARAMETERS_INVALID"))
-        for label, row, code in refusals:
-            progress("STARTED_EXPECTED_REFUSAL", label)
-            with _route_a_recorded_calls() as calls:
-                with pytest.raises((execution.AuthoritativeSearchExecutionError,
-                                    search_planner.ProductionSearchPlannerError)) as caught:
-                    run(row)
-            assert caught.value.code == code, label
-            assert all(calls.counts[name] == 0 for name in ("model_run", "runtime_strategy", "partition", "surface")), label
-            assert calls.counts["pool_lookup"] == 0
-            progress("COMPLETED_EXPECTED_REFUSAL", label)
+        def save_failure(stage, error):
+            row = observation(stage, error=error)
+            failure.append(row)
+            return row
 
-        for field in ("capture", "fitted", "search_process", "cell_plan", "config"):
-            progress("STARTED_EXPECTED_REFUSAL", "context:" + field)
-            with _route_a_recorded_calls() as calls:
-                with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
-                    run(base, **{field: object()})
-            assert caught.value.code == "ROUTE_A_SINGLE_REQUEST_CONTEXT_INVALID", field
-            assert all(calls.counts[name] == 0 for name in ("model_run", "runtime_strategy", "partition", "surface"))
-            progress("COMPLETED_EXPECTED_REFUSAL", "context:" + field)
-        progress("STARTED_EXPECTED_REFUSAL", "copied-handle")
-        with _route_a_recorded_calls() as calls:
-            with pytest.raises(execution.historical_adapter.HistoricalProductionAdapterError) as caught:
-                run(base, handle=replace(witness["handle"]))
-        assert str(caught.value) == "FROZEN_CELL_HANDLE_INVALID"
-        assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == 0
-        progress("COMPLETED_EXPECTED_REFUSAL", "copied-handle")
+        def defer_recording_failure(stage, error):
+            nonlocal observation_order
+            try:
+                save_failure(stage, error)
+            except BaseException as recording_error:
+                try:
+                    observation_order += 1
+                    diagnostic_recording_failures.append({"order": observation_order,
+                        "monotonic_ns": time.monotonic_ns(), "stage": "diagnostic-recording:" + stage,
+                        "error": recording_error, "returned": None})
+                except BaseException:
+                    # Preserve the delegated outcome if diagnostic storage itself is unavailable.
+                    pass
 
-        # Owned metadata faults; keep the real pointer-owner and frozen verifiers.
-        original_cross = witness["handle"].cross_binding_descriptor
-        progress("STARTED_EXPECTED_REFUSAL", "original-handle-cross-binding")
-        try:
-            changed_cross = dict(original_cross)
-            changed_cross["sha256"] = altered_hash(changed_cross["sha256"])
-            object.__setattr__(witness["handle"], "cross_binding_descriptor", changed_cross)
-            with _route_a_recorded_calls() as calls:
-                with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
-                    run(base)
-            assert caught.value.code == "ROUTE_A_SINGLE_REQUEST_ORIGINAL_HANDLE_MISMATCH"
-            assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == 0
-        finally:
-            object.__setattr__(witness["handle"], "cross_binding_descriptor", original_cross)
-        progress("COMPLETED_EXPECTED_REFUSAL", "original-handle-cross-binding")
-        for observed_clock, code in (
-                (witness["capture"].request.to_dict()["source_access_window_utc"]["end_exclusive_utc"],
-                 "ROUTE_A_SINGLE_REQUEST_SOURCE_WINDOW_CLOSED"),
-                ("INVENTED_INVALID_CLOCK", "ROUTE_A_SINGLE_REQUEST_SOURCE_WINDOW_INVALID")):
-            progress("STARTED_EXPECTED_REFUSAL", code)
-            with _route_a_recorded_calls() as calls:
-                with monkeypatch.context() as fault:
-                    fault.setattr(execution, "_now_utc_seconds", lambda: observed_clock)
-                    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
-                        run(base)
-            assert caught.value.code == code
-            assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == 0
-            progress("COMPLETED_EXPECTED_REFUSAL", code)
+        def bounded_error(error):
+            frames, trace = [], error.__traceback__
+            while trace is not None and len(frames) < 8:
+                code = trace.tb_frame.f_code
+                frames.append({"function": code.co_name[:96],
+                    "first_line": code.co_firstlineno, "line": trace.tb_lineno})
+                trace = trace.tb_next
+            return {"type": type(error).__name__[:96],
+                "code": str(getattr(error, "code", ""))[:96],
+                "message": str(error)[:256], "traceback_code": frames}
 
-        progress("STARTED_ISOLATION", "primed-outer-pool-replay")
-        outer = execution.Backtester(witness["config"])
-        with execution.pm_core._EntryAdmissionPreparation(refreshed._entry_spread_observations) as preparation:
-            with outer._partition_entry_admission_reuse(preparation):
-                with _route_a_recorded_calls() as calls:
-                    uncached = run(base)
-                assert outer._entry_admission_preparation is preparation and not preparation._closed
-                assert calls.counts["pool_lookup"] == 0 and calls.counts["model_run"] == 1
-        assert execution._canonical_bytes(uncached["decision_lane"]) == execution._canonical_bytes(expected["decision_lane"])
-        progress("COMPLETED_ISOLATION", "primed-outer-pool-replay")
+        def bounded_return(result):
+            summary = {"type": type(result).__name__[:96]}
+            if type(result) is dict:
+                for key in ("schema", "schema_version", "status", "reason_code", "failure_code"):
+                    value = result.get(key)
+                    if value is None or type(value) in (str, bool, int, float):
+                        summary[key] = value[:256] if type(value) is str else value
+                refusal = result.get("refusal")
+                if type(refusal) is dict:
+                    summary["refusal_code"] = str(refusal.get("code", ""))[:96]
+                    summary["refusal_message"] = str(refusal.get("details", ()))[:256]
+            return summary
 
-        real_run = execution.Backtester.run
-        def corrupt_realized_projection(self, *args, **kwargs):
-            result = real_run(self, *args, **kwargs)
-            result["swap_accrual_contract"] = dict(result["swap_accrual_contract"])
-            result["swap_accrual_contract"]["projection_sha256"] = altered_hash(
-                result["swap_accrual_contract"]["projection_sha256"])
+        def record_normal_return(stage, result):
+            summary = bounded_return(result)
+            normal_returns.append(observation(stage, returned=summary))
+            save_failure(stage, AssertionError("INVENTED producer returned before its control boundary: "
+                + str(summary)))
+
+        def record_containment(stage, error, *, returned=False, result=None):
+            if returned and callback_active:
+                classification = "CALLBACK_RESULT_ASSERTIONS"
+            elif (returned and consumer_entries and refuse_outer_consumer and type(error) is RuntimeError
+                    and error.args == ("INVENTED_OUTER_CONSUMER_REFUSAL_MUST_NOT_STOP_OWNER",)):
+                classification = "INTENTIONAL_OUTER_CONSUMER_SENTINEL"
+            else:
+                classification = "UNEXPECTED"
+            row = observation(stage, error=error,
+                returned=bounded_return(result) if returned else None)
+            row["classification"] = classification
+            containment_events.append(row)
+            if classification == "UNEXPECTED":
+                failure.append(row)
+
+        def containment_spy(error):
+            try:
+                result = original_containment(error)
+            except BaseException:
+                try:
+                    record_containment("containment-raised", error)
+                except BaseException as observation_error:
+                    defer_recording_failure("containment-observation", observation_error)
+                raise
+            try:
+                record_containment("containment-returned", error, returned=True, result=result)
+            except BaseException as observation_error:
+                defer_recording_failure("containment-observation", observation_error)
             return result
-        progress("STARTED_EXPECTED_REFUSAL", "realized-partition-source")
-        with _route_a_recorded_calls() as calls:
-            with monkeypatch.context() as fault:
-                fault.setattr(execution.Backtester, "run", corrupt_realized_projection)
-                with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
-                    run(base)
-        assert caught.value.code == "ROUTE_A_SINGLE_REQUEST_REALIZED_PARTITION_SOURCE_IDENTITY_MISMATCH"
-        assert calls.counts["model_run"] == calls.counts["partition"] == 1
-        assert calls.counts["cost"] == 1 and calls.counts["precommit"] == 2
-        progress("COMPLETED_EXPECTED_REFUSAL", "realized-partition-source")
-        assert witness["declared_header"] == before[0] and attempt.candidate == before[1]
-        assert witness["capture"].sink.artifact_roster() == before[2]
-        assert execution.historical_adapter._verify_declared_slot_capture(witness["capture"]) is True
-        witness["capture"]._require_active(witness["handle"])
-        completed.append({"roles": 2, "folds": 2, "tiers": 2, "matched_lanes": len(rows),
-                          "input_refusals": len(refusals), "fixture_provenance": "INVENTED_SOFTWARE_ONLY"})
 
-    observed = _run_owned_invented_issued_observation(tmp_path, monkeypatch,
-        source_access_window_utc=_route_a_owned_utc_window(), observe=observe,
-            native_fixture=_route_a_owned_invented_native_source)
-    assert observed["live_boundary_observed"] is True
-    assert len(completed) == 1 and completed[0]["matched_lanes"] == 8
-    assert len(callback_receipts) == 8
-    record_property("route_a_callback_receipts",
-        execution._canonical_bytes(callback_receipts).decode("ascii"))
-    progress("COMPLETED", "oracle")
+        def flush_observations():
+            failed_orders = {row["order"] for row in failure + diagnostic_recording_failures}
+            rows = tuple(observations) + tuple(diagnostic_recording_failures)
+            for row in sorted(rows, key=lambda item: item["order"]):
+                try:
+                    details = {"observation_order": row["order"],
+                        "observation_monotonic_ns": row["monotonic_ns"],
+                        "saved_failure": row["order"] in failed_orders}
+                    if "classification" in row:
+                        details["classification"] = row["classification"]
+                    if row["error"] is not None:
+                        details["error"] = bounded_error(row["error"])
+                    if row["returned"] is not None:
+                        details["returned"] = row["returned"]
+                    progress("BOUNDED_OWNER_OBSERVATION", row["stage"], **details)
+                except Exception as observation_error:
+                    defer_recording_failure("observation-progress", observation_error)
+
+        def raise_earliest_failure():
+            candidates = failure + diagnostic_recording_failures
+            if candidates:
+                earliest = min(candidates, key=lambda row: (row["monotonic_ns"], row["order"]))
+                raise earliest["error"]
+
+        def profile(frame, event, argument):
+            if event == "call":
+                if frame.f_code is executor_code:
+                    calls.executor_admission_before.append(dict(counts))
+                    progress("STARTED_NORMAL_OWNER_EXECUTOR", str(len(calls.executor_admission_before)))
+                for name in dispatch(frame.f_code, event):
+                    if name in counts:
+                        counts[name] += 1
+                        progress("STARTED_AUTH_ENTRY", name, interval="NORMAL_OWNER_AND_ADOPTION")
+                    else:
+                        calls.counts[name] += 1
+                if frame.f_code is model_codes["partition"]:
+                    calls.instances.append((frame.f_locals["strategy"], frame.f_locals["backtester"],
+                        frame.f_locals.get("_entry_admission_preparation")))
+                if frame.f_code is coordinator_code:
+                    ordinal = len(calls.unique_intervals)
+                    calls.unique_intervals.append(ordinal)
+                    active_unique.append((frame, ordinal))
+                    calls.auth_snapshots.append(dict(counts))
+                    progress("STARTED_UNIQUE_EVALUATION", str(ordinal),
+                        interval="ACTUAL_SHARED_COORDINATOR_ONLY")
+            elif event == "return":
+                if frame.f_code is model_codes["partition"] and argument is not None:
+                    partition = frame.f_locals["partition"]
+                    tier = frame.f_locals["spread_tier"].tier
+                    calls.outputs[partition.geometry_receipt["receipt_sha256"], tier] = {
+                        "decision": copy.deepcopy(frame.f_locals["decision_result_out"]),
+                        "signals": argument[2].copy(deep=True)}
+                if frame.f_code is model_codes["pool_enter"]:
+                    calls.pool_depth += 1
+                if frame.f_code is model_codes["pool_exit"]:
+                    calls.pool_depth -= 1
+                if frame.f_code is restore_code and argument is not None:
+                    calls.restore_returns += 1
+                    progress("RETURNED_ACTUAL_RESTORED_HANDLE", "fresh-INVENTED-original-request")
+                for name, code in auth_codes.items():
+                    if frame.f_code is code:
+                        progress("RETURNED_AUTH_ENTRY", name, interval="NORMAL_OWNER_AND_ADOPTION")
+                if active_unique and frame is active_unique[-1][0]:
+                    _, ordinal = active_unique.pop()
+                    calls.auth_snapshots.append(dict(counts))
+                    progress("COMPLETED_UNIQUE_EVALUATION" if argument is not None else "ABORTED_UNIQUE_EVALUATION",
+                        str(ordinal), interval="ACTUAL_SHARED_COORDINATOR_ONLY")
+
+        def header_spy(*args, **kwargs):
+            header = original_header(*args, **kwargs)
+            assert not kwargs and len(args) == 8 and calls.header_creations == 0
+            calls.header_creations += 1
+            saved["original_header_bytes"] = execution._canonical_bytes(header)
+            progress("COMPLETED_ORIGINAL_HEADER", "fresh-INVENTED-owner")
+            return header
+
+        def unit_binding_spy(*args, **kwargs):
+            binding = original_unit_binding(*args, **kwargs)
+            assert not kwargs and len(args) == 6
+            capture, refreshed, cell_plan, attempts, fold_plan, handle = args
+            saved["verified_binding_witness"] = {"capture": capture,
+                "fitted": capture.fitted_timeframe, "refreshed": refreshed,
+                "cell_plan": cell_plan, "attempts": attempts, "fold_plan": fold_plan,
+                "handle": handle, "search_process": capture.process,
+                "config": capture.pipeline_config, "binding": copy.deepcopy(binding)}
+            return binding
+
+        def ordinary_loop(actual_context, body, binding_sha256, units, produce):
+            assert actual_context is env.context and body == request.to_dict()
+            assert calls.pool_depth == 1 and callable(produce)
+            current = saved["verified_binding_witness"]
+            assert [unit["ordinal"] for unit in units] == list(range(len(current["attempts"])))
+            calls.loop_invocations += 1
+            if restore_first and calls.loop_invocations == 1:
+                assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == 0
+                saved["first_unit_roster"] = copy.deepcopy(units)
+                saved["first_binding_sha256"] = binding_sha256
+                # Revoked objects are held only for identity observations, never second-call inputs.
+                saved["first_revoked_objects_for_identity_only"] = tuple(current[name]
+                    for name in ("capture", "fitted", "refreshed", "handle")) + (
+                        current["capture"].source_session,)
+                for name in ("raw-completion.json", "evidence-completed.json"):
+                    assert execution._read_declared_unit_json(env.context,
+                        execution._declared_unit_relative(body, name)) is None
+                assert execution._declared_completed_prefix(env.context, body, binding_sha256, units) == []
+                progress("CONTROLLED_BEFORE_ORDINARY_LOOP", "fresh-header-first-invocation-no-produce")
+                raise BeforeInventedOrdinaryLoop()
+            saved["post_loop_counts"] = dict(counts)
+            progress("RETURNED_STUBBED_ORDINARY_LOOP", "INVENTED_CONTROL_FLOW_ONLY_NO_ATTEMPTS_COMPLETED")
+            header = execution._read_declared_unit_header(env.context, body)
+            return [], header["evidence_access_started_at_utc"]
+
+        def consumer(*, evaluate_batch):
+            nonlocal callback_active
+            entry = observation("consumer-entry")
+            consumer_entries.append(entry)
+            try:
+                progress("OBSERVED_CONSUMER_ENTRY", "BEFORE_ASSERTIONS",
+                    observation_order=entry["order"], observation_monotonic_ns=entry["monotonic_ns"])
+                assert saved and not reached and calls.pool_depth == 0
+                current = saved["verified_binding_witness"]
+                capture = current["capture"]
+                assert capture.request is request and capture.context is env.context
+                header = execution._read_declared_unit_header(env.context, request.to_dict())
+                assert execution._canonical_bytes(header) == saved["original_header_bytes"]
+                if restore_first:
+                    assert calls.restore_returns == 1
+                    actual_objects = tuple(current[name] for name in ("capture", "fitted", "refreshed", "handle")) + (
+                        capture.source_session,)
+                    assert all(first is not second for first, second in zip(
+                        saved["first_revoked_objects_for_identity_only"], actual_objects))
+                reached.append(True)
+                callback_active = True
+                try:
+                    assert observe(evaluate_batch=evaluate_batch, witness={
+                        "capture": capture, "fitted": current["fitted"], "refreshed": current["refreshed"],
+                        "cell_plan": current["cell_plan"], "attempts": current["attempts"],
+                        "fold_plan": current["fold_plan"], "handle": current["handle"],
+                        "declared_header": header, "search_process": current["search_process"], "config": current["config"]},
+                        counts=counts, post_header_counts=saved["post_loop_counts"], calls=calls,
+                        restored=restore_first) is None
+                finally:
+                    callback_active = False
+            except Exception as error:
+                save_failure("consumer-assertion", error)
+            if refuse_outer_consumer:
+                raise RuntimeError("INVENTED_OUTER_CONSUMER_REFUSAL_MUST_NOT_STOP_OWNER")
+            return None
+
+        def finish_entry(actual_capture, actual_handle, **kwargs):
+            entry = observation("finish-entry")
+            finish_entries.append(sorted(kwargs))
+            try:
+                progress("OBSERVED_ORIGINAL_CAPTURE_FINISH_ENTRY", "BEFORE_ASSERTIONS_CONTROL_FLOW_ONLY",
+                    observation_order=entry["order"], observation_monotonic_ns=entry["monotonic_ns"])
+                current = saved["verified_binding_witness"]
+                assert actual_capture is current["capture"] and actual_handle is current["handle"]
+                assert reached == [True] and calls.pool_depth == 0
+                assert set(kwargs) == {"attempt_evidence", "evidence_access_started_at_utc", "evidence_access_completed_at_utc"}
+                assert iter(kwargs["attempt_evidence"]) is kwargs["attempt_evidence"]
+            except Exception as error:
+                save_failure("finish-assertion", error)
+            finally:
+                raise ObservedOriginalFinishEntry()
+
+        try:
+            with monkeypatch.context() as scoped:
+                scoped.setattr(execution, "_make_declared_unit_header", header_spy)
+                scoped.setattr(execution, "_declared_unit_binding", unit_binding_spy)
+                scoped.setattr(execution, "_continue_declared_attempt_units", ordinary_loop)
+                scoped.setattr(execution, "_consume_route_a_unit", consumer)
+                scoped.setattr(execution, "_route_a_contain_consumer_failure", containment_spy)
+                scoped.setattr(execution.historical_adapter.DeclaredSlotSearchCapture,
+                    "complete_observed_cell", finish_entry)
+                previous = sys.getprofile()
+                sys.setprofile(profile)
+                try:
+                    if restore_first:
+                        try:
+                            first_return = producer.execute_declared_slot_owner_search(env.context, request=request,
+                                process=env.process, frozen_pipeline_config=env.frozen_pipeline_config)
+                        except BeforeInventedOrdinaryLoop:
+                            pass
+                        else:
+                            record_normal_return("first-producer-normal-return", first_return)
+                            flush_observations()
+                            raise_earliest_failure()
+                        assert calls.header_creations == 1 and not reached and calls.pool_depth == 0
+                        first_body = request.to_dict()
+                        for name in ("raw-completion.json", "evidence-completed.json"):
+                            assert execution._read_declared_unit_json(env.context,
+                                execution._declared_unit_relative(first_body, name)) is None
+                        assert execution._declared_completed_prefix(env.context, first_body,
+                            saved["first_binding_sha256"], saved["first_unit_roster"]) == []
+                        assert execution._canonical_bytes(execution._read_declared_unit_header(
+                            env.context, first_body)) == saved["original_header_bytes"]
+                        saved.pop("verified_binding_witness")
+                        progress("STARTED_NORMAL_EXISTING_HEADER_REOPEN", "same-live-original-request-within-original-window")
+                    try:
+                        second_return = producer.execute_declared_slot_owner_search(env.context, request=request,
+                            process=env.process, frozen_pipeline_config=env.frozen_pipeline_config)
+                    except ObservedOriginalFinishEntry:
+                        pass
+                    else:
+                        record_normal_return("second-producer-normal-return", second_return)
+                finally:
+                    sys.setprofile(previous)
+        finally:
+            orchestration._release_declared_slot_producer_request(request, env.context)
+        flush_observations()
+        raise_earliest_failure()
+        assert reached == [True] and len(finish_entries) == 1
+        assert calls.header_creations == 1 and calls.pool_depth == 0
+        assert calls.restore_returns == (1 if restore_first else 0)
+        assert calls.counts["source_reopen"] == (1 if restore_first else 0)
+        assert calls.counts["original_freeze"] == 1
+        assert not active_unique and not external_io_attempts
+    return {"fixture_provenance": "FRESH_INVENTED_NORMAL_ISSUER_POSTLOOP_FINISH_ENTRY_ONLY",
+        "normal_finish_entry_observed": True, "restored_fresh_software_header": restore_first,
+        "qualification_authority": False, "capital_authority": False, "live_order_authority": False}
+
+
+def _route_a_invented_data_specification():
+    return {"strategy_id": "INVENTED_STRATEGY_PREDICATE_ONLY",
+        "parameters": {"period": 2}, "fold_ordinal": 0,
+        "partition_role": "optimizer_train", "spread_tier": "P75", "bookkeeping": {}}
+
+
+@pytest.mark.parametrize("damage, suffix", (
+    ("container", "SPECIFICATIONS_INVALID"),
+    ("shape", "REQUEST_INVALID"),
+    ("ordinal", "REQUEST_INVALID"),
+    ("strategy", "REQUEST_INVALID"),
+    ("parameters", "REQUEST_INVALID"),
+    ("fold", "REQUEST_INVALID"),
+    ("bookkeeping", "REQUEST_INVALID"),
+    ("authority_field", "REQUEST_INVALID"),
+    ("lockbox", "LOCKBOX_REFUSED"),
+    ("role", "ROLE_INVALID"),
+    ("tier", "TIER_INVALID"),
+), ids=("container", "shape", "ordinal", "strategy", "parameters",
+    "fold", "bookkeeping", "authority_field", "lockbox", "role", "tier"))
+def test_route_a_batch_actual_data_predicates_refuse_invalid_specification(damage, suffix):
+    """INVENTED values prove actual predicates only; they issue no owner capability."""
+    row = _route_a_invented_data_specification()
+    if damage == "shape":
+        del row["parameters"]
+    elif damage == "ordinal":
+        row["request_ordinal"] = 1
+    elif damage == "strategy":
+        row["strategy_id"] = ""
+    elif damage == "parameters":
+        row["parameters"] = []
+    elif damage == "fold":
+        row["fold_ordinal"] = -1
+    elif damage == "bookkeeping":
+        row["bookkeeping"] = []
+    elif damage == "authority_field":
+        row["capture"] = "INVENTED_NOT_AUTHORITY"
+    elif damage == "lockbox":
+        row["partition_role"] = "final_lockbox"
+    elif damage == "role":
+        row["partition_role"] = "INVENTED_UNKNOWN_ROLE"
+    elif damage == "tier":
+        row["spread_tier"] = "P99"
+    specifications = {} if damage == "container" else [row]
+    before = copy.deepcopy(specifications)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._route_a_batch_specifications(specifications)
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_" + suffix
+    assert specifications == before
+
+
+def test_route_a_batch_actual_specification_snapshot_is_copy_safe():
+    row = _route_a_invented_data_specification()
+    before = copy.deepcopy(row)
+    assert execution._route_a_batch_specifications([]) == ()
+    snapshot = execution._route_a_batch_specifications([row])
+    assert type(snapshot) is tuple and len(snapshot) == 1 and snapshot[0] == {**row, "request_ordinal": 0}
+    row["parameters"]["period"] = 3
+    row["bookkeeping"]["attempt_ordinal"] = 100
+    assert snapshot[0] == {**before, "request_ordinal": 0}
+
+
+@pytest.mark.parametrize("closed,busy,suffix", (
+    (False, False, None), (False, True, "BUSY"),
+    (True, False, "CLOSED"), (True, True, "CLOSED"),
+), ids=("open_idle", "open_busy", "closed_idle", "closed_busy"))
+def test_route_a_batch_actual_idle_state_predicate(closed, busy, suffix):
+    if suffix is None:
+        assert execution._route_a_require_idle(closed=closed, busy=busy) is True
+    else:
+        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+            execution._route_a_require_idle(closed=closed, busy=busy)
+        assert caught.value.code == "ROUTE_A_UNIT_BATCH_" + suffix
+
+
+@pytest.mark.parametrize("damage,suffix", (
+    (None, None), ("closed", "CLOSED"),
+    ("process", "OWNER_MISMATCH"), ("thread", "OWNER_MISMATCH"),
+    ("early", "SOURCE_WINDOW_CLOSED"), ("expired", "SOURCE_WINDOW_CLOSED"),
+), ids=("current", "closed", "process", "thread", "early", "expired"))
+def test_route_a_batch_actual_current_owner_and_window_predicate(damage, suffix):
+    from datetime import datetime, timedelta, timezone
+    start = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(hours=1)
+    arguments = {"closed": damage == "closed", "owner_process": 11, "owner_thread": 22,
+        "current_process": 12 if damage == "process" else 11,
+        "current_thread": 23 if damage == "thread" else 22,
+        "window_start": start, "window_end": end,
+        "observed": start - timedelta(seconds=1) if damage == "early" else (
+            end if damage == "expired" else start)}
+    if suffix is None:
+        assert execution._route_a_require_scope_current(**arguments) is True
+    else:
+        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+            execution._route_a_require_scope_current(**arguments)
+        assert caught.value.code == "ROUTE_A_UNIT_BATCH_" + suffix
+
+
+def test_route_a_batch_actual_nonauthorizing_lifecycle_transitions():
+    lifecycle = execution._RouteABatchLifecycle()
+    assert lifecycle.closed is False and lifecycle.busy is False
+    lifecycle.enter()
+    assert lifecycle.busy is True and lifecycle.closed is False
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        lifecycle.enter()
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_BUSY"
+    lifecycle.leave()
+    assert lifecycle.busy is False and lifecycle.closed is False
+    lifecycle.enter()
+    lifecycle.close()
+    assert lifecycle.closed is True and lifecycle.busy is False
+    lifecycle.leave()
+    assert lifecycle.closed is True and lifecycle.busy is False
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        lifecycle.enter()
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_CLOSED"
+
+
+def test_route_a_batch_actual_transfer_refusal_revokes_plain_lifecycle():
+    lifecycle = execution._RouteABatchLifecycle()
+    lifecycle.enter()
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._route_a_refuse_transfer(lifecycle)
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_CAPABILITY_NOT_TRANSFERABLE"
+    assert lifecycle.closed is True and lifecycle.busy is False
+
+
+def test_route_a_batch_actual_shared_content_comparison_representatives():
+    expected = {"top": "INVENTED_BOUND", "nested": {"field": [1, 2]}}
+    assert execution._route_a_require_unchanged(expected=expected, observed=copy.deepcopy(expected)) is True
+    for changed in ({**expected, "top": "INVENTED_OTHER"},
+            {**expected, "nested": {"field": [1, 3]}}):
+        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+            execution._route_a_require_unchanged(expected=expected, observed=changed)
+        assert caught.value.code == "ROUTE_A_UNIT_BATCH_SHARED_CONTENT_CHANGED"
+
+
+@pytest.mark.parametrize("damage", (
+    "value", "dtype", "index_value", "index_name", "column_name", "column_order", "attrs",
+    "series_name", "series_dtype", "categorical_order", "timezone",
+), ids=("value", "dtype", "index_value", "index_name", "column_name", "column_order", "attrs",
+    "series_name", "series_dtype", "categorical_order", "timezone"))
+def test_route_a_batch_actual_pandas_fingerprint_covers_typed_content(damage):
+    """Tiny INVENTED typed values exercise mutation detection, not market evidence."""
+    frame = pd.DataFrame({"first": pd.Series([1, 2], dtype="int32"),
+        "second": pd.Series([3, 4], dtype="int32")})
+    if damage == "series_name":
+        original = pd.Series([1, 2], name="INVENTED_ORIGINAL", dtype="int32")
+        changed = original.rename("INVENTED_CHANGED")
+    elif damage == "series_dtype":
+        original = pd.Series([1, 2], dtype="int32")
+        changed = original.astype("int64")
+    elif damage == "categorical_order":
+        original = pd.Series(pd.Categorical(["a", "b"], categories=["a", "b"], ordered=True))
+        changed = original.cat.reorder_categories(["b", "a"], ordered=True)
+    elif damage == "timezone":
+        original = pd.Series([1, 2], index=pd.date_range("2020-01-01", periods=2, tz="UTC"))
+        changed = original.copy(deep=True)
+        changed.index = changed.index.tz_convert("Europe/Budapest")
+    else:
+        original, changed = frame, frame.copy(deep=True)
+        if damage == "value":
+            changed.iloc[0, 0] = 9
+        elif damage == "dtype":
+            changed["first"] = changed["first"].astype("int64")
+        elif damage == "index_value":
+            changed.index = pd.Index([10, 11])
+        elif damage == "index_name":
+            changed.index = changed.index.rename("INVENTED_INDEX")
+        elif damage == "column_name":
+            changed = changed.rename(columns={"first": "INVENTED_COLUMN"})
+        elif damage == "column_order":
+            changed = changed[["second", "first"]]
+        elif damage == "attrs":
+            changed.attrs["fixture"] = "INVENTED_MUTATION"
+    expected = execution._route_a_pandas_content_sha256(original)
+    assert execution._route_a_pandas_content_sha256(original.copy(deep=True)) == expected
+    assert execution._route_a_pandas_content_sha256(changed) != expected
+
+
+def test_route_a_batch_actual_pandas_fingerprint_refuses_non_pandas_values():
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._route_a_pandas_content_sha256({"fixture": "INVENTED_NOT_A_FRAME"})
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_PANDAS_INPUT_INVALID"
+
+
+def _route_a_invented_fingerprint_namespace():
+    """Complete inert content surface; no owner, seal or issuer authority."""
+    from dataclasses import dataclass
+
+    @dataclass
+    class InventedInstrument:
+        contract: str = "INVENTED_INSTRUMENT_CONTRACT"
+
+    tier_descriptor = {
+        "fixture_provenance": "INVENTED_TIER_FINGERPRINT_SURFACE_NOT_SPREAD_EVIDENCE",
+        "symbol": "INVENTED_SOFTWARE_SYMBOL", "timeframe": "D1", "tier": "P75",
+        "source_timeframe": "D1", "point": 0.0001, "spread_points": 1.0,
+        "full_spread_price": 0.0001}
+    tier_surface = SimpleNamespace(**tier_descriptor,
+        descriptor=lambda: copy.deepcopy(tier_descriptor))
+
+    return SimpleNamespace(_bound_fit_owner=None, _derived_binding=None,
+        _frame=pd.DataFrame({"value": [1, 2]}), _entry_spread_observations=pd.Series([1, 2]),
+        _spread_source_frame=None, _spread_source_product=None,
+        source_group_decision=SimpleNamespace(to_dict=lambda: {"fixture": "INVENTED_SOURCE"}),
+        regime_fit_decision=SimpleNamespace(to_dict=lambda: {"fixture": "INVENTED_FIT"}),
+        source_contract_seed={"fixture": "INVENTED_SEED"}, cost_ladder_contract={},
+        regime_parameters={}, train_regime_support={}, instrument_spec=InventedInstrument(),
+        execution_spec_receipt={"contract": {"fixture": "INVENTED_EXECUTION_SPEC"}},
+        frame_sha256="a" * 64, source_contract_seeds={"P75": {"fixture": "INVENTED_P75"}},
+        frozen_tier_pair_contract={"fixture": "INVENTED_PAIR"},
+        _spread_tiers={"P75": tier_surface},
+        product=SimpleNamespace(index_descriptor={"sha256": "b" * 64}, index_sha256="b" * 64,
+            index={"native": {"fixture": "INVENTED_INDEX"}}, native_prefix={"fixture": "INVENTED_PREFIX"}))
+
+def test_route_a_batch_actual_fitted_fingerprint_includes_instrument_and_bound_contracts():
+    """Inert namespaces exercise content hashing only; no fitted/capture capability is constructed."""
+    fitted = _route_a_invented_fingerprint_namespace()
+    expected = execution._route_a_fitted_shared_content(fitted)
+    for target, key in ((vars(fitted.instrument_spec), "contract"),
+            (fitted.execution_spec_receipt["contract"], "fixture"),
+            (fitted.frozen_tier_pair_contract, "fixture"),
+            (fitted.product.index["native"], "fixture")):
+        previous = target[key]
+        target[key] = "INVENTED_CHANGED_BOUND_CONTENT"
+        assert execution._route_a_fitted_shared_content(fitted) != expected
+        target[key] = previous
+        assert execution._route_a_fitted_shared_content(fitted) == expected
+
+
+def test_route_a_batch_actual_fitted_fingerprint_preserves_unset_owner_slots():
+    """INVENTED eight-slot observation only; no real owner constructor, seal or issuer."""
+    class InventedSlottedOwner:
+        __slots__ = ("seal", "fitted", "context_id", "request_sha256", "header_bytes",
+            "reference_bytes", "validation_receipt", "verification_only")
+
+    owner = InventedSlottedOwner()
+    owner.seal = None
+    owner.fitted = None
+    owner.context_id = "INVENTED_CONTEXT_OBSERVATION"
+    owner.request_sha256 = "INVENTED_NOT_A_REQUEST_GRANT"
+    owner.header_bytes = b"INVENTED_HEADER_OBSERVATION_ONLY"
+    owner.reference_bytes = b"INVENTED_REFERENCE_OBSERVATION_ONLY"
+    owner.validation_receipt = {"fixture_provenance": "INVENTED_NO_VALIDATION_AUTHORITY"}
+    fitted = _route_a_invented_fingerprint_namespace()
+    fitted._bound_fit_owner = owner
+    assert not hasattr(owner, "verification_only")
+    absent = execution._route_a_fitted_shared_content(fitted)
+    assert execution._route_a_fitted_shared_content(fitted) == absent
+    observed = {absent}
+    for value in (None, False, ("absent",)):
+        owner.verification_only = value
+        present = execution._route_a_fitted_shared_content(fitted)
+        assert present not in observed
+        assert execution._route_a_fitted_shared_content(fitted) == present
+        observed.add(present)
+        del owner.verification_only
+        assert not hasattr(owner, "verification_only")
+        assert execution._route_a_fitted_shared_content(fitted) == absent
+
+
+@pytest.mark.parametrize("failure,expected", (
+    (None, ["current", "probe", "verify_probe", "current", "strategy", "run", "verify_realized", "current"]),
+    ("probe", ["current", "probe", "verify_probe"]),
+    ("expiry", ["current", "probe", "verify_probe", "current"]),
+    ("realized", ["current", "probe", "verify_probe", "current", "strategy", "run", "verify_realized"]),
+), ids=("success", "probe_refusal", "pre_strategy_expiry", "realized_refusal"))
+def test_route_a_batch_actual_coordinator_order_and_pre_strategy_refusals(failure, expected):
+    """Inert dependencies exercise the shared production coordinator, not authentication."""
+    events, probe, strategy, realized = [], object(), object(), object()
+
+    class InventedRefusal(BaseException):
+        pass
+
+    def current():
+        events.append("current")
+        if failure == "expiry" and events.count("current") == 2:
+            raise InventedRefusal()
+
+    def prepare_probe():
+        events.append("probe")
+        return probe
+
+    def verify_probe(*values):
+        events.append("verify_probe")
+        assert probe in values
+        if failure == "probe":
+            raise InventedRefusal()
+
+    def make_strategy():
+        events.append("strategy")
+        return strategy
+
+    def run_strategy(*values):
+        events.append("run")
+        assert strategy in values
+        return realized
+
+    def verify_realized(*values):
+        events.append("verify_realized")
+        assert realized in values
+        if failure == "realized":
+            raise InventedRefusal()
+
+    arguments = dict(prepare_probe=prepare_probe, verify_probe=verify_probe,
+        require_current=current, make_strategy=make_strategy, run_strategy=run_strategy,
+        verify_realized=verify_realized)
+    if failure is None:
+        assert execution._route_a_evaluate_prepared_request(**arguments) is realized
+    else:
+        with pytest.raises(InventedRefusal):
+            execution._route_a_evaluate_prepared_request(**arguments)
+    assert events == expected
+
+
+@pytest.mark.parametrize("damage", (None, "signal", "pair", "missing_partner"),
+    ids=("verified", "signal_mismatch", "pair_drift", "missing_partner"))
+def test_route_a_batch_actual_pair_gate_keeps_independent_tier_checks(monkeypatch, damage):
+    signals = {"P75": pd.Series([0, 1], dtype="int32"), "P95": pd.Series([0, 1], dtype="int32")}
+    results = {"P75": {"fixture": "INVENTED_P75"}, "P95": {"fixture": "INVENTED_P95"}}
+    frozen = {"fixture": "INVENTED_PAIR_PREDICATE_ONLY"}
+    calls = []
+
+    def build_pair(actual, *, spec, use_spread):
+        assert actual is results and use_spread is True
+        calls.append(True)
+        return {"fixture": "INVENTED_DRIFT"} if damage == "pair" else dict(frozen)
+
+    monkeypatch.setattr(execution.pm_core, "build_backtest_frozen_tier_pair_contract", build_pair)
+    if damage == "signal":
+        signals["P95"].iloc[1] = -1
+    elif damage == "missing_partner":
+        signals.pop("P95")
+        results.pop("P95")
+    arguments = dict(signals_by_tier=signals, results_by_tier=results,
+        spec=object(), use_spread=True, frozen_pair=frozen)
+    if damage in {"signal", "pair"}:
+        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+            execution._route_a_pair_check(**arguments)
+        assert caught.value.code == ("PARTITION_SIGNAL_VECTOR_TIER_MISMATCH" if damage == "signal"
+            else "REALIZED_FROZEN_TIER_POLICY_DRIFT")
+    else:
+        result = execution._route_a_pair_check(**arguments)
+        assert result["status"] == ("INCOMPLETE_MISSING_PARTNER" if damage == "missing_partner" else "VERIFIED")
+    assert len(calls) == (1 if damage in {None, "pair"} else 0)
+
+
+def _assert_route_a_batch_refusal(result, code):
+    assert result["schema_version"] == "fxpm.route-a-unit-batch-diagnostic.v1"
+    assert result["status"] == "REFUSED_DIAGNOSTIC_ONLY" and result["refusal"]["code"] == code
+    assert result["requests"] == result["request_to_unique"] == result["unique_evaluations"] == result["pair_checks"] == []
+    for name in ("execution_ready", "overall_execution_ready", "qualification_authority", "capital_authority",
+            "paper_authority", "live_authority", "order_authority", "live_order_authority"):
+        assert result[name] is False
+
+
+def test_route_a_batch_actual_refusal_containment_preserves_finish_control_flow():
+    """INVENTED finish callback outcome; this is no completed financial slot."""
+    arguments = ("INVENTED_ORIGINAL_HANDLE", {"fixture": "INVENTED_ORIGINAL_EVIDENCE"})
+    outcomes, calls, refusals = [], [], []
+
+    def finish(*actual):
+        calls.append(actual)
+        return "INVENTED_SAME_FINISH_OUTCOME"
+
+    def refused(*, evaluate_batch):
+        raise RuntimeError("INVENTED_CONSUMER_REFUSAL")
+
+    for consumer in (execution._route_a_noop_consumer, refused):
+        try:
+            consumer(evaluate_batch=lambda **_values: pytest.fail("INVENTED wiring does not evaluate"))
+        except BaseException as error:
+            refusals.append(execution._route_a_contain_consumer_failure(error))
+        outcomes.append(finish(*arguments))
+    assert calls == [arguments, arguments]
+    assert outcomes == ["INVENTED_SAME_FINISH_OUTCOME"] * 2
+    assert len(refusals) == 1
+    _assert_route_a_batch_refusal(refusals[0], "RuntimeError")
+
+
+def test_route_a_batch_actual_containment_propagates_typed_capacity_and_base_exception():
+    """Typed INVENTED exceptions prove propagation, not actual disk pressure."""
+    capacity = execution.authority_spool.spool_quota.AuthoritySpoolQuotaError(
+        "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED", "INVENTED_PROPAGATION_ONLY")
+
+    class InventedBoundary(BaseException):
+        pass
+
+    boundary = InventedBoundary("INVENTED_CONTROL_FLOW_BOUNDARY")
+    for error in (capacity, boundary):
+        with pytest.raises(type(error)) as caught:
+            execution._route_a_contain_consumer_failure(error)
+        assert caught.value is error
+
+
+def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkeypatch,
+        _route_a_owned_invented_native_source, record_property):
+    """INVENTED owner integration; no ordinary full-attempt oracle or financial experiment."""
+    path = tmp_path / "route_a_unit_batch_progress.jsonl"
+    progress = _route_a_batch_progress(path)
+    record_property("route_a_unit_batch_progress_path", str(path))
+    record_property("fixture_provenance", "INVENTED_SOFTWARE_ONLY_NO_FINANCIAL_OR_PERFORMANCE_AUTHORITY")
+    retained, receipts = [], []
+    progress("STARTED", "normal-owner-two-keys-plus-duplicate")
+
+    def observe(*, evaluate_batch, witness, counts, post_header_counts, calls, restored):
+        attempt, folds = _route_a_unambiguous_issued_attempt(witness)
+        assert restored and len(folds) == search_planner.CAUSAL_FOLD_COUNT == 4
+        original_candidate = copy.deepcopy(attempt.candidate)
+        original_header = copy.deepcopy(witness["declared_header"])
+        original_roster = copy.deepcopy(witness["capture"].sink.artifact_roster())
+        candidate = copy.deepcopy(attempt.candidate)
+        candidate["folds"] = copy.deepcopy(list(folds[:1]))
+        candidate["fixture_provenance"] = "INVENTED_ONE_FOLD_QA_REFERENCE_NOT_ISSUED_ATTEMPT"
+        reference_attempt = replace(attempt, candidate=candidate)
+        plan = witness["cell_plan"].horizon_plan.to_dict()
+        reference_before = dict(calls.counts)
+        reference_auth_before = dict(counts)
+        progress("STARTED_ORDINARY_BUILDER_REFERENCE", "INVENTED_ONE_FOLD_QA_CARRIER_SIX_LANES")
+        reference = execution._build_planned_attempt_evidence(attempt=reference_attempt,
+            raw_attempt_id="INVENTED_ONE_FOLD_ORDINARY_REFERENCE_NOT_ISSUED_ATTEMPT",
+            plan_body=plan, plan_receipt_sha256=witness["cell_plan"].horizon_plan.receipt_sha256,
+            fitted=witness["refreshed"], config=witness["config"],
+            partition_cost_precommitments=witness["handle"].frozen.partition_cost_precommitments,
+            source_observation_references=None)
+        assert len(reference["folds"]) == 1
+        assert calls.counts["model_run"] - reference_before.get("model_run", 0) == 6
+        assert calls.counts["runtime_strategy"] - reference_before.get("runtime_strategy", 0) == 1
+        assert calls.counts["surface"] - reference_before.get("surface", 0) == 1
+        assert calls.counts["pool_lookup"] - reference_before.get("pool_lookup", 0) == 0
+        assert counts == reference_auth_before
+        reference_outputs = copy.deepcopy(calls.outputs)
+        assert attempt.candidate == original_candidate
+        assert witness["declared_header"] == original_header
+        assert witness["capture"].sink.artifact_roster() == original_roster
+        progress("COMPLETED_ORDINARY_BUILDER_REFERENCE", "INVENTED_ONE_FOLD_QA_CARRIER_SIX_LANES")
+        reference_deltas = {name: calls.counts[name] - reference_before.get(name, 0)
+            for name in ("model_run", "runtime_strategy", "surface", "pool_lookup")}
+        specifications = [_route_a_batch_specification(witness, attempt, tier="P75"),
+            _route_a_batch_specification(witness, attempt, tier="P95"),
+            _route_a_batch_specification(witness, attempt, tier="P75")]
+        specifications[2]["bookkeeping"] = {"attempt_ordinal": 999,
+            "horizon_attempt_id": "INVENTED_BOOKKEEPING_NEVER_SELECTS"}
+        before = copy.deepcopy(specifications)
+        admitted = dict(counts)
+        assert len(calls.executor_admission_before) == (2 if restored else 1)
+        assert {name: admitted[name] - post_header_counts[name] for name in counts} == {
+            name: 0 for name in counts}
+        expected_normal_owner = {name: (int(restored) if name == "_verify_declared_slot_frozen_chain" else 1)
+            for name in counts}
+        assert {name: admitted[name] - calls.executor_admission_before[-1][name]
+            for name in counts} == expected_normal_owner
+        before_model_counts = dict(calls.counts)
+        before_batch_instances = len(calls.instances)
+        batch = evaluate_batch(specifications=specifications,
+            metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1")
+        assert batch["status"] == "EVALUATED_DIAGNOSTIC_ONLY"
+        assert calls.counts["full_capture"] - before_model_counts.get("full_capture", 0) == 1
+        assert calls.counts["unit_binding"] - before_model_counts.get("unit_binding", 0) == 1
+        successful_commit_deltas = {name: calls.counts[name] - before_model_counts.get(name, 0)
+            for name in ("full_capture", "unit_binding")}
+        assert specifications == before and counts == admitted
+        assert batch["schema_version"] == "fxpm.route-a-unit-batch-diagnostic.v1"
+        assert batch["request_to_unique"] == [0, 1, 0]
+        assert len(batch["requests"]) == 3 and len(batch["unique_evaluations"]) == 2
+        assert [row["unique_evaluation_ordinal"] for row in batch["requests"]] == [0, 1, 0]
+        assert [row["cache_hit"] for row in batch["requests"]] == [False, False, True]
+        assert [row["request_ordinal"] for row in batch["requests"]] == [0, 1, 2]
+        assert batch["requests"][2]["bookkeeping"] == specifications[2]["bookkeeping"]
+        assert all(row["matched_attempt_ordinal"] == attempt.ordinal for row in batch["requests"])
+        assert all(row["matched_horizon_attempt_id"] == attempt.plan_attempt["attempt_id"]
+            for row in batch["requests"])
+        for row, tier in zip(batch["requests"][:2], ("P75", "P95")):
+            expected_lane = reference["folds"][0]["lanes"]["optimizer_train_" + tier.lower()]
+            assert execution._canonical_bytes(row["decision_lane"]) == execution._canonical_bytes(expected_lane)
+            geometry = row["shared_evaluation_key"]["evaluation_binding"]["partition_geometry"]["receipt_sha256"]
+            assert row["signal_vector"].equals(reference_outputs[geometry, tier]["signals"])
+        assert attempt.candidate == original_candidate and len(execution._causal_folds(attempt)) == 4
+        assert batch["requests"][0]["shared_evaluation_key"] == batch["requests"][2]["shared_evaluation_key"]
+        assert batch["requests"][0]["signal_vector"].equals(batch["requests"][2]["signal_vector"])
+        assert batch["requests"][0]["signal_vector"] is not batch["requests"][2]["signal_vector"]
+        original_signal = batch["requests"][2]["signal_vector"].copy(deep=True)
+        batch["requests"][0]["signal_vector"].iloc[0] = 123456
+        assert batch["requests"][2]["signal_vector"].equals(original_signal)
+        assert len(batch["pair_checks"]) == 1 and batch["pair_checks"][0]["status"] == "VERIFIED"
+        assert all(row["signal_comparison"] == "VERIFIED" for row in batch["requests"])
+        assert calls.unique_intervals == [0, 1]
+        assert all(snapshot == admitted for snapshot in calls.auth_snapshots)
+        assert all(calls.counts[name] - before_model_counts.get(name, 0) == 2
+            for name in ("model_run", "runtime_strategy", "surface"))
+        assert calls.counts["pool_lookup"] == 0
+        batch_instances = calls.instances[before_batch_instances:]
+        assert len(batch_instances) == 2
+        assert batch_instances[0][0] is not batch_instances[1][0]
+        assert batch_instances[0][1] is not batch_instances[1][1]
+        assert all(preparation is None for _, _, preparation in batch_instances)
+        assert all(strategy is not previous_strategy and backtester is not previous_backtester
+            for strategy, backtester, _ in batch_instances
+            for previous_strategy, previous_backtester, _ in calls.instances[:before_batch_instances])
+        for name in ("execution_ready", "overall_execution_ready", "qualification_authority", "capital_authority",
+                "paper_authority", "live_authority", "order_authority", "live_order_authority"):
+            assert batch[name] is False
+            assert all(row[name] is False for row in batch["requests"])
+        retained.append(evaluate_batch)
+        terminal_specifications = copy.deepcopy(specifications[:2])
+        original_clock = execution._now_utc_seconds
+        original_hash = execution._route_a_pandas_content_sha256
+        terminal_hash_returns, advanced = [], []
+        before_terminal = dict(calls.counts)
+        window_end = witness["capture"].request.to_dict()["source_access_window_utc"]["end_exclusive_utc"]
+
+        def hash_then_advance_clock(value):
+            digest = original_hash(value)
+            if (calls.counts["full_capture"] > before_terminal.get("full_capture", 0)
+                    and calls.counts["unit_binding"] > before_terminal.get("unit_binding", 0)):
+                terminal_hash_returns.append(True)
+                if not advanced:
+                    advanced.append(True)
+                    progress("ADVANCED_TEST_CLOCK_AFTER_ACTUAL_HASH", "FINAL_COMMIT_ORIGINAL_WINDOW_END_NO_WAIT")
+            return digest
+
+        def clock():
+            return window_end if advanced else original_clock()
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(execution, "_route_a_pandas_content_sha256", hash_then_advance_clock)
+            scoped.setattr(execution, "_now_utc_seconds", clock)
+            refused = evaluate_batch(specifications=terminal_specifications,
+                metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1")
+        _assert_route_a_batch_refusal(refused, "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_CLOSED")
+        assert advanced == [True] and terminal_hash_returns
+        assert all(calls.counts[name] == before_terminal[name]
+            for name in ("model_run", "runtime_strategy", "surface"))
+        terminal_commit_deltas = {name: calls.counts[name] - before_terminal.get(name, 0)
+            for name in ("full_capture", "unit_binding")}
+        assert terminal_commit_deltas == {"full_capture": 1, "unit_binding": 1}
+        assert counts == admitted
+        _assert_route_a_batch_refusal(evaluate_batch(specifications=specifications,
+            metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1"), "ROUTE_A_UNIT_BATCH_CLOSED")
+        progress("COMPLETED_TERMINAL_LATE_HASH_EXPIRY", "ATOMIC_REFUSAL_NO_NEW_MODELS_NO_CLOCK_WAIT")
+        receipts.append({"named_interval": "SECOND_NORMAL_EXECUTOR_RESTORE_THEN_POST_LOOP_CONSUMER_AND_TWO_UNIQUE_KEYS",
+            "adoption_count": 1, "original_header_count": 1,
+            "ordinary_reference_fixture": "INVENTED_ONE_FOLD_QA_CARRIER_NOT_ISSUED_ATTEMPT",
+            "ordinary_reference_deltas": reference_deltas,
+            "batch_evaluation_deltas": {name: calls.counts[name] - before_model_counts.get(name, 0)
+                for name in ("model_run", "runtime_strategy", "surface", "pool_lookup")},
+            "ordinary_reference_comparison": "SAME_CURRENT_RESTORED_OWNER_TRAIN_P75_P95_LANES_AND_SIGNALS",
+            "normal_executor_admission_delta": {name: admitted[name] - calls.executor_admission_before[-1][name]
+                for name in counts},
+            "broader_issuer_counts_at_consumer": admitted,
+            "post_loop_adoption_delta": {name: admitted[name] - post_header_counts[name] for name in counts},
+            "successful_batch_commit_deltas": successful_commit_deltas,
+            "late_hash_refused_batch_commit_deltas": terminal_commit_deltas,
+            "late_hash_clock_advance_observed": bool(advanced),
+            "actual_restore_returns": calls.restore_returns,
+            "actual_normal_source_reopen_calls": calls.counts["source_reopen"],
+            "consumer_pool_depth": calls.pool_depth,
+            "after_batch_delta": {name: counts[name] - admitted[name] for name in counts},
+            "request_to_unique": batch["request_to_unique"], "pool_lookup": calls.counts["pool_lookup"],
+            "unique_key_sha256": [hashlib.sha256(execution._canonical_bytes(row["shared_evaluation_key"])).hexdigest()
+                for row in batch["unique_evaluations"]],
+            "fixture_provenance": "INVENTED_SOFTWARE_ONLY_NO_GLOBAL_CALL_OR_SPEED_CLAIM"})
+
+    observed = _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch,
+        source_access_window_utc=_route_a_owned_utc_window(),
+        native_fixture=_route_a_owned_invented_native_source, observe=observe, progress=progress,
+        restore_first=True, refuse_outer_consumer=True)
+    assert observed["normal_finish_entry_observed"] is True and observed["restored_fresh_software_header"] is True
+    assert len(retained) == 1
+    _assert_route_a_batch_refusal(retained[0](specifications=[],
+        metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1"), "ROUTE_A_UNIT_BATCH_CLOSED")
+    def observe_second_owner(*, evaluate_batch, witness, counts, post_header_counts, calls, restored):
+        assert len(calls.executor_admission_before) == (2 if restored else 1)
+        assert {name: counts[name] - post_header_counts[name] for name in counts} == {
+            name: 0 for name in counts}
+        _assert_route_a_batch_refusal(retained[0](specifications=[],
+            metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1"), "ROUTE_A_UNIT_BATCH_CLOSED")
+        admitted = dict(counts)
+        before_commit = dict(calls.counts)
+        empty = evaluate_batch(specifications=[], metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1")
+        assert calls.counts["full_capture"] - before_commit.get("full_capture", 0) == 1
+        assert calls.counts["unit_binding"] - before_commit.get("unit_binding", 0) == 1
+        assert empty["requests"] == empty["request_to_unique"] == empty["unique_evaluations"] == empty["pair_checks"] == []
+        assert counts == admitted and calls.unique_intervals == []
+        assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == calls.counts["surface"] == 0
+        assert calls.counts["pool_lookup"] == 0 and calls.instances == []
+        for name in ("execution_ready", "overall_execution_ready", "qualification_authority", "capital_authority",
+                "paper_authority", "live_authority", "order_authority", "live_order_authority"):
+            assert empty[name] is False
+        retained.append(evaluate_batch)
+        progress("COMPLETED_CROSS_OWNER_REFUSAL", "closed-original-A-inside-normally-issued-B")
+
+    _observe_owned_invented_route_a_consumer(tmp_path / "second-owner", monkeypatch,
+        source_access_window_utc=_route_a_owned_utc_window(),
+        native_fixture=_route_a_owned_invented_native_source,
+        observe=observe_second_owner, progress=progress)
+    assert len(retained) == 2
+    _assert_route_a_batch_refusal(retained[1](specifications=[],
+        metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1"), "ROUTE_A_UNIT_BATCH_CLOSED")
+    import pickle
+    for transfer in (copy.copy, copy.deepcopy, pickle.dumps):
+        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+            transfer(retained[1])
+        assert caught.value.code == "ROUTE_A_UNIT_BATCH_CAPABILITY_NOT_TRANSFERABLE"
+    record_property("route_a_unit_batch_receipts", execution._canonical_bytes(receipts).decode("ascii"))
+    progress("COMPLETED", "normal-owner-two-keys-plus-duplicate")
 
 
 def test_route_a_callback_identity_dispatch_preserves_legacy_predicate():

@@ -23,15 +23,18 @@ live authority by itself.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import hmac
 import io
 import json
 import math
 import os
+import pickle
 import secrets
 import stat
 import tempfile
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
@@ -5957,6 +5960,423 @@ def execute_historical_observed_cell(
                     _fail("STAGED_ATTEMPT_IDENTITY_CHANGED", attempt.ordinal)
                 yield body
 
+        if declared_mode:
+            route_a_consumer = _consume_route_a_unit
+            if route_a_consumer is not _route_a_noop_consumer:
+                try:
+                    import pm_historical_search_producer as producer
+                    import pm_production_config_binding as config_binding
+                    import pm_production_search_planner as planner
+                    import pm_strategies as strategy_module
+
+                    lifecycle = _RouteABatchLifecycle()
+                    owner_process, owner_thread = os.getpid(), threading.get_ident()
+                    original_handle, original_frozen = handle, handle.frozen
+                    original_context, original_request = capture.context, capture.request
+                    original_session, original_sink = capture.source_session, capture.sink
+                    original_process, original_plan = search_process, cell_plan
+                    original_config = config
+                    original_frozen_config = original_session._frozen_config
+                    unit_binding_bytes = _canonical_bytes(binding)
+                    private_fitted = _route_a_working_fitted(refreshed)
+                    private_config = copy.deepcopy(config)
+                    private_attempts = copy.deepcopy(attempts)
+                    private_plan = json.loads(_canonical_bytes(plan_body).decode("ascii"))
+                    private_domains = json.loads(_canonical_bytes(
+                        search_process.to_dict()["semantics"]["strategy_domains"]).decode("ascii"))
+                    private_precommitments = original_frozen.partition_cost_precommitments
+                    window = request_body["source_access_window_utc"]
+                    window_start = _utc(window["start_utc"], "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID")
+                    window_end = _utc(window["end_exclusive_utc"], "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID")
+                    header_relative = _declared_unit_relative(request_body, "header.json")
+                    frozen_prefix = (request_body["artifact_namespace"] + "/winner-search/"
+                        + timeframe + "/" + normalized_regime + "/frozen/")
+                    descriptors = {}
+                    for entry in declared_header["artifact_roster"]:
+                        if entry["artifact_id"].startswith(frozen_prefix):
+                            descriptor = entry["descriptor"]
+                            descriptors[descriptor["relative_path"]] = copy.deepcopy(descriptor)
+                    for descriptor in (original_handle.frozen_descriptor_graph,
+                            original_handle.cross_binding_descriptor, original_session._entry["descriptor"],
+                            declared_header["horizon_plan"]["descriptor"]):
+                        descriptors[descriptor["relative_path"]] = copy.deepcopy(descriptor)
+                    source_paths = (Path(__file__), Path(pm_core.__file__), Path(current_refit.__file__),
+                        Path(authority_spool.__file__), Path(historical.__file__),
+                        Path(historical_adapter.__file__), Path(native_prefix.__file__),
+                        Path(trade_power.__file__), Path(raw_winner.__file__), Path(winner.__file__),
+                        Path(producer.__file__), Path(planner.__file__), Path(config_binding.__file__),
+                        Path(pm_regime.__file__), Path(spread_profile.__file__),
+                        Path(strategy_module.__file__))
+                    unique_entries, selection_to_unique = [], {}
+                    issued_evaluator = None
+
+                    def close_route_a_scope():
+                        lifecycle.close()
+                        selection_to_unique.clear()
+                        unique_entries.clear()
+
+                    def physical_content():
+                        config_payload, _ = config_binding._read_config(original_frozen_config.active_config_path)
+                        if _canonical_bytes(config_payload) != original_frozen_config._payload_json:
+                            _fail("ROUTE_A_UNIT_BATCH_ORIGINAL_CONFIG_CHANGED")
+                        _, _, header_bytes = authority_spool._stream_file(original_context.root,
+                            header_relative, maximum_bytes=original_context.limits.max_json_bytes, collect=True)
+                        if _canonical_bytes(authority_spool._strict_json_bytes(header_bytes,
+                                original_context.limits.max_json_bytes)) != _canonical_bytes(declared_header):
+                            _fail("ROUTE_A_UNIT_BATCH_ORIGINAL_HEADER_CHANGED")
+                        observed_descriptors = []
+                        for relative, descriptor in sorted(descriptors.items()):
+                            digest, size, _ = authority_spool._stream_file(original_context.root, relative,
+                                maximum_bytes=original_context.limits.max_artifact_bytes,
+                                expected_size=descriptor["size_bytes"])
+                            if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
+                                _fail("ROUTE_A_UNIT_BATCH_FROZEN_BYTES_CHANGED")
+                            observed_descriptors.append((relative, digest, size))
+                        return header_bytes, observed_descriptors
+
+                    def shared_content():
+                        return hashlib.sha256(pickle.dumps({
+                            "fitted": _route_a_fitted_shared_content(fitted),
+                            "refreshed": _route_a_fitted_shared_content(refreshed),
+                            "private_fitted": _route_a_fitted_shared_content(private_fitted),
+                            "config": vars(config), "private_config": vars(private_config),
+                            "request": capture.request.to_dict(), "precommit": capture.request._precommit.to_dict(),
+                            "process": search_process.to_dict(),
+                            "plan": (cell_plan.receipt_sha256, cell_plan.cell_receipt, cell_plan.spool_entry,
+                                cell_plan.horizon_plan.to_dict(), cell_plan.attempt_artifacts(),
+                                cell_plan.state_requirements()),
+                            "private_attempts": private_attempts, "private_plan": private_plan,
+                            "private_domains": private_domains, "precommitments": private_precommitments,
+                            "frozen": asdict(handle.frozen), "handle": (
+                                handle.symbol, handle.timeframe, handle.regime, handle.artifact_namespace,
+                                handle.frozen_receipt_descriptor, handle.frozen_descriptor_graph,
+                                handle.cross_binding_descriptor, handle._cross_binding_bytes,
+                                handle._attempt_artifacts, handle._horizon_execution_contracts,
+                                handle._source_count_receipts, handle._capture_nonce),
+                            "roster": capture.sink.artifact_roster(),
+                            "context": (capture.context.generation_id, capture.context.context_sha256,
+                                capture.context.config_sha256, capture.context.native_universe_sha256,
+                                str(capture.context.root), asdict(capture.context.limits)),
+                            "frozen_config": (str(original_frozen_config.active_config_path),
+                                original_frozen_config.config_sha256, original_frozen_config.effective_config_sha256,
+                                original_frozen_config._payload_json, original_frozen_config._snapshot_json,
+                                id(original_frozen_config._seal)),
+                            "config_file": _file_sha256(Path(original_frozen_config.active_config_path)),
+                            "sources": [(str(path), _file_sha256(path)) for path in source_paths],
+                            "physical": physical_content()}, protocol=5)).hexdigest()
+
+                    if (_canonical_bytes(declared_header["frozen_plan_receipt"])
+                                != _canonical_bytes(handle.frozen_receipt_descriptor)
+                            or _canonical_bytes(declared_header["frozen_descriptor_graph"])
+                                != _canonical_bytes(handle.frozen_descriptor_graph)
+                            or _canonical_bytes(declared_header["horizon_winner_cross_binding"])
+                                != _canonical_bytes(handle.cross_binding_descriptor)
+                            or _canonical_bytes(declared_header["source_session_entry"])
+                                != _canonical_bytes(dict(original_session._entry))
+                            or _canonical_bytes(original_frozen.source_contract_seeds)
+                                != _canonical_bytes(refreshed.source_contract_seeds)
+                            or _canonical_bytes(original_frozen.frozen_tier_pair_contract)
+                                != _canonical_bytes(refreshed.frozen_tier_pair_contract)
+                            or _canonical_bytes(_declared_unit_binding(capture, refreshed, cell_plan,
+                            attempts, fold_plan, handle)) != unit_binding_bytes
+                            or _frame_sha256(refreshed._frame) != refreshed.frame_sha256
+                            or config_binding._snapshot(config) != json.loads(
+                                original_frozen_config._snapshot_json.decode("ascii"))["pipeline_config"]
+                            or _sha256(authoritative_search_execution_contract())
+                                != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256):
+                        _fail("ROUTE_A_UNIT_BATCH_ADMISSION_CHANGED")
+                    admitted_content = shared_content()
+
+                    def require_route_a_owner_window():
+                        if lifecycle.closed:
+                            _fail("ROUTE_A_UNIT_BATCH_CLOSED")
+                        if (capture.context is not original_context or capture.request is not original_request
+                                or capture.source_session is not original_session or capture.sink is not original_sink
+                                or capture.process is not original_process or search_process is not original_process
+                                or capture.cell_plan is not original_plan or cell_plan is not original_plan
+                                or config is not original_config or capture.pipeline_config is not original_config
+                                or capture.fitted_timeframe is not fitted
+                                or capture.source_session._frozen_config is not original_frozen_config
+                                or handle is not original_handle or handle.frozen is not original_frozen
+                                or capture._finished or capture._completion is not None):
+                            _fail("ROUTE_A_UNIT_BATCH_OWNER_MISMATCH")
+                        producer._verified_declared_slot_source_session_current(original_context,
+                            request=original_request, process=original_process,
+                            source_session=original_session)
+                        capture._require_active(original_handle)
+                        _route_a_require_scope_current(closed=lifecycle.closed,
+                            owner_process=owner_process, owner_thread=owner_thread,
+                            current_process=os.getpid(), current_thread=threading.get_ident(),
+                            window_start=window_start, window_end=window_end,
+                            observed=_utc(_now_utc_seconds(), "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID"))
+
+                    def require_route_a_current():
+                        require_route_a_owner_window()
+                        historical_adapter._verify_declared_slot_capture_current(capture)
+                        _route_a_require_unchanged(expected=admitted_content, observed=shared_content())
+                        require_route_a_owner_window()
+
+                    def select_request(specification):
+                        domain = next((value for value in private_domains
+                            if value["strategy_id"] == specification["strategy_id"]), None)
+                        if domain is None:
+                            _fail("ROUTE_A_UNIT_BATCH_REQUEST_INVALID")
+                        parameters = planner.validate_parameter_domain_member(
+                            domain["parameter_domain"], specification["parameters"])
+                        defaults = StrategyRegistry.get(specification["strategy_id"]).get_default_params()
+                        matches = []
+                        for candidate_attempt in private_attempts:
+                            if (candidate_attempt.plan_attempt["status"] != "PLANNED"
+                                    or candidate_attempt.artifacts.winner_process["strategy_id"]
+                                        != specification["strategy_id"]):
+                                continue
+                            actual_parameters = decode_parameter_mapping(
+                                candidate_attempt.artifacts.trial_definition["parameters"], defaults)
+                            if _canonical_bytes(actual_parameters) != _canonical_bytes(parameters):
+                                continue
+                            folds = _causal_folds(candidate_attempt)
+                            if specification["fold_ordinal"] >= len(folds):
+                                continue
+                            fold = folds[specification["fold_ordinal"]]
+                            partitions = _fold_partitions(frame=private_fitted._frame, fold=fold,
+                                attempt=candidate_attempt,
+                                dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"])
+                            partition = next(value for value in partitions
+                                if value.role == specification["partition_role"])
+                            matches.append((candidate_attempt, fold, partition, parameters))
+                        if len(matches) != 1:
+                            _fail("ROUTE_A_UNIT_BATCH_ATTEMPT_BINDING_"
+                                + ("UNAVAILABLE" if not matches else "AMBIGUOUS"))
+                        selected_attempt, fold, partition, parameters = matches[0]
+                        group = {"strategy_id": specification["strategy_id"], "parameters": parameters,
+                            "attempt_ordinal": selected_attempt.ordinal,
+                            "fold_ordinal": specification["fold_ordinal"], "fold_id": fold["fold_id"],
+                            "partition_geometry": partition.geometry_receipt,
+                            "declared_unit_binding": json.loads(unit_binding_bytes.decode("ascii"))}
+                        selection = {**group, "spread_tier": specification["spread_tier"],
+                            "metadata_recipe": _ROUTE_A_UNIT_BATCH_RECIPE}
+                        return selected_attempt, fold, partition, parameters, _canonical_bytes(selection), _canonical_bytes(group)
+
+                    def describe_request(specification, parameters, evaluation_binding):
+                        described = planner.describe_route_a_evaluation_design(frozen_domains=private_domains,
+                            configurations=[{"strategy_id": specification["strategy_id"], "parameters": parameters,
+                                "evaluation_binding": evaluation_binding,
+                                "bookkeeping": specification["bookkeeping"]}])["requests"][0]
+                        described["request_ordinal"] = specification["request_ordinal"]
+                        return described
+
+                    def evaluate_route_a_batch(*, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
+                        try:
+                            lifecycle.enter()
+                            require_route_a_current()
+                            if type(metadata_recipe) is not str or metadata_recipe != _ROUTE_A_UNIT_BATCH_RECIPE:
+                                _fail("ROUTE_A_UNIT_BATCH_RECIPE_INVALID")
+                            rows = _route_a_batch_specifications(specifications)
+                            requests, mapping, first_requests = [], [], {}
+                            for specification in rows:
+                                require_route_a_current()
+                                selected_attempt, fold, partition, parameters, selection, group = select_request(specification)
+                                tier = specification["spread_tier"]
+                                index = selection_to_unique.get(selection)
+                                cache_hit = index is not None
+                                if cache_hit:
+                                    entry = unique_entries[index]
+                                    described = describe_request(specification, parameters,
+                                        json.loads(entry["binding_bytes"].decode("ascii")))
+                                    if _canonical_bytes(described["shared_evaluation_key"]) != entry["key_bytes"]:
+                                        _fail("ROUTE_A_UNIT_BATCH_REQUEST_INVALID")
+                                    require_route_a_current()
+                                else:
+                                    working_fitted = _route_a_working_fitted(private_fitted)
+                                    working_config = copy.deepcopy(private_config)
+                                    working_partitions = _fold_partitions(frame=working_fitted._frame, fold=fold,
+                                        attempt=selected_attempt,
+                                        dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"])
+                                    working_partition = next(value for value in working_partitions
+                                        if value.role == specification["partition_role"])
+                                    _route_a_require_unchanged(expected=_canonical_bytes(partition.geometry_receipt),
+                                        observed=_canonical_bytes(working_partition.geometry_receipt))
+                                    stable_source = _source_identity(working_fitted.source_contract_seeds[tier])
+                                    prepared = {}
+                                    working_content = (_route_a_fitted_shared_content(working_fitted),
+                                        pickle.dumps(vars(working_config), protocol=5))
+
+                                    def require_working_current():
+                                        require_route_a_current()
+                                        _route_a_require_unchanged(expected=working_content,
+                                            observed=(_route_a_fitted_shared_content(working_fitted),
+                                                pickle.dumps(vars(working_config), protocol=5)))
+                                        require_route_a_owner_window()
+
+                                    def source_identity(result):
+                                        contract = raw_winner.build_trade_source_contract_from_backtester_result(result)
+                                        sample = trade_power.build_trade_sample_evidence([], source_contract=contract,
+                                            minimum_observations=raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS)
+                                        if sample.source_contract is None:
+                                            _fail("ROUTE_A_UNIT_BATCH_SOURCE_CONTRACT_UNAVAILABLE")
+                                        return sample.source_contract
+
+                                    def prepare_probe():
+                                        probe_backtester = Backtester(working_config)
+                                        if getattr(probe_backtester, "_entry_admission_preparation", None) is not None:
+                                            _fail("ROUTE_A_UNIT_BATCH_ENTRY_ADMISSION_POOL_REFUSED")
+                                        return probe_backtester.build_evidence_source_seed_result(
+                                            working_partition.frame, symbol, spec=working_fitted.instrument_spec,
+                                            timeframe=timeframe, spread_tier=working_fitted._spread_tiers[tier],
+                                            entry_spread_observations=working_fitted._entry_spread_observations.loc[
+                                                working_partition.frame.index])
+
+                                    def verify_probe(probe):
+                                        _verify_partition_precommitment(precommitments=private_precommitments,
+                                            attempt=selected_attempt, fold_ordinal=specification["fold_ordinal"],
+                                            partition=working_partition, tier=tier, result=probe,
+                                            pair=working_fitted.frozen_tier_pair_contract)
+                                        identity = source_identity(probe)
+                                        if identity.source_contract_sha256 != stable_source:
+                                            _fail("ROUTE_A_UNIT_BATCH_SOURCE_IDENTITY_MISMATCH")
+                                        evaluation_binding = {"symbol": symbol, "timeframe": timeframe,
+                                            "regime": normalized_regime, "anchor_id": private_plan["anchor"]["anchor_id"],
+                                            "selection_cutoff_utc": private_plan["anchor"]["selection_cutoff_utc"],
+                                            "search_process_receipt_sha256": original_process.receipt_sha256,
+                                            "config_sha256": original_context.config_sha256,
+                                            "effective_config_sha256": original_frozen_config.effective_config_sha256,
+                                            "declared_unit_binding": json.loads(unit_binding_bytes.decode("ascii")),
+                                            "fold_ordinal": specification["fold_ordinal"], "fold_id": fold["fold_id"],
+                                            "partition_geometry": working_partition.geometry_receipt, "spread_tier": tier,
+                                            "source_contract_sha256": stable_source,
+                                            "partition_source_contract_sha256": identity.partition_source_contract_sha256,
+                                            "spread_model_sha256": hashlib.sha256(_ROUTE_A_UNIT_BATCH_POLICY_DOMAIN
+                                                + pm_core.build_backtest_spread_mode(probe["spread_model"]).encode("ascii")).hexdigest()}
+                                        prepared["identity"] = identity
+                                        prepared["described"] = describe_request(specification, parameters, evaluation_binding)
+
+                                    def run_strategy(strategy, probe):
+                                        surface = _build_full_prefix_strategy_surface(frame=working_fitted._frame,
+                                            strategy=strategy, fitted=working_fitted, symbol=symbol, timeframe=timeframe)
+                                        decision = {}
+                                        backtester = Backtester(working_config)
+                                        if getattr(backtester, "_entry_admission_preparation", None) is not None:
+                                            _fail("ROUTE_A_UNIT_BATCH_ENTRY_ADMISSION_POOL_REFUSED")
+                                        result, _features, signals, _ = _run_tier_partition(partition=working_partition,
+                                            full_prefix_surface=surface, backtester=backtester, strategy=strategy,
+                                            symbol=symbol, timeframe=timeframe, regime=normalized_regime, config=working_config,
+                                            spec=working_fitted.instrument_spec, expected_source_contract_sha256=stable_source,
+                                            spread_tier=working_fitted._spread_tiers[tier],
+                                            entry_spread_observations=working_fitted._entry_spread_observations,
+                                            decision_result_out=decision)
+                                        return {"result": result, "signals": signals, "decision": decision}
+
+                                    def verify_realized(realized, probe):
+                                        _verify_partition_precommitment(precommitments=private_precommitments,
+                                            attempt=selected_attempt, fold_ordinal=specification["fold_ordinal"],
+                                            partition=working_partition, tier=tier, result=realized["result"],
+                                            pair=working_fitted.frozen_tier_pair_contract)
+                                        actual = source_identity(realized["result"])
+                                        expected = prepared["identity"]
+                                        if (actual.source_contract_sha256 != expected.source_contract_sha256
+                                                or actual.partition_source_contract_sha256
+                                                    != expected.partition_source_contract_sha256):
+                                            _fail("ROUTE_A_UNIT_BATCH_REALIZED_PARTITION_SOURCE_IDENTITY_MISMATCH")
+
+                                    realized = _route_a_evaluate_prepared_request(prepare_probe=prepare_probe,
+                                        verify_probe=verify_probe, require_current=require_working_current,
+                                        make_strategy=lambda: _runtime_strategy(selected_attempt)[0],
+                                        run_strategy=run_strategy, verify_realized=verify_realized)
+                                    described = prepared["described"]
+                                    index = len(unique_entries)
+                                    diagnostic = {"schema_version": "fxpm.route-a-unit-request-diagnostic.v1",
+                                        "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
+                                        "request_ordinal": specification["request_ordinal"],
+                                        "shared_evaluation_key": described["shared_evaluation_key"],
+                                        "matched_attempt_ordinal": selected_attempt.ordinal,
+                                        "matched_horizon_attempt_id": selected_attempt.plan_attempt["attempt_id"],
+                                        "decision_lane": copy.deepcopy(realized["decision"]),
+                                        "signal_vector": realized["signals"].copy(deep=True),
+                                        "signal_comparison": "INCOMPLETE_MISSING_PARTNER",
+                                        "unique_evaluation_ordinal": index, "cache_hit": False,
+                                        **_route_a_diagnostic_authorities()}
+                                    entry = {"diagnostic": diagnostic, "result": copy.deepcopy(realized["result"]),
+                                        "group": group, "tier": tier,
+                                        "binding_bytes": _canonical_bytes(described["shared_evaluation_key"]["evaluation_binding"]),
+                                        "key_bytes": _canonical_bytes(described["shared_evaluation_key"])}
+                                    unique_entries.append(entry)
+                                    selection_to_unique[selection] = index
+                                require_route_a_current()
+                                key_bytes = entry["key_bytes"]
+                                diagnostic = copy.deepcopy(entry["diagnostic"])
+                                diagnostic.update(request_ordinal=specification["request_ordinal"],
+                                    same_identity_as_request_ordinal=first_requests.get(key_bytes),
+                                    bookkeeping=copy.deepcopy(described["bookkeeping"]), cache_hit=cache_hit)
+                                first_requests.setdefault(key_bytes, specification["request_ordinal"])
+                                requests.append(diagnostic)
+                                mapping.append(index)
+                            groups = {}
+                            for entry in unique_entries:
+                                groups.setdefault(entry["group"], {})[entry["tier"]] = entry
+                            pair_checks = []
+                            for group, entries in groups.items():
+                                check = _route_a_pair_check(
+                                    signals_by_tier={tier: entry["diagnostic"]["signal_vector"]
+                                        for tier, entry in entries.items()},
+                                    results_by_tier={tier: entry["result"] for tier, entry in entries.items()},
+                                    spec=copy.deepcopy(private_fitted.instrument_spec),
+                                    use_spread=bool(private_config.use_spread),
+                                    frozen_pair=copy.deepcopy(private_fitted.frozen_tier_pair_contract))
+                                pair_checks.append({"evaluation_group_sha256": hashlib.sha256(group).hexdigest(), **check})
+                                for entry in entries.values():
+                                    entry["diagnostic"]["signal_comparison"] = check["status"]
+                            for diagnostic in requests:
+                                diagnostic["signal_comparison"] = unique_entries[
+                                    diagnostic["unique_evaluation_ordinal"]]["diagnostic"]["signal_comparison"]
+                            staged_output = {"schema_version": "fxpm.route-a-unit-batch-diagnostic.v1",
+                                "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
+                                "requests": copy.deepcopy(requests), "request_to_unique": list(mapping),
+                                "unique_evaluations": [copy.deepcopy(entry["diagnostic"]) for entry in unique_entries],
+                                "pair_checks": copy.deepcopy(pair_checks), **_route_a_diagnostic_authorities()}
+                            historical_adapter._verify_declared_slot_capture(capture)
+                            _route_a_require_unchanged(expected=unit_binding_bytes,
+                                observed=_canonical_bytes(_declared_unit_binding(capture, refreshed,
+                                    cell_plan, attempts, fold_plan, original_handle)))
+                            require_route_a_current()
+                            require_route_a_owner_window()
+                            return staged_output
+                        except Exception as exc:
+                            close_route_a_scope()
+                            return _route_a_contain_consumer_failure(exc)
+                        except BaseException:
+                            close_route_a_scope()
+                            raise
+                        finally:
+                            lifecycle.leave()
+
+                    class UnitEvaluator:
+                        __slots__ = ()
+
+                        def __call__(self, *, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
+                            if self is not issued_evaluator:
+                                close_route_a_scope()
+                                _fail("ROUTE_A_UNIT_BATCH_OWNER_MISMATCH")
+                            return evaluate_route_a_batch(specifications=specifications, metadata_recipe=metadata_recipe)
+
+                        def __copy__(self):
+                            close_route_a_scope()
+                            _route_a_refuse_transfer(lifecycle)
+
+                        def __deepcopy__(self, memo):
+                            return self.__copy__()
+
+                        def __reduce_ex__(self, protocol):
+                            return self.__copy__()
+
+                    issued_evaluator = UnitEvaluator()
+                    try:
+                        require_route_a_current()
+                        route_a_consumer_outcome = route_a_consumer(evaluate_batch=issued_evaluator)
+                        require_route_a_current()
+                    finally:
+                        close_route_a_scope()
+                except Exception as exc:
+                    route_a_consumer_outcome = _route_a_contain_consumer_failure(exc)
         production = capture.complete_observed_cell(
             handle,
             attempt_evidence=evidence_stream(),
@@ -6769,226 +7189,204 @@ def _regime_fit_evidence(*, source, product, support, detector_record, derived_b
     return evidence
 
 
-_ROUTE_A_SINGLE_REQUEST_RECIPE = "ROUTE_A_APPLIED_SPREAD_POLICY_V1"
-_ROUTE_A_SINGLE_REQUEST_POLICY_DOMAIN = b"FXPM_ROUTE_A_APPLIED_SPREAD_POLICY_V1\x00"
+_ROUTE_A_UNIT_BATCH_RECIPE = "ROUTE_A_APPLIED_SPREAD_POLICY_V1"
+_ROUTE_A_UNIT_BATCH_POLICY_DOMAIN = b"FXPM_ROUTE_A_APPLIED_SPREAD_POLICY_V1\x00"
 
 
-def _execute_route_a_single_request(*, descriptor_request, metadata_recipe,
-        capture, fitted, search_process, cell_plan, config, handle):
-    """Evaluate one issued train/tuning request without completing an attempt.
+def _route_a_noop_consumer(*, evaluate_batch):
+    """Reserved owner continuation; production sharing is not activated."""
+    return None
 
-    Reserved for the future W6 unique-evaluation-sharing consumer; this does
-    not share evaluations. Retire this unused adapter if that design changes.
-    """
-    import pm_production_search_planner as planner
 
-    def refuse(suffix, *details):
-        _fail("ROUTE_A_SINGLE_REQUEST_" + suffix, *details)
+_consume_route_a_unit = _route_a_noop_consumer
 
-    def same(left, right):
-        return _canonical_bytes(left) == _canonical_bytes(right)
 
-    def source_identity(result):
-        contract = raw_winner.build_trade_source_contract_from_backtester_result(result)
-        sample = trade_power.build_trade_sample_evidence([], source_contract=contract,
-            minimum_observations=raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS)
-        if sample.source_contract is None:
-            refuse("SOURCE_CONTRACT_UNAVAILABLE")
-        return sample.source_contract
-
-    if metadata_recipe != _ROUTE_A_SINGLE_REQUEST_RECIPE or type(metadata_recipe) is not str:
-        refuse("RECIPE_INVALID")
-    row_fields = {"request_ordinal", "strategy_id", "strategy_family", "domain_cardinality",
-        "parameters", "shared_evaluation_key", "same_identity_as_request_ordinal", "bookkeeping"}
-    if type(descriptor_request) is not dict or set(descriptor_request) != row_fields:
-        refuse("REQUEST_INVALID")
-    row = descriptor_request
-    ordinal, previous = row["request_ordinal"], row["same_identity_as_request_ordinal"]
-    if (type(ordinal) is not int or ordinal < 0
-            or (previous is not None and (type(previous) is not int or not 0 <= previous < ordinal))
-            or type(row["shared_evaluation_key"]) is not dict):
-        refuse("REQUEST_INVALID")
-    binding = row["shared_evaluation_key"].get("evaluation_binding")
-    geometry = binding.get("partition_geometry") if type(binding) is dict else None
-    if type(geometry) is not dict:
-        refuse("REQUEST_INVALID")
-    if geometry.get("role") == "final_lockbox":
-        refuse("LOCKBOX_REFUSED")
-    if geometry.get("role") not in ("optimizer_train", "tuning_validation"):
-        refuse("ROLE_INVALID")
-    if (type(capture) is not historical_adapter.DeclaredSlotSearchCapture
-            or type(fitted) is not FittedNativeSearchTimeframe
-            or not isinstance(config, PipelineConfig)):
-        refuse("CONTEXT_INVALID")
-    if (historical_adapter._verify_declared_slot_capture(capture) is not True
-            or fitted is not capture.verified_fitted_timeframe
-            or config is not capture.verified_pipeline_config
-            or search_process is not capture.process or cell_plan is not capture.cell_plan):
-        refuse("CONTEXT_INVALID")
-    capture._require_active(handle)
-    request_body = capture.request.to_dict()
-    window = request_body["source_access_window_utc"]
-    window_code = "ROUTE_A_SINGLE_REQUEST_SOURCE_WINDOW_INVALID"
-    window_start = _utc(window["start_utc"], window_code)
-    window_end = _utc(window["end_exclusive_utc"], window_code)
-    observed = _utc(_now_utc_seconds(), window_code)
-    if not window_start <= observed < window_end:
-        refuse("SOURCE_WINDOW_CLOSED")
-    header = _read_declared_unit_header(capture.context, request_body)
-    if header is None:
-        refuse("ORIGINAL_HEADER_REQUIRED")
-    if (not same(header.get("frozen_plan_receipt"), handle.frozen_receipt_descriptor)
-            or not same(header.get("frozen_descriptor_graph"), handle.frozen_descriptor_graph)
-            or not same(header.get("horizon_winner_cross_binding"), handle.cross_binding_descriptor)
-            or not same(header.get("source_session_entry"), dict(capture.source_session._entry))):
-        refuse("ORIGINAL_HANDLE_MISMATCH")
-
-    source = fitted.source_group_decision.to_dict()
-    symbol, timeframe, regime = source["symbol"], source["timeframe"], capture.regime
-    horizon_plan, artifacts = _verified_historical_cell_plan_inputs(capture,
-        search_process=search_process, cell_plan=cell_plan, symbol=symbol,
-        timeframe=timeframe, regime=regime)
-    _verify_capture_horizon_plan_identity(capture, timeframe=timeframe,
-        regime=regime, horizon_plan=horizon_plan)
-    refreshed, _ = _declared_fitted_for_execution(capture, fitted, config)
-    _reverify_cell_state_error_envelope(cell_plan=cell_plan, fitted=refreshed)
-    plan_body, attempts = _verify_attempt_roster(plan=horizon_plan,
-        attempt_artifacts=artifacts, fitted=refreshed, regime=regime)
-    fold_plan = _winner_fold_plan(attempts)
-    unit_binding = _declared_unit_binding(capture, refreshed, cell_plan, attempts, fold_plan, handle)
-    if not same(header.get("binding"), unit_binding):
-        refuse("UNIT_BINDING_MISMATCH")
-
-    registered = {}
-    for entry in capture.sink.artifact_roster():
-        if entry["artifact_id"] in registered:
-            refuse("ORIGINAL_HANDLE_MISMATCH")
-        registered[entry["artifact_id"]] = entry
-    entries = {}
-    roster = header.get("artifact_roster")
-    if type(roster) is not list:
-        refuse("ORIGINAL_HANDLE_MISMATCH")
-    for entry in roster:
-        if (type(entry) is not dict or type(entry.get("artifact_id")) is not str
-                or entry["artifact_id"] in entries
-                or not same(registered.get(entry["artifact_id"]), entry)):
-            refuse("ORIGINAL_HANDLE_MISMATCH")
-        entries[entry["artifact_id"]] = entry
-    frozen, _cross, cross_bytes, _ = historical_adapter._verify_declared_slot_frozen_chain(
-        capture.context, completion=header, parent=capture.request._precommit.to_dict(),
-        body=request_body, request=capture.request, plan=cell_plan,
-        source=refreshed.source_group_decision, fit=refreshed.regime_fit_decision,
-        entries=entries, precommit=capture.request._precommit,
-        **({"m5_fitted": refreshed}
-           if historical.declared_slot_source_kind(request_body) == "m5_derived" else {}))
-    if frozen != handle.frozen or cross_bytes != handle._cross_binding_bytes:
-        refuse("ORIGINAL_HANDLE_MISMATCH")
-
-    process_body = search_process.to_dict()
-    domains = process_body.get("semantics", {}).get("strategy_domains")
-    if type(domains) is not list:
-        refuse("PROCESS_BINDING_MISMATCH")
-    described = planner.describe_route_a_evaluation_design(frozen_domains=domains,
-        configurations=[{"strategy_id": row["strategy_id"], "parameters": row["parameters"],
-            "evaluation_binding": binding, "bookkeeping": row["bookkeeping"]}])["requests"][0]
-    for field in ("strategy_id", "strategy_family", "domain_cardinality", "parameters",
-                  "shared_evaluation_key", "bookkeeping"):
-        if not same(row[field], described[field]):
-            refuse("REQUEST_INVALID", field)
-    key = described["shared_evaluation_key"]
-    binding = key["evaluation_binding"]
-    expected_context = {"symbol": symbol, "timeframe": timeframe, "regime": regime,
-        "anchor_id": plan_body["anchor"]["anchor_id"],
-        "search_process_receipt_sha256": search_process.receipt_sha256,
-        "config_sha256": capture.context.config_sha256,
-        "effective_config_sha256": capture.source_session._frozen_config.effective_config_sha256,
-        "declared_unit_binding": unit_binding}
-    if (any(not same(binding[field], expected) for field, expected in expected_context.items())
-            or _utc(binding["selection_cutoff_utc"], "ROUTE_A_SINGLE_REQUEST_REQUEST_INVALID")
-            != _utc(plan_body["anchor"]["selection_cutoff_utc"],
-                    "ROUTE_A_SINGLE_REQUEST_REQUEST_INVALID")):
-        refuse("UNIT_BINDING_MISMATCH")
-    domain = next(value for value in domains if value["strategy_id"] == row["strategy_id"])
-    defaults = StrategyRegistry.get(row["strategy_id"]).get_default_params()
-    matches = []
-    for attempt in attempts:
-        if attempt.plan_attempt["status"] != "PLANNED":
-            continue
-        if attempt.artifacts.winner_process["strategy_id"] != row["strategy_id"]:
-            continue
-        parameters = decode_parameter_mapping(attempt.artifacts.trial_definition["parameters"], defaults)
-        parameters = planner.validate_parameter_domain_member(domain["parameter_domain"], parameters)
-        if not same(parameters, described["parameters"]):
-            continue
-        folds = _causal_folds(attempt)
-        if binding["fold_ordinal"] >= len(folds):
-            continue
-        fold = folds[binding["fold_ordinal"]]
-        if fold["fold_id"] != binding["fold_id"]:
-            continue
-        partitions = _fold_partitions(frame=refreshed._frame, fold=fold, attempt=attempt,
-            dependency_warmup_bars=plan_body["derived_dependency_geometry"]["warmup_bars"])
-        for partition in partitions:
-            if (partition.role == binding["partition_geometry"]["role"]
-                    and same(partition.geometry_receipt, binding["partition_geometry"])):
-                matches.append((attempt, partition))
-    if not matches:
-        refuse("ATTEMPT_BINDING_UNAVAILABLE")
-    if len(matches) != 1:
-        refuse("ATTEMPT_BINDING_AMBIGUOUS")
-    attempt, partition = matches[0]
-    tier = binding["spread_tier"]
-    stable_source = _source_identity(refreshed.source_contract_seeds[tier])
-    if binding["source_contract_sha256"] != stable_source:
-        refuse("SOURCE_IDENTITY_MISMATCH")
-    if (not same(frozen.source_contract_seeds, refreshed.source_contract_seeds)
-            or not same(frozen.frozen_tier_pair_contract, refreshed.frozen_tier_pair_contract)):
-        refuse("SOURCE_IDENTITY_MISMATCH")
-
-    probe_backtester = Backtester(config)
-    probe = probe_backtester.build_evidence_source_seed_result(partition.frame, symbol,
-        spec=refreshed.instrument_spec, timeframe=timeframe,
-        spread_tier=refreshed._spread_tiers[tier],
-        entry_spread_observations=refreshed._entry_spread_observations.loc[partition.frame.index])
-    _verify_partition_precommitment(precommitments=frozen.partition_cost_precommitments,
-        attempt=attempt, fold_ordinal=binding["fold_ordinal"], partition=partition,
-        tier=tier, result=probe, pair=refreshed.frozen_tier_pair_contract)
-    probe_identity = source_identity(probe)
-    if probe_identity.source_contract_sha256 != stable_source:
-        refuse("SOURCE_IDENTITY_MISMATCH")
-    if binding["partition_source_contract_sha256"] != probe_identity.partition_source_contract_sha256:
-        refuse("PARTITION_SOURCE_IDENTITY_MISMATCH")
-    applied_policy = hashlib.sha256(_ROUTE_A_SINGLE_REQUEST_POLICY_DOMAIN
-        + pm_core.build_backtest_spread_mode(probe["spread_model"]).encode("ascii")).hexdigest()
-    if binding["spread_model_sha256"] != applied_policy:
-        refuse("SPREAD_POLICY_IDENTITY_MISMATCH")
-
-    strategy, _ = _runtime_strategy(attempt)
-    surface = _build_full_prefix_strategy_surface(frame=refreshed._frame, strategy=strategy,
-        fitted=refreshed, symbol=symbol, timeframe=timeframe)
-    decision = {}
-    result, _features, signals, _ = _run_tier_partition(partition=partition,
-        full_prefix_surface=surface, backtester=Backtester(config), strategy=strategy,
-        symbol=symbol, timeframe=timeframe, regime=regime, config=config,
-        spec=refreshed.instrument_spec, expected_source_contract_sha256=stable_source,
-        spread_tier=refreshed._spread_tiers[tier],
-        entry_spread_observations=refreshed._entry_spread_observations,
-        decision_result_out=decision)
-    _verify_partition_precommitment(precommitments=frozen.partition_cost_precommitments,
-        attempt=attempt, fold_ordinal=binding["fold_ordinal"], partition=partition,
-        tier=tier, result=result, pair=refreshed.frozen_tier_pair_contract)
-    actual_identity = source_identity(result)
-    if (actual_identity.source_contract_sha256 != probe_identity.source_contract_sha256
-            or actual_identity.partition_source_contract_sha256
-            != probe_identity.partition_source_contract_sha256):
-        refuse("REALIZED_PARTITION_SOURCE_IDENTITY_MISMATCH")
-    return {"schema_version": "fxpm.route-a-single-request-diagnostic.v1",
-        "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
-        "request_ordinal": ordinal, "shared_evaluation_key": key,
-        "matched_attempt_ordinal": attempt.ordinal,
-        "matched_horizon_attempt_id": attempt.plan_attempt["attempt_id"],
-        "decision_lane": decision, "signal_vector": signals.copy(deep=True),
-        "signal_comparison": "UNAVAILABLE_SINGLE_TIER_NO_CROSS_TIER_COMPARISON",
-        "overall_execution_ready": False, "qualification_authority": False,
+def _route_a_diagnostic_authorities():
+    return {"execution_ready": False, "overall_execution_ready": False, "qualification_authority": False,
         "capital_authority": False, "paper_authority": False,
         "live_authority": False, "order_authority": False, "live_order_authority": False}
+
+
+def _route_a_contain_consumer_failure(exc):
+    if not isinstance(exc, Exception) or authority_spool.is_resource_capacity_error(exc):
+        raise exc
+    return {"schema_version": "fxpm.route-a-unit-batch-diagnostic.v1",
+        "status": "REFUSED_DIAGNOSTIC_ONLY", "metadata_recipe": _ROUTE_A_UNIT_BATCH_RECIPE,
+        "requests": [], "request_to_unique": [], "unique_evaluations": [], "pair_checks": [],
+        "refusal": {"code": str(getattr(exc, "code", type(exc).__name__)),
+            "details": [str(value) for value in getattr(exc, "details", (str(exc),))]},
+        **_route_a_diagnostic_authorities()}
+
+
+def _route_a_batch_specifications(specifications):
+    fields = {"strategy_id", "parameters", "fold_ordinal",
+        "partition_role", "spread_tier", "bookkeeping"}
+    if type(specifications) not in (list, tuple):
+        _fail("ROUTE_A_UNIT_BATCH_SPECIFICATIONS_INVALID")
+    encoded = _canonical_bytes(specifications)
+    if len(encoded) > winner.MAX_REQUEST_BYTES:
+        _fail("ROUTE_A_UNIT_BATCH_SPECIFICATIONS_INVALID")
+    rows = json.loads(encoded.decode("ascii"))
+    for ordinal, row in enumerate(rows):
+        if (type(row) is not dict or set(row) != fields
+                or type(row["strategy_id"]) is not str or not row["strategy_id"]
+                or type(row["parameters"]) is not dict or type(row["bookkeeping"]) is not dict
+                or type(row["fold_ordinal"]) is not int or row["fold_ordinal"] < 0):
+            _fail("ROUTE_A_UNIT_BATCH_REQUEST_INVALID")
+        if row["partition_role"] == "final_lockbox":
+            _fail("ROUTE_A_UNIT_BATCH_LOCKBOX_REFUSED")
+        if row["partition_role"] not in ("optimizer_train", "tuning_validation"):
+            _fail("ROUTE_A_UNIT_BATCH_ROLE_INVALID")
+        if row["spread_tier"] not in ("P75", "P95"):
+            _fail("ROUTE_A_UNIT_BATCH_TIER_INVALID")
+        row["request_ordinal"] = ordinal
+    return tuple(rows)
+
+
+def _route_a_require_idle(*, closed, busy):
+    if closed:
+        _fail("ROUTE_A_UNIT_BATCH_CLOSED")
+    if busy:
+        _fail("ROUTE_A_UNIT_BATCH_BUSY")
+    return True
+
+
+class _RouteABatchLifecycle:
+    """Nonauthorizing state only; this cannot issue an evaluator."""
+    __slots__ = ("closed", "busy")
+
+    def __init__(self):
+        self.closed, self.busy = False, False
+
+    def enter(self):
+        _route_a_require_idle(closed=self.closed, busy=self.busy)
+        self.busy = True
+
+    def leave(self):
+        self.busy = False
+
+    def close(self):
+        self.closed, self.busy = True, False
+
+
+def _route_a_refuse_transfer(lifecycle):
+    lifecycle.close()
+    _fail("ROUTE_A_UNIT_BATCH_CAPABILITY_NOT_TRANSFERABLE")
+
+
+def _route_a_require_scope_current(*, closed, owner_process, owner_thread,
+        current_process, current_thread, window_start, window_end, observed):
+    if closed:
+        _fail("ROUTE_A_UNIT_BATCH_CLOSED")
+    if owner_process != current_process or owner_thread != current_thread:
+        _fail("ROUTE_A_UNIT_BATCH_OWNER_MISMATCH")
+    if not window_start <= observed < window_end:
+        _fail("ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_CLOSED")
+    return True
+
+
+def _route_a_require_unchanged(*, expected, observed):
+    if expected != observed:
+        _fail("ROUTE_A_UNIT_BATCH_SHARED_CONTENT_CHANGED")
+    return True
+
+
+def _route_a_pandas_content_sha256(value):
+    if isinstance(value, pd.Series):
+        payload = ("series", value.name, value.index, value.dtype, value.array,
+            value.attrs, value.flags.allows_duplicate_labels)
+    elif isinstance(value, pd.DataFrame):
+        payload = ("frame", value.index, value.columns,
+            tuple((value.iloc[:, index].dtype, value.iloc[:, index].array)
+                for index in range(len(value.columns))),
+            value.attrs, value.flags.allows_duplicate_labels)
+    else:
+        _fail("ROUTE_A_UNIT_BATCH_PANDAS_INPUT_INVALID")
+    # Typed axes and column arrays retain values, dtype, categories and timezone.
+    return hashlib.sha256(pickle.dumps(payload, protocol=5)).hexdigest()
+
+
+def _route_a_fitted_shared_content(fitted):
+    owner = fitted._bound_fit_owner
+    owner_state = None
+    if owner is not None:
+        absent_slot = object()
+        owner_state = {}
+        for name in owner.__slots__:
+            value = getattr(owner, name, absent_slot)
+            if value is absent_slot:
+                owner_state[name] = ("absent",)
+            else:
+                owner_state[name] = ("present",
+                    id(value) if name in ("seal", "fitted", "original_fitted", "config") else value)
+    derived = fitted._derived_binding
+    derived_state = None
+    if derived is not None:
+        derived_state = {"context": id(derived.context), "owner": id(derived.owner),
+            "request_lease": id(derived.request_lease), "calibration_lease": id(derived.calibration_lease),
+            "cost_edition": id(derived.cost_edition), "pins": derived.declared_m5_source_pins,
+            "view_evidence": derived.view_evidence,
+            "request_view": derived.owner.view(derived.request_lease),
+            "calibration_view": derived.owner.view(derived.calibration_lease)}
+    def product_state(product):
+        return None if product is None else (id(product), dict(product.index_descriptor),
+            product.index_sha256, product.index, dict(product.native_prefix))
+    return hashlib.sha256(pickle.dumps({
+        "identity": id(fitted), "frame": _route_a_pandas_content_sha256(fitted._frame),
+        "observations": _route_a_pandas_content_sha256(fitted._entry_spread_observations),
+        "fine_frame": (None if fitted._spread_source_frame is None
+            else _route_a_pandas_content_sha256(fitted._spread_source_frame)),
+        "source": fitted.source_group_decision.to_dict(), "fit": fitted.regime_fit_decision.to_dict(),
+        "source_seed": fitted.source_contract_seed, "cost_ladder": fitted.cost_ladder_contract,
+        "parameters": fitted.regime_parameters, "support": fitted.train_regime_support,
+        "instrument": vars(fitted.instrument_spec), "execution_spec": fitted.execution_spec_receipt,
+        "declared_frame": fitted.frame_sha256, "seeds": fitted.source_contract_seeds,
+        "pair": fitted.frozen_tier_pair_contract,
+        "tiers": {key: (value.descriptor(), value.symbol, value.timeframe, value.tier,
+            value.source_timeframe, value.point, value.spread_points, value.full_spread_price)
+            for key, value in fitted._spread_tiers.items()},
+        "product": product_state(fitted.product), "fine_product": product_state(fitted._spread_source_product),
+        "owner": owner_state, "derived": derived_state}, protocol=5)).hexdigest()
+
+
+def _route_a_working_fitted(fitted):
+    return replace(fitted, _frame=fitted._frame.copy(deep=True),
+        _entry_spread_observations=fitted._entry_spread_observations.copy(deep=True),
+        _spread_source_frame=(None if fitted._spread_source_frame is None
+            else fitted._spread_source_frame.copy(deep=True)),
+        source_contract_seed=copy.deepcopy(fitted.source_contract_seed),
+        cost_ladder_contract=copy.deepcopy(fitted.cost_ladder_contract),
+        regime_parameters=copy.deepcopy(fitted.regime_parameters),
+        train_regime_support=copy.deepcopy(fitted.train_regime_support),
+        instrument_spec=copy.deepcopy(fitted.instrument_spec),
+        execution_spec_receipt=copy.deepcopy(fitted.execution_spec_receipt),
+        source_contract_seeds=copy.deepcopy(fitted.source_contract_seeds),
+        frozen_tier_pair_contract=copy.deepcopy(fitted.frozen_tier_pair_contract),
+        _spread_tiers={key: spread_profile.FrozenSpreadTier(value._json)
+            for key, value in fitted._spread_tiers.items()})
+
+
+def _route_a_evaluate_prepared_request(*, prepare_probe, verify_probe, require_current,
+        make_strategy, run_strategy, verify_realized):
+    require_current()
+    probe = prepare_probe()
+    verify_probe(probe)
+    require_current()
+    strategy = make_strategy()
+    realized = run_strategy(strategy, probe)
+    verify_realized(realized, probe)
+    require_current()
+    return realized
+
+
+def _route_a_pair_check(*, signals_by_tier, results_by_tier, spec, use_spread, frozen_pair):
+    missing = sorted({"P75", "P95"} - set(results_by_tier))
+    if missing:
+        return {"status": "INCOMPLETE_MISSING_PARTNER", "missing_tiers": missing}
+    if not signals_by_tier["P75"].equals(signals_by_tier["P95"]):
+        _fail("PARTITION_SIGNAL_VECTOR_TIER_MISMATCH")
+    pair = pm_core.build_backtest_frozen_tier_pair_contract(results_by_tier,
+        spec=spec, use_spread=use_spread)
+    if pair != dict(frozen_pair):
+        _fail("REALIZED_FROZEN_TIER_POLICY_DRIFT")
+    return {"status": "VERIFIED", "missing_tiers": []}

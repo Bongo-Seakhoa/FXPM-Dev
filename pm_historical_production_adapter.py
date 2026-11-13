@@ -6870,6 +6870,13 @@ def _make_declared_slot_capture_authority():
         return hmac.new(key, _canonical_bytes(body), hashlib.sha256).hexdigest()
 
     def verify(value):
+        verify_current(value)
+        import pm_historical_search_producer as producer
+        producer._verified_declared_slot_source_session(value.context,
+            request=value.request, process=value.process, source_session=value.source_session)
+        return True
+
+    def verify_current(value):
         import pm_historical_search_producer as producer
         if type(value) is not DeclaredSlotSearchCapture or any(not hasattr(value, k) for k in ("_capture_tag", "context", "request", "source_session", "cell_plan", "fitted_timeframe", "pipeline_config", "_bindings", "_horizon_plan_bodies", "process", "sink", "_source", "_fit", "_horizon_plans", "raw_artifact_namespace", "anchor", "symbol", "regime", "request_body")):
             _fail("DECLARED_SLOT_CAPTURE_INVALID")
@@ -6878,7 +6885,7 @@ def _make_declared_slot_capture_authority():
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
         if not hmac.compare_digest(value._capture_tag, tag(value)):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
-        session = producer._verified_declared_slot_source_session(value.context,
+        session = producer._verified_declared_slot_source_session_current(value.context,
             request=value.request, process=value.process, source_session=value.source_session)
         body = value.request.to_dict()
         cell_key = (body["timeframe"], body["regime"])
@@ -6927,10 +6934,11 @@ def _make_declared_slot_capture_authority():
         verify(value)
         return value
 
-    return open_capture, verify
+    return open_capture, verify, verify_current
 
 
-open_declared_slot_capture, _verify_declared_slot_capture = _make_declared_slot_capture_authority()
+(open_declared_slot_capture, _verify_declared_slot_capture,
+ _verify_declared_slot_capture_current) = _make_declared_slot_capture_authority()
 
 
 def open_transport_declared_slot_capture(context, *, request, process, plan, source_session):

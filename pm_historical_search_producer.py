@@ -2302,9 +2302,14 @@ def _make_declared_slot_source_authority():
 
     def verify(context, *, request, process, source_session):
         historical.verify_declared_slot_producer_request(context, request, process=process)
+        return verify_current(context, request=request, process=process,
+            source_session=source_session)
+
+    def verify_current(context, *, request, process, source_session):
         historical._verify_declared_request_identity(request, context, require_live=True)
         row = sessions.get(request.receipt_sha256)
         if (type(source_session) is not _DeclaredSlotSourceSession or row is None
+                or len(row) not in (8, 10) or row[-1] is not process
                 or row[0] is not source_session or row[1] != source_session._body_json
                 or row[2] != id(context) or row[3] is not request
                 or row[4] is not source_session._fitted or row[5] is not source_session._config
@@ -2312,10 +2317,10 @@ def _make_declared_slot_source_authority():
             _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
         validation = source_session._reopen_validation_json
         if validation is not None:
-            if (len(row) != 9 or row[7] != validation
+            if (len(row) != 10 or row[7] != validation
                     or row[8] is not getattr(source_session._fitted, "_bound_fit_owner", None)):
                 _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
-        elif len(row) != 7:
+        elif len(row) != 8:
             _fail("DECLARED_SLOT_SOURCE_CAPABILITY_INVALID")
         return source_session
 
@@ -2381,7 +2386,7 @@ def _make_declared_slot_source_authority():
                     frozen_pipeline_config, original_entry, _canonical_bytes(validation))
                 sessions[request.receipt_sha256] = (session, session._body_json, id(context), request,
                     fitted, config, _canonical_bytes(original_entry), session._reopen_validation_json,
-                    getattr(fitted, "_bound_fit_owner", None))
+                    getattr(fitted, "_bound_fit_owner", None), process)
                 return run_fitted(fitted, session, original_entry, restored_plan=original_plan)
             except Exception as exc:
                 if (authority_spool.is_resource_capacity_error(exc)
@@ -2512,7 +2517,7 @@ def _make_declared_slot_source_authority():
             entry = sink.put_json(f"{body['artifact_namespace']}/source-session", "declared_slot_source_session", source_body)
             session = _DeclaredSlotSourceSession(_canonical_bytes(source_body), fitted, config, frozen_pipeline_config, entry)
             sessions[request.receipt_sha256] = (session, session._body_json, id(context), request,
-                fitted, config, _canonical_bytes(entry))
+                fitted, config, _canonical_bytes(entry), process)
             return run_fitted(fitted, session, entry)
         except Exception as exc:
             if (authority_spool.is_resource_capacity_error(exc)
@@ -2654,7 +2659,7 @@ def _make_declared_slot_source_authority():
             owner = getattr(fitted, "_bound_fit_owner", None)
             # A newly registered LOCAL object capability, never a reminted old fit.
             sessions[request.receipt_sha256] = (session, session._body_json, id(context), request,
-                fitted, config, _canonical_bytes(original_entry), session._reopen_validation_json, owner)
+                fitted, config, _canonical_bytes(original_entry), session._reopen_validation_json, owner, process)
             try:
                 return run_session(fitted, session, restored_plan=original_plan)
             except Exception as exc:
@@ -2713,7 +2718,7 @@ def _make_declared_slot_source_authority():
                 regime_fit_decision_sha256=fitted.regime_fit_decision.receipt_sha256)
             entry = sink.put_json(f"{body['artifact_namespace']}/source-session", "declared_slot_source_session", source_body)
             session = _DeclaredSlotSourceSession(_canonical_bytes(source_body), fitted, config, frozen_pipeline_config, entry)
-            sessions[request.receipt_sha256] = (session, session._body_json, id(context), request, fitted, config, _canonical_bytes(entry))
+            sessions[request.receipt_sha256] = (session, session._body_json, id(context), request, fitted, config, _canonical_bytes(entry), process)
             return run_session(fitted, session)
         except Exception as exc:
             if (authority_spool.is_resource_capacity_error(exc)
@@ -2737,11 +2742,11 @@ def _make_declared_slot_source_authority():
             # No fitted frame or live permit survives the portable completion.
             sessions.pop(request.receipt_sha256, None)
 
-    return execute, verify, by_fitted
+    return execute, verify, by_fitted, verify_current
 
 
 (execute_declared_slot_owner_search, _verified_declared_slot_source_session,
- _verified_declared_slot_fitted) = _make_declared_slot_source_authority()
+ _verified_declared_slot_fitted, _verified_declared_slot_source_session_current) = _make_declared_slot_source_authority()
 
 
 def _declared_commit_path(precommit, cell_id, ordinal):
