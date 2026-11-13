@@ -5116,3 +5116,506 @@ def test_route_a_callback_identity_dispatch_preserves_legacy_predicate():
             expected = tuple(name for name, candidate in pairs
                              if event == "call" and frame_code is candidate)
             assert labels(frame_code, event) == expected
+
+
+
+# INVENTED plain mapping metadata; no authentication, model or financial evidence.
+def _request_mapping_seal(body, field):
+    import json
+    sealed = copy.deepcopy(body)
+    sealed[field] = hashlib.sha256(json.dumps(sealed, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")).hexdigest()
+    return sealed
+
+
+def _request_mapping_inputs():
+    parameters = {"fast_period": 10, "slow_period": 20,
+        "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+    binding_fields = ("generation_context_sha256", "producer_request_sha256",
+        "executor_release_sha256", "producer_source_sha256", "horizon_plan_receipt_sha256",
+        "cell_plan_receipt_sha256", "source_group_sha256", "regime_fit_sha256",
+        "frame_sha256", "fitted_state_reference_sha256", "execution_spec_sha256",
+        "frozen_receipt_sha256", "cost_precommitments_sha256", "fold_plan_sha256",
+        "attempt_roster_sha256")
+    unit = {"declared_unit_binding": {name: "a" * 64 for name in binding_fields},
+        "header_reference": {"schema_version": "INVENTED_HEADER_REFERENCE_ONLY", "sha256": "b" * 64},
+        "source_access_window_utc": {"start_utc": "2020-01-01T00:00:00+00:00",
+            "end_exclusive_utc": "2020-01-02T00:00:00+00:00"},
+        "cell": {"symbol": "INVENTED_SYMBOL", "timeframe": "D1", "regime": "INVENTED_REGIME"},
+        "anchor": {"anchor_id": "INVENTED_ANCHOR", "selection_cutoff_utc": "2020-01-01T00:00:00+00:00"},
+        "search_process_receipt_sha256": "c" * 64, "config_sha256": "d" * 64,
+        "effective_config_sha256": "e" * 64}
+    domain = _request_mapping_seal({"strategy_id": "EMACrossoverStrategy",
+        "strategy_family": "INVENTED_FAMILY", "parameter_domain": {
+            "schema_version": "fxpm.parameter-domain.v1", "defaults": copy.deepcopy(parameters),
+            "axes": [{"names": list(parameters), "choices": [[10, 20, 2.0, 2.0], [11, 21, 2.0, 2.0]]}],
+            "point_count": 2}}, "domain_sha256")
+    folds = []
+    for ordinal in range(4):
+        partitions = {}
+        for role in ("optimizer_train", "tuning_validation", "final_lockbox"):
+            geometry = _request_mapping_seal({"schema_version": "fxpm.winner-partition-geometry.v1",
+                "role": role, "frame_start_utc": "2019-12-31T00:00:00+00:00",
+                "scored_start_utc": "2020-01-01T00:00:00+00:00",
+                "end_exclusive_utc": "2020-01-02T00:00:00+00:00",
+                "warmup_bars": 1, "scored_bars": 2, "frame_rows": 3,
+                "frame_sha256": str(ordinal + 1) * 64}, "receipt_sha256")
+            partitions[role] = {"geometry": geometry,
+                "tier_refs": {tier: f"INVENTED_{ordinal}_{role}_{tier}" for tier in ("P75", "P95")}}
+        folds.append({"fold_id": f"INVENTED_FOLD_{ordinal}",
+            "role": "CAUSAL_ROLLING_ORIGIN_INNER", "partitions": partitions})
+    planned = {"ordinal": 0, "raw_attempt_id": "INVENTED_RAW_0",
+        "horizon_attempt_id": "INVENTED_HORIZON_0", "plan_attempt_sha256": "1" * 64,
+        "status": "PLANNED", "strategy_id": "EMACrossoverStrategy",
+        "parameters": copy.deepcopy(parameters), "causal_fold_count": 4,
+        "folds": copy.deepcopy(folds), "rejection": None}
+    rejected = copy.deepcopy(planned)
+    rejected.update(ordinal=1, raw_attempt_id="INVENTED_RAW_1", horizon_attempt_id="INVENTED_HORIZON_1",
+        plan_attempt_sha256="2" * 64, status="PROCESS_REJECTED",
+        rejection={"kind": "PROCESS_REJECTED", "code": "INVENTED_PRESEARCH_REJECTION",
+            "details": ["INVENTED_SOFTWARE_ONLY"]})
+    specification = {"strategy_id": "EMACrossoverStrategy", "parameters": copy.deepcopy(parameters),
+        "fold_ordinal": 0, "partition_role": "optimizer_train", "spread_tier": "P75", "bookkeeping": {}}
+    specifications = [copy.deepcopy(specification) for _ in range(3)]
+    specifications[1]["spread_tier"] = "P95"
+    specifications[2]["bookkeeping"] = {"attempt_ordinal": 999,
+        "horizon_attempt_id": "INVENTED_NONSELECTING_BOOKKEEPING"}
+    return {"unit_metadata": unit, "frozen_domains": [domain],
+        "attempt_roster": [planned, rejected], "original_trial_count": 2,
+        "specifications": specifications}
+
+
+def _request_mapping_normalized_specification(inputs):
+    return {**copy.deepcopy(inputs["specifications"][0]), "request_ordinal": 0}
+
+
+def _request_mapping_add_planned(inputs, parameters=None, fold_count=4):
+    row = copy.deepcopy(inputs["attempt_roster"][0])
+    ordinal = len(inputs["attempt_roster"])
+    row.update(ordinal=ordinal, raw_attempt_id=f"INVENTED_RAW_{ordinal}",
+        horizon_attempt_id=f"INVENTED_HORIZON_{ordinal}", plan_attempt_sha256=f"{ordinal + 1:x}" * 64,
+        causal_fold_count=fold_count, folds=copy.deepcopy(row["folds"][:fold_count]))
+    if parameters is not None:
+        row["parameters"] = copy.deepcopy(parameters)
+    inputs["attempt_roster"].append(row)
+    inputs["original_trial_count"] += 1
+    return row
+
+
+def _request_mapping_assert_no_authority(result):
+    for name in ("execution_ready", "overall_execution_ready", "qualification_authority",
+            "capital_authority", "paper_authority", "live_authority", "order_authority", "live_order_authority"):
+        assert result[name] is False
+
+
+def test_route_a_request_mapping_preserves_rejected_twin_and_request_order():
+    inputs = _request_mapping_inputs()
+    before = copy.deepcopy(inputs)
+    result = execution._compile_route_a_request_attempt_mapping(**inputs)
+    assert result["original_trial_count"] == 2
+    assert result["attempt_roster"] == before["attempt_roster"]
+    assert result["counts"] == {"original_trials": 2, "planned_trials": 1,
+        "rejected_trials": 1, "requests": 3, "structural_groups": 2}
+    assert result["request_to_group"] == [0, 1, 0]
+    assert len(result["requests"]) == 3 and len(result["structural_groups"]) == 2
+    assert [row["bookkeeping"] for row in result["requests"]] == [row["bookkeeping"] for row in before["specifications"]]
+    assert inputs == before
+    _request_mapping_assert_no_authority(result)
+
+
+def test_route_a_request_mapping_partial_coverage_keeps_lockbox_ordinary_only():
+    inputs = _request_mapping_inputs()
+    result = execution._compile_route_a_request_attempt_mapping(**inputs)
+    planned, rejected = result["coverage_by_attempt"]
+    assert len(planned["expected_batch_lanes"]) == 16
+    assert len(planned["requested_unique_lanes"]) == 2
+    assert len(planned["missing_batch_lanes"]) == 14
+    assert len(planned["ordinary_only_lockbox_lanes"]) == 8
+    for name in ("expected_batch_lanes", "requested_unique_lanes", "missing_batch_lanes", "ordinary_only_lockbox_lanes"):
+        assert rejected[name] == []
+    inputs["specifications"] = []
+    empty = execution._compile_route_a_request_attempt_mapping(**inputs)
+    assert empty["requests"] == empty["request_to_group"] == empty["structural_groups"] == []
+    assert len(empty["coverage_by_attempt"][0]["missing_batch_lanes"]) == 16
+    assert empty["original_trial_count"] == 2
+    _request_mapping_assert_no_authority(empty)
+
+
+_REQUEST_MAPPING_SITES = {
+    "M1": ("_route_a_resolve_request_membership", 7410, "ROUTE_A_MAPPING_REQUEST_INVALID"),
+    "M2": ("_route_a_resolve_request_membership", 7414, "ROUTE_A_MAPPING_DOMAIN_UNAVAILABLE"),
+    "M3": ("_route_a_resolve_request_membership", 7433, "ROUTE_A_MAPPING_MATCH_DATA_INVALID"),
+    "M4-unavailable": ("_route_a_resolve_request_membership", 7435, "ROUTE_A_MAPPING_MEMBERSHIP_UNAVAILABLE"),
+    "M4-ambiguous": ("_route_a_resolve_request_membership", 7435, "ROUTE_A_MAPPING_MEMBERSHIP_AMBIGUOUS"),
+    "C1": ("_compile_route_a_request_attempt_mapping", 7516, "ROUTE_A_MAPPING_INPUT_INVALID"),
+    "C2": ("_compile_route_a_request_attempt_mapping", 7535, "ROUTE_A_MAPPING_DOMAINS_INVALID"),
+    "C3": ("_compile_route_a_request_attempt_mapping", 7601, "ROUTE_A_MAPPING_ROSTER_INVALID"),
+    "C4": ("_compile_route_a_request_attempt_mapping", 7667, "ROUTE_A_MAPPING_RESULT_TOO_LARGE"),
+    "R-request": ("_route_a_batch_specifications", 7235, "ROUTE_A_UNIT_BATCH_REQUEST_INVALID"),
+    "R-lockbox": ("_route_a_batch_specifications", 7237, "ROUTE_A_UNIT_BATCH_LOCKBOX_REFUSED"),
+    "R-role": ("_route_a_batch_specifications", 7239, "ROUTE_A_UNIT_BATCH_ROLE_INVALID"),
+    "R-tier": ("_route_a_batch_specifications", 7241, "ROUTE_A_UNIT_BATCH_TIER_INVALID"),
+}
+
+
+def _request_mapping_expect_site(call, site_id):
+    function, line, code = _REQUEST_MAPPING_SITES[site_id]
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        call()
+    assert caught.value.code == code
+    trace = caught.value.__traceback__
+    expected_file = execution._compile_route_a_request_attempt_mapping.__code__.co_filename
+    reached = False
+    while trace is not None:
+        current_code = trace.tb_frame.f_code
+        if current_code.co_filename == expected_file and current_code.co_name == function and trace.tb_lineno == line:
+            reached = True
+        trace = trace.tb_next
+    assert reached, f"INVENTED fixture did not reach refusal site {site_id}"
+
+
+@pytest.mark.parametrize("case_id", (
+    "M1-normalized-ordinal", "M2-domain-absent", "M3-not-domain-member",
+    "M4-zero-match", "M4-planned-ambiguity", "M4-own-fold-bound",
+    "C1-nonplain-input", "C2-domain-digest", "C3-partition-shape", "C4-result-size",
+), ids=(
+    "M1-normalized-ordinal", "M2-domain-absent", "M3-not-domain-member",
+    "M4-zero-match", "M4-planned-ambiguity", "M4-own-fold-bound",
+    "C1-nonplain-input", "C2-domain-digest", "C3-partition-shape", "C4-result-size",
+))
+def test_route_a_request_mapping_each_new_refusal_site(case_id):
+    """INVENTED conditions; actual traceback-site evidence requires an authorized run."""
+    inputs = _request_mapping_inputs()
+    specification = _request_mapping_normalized_specification(inputs)
+    direct_member = case_id.startswith("M")
+    if case_id == "M1-normalized-ordinal":
+        specification["request_ordinal"] = True
+        site = "M1"
+    elif case_id == "M2-domain-absent":
+        inputs["frozen_domains"] = []
+        site = "M2"
+    elif case_id == "M3-not-domain-member":
+        specification["parameters"]["fast_period"] = 999
+        site = "M3"
+    elif case_id == "M4-zero-match":
+        specification["parameters"].update(fast_period=11, slow_period=21)
+        site = "M4-unavailable"
+    elif case_id == "M4-planned-ambiguity":
+        _request_mapping_add_planned(inputs)
+        specification["bookkeeping"] = {"attempt_ordinal": 0, "horizon_attempt_id": "INVENTED_HORIZON_0"}
+        site = "M4-ambiguous"
+    elif case_id == "M4-own-fold-bound":
+        inputs["attempt_roster"][0]["folds"] = inputs["attempt_roster"][0]["folds"][:1]
+        inputs["attempt_roster"][0]["causal_fold_count"] = 1
+        _request_mapping_add_planned(inputs, {
+            "fast_period": 11, "slow_period": 21, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0})
+        # The other attempt has four causal folds but different parameters.
+        inputs["attempt_roster"][-1]["folds"] = copy.deepcopy(inputs["attempt_roster"][1]["folds"])
+        inputs["attempt_roster"][-1]["causal_fold_count"] = 4
+        specification["fold_ordinal"] = 1
+        site = "M4-unavailable"
+    elif case_id == "C1-nonplain-input":
+        inputs["unit_metadata"]["cell"]["symbol"] = object()
+        site = "C1"
+    elif case_id == "C2-domain-digest":
+        inputs["frozen_domains"][0]["domain_sha256"] = "0" * 64
+        site = "C2"
+    elif case_id == "C3-partition-shape":
+        del inputs["attempt_roster"][0]["folds"][0]["partitions"]["optimizer_train"]["geometry"]
+        site = "C3"
+    elif case_id == "C4-result-size":
+        import json
+        inputs["unit_metadata"]["header_reference"]["schema_version"] = (
+            "INVENTED_LARGE_METADATA_ONLY_" + "x" * (winner.MAX_REQUEST_BYTES // 2))
+        assert len(json.dumps({**inputs, "metadata_recipe": "ROUTE_A_APPLIED_SPREAD_POLICY_V1"},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")) < winner.MAX_REQUEST_BYTES
+        site = "C4"
+    else:
+        raise AssertionError("Unknown INVENTED refusal fixture")
+    if direct_member:
+        call = lambda: execution._route_a_resolve_request_membership(
+            specification=specification, frozen_domains=inputs["frozen_domains"], attempt_roster=inputs["attempt_roster"])
+    else:
+        call = lambda: execution._compile_route_a_request_attempt_mapping(**inputs)
+    _request_mapping_expect_site(call, site)
+
+
+@pytest.mark.parametrize("case_id", (
+    "unit-extra", "unit-hash", "unit-window", "nonfinite", "dict-subclass", "recipe",
+    "trial-count-bool", "trial-count-mismatch", "unused-domain", "duplicate-domain",
+    "ordinal", "duplicate-raw", "planned-rejection", "rejected-reason", "fold-count",
+    "missing-partition", "missing-tier", "geometry-role", "geometry-count-bool",
+    "geometry-row-sum", "geometry-digest", "noncausal-partitions",
+    "request-lockbox", "request-ordinal", "request-fold-bool", "request-role", "request-tier",
+), ids=(
+    "unit-extra", "unit-hash", "unit-window", "nonfinite", "dict-subclass", "recipe",
+    "trial-count-bool", "trial-count-mismatch", "unused-domain", "duplicate-domain",
+    "ordinal", "duplicate-raw", "planned-rejection", "rejected-reason", "fold-count",
+    "missing-partition", "missing-tier", "geometry-role", "geometry-count-bool",
+    "geometry-row-sum", "geometry-digest", "noncausal-partitions",
+    "request-lockbox", "request-ordinal", "request-fold-bool", "request-role", "request-tier",
+))
+def test_route_a_request_mapping_strict_plain_data_geometry_and_domains(case_id):
+    inputs = _request_mapping_inputs()
+    attempt = inputs["attempt_roster"][0]
+    partition = attempt["folds"][0]["partitions"]["optimizer_train"]
+    site = "C1"
+    if case_id == "unit-extra":
+        inputs["unit_metadata"]["execution_ready"] = True
+    elif case_id == "unit-hash":
+        inputs["unit_metadata"]["config_sha256"] = "INVENTED_NOT_A_HASH"
+    elif case_id == "unit-window":
+        inputs["unit_metadata"]["source_access_window_utc"]["start_utc"] = None
+    elif case_id == "nonfinite":
+        inputs["specifications"][0]["bookkeeping"]["invalid"] = float("nan")
+    elif case_id == "dict-subclass":
+        class InventedDict(dict):
+            pass
+        inputs["unit_metadata"] = InventedDict(inputs["unit_metadata"])
+    elif case_id == "recipe":
+        inputs["metadata_recipe"] = "INVENTED_DIFFERENT_RECIPE"
+    elif case_id == "trial-count-bool":
+        inputs["original_trial_count"] = True
+    elif case_id == "trial-count-mismatch":
+        inputs["original_trial_count"] += 1
+    elif case_id == "unused-domain":
+        domain = copy.deepcopy(inputs["frozen_domains"][0])
+        domain.pop("domain_sha256")
+        domain["strategy_id"] = "INVENTED_UNUSED_STRATEGY"
+        domain["parameter_domain"]["point_count"] = 999
+        inputs["frozen_domains"].append(_request_mapping_seal(domain, "domain_sha256"))
+        site = "C2"
+    elif case_id == "duplicate-domain":
+        inputs["frozen_domains"].append(copy.deepcopy(inputs["frozen_domains"][0]))
+        site = "C2"
+    elif case_id == "ordinal":
+        attempt["ordinal"] = 1
+        site = "C3"
+    elif case_id == "duplicate-raw":
+        inputs["attempt_roster"][1]["raw_attempt_id"] = attempt["raw_attempt_id"]
+        site = "C3"
+    elif case_id == "planned-rejection":
+        attempt["rejection"] = copy.deepcopy(inputs["attempt_roster"][1]["rejection"])
+        site = "C3"
+    elif case_id == "rejected-reason":
+        inputs["attempt_roster"][1]["rejection"] = None
+        site = "C3"
+    elif case_id == "fold-count":
+        attempt["causal_fold_count"] = 3
+        site = "C3"
+    elif case_id == "missing-partition":
+        del attempt["folds"][0]["partitions"]["final_lockbox"]
+        site = "C3"
+    elif case_id == "missing-tier":
+        del partition["tier_refs"]["P95"]
+        site = "C3"
+    elif case_id in {"geometry-role", "geometry-count-bool", "geometry-row-sum", "geometry-digest"}:
+        geometry = partition["geometry"]
+        geometry.pop("receipt_sha256")
+        if case_id == "geometry-role":
+            geometry["role"] = "tuning_validation"
+        elif case_id == "geometry-count-bool":
+            geometry["warmup_bars"] = True
+        elif case_id == "geometry-row-sum":
+            geometry["frame_rows"] = 4
+        partition["geometry"] = _request_mapping_seal(geometry, "receipt_sha256")
+        if case_id == "geometry-digest":
+            partition["geometry"]["receipt_sha256"] = "0" * 64
+        site = "C3"
+    elif case_id == "noncausal-partitions":
+        attempt["folds"][0]["role"] = "INVENTED_NONCAUSAL"
+        attempt["causal_fold_count"] = 3
+        site = "C3"
+    elif case_id == "request-lockbox":
+        inputs["specifications"][0]["partition_role"] = "final_lockbox"
+        site = "R-lockbox"
+    elif case_id == "request-ordinal":
+        inputs["specifications"][0]["request_ordinal"] = 0
+        site = "R-request"
+    elif case_id == "request-fold-bool":
+        inputs["specifications"][0]["fold_ordinal"] = True
+        site = "R-request"
+    elif case_id == "request-role":
+        inputs["specifications"][0]["partition_role"] = "INVENTED_ROLE"
+        site = "R-role"
+    elif case_id == "request-tier":
+        inputs["specifications"][0]["spread_tier"] = "P99"
+        site = "R-tier"
+    else:
+        raise AssertionError("Unknown INVENTED semantic rejection")
+    _request_mapping_expect_site(lambda: execution._compile_route_a_request_attempt_mapping(**inputs), site)
+
+
+
+def test_route_a_request_mapping_decodes_registry_tuple_defaults_before_matching(monkeypatch):
+    """INVENTED tuple-template provider; metadata construction is not evaluation."""
+    inputs = _request_mapping_inputs()
+    templates = {"pair": (1, 2)}
+    reads = []
+    def metadata_defaults(strategy_id):
+        assert strategy_id == "INVENTED_TUPLE_DEFAULTS"
+        reads.append(strategy_id)
+        return SimpleNamespace(get_default_params=lambda: templates)
+    monkeypatch.setattr(execution.StrategyRegistry, "get", staticmethod(metadata_defaults))
+    domain = {"strategy_id": "INVENTED_TUPLE_DEFAULTS", "strategy_family": "INVENTED_TUPLE_FAMILY",
+        "parameter_domain": {"schema_version": "fxpm.parameter-domain.v1", "defaults": {"pair": [1, 2]},
+            "axes": [{"names": ["pair"], "choices": [[[1, 2]], [[2, 3]]]}], "point_count": 2}}
+    inputs["frozen_domains"] = [_request_mapping_seal(domain, "domain_sha256")]
+    for row in inputs["attempt_roster"]:
+        row["strategy_id"], row["parameters"] = "INVENTED_TUPLE_DEFAULTS", {"pair": [1, 2]}
+    for row in inputs["specifications"]:
+        row["strategy_id"], row["parameters"] = "INVENTED_TUPLE_DEFAULTS", {"pair": [1, 2]}
+    decoded = execution.decode_parameter_mapping({"pair": [1, 2]}, templates)
+    normalized = search_planner.validate_parameter_domain_member(domain["parameter_domain"], {"pair": [1, 2]})
+    assert decoded == {"pair": (1, 2)} and normalized == {"pair": [1, 2]} and decoded != normalized
+    result = execution._compile_route_a_request_attempt_mapping(**inputs)
+    assert result["request_to_group"] == [0, 1, 0]
+    assert all(row["parameters"] == {"pair": [1, 2]} for row in result["requests"])
+    assert reads and templates == {"pair": (1, 2)}
+    _request_mapping_assert_no_authority(result)
+
+
+def test_route_a_request_mapping_reports_holes_for_each_original_attempt():
+    inputs = _request_mapping_inputs()
+    alternate = {"fast_period": 11, "slow_period": 21, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+    _request_mapping_add_planned(inputs, alternate, fold_count=2)
+    request = copy.deepcopy(inputs["specifications"][0])
+    request.update(parameters=alternate, fold_ordinal=1, partition_role="tuning_validation",
+        spread_tier="P95", bookkeeping={"attempt_ordinal": 0})
+    inputs["specifications"].append(request)
+    result = execution._compile_route_a_request_attempt_mapping(**inputs)
+    assert result["original_trial_count"] == 3 and result["counts"]["planned_trials"] == 2
+    assert result["request_to_group"] == [0, 1, 0, 2]
+    assert result["requests"][-1]["attempt_ordinal"] == 2
+    coverage = result["coverage_by_attempt"]
+    assert [(len(row["expected_batch_lanes"]), len(row["requested_unique_lanes"]),
+        len(row["missing_batch_lanes"]), len(row["ordinary_only_lockbox_lanes"]))
+        for row in coverage] == [(16, 2, 14, 8), (0, 0, 0, 0), (8, 1, 7, 4)]
+    assert all(lane["attempt_ordinal"] == 2 for lane in coverage[2]["missing_batch_lanes"])
+    assert all(lane["partition_role"] == "final_lockbox" for lane in coverage[2]["ordinary_only_lockbox_lanes"])
+    assert result["requests"][-1]["ordinary_lane"] == "tuning_validation_p95"
+    _request_mapping_assert_no_authority(result)
+
+
+def test_route_a_request_mapping_ignores_noncausal_fold_positions():
+    inputs = _request_mapping_inputs()
+    inputs["attempt_roster"][0]["folds"].insert(0,
+        {"fold_id": "INVENTED_NONCAUSAL", "role": "INVENTED_NONCAUSAL", "partitions": {}})
+    result = execution._compile_route_a_request_attempt_mapping(**inputs)
+    assert all(row["fold_id"] == "INVENTED_FOLD_0" for row in result["requests"])
+    assert len(result["coverage_by_attempt"][0]["expected_batch_lanes"]) == 16
+    assert all(lane["fold_id"] != "INVENTED_NONCAUSAL"
+        for lane in result["coverage_by_attempt"][0]["expected_batch_lanes"])
+
+
+@pytest.mark.parametrize("component", (
+    "unit-header", "unit-window-text", "unit-config", "raw-id", "horizon-id", "plan-receipt",
+    "fold", "geometry", "tier-reference", "tier", "parameters", "role", "family-domain",
+), ids=(
+    "unit-header", "unit-window-text", "unit-config", "raw-id", "horizon-id", "plan-receipt",
+    "fold", "geometry", "tier-reference", "tier", "parameters", "role", "family-domain",
+))
+def test_route_a_request_mapping_full_identity_changes_with_bound_metadata(component):
+    import json
+    original = _request_mapping_inputs()
+    original["specifications"] = original["specifications"][:1]
+    changed = copy.deepcopy(original)
+    attempt = changed["attempt_roster"][0]
+    specification = changed["specifications"][0]
+    if component == "unit-header":
+        changed["unit_metadata"]["header_reference"]["sha256"] = "f" * 64
+    elif component == "unit-window-text":
+        changed["unit_metadata"]["source_access_window_utc"]["start_utc"] = "2020-01-01T00:00:00Z"
+    elif component == "unit-config":
+        changed["unit_metadata"]["config_sha256"] = "f" * 64
+    elif component == "raw-id":
+        attempt["raw_attempt_id"] = "INVENTED_OTHER_RAW"
+    elif component == "horizon-id":
+        attempt["horizon_attempt_id"] = "INVENTED_OTHER_HORIZON"
+    elif component == "plan-receipt":
+        attempt["plan_attempt_sha256"] = "f" * 64
+    elif component == "fold":
+        specification["fold_ordinal"] = 1
+    elif component == "geometry":
+        partition = attempt["folds"][0]["partitions"]["optimizer_train"]
+        geometry = partition["geometry"]
+        geometry.pop("receipt_sha256")
+        geometry["frame_sha256"] = "f" * 64
+        partition["geometry"] = _request_mapping_seal(geometry, "receipt_sha256")
+    elif component == "tier-reference":
+        attempt["folds"][0]["partitions"]["optimizer_train"]["tier_refs"]["P75"] = "INVENTED_OTHER_TIER_REFERENCE"
+    elif component == "tier":
+        specification["spread_tier"] = "P95"
+    elif component == "parameters":
+        alternate = {"fast_period": 11, "slow_period": 21, "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+        attempt["parameters"] = copy.deepcopy(alternate)
+        specification["parameters"] = copy.deepcopy(alternate)
+    elif component == "role":
+        specification["partition_role"] = "tuning_validation"
+    elif component == "family-domain":
+        domain = changed["frozen_domains"][0]
+        domain.pop("domain_sha256")
+        domain["strategy_family"] = "INVENTED_OTHER_FAMILY"
+        changed["frozen_domains"][0] = _request_mapping_seal(domain, "domain_sha256")
+    else:
+        raise AssertionError("Unknown INVENTED identity component")
+    before = execution._compile_route_a_request_attempt_mapping(**original)
+    after = execution._compile_route_a_request_attempt_mapping(**changed)
+    left, right = before["structural_groups"][0], after["structural_groups"][0]
+    assert left["structural_identity_json"] != right["structural_identity_json"]
+    assert json.loads(right["structural_identity_json"])["metadata_recipe"] == "ROUTE_A_APPLIED_SPREAD_POLICY_V1"
+    assert "bookkeeping" not in json.loads(right["structural_identity_json"])
+    assert before["request_to_group"] == after["request_to_group"] == [0]
+    _request_mapping_assert_no_authority(before)
+    _request_mapping_assert_no_authority(after)
+
+
+def test_route_a_request_mapping_display_digest_collision_cannot_merge_identities(monkeypatch):
+    monkeypatch.setattr(execution, "_sha256", lambda _value: "f" * 64)
+    result = execution._compile_route_a_request_attempt_mapping(**_request_mapping_inputs())
+    assert result["request_to_group"] == [0, 1, 0]
+    assert len(result["structural_groups"]) == 2
+    assert {row["display_sha256"] for row in result["structural_groups"]} == {"f" * 64}
+    assert result["structural_groups"][0]["structural_identity_json"] != result["structural_groups"][1]["structural_identity_json"]
+
+
+def test_route_a_request_mapping_determinism_and_bidirectional_mutation_isolation():
+    inputs = _request_mapping_inputs()
+    inputs["specifications"][0]["bookkeeping"] = {"nested": {"labels": ["INVENTED_A"]}}
+    inputs["specifications"][2]["bookkeeping"] = {"nested": {"labels": ["INVENTED_DUPLICATE"]}}
+    snapshot = copy.deepcopy(inputs)
+    first = execution._compile_route_a_request_attempt_mapping(**inputs)
+    second = execution._compile_route_a_request_attempt_mapping(**inputs)
+    assert first == second and inputs == snapshot
+    inputs["unit_metadata"]["cell"]["symbol"] = "INVENTED_CHANGED_INPUT"
+    inputs["specifications"][0]["bookkeeping"]["nested"]["labels"].append("CHANGED")
+    inputs["attempt_roster"][1]["rejection"]["details"].append("CHANGED")
+    assert first["unit_metadata"] == snapshot["unit_metadata"]
+    assert first["attempt_roster"] == snapshot["attempt_roster"]
+    assert first["requests"][0]["bookkeeping"] == snapshot["specifications"][0]["bookkeeping"]
+    first["requests"][0]["bookkeeping"]["nested"]["labels"][0] = "CHANGED_OUTPUT"
+    first["requests"][0]["partition_geometry"]["frame_start_utc"] = "CHANGED_OUTPUT"
+    first["attempt_roster"][0]["folds"][0]["partitions"]["optimizer_train"]["geometry"]["warmup_bars"] = 100
+    assert first["requests"][2]["bookkeeping"]["nested"]["labels"] == ["INVENTED_DUPLICATE"]
+    assert first["requests"][2]["partition_geometry"]["frame_start_utc"] == "2019-12-31T00:00:00+00:00"
+    assert first["requests"][0]["partition_geometry"]["warmup_bars"] == 1
+    assert second["unit_metadata"] == snapshot["unit_metadata"]
+    assert second["attempt_roster"] == snapshot["attempt_roster"]
+    assert inputs["specifications"][0]["bookkeeping"]["nested"]["labels"] == ["INVENTED_A", "CHANGED"]
+    assert snapshot["specifications"][0]["bookkeeping"]["nested"]["labels"] == ["INVENTED_A"]
+
+
+def test_route_a_request_mapping_is_metadata_only_and_does_not_route_evaluation(monkeypatch):
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("INVENTED pure compiler attempted evaluation, frame geometry, source I/O or clock access")
+    for name in ("_runtime_strategy", "_fold_partitions", "_file_sha256", "_now_utc_seconds", "Backtester"):
+        monkeypatch.setattr(execution, name, forbidden)
+    inputs = _request_mapping_inputs()
+    result = execution._compile_route_a_request_attempt_mapping(**inputs)
+    assert result["status"] == "MAPPED_METADATA_ONLY"
+    assert result["provenance_scope"] == "CALLER_SUPPLIED_METADATA_ONLY"
+    assert result["unit_metadata"]["source_access_window_utc"] == inputs["unit_metadata"]["source_access_window_utc"]
+    assert result["unit_metadata"]["anchor"]["selection_cutoff_utc"].endswith("+00:00")
+    assert result["partition_responsibilities"]["final_lockbox"] == "ORDINARY_ONLY_NOT_ROUTABLE"
+    assert "shared_evaluation_key" not in result and all("shared_evaluation_key" not in row for row in result["requests"])
+    _request_mapping_assert_no_authority(result)

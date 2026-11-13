@@ -7390,3 +7390,279 @@ def _route_a_pair_check(*, signals_by_tier, results_by_tier, spec, use_spread, f
     if pair != dict(frozen_pair):
         _fail("REALIZED_FROZEN_TIER_POLICY_DRIFT")
     return {"status": "VERIFIED", "missing_tiers": []}
+
+
+from pm_current_refit_parameters import validate_parameter_domain_member as _route_a_mapping_validate_member
+
+
+def _route_a_resolve_request_membership(*, specification, frozen_domains, attempt_roster):
+    """Resolve a normalized request against validated, nonauthorizing JSON metadata."""
+    fields = {"request_ordinal", "strategy_id", "parameters", "fold_ordinal",
+        "partition_role", "spread_tier", "bookkeeping"}
+    if (type(specification) is not dict or set(specification) != fields
+            or type(specification["request_ordinal"]) is not int or specification["request_ordinal"] < 0
+            or type(specification["strategy_id"]) is not str or not specification["strategy_id"]
+            or type(specification["parameters"]) is not dict or type(specification["bookkeeping"]) is not dict
+            or type(specification["fold_ordinal"]) is not int or specification["fold_ordinal"] < 0
+            or specification["partition_role"] not in ("optimizer_train", "tuning_validation")
+            or specification["spread_tier"] not in ("P75", "P95")
+            or type(frozen_domains) is not list or type(attempt_roster) is not list):
+        _fail("ROUTE_A_MAPPING_REQUEST_INVALID")
+    domain = next((value for value in frozen_domains
+        if value["strategy_id"] == specification["strategy_id"]), None)
+    if domain is None:
+        _fail("ROUTE_A_MAPPING_DOMAIN_UNAVAILABLE")
+    try:
+        parameters = _route_a_mapping_validate_member(domain["parameter_domain"], specification["parameters"])
+        defaults = copy.deepcopy(StrategyRegistry.get(specification["strategy_id"]).get_default_params())
+        matches = []
+        for index, attempt in enumerate(attempt_roster):
+            if attempt["status"] != "PLANNED" or attempt["strategy_id"] != specification["strategy_id"]:
+                continue
+            actual_parameters = decode_parameter_mapping(attempt["parameters"], defaults)
+            if _canonical_bytes(actual_parameters) != _canonical_bytes(parameters):
+                continue
+            folds = [fold for fold in attempt["folds"]
+                if fold["role"] == "CAUSAL_ROLLING_ORIGIN_INNER"]
+            if specification["fold_ordinal"] >= len(folds):
+                continue
+            fold = folds[specification["fold_ordinal"]]
+            partition = fold["partitions"][specification["partition_role"]]
+            matches.append((index, attempt, fold, partition))
+    except (ValueError, TypeError, KeyError, AttributeError, OverflowError, RecursionError) as error:
+        _fail("ROUTE_A_MAPPING_MATCH_DATA_INVALID", type(error).__name__)
+    if len(matches) != 1:
+        _fail("ROUTE_A_MAPPING_MEMBERSHIP_" + ("UNAVAILABLE" if not matches else "AMBIGUOUS"))
+    index, attempt, fold, partition = matches[0]
+    return json.loads(_canonical_bytes({"attempt_index": index,
+        "attempt_ordinal": attempt["ordinal"], "raw_attempt_id": attempt["raw_attempt_id"],
+        "horizon_attempt_id": attempt["horizon_attempt_id"],
+        "plan_attempt_sha256": attempt["plan_attempt_sha256"],
+        "strategy_id": specification["strategy_id"], "strategy_family": domain["strategy_family"],
+        "domain_sha256": domain["domain_sha256"], "parameters": parameters,
+        "fold_ordinal": specification["fold_ordinal"], "fold_id": fold["fold_id"],
+        "partition_role": specification["partition_role"], "partition_geometry": partition["geometry"],
+        "spread_tier": specification["spread_tier"],
+        "tier_reference": partition["tier_refs"][specification["spread_tier"]]}).decode("ascii"))
+
+
+def _compile_route_a_request_attempt_mapping(*, unit_metadata, frozen_domains, attempt_roster,
+        original_trial_count, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
+    """Compile caller metadata only; this neither authenticates nor routes an evaluation."""
+    def plain(value):
+        if type(value) in (type(None), bool, int, str):
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if type(value) is list:
+            return all(plain(item) for item in value)
+        if type(value) is dict:
+            return all(type(key) is str and plain(item) for key, item in value.items())
+        return False
+
+    def text(value):
+        return type(value) is str and bool(value)
+
+    def hexadecimal(value):
+        return type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+    binding_fields = {"generation_context_sha256", "producer_request_sha256", "executor_release_sha256",
+        "producer_source_sha256", "horizon_plan_receipt_sha256", "cell_plan_receipt_sha256",
+        "source_group_sha256", "regime_fit_sha256", "frame_sha256", "fitted_state_reference_sha256",
+        "execution_spec_sha256", "frozen_receipt_sha256", "cost_precommitments_sha256",
+        "fold_plan_sha256", "attempt_roster_sha256"}
+    unit_fields = {"declared_unit_binding", "header_reference", "source_access_window_utc", "cell",
+        "anchor", "search_process_receipt_sha256", "config_sha256", "effective_config_sha256"}
+    roles = ("optimizer_train", "tuning_validation", "final_lockbox")
+    tiers = ("P75", "P95")
+    payload = {"unit_metadata": unit_metadata, "frozen_domains": frozen_domains,
+        "attempt_roster": attempt_roster, "original_trial_count": original_trial_count,
+        "specifications": specifications, "metadata_recipe": metadata_recipe}
+    valid = False
+    try:
+        if plain(payload):
+            encoded = _canonical_bytes(payload)
+            if len(encoded) <= winner.MAX_REQUEST_BYTES:
+                snapshot = json.loads(encoded.decode("ascii"))
+                unit = snapshot["unit_metadata"]
+                binding = unit["declared_unit_binding"]
+                header = unit["header_reference"]
+                window = unit["source_access_window_utc"]
+                cell = unit["cell"]
+                anchor = unit["anchor"]
+                valid = (type(unit) is dict and set(unit) == unit_fields
+                    and type(binding) is dict and set(binding) == binding_fields
+                    and all(hexadecimal(value) for value in binding.values())
+                    and type(header) is dict and set(header) == {"schema_version", "sha256"}
+                    and text(header["schema_version"]) and hexadecimal(header["sha256"])
+                    and type(window) is dict and set(window) == {"start_utc", "end_exclusive_utc"}
+                    and all(text(value) for value in window.values())
+                    and type(cell) is dict and set(cell) == {"symbol", "timeframe", "regime"}
+                    and text(cell["symbol"]) and text(cell["timeframe"])
+                    and (cell["regime"] is None or text(cell["regime"]))
+                    and type(anchor) is dict and set(anchor) == {"anchor_id", "selection_cutoff_utc"}
+                    and all(text(value) for value in anchor.values())
+                    and all(hexadecimal(unit[name]) for name in
+                        ("search_process_receipt_sha256", "config_sha256", "effective_config_sha256"))
+                    and type(snapshot["attempt_roster"]) is list
+                    and type(snapshot["original_trial_count"]) is int
+                    and snapshot["original_trial_count"] == len(snapshot["attempt_roster"])
+                    and type(snapshot["specifications"]) is list
+                    and type(snapshot["metadata_recipe"]) is str
+                    and snapshot["metadata_recipe"] == _ROUTE_A_UNIT_BATCH_RECIPE)
+    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        valid = False
+    if not valid:
+        _fail("ROUTE_A_MAPPING_INPUT_INVALID")
+    domains, roster = snapshot["frozen_domains"], snapshot["attempt_roster"]
+    domains_valid = type(domains) is list and bool(domains)
+    domain_ids = set()
+    try:
+        for domain in domains if type(domains) is list else []:
+            required = {"strategy_id", "strategy_family", "parameter_domain", "domain_sha256"}
+            if (type(domain) is not dict or not required <= set(domain)
+                    or not text(domain["strategy_id"]) or domain["strategy_id"] in domain_ids
+                    or not text(domain["strategy_family"]) or not hexadecimal(domain["domain_sha256"])
+                    or hashlib.sha256(_canonical_bytes({key: value for key, value in domain.items()
+                        if key != "domain_sha256"})).hexdigest() != domain["domain_sha256"]):
+                domains_valid = False
+                continue
+            domain_ids.add(domain["strategy_id"])
+            _route_a_mapping_validate_member(domain["parameter_domain"], domain["parameter_domain"]["defaults"])
+    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        domains_valid = False
+    if not domains_valid:
+        _fail("ROUTE_A_MAPPING_DOMAINS_INVALID")
+
+    def partition_valid(partition, role):
+        if type(partition) is not dict or set(partition) != {"geometry", "tier_refs"}:
+            return False
+        geometry, references = partition["geometry"], partition["tier_refs"]
+        fields = {"schema_version", "role", "frame_start_utc", "scored_start_utc", "end_exclusive_utc",
+            "warmup_bars", "scored_bars", "frame_rows", "frame_sha256", "receipt_sha256"}
+        return (type(geometry) is dict and set(geometry) == fields
+            and geometry["schema_version"] == PARTITION_GEOMETRY_VERSION and geometry["role"] == role
+            and all(text(geometry[name]) for name in ("frame_start_utc", "scored_start_utc", "end_exclusive_utc"))
+            and type(geometry["warmup_bars"]) is int and geometry["warmup_bars"] >= 0
+            and type(geometry["scored_bars"]) is int and geometry["scored_bars"] > 0
+            and type(geometry["frame_rows"]) is int
+            and geometry["frame_rows"] == geometry["warmup_bars"] + geometry["scored_bars"]
+            and hexadecimal(geometry["frame_sha256"]) and hexadecimal(geometry["receipt_sha256"])
+            and hashlib.sha256(_canonical_bytes({key: value for key, value in geometry.items()
+                if key != "receipt_sha256"})).hexdigest() == geometry["receipt_sha256"]
+            and type(references) is dict and set(references) == set(tiers)
+            and all(text(value) for value in references.values()))
+
+    roster_valid, raw_ids, horizon_ids = True, set(), set()
+    try:
+        fields = {"ordinal", "raw_attempt_id", "horizon_attempt_id", "plan_attempt_sha256", "status",
+            "strategy_id", "parameters", "causal_fold_count", "folds", "rejection"}
+        for ordinal, attempt in enumerate(roster):
+            if (type(attempt) is not dict or set(attempt) != fields
+                    or type(attempt["ordinal"]) is not int or attempt["ordinal"] != ordinal
+                    or not text(attempt["raw_attempt_id"]) or attempt["raw_attempt_id"] in raw_ids
+                    or not text(attempt["horizon_attempt_id"]) or attempt["horizon_attempt_id"] in horizon_ids
+                    or not hexadecimal(attempt["plan_attempt_sha256"])
+                    or attempt["status"] not in ("PLANNED", "PROCESS_REJECTED")
+                    or attempt["strategy_id"] not in domain_ids or type(attempt["parameters"]) is not dict
+                    or type(attempt["causal_fold_count"]) is not int or attempt["causal_fold_count"] < 0
+                    or type(attempt["folds"]) is not list):
+                roster_valid = False
+                continue
+            raw_ids.add(attempt["raw_attempt_id"])
+            horizon_ids.add(attempt["horizon_attempt_id"])
+            rejection = attempt["rejection"]
+            if attempt["status"] == "PLANNED":
+                roster_valid = roster_valid and rejection is None and attempt["causal_fold_count"] > 0
+            else:
+                roster_valid = roster_valid and (type(rejection) is dict
+                    and {"kind", "code", "details"} <= set(rejection)
+                    and rejection["kind"] == "PROCESS_REJECTED" and text(rejection["code"])
+                    and type(rejection["details"]) is list and all(type(value) is str for value in rejection["details"]))
+            fold_ids, causal_count = set(), 0
+            for fold in attempt["folds"]:
+                if (type(fold) is not dict or set(fold) != {"role", "fold_id", "partitions"}
+                        or not text(fold["role"]) or not text(fold["fold_id"]) or fold["fold_id"] in fold_ids
+                        or type(fold["partitions"]) is not dict):
+                    roster_valid = False
+                    continue
+                fold_ids.add(fold["fold_id"])
+                if fold["role"] == "CAUSAL_ROLLING_ORIGIN_INNER":
+                    causal_count += 1
+                    roster_valid = roster_valid and set(fold["partitions"]) == set(roles)
+                    for role in roles:
+                        roster_valid = roster_valid and partition_valid(fold["partitions"].get(role), role)
+                else:
+                    roster_valid = roster_valid and fold["partitions"] == {}
+            roster_valid = roster_valid and causal_count == attempt["causal_fold_count"]
+    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        roster_valid = False
+    if not roster_valid:
+        _fail("ROUTE_A_MAPPING_ROSTER_INVALID")
+    rows = _route_a_batch_specifications(snapshot["specifications"])
+    requests, groups, group_indices, requested_lanes = [], [], {}, set()
+    for row in rows:
+        resolved = _route_a_resolve_request_membership(specification=row,
+            frozen_domains=domains, attempt_roster=roster)
+        structural = {"unit_metadata": unit, "attempt_ordinal": resolved["attempt_ordinal"],
+            "raw_attempt_id": resolved["raw_attempt_id"], "horizon_attempt_id": resolved["horizon_attempt_id"],
+            "plan_attempt_sha256": resolved["plan_attempt_sha256"],
+            "strategy_id": resolved["strategy_id"], "strategy_family": resolved["strategy_family"],
+            "domain_sha256": resolved["domain_sha256"], "parameters": resolved["parameters"],
+            "fold_ordinal": resolved["fold_ordinal"], "fold_id": resolved["fold_id"],
+            "partition_geometry": resolved["partition_geometry"], "spread_tier": resolved["spread_tier"],
+            "tier_reference": resolved["tier_reference"], "metadata_recipe": snapshot["metadata_recipe"]}
+        identity = _canonical_bytes(structural)
+        group_ordinal = group_indices.get(identity)
+        if group_ordinal is None:
+            group_ordinal = len(groups)
+            group_indices[identity] = group_ordinal
+            groups.append({"group_ordinal": group_ordinal, "first_request_ordinal": row["request_ordinal"],
+                "structural_identity_json": identity.decode("ascii"), "display_sha256": _sha256(structural)})
+        requests.append({**resolved, "request_ordinal": row["request_ordinal"], "group_ordinal": group_ordinal,
+            "bookkeeping": row["bookkeeping"], "ordinary_lane": row["partition_role"] + "_" + row["spread_tier"].lower()})
+        requested_lanes.add((resolved["attempt_ordinal"], row["fold_ordinal"], row["partition_role"], row["spread_tier"]))
+
+    def lane(attempt, fold, fold_ordinal, role, tier):
+        partition = fold["partitions"][role]
+        return {"attempt_ordinal": attempt["ordinal"], "raw_attempt_id": attempt["raw_attempt_id"],
+            "horizon_attempt_id": attempt["horizon_attempt_id"], "fold_ordinal": fold_ordinal,
+            "fold_id": fold["fold_id"], "partition_role": role, "spread_tier": tier,
+            "partition_geometry_receipt_sha256": partition["geometry"]["receipt_sha256"],
+            "tier_reference": partition["tier_refs"][tier]}
+
+    coverage = []
+    for attempt in roster:
+        expected, requested, missing, lockbox = [], [], [], []
+        if attempt["status"] == "PLANNED":
+            folds = [fold for fold in attempt["folds"] if fold["role"] == "CAUSAL_ROLLING_ORIGIN_INNER"]
+            for fold_ordinal, fold in enumerate(folds):
+                for role in roles:
+                    for tier in tiers:
+                        entry = lane(attempt, fold, fold_ordinal, role, tier)
+                        if role == "final_lockbox":
+                            lockbox.append(entry)
+                        else:
+                            expected.append(entry)
+                            target = requested if (attempt["ordinal"], fold_ordinal, role, tier) in requested_lanes else missing
+                            target.append(entry)
+        coverage.append({"attempt_ordinal": attempt["ordinal"], "raw_attempt_id": attempt["raw_attempt_id"],
+            "horizon_attempt_id": attempt["horizon_attempt_id"], "status": attempt["status"],
+            "expected_batch_lanes": expected, "requested_unique_lanes": requested,
+            "missing_batch_lanes": missing, "ordinary_only_lockbox_lanes": lockbox})
+    result = {"schema_version": "fxpm.route-a-request-attempt-mapping.v1", "status": "MAPPED_METADATA_ONLY",
+        "provenance_scope": "CALLER_SUPPLIED_METADATA_ONLY", "unit_metadata": unit,
+        "attempt_roster": roster, "original_trial_count": snapshot["original_trial_count"],
+        "requests": requests, "request_to_group": [row["group_ordinal"] for row in requests],
+        "structural_groups": groups, "coverage_by_attempt": coverage,
+        "counts": {"original_trials": snapshot["original_trial_count"],
+            "planned_trials": sum(attempt["status"] == "PLANNED" for attempt in roster),
+            "rejected_trials": sum(attempt["status"] == "PROCESS_REJECTED" for attempt in roster),
+            "requests": len(requests), "structural_groups": len(groups)},
+        "partition_responsibilities": {"optimizer_train": "ORIGINAL_ORDINARY_BUILDER",
+            "tuning_validation": "ORIGINAL_ORDINARY_BUILDER", "final_lockbox": "ORDINARY_ONLY_NOT_ROUTABLE"},
+        **_route_a_diagnostic_authorities()}
+    encoded_result = _canonical_bytes(result)
+    if len(encoded_result) > winner.MAX_REQUEST_BYTES:
+        _fail("ROUTE_A_MAPPING_RESULT_TOO_LARGE")
+    return json.loads(encoded_result.decode("ascii"))
