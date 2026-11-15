@@ -966,6 +966,133 @@ def publication_lease(
             guard.close(remove=remove_guard)
 
 
+@dataclass
+class PublicationBatch:
+    """One durable reservation shared by many small publications.
+
+    The durable reservation always covers every byte the batch has published and
+    not yet committed. Closing commits the same sum the per-object commits add.
+    """
+
+    _lease: PublicationLease
+    _window_bytes: int
+    _reserved_bytes: int = 0
+    _published_bytes: int = 0
+    _reported_bytes: int = 0
+    _poisoned: bool = False
+
+    @property
+    def published_bytes(self) -> int:
+        return self._published_bytes
+
+    @property
+    def reserved_bytes(self) -> int:
+        return self._reserved_bytes
+
+    @property
+    def poisoned(self) -> bool:
+        return self._poisoned
+
+    def _report(self) -> None:
+        pending = self._published_bytes - self._reported_bytes
+        if pending:
+            self._lease.materialize(pending)
+            self._reported_bytes = self._published_bytes
+
+    def reserve(self, byte_count: int) -> None:
+        """Durably cover the next object before any of its bytes are written."""
+
+        if self._poisoned:
+            _fail("SPOOL_QUOTA_BATCH_POISONED")
+        count = _bound(
+            byte_count,
+            "SPOOL_QUOTA_CONSUME_BYTES_INVALID",
+            allow_zero=True,
+        )
+        needed = self._published_bytes + count - self._reserved_bytes
+        if needed <= 0:
+            return
+        # Bytes already on disk have lowered the free space; report them so
+        # the free-space check does not also count them as promised.
+        self._report()
+        requested = max(needed, self._window_bytes)
+        try:
+            self._lease.consume(requested)
+        except AuthoritySpoolQuotaError as exc:
+            if requested == needed or exc.code not in {
+                "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
+                "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
+            }:
+                raise
+            self._lease.consume(needed)
+        self._reserved_bytes = self._lease.in_progress_bytes
+
+    def published(self, byte_count: int) -> None:
+        """Count one linked object; report materialized bytes per window."""
+
+        if self._poisoned:
+            _fail("SPOOL_QUOTA_BATCH_POISONED")
+        count = _bound(
+            byte_count,
+            "SPOOL_QUOTA_MATERIALIZE_BYTES_INVALID",
+            allow_zero=True,
+        )
+        if self._published_bytes + count > self._reserved_bytes:
+            _fail("SPOOL_QUOTA_MATERIALIZED_EXCEEDS_RESERVED")
+        self._published_bytes += count
+        if self._published_bytes - self._reported_bytes >= self._window_bytes:
+            self._report()
+
+    def poison(self) -> None:
+        """Keep the record for the rescan and refuse any further use.
+
+        The reservation then still covers every byte this batch put on disk,
+        whether or not it was counted as published, until the rescan.
+        """
+
+        self._poisoned = True
+
+    def close(self) -> None:
+        if not self._poisoned:
+            self._lease.commit(self._published_bytes)
+
+
+@contextmanager
+def publication_batch(
+    root: Path,
+    *,
+    max_generation_bytes: int,
+    min_free_bytes: int,
+    window_bytes: int,
+) -> Iterator[PublicationBatch]:
+    """Hold one reservation record across many small publications."""
+
+    window = _bound(
+        window_bytes,
+        "SPOOL_QUOTA_BATCH_WINDOW_INVALID",
+        allow_zero=False,
+    )
+    with publication_lease(
+        root,
+        max_generation_bytes=max_generation_bytes,
+        min_free_bytes=min_free_bytes,
+    ) as lease:
+        batch = PublicationBatch(_lease=lease, _window_bytes=window)
+        try:
+            yield batch
+        except BaseException:
+            # Linked objects are durable. Account for them, and keep the root
+            # cause if accounting fails: the record then stays for the rescan.
+            try:
+                if not lease._finished:
+                    batch.close()
+            except AuthoritySpoolQuotaError:
+                pass
+            raise
+        else:
+            batch.close()
+
+
 def assert_generation_not_terminal(root: Path) -> None:
     """A terminal control of any shape refuses admission; never repair it here."""
     try:
@@ -995,6 +1122,7 @@ def generation_retirement_lock(root: Path, *, max_root_entries: int) -> Iterator
 
 __all__ = [
     "AuthoritySpoolQuotaError",
+    "PublicationBatch",
     "PublicationLease",
     "QUOTA_LOCK_NAME",
     "QUOTA_RESERVATION_PREFIX",
@@ -1002,5 +1130,6 @@ __all__ = [
     "assert_generation_not_terminal",
     "generation_retirement_lock",
     "QUOTA_STATE_NAME",
+    "publication_batch",
     "publication_lease",
 ]

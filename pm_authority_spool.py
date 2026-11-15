@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import itertools
 import json
 import math
 import os
 import re
 import stat
+import threading
 import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
@@ -558,6 +560,184 @@ def _cancel_clean_reservation(
             pass
 
 
+@dataclass
+class _PublicationBatchScope:
+    account: spool_quota.PublicationBatch
+    published_objects: int = 0
+    reused_objects: int = 0
+
+
+# A batch never holds more reserved and unpublished bytes than this.
+_BATCH_RESERVATION_WINDOW_BYTES = DEFAULT_STREAM_CHUNK_BYTES
+
+# One scope per thread and spool root. A spawned child starts with none.
+_PUBLICATION_BATCHES: dict[tuple[int, str], _PublicationBatchScope] = {}
+
+
+def _publication_batch_key(context: GenerationSpoolContext) -> tuple[int, str]:
+    return threading.get_ident(), os.path.normcase(str(context.root))
+
+
+@contextmanager
+def publication_batch(context: GenerationSpoolContext) -> Iterator[None]:
+    """Share one quota reservation across the small objects published inside.
+
+    Every per-object control of the ordinary path still runs for each object:
+    the context check, the directory and reparse checks, the size bound, the
+    exclusive temporary file, fsync, the atomic link and the content-address
+    check. Only the quota bookkeeping is shared: one reservation record,
+    reserved in windows and committed once at close.
+    """
+
+    _assert_context_current(context)
+    if context.writable is not True:
+        _fail("GENERATION_CONTEXT_READ_ONLY")
+    key = _publication_batch_key(context)
+    if key in _PUBLICATION_BATCHES:
+        yield
+        return
+    try:
+        with spool_quota.publication_batch(
+            context.root,
+            max_generation_bytes=context.limits.max_generation_bytes,
+            min_free_bytes=context.limits.min_free_bytes,
+            window_bytes=_BATCH_RESERVATION_WINDOW_BYTES,
+        ) as account:
+            _PUBLICATION_BATCHES[key] = _PublicationBatchScope(account)
+            try:
+                yield
+            finally:
+                _PUBLICATION_BATCHES.pop(key, None)
+    except spool_quota.AuthoritySpoolQuotaError as exc:
+        raise AuthoritySpoolError(str(exc)) from exc
+
+
+def _buffer_small_payload(
+    chunks: Iterable[bytes],
+    limit: int,
+) -> tuple[Optional[bytes], Iterable[bytes]]:
+    """Return the whole payload when it fits one buffer, else the stream intact."""
+
+    iterator = iter(chunks)
+    held = bytearray()
+    for raw in iterator:
+        if type(raw) not in {bytes, bytearray, memoryview}:
+            _fail("ARTIFACT_CHUNK_TYPE_INVALID")
+        if len(held) + memoryview(raw).nbytes > limit:
+            return None, itertools.chain((bytes(held), raw), iterator)
+        # Producers may reuse a mutable buffer on their next iteration.
+        held.extend(bytes(raw))
+    return bytes(held), ()
+
+
+def _keep_batch_reservation_fail_closed(
+    scope: _PublicationBatchScope,
+    *,
+    temp: Path,
+    target: Path,
+    linked: bool,
+) -> None:
+    """Mirror _cancel_clean_reservation for a failure inside a batch.
+
+    The batch commits at close only while no transaction-owned inode can
+    remain unaccounted; otherwise its record stays for the existing rescan.
+    """
+
+    published = linked
+    if not published:
+        try:
+            published = os.path.samefile(temp, target)
+        except OSError:
+            pass
+    try:
+        temp.unlink(missing_ok=True)
+        cleaned = not temp.exists()
+    except OSError:
+        cleaned = False
+    if published or not cleaned:
+        scope.account.poison()
+
+
+def _publish_small_object(
+    context: GenerationSpoolContext,
+    scope: _PublicationBatchScope,
+    payload: bytes,
+    format_name: str,
+) -> dict[str, Any]:
+    if scope.account.poisoned:
+        _fail("PUBLICATION_BATCH_POISONED")
+    total = len(payload)
+    if total > context.limits.max_artifact_bytes:
+        _fail("ARTIFACT_SIZE_BOUND_EXCEEDED")
+    if total <= 0:
+        _fail("ARTIFACT_EMPTY")
+    content_hash = hashlib.sha256(payload).hexdigest()
+    relative_path = _content_relative_path(content_hash, format_name)
+    target = _local_path(context.root, relative_path)
+    try:
+        if target.exists():
+            if not _files_match(
+                context.root,
+                relative_path,
+                content_hash,
+                total,
+                context.limits.stream_chunk_bytes,
+            ):
+                _fail("CONTENT_ADDRESS_CONFLICT")
+            scope.reused_objects += 1
+        else:
+            scope.account.reserve(total)
+            temp = _temporary_path(context.root)
+            descriptor = _open_exclusive(temp)
+            linked = False
+            try:
+                try:
+                    _write_all(descriptor, memoryview(payload))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+                try:
+                    _publish_temp_exclusive(context.root, temp, relative_path)
+                    linked = True
+                except FileExistsError:
+                    if not _files_match(
+                        context.root,
+                        relative_path,
+                        content_hash,
+                        total,
+                        context.limits.stream_chunk_bytes,
+                    ):
+                        _fail("CONTENT_ADDRESS_CONFLICT")
+                try:
+                    temp.unlink()
+                except OSError as exc:
+                    raise AuthoritySpoolError(
+                        "TEMPORARY_FILE_CLEANUP_FAILED"
+                    ) from exc
+                if linked:
+                    scope.account.published(total)
+                    scope.published_objects += 1
+                else:
+                    scope.reused_objects += 1
+            except BaseException:
+                _keep_batch_reservation_fail_closed(
+                    scope,
+                    temp=temp,
+                    target=target,
+                    linked=linked,
+                )
+                raise
+    except spool_quota.AuthoritySpoolQuotaError as exc:
+        raise AuthoritySpoolError(str(exc)) from exc
+    return {
+        "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
+        "relative_path": relative_path,
+        "sha256": content_hash,
+        "size_bytes": total,
+        "format": format_name,
+    }
+
+
 def _write_streamed_object(
     context: GenerationSpoolContext,
     chunks: Iterable[bytes],
@@ -568,6 +748,15 @@ def _write_streamed_object(
     _assert_context_current(context)
     if context.writable is not True:
         _fail("GENERATION_CONTEXT_READ_ONLY")
+    if _PUBLICATION_BATCHES:
+        scope = _PUBLICATION_BATCHES.get(_publication_batch_key(context))
+        if scope is not None:
+            payload, chunks = _buffer_small_payload(
+                chunks,
+                min(context.limits.stream_chunk_bytes, DEFAULT_STREAM_CHUNK_BYTES),
+            )
+            if payload is not None:
+                return _publish_small_object(context, scope, payload, format_name)
     try:
         with spool_quota.publication_lease(
             context.root,
@@ -2767,6 +2956,7 @@ __all__ = [
     "freeze_generation_context",
     "is_resource_capacity_error",
     "open_symbol_sink",
+    "publication_batch",
     "reopen_generation_context",
     "reserve_transient_publication",
     "validate_spool_limits",

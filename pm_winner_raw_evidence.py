@@ -5715,126 +5715,127 @@ def _produce_winner_raw_evidence(
             raw = next(raw_iterator)
         except StopIteration as exc:
             raise WinnerRawEvidenceError("ATTEMPT_EVIDENCE_ROSTER_OMISSION") from exc
-        ordinal = attempt["ordinal"]
-        if (
-            not isinstance(raw, Mapping)
-            or raw.get("attempt_id") != attempt["attempt_id"]
-        ):
-            _fail(f"ATTEMPT_{ordinal:04d}_EVIDENCE_IDENTITY_MISMATCH")
-        prefix = (
-            f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}/"
-            f"attempt-{ordinal:04d}"
-        )
-        if set(raw) == {"attempt_id", "outcome"}:
-            outcome = raw.get("outcome")
-            status = _outcome_status(outcome, frozen=frozen, attempt=attempt)
-            outcome_entry = _put_ascii_json(
-                sink,
-                f"{prefix}/search-outcome",
-                "winner_search_outcome",
-                outcome.to_dict(),
+        with authority_spool.publication_batch(sink.context):
+            ordinal = attempt["ordinal"]
+            if (
+                not isinstance(raw, Mapping)
+                or raw.get("attempt_id") != attempt["attempt_id"]
+            ):
+                _fail(f"ATTEMPT_{ordinal:04d}_EVIDENCE_IDENTITY_MISMATCH")
+            prefix = (
+                f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}/"
+                f"attempt-{ordinal:04d}"
             )
-            spool_entries[f"attempt-{ordinal:04d}-outcome"] = outcome_entry
-            if status == "TECHNICAL_FAILURE":
-                raise WinnerRawEvidenceIncomplete(
-                    "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE",
-                    str(outcome.reason_code),
-                )
-            if attempt["precommitted_evidence_role"] != "PRESEARCH_PROCESS_REJECTED":
-                raise WinnerRawEvidenceIncomplete(
-                    "EVALUATION_REQUIRED_ATTEMPT_OUTCOME_ONLY",
-                    str(outcome.reason_code),
-                )
-            evidence_entries.append(
-                _evidence_entry(attempt, status=status, folds=[])
-            )
-            continue
-        if attempt["precommitted_evidence_role"] != "EVALUATION_REQUIRED":
-            _fail(f"ATTEMPT_{ordinal:04d}_PRESEARCH_REJECTED_CARRIES_RAW_FOLDS")
-        if set(raw) != {"attempt_id", "folds"}:
-            _fail(f"ATTEMPT_{ordinal:04d}_EVIDENCE_SCHEMA_INVALID")
-        raw_folds = raw.get("folds")
-        planned_folds = precommitment["causal_fold_plan"]
-        if type(raw_folds) is not list or len(raw_folds) != len(planned_folds):
-            _fail(f"ATTEMPT_{ordinal:04d}_FOLD_ROSTER_INCOMPLETE")
-        folds: list[dict[str, Any]] = []
-        attempt_shared_axis: list[dict[str, Any]] = []
-        attempt_status = "AUTHENTICATED"
-        seen_position_ids = {tier: set() for tier in _TIERS}
-        for planned_fold, raw_fold in zip(planned_folds, raw_folds, strict=True):
-            try:
-                outcome, fold_entries = _build_evaluated_fold(
+            if set(raw) == {"attempt_id", "outcome"}:
+                outcome = raw.get("outcome")
+                status = _outcome_status(outcome, frozen=frozen, attempt=attempt)
+                outcome_entry = _put_ascii_json(
                     sink,
-                    frozen=frozen,
-                    attempt=attempt,
-                    attempt_artifacts=attempt_artifacts,
-                    cross_binding=cross_binding,
-                    cross_binding_context=cross_binding_context,
-                    cross_binding_attempt=cross_binding_attempt,
-                    planned_fold=planned_fold,
-                    raw_fold=raw_fold,
-                    source_observation_entries=source_observation_entries,
-                    provenance_schemas=provenance_schemas,
-                    partition_cost_index=partition_cost_index,
+                    f"{prefix}/search-outcome",
+                    "winner_search_outcome",
+                    outcome.to_dict(),
                 )
-            except WinnerRawEvidenceIncomplete:
-                raise
-            except WinnerRawEvidenceError as exc:
-                raise WinnerRawEvidenceIncomplete(
-                    "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE", exc.code
-                ) from exc
-            for name, entry in fold_entries.items():
-                spool_entries[
-                    f"attempt-{ordinal:04d}-fold-"
-                    f"{planned_fold['fold_ordinal']:03d}-{name}"
-                ] = entry
-            if outcome.status == "TECHNICAL_FAILURE":
-                raise WinnerRawEvidenceIncomplete(
-                    "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE", outcome.reason_code
+                spool_entries[f"attempt-{ordinal:04d}-outcome"] = outcome_entry
+                if status == "TECHNICAL_FAILURE":
+                    raise WinnerRawEvidenceIncomplete(
+                        "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE",
+                        str(outcome.reason_code),
+                    )
+                if attempt["precommitted_evidence_role"] != "PRESEARCH_PROCESS_REJECTED":
+                    raise WinnerRawEvidenceIncomplete(
+                        "EVALUATION_REQUIRED_ATTEMPT_OUTCOME_ONLY",
+                        str(outcome.reason_code),
+                    )
+                evidence_entries.append(
+                    _evidence_entry(attempt, status=status, folds=[])
                 )
-            folds.append(outcome.fold)
-            attempt_shared_axis.append(outcome.shared_fold_axis_row)
-            if outcome.status == "PROCESS_REJECTED":
-                attempt_status = "PROCESS_REJECTED"
-            for tier, tier_row in outcome.fold["tier_evidence"].items():
-                count = len(tier_row["completed_trade_open_offset_seconds"])
+                continue
+            if attempt["precommitted_evidence_role"] != "EVALUATION_REQUIRED":
+                _fail(f"ATTEMPT_{ordinal:04d}_PRESEARCH_REJECTED_CARRIES_RAW_FOLDS")
+            if set(raw) != {"attempt_id", "folds"}:
+                _fail(f"ATTEMPT_{ordinal:04d}_EVIDENCE_SCHEMA_INVALID")
+            raw_folds = raw.get("folds")
+            planned_folds = precommitment["causal_fold_plan"]
+            if type(raw_folds) is not list or len(raw_folds) != len(planned_folds):
+                _fail(f"ATTEMPT_{ordinal:04d}_FOLD_ROSTER_INCOMPLETE")
+            folds: list[dict[str, Any]] = []
+            attempt_shared_axis: list[dict[str, Any]] = []
+            attempt_status = "AUTHENTICATED"
+            seen_position_ids = {tier: set() for tier in _TIERS}
+            for planned_fold, raw_fold in zip(planned_folds, raw_folds, strict=True):
                 try:
-                    positions = set(winner._decode_position_id_digests(
-                        tier_row["completed_trade_position_id_digests_base64"], count, "COMPLETED_TRADE_POSITION_ID_DIGESTS_INVALID"))
-                except ValueError as exc:
-                    raise WinnerRawEvidenceError(str(exc)) from exc
-                if seen_position_ids[tier] & positions:
-                    _fail(f"ATTEMPT_{ordinal:04d}_{tier}_POSITION_ID_REUSED_ACROSS_FOLDS")
-                seen_position_ids[tier] |= positions
-                total_completed_trades += count
-                _check_cumulative_completed_trades(total_completed_trades, _generation)
-        if len(folds) != len(planned_folds):
-            _fail("EVALUATION_REQUIRED_FOLD_ROSTER_INCOMPLETE")
-        if shared_fold_axis is None:
-            shared_fold_axis = attempt_shared_axis
-        elif shared_fold_axis != attempt_shared_axis:
-            _fail("SHARED_FOLD_AXIS_DRIFT_ACROSS_ATTEMPTS")
-        finalized_folds: list[dict[str, Any]] = []
-        for fold, axis_row in zip(folds, attempt_shared_axis, strict=True):
-            finalized = dict(fold)
-            fold_ordinal = finalized["fold_ordinal"]
-            fold_entry = _put_ascii_json(
-                sink,
-                f"{prefix}/fold-{fold_ordinal:03d}/winner-fold",
-                "winner_evaluated_fold",
-                finalized,
+                    outcome, fold_entries = _build_evaluated_fold(
+                        sink,
+                        frozen=frozen,
+                        attempt=attempt,
+                        attempt_artifacts=attempt_artifacts,
+                        cross_binding=cross_binding,
+                        cross_binding_context=cross_binding_context,
+                        cross_binding_attempt=cross_binding_attempt,
+                        planned_fold=planned_fold,
+                        raw_fold=raw_fold,
+                        source_observation_entries=source_observation_entries,
+                        provenance_schemas=provenance_schemas,
+                        partition_cost_index=partition_cost_index,
+                    )
+                except WinnerRawEvidenceIncomplete:
+                    raise
+                except WinnerRawEvidenceError as exc:
+                    raise WinnerRawEvidenceIncomplete(
+                        "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE", exc.code
+                    ) from exc
+                for name, entry in fold_entries.items():
+                    spool_entries[
+                        f"attempt-{ordinal:04d}-fold-"
+                        f"{planned_fold['fold_ordinal']:03d}-{name}"
+                    ] = entry
+                if outcome.status == "TECHNICAL_FAILURE":
+                    raise WinnerRawEvidenceIncomplete(
+                        "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE", outcome.reason_code
+                    )
+                folds.append(outcome.fold)
+                attempt_shared_axis.append(outcome.shared_fold_axis_row)
+                if outcome.status == "PROCESS_REJECTED":
+                    attempt_status = "PROCESS_REJECTED"
+                for tier, tier_row in outcome.fold["tier_evidence"].items():
+                    count = len(tier_row["completed_trade_open_offset_seconds"])
+                    try:
+                        positions = set(winner._decode_position_id_digests(
+                            tier_row["completed_trade_position_id_digests_base64"], count, "COMPLETED_TRADE_POSITION_ID_DIGESTS_INVALID"))
+                    except ValueError as exc:
+                        raise WinnerRawEvidenceError(str(exc)) from exc
+                    if seen_position_ids[tier] & positions:
+                        _fail(f"ATTEMPT_{ordinal:04d}_{tier}_POSITION_ID_REUSED_ACROSS_FOLDS")
+                    seen_position_ids[tier] |= positions
+                    total_completed_trades += count
+                    _check_cumulative_completed_trades(total_completed_trades, _generation)
+            if len(folds) != len(planned_folds):
+                _fail("EVALUATION_REQUIRED_FOLD_ROSTER_INCOMPLETE")
+            if shared_fold_axis is None:
+                shared_fold_axis = attempt_shared_axis
+            elif shared_fold_axis != attempt_shared_axis:
+                _fail("SHARED_FOLD_AXIS_DRIFT_ACROSS_ATTEMPTS")
+            finalized_folds: list[dict[str, Any]] = []
+            for fold, axis_row in zip(folds, attempt_shared_axis, strict=True):
+                finalized = dict(fold)
+                fold_ordinal = finalized["fold_ordinal"]
+                fold_entry = _put_ascii_json(
+                    sink,
+                    f"{prefix}/fold-{fold_ordinal:03d}/winner-fold",
+                    "winner_evaluated_fold",
+                    finalized,
+                )
+                spool_entries[
+                    f"attempt-{ordinal:04d}-fold-{fold_ordinal:03d}-winner-fold"
+                ] = fold_entry
+                finalized_folds.append(finalized)
+            evidence_entries.append(
+                _evidence_entry(
+                    attempt,
+                    status=attempt_status,
+                    folds=finalized_folds,
+                )
             )
-            spool_entries[
-                f"attempt-{ordinal:04d}-fold-{fold_ordinal:03d}-winner-fold"
-            ] = fold_entry
-            finalized_folds.append(finalized)
-        evidence_entries.append(
-            _evidence_entry(
-                attempt,
-                status=attempt_status,
-                folds=finalized_folds,
-            )
-        )
     try:
         next(raw_iterator)
     except StopIteration:
