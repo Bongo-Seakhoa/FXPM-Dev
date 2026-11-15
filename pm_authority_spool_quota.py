@@ -11,7 +11,7 @@ rescan before more bytes are admitted.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -980,6 +980,7 @@ class PublicationBatch:
     _published_bytes: int = 0
     _reported_bytes: int = 0
     _poisoned: bool = False
+    _in_flight_publications: dict[object, int] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @property
     def published_bytes(self) -> int:
@@ -1009,7 +1010,7 @@ class PublicationBatch:
             "SPOOL_QUOTA_CONSUME_BYTES_INVALID",
             allow_zero=True,
         )
-        needed = self._published_bytes + count - self._reserved_bytes
+        needed = self._published_bytes + sum(self._in_flight_publications.values()) + count - self._reserved_bytes
         if needed <= 0:
             return
         # Bytes already on disk have lowered the free space; report them so
@@ -1026,6 +1027,17 @@ class PublicationBatch:
                 raise
             self._lease.consume(needed)
         self._reserved_bytes = self._lease.in_progress_bytes
+
+    def _publication_started(self, byte_count: int) -> object:
+        """Keep a distinct marker until this publication is accounted or cleaned."""
+
+        count = _bound(byte_count, "SPOOL_QUOTA_MATERIALIZE_BYTES_INVALID", allow_zero=True)
+        marker = object()
+        self._in_flight_publications[marker] = count
+        return marker
+
+    def _publication_finished(self, marker: object) -> None:
+        self._in_flight_publications.pop(marker, None)
 
     def published(self, byte_count: int) -> None:
         """Count one linked object; report materialized bytes per window."""
@@ -1053,7 +1065,7 @@ class PublicationBatch:
         self._poisoned = True
 
     def close(self) -> None:
-        if not self._poisoned:
+        if not self._poisoned and not self._in_flight_publications:
             self._lease.commit(self._published_bytes)
 
 

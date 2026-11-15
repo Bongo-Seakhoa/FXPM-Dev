@@ -21,7 +21,6 @@ from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Union
 
-from pm_position import TradeTagEncoder
 
 
 LEGACY_STATE_SCHEMA_VERSION = "2026-07-10-live-outcome-state-v1"
@@ -2864,6 +2863,7 @@ class LiveOutcomeLedger:
             opening_order = sorted(opening_orders, key=lambda item: (item["time"], item["ticket"]))[0]
             entry_comment = entry_comment or opening_order["comment"]
             entry_magic = entry_magic or opening_order["magic"]
+        from pm_position import TradeTagEncoder
         decoded = TradeTagEncoder.decode_comment(entry_comment) if entry_comment else None
         decoded = dict(decoded or {})
 

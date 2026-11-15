@@ -636,6 +636,7 @@ def _keep_batch_reservation_fail_closed(
     temp: Path,
     target: Path,
     linked: bool,
+    publication: object,
 ) -> None:
     """Mirror _cancel_clean_reservation for a failure inside a batch.
 
@@ -644,9 +645,18 @@ def _keep_batch_reservation_fail_closed(
     """
 
     published = linked
+    no_owned_link = False
     if not published:
         try:
             published = os.path.samefile(temp, target)
+            no_owned_link = not published
+        except FileNotFoundError:
+            try:
+                target.lstat()
+            except FileNotFoundError:
+                no_owned_link = True
+            except OSError:
+                pass
         except OSError:
             pass
     try:
@@ -654,8 +664,10 @@ def _keep_batch_reservation_fail_closed(
         cleaned = not temp.exists()
     except OSError:
         cleaned = False
-    if published or not cleaned:
+    if published or not cleaned or not no_owned_link:
         scope.account.poison()
+    else:
+        scope.account._publication_finished(publication)
 
 
 def _publish_small_object(
@@ -688,9 +700,10 @@ def _publish_small_object(
         else:
             scope.account.reserve(total)
             temp = _temporary_path(context.root)
-            descriptor = _open_exclusive(temp)
+            publication = scope.account._publication_started(total)
             linked = False
             try:
+                descriptor = _open_exclusive(temp)
                 try:
                     _write_all(descriptor, memoryview(payload))
                     os.fsync(descriptor)
@@ -719,12 +732,14 @@ def _publish_small_object(
                     scope.published_objects += 1
                 else:
                     scope.reused_objects += 1
+                scope.account._publication_finished(publication)
             except BaseException:
                 _keep_batch_reservation_fail_closed(
                     scope,
                     temp=temp,
                     target=target,
                     linked=linked,
+                    publication=publication,
                 )
                 raise
     except spool_quota.AuthoritySpoolQuotaError as exc:

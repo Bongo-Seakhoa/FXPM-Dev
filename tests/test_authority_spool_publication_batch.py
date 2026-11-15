@@ -489,3 +489,224 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(d["sha256"], hashlib.sha256(payload(1)).hexdigest())
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
         self.assertQuota(ctx, SIZE)
+
+    def _assert_double_fault_keeps_in_flight_reservation(self, *, nested):
+        """INVENTED software faults only; no financial or performance evidence."""
+        ctx = self.context("double_nested" if nested else "double_single")
+        real_publish = spool._publish_temp_exclusive
+        real_samefile = spool.os.path.samefile
+        old_window = spool._BATCH_RESERVATION_WINDOW_BYTES
+        spool._BATCH_RESERVATION_WINDOW_BYTES = SIZE
+        self.addCleanup(setattr, spool, "_BATCH_RESERVATION_WINDOW_BYTES", old_window)
+        self.addCleanup(setattr, spool, "_publish_temp_exclusive", real_publish)
+        self.addCleanup(setattr, spool.os.path, "samefile", real_samefile)
+        outer_relative = spool._content_relative_path(hashlib.sha256(payload(1)).hexdigest(), FORMAT)
+        outer_target = ctx.root / outer_relative
+        interrupted = []
+
+        class CleanupInterrupted(BaseException):
+            pass
+
+        def publish_then_fail(root, temp, relative_path):
+            real_publish(root, temp, relative_path)
+            if relative_path == outer_relative:
+                if nested:
+                    with spool.publication_batch(ctx):
+                        spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
+                raise OSError("first fault after owned link")
+
+        def interrupt_samefile(temp, target):
+            if Path(target) == outer_target:
+                interrupted.append(True)
+                raise CleanupInterrupted("second fault in cleanup")
+            return real_samefile(temp, target)
+
+        spool._publish_temp_exclusive = publish_then_fail
+        spool.os.path.samefile = interrupt_samefile
+        with self.assertRaisesRegex(CleanupInterrupted, "second fault in cleanup") as caught:
+            with spool.publication_batch(ctx):
+                spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
+        spool._publish_temp_exclusive = real_publish
+        spool.os.path.samefile = real_samefile
+        self.assertIsInstance(caught.exception.__context__, OSError)
+        self.assertEqual(interrupted, [True])
+        linked_count = 2 if nested else 1
+        self.assertEqual(len(tree(ctx.root)), linked_count)
+        before = state(ctx.root)
+        self.assertEqual(before["committed_bytes"], self.bases[ctx.root])
+        self.assertEqual(len(before["reservations"]), 1)
+        self.assertGreaterEqual(before["reservations"][0]["reserved_bytes"], linked_count * SIZE)
+        self.assertEqual(spool._PUBLICATION_BATCHES, {})
+        spool.write_opaque_artifact(ctx, [payload(3)], format=FORMAT)
+        self.assertQuota(ctx, (linked_count + 1) * SIZE)
+        self.assertEqual(len(tree(ctx.root)), linked_count + 1)
+
+    def test_double_fault_after_link_retains_reservation_until_ordinary_rescan(self):
+        self._assert_double_fault_keeps_in_flight_reservation(nested=False)
+
+    def test_nested_publication_does_not_clear_outer_double_fault_marker(self):
+        self._assert_double_fault_keeps_in_flight_reservation(nested=True)
+
+    def test_proven_clean_prelink_failure_clears_only_its_marker(self):
+        """INVENTED pre-link fault: proven cleanup permits the existing batch."""
+        ctx = self.context("clean_prelink")
+        real = spool._publish_temp_exclusive
+        self.addCleanup(setattr, spool, "_publish_temp_exclusive", real)
+
+        def fail_before_link(root, temp, relative_path):
+            raise OSError("before any link")
+
+        with spool.publication_batch(ctx):
+            spool.write_opaque_artifact(ctx, [payload(0)], format=FORMAT)
+            spool._publish_temp_exclusive = fail_before_link
+            with self.assertRaisesRegex(OSError, "before any link"):
+                spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
+            spool._publish_temp_exclusive = real
+            self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
+            spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
+        self.assertQuota(ctx, 2 * SIZE)
+        self.assertEqual(len(tree(ctx.root)), 2)
+
+
+    def test_full_window_reports_published_bytes_before_second_window(self):
+        """INVENTED payloads exercise the unchanged 1 MiB window, not performance."""
+        ctx = self.context("two_windows")
+        object_bytes = 16 * 1024
+        window = spool._BATCH_RESERVATION_WINDOW_BYTES
+        self.assertEqual(window, 1024 * 1024)
+        self.assertEqual(window % object_bytes, 0)
+        first_window_objects = window // object_bytes
+        expected = {}
+        with spool.publication_batch(ctx):
+            for i in range(first_window_objects + 1):
+                content = payload(i, size=object_bytes)
+                descriptor = spool.write_opaque_artifact(ctx, [content], format=FORMAT)
+                self.assertEqual(descriptor["size_bytes"], object_bytes)
+                self.assertEqual(descriptor["sha256"], hashlib.sha256(content).hexdigest())
+                expected[descriptor["relative_path"]] = descriptor["sha256"]
+                if i + 1 == first_window_objects:
+                    snapshot = state(ctx.root)
+                    self.assertEqual(snapshot["committed_bytes"], self.bases[ctx.root])
+                    self.assertEqual(len(snapshot["reservations"]), 1)
+                    record = snapshot["reservations"][0]
+                    self.assertEqual(record["reserved_bytes"], window)
+                    self.assertEqual(record["materialized_bytes"], window)
+            second = state(ctx.root)["reservations"][0]
+            self.assertEqual(second["reserved_bytes"], 2 * window)
+            self.assertEqual(second["materialized_bytes"], window)
+            self.assertEqual(tree(ctx.root), expected)
+        total = (first_window_objects + 1) * object_bytes
+        self.assertGreater(total, 1024 * 1024)
+        self.assertQuota(ctx, total)
+        self.assertEqual(tree(ctx.root), expected)
+        self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
+
+    def test_terminal_control_refuses_new_object_inside_open_batch(self):
+        """INVENTED terminal control: existence of any shape must refuse admission."""
+        ctx = self.context("terminal_during_batch")
+        terminal = ctx.root / quota.GENERATION_TERMINAL_NAME
+        with spool.publication_batch(ctx):
+            descriptor = spool.write_opaque_artifact(ctx, [payload(0)], format=FORMAT)
+            before_tree = tree(ctx.root)
+            before_state = state(ctx.root)
+            terminal.write_bytes(b"INVENTED terminal refusal fixture")
+            with self.assertRaisesRegex(spool.AuthoritySpoolError, "GENERATION_WORKSPACE_TERMINAL"):
+                spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
+            self.assertEqual(tree(ctx.root), before_tree)
+            self.assertEqual(state(ctx.root), before_state)
+            self.assertEqual((ctx.root / descriptor["relative_path"]).read_bytes(), payload(0))
+        self.assertQuota(ctx, SIZE)
+        self.assertEqual(terminal.read_bytes(), b"INVENTED terminal refusal fixture")
+        self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
+
+    def _assert_unlink_failure_retains_reservation(self, *, after_link):
+        """INVENTED unlink faults distinguish owned links from uncleaned temps."""
+        ctx = self.context("unlink_after_link" if after_link else "unclean_prelink")
+        real_publish = spool._publish_temp_exclusive
+        real_unlink = Path.unlink
+        temps = []
+        unlink_attempts = []
+        self.addCleanup(setattr, spool, "_publish_temp_exclusive", real_publish)
+        self.addCleanup(setattr, Path, "unlink", real_unlink)
+
+        def publish_or_fail(root, temp, relative_path):
+            temps.append(Path(temp))
+            if after_link:
+                return real_publish(root, temp, relative_path)
+            raise OSError("injected prelink publication failure")
+
+        def fail_transaction_temp_unlink(path, *args, **kwargs):
+            if Path(path) in temps:
+                unlink_attempts.append(Path(path))
+                if not after_link or len(unlink_attempts) == 1:
+                    raise OSError("injected transaction temp unlink failure")
+            return real_unlink(path, *args, **kwargs)
+
+        spool._publish_temp_exclusive = publish_or_fail
+        Path.unlink = fail_transaction_temp_unlink
+        expected_error = spool.AuthoritySpoolError if after_link else OSError
+        expected_message = "TEMPORARY_FILE_CLEANUP_FAILED" if after_link else "injected prelink publication failure"
+        with spool.publication_batch(ctx):
+            with self.assertRaisesRegex(expected_error, expected_message):
+                spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
+            before = state(ctx.root)
+            before_tree = tree(ctx.root)
+            self.assertEqual(before["committed_bytes"], self.bases[ctx.root])
+            self.assertEqual(len(before["reservations"]), 1)
+            self.assertGreaterEqual(before["reservations"][0]["reserved_bytes"], SIZE)
+            relative = spool._content_relative_path(hashlib.sha256(payload(1)).hexdigest(), FORMAT)
+            if after_link:
+                self.assertEqual((ctx.root / relative).read_bytes(), payload(1))
+                self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
+            else:
+                self.assertFalse((ctx.root / relative).exists())
+                self.assertEqual(len(temps), 1)
+                self.assertEqual(temps[0].read_bytes(), payload(1))
+            with self.assertRaisesRegex(spool.AuthoritySpoolError, "PUBLICATION_BATCH_POISONED"):
+                spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
+            self.assertEqual(state(ctx.root), before)
+            self.assertEqual(tree(ctx.root), before_tree)
+        spool._publish_temp_exclusive = real_publish
+        Path.unlink = real_unlink
+        self.assertEqual(state(ctx.root), before)
+        spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
+        self.assertQuota(ctx, 2 * SIZE)
+        self.assertEqual(len(tree(ctx.root)), 2 if after_link else 1)
+        if not after_link:
+            self.assertEqual(temps[0].read_bytes(), payload(1))
+        self.assertEqual(spool._PUBLICATION_BATCHES, {})
+
+    def test_linked_object_unlink_failure_poison_survives_successful_cleanup(self):
+        self._assert_unlink_failure_retains_reservation(after_link=True)
+
+    def test_uncleaned_prelink_temp_poisons_batch_until_ordinary_rescan(self):
+        self._assert_unlink_failure_retains_reservation(after_link=False)
+
+    def test_close_commit_failure_retains_published_objects_for_ordinary_rescan(self):
+        """INVENTED durable state failure occurs only when close removes the record."""
+        ctx = self.context("close_commit_failure")
+        real_write_state = quota._write_state
+        self.addCleanup(setattr, quota, "_write_state", real_write_state)
+        commit_values = []
+
+        def fail_close_state(root, value):
+            if Path(root) == ctx.root and not value["reservations"]:
+                commit_values.append(value["committed_bytes"])
+                raise quota.AuthoritySpoolQuotaError("SPOOL_QUOTA_STATE_WRITE_FAILED", "injected close commit failure")
+            return real_write_state(root, value)
+
+        with self.assertRaisesRegex(spool.AuthoritySpoolError, "SPOOL_QUOTA_STATE_WRITE_FAILED"):
+            with spool.publication_batch(ctx):
+                descriptor = spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
+                before = state(ctx.root)
+                quota._write_state = fail_close_state
+        quota._write_state = real_write_state
+        self.assertEqual(commit_values, [self.bases[ctx.root] + SIZE])
+        self.assertEqual(state(ctx.root), before)
+        self.assertEqual(before["committed_bytes"], self.bases[ctx.root])
+        self.assertEqual(len(before["reservations"]), 1)
+        self.assertEqual((ctx.root / descriptor["relative_path"]).read_bytes(), payload(1))
+        self.assertEqual(spool._PUBLICATION_BATCHES, {})
+        spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
+        self.assertQuota(ctx, 2 * SIZE)
+        self.assertEqual(len(tree(ctx.root)), 2)
