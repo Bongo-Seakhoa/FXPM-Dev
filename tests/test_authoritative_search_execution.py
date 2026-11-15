@@ -4150,6 +4150,8 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
         original_containment = execution._route_a_contain_consumer_failure
         original_header = execution._make_declared_unit_header
         original_unit_binding = execution._declared_unit_binding
+        original_consumer = execution._consume_route_a_unit
+        assert original_consumer is execution._route_a_noop_consumer
         entrypoints = ((execution, "_declared_fitted_for_execution"),
             (execution, "_reverify_cell_state_error_envelope"),
             (execution, "_verify_attempt_roster"),
@@ -4169,13 +4171,33 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
             ("unit_binding", original_unit_binding),
             ("source_reopen", producer._reopen_declared_source_material),
             ("original_freeze", execution.historical_adapter.DeclaredSlotSearchCapture.freeze_observed_cell))}
-        dispatch = _route_a_callback_identity_dispatch(tuple(auth_codes.items()) + tuple(model_codes.items()))
+        owner_codes = {name: function.__code__ for name, function in (
+            ("owner_snapshot", execution._route_a_owner_membership_snapshot),
+            ("owner_rebind", execution._route_a_rebind_owner_membership),
+            ("owner_key", execution._route_a_owner_selection_bytes),
+            ("owner_geometry", execution._fold_partitions))}
+        dispatch = _route_a_callback_identity_dispatch(
+            tuple(auth_codes.items()) + tuple(model_codes.items()) + tuple(owner_codes.items()))
         coordinator_code = execution._route_a_evaluate_prepared_request.__code__
         restore_code = execution.historical_adapter.DeclaredSlotSearchCapture.restore_completed_unit_handle.__code__
         executor_code = execution.execute_historical_observed_cell.__code__
+        batch_codes = []
+        def find_batch_code(code):
+            for value in code.co_consts:
+                if isinstance(value, type(code)):
+                    if value.co_name == "evaluate_route_a_batch":
+                        batch_codes.append(value)
+                    find_batch_code(value)
+        find_batch_code(executor_code)
+        assert len(batch_codes) == 1
+        working_parent_code = batch_codes[0]
+        owner_spans = {}
         calls = SimpleNamespace(counts=Counter(), instances=[], unique_intervals=[], auth_snapshots=[],
             executor_admission_before=[], loop_invocations=0,
-            pool_depth=0, restore_returns=0, header_creations=0, outputs={})
+            pool_depth=0, restore_returns=0, header_creations=0, outputs={},
+            owner_counts=Counter(), owner_geometry=Counter(), owner_intervals=[],
+            owner_snapshots=[], default_prefix_receipts=[], owner_binding_metadata=None,
+            owner_unit_roster=None)
         active_unique = []
 
         def observation(stage, *, error=None, returned=None):
@@ -4298,6 +4320,21 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
                     if name in counts:
                         counts[name] += 1
                         progress("STARTED_AUTH_ENTRY", name, interval="NORMAL_OWNER_AND_ADOPTION")
+                    elif name in owner_codes:
+                        calls.owner_counts[name] += 1
+                        interval = name
+                        if name == "owner_geometry":
+                            caller = frame.f_back.f_code if frame.f_back is not None else None
+                            if any(label == "owner_snapshot" for _, label in owner_spans):
+                                interval = "snapshot_geometry"
+                            elif caller is owner_codes["owner_rebind"]:
+                                interval = "selected_rebind_geometry"
+                            elif caller is working_parent_code:
+                                interval = "uncached_working_geometry"
+                            else:
+                                interval = "fixture_reference_or_other_geometry"
+                            calls.owner_geometry[interval] += 1
+                        owner_spans[id(frame), name] = (interval, time.monotonic_ns())
                     else:
                         calls.counts[name] += 1
                 if frame.f_code is model_codes["partition"]:
@@ -4311,6 +4348,18 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
                     progress("STARTED_UNIQUE_EVALUATION", str(ordinal),
                         interval="ACTUAL_SHARED_COORDINATOR_ONLY")
             elif event == "return":
+                for name in dispatch(frame.f_code, "call"):
+                    if name not in owner_codes:
+                        continue
+                    interval, started = owner_spans.pop((id(frame), name))
+                    ended = time.monotonic_ns()
+                    calls.owner_intervals.append({"interval": interval,
+                        "started_monotonic_ns": started, "ended_monotonic_ns": ended,
+                        "observed_duration_ns": ended - started,
+                        "returned_nonnull": argument is not None})
+                    if name == "owner_snapshot" and type(argument) is dict:
+                        # Retain only returned plain JSON metadata, never execution frames.
+                        calls.owner_snapshots.append(copy.deepcopy(argument))
                 if frame.f_code is model_codes["partition"] and argument is not None:
                     partition = frame.f_locals["partition"]
                     tier = frame.f_locals["spread_tier"].tier
@@ -4344,6 +4393,7 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
         def unit_binding_spy(*args, **kwargs):
             binding = original_unit_binding(*args, **kwargs)
             assert not kwargs and len(args) == 6
+            calls.owner_binding_metadata = copy.deepcopy(binding)
             capture, refreshed, cell_plan, attempts, fold_plan, handle = args
             saved["verified_binding_witness"] = {"capture": capture,
                 "fitted": capture.fitted_timeframe, "refreshed": refreshed,
@@ -4360,6 +4410,15 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
             calls.loop_invocations += 1
             if restore_first and calls.loop_invocations == 1:
                 assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == 0
+                assert execution._consume_route_a_unit is original_consumer is execution._route_a_noop_consumer
+                assert all(calls.owner_counts[name] == 0 for name in ("owner_snapshot", "owner_rebind", "owner_key"))
+                calls.default_prefix_receipts.append({
+                    "interval": "DEFAULT_PREFIX_BEFORE_ORDINARY_LOOP_ONLY",
+                    "consumer_identity": "UNCHANGED_PRODUCTION_NOOP_UNWRAPPED",
+                    "snapshot_rebind_key_calls": {name: calls.owner_counts[name]
+                        for name in ("owner_snapshot", "owner_rebind", "owner_key")},
+                    "default_post_loop_gate_and_finish": "UNPROVEN_STOPPED_BEFORE_ORDINARY_LOOP",
+                    "extra_owner_preparations": 0})
                 saved["first_unit_roster"] = copy.deepcopy(units)
                 saved["first_binding_sha256"] = binding_sha256
                 # Revoked objects are held only for identity observations, never second-call inputs.
@@ -4373,6 +4432,7 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
                 progress("CONTROLLED_BEFORE_ORDINARY_LOOP", "fresh-header-first-invocation-no-produce")
                 raise BeforeInventedOrdinaryLoop()
             saved["post_loop_counts"] = dict(counts)
+            calls.owner_unit_roster = copy.deepcopy(units)
             progress("RETURNED_STUBBED_ORDINARY_LOOP", "INVENTED_CONTROL_FLOW_ONLY_NO_ATTEMPTS_COMPLETED")
             header = execution._read_declared_unit_header(env.context, body)
             return [], header["evidence_access_started_at_utc"]
@@ -4435,7 +4495,6 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
                 scoped.setattr(execution, "_make_declared_unit_header", header_spy)
                 scoped.setattr(execution, "_declared_unit_binding", unit_binding_spy)
                 scoped.setattr(execution, "_continue_declared_attempt_units", ordinary_loop)
-                scoped.setattr(execution, "_consume_route_a_unit", consumer)
                 scoped.setattr(execution, "_route_a_contain_consumer_failure", containment_spy)
                 scoped.setattr(execution.historical_adapter.DeclaredSlotSearchCapture,
                     "complete_observed_cell", finish_entry)
@@ -4463,6 +4522,7 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
                             env.context, first_body)) == saved["original_header_bytes"]
                         saved.pop("verified_binding_witness")
                         progress("STARTED_NORMAL_EXISTING_HEADER_REOPEN", "same-live-original-request-within-original-window")
+                    scoped.setattr(execution, "_consume_route_a_unit", consumer)
                     try:
                         second_return = producer.execute_declared_slot_owner_search(env.context, request=request,
                             process=env.process, frozen_pipeline_config=env.frozen_pipeline_config)
@@ -4482,6 +4542,7 @@ def _observe_owned_invented_route_a_consumer(tmp_path, monkeypatch, *,
         assert calls.counts["source_reopen"] == (1 if restore_first else 0)
         assert calls.counts["original_freeze"] == 1
         assert not active_unique and not external_io_attempts
+        assert not owner_spans
     return {"fixture_provenance": "FRESH_INVENTED_NORMAL_ISSUER_POSTLOOP_FINISH_ENTRY_ONLY",
         "normal_finish_entry_observed": True, "restored_fresh_software_header": restore_first,
         "qualification_authority": False, "capital_authority": False, "live_order_authority": False}
@@ -4899,6 +4960,99 @@ def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkey
         original_candidate = copy.deepcopy(attempt.candidate)
         original_header = copy.deepcopy(witness["declared_header"])
         original_roster = copy.deepcopy(witness["capture"].sink.artifact_roster())
+        plan = witness["cell_plan"].horizon_plan.to_dict()
+        assert len(plan["candidates"]) == 1
+        assert len(witness["attempts"]) == len(plan["attempts"]) == len(plan["trials"]) == len(calls.owner_unit_roster) > 1
+        assert len(calls.owner_snapshots) == calls.owner_counts["owner_snapshot"] == 1
+        assert calls.owner_counts["owner_rebind"] == calls.owner_counts["owner_key"] == 0
+        snapshot = calls.owner_snapshots[0]
+        assert snapshot["schema_version"] == "fxpm.route-a-owner-membership-snapshot.v2"
+        assert snapshot["provenance_scope"] == "CURRENT_OWNER_METADATA_PROJECTION_ONLY"
+        assert snapshot["original_trial_count"] == len(snapshot["attempt_roster"]) == len(witness["attempts"])
+        assert snapshot["declared_unit_binding"] == calls.owner_binding_metadata
+        assert execution._sha256([row.plan_attempt for row in witness["attempts"]]) == calls.owner_binding_metadata["attempt_roster_sha256"]
+        assert execution._sha256(witness["fold_plan"]) == calls.owner_binding_metadata["fold_plan_sha256"]
+        for name in ("execution_ready", "overall_execution_ready", "qualification_authority", "capital_authority",
+                "paper_authority", "live_authority", "order_authority", "live_order_authority"):
+            assert snapshot[name] is False
+        assert not {"unit_metadata", "header_reference", "new_header_digest"} & set(snapshot)
+        precommitments = witness["handle"].frozen.partition_cost_precommitments
+        assert precommitments["schema_version"] == execution.raw_winner.PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA
+        own_rows = {(row["attempt_ordinal"], row["fold_ordinal"], row["partition"]): row
+            for row in precommitments["rows"]}
+        assert len(own_rows) == len(precommitments["rows"])
+        planned_count = rejected_count = own_partition_count = tier_fact_count = 0
+        scheduled = []
+        for ordinal, (row, owner_attempt) in enumerate(zip(snapshot["attempt_roster"], witness["attempts"], strict=True)):
+            source_plan, source_folds = owner_attempt.plan_attempt, owner_attempt.candidate["folds"]
+            assert row["ordinal"] == owner_attempt.ordinal == ordinal
+            assert row["source_plan_attempt"] == source_plan == plan["attempts"][ordinal]
+            assert execution._sha256(source_plan) == row["plan_attempt_sha256"]
+            assert row["horizon_attempt_id"] == source_plan["attempt_id"]
+            assert row["raw_attempt_id"] == calls.owner_unit_roster[ordinal]["raw_attempt_id"]
+            assert row["source_folds"] == source_folds and len(source_folds) == len(row["folds"]) == 4
+            assert row["parameters"] == owner_attempt.artifacts.trial_definition["parameters"]
+            assert type(source_plan["state_context_disposition_sha256"]) is str
+            assert len(source_plan["state_context_disposition_sha256"]) == 64
+            expected_schedule = [value for value in plan["expected_evaluations"]
+                if value["attempt_id"] == source_plan["attempt_id"]]
+            assert row["scheduled_evaluations"] == expected_schedule
+            scheduled.extend(row["scheduled_evaluations"])
+            rejected = source_plan["status"] == "PROCESS_REJECTED"
+            if rejected:
+                rejected_count += 1
+                assert row["rejection"] == {"plan_status": "PROCESS_REJECTED",
+                    "reason_code": source_plan["reason_code"],
+                    "state_context_disposition_sha256": source_plan["state_context_disposition_sha256"]}
+                assert len(expected_schedule) == 1
+                assert expected_schedule[0]["fold_id"] == "TERMINAL"
+                assert expected_schedule[0]["role"] == "TERMINAL_MECHANICAL_REJECTION"
+                assert expected_schedule[0]["expected_reason_code"] == source_plan["reason_code"]
+            else:
+                planned_count += 1
+                assert source_plan["status"] == "PLANNED" and row["rejection"] is None
+                assert len(expected_schedule) == 4
+            for fold_ordinal, (projected, source_fold) in enumerate(zip(row["folds"], source_folds, strict=True)):
+                assert len(source_fold) == 14 and source_fold["role"] == "CAUSAL_ROLLING_ORIGIN_INNER"
+                assert execution._sha256({key: value for key, value in source_fold.items()
+                    if key != "fold_definition_sha256"}) == source_fold["fold_definition_sha256"]
+                assert projected["fold_id"] == source_fold["fold_id"] and projected["role"] == source_fold["role"]
+                if rejected:
+                    assert projected["partitions"] == {"status": "UNSCHEDULED"}
+                    continue
+                assert set(projected["partitions"]) == {"optimizer_train", "tuning_validation", "final_lockbox"}
+                for role, identity in projected["partitions"].items():
+                    expected_row = own_rows[ordinal, fold_ordinal, role]
+                    geometry_sha = expected_row["partition_geometry_receipt_sha256"]
+                    record = precommitments["records"][geometry_sha]
+                    assert identity["precommitment_row"] == expected_row
+                    assert identity["partition_geometry_receipt_sha256"] == geometry_sha
+                    assert identity["partition_frame_sha256"] == record["partition_frame_sha256"]
+                    assert set(record["tiers"]) == set(identity["tier_refs"]) == {"P75", "P95"}
+                    assert identity["tier_refs"] == {tier: "|".join((precommitments["schema_version"],
+                        precommitments["receipt_sha256"], geometry_sha, tier)) for tier in ("P75", "P95")}
+                    own_partition_count += 1
+                    tier_fact_count += len(record["tiers"])
+        assert scheduled == plan["expected_evaluations"]
+        assert planned_count + rejected_count == len(witness["attempts"])
+        assert own_partition_count == planned_count * 4 * 3 and tier_fact_count == own_partition_count * 2
+        payload_bytes = len(execution._canonical_bytes({name: snapshot[name]
+            for name in ("frozen_domains", "attempt_roster", "declared_unit_binding")}))
+        wrapper_bytes = len(execution._canonical_bytes(snapshot))
+        assert payload_bytes <= execution.winner.MAX_REQUEST_BYTES
+        owner_snapshot_receipt = {"original_trials": len(witness["attempts"]), "horizon_candidates": 1,
+            "planned_trials": planned_count, "rejected_trials": rejected_count,
+            "terminal_rejection_branch": "OBSERVED" if rejected_count else "UNOBSERVED_ZERO_ACTUAL_REJECTIONS",
+            "all_rejected_unsearched_entry": "UNPROVEN_NO_JUSTIFIED_NORMALLY_ISSUED_FIXTURE",
+            "planned_v2_own_partition_rows": own_partition_count, "both_tier_facts": tier_fact_count,
+            "validated_three_field_payload_bytes": payload_bytes, "full_snapshot_wrapper_bytes": wrapper_bytes,
+            "existing_payload_limit_bytes": execution.winner.MAX_REQUEST_BYTES, "wrapper_cap": "NONE_ADDED",
+            "snapshot_geometry_calls": calls.owner_geometry["snapshot_geometry"],
+            "snapshot_monotonic_observations": [copy.deepcopy(row) for row in calls.owner_intervals
+                if row["interval"] == "owner_snapshot"],
+            "default_prefix": copy.deepcopy(calls.default_prefix_receipts),
+            "default_post_loop_gate_and_finish": "UNPROVEN_NO_EXTRA_OWNER_PREPARATION_ADDED"}
+        assert calls.owner_geometry["snapshot_geometry"] == 0
         candidate = copy.deepcopy(attempt.candidate)
         candidate["folds"] = copy.deepcopy(list(folds[:1]))
         candidate["fixture_provenance"] = "INVENTED_ONE_FOLD_QA_REFERENCE_NOT_ISSUED_ATTEMPT"
@@ -4942,9 +5096,21 @@ def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkey
             for name in counts} == expected_normal_owner
         before_model_counts = dict(calls.counts)
         before_batch_instances = len(calls.instances)
+        before_owner_counts = dict(calls.owner_counts)
+        before_owner_geometry = dict(calls.owner_geometry)
+        before_owner_intervals = len(calls.owner_intervals)
         batch = evaluate_batch(specifications=specifications,
             metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1")
         assert batch["status"] == "EVALUATED_DIAGNOSTIC_ONLY"
+        assert calls.owner_counts["owner_snapshot"] - before_owner_counts.get("owner_snapshot", 0) == 0
+        assert calls.owner_counts["owner_rebind"] - before_owner_counts.get("owner_rebind", 0) == 3
+        assert calls.owner_counts["owner_key"] - before_owner_counts.get("owner_key", 0) == 3
+        owner_geometry_deltas = {name: calls.owner_geometry[name] - before_owner_geometry.get(name, 0)
+            for name in ("snapshot_geometry", "selected_rebind_geometry", "uncached_working_geometry")}
+        assert owner_geometry_deltas == {"snapshot_geometry": 0, "selected_rebind_geometry": 3,
+            "uncached_working_geometry": 2}
+        first_batch_owner_intervals = copy.deepcopy(calls.owner_intervals[before_owner_intervals:])
+        assert all(row["observed_duration_ns"] >= 0 for row in first_batch_owner_intervals)
         assert calls.counts["full_capture"] - before_model_counts.get("full_capture", 0) == 1
         assert calls.counts["unit_binding"] - before_model_counts.get("unit_binding", 0) == 1
         successful_commit_deltas = {name: calls.counts[name] - before_model_counts.get(name, 0)
@@ -5030,6 +5196,10 @@ def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkey
         progress("COMPLETED_TERMINAL_LATE_HASH_EXPIRY", "ATOMIC_REFUSAL_NO_NEW_MODELS_NO_CLOCK_WAIT")
         receipts.append({"named_interval": "SECOND_NORMAL_EXECUTOR_RESTORE_THEN_POST_LOOP_CONSUMER_AND_TWO_UNIQUE_KEYS",
             "adoption_count": 1, "original_header_count": 1,
+            "owner_membership_snapshot": owner_snapshot_receipt,
+            "first_successful_batch_product_geometry_calls": owner_geometry_deltas,
+            "first_successful_batch_monotonic_observations": first_batch_owner_intervals,
+            "monotonic_observation_claim": "OBSERVED_INTERVALS_ONLY_NO_SPEEDUP_RESOURCE_OR_RUNTIME_FORECAST",
             "ordinary_reference_fixture": "INVENTED_ONE_FOLD_QA_CARRIER_NOT_ISSUED_ATTEMPT",
             "ordinary_reference_deltas": reference_deltas,
             "batch_evaluation_deltas": {name: calls.counts[name] - before_model_counts.get(name, 0)
@@ -5242,19 +5412,19 @@ def test_route_a_request_mapping_partial_coverage_keeps_lockbox_ordinary_only():
 
 
 _REQUEST_MAPPING_SITES = {
-    "M1": ("_route_a_resolve_request_membership", 7410, "ROUTE_A_MAPPING_REQUEST_INVALID"),
-    "M2": ("_route_a_resolve_request_membership", 7414, "ROUTE_A_MAPPING_DOMAIN_UNAVAILABLE"),
-    "M3": ("_route_a_resolve_request_membership", 7433, "ROUTE_A_MAPPING_MATCH_DATA_INVALID"),
-    "M4-unavailable": ("_route_a_resolve_request_membership", 7435, "ROUTE_A_MAPPING_MEMBERSHIP_UNAVAILABLE"),
-    "M4-ambiguous": ("_route_a_resolve_request_membership", 7435, "ROUTE_A_MAPPING_MEMBERSHIP_AMBIGUOUS"),
-    "C1": ("_compile_route_a_request_attempt_mapping", 7516, "ROUTE_A_MAPPING_INPUT_INVALID"),
-    "C2": ("_compile_route_a_request_attempt_mapping", 7535, "ROUTE_A_MAPPING_DOMAINS_INVALID"),
-    "C3": ("_compile_route_a_request_attempt_mapping", 7601, "ROUTE_A_MAPPING_ROSTER_INVALID"),
-    "C4": ("_compile_route_a_request_attempt_mapping", 7667, "ROUTE_A_MAPPING_RESULT_TOO_LARGE"),
-    "R-request": ("_route_a_batch_specifications", 7235, "ROUTE_A_UNIT_BATCH_REQUEST_INVALID"),
-    "R-lockbox": ("_route_a_batch_specifications", 7237, "ROUTE_A_UNIT_BATCH_LOCKBOX_REFUSED"),
-    "R-role": ("_route_a_batch_specifications", 7239, "ROUTE_A_UNIT_BATCH_ROLE_INVALID"),
-    "R-tier": ("_route_a_batch_specifications", 7241, "ROUTE_A_UNIT_BATCH_TIER_INVALID"),
+    "M1": ("_route_a_resolve_request_membership", 7392, "ROUTE_A_MAPPING_REQUEST_INVALID"),
+    "M2": ("_route_a_resolve_request_membership", 7396, "ROUTE_A_MAPPING_DOMAIN_UNAVAILABLE"),
+    "M3": ("_route_a_resolve_request_membership", 7415, "ROUTE_A_MAPPING_MATCH_DATA_INVALID"),
+    "M4-unavailable": ("_route_a_resolve_request_membership", 7417, "ROUTE_A_MAPPING_MEMBERSHIP_UNAVAILABLE"),
+    "M4-ambiguous": ("_route_a_resolve_request_membership", 7417, "ROUTE_A_MAPPING_MEMBERSHIP_AMBIGUOUS"),
+    "C1": ("_compile_route_a_request_attempt_mapping", 7718, "ROUTE_A_MAPPING_INPUT_INVALID"),
+    "C2": ("_route_a_validate_mapping_snapshot", 7495, "ROUTE_A_MAPPING_DOMAINS_INVALID"),
+    "C3": ("_route_a_validate_mapping_snapshot", 7647, "ROUTE_A_MAPPING_ROSTER_INVALID"),
+    "C4": ("_compile_route_a_request_attempt_mapping", 7786, "ROUTE_A_MAPPING_RESULT_TOO_LARGE"),
+    "R-request": ("_route_a_batch_specifications", 7217, "ROUTE_A_UNIT_BATCH_REQUEST_INVALID"),
+    "R-lockbox": ("_route_a_batch_specifications", 7219, "ROUTE_A_UNIT_BATCH_LOCKBOX_REFUSED"),
+    "R-role": ("_route_a_batch_specifications", 7221, "ROUTE_A_UNIT_BATCH_ROLE_INVALID"),
+    "R-tier": ("_route_a_batch_specifications", 7223, "ROUTE_A_UNIT_BATCH_TIER_INVALID"),
 }
 
 
@@ -5619,3 +5789,1009 @@ def test_route_a_request_mapping_is_metadata_only_and_does_not_route_evaluation(
     assert result["partition_responsibilities"]["final_lockbox"] == "ORDINARY_ONLY_NOT_ROUTABLE"
     assert "shared_evaluation_key" not in result and all("shared_evaluation_key" not in row for row in result["requests"])
     _request_mapping_assert_no_authority(result)
+
+
+# INVENTED source carriers exercise metadata consistency, not authenticated owner issuance.
+def _owner_snapshot_inputs(monkeypatch):
+    literal = {'provenance': 'INVENTED_SOFTWARE_ONLY_INERT_CARRIER_NO_AUTHORITY_NO_FINANCIAL_EVIDENCE',
+     'declared_unit_binding': {'generation_context_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'producer_request_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'executor_release_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'producer_source_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'horizon_plan_receipt_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'cell_plan_receipt_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'source_group_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'regime_fit_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'frame_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'fitted_state_reference_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'execution_spec_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'frozen_receipt_sha256': 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                               'cost_precommitments_sha256': '1b907d4cda6d50ee3c47fa1608f34c863501ce0d6658e25a0ead14fa32a3c881',
+                               'fold_plan_sha256': '4490ba9f111d444fc0e134e572436dd58b14f9dde0c11a1c3e1c85e4a43cb0fd',
+                               'attempt_roster_sha256': '5e5c6dfac887378a081c1d21dbddc739e5112a452019e1f743f100b072f3a586'},
+     'frozen_domains': [{'strategy_id': 'EMACrossoverStrategy',
+                         'strategy_family': 'INVENTED_FAMILY',
+                         'parameter_domain': {'schema_version': 'fxpm.parameter-domain.v1',
+                                              'defaults': {'fast_period': 10,
+                                                           'slow_period': 20,
+                                                           'sl_atr_mult': 2.0,
+                                                           'tp_atr_mult': 2.0},
+                                              'axes': [{'names': ['fast_period',
+                                                                  'slow_period',
+                                                                  'sl_atr_mult',
+                                                                  'tp_atr_mult'],
+                                                        'choices': [[10, 20, 2.0, 2.0], [11, 21, 2.0, 2.0]]}],
+                                              'point_count': 2},
+                         'domain_sha256': '2d49c19d048d757ddc3c23db2d70c7e76ffda730edfa6a19b59511e584810e48'}],
+     'plan_body': {'cell': {'symbol': 'INVENTED_SYMBOL', 'timeframe': 'D1', 'regime': 'INVENTED_REGIME'},
+                   'candidates': [{'candidate_id': 'INVENTED-CANDIDATE',
+                                   'candidate_definition_sha256': '4d16813b7a97f88861d6357f0b4d7c937d44016e20423267a565504551bdb749',
+                                   'folds': [{'fold_id': 'INVENTED-CAUSAL-01',
+                                              'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                              'fit_start_utc': '2018-10-03T00:00:00+00:00',
+                                              'fit_end_exclusive_utc': '2019-01-01T00:00:00+00:00',
+                                              'validation_warmup_start_utc': '2018-12-31T00:00:00+00:00',
+                                              'validation_start_utc': '2019-01-01T00:00:00+00:00',
+                                              'validation_end_exclusive_utc': '2019-03-05T00:00:00+00:00',
+                                              'right_fit_start_utc': None,
+                                              'right_fit_end_exclusive_utc': None,
+                                              'fit_rows': 90,
+                                              'validation_rows': 63,
+                                              'source_slice_sha256': 'a1cfa36be3d2a5d735dbd681babcad9c78ecf4b6eb26e52242f81f13465c42ab',
+                                              'final_oos_authority': False,
+                                              'fold_definition_sha256': '38e32b6ac27858f0e6f4b75efdc9a3f510fb3f9dd0393cf962995bb6caef3404'},
+                                             {'fold_id': 'INVENTED-CAUSAL-02',
+                                              'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                              'fit_start_utc': '2018-12-05T00:00:00+00:00',
+                                              'fit_end_exclusive_utc': '2019-03-05T00:00:00+00:00',
+                                              'validation_warmup_start_utc': '2019-03-04T00:00:00+00:00',
+                                              'validation_start_utc': '2019-03-05T00:00:00+00:00',
+                                              'validation_end_exclusive_utc': '2019-05-07T00:00:00+00:00',
+                                              'right_fit_start_utc': None,
+                                              'right_fit_end_exclusive_utc': None,
+                                              'fit_rows': 90,
+                                              'validation_rows': 63,
+                                              'source_slice_sha256': '8232ee597e78ea5d1ec1a845b456e9930bfcc6a786d3e27340fa08c8f16b2563',
+                                              'final_oos_authority': False,
+                                              'fold_definition_sha256': '8b516df70fed00f385b16799bd29dc65cf882b196076db96512d012b5096f0c5'},
+                                             {'fold_id': 'INVENTED-CAUSAL-03',
+                                              'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                              'fit_start_utc': '2019-02-06T00:00:00+00:00',
+                                              'fit_end_exclusive_utc': '2019-05-07T00:00:00+00:00',
+                                              'validation_warmup_start_utc': '2019-05-06T00:00:00+00:00',
+                                              'validation_start_utc': '2019-05-07T00:00:00+00:00',
+                                              'validation_end_exclusive_utc': '2019-07-09T00:00:00+00:00',
+                                              'right_fit_start_utc': None,
+                                              'right_fit_end_exclusive_utc': None,
+                                              'fit_rows': 90,
+                                              'validation_rows': 63,
+                                              'source_slice_sha256': '0fcb0e2812f61d3f1efba3cb5a3bacb1eefe758bb070c15bce6465d91ffc2157',
+                                              'final_oos_authority': False,
+                                              'fold_definition_sha256': '0358d91fd3b274c868280c9bf96f723207d0bb384f96dc915e095f506f5da640'},
+                                             {'fold_id': 'INVENTED-CAUSAL-04',
+                                              'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                              'fit_start_utc': '2019-04-10T00:00:00+00:00',
+                                              'fit_end_exclusive_utc': '2019-07-09T00:00:00+00:00',
+                                              'validation_warmup_start_utc': '2019-07-08T00:00:00+00:00',
+                                              'validation_start_utc': '2019-07-09T00:00:00+00:00',
+                                              'validation_end_exclusive_utc': '2019-09-10T00:00:00+00:00',
+                                              'right_fit_start_utc': None,
+                                              'right_fit_end_exclusive_utc': None,
+                                              'fit_rows': 90,
+                                              'validation_rows': 63,
+                                              'source_slice_sha256': '46cb25bb9cdbd286092620e64d5a7da2cfc0579f4da287789a85e3910095ba9a',
+                                              'final_oos_authority': False,
+                                              'fold_definition_sha256': 'ce34e0242789b1be41b66f38be7a9ebdfde82226c585f6ce2dab00cdf9859f5a'}]}],
+                   'trials': [{'trial_id': 'INVENTED-TRIAL-0'}, {'trial_id': 'INVENTED-TRIAL-1'}],
+                   'attempts': [{'attempt_id': 'INVENTED-HORIZON-0',
+                                 'candidate_id': 'INVENTED-CANDIDATE',
+                                 'candidate_definition_sha256': '4d16813b7a97f88861d6357f0b4d7c937d44016e20423267a565504551bdb749',
+                                 'trial_id': 'INVENTED-TRIAL-0',
+                                 'trial_definition_sha256': '42d42e458c33cbc3a09c69c579b916ed4023e1cba6bac206a9d892b18ee4397b',
+                                 'strategy_id': 'EMACrossoverStrategy',
+                                 'strategy_release_sha256': '1111111111111111111111111111111111111111111111111111111111111111',
+                                 'parameter_set_sha256': '1764b05366fdd4d87c32b565ab1fb3a21b62e6813017309b3a8d0867e2370063',
+                                 'status': 'PLANNED',
+                                 'reason_code': None,
+                                 'state_context_disposition_sha256': '737b764327e768a6826eb1e63cd58a6dae5a0519af707f00a021e458675eef48'},
+                                {'attempt_id': 'INVENTED-HORIZON-1',
+                                 'candidate_id': 'INVENTED-CANDIDATE',
+                                 'candidate_definition_sha256': '4d16813b7a97f88861d6357f0b4d7c937d44016e20423267a565504551bdb749',
+                                 'trial_id': 'INVENTED-TRIAL-1',
+                                 'trial_definition_sha256': 'faa6d8fcbbdd71a393dec04cb00564da3d04bfccf4f79552a13c37462166a1e1',
+                                 'strategy_id': 'EMACrossoverStrategy',
+                                 'strategy_release_sha256': '1111111111111111111111111111111111111111111111111111111111111111',
+                                 'parameter_set_sha256': '1764b05366fdd4d87c32b565ab1fb3a21b62e6813017309b3a8d0867e2370063',
+                                 'status': 'PROCESS_REJECTED',
+                                 'reason_code': 'STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL',
+                                 'state_context_disposition_sha256': '52d41ef53aa1acced85644b57a57924ce785c0fb1f38c1baf3bb185013776663'}],
+                   'expected_evaluations': [{'ordinal': 0,
+                                             'attempt_id': 'INVENTED-HORIZON-0',
+                                             'fold_id': 'INVENTED-CAUSAL-01',
+                                             'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                             'validation_start_utc': '2019-01-01T00:00:00+00:00',
+                                             'validation_end_exclusive_utc': '2019-03-05T00:00:00+00:00',
+                                             'expected_status': 'EVALUATION_REQUIRED',
+                                             'expected_reason_code': None,
+                                             'downstream_causal_eligible': True,
+                                             'final_oos_authority': False,
+                                             'context_sha256': '6f62a66a2e2482b45ca0f041856f8fcd81ffed5eaeb3a0b697105fa35c6c7994'},
+                                            {'ordinal': 1,
+                                             'attempt_id': 'INVENTED-HORIZON-0',
+                                             'fold_id': 'INVENTED-CAUSAL-02',
+                                             'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                             'validation_start_utc': '2019-03-05T00:00:00+00:00',
+                                             'validation_end_exclusive_utc': '2019-05-07T00:00:00+00:00',
+                                             'expected_status': 'EVALUATION_REQUIRED',
+                                             'expected_reason_code': None,
+                                             'downstream_causal_eligible': True,
+                                             'final_oos_authority': False,
+                                             'context_sha256': 'd01ebf458d44471095ac0ec91cce7917627cf4f6cba702678aca7939571b98da'},
+                                            {'ordinal': 2,
+                                             'attempt_id': 'INVENTED-HORIZON-0',
+                                             'fold_id': 'INVENTED-CAUSAL-03',
+                                             'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                             'validation_start_utc': '2019-05-07T00:00:00+00:00',
+                                             'validation_end_exclusive_utc': '2019-07-09T00:00:00+00:00',
+                                             'expected_status': 'EVALUATION_REQUIRED',
+                                             'expected_reason_code': None,
+                                             'downstream_causal_eligible': True,
+                                             'final_oos_authority': False,
+                                             'context_sha256': '11ff9669ce3caf9f906f09a02979ecb9b77d7985469610e20cdcd9c61fc30558'},
+                                            {'ordinal': 3,
+                                             'attempt_id': 'INVENTED-HORIZON-0',
+                                             'fold_id': 'INVENTED-CAUSAL-04',
+                                             'role': 'CAUSAL_ROLLING_ORIGIN_INNER',
+                                             'validation_start_utc': '2019-07-09T00:00:00+00:00',
+                                             'validation_end_exclusive_utc': '2019-09-10T00:00:00+00:00',
+                                             'expected_status': 'EVALUATION_REQUIRED',
+                                             'expected_reason_code': None,
+                                             'downstream_causal_eligible': True,
+                                             'final_oos_authority': False,
+                                             'context_sha256': 'd61208f1a5119f85d3145657f3beb676a2b292aa4833b61100685fa51b0dc082'},
+                                            {'ordinal': 4,
+                                             'attempt_id': 'INVENTED-HORIZON-1',
+                                             'fold_id': 'TERMINAL',
+                                             'role': 'TERMINAL_MECHANICAL_REJECTION',
+                                             'validation_start_utc': None,
+                                             'validation_end_exclusive_utc': None,
+                                             'expected_status': 'PROCESS_REJECTED',
+                                             'expected_reason_code': 'STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL',
+                                             'downstream_causal_eligible': False,
+                                             'final_oos_authority': False,
+                                             'context_sha256': 'c9feb5736da8a6bbf9776d51230a100c25c21b47fad5591a05c5338bc82d12e4'}]},
+     'precommitments': {'schema_version': 'fxpm.winner-partition-cost-precommitments.v2',
+                        'frozen_tier_pair_contract_sha256': '8888888888888888888888888888888888888888888888888888888888888888',
+                        'rows': [{'attempt_ordinal': 0,
+                                  'fold_ordinal': 0,
+                                  'partition': 'optimizer_train',
+                                  'partition_geometry_receipt_sha256': '78e33700ee09b2fa89b7d7ad1d62fc62c6dd2a44c4317d3f9ac93ecb3b8fecaf'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 0,
+                                  'partition': 'tuning_validation',
+                                  'partition_geometry_receipt_sha256': '073c55a63b1c14a6db6fbf1819f4cfd8c0273e2b9c7248a5c9b1e0e84c99fca3'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 0,
+                                  'partition': 'final_lockbox',
+                                  'partition_geometry_receipt_sha256': '8f23b6086ad88e0fe8c7f0aaa7b5906cdcc2a319e086a53139221fdfdcac9660'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 1,
+                                  'partition': 'optimizer_train',
+                                  'partition_geometry_receipt_sha256': '3fb7b82b9cbb2e7739fd8d338917430586037655efd5e33976b085dfc83e6412'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 1,
+                                  'partition': 'tuning_validation',
+                                  'partition_geometry_receipt_sha256': 'b90d7b9767b67d3443bb8656eee72582f4b4f5639adf8bfda6f73de362c6ebf2'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 1,
+                                  'partition': 'final_lockbox',
+                                  'partition_geometry_receipt_sha256': '023984080e9968adf1d455470c75ac06e2614c0bc218e59537d19611222a219c'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 2,
+                                  'partition': 'optimizer_train',
+                                  'partition_geometry_receipt_sha256': '5caaa46e4a8d20fd55602d076a41aeeeb5ecae5a9356936e680cb16e340a55a4'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 2,
+                                  'partition': 'tuning_validation',
+                                  'partition_geometry_receipt_sha256': '035a3b3772ab07a10407ca30da8480f94d363691c18fa94e3bac695d96b8c7c1'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 2,
+                                  'partition': 'final_lockbox',
+                                  'partition_geometry_receipt_sha256': '8abb3a001dddcabb76bb5b81abec2398ecddba10aef6bf6254f8670f9927f6d5'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 3,
+                                  'partition': 'optimizer_train',
+                                  'partition_geometry_receipt_sha256': 'd97393f9f468704833d41affda38fbabf48537b7344db468324d1b5b86546f0e'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 3,
+                                  'partition': 'tuning_validation',
+                                  'partition_geometry_receipt_sha256': '6e8736d1fcc728d8d94660652b6a7b2b44ea49b93a9b9205ea875591a8165fd1'},
+                                 {'attempt_ordinal': 0,
+                                  'fold_ordinal': 3,
+                                  'partition': 'final_lockbox',
+                                  'partition_geometry_receipt_sha256': '10eee714d437386768b6755ae3a7ec35099ec765d7d93ddba433b10daa1a70f5'}],
+                        'records': {'78e33700ee09b2fa89b7d7ad1d62fc62c6dd2a44c4317d3f9ac93ecb3b8fecaf': {'partition_frame_sha256': 'cad40cf8a8b88e782eca1b3c65b97dd896ebdfd4ea210efaa3b91c83e6ed3a7a',
+                                                                                                         'source_observation_receipt_sha256': '6393f584eb6f7abcb17a38e48c10620722c3b9c4d680e8cd1106630e0ae6f895',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': 'aa3a8346550b97912cbcc307b1fe72ec2e728d36bf745055e44f0360cf67c3be',
+                                                                                                                           'intrabar_half_spread_values_sha256': '64718124eb917d98f708610321e6df0965fbb0c478f9853666049bd0587e2f03',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '94d213b8b884fd0d9ded78c5c6271d786653e67d0945d47985f2a8c7caaf6709',
+                                                                                                                           'entry_observations_sha256': 'cc655a6fb3bc5a75e3cae3b3d06e8604b233db5afdab931990f1bdb1041792b0',
+                                                                                                                           'entry_admission_mask_sha256': '340c606e364a2c3d1cb5c08e909ec69e7a911f68271040c9f1eba541920b8f81'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': '7d8ef5d3c262a08b9de162212a86ae7db20244631d45858d2e7273734cc330cd',
+                                                                                                                           'intrabar_half_spread_values_sha256': '56bbe64ac46ad1c2e5d5499a2fed1fc91f21bc351c74b02f5743dba1e83adabc',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '8475f8fe154942d09b2937b80ba17f3f17ab6509bfb20a5f669691293920af5a',
+                                                                                                                           'entry_observations_sha256': '0e6efd81d76e91519617c9f12d8601afde6ebd6065267a0cca023e62674d2ec2',
+                                                                                                                           'entry_admission_mask_sha256': '582f17b4421e6a86cb820003aeb1d3b0d41027bb2345ee1e8055bfe7d53734af'}}},
+                                    '073c55a63b1c14a6db6fbf1819f4cfd8c0273e2b9c7248a5c9b1e0e84c99fca3': {'partition_frame_sha256': '8117bc446d1120e5d6a79fdc76c248c88bcd498cc3ae59237a9d62a86103c183',
+                                                                                                         'source_observation_receipt_sha256': '0cf35b33fe9b27530f9711f9c6baef08ee9f1523986a631eefda35f72da774a0',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': '0ab93a9cc31c8538e0de1ba960c72fdb9d9cca0d93afd97759d5aa08c0db5627',
+                                                                                                                           'intrabar_half_spread_values_sha256': '920cc488c460f2836c1bd63b524aad51cb15cd1fe07895738859e4631dd12c5a',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '35932feb5d9e2d07cf798ed1d335b3f51532496c268d29a63f048873f12c7139',
+                                                                                                                           'entry_observations_sha256': '8d7d48bfe0e61bd9c69bd6b72a84aa29f6d178d4902d133224a5ee93bae58a83',
+                                                                                                                           'entry_admission_mask_sha256': 'fa96282775c69396b5bf4b414b09a0010d044d3685dbd86f23443e3de8f75efc'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': 'd0bfd79da0bf99351edb85ed8d5da2a7f3494610f48454f3f1e4fa23a2445f55',
+                                                                                                                           'intrabar_half_spread_values_sha256': '2f5865397e6c1bc561c74eb8a5938fcbab08dc9876748d3303266d999c83bf18',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '1a0be63b1d4073e8e47e59bbb99c5428c5ba1f8a85f48c8df62c78d358cb752f',
+                                                                                                                           'entry_observations_sha256': '587c63f847f54bec46d8ae8dccc015ff107b6b684acc7c0af0075c3e39b10d2c',
+                                                                                                                           'entry_admission_mask_sha256': 'ec608319a6397b8937f6afcd69702b7f3276b4cf39b3d97ae584762324a75f54'}}},
+                                    '8f23b6086ad88e0fe8c7f0aaa7b5906cdcc2a319e086a53139221fdfdcac9660': {'partition_frame_sha256': '615d741dc75a18eb71f4546a19f27770741f8ba1acebf9af8c0ac5637b93b420',
+                                                                                                         'source_observation_receipt_sha256': '6f7f0d31face70b657a15a48abdad8f29ae5a9fdc199acc9279292ee3ca17c7e',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': 'a997677b5033e3e4347c38b92cbe297cf98fd9133e5f64e22fc553f5e2454b9a',
+                                                                                                                           'intrabar_half_spread_values_sha256': '17c1af7e24d0763bc1caef04c0d6fdb9cb4cf08b2a4370205ac52b9c67aeb744',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': 'a518270b17711d856076bcc516e077f3c08a52f01d96f6240571adf8d294ed74',
+                                                                                                                           'entry_observations_sha256': '04cdee81476af777e8ae9b57568ee7fc31a79e8c55584aa76a0e69756076d148',
+                                                                                                                           'entry_admission_mask_sha256': 'f79a2362cdfb986d650884c14b22a3f5fd5e9a8c0a82f38f59a9729f06572daa'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': 'acef5450cfacc19a521fc6739a867c5db59c1f0d00d7541f8d77c351995dbb4e',
+                                                                                                                           'intrabar_half_spread_values_sha256': '7d867f348f25ad7e030b6249b9e990857501d930e291e3a3660284c67d4cba41',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '1f7014aeea45b3705503818fc259cffdd221cded6e995e247ab7ededb929feaf',
+                                                                                                                           'entry_observations_sha256': 'd5711ec0d56c411cc3200b6877b388c9ec022711e00f481b9784a9fb0927e515',
+                                                                                                                           'entry_admission_mask_sha256': '9f4f7ba93cde621f130046bfb4d879af84817869bc0fdb935ea691f3b574384a'}}},
+                                    '3fb7b82b9cbb2e7739fd8d338917430586037655efd5e33976b085dfc83e6412': {'partition_frame_sha256': '59fdd2920e11fc2a0a21bb847d732b23a5447359a8ab17f7384c3b565517cfc0',
+                                                                                                         'source_observation_receipt_sha256': '96a4edcbd9b8e68f88c9cccc90d2c56b65f4b1bc635a8f2bf69b6c9a1c6f84c4',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': 'ab51275e6b2e61eb7c2c96f10cbaa06a94ad09caee17be2fe830d0e276e68726',
+                                                                                                                           'intrabar_half_spread_values_sha256': 'a1bb2c01197472cdc13540b46adc213287b510390750923e2cf0d2a655cd2034',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '55a70d08fc551db3e8c454e992749f9f60a7e269870da740d2dc44f0ddbf24fa',
+                                                                                                                           'entry_observations_sha256': 'f6095bae57149c434704a06c7d72fc3626550de2f9cf4ae6fc295262ecfe9b1f',
+                                                                                                                           'entry_admission_mask_sha256': 'a0cc6f0380d1e52ba8a6e26579ab25bf9f9f81662e7cf4f44e78304f8e8b5564'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': '0b830979a8bc386c08163f48b5f185a324f32336489a05c9310a160d4a75d7cb',
+                                                                                                                           'intrabar_half_spread_values_sha256': '587d28032b2d41c632abb669ed4467dbbb35c4542c65cf5b374b7edd81a4cdb0',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '683fe4475efb27818fbe2bbe2f28d13910ec0d921276782e7b973fade200682d',
+                                                                                                                           'entry_observations_sha256': '1f37dea029d073d27a1c478e530578c7782ca77e8e87f30418c10ae37ac29575',
+                                                                                                                           'entry_admission_mask_sha256': '3a47de3f5e425a13d134a707326cc57b075d6ff89a40ead36bdba3edacdfa1d0'}}},
+                                    'b90d7b9767b67d3443bb8656eee72582f4b4f5639adf8bfda6f73de362c6ebf2': {'partition_frame_sha256': '7446c973160f641c59628b0ef268bbda0ecbb2bdb5b4300e7554f7e482f2f5ec',
+                                                                                                         'source_observation_receipt_sha256': '05d4263fc432703782bff60484732fff7187a5098995c909f1ebe2bc72d10d12',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': 'fb0eecabb58c13b52822534f54fd5a653485c3e1959e51c9a1dab467c8ea39a6',
+                                                                                                                           'intrabar_half_spread_values_sha256': 'f271c57df17a7fe8209d0a7577d65ea61d56c92a00e533553c7637a0ded81a8e',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '70264b79da9cdc715e08a39adc70c4ead73de109ee38740ded9cfc0683ffd92c',
+                                                                                                                           'entry_observations_sha256': '7275ff4a1ae76476d506c38b8696b6ceef9b02ee9e9a12c5caaa628861c0f7f8',
+                                                                                                                           'entry_admission_mask_sha256': 'eb3b65320918489d3f0992b5c777d3e74f6c8f7bb6ddee206565cce23fb20ad5'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': 'de2a0fb1e1e0bc8e76915d3861746b5da6069b288644322b53a69fd33e3e096f',
+                                                                                                                           'intrabar_half_spread_values_sha256': '84b75fb351686e68a88973758a64dd3538c0e7594f89e63abbe2bd457de0264d',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '7c358122aacf848d91666bd6ee49e7b9d906e652081ccec9cac84d81e6275c4e',
+                                                                                                                           'entry_observations_sha256': '6120143ad2f7cbd35906b96919f72cab2aa69f309c6be2d273dba5ca6a6ea120',
+                                                                                                                           'entry_admission_mask_sha256': 'c8af5fd36f260b98efc909aaedca04ef302553566932dc0a4eb22d5bbe3b6973'}}},
+                                    '023984080e9968adf1d455470c75ac06e2614c0bc218e59537d19611222a219c': {'partition_frame_sha256': '3a659857d5f2c4f7d94a4d5ba39a3a4942efae35d50fc533a37e7ecddbe30608',
+                                                                                                         'source_observation_receipt_sha256': 'a759a8a34ad37585b8365689a693199f0f14f8a7989157655bf9501d2438ed1f',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': 'fa4c42779610b70a271048a7487edd69791e60ca0057b7a00ff5aa0057ae6a3c',
+                                                                                                                           'intrabar_half_spread_values_sha256': '88ef1f28ee3cc0c9db17e6ca5b25afc70ac45ca105376535dcdc13f551c6aa9f',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': 'bc7d4d81889794fcaad49b5ec6ace91a3c971b66c81ac6a7d5d9947f5827c439',
+                                                                                                                           'entry_observations_sha256': '02cca38791705a0085d8c3698bbbd39e745ff31aec0fdbbd3216807c444340a6',
+                                                                                                                           'entry_admission_mask_sha256': 'acc25423bab015448a211248de629e84328bcecb20612e79bff50f93f55b65cb'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': '7543a4b8efa917e673da7eea4d3092f8081f122ba83adbd9bd907c87f9f5e225',
+                                                                                                                           'intrabar_half_spread_values_sha256': '134f0d423e5a6b10be7ff86973731099a4232fb6aaa3105e548aee0babca9850',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': 'a2356f7a523bc52c4f22ca49a72f92c9477938b2f7e7b4de4fb34b9717f1adac',
+                                                                                                                           'entry_observations_sha256': '673db9300b99d2a5ea6a5801feedebe3b217e9448d53c4233378aaece882d38b',
+                                                                                                                           'entry_admission_mask_sha256': '7a16032e060d9fc32fb0ce9dd73db6c8a64aa1ef21aa0b8afd0a236e82d99bd5'}}},
+                                    '5caaa46e4a8d20fd55602d076a41aeeeb5ecae5a9356936e680cb16e340a55a4': {'partition_frame_sha256': 'c132afcd2f02b5e4b9ac22d19c75bdd576a092426af884901e3844ec8e7a616d',
+                                                                                                         'source_observation_receipt_sha256': '5e720e01a99b0a9933dfdaff46a978de6253e2595d8cb566c484041889b46a70',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': '75d73b9a545312a7c8cd56df7aacd5395ae9608f46bf38641c74de492c25abb0',
+                                                                                                                           'intrabar_half_spread_values_sha256': '951d69284686beb87994a530c7e332d1de591c3c56af953f9fc40278695934ef',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '781895d7df6b91cabfa2eb54a1b9443f57453e4e467bf88e70f3b94c7e46fbf5',
+                                                                                                                           'entry_observations_sha256': '74061eff046f1ef90e472bec0fe8d569f59a1d05122ddd5e86895c0c07a4d9c0',
+                                                                                                                           'entry_admission_mask_sha256': 'a389632cb23a674a3f6957bc5b7c69890e8d509df80a642f7a769618071344a8'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': '1b21914f1ef717c68ad278f6f9df6bb46b37496fb7aa8e517507b8990fc11f6d',
+                                                                                                                           'intrabar_half_spread_values_sha256': '9481bd375ff35ede3910985620544d31b66200285cd886c907d78ec72529ce67',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '966484440ee2609585b7258e603c0f376f65671bfbeb17c76f97e4bbab896be3',
+                                                                                                                           'entry_observations_sha256': '70127b00192048c7e128d73d0ee63a73585bb333fb9f349ecd309806a48573de',
+                                                                                                                           'entry_admission_mask_sha256': '18dee978644691ebbe48bc6cca73fd3af63ab01d5d0894b123e931b4a1e91514'}}},
+                                    '035a3b3772ab07a10407ca30da8480f94d363691c18fa94e3bac695d96b8c7c1': {'partition_frame_sha256': 'ea117b41616bdca568d4fdb5450d4d573abd6a1068dd80a7235049acbb0c421a',
+                                                                                                         'source_observation_receipt_sha256': '6dc5daa5765db2aa0cdb3f7d17f8b40ea260cfa9444f9020e5318a239f325224',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': '6d75632a707b72e3d6bc326e17b4db037d8335f0c5d2aad5c62318d77ab86312',
+                                                                                                                           'intrabar_half_spread_values_sha256': '64b5c2111a620b2f6cf04284c1070b922e6426704e4c37bab1e1d122050da825',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': 'd31c30c42eb0fe8e6d8d7c22a6fde8b4ffcf967021bd3b0decd748a8cc1a54ee',
+                                                                                                                           'entry_observations_sha256': 'c4efbdad7b94ae5dd37a7138988aadb583bda1c5ac784fd1fbb6dfd5ad7703fa',
+                                                                                                                           'entry_admission_mask_sha256': '15dfb83e41d6d6a5d6401eb165a07eee88034cdb24e33fb1562859d73761a4eb'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': 'b60968a28d60ea1ab252046b5f38713c6265f727823b4dfb777d36d25eddb793',
+                                                                                                                           'intrabar_half_spread_values_sha256': 'd600a5d6e1dec66f6e329214eb13ee607fd0eb196ebf4c02a8482e4085cb0aa4',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '5a6381a9b5ee6ddd9b5df8d94a083692a9f87509c1d1a4eaf9b196ab364eb6aa',
+                                                                                                                           'entry_observations_sha256': '370679b3b6d339326f257d03cceadddd4da62452fadf54be4fa686c75f36bd80',
+                                                                                                                           'entry_admission_mask_sha256': 'a53807540f6fa8101f351f74f2d729592ae623d8f8a85c698d2dbb7b96be8c00'}}},
+                                    '8abb3a001dddcabb76bb5b81abec2398ecddba10aef6bf6254f8670f9927f6d5': {'partition_frame_sha256': 'ad46d89ffa341cad862a2240a55635f7d3002f25eef559ca4ef4a2fe5f65881e',
+                                                                                                         'source_observation_receipt_sha256': '8e2bb5de17da73ffff3e74a25d9bf4f4e8fdbc3b80d712a2ac04cd757013d9fa',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': 'c9eaf3cd61600c84a0662768f1b64822cab1b57df4bcb90089e742ea346c47d4',
+                                                                                                                           'intrabar_half_spread_values_sha256': '592c95d3e1ffa59e87aa8d9d1e14683041ddda22ba4102c891cf6ed6fd05c4ef',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '81f47e36abf463aa5e68e3e070abe5922ac96084a2bd5751f29f485f384bcc93',
+                                                                                                                           'entry_observations_sha256': '2c5db67093b1c43220ce09a47c91fb944b3fe425cc1fba721de6bd90646a80f6',
+                                                                                                                           'entry_admission_mask_sha256': '4484cb2f0bdfac1cb0e7660b00a4993b52f4640b5150074593869834613b72d6'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': 'df51957dde71fa7458ecc169e9ff4b05c15f35b7f2fe7bd37fd3e88e7b6d1945',
+                                                                                                                           'intrabar_half_spread_values_sha256': '6834ae9ae50dffc37020f2fbc3932e5beaa67e3f1c5baab59031cc4093897e79',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '3fe080ff992b221308e16b44da514bf09e44a42c1b67159a271f49b4877d06d7',
+                                                                                                                           'entry_observations_sha256': '961768a33dc696cc6adf3cf07239d13f97272983c44832de526553c9aeb6fc9f',
+                                                                                                                           'entry_admission_mask_sha256': '1a6b237362cf9333b6bf77171341561807d9a7d48b6195707f87ba7e21b3766b'}}},
+                                    'd97393f9f468704833d41affda38fbabf48537b7344db468324d1b5b86546f0e': {'partition_frame_sha256': '885a443c8e5a0e3619da7faaa9640b00cc4795516ded54e8b8c10c2d79c5f9a2',
+                                                                                                         'source_observation_receipt_sha256': 'dccf38345b3066080854aa72d796ccd21e583e7f05213519f17b852d8c6aa9d0',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': '1ecd41b2b833caf411cd64016ad174dac36427838369e2167cc9cc421fb368f0',
+                                                                                                                           'intrabar_half_spread_values_sha256': '80d49d1aee1cddcf33b918331cbc92bacf824e4e4f38d5d333432076d0338491',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': 'c7aca6848fa204e29dd6a98afb8b84c63a3d0a7b069f371252c8065b16f647a9',
+                                                                                                                           'entry_observations_sha256': '6d6b07f7f7958e92c32338d26ea55c5a712639b632073ce6993fab6011d03c33',
+                                                                                                                           'entry_admission_mask_sha256': '4b138b681bdb046e5dd7e8465d2165657ca7a0827295eecf5a2cf0e4db867cfc'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': 'f6ce403707c5ef1bae85deba570784cdb001601378fec713bf9175a93610d012',
+                                                                                                                           'intrabar_half_spread_values_sha256': 'c61470109b9eb6f1d9b1b2ffc4b82a7e55059ba0c8ba839a85215e08df27e110',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '9ac5b688aee20ded498a73c6ba318883c23ef715ab7f85fd4c15cd42f7edf64b',
+                                                                                                                           'entry_observations_sha256': '183a7c658c91544baff251833746a7939e663ebc9a94d2a209d999898c7a45aa',
+                                                                                                                           'entry_admission_mask_sha256': 'a06f2c4cf4a03bcd9cf3180b6cb799b26ed7efa32470a0bf5c3d824601a81451'}}},
+                                    '6e8736d1fcc728d8d94660652b6a7b2b44ea49b93a9b9205ea875591a8165fd1': {'partition_frame_sha256': '01339cd1eed72820a599ab1b49bcbc2fe4e723c7c0707d9351304c28a1f21694',
+                                                                                                         'source_observation_receipt_sha256': 'f23036ec8d76aafcaf179e82256fc736f9dde5d7b70bc0a3c1a303124ddec367',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': '2524f3b428671c549a2a7a9c5dd6d74c0bb990f37c7137abfc5a29a0f29e3df5',
+                                                                                                                           'intrabar_half_spread_values_sha256': '81d0a3ef270db29260c5fa2314c758d1ae0a25b1c26e22d2e694047fe2bfb8c1',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': 'eec7f10b9b3175f40fccded61531e908c83cee1432090fce14c90ea58d7fe80e',
+                                                                                                                           'entry_observations_sha256': '3e61d261a2a55aeddf6f063dcc36bd5b11679b2549df7953b1e050f2e048c052',
+                                                                                                                           'entry_admission_mask_sha256': '8eeadbb746e3a21ed61ae8b181e9c68cff04856df533d89d9cd82168e505598e'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': 'f19188822f5eb4f185c33bd63f2b3c6897919d1230214b15c14cda8c9e713d4b',
+                                                                                                                           'intrabar_half_spread_values_sha256': 'db478cfd4f5ce2601ddb3dc5e2345ceb6a2593b103046afe83a4c8c95967d60a',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '1f5c25fa73cfae96aecc2ad1cca1f1190be18f0f5158ca5f3c5a4eff8ee9d5f9',
+                                                                                                                           'entry_observations_sha256': 'd2fd88223af1b4abfd783cc1353da15f154f935cf500c5b23e47871a21a1e888',
+                                                                                                                           'entry_admission_mask_sha256': '9be6de728e8cbb7e96d34e50f210d7689cc09a94ce91f03f8ff22f55df33f076'}}},
+                                    '10eee714d437386768b6755ae3a7ec35099ec765d7d93ddba433b10daa1a70f5': {'partition_frame_sha256': '7f627ec606c0cad87d1b611213ca5bc1b60a3e819059f5d2361bda1e26747016',
+                                                                                                         'source_observation_receipt_sha256': 'f06975ff1c3dac2563e922b35d369f1e6c34088a2c871c120522b4e378e4d1c1',
+                                                                                                         'tiers': {'P75': {'entry_half_spread_values_sha256': 'd3439820909fc6587746bd6e77614f1e296014872a4260d9e109a9e860d8b6ea',
+                                                                                                                           'intrabar_half_spread_values_sha256': '83c3a9bb3052b24cfc654e7d1a0162ff6758c119e590d4e342929c2c18e24697',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '4e6f552292a839358e838fb62ff798ad105900bc6d15f45cc7734cb86afba864',
+                                                                                                                           'entry_observations_sha256': 'c600485f748ff65ebcd633e5bda173d2954e35e96e5a7c94624379fec26b8bbd',
+                                                                                                                           'entry_admission_mask_sha256': 'b3ea09fcc945e1bbbf3a7325e92cbc40ccdbbfd92f0f5bc7510cea6e40edc91c'},
+                                                                                                                   'P95': {'entry_half_spread_values_sha256': '50be81d1027f1bfea9e3beb88145a9e6b7d44f66f8dee775c422dfff194ccd1c',
+                                                                                                                           'intrabar_half_spread_values_sha256': '03d66c38a1d0f4bc4ee39a9ccc4152b4fb6516f500e711d50333d902884e1591',
+                                                                                                                           'numerical_execution_cost_attestation_sha256': '16c9bb94490b932893f6cb1ddafd05d948df58d08be8a6bd7b0f2b046e666f72',
+                                                                                                                           'entry_observations_sha256': 'e2ed0ccdef45834382fbdef03155d2dcfd4b784c5544d2eaa9f098ea98fa62c4',
+                                                                                                                           'entry_admission_mask_sha256': '8ec303e49e34f515b1b8e0df3d8f09579ce4968006f2c5a0406b390d42359e48'}}}},
+                        'receipt_sha256': '1411061ab29a2c12890a0cfd308aaa0d405c87bca6ce848be1acea0b375c75eb'},
+     'resolved_derive_stub_rows': [{'fold_ordinal': 0,
+                                    'role': 'optimizer_train',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'optimizer_train',
+                                                         'frame_start_utc': '2018-12-31T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-01-01T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-03-05T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': 'cad40cf8a8b88e782eca1b3c65b97dd896ebdfd4ea210efaa3b91c83e6ed3a7a',
+                                                         'receipt_sha256': '78e33700ee09b2fa89b7d7ad1d62fc62c6dd2a44c4317d3f9ac93ecb3b8fecaf'}},
+                                   {'fold_ordinal': 0,
+                                    'role': 'tuning_validation',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'tuning_validation',
+                                                         'frame_start_utc': '2018-12-31T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-01-01T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-03-05T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '8117bc446d1120e5d6a79fdc76c248c88bcd498cc3ae59237a9d62a86103c183',
+                                                         'receipt_sha256': '073c55a63b1c14a6db6fbf1819f4cfd8c0273e2b9c7248a5c9b1e0e84c99fca3'}},
+                                   {'fold_ordinal': 0,
+                                    'role': 'final_lockbox',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'final_lockbox',
+                                                         'frame_start_utc': '2018-12-31T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-01-01T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-03-05T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '615d741dc75a18eb71f4546a19f27770741f8ba1acebf9af8c0ac5637b93b420',
+                                                         'receipt_sha256': '8f23b6086ad88e0fe8c7f0aaa7b5906cdcc2a319e086a53139221fdfdcac9660'}},
+                                   {'fold_ordinal': 1,
+                                    'role': 'optimizer_train',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'optimizer_train',
+                                                         'frame_start_utc': '2019-03-04T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-03-05T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-05-07T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '59fdd2920e11fc2a0a21bb847d732b23a5447359a8ab17f7384c3b565517cfc0',
+                                                         'receipt_sha256': '3fb7b82b9cbb2e7739fd8d338917430586037655efd5e33976b085dfc83e6412'}},
+                                   {'fold_ordinal': 1,
+                                    'role': 'tuning_validation',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'tuning_validation',
+                                                         'frame_start_utc': '2019-03-04T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-03-05T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-05-07T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '7446c973160f641c59628b0ef268bbda0ecbb2bdb5b4300e7554f7e482f2f5ec',
+                                                         'receipt_sha256': 'b90d7b9767b67d3443bb8656eee72582f4b4f5639adf8bfda6f73de362c6ebf2'}},
+                                   {'fold_ordinal': 1,
+                                    'role': 'final_lockbox',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'final_lockbox',
+                                                         'frame_start_utc': '2019-03-04T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-03-05T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-05-07T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '3a659857d5f2c4f7d94a4d5ba39a3a4942efae35d50fc533a37e7ecddbe30608',
+                                                         'receipt_sha256': '023984080e9968adf1d455470c75ac06e2614c0bc218e59537d19611222a219c'}},
+                                   {'fold_ordinal': 2,
+                                    'role': 'optimizer_train',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'optimizer_train',
+                                                         'frame_start_utc': '2019-05-06T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-05-07T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-07-09T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': 'c132afcd2f02b5e4b9ac22d19c75bdd576a092426af884901e3844ec8e7a616d',
+                                                         'receipt_sha256': '5caaa46e4a8d20fd55602d076a41aeeeb5ecae5a9356936e680cb16e340a55a4'}},
+                                   {'fold_ordinal': 2,
+                                    'role': 'tuning_validation',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'tuning_validation',
+                                                         'frame_start_utc': '2019-05-06T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-05-07T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-07-09T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': 'ea117b41616bdca568d4fdb5450d4d573abd6a1068dd80a7235049acbb0c421a',
+                                                         'receipt_sha256': '035a3b3772ab07a10407ca30da8480f94d363691c18fa94e3bac695d96b8c7c1'}},
+                                   {'fold_ordinal': 2,
+                                    'role': 'final_lockbox',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'final_lockbox',
+                                                         'frame_start_utc': '2019-05-06T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-05-07T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-07-09T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': 'ad46d89ffa341cad862a2240a55635f7d3002f25eef559ca4ef4a2fe5f65881e',
+                                                         'receipt_sha256': '8abb3a001dddcabb76bb5b81abec2398ecddba10aef6bf6254f8670f9927f6d5'}},
+                                   {'fold_ordinal': 3,
+                                    'role': 'optimizer_train',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'optimizer_train',
+                                                         'frame_start_utc': '2019-07-08T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-07-09T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-09-10T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '885a443c8e5a0e3619da7faaa9640b00cc4795516ded54e8b8c10c2d79c5f9a2',
+                                                         'receipt_sha256': 'd97393f9f468704833d41affda38fbabf48537b7344db468324d1b5b86546f0e'}},
+                                   {'fold_ordinal': 3,
+                                    'role': 'tuning_validation',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'tuning_validation',
+                                                         'frame_start_utc': '2019-07-08T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-07-09T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-09-10T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '01339cd1eed72820a599ab1b49bcbc2fe4e723c7c0707d9351304c28a1f21694',
+                                                         'receipt_sha256': '6e8736d1fcc728d8d94660652b6a7b2b44ea49b93a9b9205ea875591a8165fd1'}},
+                                   {'fold_ordinal': 3,
+                                    'role': 'final_lockbox',
+                                    'geometry_receipt': {'schema_version': 'fxpm.winner-partition-geometry.v1',
+                                                         'role': 'final_lockbox',
+                                                         'frame_start_utc': '2019-07-08T00:00:00+00:00',
+                                                         'scored_start_utc': '2019-07-09T00:00:00+00:00',
+                                                         'end_exclusive_utc': '2019-09-10T00:00:00+00:00',
+                                                         'warmup_bars': 1,
+                                                         'scored_bars': 63,
+                                                         'frame_rows': 64,
+                                                         'frame_sha256': '7f627ec606c0cad87d1b611213ca5bc1b60a3e819059f5d2361bda1e26747016',
+                                                         'receipt_sha256': '10eee714d437386768b6755ae3a7ec35099ec765d7d93ddba433b10daa1a70f5'}}]}
+    plan = copy.deepcopy(literal["plan_body"])
+    owners = tuple(SimpleNamespace(ordinal=ordinal, plan_attempt=copy.deepcopy(row),
+        candidate=copy.deepcopy(plan["candidates"][0]), trial=copy.deepcopy(plan["trials"][ordinal]),
+        artifacts=SimpleNamespace(winner_process={"strategy_id": row["strategy_id"], "strategy_family": "INVENTED_FAMILY"},
+            trial_definition={"parameters": copy.deepcopy(literal["frozen_domains"][0]["parameter_domain"]["defaults"])}))
+        for ordinal, row in enumerate(plan["attempts"]))
+    case = {"provenance": literal["provenance"], "declared_unit_binding": copy.deepcopy(literal["declared_unit_binding"]),
+        "frozen_domains": copy.deepcopy(literal["frozen_domains"]), "plan_body": plan,
+        "owner_attempts": owners, "attempts": tuple(copy.deepcopy(owners)), "raw_ids": ("INVENTED-RAW-0", "INVENTED-RAW-1"),
+        "precommitments": copy.deepcopy(literal["precommitments"]), "derive_rows": copy.deepcopy(literal["resolved_derive_stub_rows"]),
+        "frame": object(), "dependency_warmup_bars": 1, "derive_calls": [],
+        "specification": {"strategy_id": "EMACrossoverStrategy", "parameters": copy.deepcopy(literal["frozen_domains"][0]["parameter_domain"]["defaults"]),
+            "fold_ordinal": 0, "partition_role": "optimizer_train", "spread_tier": "P75", "bookkeeping": {}, "request_ordinal": 0}}
+    def derive(*, frame, fold, attempt, dependency_warmup_bars):
+        assert frame is case["frame"] and attempt is case["attempts"][0] and dependency_warmup_bars == 1
+        matches = [(index, candidate) for index, candidate in enumerate(attempt.candidate["folds"])
+            if candidate["fold_id"] == fold["fold_id"]]
+        assert len(matches) == 1
+        fold_ordinal, source_fold = matches[0]
+        assert fold == source_fold
+        case["derive_calls"].append((attempt.ordinal, fold_ordinal))
+        return tuple(SimpleNamespace(role=row["role"], geometry_receipt=copy.deepcopy(row["geometry_receipt"]))
+            for row in case["derive_rows"] if row["fold_ordinal"] == fold_ordinal)
+    monkeypatch.setattr(execution, "_fold_partitions", derive)
+    return case
+
+
+def _owner_snapshot_sha(value):
+    import json
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=True, allow_nan=False).encode("ascii")).hexdigest()
+
+
+def _owner_snapshot_build(case):
+    return execution._route_a_owner_membership_snapshot(**{key: case[key] for key in (
+        "declared_unit_binding", "frozen_domains", "plan_body", "attempts", "raw_ids", "precommitments")})
+
+
+def _owner_snapshot_rebind(case, snapshot, specification=None):
+    return execution._route_a_rebind_owner_membership(
+        specification=case["specification"] if specification is None else specification, snapshot=snapshot,
+        **{key: case[key] for key in ("attempts", "owner_attempts", "raw_ids", "frame", "dependency_warmup_bars", "precommitments")})
+
+
+def _owner_snapshot_validate(snapshot):
+    return execution._route_a_validate_mapping_snapshot(frozen_domains=snapshot["frozen_domains"],
+        attempt_roster=snapshot["attempt_roster"], owner_projection=True,
+        declared_unit_binding=snapshot["declared_unit_binding"])
+
+
+_OWNER_SNAPSHOT_SITES = {
+    "V0": ("_route_a_validate_mapping_snapshot", 7475, "ROUTE_A_MAPPING_SNAPSHOT_INVALID"),
+    "OS-SOURCE": ("_route_a_owner_membership_snapshot", 7874, "ROUTE_A_OWNER_SNAPSHOT_SOURCE_INVALID"),
+    "OS-BINDING": ("_route_a_owner_membership_snapshot", 7874, "ROUTE_A_OWNER_SNAPSHOT_SOURCE_INVALID"),
+    "OS-PRECOMMIT": ("_route_a_owner_partition_identity", 7820, "ROUTE_A_OWNER_SNAPSHOT_PRECOMMITMENT_INVALID"),
+    "OS-REBIND": ("_route_a_rebind_owner_membership", 7922, "ROUTE_A_OWNER_SNAPSHOT_REBIND_INVALID"),
+    "OS-GEOMETRY": ("_route_a_rebind_owner_membership", 7939, "ROUTE_A_OWNER_SNAPSHOT_GEOMETRY_MISMATCH"),
+    "PROPAGATED-BOUNDARY": ("_winner_fold_plan", 2000, "PLANNED_ATTEMPT_HAS_NO_CAUSAL_FOLDS"),
+}
+
+
+def _owner_snapshot_expect_site(call, site_id):
+    function, line, code = _OWNER_SNAPSHOT_SITES[site_id]
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        call()
+    assert caught.value.code == code
+    trace = caught.value.__traceback__
+    filename = execution._route_a_owner_membership_snapshot.__code__.co_filename
+    reached = False
+    while trace is not None:
+        current = trace.tb_frame.f_code
+        reached |= current.co_filename == filename and current.co_name == function and trace.tb_lineno == line
+        trace = trace.tb_next
+    assert reached, f"INVENTED fixture did not reach owner refusal site {site_id}"
+
+
+def test_route_a_owner_snapshot_sparse_roster_preserves_full_source_and_terminal_rejection(monkeypatch):
+    case = _owner_snapshot_inputs(monkeypatch)
+    plans = [copy.deepcopy(row.plan_attempt) for row in case["attempts"]]
+    folds = [copy.deepcopy(row.candidate["folds"]) for row in case["attempts"]]
+    snapshot = _owner_snapshot_build(case)
+    assert snapshot["schema_version"] == "fxpm.route-a-owner-membership-snapshot.v2"
+    assert snapshot["provenance_scope"] == "CURRENT_OWNER_METADATA_PROJECTION_ONLY"
+    assert snapshot["original_trial_count"] == 2 and len(snapshot["attempt_roster"]) == 2
+    assert len(case["plan_body"]["candidates"]) == 1
+    assert [row["source_plan_attempt"] for row in snapshot["attempt_roster"]] == plans
+    assert [row["source_folds"] for row in snapshot["attempt_roster"]] == folds
+    assert all(len(fold) == 14 for attempt_folds in folds for fold in attempt_folds)
+    for row in snapshot["attempt_roster"]:
+        assert _owner_snapshot_sha(row["source_plan_attempt"]) == row["plan_attempt_sha256"]
+        assert row["parameters"] == case["attempts"][row["ordinal"]].artifacts.trial_definition["parameters"]
+    assert _owner_snapshot_sha(plans) == snapshot["declared_unit_binding"]["attempt_roster_sha256"]
+    assert snapshot["frozen_domains"] == case["frozen_domains"]
+    assert not {"unit_metadata", "header_reference", "new_header_digest"} & set(snapshot)
+    planned, rejected = snapshot["attempt_roster"]
+    assert planned["rejection"] is None and plans[0]["reason_code"] is None
+    assert rejected["rejection"] == {"plan_status": "PROCESS_REJECTED", "reason_code": plans[1]["reason_code"],
+        "state_context_disposition_sha256": plans[1]["state_context_disposition_sha256"]}
+    assert all(fold["partitions"] == {"status": "UNSCHEDULED"} for fold in rejected["folds"])
+    assert len(planned["scheduled_evaluations"]) == 4 and len(rejected["scheduled_evaluations"]) == 1
+    assert rejected["scheduled_evaluations"] == [case["plan_body"]["expected_evaluations"][-1]]
+    assert rejected["scheduled_evaluations"][0]["fold_id"] == "TERMINAL"
+    assert rejected["scheduled_evaluations"][0]["role"] == "TERMINAL_MECHANICAL_REJECTION"
+    assert "kind" not in rejected["rejection"] and "details" not in rejected["rejection"]
+    identity = planned["folds"][0]["partitions"]["optimizer_train"]
+    assert set(identity) == {"precommitment_row", "partition_geometry_receipt_sha256", "partition_frame_sha256", "tier_refs"}
+    assert identity["precommitment_row"] == case["precommitments"]["rows"][0]
+    assert "geometry" not in identity
+    assert case["derive_calls"] == []
+    _request_mapping_assert_no_authority(snapshot)
+
+
+@pytest.mark.parametrize("case_id", (
+    "rejected-reason-missing", "rejected-reason-empty", "planned-reason-nonnull", "planned-reason-missing",
+    "disposition-missing", "planned-disposition-missing", "fold-id-missing", "fold-id-duplicate", "fold-definition-hash",
+    "non-state-context-reason", "regime-null", "two-candidates",
+), ids=(
+    "rejected-reason-missing", "rejected-reason-empty", "planned-reason-nonnull", "planned-reason-missing",
+    "disposition-missing", "planned-disposition-missing", "fold-id-missing", "fold-id-duplicate", "fold-definition-hash",
+    "non-state-context-reason", "regime-null", "two-candidates",
+))
+def test_route_a_owner_snapshot_refuses_unsupported_real_owner_sources(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    if case_id == "rejected-reason-missing":
+        del case["attempts"][1].plan_attempt["reason_code"]
+    elif case_id == "rejected-reason-empty":
+        case["attempts"][1].plan_attempt["reason_code"] = ""
+    elif case_id == "planned-reason-nonnull":
+        case["attempts"][0].plan_attempt["reason_code"] = "INVENTED_INVALID_PLANNED_REASON"
+    elif case_id == "planned-reason-missing":
+        del case["attempts"][0].plan_attempt["reason_code"]
+    elif case_id == "disposition-missing":
+        del case["attempts"][1].plan_attempt["state_context_disposition_sha256"]
+    elif case_id == "planned-disposition-missing":
+        del case["attempts"][0].plan_attempt["state_context_disposition_sha256"]
+    elif case_id == "non-state-context-reason":
+        case["attempts"][1].plan_attempt["reason_code"] = "SOURCE_BOUNDARY_SHORTFALL"
+        case["plan_body"]["expected_evaluations"][-1]["expected_reason_code"] = "SOURCE_BOUNDARY_SHORTFALL"
+    elif case_id in {"fold-id-missing", "fold-id-duplicate", "fold-definition-hash"}:
+        for attempt in case["attempts"]:
+            if case_id == "fold-id-missing":
+                del attempt.candidate["folds"][0]["fold_id"]
+            elif case_id == "fold-id-duplicate":
+                duplicate = attempt.candidate["folds"][1]
+                duplicate.pop("fold_definition_sha256")
+                duplicate["fold_id"] = attempt.candidate["folds"][0]["fold_id"]
+                attempt.candidate["folds"][1] = _request_mapping_seal(duplicate, "fold_definition_sha256")
+            elif case_id == "fold-definition-hash":
+                attempt.candidate["folds"][0]["fit_rows"] += 1
+        case["plan_body"]["candidates"][0] = copy.deepcopy(case["attempts"][0].candidate)
+        if case_id == "fold-id-duplicate":
+            case["plan_body"]["expected_evaluations"][1]["fold_id"] = case["attempts"][0].candidate["folds"][1]["fold_id"]
+            for attempt in case["attempts"]:
+                duplicate = attempt.candidate["folds"][1]
+                assert _owner_snapshot_sha({key: value for key, value in duplicate.items()
+                    if key != "fold_definition_sha256"}) == duplicate["fold_definition_sha256"]
+    elif case_id == "regime-null":
+        case["plan_body"]["cell"]["regime"] = None
+    elif case_id == "two-candidates":
+        case["plan_body"]["candidates"].append(copy.deepcopy(case["plan_body"]["candidates"][0]))
+    else:
+        raise AssertionError("Unknown INVENTED real-owner source case")
+    case["plan_body"]["attempts"] = [copy.deepcopy(row.plan_attempt) for row in case["attempts"]]
+    case["declared_unit_binding"]["attempt_roster_sha256"] = _owner_snapshot_sha(case["plan_body"]["attempts"])
+    if case_id in {"fold-id-duplicate", "fold-definition-hash", "planned-disposition-missing"}:
+        _request_mapping_expect_site(lambda: _owner_snapshot_build(case), "C3")
+    else:
+        _owner_snapshot_expect_site(lambda: _owner_snapshot_build(case), "OS-SOURCE")
+    assert case["derive_calls"] == []
+
+
+@pytest.mark.parametrize("case_id", ("roster-hash", "fold-plan-hash"), ids=("roster-hash", "fold-plan-hash"))
+def test_route_a_owner_snapshot_refuses_existing_binding_mismatch(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    field = "attempt_roster_sha256" if case_id == "roster-hash" else "fold_plan_sha256"
+    case["declared_unit_binding"][field] = "0" * 64
+    _owner_snapshot_expect_site(lambda: _owner_snapshot_build(case), "OS-BINDING")
+    assert case["derive_calls"] == []
+
+
+@pytest.mark.parametrize("case_id", ("rejected-per-fold", "terminal-reason", "planned-own-fold"),
+    ids=("rejected-per-fold", "terminal-reason", "planned-own-fold"))
+def test_route_a_owner_snapshot_refuses_schedule_projection_drift(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    rows = case["plan_body"]["expected_evaluations"]
+    if case_id == "rejected-per-fold":
+        rows.append(copy.deepcopy(rows[-1]))
+    elif case_id == "terminal-reason":
+        rows[-1]["expected_reason_code"] = "INVENTED_OTHER_REASON"
+    else:
+        rows[0]["fold_id"] = "INVENTED_FOREIGN_FOLD"
+    _request_mapping_expect_site(lambda: _owner_snapshot_build(case), "C3")
+
+
+@pytest.mark.parametrize("case_id", ("source-plan-hash", "source-fold-order", "rejected-scheduled", "rejection-kind", "interpolation-fold"),
+    ids=("source-plan-hash", "source-fold-order", "rejected-scheduled", "rejection-kind", "interpolation-fold"))
+def test_route_a_owner_snapshot_shared_validator_checks_sparse_source_joins(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    planned, rejected = snapshot["attempt_roster"]
+    if case_id == "source-plan-hash":
+        planned["source_plan_attempt"]["trial_id"] = "INVENTED_OTHER_TRIAL"
+    elif case_id == "source-fold-order":
+        planned["source_folds"].reverse()
+    elif case_id == "rejected-scheduled":
+        rejected["folds"][0]["partitions"] = copy.deepcopy(planned["folds"][0]["partitions"])
+    elif case_id == "interpolation-fold":
+        fold = planned["source_folds"][0]
+        fold.pop("fold_definition_sha256")
+        fold["role"] = "INTERPOLATION_ONLY"
+        planned["source_folds"][0] = _request_mapping_seal(fold, "fold_definition_sha256")
+        planned["folds"][0]["role"] = "INTERPOLATION_ONLY"
+    else:
+        rejected["rejection"] = {"kind": "EXPECTED_INELIGIBLE", "reason_code": "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"}
+    _request_mapping_expect_site(lambda: _owner_snapshot_validate(snapshot), "C3")
+
+
+@pytest.mark.parametrize("case_id", (
+    "v2-schema", "receipt-format", "row-missing", "row-duplicate", "row-other-attempt",
+    "record-missing", "p75-missing", "p95-missing", "geometry-hash-format", "frame-hash-format",
+), ids=(
+    "v2-schema", "receipt-format", "row-missing", "row-duplicate", "row-other-attempt",
+    "record-missing", "p75-missing", "p95-missing", "geometry-hash-format", "frame-hash-format",
+))
+def test_route_a_owner_snapshot_refuses_missing_or_crossed_v2_identity(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    bundle = case["precommitments"]
+    digest = bundle["rows"][0]["partition_geometry_receipt_sha256"]
+    if case_id == "v2-schema":
+        bundle["schema_version"] = "INVENTED_NOT_V2"
+    elif case_id == "receipt-format":
+        bundle["receipt_sha256"] = "INVENTED_NOT_A_RECEIPT"
+    elif case_id == "row-missing":
+        bundle["rows"] = bundle["rows"][1:]
+    elif case_id == "row-duplicate":
+        bundle["rows"].append(copy.deepcopy(bundle["rows"][0]))
+    elif case_id == "row-other-attempt":
+        # Geometry records can be shared; the required OWN row cannot.
+        bundle["rows"][0]["attempt_ordinal"] = 1
+    elif case_id == "record-missing":
+        del bundle["records"][digest]
+    elif case_id == "p75-missing":
+        del bundle["records"][digest]["tiers"]["P75"]
+    elif case_id == "p95-missing":
+        del bundle["records"][digest]["tiers"]["P95"]
+    elif case_id == "geometry-hash-format":
+        bundle["rows"][0]["partition_geometry_receipt_sha256"] = "INVENTED_NOT_A_GEOMETRY_HASH"
+    else:
+        bundle["records"][digest]["partition_frame_sha256"] = "INVENTED_NOT_A_FRAME_HASH"
+    _owner_snapshot_expect_site(lambda: execution._route_a_owner_partition_identity(
+        precommitments=bundle, attempt_ordinal=0, fold_ordinal=0, partition_role="optimizer_train"), "OS-PRECOMMIT")
+
+
+@pytest.mark.parametrize("tier", ("P75", "P95"), ids=("P75", "P95"))
+def test_route_a_owner_snapshot_rebind_derives_only_resolved_fold_and_uses_shared_matcher(monkeypatch, tier):
+    case = _owner_snapshot_inputs(monkeypatch)
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("INVENTED owner matching attempted compiler, evaluation, source I/O or clock access")
+    for name in ("_compile_route_a_request_attempt_mapping", "_runtime_strategy", "Backtester", "_file_sha256", "_now_utc_seconds"):
+        monkeypatch.setattr(execution, name, forbidden)
+    snapshot = _owner_snapshot_build(case)
+    assert case["derive_calls"] == []
+    member, calls = execution._route_a_resolve_request_membership, []
+    def resolve(**kwargs):
+        calls.append(copy.deepcopy(kwargs["specification"]))
+        assert kwargs["owner_projection"] is True
+        return member(**kwargs)
+    monkeypatch.setattr(execution, "_route_a_resolve_request_membership", resolve)
+    specification = copy.deepcopy(case["specification"])
+    specification.update(spread_tier=tier, fold_ordinal=2, bookkeeping={"attempt_ordinal": 999, "horizon_attempt_id": "INVENTED_NONSELECTING"})
+    for ordinal in (0, 1):
+        specification["request_ordinal"] = ordinal
+        selected, fold, partition, parameters = _owner_snapshot_rebind(case, snapshot, specification)
+        assert selected is case["attempts"][0] and fold == selected.candidate["folds"][2]
+        assert fold["fold_id"] == selected.candidate["folds"][2]["fold_id"]
+        assert partition.role == "optimizer_train" and parameters == case["specification"]["parameters"]
+        assert partition.geometry_receipt == next(row["geometry_receipt"] for row in case["derive_rows"]
+            if row["fold_ordinal"] == 2 and row["role"] == "optimizer_train")
+    assert len(calls) == 2 and case["derive_calls"] == [(0, 2), (0, 2)]
+    _request_mapping_assert_no_authority(snapshot)
+
+
+@pytest.mark.parametrize("case_id", (
+    "private-ordinal", "raw-id", "horizon-id", "plan-content", "planned-status", "original-plan",
+    "source-fold-content", "original-owner-order", "original-strategy", "original-parameters",
+), ids=(
+    "private-ordinal", "raw-id", "horizon-id", "plan-content", "planned-status", "original-plan",
+    "source-fold-content", "original-owner-order", "original-strategy", "original-parameters",
+))
+def test_route_a_owner_snapshot_rebind_refuses_current_or_original_identity_drift(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    if case_id == "private-ordinal":
+        case["attempts"][0].ordinal = 7
+    elif case_id == "raw-id":
+        case["raw_ids"] = ("INVENTED_OTHER_RAW", case["raw_ids"][1])
+    elif case_id == "horizon-id":
+        case["attempts"][0].plan_attempt["attempt_id"] = "INVENTED_OTHER_HORIZON"
+    elif case_id == "plan-content":
+        case["attempts"][0].plan_attempt["invented_new_field"] = "INVENTED_CHANGED"
+    elif case_id == "planned-status":
+        case["attempts"][0].plan_attempt.update(status="PROCESS_REJECTED", reason_code="INVENTED_CHANGED")
+    elif case_id == "original-plan":
+        case["owner_attempts"][0].plan_attempt["invented_new_field"] = "INVENTED_CHANGED"
+    elif case_id == "source-fold-content":
+        case["attempts"][0].candidate["folds"][0]["fit_rows"] += 1
+    elif case_id == "original-owner-order":
+        case["owner_attempts"] = tuple(reversed(case["owner_attempts"]))
+    elif case_id == "original-strategy":
+        case["owner_attempts"][0].artifacts.winner_process["strategy_id"] = "INVENTED_OTHER_STRATEGY"
+    elif case_id == "original-parameters":
+        case["owner_attempts"][0].artifacts.trial_definition["parameters"]["fast_period"] = 11
+    else:
+        raise AssertionError("Unknown INVENTED original-owner join case")
+    _owner_snapshot_expect_site(lambda: _owner_snapshot_rebind(case, snapshot), "OS-REBIND")
+    assert case["derive_calls"] == []
+
+
+@pytest.mark.parametrize("index", (-1, 2), ids=("negative-index", "past-original-roster"))
+def test_route_a_owner_snapshot_rebind_refuses_untrusted_helper_index(monkeypatch, index):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    member = execution._route_a_resolve_request_membership
+    def invalid_index(**kwargs):
+        result = member(**kwargs)
+        result["attempt_index"] = index
+        return result
+    monkeypatch.setattr(execution, "_route_a_resolve_request_membership", invalid_index)
+    _owner_snapshot_expect_site(lambda: _owner_snapshot_rebind(case, snapshot), "OS-REBIND")
+    assert case["derive_calls"] == []
+
+
+@pytest.mark.parametrize("case_id", ("geometry-receipt", "frame-hash", "tier-reference", "geometry-body"),
+    ids=("geometry-receipt", "frame-hash", "tier-reference", "geometry-body"))
+def test_route_a_owner_snapshot_rebind_refuses_selected_geometry_or_reference_drift(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    identity = snapshot["attempt_roster"][0]["folds"][0]["partitions"]["optimizer_train"]
+    geometry = case["derive_rows"][0]["geometry_receipt"]
+    if case_id == "geometry-receipt":
+        # Equivalent UTC text keeps the frame identity while changing committed body bytes.
+        assert geometry["frame_start_utc"].endswith("+00:00")
+        geometry["frame_start_utc"] = geometry["frame_start_utc"].replace("+00:00", "Z")
+        geometry["receipt_sha256"] = _owner_snapshot_sha({key: value for key, value in geometry.items() if key != "receipt_sha256"})
+        assert geometry["receipt_sha256"] != identity["partition_geometry_receipt_sha256"]
+        assert geometry["frame_sha256"] == identity["partition_frame_sha256"]
+    elif case_id == "frame-hash":
+        old_digest, expected_frame = identity["partition_geometry_receipt_sha256"], identity["partition_frame_sha256"]
+        geometry["frame_sha256"] = "9" * 64
+        geometry["receipt_sha256"] = _owner_snapshot_sha({key: value for key, value in geometry.items() if key != "receipt_sha256"})
+        bundle = case["precommitments"]
+        own_row = next(row for row in bundle["rows"] if (row["attempt_ordinal"], row["fold_ordinal"], row["partition"]) == (0, 0, "optimizer_train"))
+        own_row["partition_geometry_receipt_sha256"] = geometry["receipt_sha256"]
+        bundle["records"][geometry["receipt_sha256"]] = copy.deepcopy(bundle["records"][old_digest])
+        if not any(row["partition_geometry_receipt_sha256"] == old_digest for row in bundle["rows"]):
+            del bundle["records"][old_digest]
+        bundle.pop("receipt_sha256")
+        case["precommitments"] = _request_mapping_seal(bundle, "receipt_sha256")
+        bundle = case["precommitments"]
+        own_row = next(row for row in bundle["rows"] if (row["attempt_ordinal"], row["fold_ordinal"], row["partition"]) == (0, 0, "optimizer_train"))
+        identity.update(precommitment_row=copy.deepcopy(own_row), partition_geometry_receipt_sha256=geometry["receipt_sha256"],
+            tier_refs={tier: "|".join((bundle["schema_version"], bundle["receipt_sha256"], geometry["receipt_sha256"], tier)) for tier in ("P75", "P95")})
+        case["declared_unit_binding"]["cost_precommitments_sha256"] = _owner_snapshot_sha(bundle)
+        snapshot["declared_unit_binding"]["cost_precommitments_sha256"] = _owner_snapshot_sha(bundle)
+        assert geometry["receipt_sha256"] == identity["partition_geometry_receipt_sha256"]
+        assert geometry["frame_sha256"] != identity["partition_frame_sha256"] == expected_frame
+        assert bundle["records"][geometry["receipt_sha256"]]["partition_frame_sha256"] == expected_frame
+    elif case_id == "geometry-body":
+        assert geometry["frame_start_utc"].endswith("+00:00")
+        geometry["frame_start_utc"] = geometry["frame_start_utc"].replace("+00:00", "Z")
+        assert geometry["receipt_sha256"] == identity["partition_geometry_receipt_sha256"]
+        assert geometry["frame_sha256"] == identity["partition_frame_sha256"]
+    else:
+        identity["tier_refs"]["P75"] = "|".join((case["precommitments"]["schema_version"], "9" * 64,
+            identity["partition_geometry_receipt_sha256"], "P75"))
+    actual_selfhash = _owner_snapshot_sha({key: value for key, value in geometry.items() if key != "receipt_sha256"})
+    assert (actual_selfhash == geometry["receipt_sha256"]) is (case_id != "geometry-body")
+    _owner_snapshot_expect_site(lambda: _owner_snapshot_rebind(case, snapshot), "OS-GEOMETRY")
+
+
+def test_route_a_owner_snapshot_rebind_preserves_typed_tuple_parameters(monkeypatch):
+    """INVENTED metadata provider; canonical wire equality must preserve runtime tuple type."""
+    case = _owner_snapshot_inputs(monkeypatch)
+    templates = {"pair": (1, 2)}
+    def defaults(strategy_id):
+        assert strategy_id == "INVENTED_TUPLE_DEFAULTS"
+        return SimpleNamespace(get_default_params=lambda: templates)
+    monkeypatch.setattr(execution.StrategyRegistry, "get", staticmethod(defaults))
+    domain = {"strategy_id": "INVENTED_TUPLE_DEFAULTS", "strategy_family": "INVENTED_TUPLE_FAMILY",
+        "parameter_domain": {"schema_version": "fxpm.parameter-domain.v1", "defaults": {"pair": [1, 2]},
+            "axes": [{"names": ["pair"], "choices": [[[1, 2]], [[2, 3]]]}], "point_count": 2}}
+    case["frozen_domains"] = [_request_mapping_seal(domain, "domain_sha256")]
+    for row in (*case["attempts"], *case["owner_attempts"]):
+        row.plan_attempt["strategy_id"] = "INVENTED_TUPLE_DEFAULTS"
+        row.plan_attempt["parameter_set_sha256"] = _owner_snapshot_sha({"pair": [1, 2]})
+        row.artifacts.winner_process.update(strategy_id="INVENTED_TUPLE_DEFAULTS", strategy_family="INVENTED_TUPLE_FAMILY")
+        row.artifacts.trial_definition["parameters"] = {"pair": [1, 2]}
+    case["plan_body"]["attempts"] = [copy.deepcopy(row.plan_attempt) for row in case["attempts"]]
+    case["declared_unit_binding"]["attempt_roster_sha256"] = _owner_snapshot_sha(case["plan_body"]["attempts"])
+    case["specification"].update(strategy_id="INVENTED_TUPLE_DEFAULTS", parameters={"pair": [1, 2]})
+    snapshot = _owner_snapshot_build(case)
+    selected, _fold, _partition, parameters = _owner_snapshot_rebind(case, snapshot)
+    assert selected is case["attempts"][0] and parameters == {"pair": (1, 2)} and type(parameters["pair"]) is tuple
+    assert snapshot["attempt_roster"][0]["parameters"] == {"pair": [1, 2]}
+    parameters["pair"] = (9, 9)
+    assert templates == {"pair": (1, 2)} and selected.artifacts.trial_definition["parameters"] == {"pair": [1, 2]}
+
+
+def test_route_a_owner_snapshot_pair_selection_bytes_preserve_old_formula(monkeypatch):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    selected, fold, partition, parameters = _owner_snapshot_rebind(case, snapshot)
+    common = dict(strategy_id=selected.artifacts.winner_process["strategy_id"], parameters=parameters,
+        attempt_ordinal=selected.ordinal, fold_ordinal=0, fold_id=fold["fold_id"],
+        partition_geometry=partition.geometry_receipt, declared_unit_binding=case["declared_unit_binding"])
+    low, low_group = execution._route_a_owner_selection_bytes(**common, spread_tier="P75")
+    high, high_group = execution._route_a_owner_selection_bytes(**common, spread_tier="P95")
+    assert low != high and low_group == high_group
+    assert hashlib.sha256(low_group).hexdigest() == hashlib.sha256(high_group).hexdigest()
+    import json
+    expected_group = {"strategy_id": selected.artifacts.winner_process["strategy_id"], "parameters": parameters,
+        "attempt_ordinal": selected.ordinal, "fold_ordinal": 0, "fold_id": fold["fold_id"],
+        "partition_geometry": partition.geometry_receipt, "declared_unit_binding": case["declared_unit_binding"]}
+    encode = lambda value: json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+    assert low_group == encode(expected_group)
+    assert low == encode({**expected_group, "spread_tier": "P75", "metadata_recipe": "ROUTE_A_APPLIED_SPREAD_POLICY_V1"})
+    assert high == encode({**expected_group, "spread_tier": "P95", "metadata_recipe": "ROUTE_A_APPLIED_SPREAD_POLICY_V1"})
+    assert "spread_tier" not in json.loads(low_group) and "metadata_recipe" not in json.loads(low_group)
+
+
+def test_route_a_owner_snapshot_copies_source_and_projection_without_aliases(monkeypatch):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    pristine = copy.deepcopy(snapshot)
+    case["attempts"][1].plan_attempt["reason_code"] = "INVENTED_CHANGED_SOURCE"
+    case["attempts"][0].candidate["folds"][0]["fit_rows"] += 1
+    case["frozen_domains"][0]["strategy_family"] = "INVENTED_CHANGED_SOURCE"
+    assert snapshot == pristine
+    snapshot["attempt_roster"][0]["source_folds"][0]["fit_rows"] += 1
+    snapshot["attempt_roster"][1]["rejection"]["reason_code"] = "INVENTED_CHANGED_OUTPUT"
+    assert snapshot["attempt_roster"][1]["source_folds"] == pristine["attempt_roster"][1]["source_folds"]
+    assert snapshot["attempt_roster"][1]["source_plan_attempt"] == pristine["attempt_roster"][1]["source_plan_attempt"]
+    assert case["attempts"][1].plan_attempt["reason_code"] == "INVENTED_CHANGED_SOURCE"
+
+
+def test_route_a_owner_snapshot_identity_names_receipt_without_authenticating_it(monkeypatch):
+    """INVENTED consistency only; authenticated full-content guards remain external."""
+    case = _owner_snapshot_inputs(monkeypatch)
+    case["precommitments"]["receipt_sha256"] = "9" * 64
+    identity = execution._route_a_owner_partition_identity(precommitments=case["precommitments"],
+        attempt_ordinal=0, fold_ordinal=0, partition_role="optimizer_train")
+    assert identity["tier_refs"] == {tier: "|".join((case["precommitments"]["schema_version"], "9" * 64,
+        identity["partition_geometry_receipt_sha256"], tier)) for tier in ("P75", "P95")}
+
+
+@pytest.mark.parametrize("case_id", ("nonplain", "binding-shape", "owner-flag"), ids=("nonplain", "binding-shape", "owner-flag"))
+def test_route_a_owner_snapshot_shared_input_guard_refuses_invalid_projection(monkeypatch, case_id):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    kwargs = {"frozen_domains": snapshot["frozen_domains"], "attempt_roster": snapshot["attempt_roster"],
+        "owner_projection": True, "declared_unit_binding": snapshot["declared_unit_binding"]}
+    if case_id == "nonplain":
+        kwargs["attempt_roster"][0]["source_plan_attempt"]["invented_nonplain"] = object()
+    elif case_id == "binding-shape":
+        del kwargs["declared_unit_binding"]["attempt_roster_sha256"]
+    else:
+        kwargs["owner_projection"] = 1
+    _owner_snapshot_expect_site(lambda: execution._route_a_validate_mapping_snapshot(**kwargs), "V0")
+
+
+def test_route_a_owner_snapshot_membership_owner_flag_is_exact_bool(monkeypatch):
+    case = _owner_snapshot_inputs(monkeypatch)
+    snapshot = _owner_snapshot_build(case)
+    _request_mapping_expect_site(lambda: execution._route_a_resolve_request_membership(
+        specification=case["specification"], frozen_domains=snapshot["frozen_domains"],
+        attempt_roster=snapshot["attempt_roster"], owner_projection=1), "M1")
+
+
+def test_route_a_owner_snapshot_boundary_refuses_at_existing_fold_plan_callee(monkeypatch):
+    """INVENTED unsupported real-route input; this is existing-callee propagation, not a new owner site."""
+    case = _owner_snapshot_inputs(monkeypatch)
+    for attempt in case["attempts"]:
+        attempt.candidate["folds"] = []
+    case["plan_body"]["candidates"][0] = copy.deepcopy(case["attempts"][0].candidate)
+    _owner_snapshot_expect_site(lambda: _owner_snapshot_build(case), "PROPAGATED-BOUNDARY")
+    assert case["derive_calls"] == []
+
+
+def test_route_a_owner_snapshot_direct_projection_refuses_all_rejected_roster(monkeypatch):
+    """Direct helper refusal does not establish the outer UNSEARCHED bypass."""
+    case = _owner_snapshot_inputs(monkeypatch)
+    case["attempts"][0].plan_attempt.update(status="PROCESS_REJECTED", reason_code="STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL")
+    case["plan_body"]["attempts"] = [copy.deepcopy(row.plan_attempt) for row in case["attempts"]]
+    case["declared_unit_binding"]["attempt_roster_sha256"] = _owner_snapshot_sha(case["plan_body"]["attempts"])
+    _owner_snapshot_expect_site(lambda: _owner_snapshot_build(case), "OS-SOURCE")
+    assert case["derive_calls"] == []

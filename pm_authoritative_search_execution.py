@@ -6009,8 +6009,11 @@ def execute_historical_observed_cell(
                         Path(strategy_module.__file__))
                     unique_entries, selection_to_unique = [], {}
                     issued_evaluator = None
+                    owner_snapshot_bytes = None
 
                     def close_route_a_scope():
+                        nonlocal owner_snapshot_bytes
+                        owner_snapshot_bytes = None
                         lifecycle.close()
                         selection_to_unique.clear()
                         unique_entries.clear()
@@ -6116,46 +6119,25 @@ def execute_historical_observed_cell(
                         _route_a_require_unchanged(expected=admitted_content, observed=shared_content())
                         require_route_a_owner_window()
 
+                    owner_snapshot_bytes = _canonical_bytes(_route_a_owner_membership_snapshot(
+                        declared_unit_binding=json.loads(unit_binding_bytes.decode("ascii")),
+                        frozen_domains=private_domains, plan_body=private_plan, attempts=private_attempts,
+                        raw_ids=raw_ids, precommitments=private_precommitments))
+
                     def select_request(specification):
-                        domain = next((value for value in private_domains
-                            if value["strategy_id"] == specification["strategy_id"]), None)
-                        if domain is None:
-                            _fail("ROUTE_A_UNIT_BATCH_REQUEST_INVALID")
-                        parameters = planner.validate_parameter_domain_member(
-                            domain["parameter_domain"], specification["parameters"])
-                        defaults = StrategyRegistry.get(specification["strategy_id"]).get_default_params()
-                        matches = []
-                        for candidate_attempt in private_attempts:
-                            if (candidate_attempt.plan_attempt["status"] != "PLANNED"
-                                    or candidate_attempt.artifacts.winner_process["strategy_id"]
-                                        != specification["strategy_id"]):
-                                continue
-                            actual_parameters = decode_parameter_mapping(
-                                candidate_attempt.artifacts.trial_definition["parameters"], defaults)
-                            if _canonical_bytes(actual_parameters) != _canonical_bytes(parameters):
-                                continue
-                            folds = _causal_folds(candidate_attempt)
-                            if specification["fold_ordinal"] >= len(folds):
-                                continue
-                            fold = folds[specification["fold_ordinal"]]
-                            partitions = _fold_partitions(frame=private_fitted._frame, fold=fold,
-                                attempt=candidate_attempt,
-                                dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"])
-                            partition = next(value for value in partitions
-                                if value.role == specification["partition_role"])
-                            matches.append((candidate_attempt, fold, partition, parameters))
-                        if len(matches) != 1:
-                            _fail("ROUTE_A_UNIT_BATCH_ATTEMPT_BINDING_"
-                                + ("UNAVAILABLE" if not matches else "AMBIGUOUS"))
-                        selected_attempt, fold, partition, parameters = matches[0]
-                        group = {"strategy_id": specification["strategy_id"], "parameters": parameters,
-                            "attempt_ordinal": selected_attempt.ordinal,
-                            "fold_ordinal": specification["fold_ordinal"], "fold_id": fold["fold_id"],
-                            "partition_geometry": partition.geometry_receipt,
-                            "declared_unit_binding": json.loads(unit_binding_bytes.decode("ascii"))}
-                        selection = {**group, "spread_tier": specification["spread_tier"],
-                            "metadata_recipe": _ROUTE_A_UNIT_BATCH_RECIPE}
-                        return selected_attempt, fold, partition, parameters, _canonical_bytes(selection), _canonical_bytes(group)
+                        selected_attempt, fold, partition, parameters = _route_a_rebind_owner_membership(
+                            specification=specification, snapshot=json.loads(owner_snapshot_bytes.decode("ascii")),
+                            attempts=private_attempts, owner_attempts=attempts, raw_ids=raw_ids,
+                            frame=private_fitted._frame,
+                            dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"],
+                            precommitments=private_precommitments)
+                        selection, group = _route_a_owner_selection_bytes(
+                            strategy_id=selected_attempt.artifacts.winner_process["strategy_id"], parameters=parameters,
+                            attempt_ordinal=selected_attempt.ordinal, fold_ordinal=specification["fold_ordinal"],
+                            fold_id=fold["fold_id"], partition_geometry=partition.geometry_receipt,
+                            declared_unit_binding=json.loads(unit_binding_bytes.decode("ascii")),
+                            spread_tier=specification["spread_tier"])
+                        return selected_attempt, fold, partition, parameters, selection, group
 
                     def describe_request(specification, parameters, evaluation_binding):
                         described = planner.describe_route_a_evaluation_design(frozen_domains=private_domains,
@@ -7395,7 +7377,7 @@ def _route_a_pair_check(*, signals_by_tier, results_by_tier, spec, use_spread, f
 from pm_current_refit_parameters import validate_parameter_domain_member as _route_a_mapping_validate_member
 
 
-def _route_a_resolve_request_membership(*, specification, frozen_domains, attempt_roster):
+def _route_a_resolve_request_membership(*, specification, frozen_domains, attempt_roster, owner_projection=False):
     """Resolve a normalized request against validated, nonauthorizing JSON metadata."""
     fields = {"request_ordinal", "strategy_id", "parameters", "fold_ordinal",
         "partition_role", "spread_tier", "bookkeeping"}
@@ -7406,7 +7388,7 @@ def _route_a_resolve_request_membership(*, specification, frozen_domains, attemp
             or type(specification["fold_ordinal"]) is not int or specification["fold_ordinal"] < 0
             or specification["partition_role"] not in ("optimizer_train", "tuning_validation")
             or specification["spread_tier"] not in ("P75", "P95")
-            or type(frozen_domains) is not list or type(attempt_roster) is not list):
+            or type(frozen_domains) is not list or type(attempt_roster) is not list or type(owner_projection) is not bool):
         _fail("ROUTE_A_MAPPING_REQUEST_INVALID")
     domain = next((value for value in frozen_domains
         if value["strategy_id"] == specification["strategy_id"]), None)
@@ -7441,9 +7423,229 @@ def _route_a_resolve_request_membership(*, specification, frozen_domains, attemp
         "strategy_id": specification["strategy_id"], "strategy_family": domain["strategy_family"],
         "domain_sha256": domain["domain_sha256"], "parameters": parameters,
         "fold_ordinal": specification["fold_ordinal"], "fold_id": fold["fold_id"],
-        "partition_role": specification["partition_role"], "partition_geometry": partition["geometry"],
+        "partition_role": specification["partition_role"],
+        **({"partition_identity": partition} if owner_projection else {"partition_geometry": partition["geometry"]}),
         "spread_tier": specification["spread_tier"],
         "tier_reference": partition["tier_refs"][specification["spread_tier"]]}).decode("ascii"))
+
+
+def _route_a_validate_mapping_snapshot(*, frozen_domains, attempt_roster,
+        owner_projection=False, declared_unit_binding=None):
+    """Validate copied data for legacy designs or the narrow current-owner view."""
+    def plain(value):
+        if type(value) in (type(None), bool, int, str):
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if type(value) is list:
+            return all(plain(item) for item in value)
+        if type(value) is dict:
+            return all(type(key) is str and plain(item) for key, item in value.items())
+        return False
+
+    def text(value):
+        return type(value) is str and bool(value)
+
+    def hexadecimal(value):
+        return type(value) is str and len(value) == 64 and all(char in "0123456789abcdef" for char in value)
+
+    valid = False
+    try:
+        payload = {"frozen_domains": frozen_domains, "attempt_roster": attempt_roster}
+        if owner_projection:
+            payload["declared_unit_binding"] = declared_unit_binding
+        if type(owner_projection) is bool and plain(payload):
+            encoded = _canonical_bytes(payload)
+            if len(encoded) <= winner.MAX_REQUEST_BYTES:
+                snapshot = json.loads(encoded.decode("ascii"))
+                valid = type(snapshot["attempt_roster"]) is list
+                if owner_projection:
+                    fields = {"generation_context_sha256", "producer_request_sha256", "executor_release_sha256",
+                        "producer_source_sha256", "horizon_plan_receipt_sha256", "cell_plan_receipt_sha256",
+                        "source_group_sha256", "regime_fit_sha256", "frame_sha256", "fitted_state_reference_sha256",
+                        "execution_spec_sha256", "frozen_receipt_sha256", "cost_precommitments_sha256",
+                        "fold_plan_sha256", "attempt_roster_sha256"}
+                    binding = snapshot["declared_unit_binding"]
+                    valid = valid and type(binding) is dict and set(binding) == fields and all(hexadecimal(v) for v in binding.values())
+                else:
+                    valid = valid and declared_unit_binding is None
+    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        valid = False
+    if not valid:
+        _fail("ROUTE_A_MAPPING_SNAPSHOT_INVALID")
+    roles, tiers = ("optimizer_train", "tuning_validation", "final_lockbox"), ("P75", "P95")
+    domains, roster = snapshot["frozen_domains"], snapshot["attempt_roster"]
+    domains_valid = type(domains) is list and bool(domains)
+    domain_ids = set()
+    try:
+        for domain in domains if type(domains) is list else []:
+            required = {"strategy_id", "strategy_family", "parameter_domain", "domain_sha256"}
+            if (type(domain) is not dict or not required <= set(domain)
+                    or not text(domain["strategy_id"]) or domain["strategy_id"] in domain_ids
+                    or not text(domain["strategy_family"]) or not hexadecimal(domain["domain_sha256"])
+                    or hashlib.sha256(_canonical_bytes({key: value for key, value in domain.items()
+                        if key != "domain_sha256"})).hexdigest() != domain["domain_sha256"]):
+                domains_valid = False
+                continue
+            domain_ids.add(domain["strategy_id"])
+            _route_a_mapping_validate_member(domain["parameter_domain"], domain["parameter_domain"]["defaults"])
+    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        domains_valid = False
+    if not domains_valid:
+        _fail("ROUTE_A_MAPPING_DOMAINS_INVALID")
+
+    def partition_valid(partition, role):
+        if type(partition) is not dict or set(partition) != {"geometry", "tier_refs"}:
+            return False
+        geometry, references = partition["geometry"], partition["tier_refs"]
+        fields = {"schema_version", "role", "frame_start_utc", "scored_start_utc", "end_exclusive_utc",
+            "warmup_bars", "scored_bars", "frame_rows", "frame_sha256", "receipt_sha256"}
+        return (type(geometry) is dict and set(geometry) == fields
+            and geometry["schema_version"] == PARTITION_GEOMETRY_VERSION and geometry["role"] == role
+            and all(text(geometry[name]) for name in ("frame_start_utc", "scored_start_utc", "end_exclusive_utc"))
+            and type(geometry["warmup_bars"]) is int and geometry["warmup_bars"] >= 0
+            and type(geometry["scored_bars"]) is int and geometry["scored_bars"] > 0
+            and type(geometry["frame_rows"]) is int
+            and geometry["frame_rows"] == geometry["warmup_bars"] + geometry["scored_bars"]
+            and hexadecimal(geometry["frame_sha256"]) and hexadecimal(geometry["receipt_sha256"])
+            and hashlib.sha256(_canonical_bytes({key: value for key, value in geometry.items()
+                if key != "receipt_sha256"})).hexdigest() == geometry["receipt_sha256"]
+            and type(references) is dict and set(references) == set(tiers)
+            and all(text(value) for value in references.values()))
+
+
+    def source_fold_valid(fold):
+        fields = {"fold_id", "role", "fit_start_utc", "fit_end_exclusive_utc", "validation_warmup_start_utc",
+            "validation_start_utc", "validation_end_exclusive_utc", "right_fit_start_utc", "right_fit_end_exclusive_utc",
+            "fit_rows", "validation_rows", "source_slice_sha256", "final_oos_authority", "fold_definition_sha256"}
+        alphanumeric = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        return (type(fold) is dict and set(fold) == fields
+            and text(fold["fold_id"]) and 1 <= len(fold["fold_id"]) <= 128 and fold["fold_id"][0] in alphanumeric
+            and all(char in alphanumeric + "._:-" for char in fold["fold_id"])
+            and fold["role"] == "CAUSAL_ROLLING_ORIGIN_INNER"
+            and all(text(fold[name]) for name in ("fit_start_utc", "fit_end_exclusive_utc", "validation_warmup_start_utc",
+                "validation_start_utc", "validation_end_exclusive_utc"))
+            and fold["right_fit_start_utc"] is None and fold["right_fit_end_exclusive_utc"] is None
+            and type(fold["fit_rows"]) is int and fold["fit_rows"] > 0
+            and type(fold["validation_rows"]) is int and fold["validation_rows"] > 0
+            and fold["final_oos_authority"] is False and hexadecimal(fold["source_slice_sha256"])
+            and hexadecimal(fold["fold_definition_sha256"])
+            and hashlib.sha256(_canonical_bytes({key: value for key, value in fold.items()
+                if key != "fold_definition_sha256"})).hexdigest() == fold["fold_definition_sha256"])
+
+    def scheduled_valid(scheduled, attempt, source_folds):
+        fields = {"ordinal", "attempt_id", "fold_id", "role", "validation_start_utc", "validation_end_exclusive_utc",
+            "expected_status", "expected_reason_code", "downstream_causal_eligible", "final_oos_authority", "context_sha256"}
+        if (type(scheduled) is not list or len(scheduled) != (4 if attempt["status"] == "PLANNED" else 1)
+                or not all(type(row) is dict and set(row) == fields and type(row["ordinal"]) is int
+                    and row["ordinal"] >= 0 and row["attempt_id"] == attempt["horizon_attempt_id"]
+                    and row["final_oos_authority"] is False and hexadecimal(row["context_sha256"]) for row in scheduled)):
+            return False
+        if attempt["status"] == "PROCESS_REJECTED":
+            row = scheduled[0]
+            return (row["fold_id"] == "TERMINAL" and row["role"] == "TERMINAL_MECHANICAL_REJECTION"
+                and row["validation_start_utc"] is None and row["validation_end_exclusive_utc"] is None
+                and row["expected_status"] == "PROCESS_REJECTED"
+                and row["expected_reason_code"] == attempt["source_plan_attempt"]["reason_code"]
+                and row["downstream_causal_eligible"] is False)
+        return all(row["fold_id"] == fold["fold_id"] and row["role"] == fold["role"]
+            and row["validation_start_utc"] == fold["validation_start_utc"]
+            and row["validation_end_exclusive_utc"] == fold["validation_end_exclusive_utc"]
+            and row["expected_status"] == "EVALUATION_REQUIRED" and row["expected_reason_code"] is None
+            and row["downstream_causal_eligible"] is True for row, fold in zip(scheduled, source_folds, strict=True))
+
+    def sparse_partition_valid(partition, role, ordinal, fold_ordinal):
+        if type(partition) is not dict or set(partition) != {"precommitment_row",
+                "partition_geometry_receipt_sha256", "partition_frame_sha256", "tier_refs"}:
+            return False
+        row = partition["precommitment_row"]
+        return (type(row) is dict and set(row) == {"attempt_ordinal", "fold_ordinal", "partition", "partition_geometry_receipt_sha256"}
+            and type(row["attempt_ordinal"]) is int and row["attempt_ordinal"] == ordinal
+            and type(row["fold_ordinal"]) is int and row["fold_ordinal"] == fold_ordinal and row["partition"] == role
+            and hexadecimal(partition["partition_geometry_receipt_sha256"])
+            and row["partition_geometry_receipt_sha256"] == partition["partition_geometry_receipt_sha256"]
+            and hexadecimal(partition["partition_frame_sha256"])
+            and type(partition["tier_refs"]) is dict and set(partition["tier_refs"]) == set(tiers)
+            and all(text(value) for value in partition["tier_refs"].values()))
+
+    roster_valid, raw_ids, horizon_ids = True, set(), set()
+    try:
+        fields = {"ordinal", "raw_attempt_id", "horizon_attempt_id", "plan_attempt_sha256", "status",
+            "strategy_id", "parameters", "causal_fold_count", "folds", "rejection"}
+        if owner_projection:
+            fields |= {"source_plan_attempt", "source_folds", "scheduled_evaluations"}
+        for ordinal, attempt in enumerate(roster):
+            if (type(attempt) is not dict or set(attempt) != fields
+                    or type(attempt["ordinal"]) is not int or attempt["ordinal"] != ordinal
+                    or not text(attempt["raw_attempt_id"]) or attempt["raw_attempt_id"] in raw_ids
+                    or not text(attempt["horizon_attempt_id"]) or attempt["horizon_attempt_id"] in horizon_ids
+                    or not hexadecimal(attempt["plan_attempt_sha256"])
+                    or attempt["status"] not in ("PLANNED", "PROCESS_REJECTED")
+                    or attempt["strategy_id"] not in domain_ids or type(attempt["parameters"]) is not dict
+                    or type(attempt["causal_fold_count"]) is not int or attempt["causal_fold_count"] < 0
+                    or type(attempt["folds"]) is not list):
+                roster_valid = False
+                continue
+            raw_ids.add(attempt["raw_attempt_id"]); horizon_ids.add(attempt["horizon_attempt_id"])
+            rejection = attempt["rejection"]
+            if owner_projection:
+                source_plan, source_folds = attempt["source_plan_attempt"], attempt["source_folds"]
+                source_valid = (type(source_plan) is dict and type(source_folds) is list
+                    and len(source_folds) == len(attempt["folds"]) == attempt["causal_fold_count"] == 4
+                    and all(source_fold_valid(fold) for fold in source_folds)
+                    and source_plan.get("attempt_id") == attempt["horizon_attempt_id"]
+                    and source_plan.get("status") == attempt["status"]
+                    and source_plan.get("strategy_id") == attempt["strategy_id"]
+                    and "reason_code" in source_plan and hexadecimal(source_plan.get("state_context_disposition_sha256"))
+                    and _sha256(source_plan) == attempt["plan_attempt_sha256"]
+                    and _sha256(attempt["parameters"]) == source_plan.get("parameter_set_sha256")
+                    and scheduled_valid(attempt["scheduled_evaluations"], attempt, source_folds))
+                if attempt["status"] == "PLANNED":
+                    roster_valid = roster_valid and source_valid and source_plan.get("reason_code") is None and rejection is None
+                else:
+                    expected = {"plan_status": "PROCESS_REJECTED", "reason_code": source_plan.get("reason_code"),
+                        "state_context_disposition_sha256": source_plan.get("state_context_disposition_sha256")}
+                    roster_valid = (roster_valid and source_valid and expected["reason_code"] == "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
+                        and type(rejection) is dict and set(rejection) == set(expected) and rejection == expected)
+            elif attempt["status"] == "PLANNED":
+                roster_valid = roster_valid and rejection is None and attempt["causal_fold_count"] > 0
+            else:
+                roster_valid = roster_valid and (type(rejection) is dict and {"kind", "code", "details"} <= set(rejection)
+                    and rejection["kind"] == "PROCESS_REJECTED" and text(rejection["code"])
+                    and type(rejection["details"]) is list and all(type(value) is str for value in rejection["details"]))
+            fold_ids, causal_count = set(), 0
+            for fold_index, fold in enumerate(attempt["folds"]):
+                if (type(fold) is not dict or set(fold) != {"role", "fold_id", "partitions"}
+                        or not text(fold["role"]) or not text(fold["fold_id"]) or fold["fold_id"] in fold_ids
+                        or type(fold["partitions"]) is not dict):
+                    roster_valid = False
+                    continue
+                fold_ids.add(fold["fold_id"])
+                if owner_projection:
+                    source = source_folds[fold_index]
+                    roster_valid = roster_valid and fold["fold_id"] == source["fold_id"] and fold["role"] == source["role"]
+                if fold["role"] == "CAUSAL_ROLLING_ORIGIN_INNER":
+                    causal_count += 1
+                    if owner_projection and attempt["status"] == "PROCESS_REJECTED":
+                        roster_valid = roster_valid and fold["partitions"] == {"status": "UNSCHEDULED"}
+                    else:
+                        roster_valid = roster_valid and set(fold["partitions"]) == set(roles)
+                        for role in roles:
+                            roster_valid = roster_valid and (sparse_partition_valid(fold["partitions"].get(role), role, ordinal, causal_count - 1)
+                                if owner_projection else partition_valid(fold["partitions"].get(role), role))
+                else:
+                    roster_valid = roster_valid and not owner_projection and fold["partitions"] == {}
+            roster_valid = roster_valid and causal_count == attempt["causal_fold_count"]
+        if owner_projection:
+            roster_valid = (roster_valid and bool(roster) and any(row["status"] == "PLANNED" for row in roster)
+                and _sha256([row["source_plan_attempt"] for row in roster]) == snapshot["declared_unit_binding"]["attempt_roster_sha256"]
+                and [row["ordinal"] for attempt in roster for row in attempt["scheduled_evaluations"]]
+                    == list(range(sum(len(attempt["scheduled_evaluations"]) for attempt in roster))))
+    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, IndexError, OverflowError, RecursionError):
+        roster_valid = False
+    if not roster_valid:
+        _fail("ROUTE_A_MAPPING_ROSTER_INVALID")
+    return domains, roster
 
 
 def _compile_route_a_request_attempt_mapping(*, unit_metadata, frozen_domains, attempt_roster,
@@ -7514,91 +7716,8 @@ def _compile_route_a_request_attempt_mapping(*, unit_metadata, frozen_domains, a
         valid = False
     if not valid:
         _fail("ROUTE_A_MAPPING_INPUT_INVALID")
-    domains, roster = snapshot["frozen_domains"], snapshot["attempt_roster"]
-    domains_valid = type(domains) is list and bool(domains)
-    domain_ids = set()
-    try:
-        for domain in domains if type(domains) is list else []:
-            required = {"strategy_id", "strategy_family", "parameter_domain", "domain_sha256"}
-            if (type(domain) is not dict or not required <= set(domain)
-                    or not text(domain["strategy_id"]) or domain["strategy_id"] in domain_ids
-                    or not text(domain["strategy_family"]) or not hexadecimal(domain["domain_sha256"])
-                    or hashlib.sha256(_canonical_bytes({key: value for key, value in domain.items()
-                        if key != "domain_sha256"})).hexdigest() != domain["domain_sha256"]):
-                domains_valid = False
-                continue
-            domain_ids.add(domain["strategy_id"])
-            _route_a_mapping_validate_member(domain["parameter_domain"], domain["parameter_domain"]["defaults"])
-    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
-        domains_valid = False
-    if not domains_valid:
-        _fail("ROUTE_A_MAPPING_DOMAINS_INVALID")
-
-    def partition_valid(partition, role):
-        if type(partition) is not dict or set(partition) != {"geometry", "tier_refs"}:
-            return False
-        geometry, references = partition["geometry"], partition["tier_refs"]
-        fields = {"schema_version", "role", "frame_start_utc", "scored_start_utc", "end_exclusive_utc",
-            "warmup_bars", "scored_bars", "frame_rows", "frame_sha256", "receipt_sha256"}
-        return (type(geometry) is dict and set(geometry) == fields
-            and geometry["schema_version"] == PARTITION_GEOMETRY_VERSION and geometry["role"] == role
-            and all(text(geometry[name]) for name in ("frame_start_utc", "scored_start_utc", "end_exclusive_utc"))
-            and type(geometry["warmup_bars"]) is int and geometry["warmup_bars"] >= 0
-            and type(geometry["scored_bars"]) is int and geometry["scored_bars"] > 0
-            and type(geometry["frame_rows"]) is int
-            and geometry["frame_rows"] == geometry["warmup_bars"] + geometry["scored_bars"]
-            and hexadecimal(geometry["frame_sha256"]) and hexadecimal(geometry["receipt_sha256"])
-            and hashlib.sha256(_canonical_bytes({key: value for key, value in geometry.items()
-                if key != "receipt_sha256"})).hexdigest() == geometry["receipt_sha256"]
-            and type(references) is dict and set(references) == set(tiers)
-            and all(text(value) for value in references.values()))
-
-    roster_valid, raw_ids, horizon_ids = True, set(), set()
-    try:
-        fields = {"ordinal", "raw_attempt_id", "horizon_attempt_id", "plan_attempt_sha256", "status",
-            "strategy_id", "parameters", "causal_fold_count", "folds", "rejection"}
-        for ordinal, attempt in enumerate(roster):
-            if (type(attempt) is not dict or set(attempt) != fields
-                    or type(attempt["ordinal"]) is not int or attempt["ordinal"] != ordinal
-                    or not text(attempt["raw_attempt_id"]) or attempt["raw_attempt_id"] in raw_ids
-                    or not text(attempt["horizon_attempt_id"]) or attempt["horizon_attempt_id"] in horizon_ids
-                    or not hexadecimal(attempt["plan_attempt_sha256"])
-                    or attempt["status"] not in ("PLANNED", "PROCESS_REJECTED")
-                    or attempt["strategy_id"] not in domain_ids or type(attempt["parameters"]) is not dict
-                    or type(attempt["causal_fold_count"]) is not int or attempt["causal_fold_count"] < 0
-                    or type(attempt["folds"]) is not list):
-                roster_valid = False
-                continue
-            raw_ids.add(attempt["raw_attempt_id"])
-            horizon_ids.add(attempt["horizon_attempt_id"])
-            rejection = attempt["rejection"]
-            if attempt["status"] == "PLANNED":
-                roster_valid = roster_valid and rejection is None and attempt["causal_fold_count"] > 0
-            else:
-                roster_valid = roster_valid and (type(rejection) is dict
-                    and {"kind", "code", "details"} <= set(rejection)
-                    and rejection["kind"] == "PROCESS_REJECTED" and text(rejection["code"])
-                    and type(rejection["details"]) is list and all(type(value) is str for value in rejection["details"]))
-            fold_ids, causal_count = set(), 0
-            for fold in attempt["folds"]:
-                if (type(fold) is not dict or set(fold) != {"role", "fold_id", "partitions"}
-                        or not text(fold["role"]) or not text(fold["fold_id"]) or fold["fold_id"] in fold_ids
-                        or type(fold["partitions"]) is not dict):
-                    roster_valid = False
-                    continue
-                fold_ids.add(fold["fold_id"])
-                if fold["role"] == "CAUSAL_ROLLING_ORIGIN_INNER":
-                    causal_count += 1
-                    roster_valid = roster_valid and set(fold["partitions"]) == set(roles)
-                    for role in roles:
-                        roster_valid = roster_valid and partition_valid(fold["partitions"].get(role), role)
-                else:
-                    roster_valid = roster_valid and fold["partitions"] == {}
-            roster_valid = roster_valid and causal_count == attempt["causal_fold_count"]
-    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, OverflowError, RecursionError):
-        roster_valid = False
-    if not roster_valid:
-        _fail("ROUTE_A_MAPPING_ROSTER_INVALID")
+    domains, roster = _route_a_validate_mapping_snapshot(
+        frozen_domains=snapshot["frozen_domains"], attempt_roster=snapshot["attempt_roster"])
     rows = _route_a_batch_specifications(snapshot["specifications"])
     requests, groups, group_indices, requested_lanes = [], [], {}, set()
     for row in rows:
@@ -7666,3 +7785,166 @@ def _compile_route_a_request_attempt_mapping(*, unit_metadata, frozen_domains, a
     if len(encoded_result) > winner.MAX_REQUEST_BYTES:
         _fail("ROUTE_A_MAPPING_RESULT_TOO_LARGE")
     return json.loads(encoded_result.decode("ascii"))
+
+
+
+def _route_a_owner_partition_identity(*, precommitments, attempt_ordinal, fold_ordinal, partition_role):
+    """Name the owner's existing V2 row; this is not an authenticator."""
+    valid = False
+    try:
+        hexadecimal = lambda value: type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+        matches = [row for row in precommitments["rows"]
+            if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
+                == (attempt_ordinal, fold_ordinal, partition_role)]
+        row = matches[0] if len(matches) == 1 else None
+        identity = row["partition_geometry_receipt_sha256"] if row is not None else None
+        record = precommitments["records"].get(identity)
+        tier_fields = {"entry_half_spread_values_sha256", "intrabar_half_spread_values_sha256",
+            "numerical_execution_cost_attestation_sha256", "entry_observations_sha256", "entry_admission_mask_sha256"}
+        valid = (type(precommitments) is dict and set(precommitments) == {"schema_version", "frozen_tier_pair_contract_sha256", "rows", "records", "receipt_sha256"}
+            and precommitments["schema_version"] == raw_winner.PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA
+            and hexadecimal(precommitments["receipt_sha256"]) and hexadecimal(precommitments["frozen_tier_pair_contract_sha256"])
+            and type(precommitments["rows"]) is list and type(precommitments["records"]) is dict
+            and type(attempt_ordinal) is int and attempt_ordinal >= 0 and type(fold_ordinal) is int and fold_ordinal >= 0
+            and partition_role in ("optimizer_train", "tuning_validation", "final_lockbox")
+            and type(row) is dict and set(row) == {"attempt_ordinal", "fold_ordinal", "partition", "partition_geometry_receipt_sha256"}
+            and type(row["attempt_ordinal"]) is int and type(row["fold_ordinal"]) is int and hexadecimal(identity)
+            and type(record) is dict and set(record) == {"partition_frame_sha256", "source_observation_receipt_sha256", "tiers"}
+            and hexadecimal(record["partition_frame_sha256"]) and hexadecimal(record["source_observation_receipt_sha256"])
+            and type(record["tiers"]) is dict and set(record["tiers"]) == {"P75", "P95"}
+            and all(type(value) is dict and set(value) == tier_fields
+                and all(hexadecimal(item) for item in value.values()) for value in record["tiers"].values()))
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError, RecursionError):
+        valid = False
+    if not valid:
+        _fail("ROUTE_A_OWNER_SNAPSHOT_PRECOMMITMENT_INVALID")
+    return json.loads(_canonical_bytes({"precommitment_row": row,
+        "partition_geometry_receipt_sha256": identity, "partition_frame_sha256": record["partition_frame_sha256"],
+        "tier_refs": {tier: "|".join((precommitments["schema_version"], precommitments["receipt_sha256"], identity, tier))
+            for tier in ("P75", "P95")}}).decode("ascii"))
+
+
+def _route_a_owner_membership_snapshot(*, declared_unit_binding, frozen_domains, plan_body, attempts, raw_ids, precommitments):
+    """Project the admitted real declared route without deriving partition geometry."""
+    rows, valid = [], False
+    try:
+        candidate = plan_body["candidates"][0]
+        valid = (type(plan_body) is dict and type(plan_body["cell"]["regime"]) is str and bool(plan_body["cell"]["regime"])
+            and type(plan_body["candidates"]) is list and len(plan_body["candidates"]) == 1
+            and type(attempts) in (list, tuple) and bool(attempts) and type(raw_ids) in (list, tuple)
+            and len(attempts) == len(raw_ids) == len(plan_body["trials"]) == len(plan_body["attempts"])
+            and len(set(raw_ids)) == len(raw_ids) and all(type(value) is str and value for value in raw_ids)
+            and any(attempt.plan_attempt["status"] == "PLANNED" for attempt in attempts)
+            and _canonical_bytes([attempt.plan_attempt for attempt in attempts]) == _canonical_bytes(plan_body["attempts"])
+            and _sha256(plan_body["attempts"]) == declared_unit_binding["attempt_roster_sha256"]
+            and _sha256(_winner_fold_plan(attempts)) == declared_unit_binding["fold_plan_sha256"]
+            and precommitments["schema_version"] == raw_winner.PARTITION_COST_PRECOMMITMENTS_V2_SCHEMA)
+        for ordinal, attempt in enumerate(attempts):
+            source_plan, source_folds = copy.deepcopy(attempt.plan_attempt), copy.deepcopy(attempt.candidate["folds"])
+            status = source_plan["status"]
+            valid = (valid and type(attempt.ordinal) is int and attempt.ordinal == ordinal
+                and _canonical_bytes(attempt.candidate) == _canonical_bytes(candidate)
+                and type(source_folds) is list and len(source_folds) == 4
+                and all(type(fold) is dict and fold.get("role") == "CAUSAL_ROLLING_ORIGIN_INNER" for fold in source_folds)
+                and status in ("PLANNED", "PROCESS_REJECTED") and "reason_code" in source_plan
+                and ((status == "PLANNED" and source_plan["reason_code"] is None)
+                    or (status == "PROCESS_REJECTED" and source_plan["reason_code"] == "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL")))
+            if not valid:
+                continue
+            scheduled = [copy.deepcopy(row) for row in plan_body["expected_evaluations"] if row["attempt_id"] == source_plan["attempt_id"]]
+            rejection = None if status == "PLANNED" else {"plan_status": status, "reason_code": source_plan["reason_code"],
+                "state_context_disposition_sha256": source_plan["state_context_disposition_sha256"]}
+            folds = [{"role": fold["role"], "fold_id": fold["fold_id"], "partitions":
+                ({role: _route_a_owner_partition_identity(precommitments=precommitments, attempt_ordinal=ordinal,
+                    fold_ordinal=fold_ordinal, partition_role=role)
+                    for role in ("optimizer_train", "tuning_validation", "final_lockbox")}
+                    if status == "PLANNED" else {"status": "UNSCHEDULED"})}
+                for fold_ordinal, fold in enumerate(source_folds)]
+            rows.append({"ordinal": ordinal, "raw_attempt_id": raw_ids[ordinal], "horizon_attempt_id": source_plan["attempt_id"],
+                "plan_attempt_sha256": _sha256(source_plan), "status": status,
+                "strategy_id": attempt.artifacts.winner_process["strategy_id"],
+                "parameters": copy.deepcopy(attempt.artifacts.trial_definition["parameters"]), "causal_fold_count": len(source_folds),
+                "folds": folds, "rejection": rejection, "source_plan_attempt": source_plan, "source_folds": source_folds,
+                "scheduled_evaluations": scheduled})
+        valid = (valid and _canonical_bytes([row for attempt in rows for row in attempt["scheduled_evaluations"]])
+            == _canonical_bytes(plan_body["expected_evaluations"]))
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError, RecursionError):
+        valid = False
+    if not valid:
+        _fail("ROUTE_A_OWNER_SNAPSHOT_SOURCE_INVALID")
+    domains, roster = _route_a_validate_mapping_snapshot(frozen_domains=frozen_domains, attempt_roster=rows,
+        owner_projection=True, declared_unit_binding=declared_unit_binding)
+    return json.loads(_canonical_bytes({"schema_version": "fxpm.route-a-owner-membership-snapshot.v2",
+        "provenance_scope": "CURRENT_OWNER_METADATA_PROJECTION_ONLY", "declared_unit_binding": declared_unit_binding,
+        "frozen_domains": domains, "attempt_roster": roster, "original_trial_count": len(attempts),
+        **_route_a_diagnostic_authorities()}).decode("ascii"))
+
+
+def _route_a_rebind_owner_membership(*, specification, snapshot, attempts, owner_attempts, raw_ids,
+        frame, dependency_warmup_bars, precommitments):
+    """Rebind plain membership and derive only the selected current fold."""
+    valid = False
+    try:
+        flags = _route_a_diagnostic_authorities()
+        valid = (type(snapshot) is dict and set(snapshot) == {"schema_version", "provenance_scope", "declared_unit_binding",
+                "frozen_domains", "attempt_roster", "original_trial_count"} | set(flags)
+            and snapshot["schema_version"] == "fxpm.route-a-owner-membership-snapshot.v2"
+            and snapshot["provenance_scope"] == "CURRENT_OWNER_METADATA_PROJECTION_ONLY"
+            and all(snapshot[name] is False for name in flags)
+            and type(attempts) in (list, tuple) and type(owner_attempts) in (list, tuple) and type(raw_ids) in (list, tuple)
+            and type(snapshot["original_trial_count"]) is int
+            and len(attempts) == len(owner_attempts) == len(raw_ids) == snapshot["original_trial_count"] == len(snapshot["attempt_roster"]))
+        if valid:
+            resolved = _route_a_resolve_request_membership(specification=specification,
+                frozen_domains=snapshot["frozen_domains"], attempt_roster=snapshot["attempt_roster"], owner_projection=True)
+            index = resolved["attempt_index"]
+            valid = type(index) is int and 0 <= index < len(attempts)
+            if valid:
+                row, selected_attempt, owner_attempt = snapshot["attempt_roster"][index], attempts[index], owner_attempts[index]
+                valid = (resolved["attempt_ordinal"] == row["ordinal"] == index
+                    and resolved["raw_attempt_id"] == row["raw_attempt_id"] == raw_ids[index]
+                    and resolved["horizon_attempt_id"] == row["horizon_attempt_id"]
+                    and resolved["plan_attempt_sha256"] == row["plan_attempt_sha256"] and row["status"] == "PLANNED")
+                for current in (selected_attempt, owner_attempt):
+                    valid = (valid and type(current.ordinal) is int and current.ordinal == index
+                        and current.plan_attempt["status"] == "PLANNED" and current.plan_attempt["attempt_id"] == row["horizon_attempt_id"]
+                        and _sha256(current.plan_attempt) == row["plan_attempt_sha256"]
+                        and _canonical_bytes(current.plan_attempt) == _canonical_bytes(row["source_plan_attempt"])
+                        and _canonical_bytes(current.candidate["folds"]) == _canonical_bytes(row["source_folds"])
+                        and current.artifacts.winner_process["strategy_id"] == resolved["strategy_id"] == row["strategy_id"])
+                defaults = copy.deepcopy(StrategyRegistry.get(row["strategy_id"]).get_default_params())
+                parameters = decode_parameter_mapping(selected_attempt.artifacts.trial_definition["parameters"], defaults)
+                original_parameters = decode_parameter_mapping(owner_attempt.artifacts.trial_definition["parameters"], defaults)
+                valid = (valid and _canonical_bytes(parameters) == _canonical_bytes(original_parameters) == _canonical_bytes(resolved["parameters"]))
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError, OverflowError, RecursionError):
+        valid = False
+    if not valid:
+        _fail("ROUTE_A_OWNER_SNAPSHOT_REBIND_INVALID")
+    fold = _causal_folds(selected_attempt)[specification["fold_ordinal"]]
+    partitions = _fold_partitions(frame=frame, fold=fold, attempt=selected_attempt, dependency_warmup_bars=dependency_warmup_bars)
+    partition = next((value for value in partitions if value.role == specification["partition_role"]), None)
+    geometry_valid = partition is not None
+    if geometry_valid:
+        identity = _route_a_owner_partition_identity(precommitments=precommitments, attempt_ordinal=selected_attempt.ordinal,
+            fold_ordinal=specification["fold_ordinal"], partition_role=specification["partition_role"])
+        expected = resolved["partition_identity"]
+        geometry = partition.geometry_receipt
+        geometry_valid = (fold["fold_id"] == resolved["fold_id"]
+            and _canonical_bytes(identity) == _canonical_bytes(expected)
+            and geometry["receipt_sha256"] == expected["partition_geometry_receipt_sha256"]
+            and geometry["frame_sha256"] == expected["partition_frame_sha256"]
+            and hashlib.sha256(_canonical_bytes({key: value for key, value in geometry.items()
+                if key != "receipt_sha256"})).hexdigest() == geometry["receipt_sha256"])
+    if not geometry_valid:
+        _fail("ROUTE_A_OWNER_SNAPSHOT_GEOMETRY_MISMATCH")
+    return selected_attempt, fold, partition, parameters
+
+
+def _route_a_owner_selection_bytes(*, strategy_id, parameters, attempt_ordinal, fold_ordinal,
+        fold_id, partition_geometry, declared_unit_binding, spread_tier):
+    """Keep the admitted selection and tier-independent pair-group byte contract."""
+    group = {"strategy_id": strategy_id, "parameters": parameters, "attempt_ordinal": attempt_ordinal,
+        "fold_ordinal": fold_ordinal, "fold_id": fold_id, "partition_geometry": partition_geometry,
+        "declared_unit_binding": declared_unit_binding}
+    selection = {**group, "spread_tier": spread_tier, "metadata_recipe": _ROUTE_A_UNIT_BATCH_RECIPE}
+    return _canonical_bytes(selection), _canonical_bytes(group)
