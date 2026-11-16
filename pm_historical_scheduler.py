@@ -7,6 +7,7 @@ symbol reaches a terminal result or the operator stops the enclosing run.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Final, Mapping, Sequence
 
 import pm_memory_governor as memory_governor
@@ -818,7 +819,7 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
                 source_identity={name: view[name] for name in
                     ("activation_id", "activation_manifest_sha256", "activation_entry_sha256", "native_bars_sha256")},
                 no_trade_run_receipt_sha256=run["sha256"] if selection["outcome"] == "NO_TRADE" else None,
-                process_edition_sha256=process.receipt_sha256, code_sha256=code, metrics={},
+                process_edition_sha256=process.receipt_sha256, code_sha256=code, metrics=_cash_snapshot_reporting(),
                 produced_at_utc=prior[0].produced_at_utc if prior else produced, **selection)
             if prior and prior[0].to_bytes() != record.to_bytes():
                 _fail("DECLARED_NATIVE_FINALIZATION_GRID_CONFLICT")
@@ -1430,6 +1431,12 @@ def run_declared_symbol_scheduler(
         "cells":[rows[index] for index in range(len(owned["cells"]))],"requested_workers":requested_workers,
         "worker_limit":worker_limit,"errors":errors,"admission_deferral_reason":gate["reason"] if not gate["open"] else None,"resource_stats":asdict(stats) if is_dataclass(stats) else dict(stats),
         "qualification_authority":False,"capital_authority":False,"live_authority":False,"order_authority":False}
+    if is_m5:
+        try:
+            report["development_completion"] = build_declared_m5_development_completion(owned, report).to_dict()
+        except Exception as exc:
+            retain_error("DEVELOPMENT_COMPLETION:" + str(getattr(exc, "code", type(exc).__name__)))
+            report["status"] = "FAILED"
     if errors:
         raise DeclaredSymbolSchedulerError("DECLARED_SYMBOL_DISPATCH_FAILED",errors,report)
     return report
@@ -1968,6 +1975,7 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
             "selected_attempt": selected, "target_view_window": window,
             "cost_tier_semantics": ("SELECTED_OWNER_TIER" if actual is not None
                 else "BOUND_BASELINE_DESCRIPTOR_NO_SELECTED_WINNER"),
+            "cash_reporting_basis": _cash_snapshot_reporting(),
             "bound_baseline_descriptor_sha256": None if baseline is None else _declared_m5_hash(baseline),
             "bound_baseline_descriptor": baseline,
             "development_scope": orchestration.declared_slot_development_scope(precommit.to_dict()),
@@ -2001,7 +2009,7 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
                 "constructor_implementation_sha256": requests[view_id]["constructor_implementation_sha256"],
                 "gap_findings_sha256": requests[view_id]["gap_findings_sha256"]},
             cost_tier=tier, process_edition_sha256=process.receipt_sha256,
-            code_sha256=code, metrics={}, strategy_family=family,
+            code_sha256=code, metrics=_cash_snapshot_reporting(), strategy_family=family,
             configuration_sha256=configuration,
             job_binding_sha256=owner.job_binding_sha256, consumer_binding_sha256=consumers[0], produced_at_utc=_declared_m5_grid_utc(produced))
         planned.append((key, record))
@@ -2874,3 +2882,268 @@ def _declared_owned_direct_files(context, precommit, row, *, max_paths, verified
 
 
 __all__ += ["DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA"]
+
+
+DECLARED_DEVELOPMENT_COMPLETION_SCHEMA: Final = "fxpm.declared-development-completion.v1"
+
+
+@dataclass(frozen=True, slots=True)
+class DeclaredDevelopmentCompletionReport:
+    """Immutable recording projection; never an execution or trading capability."""
+
+    body_json: str
+
+    def to_dict(self) -> dict[str, Any]:
+        import json
+        return json.loads(self.body_json)
+
+    @property
+    def receipt_sha256(self) -> str:
+        import hashlib
+        return hashlib.sha256(self.body_json.encode("ascii")).hexdigest()
+
+
+def _declared_development_report(body):
+    import json
+    return DeclaredDevelopmentCompletionReport(json.dumps(body, ensure_ascii=True,
+        sort_keys=True, separators=(",", ":"), allow_nan=False))
+
+
+def _declared_development_expected(contract):
+    """Keep the existing eligible-cell and first-K admission unchanged."""
+    checked, _ = _declared_m5_contract(contract)
+    cell = checked["cells"][0]
+    dev = cell["m5_development"]
+    axes = {axis["view_id"]: axis for axis in dev["view_axes"]}
+    periods = [{"cell_id": cell["cell"]["cell_id"], "slot_id": slot_id,
+        "information_cutoff_utc": _declared_m5_grid_utc(axes[dev["slot_view_ids"][slot_id]]["cutoff_utc"])}
+        for slot_id in dev["development_slot_ids"]]
+    import pm_historical_anchor_orchestration as orchestration
+    protected = _declared_m5_utc(cell["protected_end_exclusive_utc"])
+    if protected > _declared_m5_utc(orchestration._DECLARED_PROTECTED_END_EXCLUSIVE_UTC):
+        _fail("DEVELOPMENT_COMPLETION_PROTECTED_CUTOFF")
+    if any(_declared_m5_utc(item["information_cutoff_utc"]) > protected for item in periods):
+        _fail("DEVELOPMENT_COMPLETION_PROTECTED_CUTOFF")
+    identity = _declared_m5_cell_contract_sha256(checked, cell)
+    return checked, cell, periods, identity
+
+
+def _declared_development_grid_rows(cell, references):
+    from pathlib import Path
+    import pm_end_grid as grid
+    if type(references) is not dict or not set(references).issubset(cell["m5_development"]["development_slot_ids"]):
+        _fail("DEVELOPMENT_COMPLETION_GRID_ROSTER")
+    expected_path = Path(cell["m5_development"]["end_grid_root"]) / (cell["cell"]["symbol"] + ".jsonl")
+    retained = grid.read_end_grid(expected_path.parent, cell["cell"]["symbol"]) if references else []
+    selected = {}
+    for slot_id, reference in references.items():
+        if (type(reference) is not dict or reference.get("path") != str(expected_path)
+                or not _declared_digest(reference.get("row_sha256"))):
+            _fail("DEVELOPMENT_COMPLETION_GRID_REFERENCE")
+        matches = [item for item in retained if item.row_sha256 == reference["row_sha256"]]
+        if len(matches) != 1:
+            _fail("DEVELOPMENT_COMPLETION_GRID_READBACK")
+        item = matches[0]
+        if any(getattr(item, key) != cell["cell"][key] for key in ("cell_id", "symbol", "timeframe", "regime")):
+            _fail("DEVELOPMENT_COMPLETION_GRID_CELL")
+        selected[slot_id] = item
+    return selected
+
+
+def _declared_development_completed_bindings(checked, cell, periods, archive, fence, rows):
+    """Join retained identities after the existing archive and grid verifiers."""
+    from pathlib import Path
+    import pm_end_grid as grid
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_production_anchor_plan as anchors
+    summary = fence.get("source_summary")
+    if type(summary) is not dict:
+        return None, None
+    binding = summary.get("binding")
+    dev = cell["m5_development"]
+    if (type(binding) is not dict or binding.get("config_sha256") != checked["config_sha256"]
+            or binding.get("precommit_sha256") != archive["precommit_sha256"]
+            or binding.get("required_result_keys") != dev["required_result_keys"]
+            or binding.get("terminal_result_key") != dev["terminal_result_key"]
+            or binding.get("run_id") != cell["run_id"] or binding.get("cell_id") != cell["cell"]["cell_id"]
+            or binding.get("generation_context_sha256") != archive["generation_context_sha256"]
+            or binding.get("view_plan_sha256") != dev["m5_source_pins"]["view_plan_sha256"]
+            or binding.get("view_budgets_sha256") != _declared_m5_hash(checked["view_budgets"])
+            or not _declared_digest(binding.get("effective_config_sha256"))):
+        _fail("DEVELOPMENT_COMPLETION_SOURCE_BINDING")
+    roster = anchors.derive_declared_owner_slot_roster_v2(
+        launch_activation_utc=cell["launch_activation_utc"], frozen_refit_clock=cell["frozen_refit_clock"],
+        config_identity_refs={"config_sha256": checked["config_sha256"],
+            "effective_config_sha256": binding["effective_config_sha256"]},
+        extend_frozen_clock_backward=cell["extend_frozen_clock_backward"],
+        protected_end_exclusive_utc=cell["protected_end_exclusive_utc"])
+    slots = roster["slots"][:len(periods)]
+    if [item["slot_id"] for item in slots] != dev["development_slot_ids"]:
+        _fail("DEVELOPMENT_COMPLETION_ORIGINAL_PREFIX")
+    pairs = summary.get("results")
+    if (type(pairs) is not list or any(type(pair) is not list or len(pair) != 2 for pair in pairs)
+            or len({pair[0] for pair in pairs}) != len(pairs)):
+        _fail("DEVELOPMENT_COMPLETION_RESULT_BINDINGS")
+    results = dict(pairs)
+    if set(results) != set(dev["required_result_keys"]) or set(rows) != set(dev["development_slot_ids"]):
+        _fail("DEVELOPMENT_COMPLETION_RESULT_BINDINGS")
+    job_sha = _declared_m5_hash(binding)
+    terminal = results[dev["terminal_result_key"]]
+    if (type(terminal) is not dict or not _declared_digest(terminal.get("result_sha256"))
+            or terminal.get("job_binding_sha256") != job_sha
+            or not rows or terminal.get("result_descriptor_sha256") != rows[slots[-1]["slot_id"]].row_sha256):
+        _fail("DEVELOPMENT_COMPLETION_ACCOUNT_BINDING")
+    account_sha, run_sha = terminal["result_sha256"], None
+    all_accounts = True
+    for expected, slot in zip(periods, slots):
+        slot_id = slot["slot_id"]
+        item = rows.get(slot_id)
+        if item is None:
+            _fail("DEVELOPMENT_COMPLETION_MISSING_PERIOD")
+        if (item.cycle_start_utc != _declared_m5_grid_utc(slot["activation_utc"])
+                or item.cycle_end_utc != _declared_m5_grid_utc(slot["end_exclusive_utc"])
+                or item.information_cutoff_utc != _declared_m5_grid_utc(slot["native_cutoff_utc"])
+                or item.information_cutoff_utc != expected["information_cutoff_utc"]
+                or item.job_binding_sha256 != job_sha
+                or item.process_edition_sha256 != binding["search_process_receipt_sha256"]):
+            _fail("DEVELOPMENT_COMPLETION_PERIOD_BINDING")
+        result = results.get(slot_id)
+        if (type(result) is not dict or result.get("job_binding_sha256") != job_sha
+                or result.get("result_descriptor_sha256") != item.row_sha256
+                or result.get("consumer_binding_sha256") != [item.consumer_binding_sha256]):
+            _fail("DEVELOPMENT_COMPLETION_PERIOD_RESULT")
+        if item.outcome not in {"WINNER", "NO_TRADE"}:
+            all_accounts = False
+            continue
+        body = grid.load_view_contract(Path(dev["end_grid_root"]), item.view_contract_sha256)
+        identity = body.get("actual_result_identity", {})
+        if (body.get("schema_version") != "fxpm.m5-end-grid-reconstruction.v1"
+                or body.get("job_binding") != binding or body.get("m5_source_pins") != dev["m5_source_pins"]
+                or body.get("actual_slot_consumer", {}).get("slot_id") != slot_id
+                or body.get("target_view_window", {}).get("view_key") != item.view_key
+                or body.get("target_view_window", {}).get("m5_view_contract_sha256") != binding["m5_view_contract_sha256"]
+                or body.get("development_scope") != orchestration._declared_development_scope_body(roster, dev["development_slot_ids"])
+                or body.get("selected_slots") != len(slots) or body.get("accepted_roster_slots") != len(roster["slots"])
+                or identity.get("account_artifact_sha256") != account_sha
+                or identity.get("slot_commit_sha256") != result.get("result_sha256")
+                or not _declared_digest(identity.get("cell_run_receipt_sha256"))):
+            _fail("DEVELOPMENT_COMPLETION_ACCOUNT_JOIN")
+        actual_run = identity["cell_run_receipt_sha256"]
+        if run_sha is not None and actual_run != run_sha:
+            _fail("DEVELOPMENT_COMPLETION_RUN_JOIN")
+        run_sha = actual_run
+        if item.outcome == "NO_TRADE" and item.no_trade_run_receipt_sha256 != run_sha:
+            _fail("DEVELOPMENT_COMPLETION_NO_TRADE_JOIN")
+        if slot_id == slots[-1]["slot_id"]:
+            reference = body.get("terminal_account_reference", {})
+            if (reference.get("semantics") != "FINAL_SELECTED_SLOT_ROW_WITH_SEPARATE_ACCOUNT_BINDING"
+                    or reference.get("account_artifact_sha256") != account_sha
+                    or reference.get("cell_run_receipt_sha256") != run_sha
+                    or reference.get("actual_terminal_consumer_sha256") != terminal.get("consumer_binding_sha256")):
+                _fail("DEVELOPMENT_COMPLETION_TERMINAL_ACCOUNT_JOIN")
+    return (account_sha, run_sha) if all_accounts else (None, None)
+
+
+def _declared_development_project_periods(periods, actual, rows):
+    """Preserve all frozen periods and keep technical and economic states apart."""
+    result_periods = []
+    for expected in periods:
+        item = rows.get(expected["slot_id"])
+        if item is not None and item.information_cutoff_utc != expected["information_cutoff_utc"]:
+            _fail("DEVELOPMENT_COMPLETION_PROTECTED_CUTOFF")
+        result_periods.append({**expected, "dispatch_status": actual["status"],
+            "outcome": None if item is None else item.outcome,
+            "coverage_status": actual["status"] if item is None else item.outcome,
+            "reason_code": actual["reason_code"] if item is None else item.reason_code,
+            "row_sha256": None if item is None else item.row_sha256,
+            "cycle_start_utc": None if item is None else item.cycle_start_utc,
+            "cycle_end_utc": None if item is None else item.cycle_end_utc})
+    return result_periods
+
+
+def build_declared_m5_development_completion(contract, dispatch_report):
+    """Describe every frozen period without running or reopening an account."""
+    from pathlib import Path
+    import pm_authority_spool as spool
+    checked, cell, periods, contract_sha = _declared_development_expected(contract)
+    if (type(dispatch_report) is not dict or dispatch_report.get("schema_version") != DECLARED_SCHEDULER_SCHEMA
+            or type(dispatch_report.get("cells")) is not list or len(dispatch_report["cells"]) != 1
+            or any(dispatch_report.get(key) is not False for key in _DECLARED_M5_SCOPE if key.endswith("_authority"))):
+        _fail("DEVELOPMENT_COMPLETION_DISPATCH_SHAPE")
+    actual = dispatch_report["cells"][0]
+    if (type(actual) is not dict or any(actual.get(key) != cell[key] for key in ("descriptor_index", "root", "run_id"))
+            or actual.get("cell_id") != cell["cell"]["cell_id"] or actual.get("symbol") != cell["cell"]["symbol"]
+            or actual.get("status") not in _DECLARED_CELL_STATUSES
+            or any(actual.get(key) is not False for key in _DECLARED_M5_SCOPE if key.endswith("_authority"))):
+        _fail("DEVELOPMENT_COMPLETION_DISPATCH_CELL")
+    archive, account_sha, run_sha = None, None, None
+    references = actual.get("terminal_refusal_end_grid", {})
+    if actual["status"] == "ARCHIVED" or actual.get("archive_record") is not None:
+        archive = spool.read_generation_retirement(Path(cell["root"]),
+            expected_context_sha256=actual.get("generation_context_sha256"))
+        dev = cell["m5_development"]
+        if (type(archive) is not dict or archive.get("status") != "ARCHIVED_RECORD_ONLY"
+                or archive.get("cell_contract_sha256") != contract_sha
+                or not _declared_digest(actual.get("generation_context_sha256"))
+                or archive.get("generation_context_sha256") != actual["generation_context_sha256"]
+                or archive.get("precommit_sha256") != actual.get("precommit_sha256")
+                or archive.get("generation_id") != cell["run_id"] or archive.get("cell_id") != cell["cell"]["cell_id"]
+                or (actual["status"] == "ARCHIVED" and actual.get("archive_record_confirmed") is not True)
+                or actual.get("archive_record") != {"path": archive["retirement_receipt_path"], "sha256": archive["retirement_receipt_sha256"]}
+                or archive["retirement_receipt_path"] != dev["retirement"]["receipt_path"]
+                or archive["source_fence"]["path"] != dev["source_fence_path"]):
+            _fail("DEVELOPMENT_COMPLETION_ARCHIVE_BINDING")
+        fence, fence_sha = spool._retirement_external(Path(dev["source_fence_path"]), 4 * 1024**2)
+        if (fence_sha != archive["source_fence"]["sha256"] or fence.get("end_grid_rows") != archive["end_grid_rows"]
+                or actual.get("archived_result_reference") != archive["source_fence"]
+                or actual.get("retained_end_grid_rows") != archive["end_grid_rows"]):
+            _fail("DEVELOPMENT_COMPLETION_FENCE_BINDING")
+        references = archive["end_grid_rows"]
+    rows = _declared_development_grid_rows(cell, references)
+    if archive is not None:
+        account_sha, run_sha = _declared_development_completed_bindings(checked, cell, periods, archive, fence, rows)
+    result_periods = _declared_development_project_periods(periods, actual, rows)
+    complete = (dispatch_report.get("status") == "COMPLETED" and not dispatch_report.get("errors")
+        and actual["status"] == "ARCHIVED" and archive is not None and account_sha is not None and run_sha is not None
+        and len(rows) == len(periods) and all(item["outcome"] in {"WINNER", "NO_TRADE"} for item in result_periods))
+    return _declared_development_report({"schema_version": DECLARED_DEVELOPMENT_COMPLETION_SCHEMA,
+        "cell_contract_sha256": contract_sha, "cell": cell["cell"],
+        "expected_roster_sha256": _declared_m5_hash(periods), "periods": result_periods,
+        "status": "MECHANISM_COMPLETE" if complete else "INCOMPLETE",
+        "mechanism_complete": complete, "period_coverage_complete": len(rows) == len(periods),
+        "account_artifact_sha256": account_sha, "cell_run_receipt_sha256": run_sha,
+        "archive_record": None if archive is None else actual["archive_record"],
+        "ordering_assurance": None if archive is None else "EXISTING_RETIREMENT_PROTOCOL_FENCE_BEFORE_RELEASE",
+        "result_kind": "DEVELOPMENT_PARTIAL", "design_contaminated": True, "pristine_validation": False,
+        "financial_consumer_ready": False, "full_native_context_eligibility": False,
+        "identity_assurance": ("REVERIFIED_RETAINED_RECORDINGS_NOT_ACCOUNT_REEXECUTION" if archive is not None
+            else "REVERIFIED_GRID_RECORDS_WITHOUT_ACCOUNT_OR_RELEASE" if rows else "FROZEN_SCOPE_AND_TECHNICAL_DISPATCH_ONLY"),
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False})
+
+
+def reconcile_declared_m5_development_roster(contracts, dispatch_reports):
+    """Closed-world join; reverify records rather than trust report-shaped input."""
+    if (type(contracts) not in (list, tuple) or not contracts
+            or type(dispatch_reports) not in (list, tuple) or len(dispatch_reports) != len(contracts)):
+        _fail("DEVELOPMENT_COMPLETION_ROSTER_SHAPE")
+    bodies = [build_declared_m5_development_completion(contract, report).to_dict()
+        for contract, report in zip(contracts, dispatch_reports)]
+    identities = [(body["cell_contract_sha256"], body["expected_roster_sha256"]) for body in bodies]
+    keys = [(period["cell_id"], period["slot_id"]) for body in bodies for period in body["periods"]]
+    if len(set(identities)) != len(identities) or len(set(keys)) != len(keys):
+        _fail("DEVELOPMENT_COMPLETION_DUPLICATE_PERIOD")
+    return _declared_development_report({"schema_version": "fxpm.declared-development-roster-completion.v1",
+        "frozen_contract_roster_sha256": _declared_m5_hash(identities), "cells": bodies,
+        "mechanism_complete": all(body["mechanism_complete"] for body in bodies),
+        "result_kind": "DEVELOPMENT_PARTIAL", "design_contaminated": True, "pristine_validation": False,
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False})
+
+
+__all__ += ["DECLARED_DEVELOPMENT_COMPLETION_SCHEMA", "DeclaredDevelopmentCompletionReport",
+    "build_declared_m5_development_completion", "reconcile_declared_m5_development_roster"]
+
+
+def _cash_snapshot_reporting():
+    """Disclose the existing cash basis without changing execution or conversion."""
+    return {"cash_uses_tick_value_snapshot": True,
+            "historical_fx_reconstructed": False}
