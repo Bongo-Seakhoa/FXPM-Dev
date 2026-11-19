@@ -194,112 +194,49 @@ def test_quota_state_replace_exhaustion_preserves_prior_state_and_cleans_temp(
     assert not list(root.glob(f"{quota.QUOTA_TEMP_PREFIX}*.tmp"))
 
 
-def test_aggregate_quota_spans_publications_and_manifest_domains(
-    tmp_path: Path,
-) -> None:
+def test_accounting_spans_publications_and_manifest_domains_above_legacy_cap(tmp_path: Path) -> None:
     root = tmp_path / "spool"
     root.mkdir()
-    _publish(
-        root,
-        "historical/EURUSD/a.bin",
-        b"123456",
-        maximum=10,
-    )
-
-    with pytest.raises(
-        quota.AuthoritySpoolQuotaError,
-        match="SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-    ):
-        _publish(
-            root,
-            "current/EURUSD/too-large.bin",
-            b"12345",
-            maximum=10,
-        )
-    assert not (root / "current/EURUSD/too-large.bin").exists()
-
-    _publish(
-        root,
-        "current/EURUSD/b.bin",
-        b"7890",
-        maximum=10,
-    )
-    assert _state(root)["committed_bytes"] == 10
-    assert (root / "historical/EURUSD/a.bin").stat().st_size == 6
-    assert (root / "current/EURUSD/b.bin").stat().st_size == 4
+    _publish(root, "historical/EURUSD/a.bin", b"123456", maximum=10)
+    _publish(root, "current/EURUSD/over-cap.bin", b"12345", maximum=10)
+    _publish(root, "current/EURUSD/b.bin", b"7890", maximum=10)
+    assert (root / "historical/EURUSD/a.bin").read_bytes() == b"123456"
+    assert (root / "current/EURUSD/over-cap.bin").read_bytes() == b"12345"
+    assert (root / "current/EURUSD/b.bin").read_bytes() == b"7890"
+    assert _state(root)["committed_bytes"] == 15
+    assert _state(root)["reservations"] == []
 
 
-def test_free_space_reserve_is_checked_before_admitting_bytes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_legacy_free_space_reserve_does_not_block_actual_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, free in (("below-old-boundary", 99), ("old-boundary", 100)):
+        root = tmp_path / name
+        root.mkdir()
+        monkeypatch.setattr(quota.shutil, "disk_usage",
+            lambda _path, free=free: SimpleNamespace(total=200, used=200-free, free=free))
+        _publish(root, "object.bin", b"x" * 20, maximum=100, reserve=80)
+        assert (root / "object.bin").read_bytes() == b"x" * 20
+        assert _state(root)["committed_bytes"] == 20
+        assert _state(root)["reservations"] == []
+
+
+def test_simultaneous_reservations_remain_accounted_above_legacy_free_space_rule(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "spool"
     root.mkdir()
-    monkeypatch.setattr(
-        quota.shutil,
-        "disk_usage",
-        lambda _path: SimpleNamespace(total=200, used=101, free=99),
-    )
-
-    with quota.publication_lease(
-        root,
-        max_generation_bytes=100,
-        min_free_bytes=80,
-    ) as lease:
-        with pytest.raises(
-            quota.AuthoritySpoolQuotaError,
-            match="SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
-        ):
-            lease.consume(20)
-
-    boundary = tmp_path / "boundary"
-    boundary.mkdir()
-    monkeypatch.setattr(
-        quota.shutil,
-        "disk_usage",
-        lambda _path: SimpleNamespace(total=200, used=100, free=100),
-    )
-    with quota.publication_lease(
-        boundary,
-        max_generation_bytes=100,
-        min_free_bytes=80,
-    ) as lease:
-        lease.consume(20)
-        lease.commit(0)
-    assert _state(boundary)["status"] == "CLEAN"
-
-
-def test_free_space_reserve_includes_other_unwritten_reservations(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = tmp_path / "spool"
-    root.mkdir()
-    monkeypatch.setattr(
-        quota.shutil,
-        "disk_usage",
-        lambda _path: SimpleNamespace(total=200, used=100, free=100),
-    )
-
-    with quota.publication_lease(
-        root,
-        max_generation_bytes=100,
-        min_free_bytes=80,
-    ) as first:
+    monkeypatch.setattr(quota.shutil, "disk_usage",
+        lambda _path: SimpleNamespace(total=200, used=100, free=100))
+    with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=80) as first:
         first.consume(15)
-        with quota.publication_lease(
-            root,
-            max_generation_bytes=100,
-            min_free_bytes=80,
-        ) as second:
+        with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=80) as second:
             second.consume(5)
-            with pytest.raises(
-                quota.AuthoritySpoolQuotaError,
-                match="SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
-            ):
-                second.consume(1)
+            second.consume(1)
+            records = _state(root)["reservations"]
+            assert len(records) == 2
+            assert sum(row["reserved_bytes"] for row in records) == 21
             second.cancel_after_cleanup()
+        assert sum(row["reserved_bytes"] for row in _state(root)["reservations"]) == 15
         first.cancel_after_cleanup()
+    assert _state(root)["reservations"] == []
+    assert _state(root)["committed_bytes"] == 0
 
 
 def test_dirty_recovery_rescans_exact_unique_inodes(
@@ -343,31 +280,19 @@ def test_dirty_recovery_rescans_exact_unique_inodes(
     assert _state(root)["committed_bytes"] == 10
 
 
-def test_coherent_state_limits_cannot_be_reopened_with_changed_limits(
-    tmp_path: Path,
-) -> None:
+def test_legacy_limit_metadata_can_change_without_losing_over_cap_accounting(tmp_path: Path) -> None:
     root = tmp_path / "spool"
     root.mkdir()
-    with quota.publication_lease(
-        root,
-        max_generation_bytes=100,
-        min_free_bytes=10,
-    ) as lease:
-        lease.commit(0)
-    original = (root / quota.QUOTA_STATE_NAME).read_bytes()
-
+    _publish(root, "object.bin", b"x" * 120, maximum=100, reserve=10)
     for maximum, reserve in ((101, 10), (100, 11)):
-        with pytest.raises(
-            quota.AuthoritySpoolQuotaError,
-            match="SPOOL_QUOTA_LIMITS_CHANGED",
-        ):
-            with quota.publication_lease(
-                root,
-                max_generation_bytes=maximum,
-                min_free_bytes=reserve,
-            ):
-                pytest.fail("changed limits were admitted")
-        assert (root / quota.QUOTA_STATE_NAME).read_bytes() == original
+        with quota.publication_lease(root, max_generation_bytes=maximum, min_free_bytes=reserve) as lease:
+            lease.commit(0)
+        current = _state(root)
+        assert current["max_generation_bytes"] == maximum
+        assert current["min_free_bytes"] == reserve
+        assert current["committed_bytes"] == 120
+        assert current["reservations"] == []
+        assert (root / "object.bin").read_bytes() == b"x" * 120
 
 
 def test_oversized_integer_state_fails_with_typed_read_error(
@@ -401,7 +326,7 @@ def test_oversized_integer_state_fails_with_typed_read_error(
             pytest.fail("malformed state was admitted")
 
 
-def test_concurrent_threads_cannot_jointly_exceed_generation_budget(
+def test_concurrent_threads_account_all_publications_above_legacy_generation_cap(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "spool"
@@ -419,20 +344,19 @@ def test_concurrent_threads_cannot_jointly_exceed_generation_budget(
     with ThreadPoolExecutor(max_workers=2) as pool:
         outcomes = list(pool.map(attempt, ("historical", "current")))
 
-    assert sorted(outcomes) == [
-        "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-        "ok",
-    ]
+    assert outcomes == ["ok", "ok"]
     objects = list(root.glob("*/object.bin"))
-    assert len(objects) == 1
-    assert sum(path.stat().st_size for path in objects) == 6
+    assert len(objects) == 2
+    assert sum(path.stat().st_size for path in objects) == 12
+    assert _state(root)["committed_bytes"] == 12
+    assert _state(root)["reservations"] == []
 
 
 @pytest.mark.skipif(
     os.environ.get("FXPM_SKIP_MULTIPROCESS_TESTS") == "1",
     reason="multiprocessing explicitly disabled by environment",
 )
-def test_concurrent_processes_cannot_jointly_exceed_generation_budget(
+def test_concurrent_processes_account_all_publications_above_legacy_generation_cap(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "spool"
@@ -476,13 +400,12 @@ def test_concurrent_processes_cannot_jointly_exceed_generation_budget(
         ready_queue.join_thread()
         result_queue.join_thread()
 
-    assert sorted(outcomes) == [
-        "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-        "ok",
-    ]
+    assert outcomes == ["ok", "ok"]
     objects = list(root.glob("*/object.bin"))
-    assert len(objects) == 1
-    assert sum(path.stat().st_size for path in objects) == 6
+    assert len(objects) == 2
+    assert sum(path.stat().st_size for path in objects) == 12
+    assert _state(root)["committed_bytes"] == 12
+    assert _state(root)["reservations"] == []
 
 
 @pytest.mark.skipif(

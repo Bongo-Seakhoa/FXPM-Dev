@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import hashlib
 import itertools
 import json
@@ -46,6 +47,7 @@ TERMINAL_REFUSAL_RESULT_KIND = "TERMINAL_REFUSAL_SOURCE_NOT_COMPLETED"
 POST_SOURCE_ABORT_FENCE_SCHEMA = "fxpm.declared-m5-post-source-abort-fence.v1"
 POST_SOURCE_ABORT_RESULT_KIND = "POST_SOURCE_ABORT_SOURCE_NOT_COMPLETED"
 NATIVE_COMPLETION_FENCE_SCHEMA = "fxpm.declared-broker-native-completion-fence.v1"
+NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA = "fxpm.declared-broker-native-development-completion-fence.v1"
 POST_SOURCE_ABORT_GRID_SOURCE_FIELDS = ("symbol", "timeframe", "activation_sha256", "bars_sha256",
     "sidecar_sha256", "provenance_sha256", "request_sha256", "spread_unit")
 DEFAULT_STREAM_CHUNK_BYTES = 1024 * 1024
@@ -124,7 +126,37 @@ class AuthoritySpoolError(ValueError):
     """Fail-closed spool error."""
 
 
+def resource_capacity_reason(error: BaseException) -> Optional[str]:
+    """Classify actual resource failures without probing or interpreting messages."""
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, MemoryError):
+            return "MEMORY_ERROR"
+        if isinstance(current, OSError) and (
+            current.errno == errno.ENOMEM
+            or getattr(current, "winerror", None) in {8, 14, 1455}
+        ):
+            return "MEMORY_ERROR"
+        if isinstance(current, OSError) and (
+            current.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
+            or getattr(current, "winerror", None) in {112, 39}
+        ):
+            return "DISK_LOW"
+        pending.extend((current.__context__, current.__cause__))
+    return "DISK_LOW" if _legacy_resource_capacity_error(error) else None
+
+
 def is_resource_capacity_error(error: BaseException) -> bool:
+    """Compatibility predicate for existing producer custody handlers."""
+    return resource_capacity_reason(error) is not None
+
+
+def _legacy_resource_capacity_error(error: BaseException) -> bool:
     """Recognize only the preserved typed disk-reserve failure, without I/O."""
     current = error
     seen = set()
@@ -226,10 +258,6 @@ def _validate_limits(limits: SpoolLimits) -> SpoolLimits:
         _fail("MAX_MANIFEST_BYTES_EXCEEDS_ARTIFACT_BOUND")
     if limits.stream_chunk_bytes > limits.max_artifact_bytes:
         _fail("STREAM_CHUNK_BYTES_EXCEEDS_ARTIFACT_BOUND")
-    if limits.max_artifact_bytes > limits.max_generation_bytes:
-        _fail("MAX_ARTIFACT_BYTES_EXCEEDS_GENERATION_BOUND")
-    if limits.max_symbol_bytes > limits.max_generation_bytes:
-        _fail("MAX_SYMBOL_BYTES_EXCEEDS_GENERATION_BOUND")
     return limits
 
 
@@ -413,7 +441,14 @@ def _open_exclusive(path: Path) -> int:
         descriptor = os.open(path, flags, 0o600)
     except FileExistsError as exc:
         raise AuthoritySpoolError("TEMPORARY_FILE_COLLISION") from exc
-    info = os.fstat(descriptor)
+    try:
+        info = os.fstat(descriptor)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
     if not stat.S_ISREG(info.st_mode):
         os.close(descriptor)
         _fail("TEMPORARY_FILE_NOT_REGULAR")
@@ -563,6 +598,7 @@ def _cancel_clean_reservation(
 @dataclass
 class _PublicationBatchScope:
     account: spool_quota.PublicationBatch
+    context_binding: tuple
     published_objects: int = 0
     reused_objects: int = 0
 
@@ -574,6 +610,11 @@ _BATCH_RESERVATION_WINDOW_BYTES = DEFAULT_STREAM_CHUNK_BYTES
 _PUBLICATION_BATCHES: dict[tuple[int, str], _PublicationBatchScope] = {}
 
 
+def _publication_context_binding(context: GenerationSpoolContext) -> tuple:
+    return (context.root, context.generation_id, context.native_universe_sha256,
+        context.config_sha256, context.context_sha256, context.limits, context.writable)
+
+
 def _publication_batch_key(context: GenerationSpoolContext) -> tuple[int, str]:
     return threading.get_ident(), os.path.normcase(str(context.root))
 
@@ -582,11 +623,10 @@ def _publication_batch_key(context: GenerationSpoolContext) -> tuple[int, str]:
 def publication_batch(context: GenerationSpoolContext) -> Iterator[None]:
     """Share one quota reservation across the small objects published inside.
 
-    Every per-object control of the ordinary path still runs for each object:
-    the context check, the directory and reparse checks, the size bound, the
-    exclusive temporary file, fsync, the atomic link and the content-address
-    check. Only the quota bookkeeping is shared: one reservation record,
-    reserved in windows and committed once at close.
+    Generation context is checked on disk at the outer entry and exit;
+    objects and nested batches retain its admitted immutable binding. Other
+    per-object publication controls remain unchanged. Quota bookkeeping uses
+    one reservation record, reserved in windows and committed once at close.
     """
 
     _assert_context_current(context)
@@ -603,13 +643,14 @@ def publication_batch(context: GenerationSpoolContext) -> Iterator[None]:
             min_free_bytes=context.limits.min_free_bytes,
             window_bytes=_BATCH_RESERVATION_WINDOW_BYTES,
         ) as account:
-            _PUBLICATION_BATCHES[key] = _PublicationBatchScope(account)
+            _PUBLICATION_BATCHES[key] = _PublicationBatchScope(account, _publication_context_binding(context))
             try:
                 yield
             finally:
                 _PUBLICATION_BATCHES.pop(key, None)
     except spool_quota.AuthoritySpoolQuotaError as exc:
         raise AuthoritySpoolError(str(exc)) from exc
+    _assert_context_current(context)
 
 
 def _buffer_small_payload(
@@ -675,6 +716,7 @@ def _publish_small_object(
     scope: _PublicationBatchScope,
     payload: bytes,
     format_name: str,
+    admitted_descriptors: Optional[set[tuple[str, str, int, str]]] = None,
 ) -> dict[str, Any]:
     if scope.account.poisoned:
         _fail("PUBLICATION_BATCH_POISONED")
@@ -687,7 +729,11 @@ def _publish_small_object(
     relative_path = _content_relative_path(content_hash, format_name)
     target = _local_path(context.root, relative_path)
     try:
-        if target.exists():
+        if admitted_descriptors is not None and (
+            relative_path, content_hash, total, format_name
+        ) in admitted_descriptors:
+            scope.reused_objects += 1
+        elif target.exists():
             if not _files_match(
                 context.root,
                 relative_path,
@@ -758,6 +804,7 @@ def _write_streamed_object(
     chunks: Iterable[bytes],
     *,
     format_name: str,
+    admitted_descriptors: Optional[set[tuple[str, str, int, str]]] = None,
 ) -> dict[str, Any]:
     _validate_format(format_name)
     _assert_context_current(context)
@@ -771,7 +818,10 @@ def _write_streamed_object(
                 min(context.limits.stream_chunk_bytes, DEFAULT_STREAM_CHUNK_BYTES),
             )
             if payload is not None:
-                return _publish_small_object(context, scope, payload, format_name)
+                _assert_context_current(context)
+                return _publish_small_object(
+                    context, scope, payload, format_name, admitted_descriptors
+                )
     try:
         with spool_quota.publication_lease(
             context.root,
@@ -855,6 +905,7 @@ def _write_streamed_object(
                                 len(pending) == buffer_limit
                             ):
                                 flush_pending()
+                    _assert_context_current(context)
                     flush_pending()
                     if total <= 0:
                         _fail("ARTIFACT_EMPTY")
@@ -870,7 +921,11 @@ def _write_streamed_object(
                 )
                 target = _local_path(context.root, relative_path)
                 new_unique_bytes = 0
-                if target.exists():
+                if admitted_descriptors is not None and (
+                    relative_path, content_hash, total, format_name
+                ) in admitted_descriptors:
+                    pass
+                elif target.exists():
                     if not _files_match(
                         context.root,
                         relative_path,
@@ -1099,6 +1154,81 @@ def _limits_from_payload(
     return _validate_limits(limits)
 
 
+@contextmanager
+def _generation_bootstrap_lock(root: Path) -> Iterator[None]:
+    context_path = root / CONTEXT_RELATIVE_PATH
+    if context_path.exists() or context_path.is_symlink():
+        yield
+        return
+    lock_path = root.parent / f".{root.name}.generation-bootstrap.lock"
+    _reject_reparse_chain(lock_path)
+    acquired = False
+    try:
+        with spool_quota._exclusive_file_lock(lock_path, timeout_seconds=0):
+            acquired = True
+            _reject_reparse_chain(lock_path)
+            yield
+    except TimeoutError as exc:
+        if not acquired:
+            raise AuthoritySpoolError("GENERATION_BOOTSTRAP_BUSY") from exc
+        raise
+
+
+def _rollback_owned_bootstrap(root: Path, root_identity: list[int], created: list,
+        temporary_identity: Optional[tuple[int, int]]) -> bool:
+    """Undo only this failed bootstrap's published controls and empty temp directory."""
+    _assert_retirement_root(root, root_identity)
+    context_path = root / CONTEXT_RELATIVE_PATH
+    if context_path.exists() or context_path.is_symlink():
+        return False
+    if temporary_identity is None:
+        return False
+    temporary = root / "tmp"
+    known = {relative for relative, _ in created} | {"tmp"}
+    if any(path.name not in known for path in root.iterdir()):
+        return False
+    try:
+        info = temporary.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if (not stat.S_ISDIR(info.st_mode) or _is_reparse(temporary)
+                or (info.st_dev, info.st_ino) != temporary_identity or any(temporary.iterdir())):
+            return False
+    for relative, identity in created:
+        if relative not in {CONTEXT_RELATIVE_PATH, WORKSPACE_OWNER_RELATIVE_PATH}:
+            return False
+        path = _local_path(root, relative)
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (not stat.S_ISREG(info.st_mode) or _is_reparse(path)
+                or info.st_nlink != 1 or _file_identity(info) != identity):
+            return False
+    for relative, identity in reversed(created):
+        _assert_retirement_root(root, root_identity)
+        path = _local_path(root, relative)
+        try:
+            info = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or _file_identity(info) != identity or info.st_nlink != 1:
+            return False
+        path.unlink()
+    try:
+        info = temporary.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        _assert_retirement_root(root, root_identity)
+        if (not stat.S_ISDIR(info.st_mode) or _is_reparse(temporary)
+                or (info.st_dev, info.st_ino) != temporary_identity or any(temporary.iterdir())):
+            return False
+        temporary.rmdir()
+    return True
+
+
 def freeze_generation_context(
     root: Path,
     *,
@@ -1118,8 +1248,6 @@ def freeze_generation_context(
                 or set(owned_workspace) != {"cell_id", "cell_contract_sha256"}
                 or not all(_is_sha256(value) for value in owned_workspace.values())):
             _fail("WORKSPACE_OWNER_DECLARATION_INVALID")
-        if any(safe_root.iterdir()):
-            _fail("WORKSPACE_ROOT_NOT_EMPTY")
         workspace = dict(owned_workspace)
         info = safe_root.stat(follow_symlinks=False)
         workspace_root_identity = [info.st_dev, info.st_ino]
@@ -1144,17 +1272,39 @@ def freeze_generation_context(
         limits=active_limits,
         writable=True,
     )
-    if workspace is not None:
-        _assert_retirement_root(safe_root, workspace_root_identity)
-    _publish_exact_json(bootstrap, CONTEXT_RELATIVE_PATH, payload, MAX_CONTEXT_BYTES)
-    if workspace is not None:
-        _assert_retirement_root(safe_root, workspace_root_identity)
-        _publish_exact_json(bootstrap, WORKSPACE_OWNER_RELATIVE_PATH, {
-            "schema_version": WORKSPACE_OWNER_SCHEMA, "generation_id": generation,
-            "generation_context_sha256": bootstrap.context_sha256,
-            "creation_provenance": "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION", **workspace,
-            "root": str(safe_root), "root_identity": workspace_root_identity,
-        }, MAX_CONTEXT_BYTES)
+    with _generation_bootstrap_lock(safe_root):
+        if workspace is None:
+            _publish_exact_json(bootstrap, CONTEXT_RELATIVE_PATH, payload, MAX_CONTEXT_BYTES)
+        else:
+            _assert_retirement_root(safe_root, workspace_root_identity)
+            if any(safe_root.iterdir()):
+                _fail("WORKSPACE_ROOT_NOT_EMPTY")
+            owner_payload = {
+                "schema_version": WORKSPACE_OWNER_SCHEMA, "generation_id": generation,
+                "generation_context_sha256": bootstrap.context_sha256,
+                "creation_provenance": "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION", **workspace,
+                "root": str(safe_root), "root_identity": workspace_root_identity,
+            }
+            created, temporary_identity = [], None
+            root_owner = {"root": str(safe_root), "root_identity": workspace_root_identity}
+            try:
+                temporary = safe_root / "tmp"
+                temporary.mkdir()
+                info = temporary.stat(follow_symlinks=False)
+                temporary_identity = (info.st_dev, info.st_ino)
+                if any(path.name != "tmp" for path in safe_root.iterdir()):
+                    _fail("WORKSPACE_ROOT_NOT_EMPTY")
+                # CONTEXT is the visibility point; the first publication accounts both controls.
+                _retirement_publish_v2(safe_root, WORKSPACE_OWNER_RELATIVE_PATH, owner_payload, MAX_CONTEXT_BYTES,
+                    root_owner=root_owner, created_files=created)
+                _retirement_publish_v2(safe_root, CONTEXT_RELATIVE_PATH, payload, MAX_CONTEXT_BYTES,
+                    root_owner=root_owner, created_files=created)
+            except BaseException:
+                try:
+                    _rollback_owned_bootstrap(safe_root, workspace_root_identity, created, temporary_identity)
+                except (OSError, AuthoritySpoolError):
+                    pass
+                raise
     return reopen_generation_context(
         safe_root,
         expected_generation_id=generation,
@@ -1226,6 +1376,10 @@ def reopen_generation_context(
 def _assert_context_current(context: GenerationSpoolContext) -> None:
     if type(context) is not GenerationSpoolContext:
         _fail("GENERATION_CONTEXT_OBJECT_INVALID")
+    scope = (_PUBLICATION_BATCHES.get(_publication_batch_key(context))
+        if _PUBLICATION_BATCHES else None)
+    if scope is not None and scope.context_binding == _publication_context_binding(context):
+        return
     observed = reopen_generation_context(
         context.root,
         expected_generation_id=context.generation_id,
@@ -1236,6 +1390,7 @@ def _assert_context_current(context: GenerationSpoolContext) -> None:
         observed.context_sha256 != context.context_sha256
         or observed.limits != context.limits
         or observed.writable is not context.writable
+        or scope is not None
     ):
         _fail("GENERATION_CONTEXT_CHANGED")
 
@@ -1293,6 +1448,9 @@ def reserve_transient_publication(
         raise AuthoritySpoolError(str(exc)) from exc
 
 
+MAX_ROSTER_VERIFY_WORKERS = 8
+
+
 class SymbolAuthoritySink:
     """Bounded per-symbol artifact roster."""
 
@@ -1308,6 +1466,8 @@ class SymbolAuthoritySink:
         self.symbol = _identity(symbol, "SYMBOL", maximum_bytes=256)
         self.manifest_domain = _manifest_domain(manifest_domain)
         self._artifacts: dict[str, dict[str, Any]] = {}
+        # Exact descriptors already admitted by this sink, never shared on reopen.
+        self._admitted_descriptors: set[tuple[str, str, int, str]] = set()
         self._total_bytes = 0
 
     def register_artifact(
@@ -1316,6 +1476,64 @@ class SymbolAuthoritySink:
         artifact_type: str,
         descriptor: Mapping[str, Any],
     ) -> dict[str, Any]:
+        return self._admit(*self._checked(artifact_id, artifact_type, descriptor))
+
+    def register_roster(
+        self,
+        entries: Iterable[Mapping[str, Any]],
+        *,
+        workers: int,
+    ) -> None:
+        """Register a whole roster in order; members are read and hashed several at a time.
+
+        Each member gets the same checks as register_artifact, in this call. The
+        first failure in roster order is raised, after earlier members are admitted.
+        """
+
+        if type(workers) is not int or not 1 <= workers <= MAX_ROSTER_VERIFY_WORKERS:
+            _fail("ROSTER_VERIFY_WORKERS_INVALID")
+        roster = list(entries)
+        if workers == 1 or len(roster) < 2:
+            for entry in roster:
+                self.register_artifact(
+                    entry["artifact_id"], entry["artifact_type"], entry["descriptor"]
+                )
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        def checked(entry: Mapping[str, Any]) -> tuple[str, str, dict[str, Any]]:
+            return self._checked(
+                entry["artifact_id"], entry["artifact_type"], entry["descriptor"]
+            )
+
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            for member in pool.map(checked, roster):
+                self._admit(*member)
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    def _checked(
+        self,
+        artifact_id: str,
+        artifact_type: str,
+        descriptor: Mapping[str, Any],
+    ) -> tuple[str, str, dict[str, Any]]:
+        member = self._checked_metadata(artifact_id, artifact_type, descriptor)
+        normalized = member[2]
+        if (
+            normalized["relative_path"], normalized["sha256"],
+            normalized["size_bytes"], normalized["format"],
+        ) not in self._admitted_descriptors:
+            _verify_artifact_file(self.context, normalized)
+        return member
+
+    def _checked_metadata(
+        self,
+        artifact_id: str,
+        artifact_type: str,
+        descriptor: Mapping[str, Any],
+    ) -> tuple[str, str, dict[str, Any]]:
         artifact_key = _identity(artifact_id, "ARTIFACT_ID", maximum_bytes=1024)
         type_name = _identity(artifact_type, "ARTIFACT_TYPE", maximum_bytes=256)
         normalized = _validate_descriptor(
@@ -1323,7 +1541,19 @@ class SymbolAuthoritySink:
         )
         if normalized["size_bytes"] > self.context.limits.max_artifact_bytes:
             _fail("ARTIFACT_SIZE_BOUND_EXCEEDED")
-        _verify_artifact_file(self.context, normalized)
+        if (
+            normalized["format"] == CANONICAL_JSON_FORMAT
+            and normalized["size_bytes"] > self.context.limits.max_json_bytes
+        ):
+            _fail("JSON_SIZE_BOUND_EXCEEDED")
+        return artifact_key, type_name, normalized
+
+    def _admit(
+        self,
+        artifact_key: str,
+        type_name: str,
+        normalized: dict[str, Any],
+    ) -> dict[str, Any]:
         entry = {
             "artifact_id": artifact_key,
             "artifact_type": type_name,
@@ -1333,15 +1563,17 @@ class SymbolAuthoritySink:
         if existing is not None:
             if existing != entry:
                 _fail("ARTIFACT_ID_CONFLICT")
-            return dict(existing)
+            return dict(existing, descriptor=dict(existing["descriptor"]))
         if len(self._artifacts) >= self.context.limits.max_artifacts_per_symbol:
             _fail("ARTIFACT_COUNT_BOUND_EXCEEDED")
         projected = self._total_bytes + int(normalized["size_bytes"])
-        if projected > self.context.limits.max_symbol_bytes:
-            _fail("SYMBOL_BYTE_BOUND_EXCEEDED")
         self._artifacts[artifact_key] = entry
+        self._admitted_descriptors.add((
+            normalized["relative_path"], normalized["sha256"],
+            normalized["size_bytes"], normalized["format"],
+        ))
         self._total_bytes = projected
-        return dict(entry)
+        return dict(entry, descriptor=dict(normalized))
 
     def put_json(
         self,
@@ -1349,8 +1581,26 @@ class SymbolAuthoritySink:
         artifact_type: str,
         value: Any,
     ) -> dict[str, Any]:
-        descriptor = write_canonical_json_artifact(self.context, value)
-        return self.register_artifact(artifact_id, artifact_type, descriptor)
+        encoded = _canonical_json_bytes(value, self.context.limits.max_json_bytes)
+        existing = self._artifacts.get(artifact_id) if type(artifact_id) is str else None
+        if existing is not None:
+            _assert_context_current(self.context)
+            if self.context.writable is not True:
+                _fail("GENERATION_CONTEXT_READ_ONLY")
+            content_hash = hashlib.sha256(encoded).hexdigest()
+            descriptor = {
+                "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
+                "relative_path": _content_relative_path(content_hash, CANONICAL_JSON_FORMAT),
+                "sha256": content_hash,
+                "size_bytes": len(encoded),
+                "format": CANONICAL_JSON_FORMAT,
+            }
+        else:
+            descriptor = _write_streamed_object(
+                self.context, (encoded,), format_name=CANONICAL_JSON_FORMAT,
+                admitted_descriptors=self._admitted_descriptors,
+            )
+        return self._admit(*self._checked_metadata(artifact_id, artifact_type, descriptor))
 
     def put_opaque(
         self,
@@ -1372,8 +1622,11 @@ class SymbolAuthoritySink:
                 format_name=format_name,
                 existing=existing,
             )
-        descriptor = write_opaque_artifact(self.context, chunks, format=format)
-        return self.register_artifact(artifact_id, artifact_type, descriptor)
+        descriptor = _write_streamed_object(
+            self.context, chunks, format_name=format_name,
+            admitted_descriptors=self._admitted_descriptors,
+        )
+        return self._admit(*self._checked_metadata(artifact_id, artifact_type, descriptor))
 
     def _reuse_registered_opaque(
         self,
@@ -1384,7 +1637,7 @@ class SymbolAuthoritySink:
         format_name: str,
         existing: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Verify an exact same-sink replay without republishing its bytes."""
+        """Check incoming replay bytes against this sink's admitted descriptor."""
 
         _assert_context_current(self.context)
         if self.context.writable is not True:
@@ -1402,6 +1655,7 @@ class SymbolAuthoritySink:
             total = projected
         if total <= 0:
             _fail("ARTIFACT_EMPTY")
+        _assert_context_current(self.context)
         content_hash = digest.hexdigest()
         descriptor = {
             "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
@@ -1417,8 +1671,7 @@ class SymbolAuthoritySink:
         }
         if dict(existing) != candidate:
             _fail("ARTIFACT_ID_CONFLICT")
-        _verify_artifact_file(self.context, descriptor)
-        return dict(existing)
+        return dict(existing, descriptor=dict(existing["descriptor"]))
 
     def artifact_roster(self) -> list[dict[str, Any]]:
         """Return a bounded canonical copy without publishing a manifest."""
@@ -1501,6 +1754,8 @@ def open_symbol_sink(
 def _verify_artifact_file(
     context: GenerationSpoolContext,
     descriptor: Mapping[str, Any],
+    *,
+    _json_value_out: Optional[dict] = None,
 ) -> None:
     normalized = _validate_descriptor(dict(descriptor), content_addressed=True)
     if normalized["size_bytes"] > context.limits.max_artifact_bytes:
@@ -1520,7 +1775,11 @@ def _verify_artifact_file(
         _fail("ARTIFACT_INTEGRITY_MISMATCH")
     if collect:
         assert encoded is not None
-        _strict_json_bytes(encoded, context.limits.max_json_bytes)
+        value = _strict_json_bytes(encoded, context.limits.max_json_bytes)
+        if _json_value_out is not None:
+            key = (normalized["relative_path"], normalized["sha256"],
+                   normalized["size_bytes"], normalized["format"])
+            _json_value_out[key] = (value, digest, dict(normalized))
 
 
 def _receipt_payload(receipt: Any) -> dict[str, Any]:
@@ -1549,6 +1808,9 @@ def verify_symbol_receipt(
     expected_native_universe_sha256: str,
     expected_config_sha256: str,
     expected_manifest_domain: Optional[str] = None,
+    _verified_commit_objects: Optional[dict] = None,
+    _verified_artifact_descriptors: Optional[set] = None,
+    _manifest_record: Optional[tuple] = None,
 ) -> dict[str, Any]:
     """Reopen and verify a compact worker receipt and every roster artifact."""
 
@@ -1592,14 +1854,19 @@ def verify_symbol_receipt(
         _fail("SYMBOL_MANIFEST_FORMAT_INVALID")
     if manifest_descriptor["size_bytes"] > context.limits.max_manifest_bytes:
         _fail("SYMBOL_MANIFEST_SIZE_BOUND_EXCEEDED")
-    digest, size, encoded = _stream_file(
-        context.root,
-        manifest_descriptor["relative_path"],
-        maximum_bytes=context.limits.max_manifest_bytes,
-        expected_size=manifest_descriptor["size_bytes"],
-        collect=True,
-        chunk_bytes=context.limits.stream_chunk_bytes,
-    )
+    if _manifest_record is None:
+        digest, size, encoded = _stream_file(
+            context.root,
+            manifest_descriptor["relative_path"],
+            maximum_bytes=context.limits.max_manifest_bytes,
+            expected_size=manifest_descriptor["size_bytes"],
+            collect=True,
+            chunk_bytes=context.limits.stream_chunk_bytes,
+        )
+    else:
+        digest, size, encoded = _manifest_record
+        if type(encoded) is not bytes or len(encoded) != size:
+            _fail("SYMBOL_MANIFEST_INTEGRITY_MISMATCH")
     if digest != manifest_descriptor["sha256"] or size != manifest_descriptor["size_bytes"]:
         _fail("SYMBOL_MANIFEST_INTEGRITY_MISMATCH")
     assert encoded is not None
@@ -1640,9 +1907,16 @@ def verify_symbol_receipt(
         )
         observed_ids.append(artifact_id)
         total_bytes += descriptor["size_bytes"]
-        if total_bytes > context.limits.max_symbol_bytes:
-            _fail("SYMBOL_BYTE_BOUND_EXCEEDED")
-        _verify_artifact_file(context, descriptor)
+        descriptor_key = (descriptor["relative_path"], descriptor["sha256"],
+                          descriptor["size_bytes"], descriptor["format"])
+        if (_verified_artifact_descriptors is not None
+                and descriptor_key in _verified_artifact_descriptors):
+            continue
+        if (_verified_commit_objects is not None
+                and entry["artifact_type"] == "declared_slot_commit"):
+            _verify_artifact_file(context, descriptor, _json_value_out=_verified_commit_objects)
+        else:
+            _verify_artifact_file(context, descriptor)
     if observed_ids != sorted(observed_ids) or len(observed_ids) != len(set(observed_ids)):
         _fail("SYMBOL_MANIFEST_ROSTER_ORDER_OR_DUPLICATE_INVALID")
     if manifest.get("artifact_total_bytes") != total_bytes:
@@ -1689,29 +1963,40 @@ def _retirement_publish(root: Path, relative: str, body: dict, maximum: int,
         root_identity = [info.st_dev, info.st_ino]
     target = _local_path(root, relative)
     _reject_reparse_chain(target)
-    if not target.exists():
-        _assert_retirement_root(root, root_identity)
-        temporary = _temporary_path(root)
-        descriptor = _open_exclusive(temporary)
-        try:
-            _write_all(descriptor, memoryview(encoded))
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        identity = _file_identity(temporary.stat(follow_symlinks=False))
-        try:
+    temporary, identity = None, None
+    try:
+        if not target.exists():
             _assert_retirement_root(root, root_identity)
-            _publish_temp_exclusive(root, temporary, relative)
-        finally:
-            if temporary.exists():
-                _assert_retirement_root(root, root_identity)
-                if _file_identity(temporary.stat(follow_symlinks=False)) != identity:
-                    _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
-                temporary.unlink()
-    observed, digest = _retirement_control(root, relative, maximum)
-    if observed != body or digest != expected:
-        _fail("RETIREMENT_CONTROL_CONFLICT")
-    return digest
+            temporary = _temporary_path(root)
+            descriptor = _open_exclusive(temporary)
+            try:
+                _write_all(descriptor, memoryview(encoded))
+                os.fsync(descriptor)
+            finally:
+                try:
+                    identity = _file_identity(os.fstat(descriptor))
+                finally:
+                    os.close(descriptor)
+            _assert_retirement_root(root, root_identity)
+            info = temporary.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or _file_identity(info) != identity):
+                _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
+            try:
+                _publish_temp_exclusive(root, temporary, relative)
+            except FileExistsError:
+                pass
+        observed, digest = _retirement_control(root, relative, maximum)
+        if observed != body or digest != expected:
+            _fail("RETIREMENT_CONTROL_CONFLICT")
+        return digest
+    finally:
+        if temporary is not None and identity is not None and temporary.exists():
+            _assert_retirement_root(root, root_identity)
+            info = temporary.stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or _file_identity(info) != identity:
+                _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
+            temporary.unlink()
 
 
 def read_owned_generation_workspace(context: GenerationSpoolContext) -> tuple[dict, str]:
@@ -1741,10 +2026,11 @@ def _retirement_terminal_refusal_fence(body: dict, *, context_sha256: str, gener
     flags = {"qualification_authority", "capital_authority", "live_authority", "order_authority",
         "full_native_context_eligibility", "financial_consumer_ready"}
     if (set(body) != {"schema_version", "workspace_owner_sha256", "binding", "refusal",
-            "source_disposition", "end_grid_rows", "code_sha256"} | flags
+            "source_disposition", "end_grid_rows", "code_sha256"} | flags | ({"period_facts"} if "period_facts" in body else set())
             or body["schema_version"] != TERMINAL_REFUSAL_FENCE_SCHEMA
             or body["workspace_owner_sha256"] != workspace_sha256
-            or any(body.get(key) is not False for key in flags)):
+            or any(body.get(key) is not False for key in flags)
+            or ("period_facts" in body and type(body["period_facts"]) is not list)):
         _fail("RETIREMENT_TERMINAL_REFUSAL_INVALID")
     disposition = body["source_disposition"]
     if (type(disposition) is not dict or disposition != {
@@ -1845,10 +2131,11 @@ def _retirement_post_source_abort_fence(body: dict, *, context_sha256: str, gene
     flags = {"qualification_authority", "capital_authority", "live_authority", "order_authority",
         "full_native_context_eligibility", "financial_consumer_ready"}
     if (set(body) != {"schema_version", "workspace_owner_sha256", "binding", "refusal",
-            "source_disposition", "end_grid_rows", "code_sha256", "abort_report", "bound_fitted_header"} | flags
+            "source_disposition", "end_grid_rows", "code_sha256", "abort_report", "bound_fitted_header"} | flags | ({"period_facts"} if "period_facts" in body else set())
             or body["schema_version"] != POST_SOURCE_ABORT_FENCE_SCHEMA
             or body["workspace_owner_sha256"] != workspace_sha256
-            or any(body.get(key) is not False for key in flags)):
+            or any(body.get(key) is not False for key in flags)
+            or ("period_facts" in body and type(body["period_facts"]) is not list)):
         _fail("RETIREMENT_POST_SOURCE_ABORT_INVALID")
     if body["bound_fitted_header"] is not None:
         _fail("RETIREMENT_ABORT_HEADER_UNSUPPORTED")
@@ -2004,14 +2291,104 @@ def _retirement_post_source_abort_fence(body: dict, *, context_sha256: str, gene
     return body
 
 
+def _retirement_retained_account(fence: dict, *, binding: dict, grid_root: Path,
+        working_root: Path, required: bool,
+        retained_account_result_out: Optional[dict] = None) -> Optional[dict]:
+    if retained_account_result_out is not None:
+        retained_account_result_out.clear()
+    reference = fence.get("retained_account_result")
+    invalid = "RETIREMENT_RETAINED_ACCOUNT_INVALID"
+    if reference is None and "retained_account_result" not in fence:
+        if not required:
+            return None
+        if fence["schema_version"] in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA):
+            expected_sha = fence["completion"].get("account_artifact_sha256")
+        elif fence["schema_version"] == "fxpm.declared-m5-development-source-fence.v1":
+            terminal_key = binding.get("terminal_result_key")
+            results = fence["source_summary"].get("results")
+            terminal = [value[1] for value in results if type(value) in (list, tuple)
+                and len(value) == 2 and value[0] == terminal_key] if type(results) is list else []
+            if type(terminal_key) is not str or len(terminal) != 1 or type(terminal[0]) is not dict:
+                _fail(invalid)
+            expected_sha = terminal[0].get("result_sha256")
+        else:
+            _fail(invalid)
+        if not _is_sha256(expected_sha):
+            _fail(invalid)
+        path = _safe_regular_file(grid_root, "declared-account-" + expected_sha + ".json")
+        reference = {"path": str(path), "sha256": expected_sha,
+            "size_bytes": path.stat(follow_symlinks=False).st_size}
+    if (type(reference) is not dict or set(reference) != {"path", "sha256", "size_bytes"}
+            or type(reference["path"]) is not str or not _is_sha256(reference["sha256"])
+            or type(reference["size_bytes"]) is not int or reference["size_bytes"] <= 0):
+        _fail(invalid)
+    path = Path(reference["path"])
+    if (not path.is_absolute() or path != grid_root / ("declared-account-" + reference["sha256"] + ".json")
+            or path.is_relative_to(working_root) or working_root.is_relative_to(path)):
+        _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    parent = _validate_root(path.parent, create=False)
+    digest, size, encoded = _stream_file(parent, path.name, maximum_bytes=reference["size_bytes"],
+        expected_size=reference["size_bytes"], collect=True)
+    if digest != reference["sha256"] or size != reference["size_bytes"] or encoded is None:
+        _fail(invalid)
+    account = _strict_json_bytes(encoded, reference["size_bytes"])
+    if (type(account) is not dict or _canonical_json_bytes(account, reference["size_bytes"]) != encoded
+            or account.get("generation_id") != binding["run_id"]
+            or account.get("generation_context_sha256") != binding["generation_context_sha256"]
+            or account.get("declared_precommit_sha256") != binding["precommit_sha256"]
+            or account.get("search_process_receipt_sha256") != binding["search_process_receipt_sha256"]
+            or type(account.get("cell")) is not dict or account["cell"].get("cell_id") != binding["cell_id"]
+            or type(account.get("account")) is not dict
+            or any(account.get(key) is not False for key in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail(invalid)
+    native = fence["schema_version"] in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA)
+    development = fence["schema_version"] != NATIVE_COMPLETION_FENCE_SCHEMA
+    expected_schema = ("fxpm.declared-development-native-cell-raw-account.v1" if native and development
+        else "fxpm.declared-cell-raw-account.v4" if native
+        else "fxpm.declared-development-m5-cell-raw-account.v1")
+    if (account.get("schema_version") != expected_schema
+            or account.get("progress_status") != ("DEVELOPMENT_COMPLETE" if development else "COMPLETE")):
+        _fail(invalid)
+    if native:
+        completion = fence["completion"]
+        if reference["sha256"] != completion["account_artifact_sha256"]:
+            _fail(invalid)
+        if development and (account.get("saved_cell_run_receipt_sha256") != completion["cell_run_receipt_sha256"]
+                or account.get("development_scope") != fence["development_scope"]
+                or account.get("development_scope_sha256") != fence["development_scope_sha256"]):
+            _fail(invalid)
+    else:
+        summary = fence["source_summary"]
+        terminal_key = binding.get("terminal_result_key")
+        results = summary.get("results")
+        terminal = [value[1] for value in results if type(value) in (list, tuple)
+            and len(value) == 2 and value[0] == terminal_key] if type(results) is list else []
+        if (type(terminal_key) is not str or len(terminal) != 1 or type(terminal[0]) is not dict
+                or terminal[0].get("result_sha256") != reference["sha256"]):
+            _fail(invalid)
+    if development and (account.get("result_kind") != "DEVELOPMENT_PARTIAL"
+            or account.get("source_kind") != ("broker_native" if native else "m5_derived")
+            or account.get("design_contaminated") is not True or account.get("pristine_validation") is not False):
+        _fail(invalid)
+    if retained_account_result_out is not None:
+        retained_account_result_out.clear()
+        retained_account_result_out.update(reference)
+    return account
+
+
 def _retirement_native_view_contract(contract: dict, row: Any, *, binding: dict,
-        completion: dict, slot_id: str, ordinal: int) -> None:
+        completion: dict, slot_id: str, ordinal: int, retained_account_result: Optional[dict] = None) -> None:
     from datetime import datetime, timedelta
 
     import pm_end_grid as end_grid
 
     invalid = "RETIREMENT_NATIVE_VIEW_CONTRACT_INVALID"
-    if (set(contract) != {"schema_version", "view", "result", "cost_tier_evidence"}
+    fields = {"schema_version", "view", "result", "cost_tier_evidence"}
+    if "retained_account_result" in contract:
+        fields.add("retained_account_result")
+    if (set(contract) != fields
+            or "retained_account_result" in contract and contract["retained_account_result"] != retained_account_result
             or contract["schema_version"] != "fxpm.broker-native-end-grid-reconstruction.v1"):
         _fail(invalid)
     view, result, evidence = contract["view"], contract["result"], contract["cost_tier_evidence"]
@@ -2058,16 +2435,24 @@ def _retirement_native_view_contract(contract: dict, row: Any, *, binding: dict,
 
 
 def _retirement_native_completion_fence(body: dict, *, context_sha256: str, generation_id: str,
-        cell_id: str, workspace_sha256: str, working_root: Path, owner: Optional[dict]) -> dict:
+        cell_id: str, workspace_sha256: str, working_root: Path, owner: Optional[dict],
+        require_retained_account: bool = False,
+        retained_account_result_out: Optional[dict] = None) -> dict:
     """Join caller-verified native completion identities to retained Grid evidence."""
     from datetime import datetime, timedelta
 
     import pm_end_grid as end_grid
 
     invalid = "RETIREMENT_NATIVE_COMPLETION_FENCE_INVALID"
-    if (set(body) != {"schema_version", "workspace_owner_sha256", "binding", "completion",
-            "selected_slots", "end_grid_rows"} | set(end_grid.AUTHORITY_FLAGS)
-            or body["schema_version"] != NATIVE_COMPLETION_FENCE_SCHEMA
+    development = body.get("schema_version") == NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
+    fields = {"schema_version", "workspace_owner_sha256", "binding", "completion",
+        "selected_slots", "end_grid_rows"} | set(end_grid.AUTHORITY_FLAGS)
+    if development:
+        fields.update(("development_scope", "development_scope_sha256", "accepted_slot_ids"))
+    if "retained_account_result" in body:
+        fields.add("retained_account_result")
+    if (set(body) != fields
+            or body["schema_version"] not in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA)
             or body["workspace_owner_sha256"] != workspace_sha256
             or any(body[key] is not False for key in end_grid.AUTHORITY_FLAGS)):
         _fail(invalid)
@@ -2087,8 +2472,29 @@ def _retirement_native_completion_fence(body: dict, *, context_sha256: str, gene
             or any(not _is_sha256(value) for value in completion.values())):
         _fail(invalid)
     slots, references = body["selected_slots"], body["end_grid_rows"]
-    if type(slots) is not list or len(slots) != 13 or type(references) is not dict:
+    if (type(slots) is not list or type(references) is not dict
+            or (not development and len(slots) != 13)
+            or (development and not 1 <= len(slots) <= 3)):
         _fail(invalid)
+    if development:
+        import pm_historical_anchor_orchestration as orchestration
+        accepted = body["accepted_slot_ids"]
+        if (type(accepted) is not list or len(accepted) != 13
+                or any(type(value) is not str for value in accepted) or len(set(accepted)) != 13):
+            _fail(invalid)
+        for value in accepted:
+            _identity(value, "RETIREMENT_NATIVE_SLOT_ID")
+        selected = [slot.get("slot_id") if type(slot) is dict else None for slot in slots]
+        try:
+            expected_scope = orchestration._declared_development_scope_body(
+                {"slots": [{"slot_id": value} for value in accepted]}, selected)
+        except orchestration.HistoricalAnchorOrchestrationError:
+            _fail(invalid)
+        if (body["development_scope"] != expected_scope
+                or not _is_sha256(body["development_scope_sha256"])
+                or hashlib.sha256(_canonical_json_bytes(expected_scope, MAX_CONTEXT_BYTES)).hexdigest()
+                    != body["development_scope_sha256"]):
+            _fail(invalid)
     time_keys = ("cycle_start_utc", "cycle_end_utc", "information_cutoff_utc")
     slot_ids, starts, grid_path = set(), set(), None
     previous_end = None
@@ -2124,6 +2530,10 @@ def _retirement_native_completion_fence(body: dict, *, context_sha256: str, gene
     grid_root = grid_path.parent.resolve()
     if grid_root.is_relative_to(working_root) or working_root.is_relative_to(grid_root):
         _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    retained_reference = {}
+    retained = _retirement_retained_account(body, binding=binding, grid_root=grid_root,
+        working_root=working_root, required=require_retained_account,
+        retained_account_result_out=retained_reference)
     rows_by_start = {}
     for row in end_grid.read_end_grid(grid_path.parent, grid_path.stem):
         if row.cell_id == cell_id and row.process_edition_sha256 == binding["search_process_receipt_sha256"]:
@@ -2139,15 +2549,25 @@ def _retirement_native_completion_fence(body: dict, *, context_sha256: str, gene
                 or row.view_contract_sha256 is None
                 or (row.outcome == "NO_TRADE" and row.no_trade_run_receipt_sha256 != completion["cell_run_receipt_sha256"])):
             _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        if retained is not None and any(retained["cell"].get(key) != getattr(row, key)
+                for key in ("cell_id", "symbol", "timeframe", "regime")):
+            _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
         contract = end_grid.load_view_contract(grid_path.parent, row.view_contract_sha256)
         _retirement_native_view_contract(contract, row, binding=binding, completion=completion,
-            slot_id=slot["slot_id"], ordinal=ordinal)
+            slot_id=slot["slot_id"], ordinal=ordinal, retained_account_result=retained_reference or None)
+    if retained_account_result_out is not None:
+        retained_account_result_out.clear()
+        retained_account_result_out.update(retained_reference)
     return body
 
 
 def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generation_id: str,
-        cell_id: str, workspace_sha256: str, working_root: Path, owner: Optional[dict] = None) -> dict:
+        cell_id: str, workspace_sha256: str, working_root: Path, owner: Optional[dict] = None,
+        require_retained_account: bool = False,
+        retained_account_result_out: Optional[dict] = None) -> dict:
     import pm_end_grid as end_grid
+    if retained_account_result_out is not None:
+        retained_account_result_out.clear()
     if path.resolve().is_relative_to(working_root):
         _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
     body, digest = _retirement_external(path, 4 * 1024**2)
@@ -2163,12 +2583,13 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
         return _retirement_terminal_refusal_fence(body, context_sha256=context_sha256,
             generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
             working_root=working_root)
-    if body.get("schema_version") == NATIVE_COMPLETION_FENCE_SCHEMA:
+    if body.get("schema_version") in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA):
         if digest != expected:
             _fail("RETIREMENT_NATIVE_COMPLETION_FENCE_INVALID")
         return _retirement_native_completion_fence(body, context_sha256=context_sha256,
             generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
-            working_root=working_root, owner=owner)
+            working_root=working_root, owner=owner, require_retained_account=require_retained_account,
+            retained_account_result_out=retained_account_result_out)
     summary = body.get("source_summary")
     if (digest != expected or body.get("schema_version") != "fxpm.declared-m5-development-source-fence.v1"
             or body.get("workspace_owner_sha256") != workspace_sha256
@@ -2187,6 +2608,11 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
     if type(rows) is not dict or not rows:
         _fail("RETIREMENT_GRID_READBACK_REQUIRED")
     job_sha = hashlib.sha256(_canonical_json_bytes(binding, MAX_CONTEXT_BYTES)).hexdigest()
+    retained = None
+    retained_reference = {}
+    retained_checked = False
+    terminal_seen = False
+    terminal_row_sha = None
     for reference in rows.values():
         if (type(reference) is not dict or set(reference) != {"path", "row_sha256"}
                 or type(reference["path"]) is not str or not _is_sha256(reference["row_sha256"])):
@@ -2201,8 +2627,47 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
             if row.row_sha256 == reference["row_sha256"]]
         if len(matched) != 1 or matched[0].cell_id != cell_id or matched[0].job_binding_sha256 != job_sha:
             _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+        if not retained_checked:
+            retained = _retirement_retained_account(body, binding=binding, grid_root=grid_root,
+                working_root=working_root, required=require_retained_account,
+                retained_account_result_out=retained_reference)
+            retained_checked = True
+            if retained is not None:
+                terminal_result = next(value[1] for value in summary["results"]
+                    if type(value) in (list, tuple) and len(value) == 2
+                    and value[0] == binding["terminal_result_key"])
+                terminal_row_sha = terminal_result.get("result_descriptor_sha256")
+                if not _is_sha256(terminal_row_sha):
+                    _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
+        if retained is not None and (Path(retained_reference["path"]).parent != grid_root
+                or any(retained["cell"].get(key) != getattr(matched[0], key)
+                    for key in ("cell_id", "symbol", "timeframe", "regime"))):
+            _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
+        if retained is not None and matched[0].view_contract_sha256 is None:
+            _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
         if matched[0].view_contract_sha256 is not None:
-            end_grid.load_view_contract(grid_path.parent, matched[0].view_contract_sha256)
+            contract = end_grid.load_view_contract(grid_path.parent, matched[0].view_contract_sha256)
+            if retained is not None:
+                identity = contract.get("actual_result_identity", {})
+                if (identity.get("account_artifact_sha256") != retained_reference["sha256"]
+                        or identity.get("cell_run_receipt_sha256") != retained.get("saved_cell_run_receipt_sha256")
+                        or contract.get("development_scope") != retained.get("development_scope")
+                        or "retained_account_result" in contract
+                        and contract["retained_account_result"] != retained_reference):
+                    _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
+                terminal = contract.get("terminal_account_reference")
+                if reference["row_sha256"] == terminal_row_sha:
+                    terminal_seen = True
+                    if type(terminal) is not dict:
+                        _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
+                if terminal is not None and (type(terminal) is not dict
+                        or terminal.get("account_artifact_sha256") != retained_reference["sha256"]
+                        or terminal.get("cell_run_receipt_sha256") != retained.get("saved_cell_run_receipt_sha256")):
+                    _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
+    if retained is not None and not terminal_seen:
+        _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
+    if retained_account_result_out is not None:
+        retained_account_result_out.update(retained_reference)
     return body
 
 
@@ -2256,9 +2721,17 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
     if (marker["schema_version"] == RETIREMENT_SCHEMA_V2
             and (type(receipt.get("intent_segment_count")) is not int or receipt["intent_segment_count"] < 0)):
         _fail("RETIREMENT_COMPLETION_INVALID")
+    retained_reference = {}
     fence = _retirement_fence(Path(marker["source_fence_path"]), marker["source_fence_sha256"],
         context_sha256=marker["generation_context_sha256"], generation_id=marker["generation_id"],
-        cell_id=marker["cell_id"], workspace_sha256=marker["workspace_owner_sha256"], working_root=root, owner=owner)
+        cell_id=marker["cell_id"], workspace_sha256=marker["workspace_owner_sha256"], working_root=root, owner=owner,
+        require_retained_account="retained_account_result" in receipt,
+        retained_account_result_out=retained_reference)
+    if receipt.get("retained_account_result") != (retained_reference or None):
+        _fail("RETIREMENT_COMPLETION_INVALID")
+    if (("period_facts" in receipt) != ("period_facts" in fence)
+            or receipt.get("period_facts") != fence.get("period_facts")):
+        _fail("RETIREMENT_COMPLETION_INVALID")
     if expected_completed_fence_schema is not None and fence["schema_version"] != expected_completed_fence_schema:
         _fail("RETIREMENT_COMPLETED_FENCE_SCHEMA_MISMATCH")
     if fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA:
@@ -2274,13 +2747,16 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
             _fail("RETIREMENT_COMPLETION_INVALID")
     elif "result_kind" in receipt or "terminal_refusal" in receipt:
         _fail("RETIREMENT_COMPLETION_INVALID")
-    if fence["schema_version"] == NATIVE_COMPLETION_FENCE_SCHEMA:
+    if fence["schema_version"] in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA):
         expected_receipt = {"generation_id": marker["generation_id"], "cell_id": marker["cell_id"],
             "cell_contract_sha256": fence["binding"]["cell_contract_sha256"],
             "workspace_owner_sha256": marker["workspace_owner_sha256"], "intent_sha256": marker["intent_sha256"],
             "precommit_sha256": fence["binding"]["precommit_sha256"], "end_grid_rows": fence["end_grid_rows"],
             "source_fence": {"path": marker["source_fence_path"], "sha256": marker["source_fence_sha256"]},
             "descriptor_assurance": "IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE"}
+        if fence["schema_version"] == NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA:
+            expected_receipt.update({key: fence[key] for key in
+                ("development_scope", "development_scope_sha256", "accepted_slot_ids")})
         if any(receipt.get(key) != value for key, value in expected_receipt.items()):
             _fail("RETIREMENT_COMPLETION_INVALID")
     return {**receipt, "retirement_receipt_sha256": digest,
@@ -2493,7 +2969,7 @@ def _retirement_control_os_error(exc: OSError, step: str) -> AuthoritySpoolError
 
 
 def _retirement_publish_v2(root: Path, relative: str, body: dict, maximum: int,
-        *, root_owner: Optional[dict] = None) -> str:
+        *, root_owner: Optional[dict] = None, created_files: Optional[list] = None) -> str:
     encoded = _canonical_json_bytes(body, maximum)
     expected = hashlib.sha256(encoded).hexdigest()
     temporary, descriptor, identity = None, None, None
@@ -2539,7 +3015,18 @@ def _retirement_publish_v2(root: Path, relative: str, body: dict, maximum: int,
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                     or _file_identity(info) != identity):
                 _fail("RETIREMENT_CONTROL_TEMP_CHANGED")
-            _publish_temp_exclusive(root, temporary, relative)
+            try:
+                _publish_temp_exclusive(root, temporary, relative)
+            finally:
+                if created_files is not None:
+                    _assert_retirement_root(root, root_identity, declared_root=declared_root)
+                    try:
+                        linked = target.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        linked = None
+                    if (linked is not None and stat.S_ISREG(linked.st_mode)
+                            and _file_identity(linked) == identity):
+                        created_files.append((relative, identity))
             step = "temporary_cleanup"
             _assert_retirement_root(root, root_identity, declared_root=declared_root)
             if _file_identity(temporary.stat(follow_symlinks=False)) != identity:
@@ -2640,8 +3127,7 @@ def _retirement_v2_prepare(root: Path, *, existing: Optional[dict], context_body
             present_nodes += 1
     control_bytes = plan["intent_size_bytes"] + sum(segment["size_bytes"] for segment in plan["segments"]) + 2 * MAX_CONTEXT_BYTES
     if (nodes + 3 + len(plan["segments"]) - present_nodes > arguments["max_nodes"]
-            or root_bytes - present_bytes + control_bytes > min(arguments["max_bytes"], context_body["limits"]["max_generation_bytes"])
-            or shutil.disk_usage(root).free - (control_bytes - present_bytes) < context_body["limits"]["min_free_bytes"]):
+            or root_bytes - present_bytes + control_bytes > arguments["max_bytes"]):
         _fail("RETIREMENT_CONTROL_CAPACITY")
     intent_sha = _retirement_publish_v2(root, RETIREMENT_INTENT_RELATIVE_PATH, plan["intent"], maximum, root_owner=owner)
     for segment in plan["segments"]:
@@ -2808,6 +3294,16 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             if segment_max_records is not None:
                 context_body, _ = _retirement_control(root, CONTEXT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
                 maximum = min(context_body["limits"]["max_json_bytes"], 64 * 1024**2)
+                if _local_path(root, RETIREMENT_INTENT_RELATIVE_PATH).exists():
+                    saved, _ = _retirement_control(root, RETIREMENT_INTENT_RELATIVE_PATH, maximum)
+                    saved_arguments = saved.get("arguments") if type(saved) is dict else None
+                    if type(saved_arguments) is not dict:
+                        _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+                    if "retained_account_result" in saved_arguments:
+                        if ("retained_account_result" not in existing
+                                or saved_arguments["retained_account_result"] != existing["retained_account_result"]):
+                            _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+                        v2_arguments["retained_account_result"] = dict(existing["retained_account_result"])
                 _retirement_v2_cleanup(root, marker["intent_sha256"], v2_arguments, maximum, owner_before_lock)
             return existing
         if existing is None and retirement_receipt_path.exists():
@@ -2832,24 +3328,62 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                 or owner.get("creation_provenance") != "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION"):
             _fail("RETIREMENT_OWNER_REQUIRED")
         _assert_retirement_root(root, owner["root_identity"], declared_root=owner["root"])
-        fence = _retirement_fence(source_fence_path, source_fence_sha256, context_sha256=context_sha,
-            generation_id=owner["generation_id"], cell_id=owner["cell_id"], workspace_sha256=owner_sha,
-            working_root=root, owner=owner)
-        terminal_refusal = fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA
-        post_source_abort = fence.get("schema_version") == POST_SOURCE_ABORT_FENCE_SCHEMA
-        native_completion = fence.get("schema_version") == NATIVE_COMPLETION_FENCE_SCHEMA
-        if terminal_refusal and (unit_lock_paths or direct != frozenset({
-                f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
-            _fail("RETIREMENT_REFUSAL_SOURCE_STATE_INVALID")
-        if post_source_abort and (unit_lock_paths or direct != frozenset({
-                f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
-            _fail("RETIREMENT_ABORT_SOURCE_STATE_INVALID")
         maximum = min(context_body["limits"]["max_json_bytes"], 64 * 1024**2)
         arguments = {"source_fence_path": str(source_fence_path), "source_fence_sha256": source_fence_sha256,
             "retirement_receipt_path": str(retirement_receipt_path), "workspace_owner_sha256": owner_sha,
             "protected_paths": [str(Path(value).resolve()) for value in protected_paths],
             "owned_direct_files": sorted(direct), "unit_lock_paths": list(unit_lock_paths),
             "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes}
+        if segment_max_records is not None:
+            arguments = v2_arguments
+        saved_intent = None
+        if _local_path(root, RETIREMENT_INTENT_RELATIVE_PATH).exists():
+            saved_intent, saved_sha = _retirement_control(root, RETIREMENT_INTENT_RELATIVE_PATH, maximum)
+            saved_arguments = saved_intent.get("arguments") if type(saved_intent) is dict else None
+            if type(saved_arguments) is not dict:
+                _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+            if "retained_account_result" in saved_arguments:
+                arguments["retained_account_result"] = saved_arguments["retained_account_result"]
+            if segment_max_records is not None:
+                saved_intent, saved_sha = _retirement_v2_intent(root,
+                    existing["intent_sha256"] if existing is not None else None, arguments, maximum)
+            else:
+                if (set(saved_intent) != {"schema_version", "generation_context_sha256", "arguments", "files"}
+                        or saved_intent.get("schema_version") != RETIREMENT_SCHEMA
+                        or saved_intent.get("arguments") != arguments
+                        or type(saved_intent.get("files")) is not list
+                        or len(saved_intent["files"]) > max_paths):
+                    _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+                paths = [_retirement_record(item)["relative_path"] for item in saved_intent["files"]]
+                if len(paths) != len(set(paths)):
+                    _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+            if (saved_intent.get("generation_context_sha256") != context_sha
+                    or existing is not None and saved_sha != existing["intent_sha256"]):
+                _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+        elif existing is not None:
+            _fail("RETIREMENT_INTENT_CHANGED")
+        # A verified saved intent continues its original release contract.
+        retained_reference = {}
+        fence = _retirement_fence(source_fence_path, source_fence_sha256, context_sha256=context_sha,
+            generation_id=owner["generation_id"], cell_id=owner["cell_id"], workspace_sha256=owner_sha,
+            working_root=root, owner=owner,
+            require_retained_account=saved_intent is None or "retained_account_result" in arguments,
+            retained_account_result_out=retained_reference)
+        if ("retained_account_result" in arguments
+                and arguments["retained_account_result"] != retained_reference):
+            _fail("RETIREMENT_RESUME_BINDING_CHANGED")
+        if saved_intent is None and retained_reference and "retained_account_result" not in fence:
+            arguments["retained_account_result"] = dict(retained_reference)
+        terminal_refusal = fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA
+        post_source_abort = fence.get("schema_version") == POST_SOURCE_ABORT_FENCE_SCHEMA
+        native_completion = fence.get("schema_version") in (
+            NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA)
+        if terminal_refusal and (unit_lock_paths or direct != frozenset({
+                f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
+            _fail("RETIREMENT_REFUSAL_SOURCE_STATE_INVALID")
+        if post_source_abort and (unit_lock_paths or direct != frozenset({
+                f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
+            _fail("RETIREMENT_ABORT_SOURCE_STATE_INVALID")
         controls = ()
         if segment_max_records is not None:
             arguments = v2_arguments
@@ -2864,8 +3398,7 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                 "arguments": arguments, "files": records}
             intent_bytes = len(_canonical_json_bytes(intent, maximum))
             control_bytes = intent_bytes + 2 * MAX_CONTEXT_BYTES
-            if (nodes + 3 > max_nodes or root_bytes + control_bytes > min(max_bytes, context_body["limits"]["max_generation_bytes"])
-                    or shutil.disk_usage(root).free - control_bytes < context_body["limits"]["min_free_bytes"]):
+            if (nodes + 3 > max_nodes or root_bytes + control_bytes > max_bytes):
                 _fail("RETIREMENT_CONTROL_CAPACITY")
             intent_sha = _retirement_publish(root, RETIREMENT_INTENT_RELATIVE_PATH, intent, maximum, root_owner=owner)
             marker = {"schema_version": RETIREMENT_SCHEMA, "status": "RETIRING", "generation_context_sha256": context_sha,
@@ -2924,8 +3457,15 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             "retained_unit_locks": list(unit_lock_paths),
             "qualification_authority": False, "capital_authority": False,
             "live_authority": False, "order_authority": False}
+        if retained_reference:
+            receipt["retained_account_result"] = dict(retained_reference)
+        if "period_facts" in fence:
+            receipt["period_facts"] = fence["period_facts"]
         if segment_max_records is not None:
             receipt["intent_segment_count"] = len(intent["segments"])
+        if fence["schema_version"] == NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA:
+            receipt.update({key: fence[key] for key in
+                ("development_scope", "development_scope_sha256", "accepted_slot_ids")})
         if terminal_refusal:
             receipt.update(result_kind=TERMINAL_REFUSAL_RESULT_KIND,
                 terminal_refusal=dict(fence["refusal"]))
@@ -2961,7 +3501,7 @@ __all__ = [
     "GenerationSpoolContext",
     "HISTORICAL_ANCHOR_MANIFEST_DOMAIN",
     "LEGACY_GENERATION_CONTEXT_SCHEMA",
-    "NATIVE_COMPLETION_FENCE_SCHEMA",
+    "NATIVE_COMPLETION_FENCE_SCHEMA", "NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA",
     "RETIREMENT_SCHEMA_V2",
     "RETIREMENT_SEGMENT_SCHEMA",
     "MAX_RETIREMENT_SEGMENT_RECORDS",
@@ -2969,6 +3509,7 @@ __all__ = [
     "SpoolLimits",
     "SymbolAuthoritySink",
     "freeze_generation_context",
+    "resource_capacity_reason",
     "is_resource_capacity_error",
     "open_symbol_sink",
     "publication_batch",

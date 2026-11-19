@@ -24,7 +24,11 @@ import re
 import stat
 import tempfile
 import threading
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import wraps
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Final, Iterator, Mapping, Sequence
@@ -33,12 +37,13 @@ import numpy as np
 import pandas as pd
 
 import pm_authority_spool as authority_spool
+import pm_native_activation as native_activation
 from pm_native_activation import (
     ACTIVATION_MANIFEST_SCHEMA,
     NATIVE_BARS_SCHEMA,
     NATIVE_EVIDENCE_CANDIDATE,
     ActiveNativeResolution,
-    resolve_active_native_artifact,
+    resolve_active_native_artifact as _resolve_active_native_artifact_cold,
 )
 from pm_native_request_contract import (
     ACQUISITION_CONTRACT_VERSION,
@@ -2312,6 +2317,67 @@ def _batch_checkpoint(
 ) -> None:
     if cancellation_event is not None and cancellation_event.is_set():
         _fail("PREFIX_BATCH_CANCELLED")
+
+
+_NATIVE_CELL_RESOLUTION_STATE = ContextVar("fxpm_owned_native_cell_resolutions", default=None)
+
+
+@contextmanager
+def _owned_native_resolution_scope():
+    current = _NATIVE_CELL_RESOLUTION_STATE.get()
+    if current is not None:
+        current["scope"]._assert_live_owner()
+        yield current
+        return
+    existing = native_activation._PRODUCTION_NATIVE_AUTHORITY_SCOPE.get()
+    with (nullcontext(existing) if existing is not None
+            else native_activation.production_native_authority_verification_scope()) as scope:
+        scope._assert_live_owner()
+        state = {"scope": scope, "resolutions": {}}
+        token = _NATIVE_CELL_RESOLUTION_STATE.set(state)
+        try:
+            yield state
+        finally:
+            state["resolutions"].clear()
+            _NATIVE_CELL_RESOLUTION_STATE.reset(token)
+
+
+def _owned_native_resolution_call(function):
+    @wraps(function)
+    def owned(*args, **kwargs):
+        with _owned_native_resolution_scope():
+            return function(*args, **kwargs)
+    return owned
+
+
+def _detached_native_resolution(value: ActiveNativeResolution) -> ActiveNativeResolution:
+    return ActiveNativeResolution(symbol=value.symbol, timeframe=value.timeframe,
+        data_path=value.data_path, sidecar_path=value.sidecar_path,
+        activation_id=value.activation_id, activation_manifest_path=value.activation_manifest_path,
+        activation_manifest_sha256=value.activation_manifest_sha256,
+        entry=deepcopy(value.entry), errors=list(value.errors))
+
+
+def resolve_active_native_artifact(data_dir: Path, symbol: str, timeframe: str, *,
+        production_contract_required: bool = False) -> ActiveNativeResolution:
+    state = _NATIVE_CELL_RESOLUTION_STATE.get()
+    key = None
+    if state is not None:
+        state["scope"]._assert_live_owner()
+        if type(production_contract_required) is bool:
+            try:
+                key = (os.path.normcase(os.path.abspath(os.fspath(data_dir))),
+                    str(symbol or "").strip(), str(timeframe or "").strip().upper(),
+                    production_contract_required)
+            except (TypeError, ValueError, OSError):
+                pass
+        if key is not None and key in state["resolutions"]:
+            return _detached_native_resolution(state["resolutions"][key])
+    result = _resolve_active_native_artifact_cold(data_dir, symbol, timeframe,
+        production_contract_required=production_contract_required)
+    if state is not None and key is not None and result.valid:
+        state["resolutions"][key] = _detached_native_resolution(result)
+    return result
 
 
 def stage_activated_native_prefixes(

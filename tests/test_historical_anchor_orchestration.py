@@ -1244,10 +1244,11 @@ def test_declared_public_factories_choose_fixed_edition_without_caller_resource_
     kwargs = dict(run_id="synthetic-declared-routing", process=object(), slot_roster={},
         cell_roster=[], frozen_pipeline_config=object(), spread_profile_identity={},
         source_access_window_utc={}, launch_activation_utc="2024-01-01T00:00:00Z")
-    assert getattr(orchestration, factory)(context, **kwargs) is sentinel
+    request = {"final_study_13": True} if factory.endswith("_v2") else {}
+    assert getattr(orchestration, factory)(context, **kwargs, **request) is sentinel
     assert received == [(context, {**kwargs, "transport_edition": edition})]
     with pytest.raises(TypeError):
-        getattr(orchestration, factory)(context, **kwargs, transport_edition=edition)
+        getattr(orchestration, factory)(context, **kwargs, **request, transport_edition=edition)
     assert len(received) == 1
 
 
@@ -1255,7 +1256,7 @@ def test_declared_precommit_validator_refuses_request_role_on_genuine_metadata(t
     from tests.test_declared_slot_owner_surface import _declared_environment
 
     env = _declared_environment(tmp_path, monkeypatch)
-    v2 = orchestration.precommit_declared_slot_owner_run_v2(env.context, **env.arguments)
+    v2 = orchestration.precommit_declared_slot_owner_run_v2(env.context, **env.arguments, final_study_13=True)
     for parent in (env.precommit, v2):
         body = orchestration.verify_declared_slot_owner_run_precommit(
             env.context, parent, process=env.process)
@@ -1315,7 +1316,7 @@ def test_declared_v2_precommit_public_cold_reopen_binds_saved_profile_and_source
     profile = spread_profile.load_spread_profile(profile_path)
     assert profile.sha256 == hashlib.sha256(profile_bytes).hexdigest()
     precommit = orchestration.precommit_declared_slot_owner_run_v2(env.context,
-        **{**env.arguments, "spread_profile_identity": {"profile_sha256": profile.sha256}})
+        **{**env.arguments, "spread_profile_identity": {"profile_sha256": profile.sha256}}, final_study_13=True)
     saved_path = env.context.root / f"declared-slots/{precommit.receipt_sha256}/precommit.json"
     saved = saved_path.read_bytes()
     restored = orchestration.reopen_declared_slot_owner_run_precommit(env.context,

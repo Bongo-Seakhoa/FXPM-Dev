@@ -117,7 +117,6 @@ from pm_current_refit_parameters import (
     build_parameter_domain,
     validate_parameter_domain_member,
     parameter_domain_point,
-    RETAINED_STRATEGY_SOURCE_V1_SHA256,
 )
 from pm_book_multiplicity import BOOK_MULTIPLICITY_CONTRACT_VERSION
 from pm_two_phase_lockbox import FROZEN_PRELOCKBOX_STATUS
@@ -792,7 +791,6 @@ def _current_refit_validate_trial(
     strategy_id: str,
     process_sha256: str,
     horizon_sha256: str,
-    process_source_sha256: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     trial = _current_refit_exact(
         value, _CURRENT_REFIT_TRIAL_FIELDS, "CURRENT_REFIT_TRIAL_FIELDS_INVALID"
@@ -824,12 +822,7 @@ def _current_refit_validate_trial(
     normalized = _current_refit_json_parameters(fitted.get_params())
     if canonical_parameter_bytes(normalized) != canonical_parameter_bytes(parameters):
         raise ValueError("CURRENT_REFIT_TRIAL_PARAMETERS_NONCANONICAL")
-    if process_source_sha256 == RETAINED_STRATEGY_SOURCE_V1_SHA256:
-        from pm_current_refit_artifacts import retained_strategy_metadata_v1
-        _, _, defaults, grid = retained_strategy_metadata_v1(strategy_id)
-        groups = ()
-    else:
-        defaults, grid, groups = base.get_default_params(), base.get_param_grid(), base.get_param_couplings()
+    defaults, grid, groups = base.get_default_params(), base.get_param_grid(), base.get_param_couplings()
     try:
         validate_parameter_domain_member(build_parameter_domain(defaults, grid, coupled_groups=groups), parameters)
     except CurrentRefitParameterCodecError as exc:
@@ -846,10 +839,6 @@ def _current_refit_validate_process(
         value, _CURRENT_REFIT_PROCESS_FIELDS, "CURRENT_REFIT_PROCESS_FIELDS_INVALID"
     )
     strategy = StrategyRegistry.get(strategy_id)
-    retained = process.get("strategy_code_sha256") == RETAINED_STRATEGY_SOURCE_V1_SHA256
-    if retained:
-        from pm_current_refit_artifacts import retained_strategy_metadata_v1
-        _, domain, _, _ = retained_strategy_metadata_v1(strategy_id)
     if (
         process["schema_version"] != CURRENT_REFIT_PROCESS_VERSION
         or process["strategy_id"] != strategy_id
@@ -859,11 +848,11 @@ def _current_refit_validate_process(
         or type(process["process_candidate_id"]) is not str
         or not 1 <= len(process["process_candidate_id"]) <= 512
         or process["strategy_code_sha256"]
-        != (RETAINED_STRATEGY_SOURCE_V1_SHA256 if retained else _current_refit_strategy_code_sha256(strategy_id))
+        != _current_refit_strategy_code_sha256(strategy_id)
         or process["entry_rule_identity_sha256"]
-        != (domain["entry_rule_identity_sha256"] if retained else _current_refit_callable_sha256(type(strategy).generate_signals))
+        != _current_refit_callable_sha256(type(strategy).generate_signals)
         or process["exit_rule_identity_sha256"]
-        != (domain["exit_rule_identity_sha256"] if retained else _current_refit_callable_sha256(type(strategy).calculate_stops))
+        != _current_refit_callable_sha256(type(strategy).calculate_stops)
         or process["regime_conditioning"]
         != "EXACT_SYMBOL_TIMEFRAME_REGIME_CELL"
     ):
@@ -912,17 +901,11 @@ def _current_refit_validate_recipe(
     horizon_sha256: str,
     trial_sha256: str,
     source_bar_count: int,
-    process_source_sha256: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str]:
     recipe = _current_refit_exact(
         value, _CURRENT_REFIT_RECIPE_FIELDS, "CURRENT_REFIT_RECIPE_FIELDS_INVALID"
     )
     strategy = StrategyRegistry.get(strategy_id)
-    retained_pins = None
-    if process_source_sha256 == RETAINED_STRATEGY_SOURCE_V1_SHA256:
-        from pm_current_refit_artifacts import retained_strategy_metadata_v1
-        table, _, _, _ = retained_strategy_metadata_v1(strategy_id)
-        retained_pins = table["recipe_version_pins"]
     seed = recipe.get("seed")
     if type(seed) is not int or not 0 <= seed <= 0x7FFFFFFF:
         raise ValueError("CURRENT_REFIT_RECIPE_SEED_INVALID")
@@ -938,7 +921,7 @@ def _current_refit_validate_recipe(
         "fit_window_rule": "HORIZON_NATIVE_PREFIX_THROUGH_CURRENT_CUTOFF",
         "deterministic_fit_procedure_id": "FXPM_STATELESS_RULE_MATERIALIZE_V1",
         "seed": seed,
-        "version_pins": retained_pins if retained_pins is not None else {
+        "version_pins": {
             "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
             "numpy": np.__version__,
             "pandas": pd.__version__,
@@ -1213,7 +1196,6 @@ def replay_current_refit_execution_from_raw_manifest(
             strategy_id=request["strategy_id"],
             process_sha256=process_sha256,
             horizon_sha256=horizon_sha256,
-            process_source_sha256=process["strategy_code_sha256"],
         )
         expected_process_candidate_id = _current_refit_process_candidate_id(
             symbol=request["symbol"],
@@ -1237,7 +1219,6 @@ def replay_current_refit_execution_from_raw_manifest(
             horizon_sha256=horizon_sha256,
             trial_sha256=trial_sha256,
             source_bar_count=source["bar_count"],
-            process_source_sha256=process["strategy_code_sha256"],
         )
         book_entry, book_entry_sha256 = _current_refit_validate_book_entry(
             _current_refit_read_json(

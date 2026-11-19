@@ -8678,7 +8678,8 @@ class Backtester:
             spread_tier: Optional[FrozenSpreadTier] = None,
             entry_spread_observations: Optional[pd.Series] = None,
             entry_schedule: Optional[ContinuousEntrySchedule] = None,
-            terminal_policy: str = "LIQUIDATE") -> Dict[str, Any]:
+            terminal_policy: str = "LIQUIDATE",
+            _exact_trade_facts_out: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Run backtest on a dataset with signals.
         
@@ -8700,6 +8701,12 @@ class Backtester:
         Returns:
             Dict with complete backtest results and metrics
         """
+        if _exact_trade_facts_out is not None:
+            if (type(_exact_trade_facts_out) is not dict or _exact_trade_facts_out
+                    or governance_policy is not None or entry_schedule is not None or terminal_policy != "LIQUIDATE"):
+                raise ValueError("EXACT_TRADE_CAPTURE_FIXED_CONTROL_ARGUMENT_INVALID")
+            _exact_trade_facts_out.update(schema_version="fxpm.backtest-exact-executed-trades.v1",
+                backend="NO_EXECUTION", trades=[])
         self._validate_research_cost_level(research_cost_level_id)
         if spec is None:
             spec = get_instrument_spec(symbol)
@@ -8799,6 +8806,9 @@ class Backtester:
                     spec=spec,
                 )
             )
+            if _exact_trade_facts_out is not None:
+                _exact_trade_facts_out["swap_accrual_contract"] = swap_accrual_contract
+                _exact_trade_facts_out["swap_model_enabled"] = bool(getattr(self.config, "swap_model_enabled", True))
             return metrics
         
         # ----------------------------------------------------------------
@@ -9088,6 +9098,15 @@ class Backtester:
             for j in range(len(trade_signal_bars)):
                 r_multiple = trade_pnl_dollars[j] / trade_risk_amounts[j] if trade_risk_amounts[j] > 0 else 0.0
                 
+                if _exact_trade_facts_out is not None:
+                    _append_exact_backtest_trade(_exact_trade_facts_out, backend="NUMBA",
+                        signal_bar=int(trade_signal_bars[j]), entry_bar=int(trade_entry_bars[j]), exit_bar=int(trade_exit_bars[j]),
+                        direction=int(trade_directions[j]), entry_price=float(trade_entry_prices[j]),
+                        exit_price=float(trade_exit_prices[j]), initial_stop=float(trade_sl_prices[j]),
+                        volume=float(trade_sizes[j]), exit_reason=exit_reason_map.get(trade_exit_reasons[j], "unknown"),
+                        swap_cash=float(trade_swap_dollars[j]), swap_units=int(trade_swap_rollover_units[j]),
+                        causal_swap_enabled=causal_swap_enabled, pre_open_units=pre_open_rollover_units_arr,
+                        close_units=rollover_units_arr, long_rates=swap_long_per_lot_arr, short_rates=swap_short_per_lot_arr)
                 trades.append({
                     'signal_bar': int(trade_signal_bars[j]),
                     'entry_bar': int(trade_entry_bars[j]),
@@ -9138,6 +9157,7 @@ class Backtester:
                 swap_short_per_lot_arr=swap_short_per_lot_arr,
                 causal_swap_enabled=causal_swap_enabled,
                 pre_open_rollover_units_arr=pre_open_rollover_units_arr,
+                **({"_exact_trade_facts_out": _exact_trade_facts_out} if _exact_trade_facts_out is not None else {}),
                 **kernel_extra,
             )
         
@@ -9153,7 +9173,11 @@ class Backtester:
                 features,
                 spec,
                 timeframe=timeframe,
+                **({"_exact_trade_facts_out": _exact_trade_facts_out} if _exact_trade_facts_out is not None else {}),
             )
+        if _exact_trade_facts_out is not None:
+            _exact_trade_facts_out["swap_accrual_contract"] = swap_accrual_contract
+            _exact_trade_facts_out["swap_model_enabled"] = bool(getattr(self.config, "swap_model_enabled", True))
 
         metrics = self._calculate_metrics(
             trades,
@@ -9671,7 +9695,8 @@ class Backtester:
                           features: Optional[pd.DataFrame],
                           spec: InstrumentSpec,
                           *,
-                          timeframe: str = "") -> Tuple[List[Dict[str, Any]], float, float, List[float]]:
+                          timeframe: str = "",
+                          _exact_trade_facts_out=None) -> Tuple[List[Dict[str, Any]], float, float, List[float]]:
         """Apply signed overnight swap to closed trades and the equity curve."""
         if not bool(getattr(self.config, "swap_model_enabled", True)):
             return trades, final_equity, max_drawdown, equity_curve
@@ -9681,7 +9706,7 @@ class Backtester:
         curve_length = len(equity_curve or [])
         adjustments_by_effective_bar: Dict[int, float] = {}
         total_swap = 0.0
-        for trade in trades:
+        for trade_ordinal, trade in enumerate(trades):
             schedule = self._calendar_swap_rollover_schedule(trade, spec=spec)
             units = (
                 sum(int(weight) for _timestamp, weight in schedule)
@@ -9693,6 +9718,9 @@ class Backtester:
             if units <= 0:
                 trade["swap_rollover_units"] = 0
                 trade["swap_dollars"] = 0.0
+                if _exact_trade_facts_out is not None:
+                    _exact_trade_facts_out["trades"][trade_ordinal].update(
+                        swap_source_kind="LEGACY_MODEL", swap_dollars_exact=0.0, swap_rollover_units=0, swap_cash_steps=[])
                 continue
             volume = float(trade.get("position_size", trade.get("size", 0.0)) or 0.0)
             raw_daily_swap = float(spec.swap_long if self._trade_is_long(trade) else spec.swap_short)
@@ -9707,6 +9735,11 @@ class Backtester:
             gross_pnl = float(trade.get("pnl_dollars", 0.0) or 0.0)
             trade.setdefault("gross_pnl_dollars", round(gross_pnl, 2))
             trade["swap_rollover_units"] = int(units)
+            if _exact_trade_facts_out is not None:
+                _exact_trade_facts_out["trades"][trade_ordinal].update(swap_source_kind="LEGACY_MODEL",
+                    swap_dollars_exact=float(swap_dollars), swap_rollover_units=int(units), swap_cash_steps=[{
+                        "bar": int(trade["exit_bar"]), "phase": "LEGACY_AT_EXIT", "rollover_units": int(units),
+                        "rate_per_lot_dollars": float(daily_swap), "cash": float(swap_dollars)}])
             trade["swap_dollars"] = round(float(swap_dollars), 2)
             trade["pnl_dollars"] = round(gross_pnl + swap_dollars, 2)
             risk_amount = float(trade.get("risk_amount", 0.0) or 0.0)
@@ -9784,12 +9817,15 @@ class Backtester:
                          causal_swap_enabled: bool = False,
                          pre_open_rollover_units_arr: Optional[np.ndarray] = None,
                          entry_owner_codes=None, owner_half_spreads=None, mark_open=False,
-                         terminal_float_out=None, terminal_int_out=None) -> Tuple[List[Dict], float, float, List[float]]:
+                         terminal_float_out=None, terminal_int_out=None,
+                         _exact_trade_facts_out=None) -> Tuple[List[Dict], float, float, List[float]]:
         """
         Pure Python backtest loop (fallback when Numba not available).
         
         Uses LIVE EQUITY for position sizing (compounding preserved).
         """
+        if _exact_trade_facts_out is not None and (governance_policy is not None or mark_open):
+            raise ValueError("EXACT_TRADE_CAPTURE_FIXED_CONTROL_ARGUMENT_INVALID")
         _validate_continuous_buffers(mark_open, terminal_float_out, terminal_int_out)
         if mark_open:
             _validate_continuous_arrays(len(open_arr), entry_owner_codes, owner_half_spreads, entry_prices)
@@ -10213,6 +10249,14 @@ class Backtester:
                     equity += gross_pnl_dollars
                     
                     # Record trade
+                    if _exact_trade_facts_out is not None:
+                        _append_exact_backtest_trade(_exact_trade_facts_out, backend="PYTHON",
+                            signal_bar=signal_bar, entry_bar=entry_bar, exit_bar=i,
+                            direction=position_direction, entry_price=entry_price, exit_price=exit_price,
+                            initial_stop=stop_loss, volume=position_size, exit_reason=exit_reason,
+                            swap_cash=accrued_swap_dollars_current, swap_units=accrued_swap_units_current,
+                            causal_swap_enabled=causal_swap_enabled, pre_open_units=pre_open_rollover_units_arr,
+                            close_units=rollover_units_arr, long_rates=swap_long_per_lot_arr, short_rates=swap_short_per_lot_arr)
                     trades.append({
                         'signal_bar': signal_bar,
                         'entry_bar': entry_bar,
@@ -10387,6 +10431,14 @@ class Backtester:
                                 net_pnl_dollars = gross_pnl_dollars + accrued_swap_dollars_current
                                 r_multiple = net_pnl_dollars / risk_amount_at_entry if risk_amount_at_entry > 0 else 0.0
                                 equity += gross_pnl_dollars
+                                if _exact_trade_facts_out is not None:
+                                    _append_exact_backtest_trade(_exact_trade_facts_out, backend="PYTHON",
+                                        signal_bar=signal_bar, entry_bar=entry_bar, exit_bar=i,
+                                        direction=position_direction, entry_price=entry_price, exit_price=exit_price,
+                                        initial_stop=stop_loss, volume=position_size, exit_reason=exit_reason,
+                                        swap_cash=accrued_swap_dollars_current, swap_units=accrued_swap_units_current,
+                                        causal_swap_enabled=causal_swap_enabled, pre_open_units=pre_open_rollover_units_arr,
+                                        close_units=rollover_units_arr, long_rates=swap_long_per_lot_arr, short_rates=swap_short_per_lot_arr)
                                 trades.append({
                                     'signal_bar': signal_bar,
                                     'entry_bar': entry_bar,
@@ -10467,6 +10519,14 @@ class Backtester:
             
             equity += gross_pnl_dollars
             
+            if _exact_trade_facts_out is not None:
+                _append_exact_backtest_trade(_exact_trade_facts_out, backend="PYTHON",
+                    signal_bar=signal_bar, entry_bar=entry_bar, exit_bar=n_bars - 1,
+                    direction=position_direction, entry_price=entry_price, exit_price=exit_price,
+                    initial_stop=stop_loss, volume=position_size, exit_reason=TradeStatus.CLOSED_EOD.value,
+                    swap_cash=accrued_swap_dollars_current, swap_units=accrued_swap_units_current,
+                    causal_swap_enabled=causal_swap_enabled, pre_open_units=pre_open_rollover_units_arr,
+                    close_units=rollover_units_arr, long_rates=swap_long_per_lot_arr, short_rates=swap_short_per_lot_arr)
             trades.append({
                 'signal_bar': signal_bar,
                 'entry_bar': entry_bar,
@@ -11198,3 +11258,32 @@ if __name__ == "__main__":
     print(f"\nWorkflow indices for 1000 rows: {indices}")
     
     print("\npm_core.py loaded successfully!")
+
+
+def _append_exact_backtest_trade(output, *, backend, signal_bar, entry_bar, exit_bar, direction,
+        entry_price, exit_price, initial_stop, volume, exit_reason, swap_cash, swap_units,
+        causal_swap_enabled, pre_open_units, close_units, long_rates, short_rates):
+    """Capture numeric execution facts before reporting rounds cash; this grants no authority."""
+    rate = float((long_rates if direction == 1 else short_rates)[entry_bar])
+    steps = []
+    if causal_swap_enabled:
+        for bar in range(entry_bar, exit_bar + 1):
+            items = []
+            if bar > entry_bar:
+                items.append(("PRE_OPEN", int(pre_open_units[bar])))
+            if bar < exit_bar or exit_reason == TradeStatus.CLOSED_EOD.value:
+                items.append(("CLOSE", int(close_units[bar])))
+            for phase, units in items:
+                if units > 0:
+                    steps.append({"bar": bar, "phase": phase, "rollover_units": units,
+                        "rate_per_lot_dollars": rate, "cash": rate * volume * units})
+    output["backend"] = backend
+    output["trades"].append({"schema_version": "fxpm.backtest-exact-executed-trade.v1",
+        "ordinal": len(output["trades"]), "backend": backend,
+        "signal_bar": int(signal_bar), "entry_bar": int(entry_bar), "exit_bar": int(exit_bar),
+        "direction": "LONG" if direction == 1 else "SHORT", "entry_price": float(entry_price),
+        "exit_price": float(exit_price), "initial_stop_price": float(initial_stop),
+        "executed_volume": float(volume), "exit_reason": exit_reason,
+        "swap_dollars_exact": float(swap_cash), "swap_rollover_units": int(swap_units),
+        "swap_source_kind": "CAUSAL_KERNEL" if causal_swap_enabled else "DISABLED_OR_PENDING_LEGACY",
+        "swap_cash_steps": steps})

@@ -19,7 +19,6 @@ import pm_historical_anchor_orchestration as historical
 import pm_pipeline as pipeline
 import pm_production_search_planner as planner
 from pm_current_refit_parameters import (
-    load_retained_strategy_domain_v1,
     parameter_values_equal,
     validate_parameter_domain_member,
 )
@@ -184,7 +183,6 @@ def test_process_freeze_reopens_exact_100_strategy_domain(tmp_path) -> None:
     assert planner.verify_frozen_production_search_process(context, frozen) is True
     body = frozen.to_dict()
     assert body["candidate_domain_sha256"] == planner.state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
-    assert body["candidate_domain_sha256"] != planner.state_contract.ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256
     assert body["semantics"]["strategy_domain_count"] == 100
     assert (
         body["semantics"]["attempt_policy"]["attempt_count_per_observed_cell"]
@@ -198,35 +196,10 @@ def test_process_freeze_reopens_exact_100_strategy_domain(tmp_path) -> None:
         context, spool_receipt=frozen.spool_receipt, expected_receipt_sha256=frozen.receipt_sha256,
     )
     assert reopened._body_json == frozen._body_json
-
-
-def test_retained_original_process_reopens_without_live_registry_or_reissue(tmp_path, monkeypatch) -> None:
-    """A synthetic generation carries the real retained v1 process template."""
-    context = authority_spool.freeze_generation_context(
-        (tmp_path / "original-transport").resolve(), generation_id="synthetic-retained-v1-process",
-        native_universe_sha256="a" * 64, config_sha256="b" * 64,
-    )
-    body = planner._expected_process_body(
-        context, run_id="synthetic-v1-transport", schema_version=planner.ORIGINAL_PROCESS_SCHEMA,
-    )
-    sink = authority_spool.open_symbol_sink(context, planner.PROCESS_SPOOL_SYMBOL)
-    entry = sink.put_json(planner.PROCESS_ARTIFACT_ID, planner.PROCESS_ARTIFACT_TYPE, body)
-    receipt = sink.seal()
-    def reject_live(*args, **kwargs):
-        raise AssertionError("retained process verification read the live registry")
-    monkeypatch.setattr(planner.StrategyRegistry, "get", reject_live)
-    restored = planner.reopen_production_search_process(
-        context, spool_receipt=receipt, expected_receipt_sha256=entry["descriptor"]["sha256"],
-    )
-    assert restored.to_dict() == body
-    assert restored.to_dict()["semantics"] == load_retained_strategy_domain_v1()["process_template"]["semantics"]
-    with pytest.raises(planner.ProductionSearchPlannerError, match="RETAINED_PROCESS_IS_READ_ONLY"):
-        planner._require_current_process(restored)
     with pytest.raises(planner.ProductionSearchPlannerError, match="PROCESS_SPOOL_DESCRIPTOR_MISMATCH"):
-        planner.reopen_production_search_process(context, spool_receipt=receipt, expected_receipt_sha256="0" * 64)
-    monkeypatch.setattr(planner, "_source_sha256", lambda _value: "0" * 64)
-    with pytest.raises(planner.ProductionSearchPlannerError, match="RETAINED_STRATEGY_SUCCESSOR_CHANGED"):
-        planner.verify_frozen_production_search_process(context, restored)
+        planner.reopen_production_search_process(
+            context, spool_receipt=frozen.spool_receipt, expected_receipt_sha256="0" * 64,
+        )
 
 
 def test_unknown_candidate_authority_is_never_inferred() -> None:

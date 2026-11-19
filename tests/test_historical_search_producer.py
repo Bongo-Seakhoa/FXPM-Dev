@@ -1329,3 +1329,499 @@ def test_declared_verified_parent_selects_transport_capture_and_executor(tmp_pat
     assert source_calls == ["observe", "produce", "reverify"]
     assert completion["classification"] == "STRUCTURAL_STUB_NOT_OWNER_EVIDENCE"
     assert completion["status"] == "NO_TRADE" and request._body_json == request_before
+
+
+@pytest.fixture
+def parallel_capacity_store(tmp_path, monkeypatch):
+    """INVENTED metadata-only parallel custody; no source, fit or market model."""
+    context = spool.freeze_generation_context(tmp_path / "parallel-spool",
+        generation_id="INVENTED-capacity-reentry-software", native_universe_sha256="a" * 64,
+        config_sha256="b" * 64)
+    slots = tuple({"slot_id": f"INVENTED-slot-{ordinal:02d}", "ordinal": ordinal}
+        for ordinal in range(1, 14))
+    parent = {"source_access_window_utc": {"start_utc": "2025-01-01T00:00:00Z",
+        "end_exclusive_utc": "2027-01-01T00:00:00Z"},
+        "cells": [{"symbol": "EURUSD", "cell_id": "f" * 64}]}
+    precommit = SimpleNamespace(receipt_sha256="c" * 64, to_dict=lambda: parent)
+    process = SimpleNamespace(receipt_sha256="d" * 64, spool_receipt={"INVENTED": True})
+    frozen = SimpleNamespace(active_config_path=tmp_path / "config.json", effective_config_sha256="e" * 64)
+    frozen.active_config_path.write_text("{}", encoding="ascii")
+    cell_id = "f" * 64
+    root = producer._parallel_slot_root(precommit.receipt_sha256, cell_id)
+    monkeypatch.setattr(producer, "_now_utc_seconds", lambda: "2026-01-01T00:00:00Z")
+    monkeypatch.setattr(historical, "verify_declared_slot_owner_run_precommit", lambda *args, **kwargs: parent)
+    monkeypatch.setattr(historical, "declared_slot_selected_slots", lambda body: slots)
+    monkeypatch.setattr(historical, "declared_slot_source_kind", lambda body: "broker_native")
+
+    def spec(ordinal, *, prior=None, attempt=None):
+        return producer._parallel_slot_spec(context, precommit, process, frozen, cell_id,
+            slots[ordinal - 1], attempt or f"INVENTED-attempt-{ordinal:02d}", prior_capacity=prior)
+
+    def completion(binding):
+        return {"status": "NO_TRADE", "request_body": {key: binding[key]
+            for key in ("precommit_sha256", "cell_id", "slot_id", "attempt_id")}}
+
+    def persist_preunit(binding):
+        body = {"schema_version": "INVENTED_REQUEST_METADATA_ONLY_NO_ISSUANCE_AUTHORITY",
+            **{key: binding[key] for key in ("precommit_sha256", "cell_id", "slot_id", "attempt_id")}}
+        request_path = (f"declared-slots/{precommit.receipt_sha256}/requests/"
+            f"{cell_id}/{binding['slot_id']}/{binding['attempt_id']}.json")
+        start_path = (f"declared-slots/{precommit.receipt_sha256}/{cell_id}/attempts/"
+            f"{binding['slot_id']}/{binding['attempt_id']}.json")
+        spool._publish_exact_json(context, request_path, body, context.limits.max_json_bytes)
+        spool._publish_exact_json(context, start_path,
+            {"schema_version": "fxpm.declared-slot-attempt-start.v1", "slot_id": binding["slot_id"],
+                "request_sha256": _sha(body)}, context.limits.max_json_bytes)
+        return body, (request_path, start_path)
+
+    def publish(binding, *, failure=None, completed=False, legacy=False):
+        selected = producer._parallel_slot_spec_root(binding)
+        claim_path = producer._parallel_slot_path(selected, "claims", binding["ordinal"])
+        schema = (producer._PARALLEL_RECOVERY_CLAIM_SCHEMA
+            if producer._PARALLEL_RECOVERY_KEY in binding else producer._PARALLEL_CLAIM_SCHEMA)
+        claim = {"schema_version": schema, "binding": binding}
+        claim_record = spool._publish_exact_json(context, claim_path, claim, context.limits.max_json_bytes)
+        result = {"schema_version": (producer._PARALLEL_RESULT_SCHEMA if completed or legacy
+                else producer._PARALLEL_FAILURE_RESULT_SCHEMA),
+            "claim_sha256": claim_record["sha256"], "completion": completion(binding) if completed else None,
+            "artifact_roster": [], "post_completion_failure": None, "failure": failure}
+        relative = producer._parallel_slot_path(selected, "results", binding["ordinal"])
+        saved = spool._publish_exact_json(context, relative, result, context.limits.max_json_bytes)
+        return result, saved["sha256"], (claim_path, relative)
+
+    def commit(_context, *, slot, completion, artifact_roster, previous_commit_sha256, **kwargs):
+        body = {"schema_version": producer.DECLARED_SLOT_COMMIT_SCHEMA,
+            "generation_context_sha256": context.context_sha256, "precommit_sha256": precommit.receipt_sha256,
+            "cell_id": cell_id, "slot_id": slot["slot_id"], "ordinal": slot["ordinal"],
+            "previous_commit_sha256": previous_commit_sha256, "completion": completion,
+            "artifact_roster": artifact_roster}
+        descriptor = spool.write_canonical_json_artifact(context, body)
+        pointer = {"schema_version": producer._DECLARED_SLOT_POINTER_SCHEMA, "commit_descriptor": descriptor}
+        spool._publish_exact_json(context, producer._declared_commit_path(precommit, cell_id, slot["ordinal"]),
+            pointer, context.limits.max_json_bytes)
+        summary = {"slot_id": slot["slot_id"], "ordinal": slot["ordinal"],
+            "status": completion["status"], "commit_sha256": descriptor["sha256"]}
+        return summary, descriptor
+
+    monkeypatch.setattr(producer, "_commit_declared_slot_completion", commit)
+    return SimpleNamespace(context=context, precommit=precommit, process=process, frozen=frozen,
+        slots=slots, parent=parent, cell_id=cell_id, root=root, spec=spec,
+        completion=completion, publish=publish, persist_preunit=persist_preunit)
+
+
+@pytest.mark.parametrize("kind", ["disk", "memory", "wrapped-disk", "wrapped-memory"])
+def test_parallel_failure_preserves_actual_capacity_kind(kind):
+    import errno
+
+    original = MemoryError("INVENTED") if "memory" in kind else OSError(errno.ENOSPC, "INVENTED")
+    error = original
+    if kind.startswith("wrapped-"):
+        error = RuntimeError("INVENTED wrapper")
+        error.__cause__ = original
+    failure = producer._parallel_slot_failure(error)
+    expected = "MEMORY_ERROR" if "memory" in kind else "DISK_LOW"
+    assert failure["resource_capacity_reason"] == failure["failure_code"] == expected
+    assert producer._parallel_slot_capacity({"failure": failure}) == (True, expected)
+
+
+@pytest.mark.parametrize("error", [ValueError("MEMORY_ERROR"),
+    RuntimeError("DISK_LOW"), producer.HistoricalSearchProducerError("MEMORY_ERROR")])
+def test_parallel_capacity_is_not_inferred_from_error_text(error):
+    failure = producer._parallel_slot_failure(error)
+    assert failure["resource_capacity_reason"] is None
+    assert producer._parallel_slot_capacity({"failure": failure}) == (False, None)
+
+
+@pytest.mark.parametrize("exception_type,reason,proven", [
+    ("pm_authority_spool.AuthoritySpoolError", None, False),
+    ("builtins.MemoryError", "MEMORY_ERROR", True),
+    ("pm_authority_spool_quota.AuthoritySpoolQuotaError", "DISK_LOW", True),
+    ("builtins.RuntimeError", None, False), ("builtins.OSError", None, False),
+    ("INVENTED.CustomTechnicalCodeError", None, False)])
+def test_parallel_legacy_collapsed_capacity_requires_independent_type_evidence(exception_type, reason, proven):
+    failure = {"exception_type": exception_type, "failure_code": producer._PARALLEL_CAPACITY_FAILURE,
+        "failure_observed_at_utc": "2026-01-01T00:00:00Z"}
+    assert producer._parallel_slot_capacity({"failure": failure}) == (proven, reason)
+
+
+@pytest.mark.parametrize("defect", ["reason-type", "reason-value", "code-disagrees"])
+def test_parallel_capacity_reason_is_validated_in_saved_transport(parallel_capacity_store, defect):
+    env = parallel_capacity_store
+    failure = producer._parallel_slot_failure(MemoryError("INVENTED"))
+    failure["resource_capacity_reason"] = {"reason-type": [], "reason-value": "CAPACITY", "code-disagrees": "DISK_LOW"}[defect]
+    _, digest, paths = env.publish(env.spec(1), failure=failure)
+    claim = producer._read_declared_record(env.context, paths[0])
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_PARALLEL_SLOT_RESULT_INVALID"):
+        producer._parallel_slot_read_result(env.context, paths[1], claim[1], env.spec(1), expected_sha=digest)
+
+
+def test_parallel_capacity_reentry_is_one_later_entry_and_preserves_all_history(parallel_capacity_store, monkeypatch):
+    env = parallel_capacity_store
+    completed, artifacts, admitted = [], [], []
+
+    def failed_dispatch(tasks, gate, task_ready):
+        for task in tasks:
+            if gate():
+                assert task_ready(task)
+                spec, = task.args
+                admitted.append(spec)
+                _, digest, _ = env.publish(spec, failure=producer._parallel_slot_failure(MemoryError("INVENTED")))
+                yield SimpleNamespace(task_key=task.key, status="COMPLETED", value=digest)
+            else:
+                yield SimpleNamespace(task_key=task.key, status="NOT_RUN")
+
+    def execute(dispatch):
+        return producer._execute_parallel_declared_slots(env.context, precommit=env.precommit,
+            process=env.process, frozen_pipeline_config=env.frozen, cell_id=env.cell_id,
+            slots=env.slots, completed=completed, commit_artifacts=artifacts,
+            previous=completed[-1]["commit_sha256"] if completed else None,
+            terminal_failure=None, terminal_stop=False, slot_dispatch=dispatch, slot_worker_limit=1)
+
+    with pytest.raises(producer.DeclaredParallelSlotCapacityError) as caught:
+        execute(failed_dispatch)
+    assert caught.value.capacity_reason == "MEMORY_ERROR"
+    assert len(admitted) == 1 and completed == [] and artifacts == []
+    old_paths = tuple(env.context.root / producer._parallel_slot_path(env.root, kind, 1)
+        for kind in ("claims", "results"))
+    old_bytes = {path: path.read_bytes() for path in old_paths}
+    prior = producer._read_declared_record(env.context, producer._parallel_slot_path(env.root, "results", 1))[1]
+
+    def success_dispatch(tasks, gate, task_ready):
+        for task in tasks:
+            assert gate() and task_ready(task)
+            spec, = task.args
+            admitted.append(spec)
+            if spec["ordinal"] == 1:
+                assert spec[producer._PARALLEL_RECOVERY_KEY] == prior
+            else:
+                assert producer._PARALLEL_RECOVERY_KEY not in spec
+            _, digest, _ = env.publish(spec, completed=True)
+            yield SimpleNamespace(task_key=task.key, status="COMPLETED", value=digest)
+
+    from contextlib import contextmanager
+    lock_paths = []
+    locked_claim = producer._locked_parallel_slot_claim
+
+    @contextmanager
+    def observed_claim(context, relative):
+        lock_paths.append(relative)
+        with locked_claim(context, relative) as value:
+            yield value
+
+    monkeypatch.setattr(producer, "_locked_parallel_slot_claim", observed_claim)
+    last, failure = execute(success_dispatch)
+    assert lock_paths[-13:] == [producer._parallel_slot_path(
+        producer._parallel_slot_spec_root(spec), "claims", spec["ordinal"]) for spec in admitted[1:]]
+    assert failure is None and last == completed[-1]["commit_sha256"] and len(completed) == 13
+    assert len(admitted) == 14
+    assert {path: path.read_bytes() for path in old_paths} == old_bytes
+    snapshot = {path: path.read_bytes() for path in env.context.root.rglob("*") if path.is_file()}
+    execute(lambda *args: pytest.fail("A complete prefix was dispatched again"))
+    assert {path: path.read_bytes() for path in snapshot} == snapshot
+
+    run = {"terminal_stop": False, "cell_id": env.cell_id, "precommit_sha256": env.precommit.receipt_sha256,
+        "generation_context_sha256": env.context.context_sha256, "completed_slots": 13, "declared_slots": 13,
+        "last_commit_sha256": last, "slot_commits": [{"slot_id": item["slot_id"], "status": item["status"]} for item in completed]}
+    spool._publish_exact_json(env.context, producer._declared_run_path(env.precommit, env.cell_id),
+        run, env.context.limits.max_json_bytes)
+    retained = producer.verify_declared_parallel_slot_files(env.context, precommit=env.precommit,
+        process=env.process, cell_id=env.cell_id, frozen_pipeline_config=env.frozen)
+    assert len(retained) == 28 and len(set(retained)) == 28
+    assert all(str(path.relative_to(env.context.root)).replace("\\", "/") in retained for path in old_paths)
+
+
+@pytest.mark.parametrize("prior_kind", ["success", "technical"])
+def test_parallel_reentry_cannot_follow_a_noncapacity_result(parallel_capacity_store, prior_kind):
+    env = parallel_capacity_store
+    _, prior, _ = env.publish(env.spec(1), completed=prior_kind == "success",
+        failure=producer._parallel_slot_failure(ValueError("INVENTED")) if prior_kind == "technical" else None)
+    env.publish(env.spec(1, prior=prior, attempt="INVENTED-next-attempt"), completed=True)
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_PARALLEL_SLOT_CUSTODY_INVALID"):
+        with producer._bound_parallel_slot_result(env.context, env.precommit, env.process, env.frozen,
+                env.cell_id, env.slots[0], env.root):
+            pytest.fail("A noncapacity predecessor authorized another attempt")
+
+
+def test_parallel_reentry_refuses_an_active_original_claim(parallel_capacity_store):
+    env = parallel_capacity_store
+    env.publish(env.spec(1), failure=producer._parallel_slot_failure(MemoryError("INVENTED")))
+    path = producer._parallel_slot_path(env.root, "claims", 1)
+    with producer._locked_parallel_slot_claim(env.context, path):
+        with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE"):
+            producer._parallel_slot_existing(env.context, env.precommit, env.process, env.frozen,
+                env.cell_id, env.slots, [])
+
+
+def test_parallel_capacity_reentry_cannot_extend_the_original_window(parallel_capacity_store):
+    env = parallel_capacity_store
+    env.publish(env.spec(1), failure=producer._parallel_slot_failure(MemoryError("INVENTED")))
+    env.parent["source_access_window_utc"]["end_exclusive_utc"] = "2025-12-31T23:59:59Z"
+    before = {path: path.read_bytes() for path in env.context.root.rglob("*") if path.is_file()}
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_PARALLEL_SLOT_SOURCE_WINDOW_EXPIRED"):
+        producer._execute_parallel_declared_slots(env.context, precommit=env.precommit,
+            process=env.process, frozen_pipeline_config=env.frozen, cell_id=env.cell_id,
+            slots=env.slots, completed=[], commit_artifacts=[], previous=None, terminal_failure=None,
+            terminal_stop=False, slot_dispatch=lambda *args: pytest.fail("Expired recovery dispatched"), slot_worker_limit=1)
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (env.context.root / (env.root + "/reentries")).exists()
+
+
+def test_parallel_capacity_worker_reuses_the_original_pending_attempt(parallel_capacity_store, monkeypatch):
+    """Actual parent/worker selection over stored metadata; issuance/completion are finite doubles."""
+    from contextlib import contextmanager
+
+    env = parallel_capacity_store
+    original = env.spec(1, attempt="INVENTED-pending-preunit-attempt")
+    request, original_paths = env.persist_preunit(original)
+    _, prior, failure_paths = env.publish(original, failure=producer._parallel_slot_failure(MemoryError("INVENTED")))
+    namespace = spool._local_path(env.context.root, search_execution._declared_unit_relative(request, "header.json")).parent
+    assert not namespace.exists()
+    monkeypatch.setattr(producer.search_planner, "reopen_production_search_process", lambda *args, **kwargs: env.process)
+    monkeypatch.setattr(producer.config_binding, "load_effective_pipeline_config", lambda *args: ({}, object()))
+    monkeypatch.setattr(producer.config_binding, "freeze_production_pipeline_config", lambda *args, **kwargs: env.frozen)
+    monkeypatch.setattr(historical, "reopen_declared_slot_owner_run_precommit", lambda *args, **kwargs: env.precommit)
+    observed = []
+
+    @contextmanager
+    def attempt(*args, **kwargs):
+        observed.append(kwargs)
+        body = {"precommit_sha256": env.precommit.receipt_sha256, "cell_id": env.cell_id,
+            "slot_id": kwargs["slot"]["slot_id"], "attempt_id": kwargs["attempt_id"]}
+        yield env.completion(body), [], None
+
+    monkeypatch.setattr(producer, "_declared_slot_attempt", attempt)
+    protected = tuple(env.context.root / path for path in (*original_paths, *failure_paths))
+    before = {path: path.read_bytes() for path in protected}
+    admitted = []
+
+    def dispatch(tasks, gate, task_ready):
+        for task in tasks:
+            assert gate() and task_ready(task)
+            spec, = task.args
+            admitted.append(spec)
+            if spec["ordinal"] == 1:
+                assert spec[producer._PARALLEL_RECOVERY_KEY] == prior
+                assert spec["attempt_id"] == original["attempt_id"]
+            digest = producer.declared_slot_worker(spec)
+            yield SimpleNamespace(task_key=task.key, status="COMPLETED", value=digest)
+
+    completed = []
+    producer._execute_parallel_declared_slots(env.context, precommit=env.precommit,
+        process=env.process, frozen_pipeline_config=env.frozen, cell_id=env.cell_id,
+        slots=env.slots, completed=completed, commit_artifacts=[], previous=None,
+        terminal_failure=None, terminal_stop=False, slot_dispatch=dispatch, slot_worker_limit=1)
+    assert len(admitted) == len(completed) == len(observed) == 13
+    assert observed[0]["resumed"] is True
+    assert observed[0]["attempt_id"] == original["attempt_id"]
+    assert {path: path.read_bytes() for path in before} == before
+    assert len(list((env.context.root / original_paths[0]).parent.glob("*.json"))) == 1
+    assert len(list((env.context.root / original_paths[1]).parent.glob("*.json"))) == 1
+    assert not namespace.exists()
+
+
+def test_parallel_capacity_reentry_refuses_an_unlinked_history_branch(parallel_capacity_store):
+    env = parallel_capacity_store
+    env.publish(env.spec(1), failure=producer._parallel_slot_failure(MemoryError("INVENTED")))
+    unknown = env.context.root / env.root / "reentries" / "01" / ("0" * 64)
+    unknown.mkdir(parents=True)
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_PARALLEL_SLOT_CUSTODY_INVALID"):
+        with producer._bound_parallel_slot_result(env.context, env.precommit, env.process, env.frozen,
+                env.cell_id, env.slots[0], env.root):
+            pytest.fail("Unlinked recovery history was ignored")
+    assert unknown.is_dir()
+
+
+def test_parallel_unfinished_reentry_claim_is_not_automatically_replayed(parallel_capacity_store):
+    env = parallel_capacity_store
+    _, prior, _ = env.publish(env.spec(1), failure=producer._parallel_slot_failure(MemoryError("INVENTED")))
+    spec = env.spec(1, prior=prior, attempt="INVENTED-unresolved-admission")
+    relative = producer._parallel_slot_path(producer._parallel_slot_spec_root(spec), "claims", 1)
+    spool._publish_exact_json(env.context, relative,
+        {"schema_version": producer._PARALLEL_RECOVERY_CLAIM_SCHEMA, "binding": spec}, env.context.limits.max_json_bytes)
+    before = {path: path.read_bytes() for path in env.context.root.rglob("*") if path.is_file()}
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_PARALLEL_SLOT_ORPHAN_UNRESOLVED"):
+        producer._execute_parallel_declared_slots(env.context, precommit=env.precommit,
+            process=env.process, frozen_pipeline_config=env.frozen, cell_id=env.cell_id,
+            slots=env.slots, completed=[], commit_artifacts=[], previous=None, terminal_failure=None,
+            terminal_stop=False, slot_dispatch=lambda *args: pytest.fail("Unknown worker admission was replayed"),
+            slot_worker_limit=1)
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_parallel_capacity_reentry_can_reuse_only_its_unpublished_empty_target(parallel_capacity_store):
+    env = parallel_capacity_store
+    _, prior, paths = env.publish(env.spec(1), failure=producer._parallel_slot_failure(MemoryError("INVENTED")))
+    spec = env.spec(1, prior=prior, attempt="INVENTED-after-claim-publication-failure")
+    target = env.context.root / producer._parallel_slot_spec_root(spec)
+    (target / "claims").mkdir(parents=True)
+    before = {env.context.root / path: (env.context.root / path).read_bytes() for path in paths}
+    root, ready = producer._parallel_slot_existing(env.context, env.precommit, env.process, env.frozen,
+        env.cell_id, env.slots, [])
+    assert root == env.root and ready == {}
+    _, digest, _ = env.publish(spec, completed=True)
+    with producer._bound_parallel_slot_result(env.context, env.precommit, env.process, env.frozen,
+            env.cell_id, env.slots[0], env.root) as (body, observed):
+        assert observed == digest and body["completion"]["status"] == "NO_TRADE"
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("kind", ["message", "custom-code", "os-message", "spool-message"])
+def test_parallel_legacy_capacity_text_collision_is_retained_unresolved(parallel_capacity_store, kind):
+    env = parallel_capacity_store
+
+    class LegacyTechnicalCodeError(RuntimeError):
+        code = producer._PARALLEL_CAPACITY_FAILURE
+
+    error = {"message": RuntimeError(producer._PARALLEL_CAPACITY_FAILURE),
+        "custom-code": LegacyTechnicalCodeError("INVENTED technical failure"),
+        "os-message": OSError(producer._PARALLEL_CAPACITY_FAILURE),
+        "spool-message": spool.AuthoritySpoolError(producer._PARALLEL_CAPACITY_FAILURE)}[kind]
+    assert spool.resource_capacity_reason(error) is None
+    legacy = {"exception_type": f"{type(error).__module__}.{type(error).__name__}",
+        "failure_code": str(getattr(error, "code", None) or error),
+        "failure_observed_at_utc": "2026-01-01T00:00:00Z"}
+    assert legacy["failure_code"] == producer._PARALLEL_CAPACITY_FAILURE
+    env.publish(env.spec(1), failure=legacy, legacy=True)
+    before = {path: path.read_bytes() for path in env.context.root.rglob("*") if path.is_file()}
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_PARALLEL_SLOT_LEGACY_FAILURE_UNRESOLVED"):
+        producer._execute_parallel_declared_slots(env.context, precommit=env.precommit,
+            process=env.process, frozen_pipeline_config=env.frozen, cell_id=env.cell_id,
+            slots=env.slots, completed=[], commit_artifacts=[], previous=None, terminal_failure=None,
+            terminal_stop=False, slot_dispatch=lambda *args: pytest.fail("Unproved legacy capacity was retried"),
+            slot_worker_limit=1)
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (env.context.root / env.root / "reentries").exists()
+
+
+@pytest.mark.parametrize("reason", [None, "RESOURCE_CAPACITY", "DISK_LOW_TEXT"])
+def test_parallel_capacity_transport_exception_requires_observed_kind(reason):
+    with pytest.raises(ValueError, match="DECLARED_PARALLEL_CAPACITY_REASON_INVALID"):
+        producer.DeclaredParallelSlotCapacityError(reason, "INVENTED-slot", "INVENTED.type", "INVENTED-code")
+
+
+@pytest.mark.parametrize("mode", ["serial", "parallel"])
+@pytest.mark.parametrize("unit_lease", [False, True], ids=["before-unit-lease", "released-unit-lease"])
+def test_preunit_capacity_reentry_keeps_the_real_issued_request_and_start(tmp_path, monkeypatch, mode, unit_lease):
+    """Real issuers/parent/worker and optional unit lease; no source or fit execution."""
+    from prototype_support import CELL_ID, _declared_environment
+
+    env = _declared_environment(tmp_path, monkeypatch)
+    slot = historical.declared_slot_selected_slots(env.precommit.to_dict())[0]
+    observed = []
+
+    def before_unit_capacity(context, *, request, **kwargs):
+        body = request.to_dict()
+        namespace = spool._local_path(context.root,
+            search_execution._declared_unit_relative(body, "header.json")).parent
+        if unit_lease:
+            with search_execution._declared_unit_lease(context, body):
+                assert {path.name for path in namespace.iterdir()} == {"units.lock"}
+                observed.append(body)
+                raise MemoryError("INVENTED_PREUNIT_CAPACITY_NO_SOURCE_OR_FIT_EXECUTION")
+        assert not namespace.exists()
+        observed.append(body)
+        raise MemoryError("INVENTED_PREUNIT_CAPACITY_NO_SOURCE_OR_FIT_EXECUTION")
+
+    monkeypatch.setattr(producer, "execute_declared_slot_owner_search", before_unit_capacity)
+    admitted = []
+
+    def dispatch(tasks, gate, task_ready):
+        for task in tasks:
+            if gate():
+                assert task_ready(task)
+                admitted.append(task.args[0])
+                digest = producer.declared_slot_worker(*task.args)
+                yield SimpleNamespace(task_key=task.key, status="COMPLETED", value=digest)
+            else:
+                yield SimpleNamespace(task_key=task.key, status="NOT_RUN")
+
+    options = {"slot_dispatch": dispatch, "slot_worker_limit": 1} if mode == "parallel" else {}
+    expected = producer.DeclaredParallelSlotCapacityError if mode == "parallel" else MemoryError
+    original = None
+    for entry in range(2):
+        with pytest.raises(expected) as caught:
+            producer.execute_declared_cell_owner_slots(context=env.context, precommit=env.precommit,
+                process=env.process, frozen_pipeline_config=env.frozen, cell_id=CELL_ID, **options)
+        if mode == "parallel":
+            assert caught.value.capacity_reason == "MEMORY_ERROR"
+        starts = producer._declared_prior_attempt_starts(env.context, env.precommit, CELL_ID, slot)
+        assert len(starts) == 1
+        attempt = producer._declared_pending_unit_attempt(env.context, env.precommit, CELL_ID, slot)
+        assert attempt is not None and attempt == observed[0]["attempt_id"]
+        request_path = (f"declared-slots/{env.precommit.receipt_sha256}/requests/"
+            f"{CELL_ID}/{slot['slot_id']}/{attempt}.json")
+        paths = (env.context.root / request_path, env.context.root / starts[0]["relative_path"])
+        saved = {path: path.read_bytes() for path in paths}
+        if entry == 0:
+            original = saved
+        else:
+            assert saved == original
+        assert len(list(paths[0].parent.glob("*.json"))) == 1
+        namespace = spool._local_path(env.context.root,
+            search_execution._declared_unit_relative(observed[0], "header.json")).parent
+        if unit_lease:
+            assert {path.name for path in namespace.iterdir()} == {"units.lock"}
+            assert (namespace / "units.lock").read_bytes() == b"0"
+        else:
+            assert not namespace.exists()
+    assert len(observed) == 2 and observed[0] == observed[1]
+    if mode == "parallel":
+        assert len(admitted) == 2 and admitted[0]["attempt_id"] == admitted[1]["attempt_id"]
+        assert producer._PARALLEL_RECOVERY_KEY not in admitted[0]
+        assert producer._PARALLEL_RECOVERY_KEY in admitted[1]
+
+
+@pytest.mark.parametrize("partial", ["empty-directory", "empty-lock", "nul-lock", "wrong-lock",
+    "long-lock", "lock-directory", "extra-file", "raw-without-header"])
+def test_preunit_reentry_preserves_and_refuses_partial_unit_namespaces(parallel_capacity_store, partial):
+    env = parallel_capacity_store
+    binding = env.spec(1)
+    request, paths = env.persist_preunit(binding)
+    namespace = spool._local_path(env.context.root,
+        search_execution._declared_unit_relative(request, "header.json")).parent
+    namespace.mkdir(parents=True)
+    if partial in {"empty-lock", "nul-lock", "wrong-lock", "long-lock", "extra-file"}:
+        encoded = {"empty-lock": b"", "nul-lock": b"\0", "wrong-lock": b"x",
+                   "long-lock": b"00", "extra-file": b"0"}[partial]
+        (namespace / "units.lock").write_bytes(encoded)
+        if partial == "extra-file":
+            (namespace / "unknown.txt").write_bytes(b"INVENTED_UNKNOWN_PRESERVE")
+    elif partial == "lock-directory":
+        (namespace / "units.lock").mkdir()
+    elif partial == "raw-without-header":
+        relative = search_execution._declared_unit_relative(request, "raw-completion.json")
+        spool._publish_exact_json(env.context, relative,
+            {"fixture_provenance": "INVENTED_ORPHAN_RAW_METADATA_ONLY"}, env.context.limits.max_json_bytes)
+    before = {path: path.read_bytes() for path in env.context.root.rglob("*") if path.is_file()}
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_UNIT_PREUNIT_NAMESPACE_UNRESOLVED"):
+        producer._declared_pending_unit_attempt(env.context, env.precommit, env.cell_id, env.slots[0])
+    assert {path: path.read_bytes() for path in before} == before
+    assert namespace.is_dir()
+
+
+def test_preunit_reentry_refuses_a_held_real_unit_lease_and_releases_its_probe(parallel_capacity_store):
+    """Actual executor kernel lease; request metadata is an explicitly invented fixture."""
+    env = parallel_capacity_store
+    request, paths = env.persist_preunit(env.spec(1))
+    before = {name: spool._local_path(env.context.root, name).read_bytes() for name in paths}
+    with search_execution._declared_unit_lease(env.context, request):
+        with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_SLOT_RUN_ACTIVE"):
+            producer._declared_pending_unit_attempt(env.context, env.precommit, env.cell_id, env.slots[0])
+    assert producer._declared_pending_unit_attempt(env.context, env.precommit, env.cell_id, env.slots[0]) == request["attempt_id"]
+    # A second actual lease must succeed after the selector's probe, including on Windows.
+    with search_execution._declared_unit_lease(env.context, request):
+        pass
+    lock = spool._local_path(env.context.root, search_execution._declared_unit_relative(request, "units.lock"))
+    assert lock.read_bytes() == b"0"
+    assert {name: spool._local_path(env.context.root, name).read_bytes() for name in paths} == before
+    assert len(producer._declared_prior_attempt_starts(env.context, env.precommit, env.cell_id, env.slots[0])) == 1
+
+
+def test_preunit_reentry_does_not_choose_between_multiple_authenticated_starts(parallel_capacity_store):
+    env = parallel_capacity_store
+    env.persist_preunit(env.spec(1, attempt="INVENTED-first-unresolved-attempt"))
+    env.persist_preunit(env.spec(1, attempt="INVENTED-second-unresolved-attempt"))
+    before = {path: path.read_bytes() for path in env.context.root.rglob("*") if path.is_file()}
+    with pytest.raises(producer.HistoricalSearchProducerError, match="DECLARED_UNIT_OWNER_AMBIGUOUS"):
+        producer._declared_pending_unit_attempt(env.context, env.precommit, env.cell_id, env.slots[0])
+    assert {path: path.read_bytes() for path in before} == before

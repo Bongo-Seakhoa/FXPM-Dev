@@ -2,25 +2,18 @@ from __future__ import annotations
 
 from copy import deepcopy
 from enum import Enum
-import hashlib
-import json
 from typing import Any
 
 from pm_current_refit_parameters import (
-    decode_retained_parameter_metadata,
-    load_retained_strategy_domain_v1,
     parameter_values_equal,
 )
 from pm_core import FeatureComputer
 from pm_state_contract import (
     ACTUAL_STRATEGY_NAMES,
     DEFAULT_AUTHORITY,
-    ORIGINAL_STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION,
-    ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256,
     STATE_FEATURE_ALIASES,
     STRATEGY_CANDIDATE_DOMAIN_SHA256,
     strategy_candidate_domain_sha256,
-    retained_v1_authority,
 )
 from pm_strategies import StrategyRegistry
 
@@ -109,31 +102,6 @@ def test_coupled_rows_preserve_typed_axis_members_and_default() -> None:
     assert set(coupled_names) == {
         "StochRSITrendGateStrategy", "SessionVWAPReversionStrategy", "MACDHistogramMomentumStrategy",
     }
-
-
-def test_retained_original_candidate_hash_and_authority_are_recomputed() -> None:
-    table = load_retained_strategy_domain_v1()
-    documents = sorted([
-        {"name": row["strategy_id"],
-         "defaults": _normalize(decode_retained_parameter_metadata(row["typed_metadata"]["defaults"])),
-         "grid": _normalize(decode_retained_parameter_metadata(row["typed_metadata"]["grid"]))}
-        for row in table["strategies"]
-    ], key=lambda row: row["name"])
-    encoded = json.dumps(
-        {"schema_version": ORIGINAL_STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION, "strategies": documents},
-        sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
-    ).encode("ascii")
-    original_hash = hashlib.sha256(encoded).hexdigest()
-    assert original_hash == ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256 == (
-        "d4d8ae2deee050989bdc8e93b21d779c8d68ddb4666668a9c34c5d65177803e3"
-    )
-    assert strategy_candidate_domain_sha256(documents) != original_hash
-    original = retained_v1_authority()
-    assert original.candidate_domain_hash == original_hash
-    assert original.registry_hash == "ccd2635409bb3fb86effaf9274f8c06ea60e1e77bde71e245082321582c7ab29"
-    assert original.registry_hash == table["process_template"]["state_contract_registry_sha256"]
-    assert original.registry_hash != DEFAULT_AUTHORITY.registry_hash
-    assert original.candidate_domain_hash != DEFAULT_AUTHORITY.candidate_domain_hash
 
 
 def test_every_grid_axis_contains_its_default_candidate_value() -> None:

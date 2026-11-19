@@ -2095,7 +2095,9 @@ def _cross_binding_body_m5(
     for value in winner_roster.values():
         _hex64(value, "WINNER_CROSS_BINDING_ROSTER_INVALID")
     return {
-        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
+                           if generation is winner_selection.V17_GENERATION
+                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
                            if generation is winner_selection.V16_GENERATION
                            else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3
                            if current_costs else HORIZON_WINNER_CROSS_BINDING_SCHEMA),
@@ -2907,7 +2909,9 @@ def _cross_binding_body(
     for value in winner_roster.values():
         _hex64(value, "WINNER_CROSS_BINDING_ROSTER_INVALID")
     return {
-        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
+                           if generation is winner_selection.V17_GENERATION
+                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
                            if generation is winner_selection.V16_GENERATION
                            else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3
                            if current_costs else HORIZON_WINNER_CROSS_BINDING_SCHEMA),
@@ -3070,7 +3074,7 @@ class HistoricalSymbolSearchCapture:
         symbol: str,
         *, _winner_generation: Any = None,
     ) -> None:
-        if not any(_winner_generation is known for known in (None, winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION)):
+        if not any(_winner_generation is known for known in (None, winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION, winner_selection.V17_GENERATION)):
             _fail("WINNER_CAPTURE_GENERATION_INVALID")
         self._winner_generation = _winner_generation or winner_selection.CURRENT_GENERATION
         if type(context) is not authority_spool.GenerationSpoolContext:
@@ -3174,8 +3178,6 @@ class HistoricalSymbolSearchCapture:
         ):
             _fail("RAW_DESCRIPTOR_GRAPH_ROSTER_INVALID")
         total_bytes = sum(int(item["descriptor"]["size_bytes"]) for item in normalized)
-        if total_bytes > self.context.limits.max_symbol_bytes:
-            _fail("RAW_DESCRIPTOR_GRAPH_BYTE_BOUND_EXCEEDED")
         body = {
             "schema_version": RAW_DESCRIPTOR_GRAPH_SCHEMA,
             "generation_id": self.context.generation_id,
@@ -3226,12 +3228,15 @@ class HistoricalSymbolSearchCapture:
         if receipt.get("schema_version") in {
             raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA,
             raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA,
+            raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA,
         }:
             if type(self) is not DeclaredSlotSearchCapture:
                 _fail("BOUND_FIT_CANARY_OR_LEGACY_CAPTURE_FORBIDDEN")
             _verify_declared_slot_capture(self)
             expected_schema = (
-                raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA
+                raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA
+                if self._winner_generation is winner_selection.V17_GENERATION
+                else raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA
                 if self._winner_generation is winner_selection.V16_GENERATION
                 else raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA
             )
@@ -3317,7 +3322,9 @@ class HistoricalSymbolSearchCapture:
         key = (timeframe, regime)
         if key in self._evidence:
             _fail("CELL_CAPTURE_DUPLICATED")
-        state_factory = (book.create_transport_historical_process_state_decision
+        state_factory = (book.create_matched_floor_historical_process_state_decision
+                         if getattr(self, "_winner_generation", None) is winner_selection.V17_GENERATION
+                         else book.create_transport_historical_process_state_decision
                          if getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
                          else book.create_historical_process_state_decision)
         state = state_factory(
@@ -3718,6 +3725,7 @@ class HistoricalSymbolSearchCapture:
             self._horizon_plan_bodies[key], len(normalized_attempts)
         )
         transport = getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
+        matched = getattr(self, "_winner_generation", None) is winner_selection.V17_GENERATION
         freeze = raw_winner.freeze_winner_search_plan_v5 if transport else raw_winner.freeze_winner_search_plan_v4
         if type(self) is DeclaredSlotSearchCapture and (
             type(bound_fitted_state_entry) is not dict or not bound_fitted_state_entry
@@ -3727,7 +3735,13 @@ class HistoricalSymbolSearchCapture:
             if type(self) is not DeclaredSlotSearchCapture:
                 _fail("BOUND_FIT_CANARY_OR_LEGACY_CAPTURE_FORBIDDEN")
             freeze = raw_winner.freeze_winner_search_plan_v7 if transport else raw_winner.freeze_winner_search_plan_v6
-        produce = raw_winner.produce_winner_v16_raw_evidence if transport else raw_winner.produce_winner_v15_raw_evidence
+        if matched:
+            _verify_declared_slot_capture(self)
+            if bound_fitted_state_entry is None:
+                _fail("MATCHED_FLOOR_BOUND_FIT_REQUIRED")
+            freeze = raw_winner.freeze_winner_search_plan_v9
+        produce = (raw_winner.produce_winner_v17_raw_evidence if matched else
+            raw_winner.produce_winner_v16_raw_evidence if transport else raw_winner.produce_winner_v15_raw_evidence)
         if not _raw_namespace_supported(freeze) or not _raw_namespace_supported(produce):
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
         try:
@@ -3748,6 +3762,7 @@ class HistoricalSymbolSearchCapture:
                 risk_unit_contract=risk_unit_contract,
                 artifact_namespace=self.raw_artifact_namespace,
                 **({"bound_fitted_state_entry": bound_fitted_state_entry} if bound_fitted_state_entry is not None else {}),
+                **({"selection_complexity_roster": _declared_frozen_selection_complexity(self, normalized_attempts)} if matched else {}),
             )
         except TypeError as exc:
             raise HistoricalProductionAdapterError(
@@ -3907,7 +3922,9 @@ class HistoricalSymbolSearchCapture:
             or handle.cross_binding_descriptor["format"] != raw_winner.ASCII_JSON_FORMAT
         ):
             _fail("HORIZON_WINNER_CROSS_BINDING_REPLAY_FAILED")
-        produce = (raw_winner.produce_winner_v16_raw_evidence
+        produce = (raw_winner.produce_winner_v17_raw_evidence
+                   if handle.frozen.selection_generation is winner_selection.V17_GENERATION
+                   else raw_winner.produce_winner_v16_raw_evidence
                    if handle.frozen.selection_generation is winner_selection.V16_GENERATION
                    else raw_winner.produce_winner_v15_raw_evidence)
         if not _raw_namespace_supported(produce):
@@ -4866,7 +4883,7 @@ def _rebuild_winner_pair(
         maximum_bytes=winner_selection.MAX_SUPPORTED_WINNER_REQUEST_BYTES,
         code="WORKER_WINNER_REQUEST_REOPEN_FAILED",
     )
-    if (request_body.get("contract_version") != winner_selection.V16_GENERATION.request_version
+    if (request_body.get("contract_version") not in (winner_selection.V16_GENERATION.request_version, winner_selection.V17_GENERATION.request_version)
             and len(request_bytes) > winner_selection.MAX_REQUEST_BYTES):
         _fail("WORKER_WINNER_REQUEST_REOPEN_FAILED")
     if set(request_body) != {
@@ -4944,7 +4961,9 @@ def _verify_worker_production_receipt(
     roster = body.get("artifact_roster")
     if (
         body.get("schema_version") not in (
-            {raw_winner.V16_PRODUCTION_SCHEMA}
+            {raw_winner.V17_PRODUCTION_SCHEMA}
+            if request.to_dict()["contract_version"] == winner_selection.V17_GENERATION.request_version
+            else {raw_winner.V16_PRODUCTION_SCHEMA}
             if request.to_dict()["contract_version"] == winner_selection.V16_GENERATION.request_version
             else {raw_winner.PRODUCTION_SCHEMA, raw_winner.CURRENT_PRODUCTION_SCHEMA})
         or body.get("generation_context_sha256") != context.context_sha256
@@ -5403,7 +5422,9 @@ def reopen_historical_symbol_worker_bundle(
             ):
                 _fail("WORKER_PROCESS_CELL_SPLICE")
             binding_schema = (process_payload.get("insufficient_evidence_binding") or {}).get("schema_version")
-            state_factory = (book.create_transport_historical_process_state_decision
+            state_factory = (book.create_matched_floor_historical_process_state_decision
+                if binding_schema == book.V17_GENERATION.insufficient_schema
+                else book.create_transport_historical_process_state_decision
                 if binding_schema == book.V16_GENERATION.insufficient_schema else book.create_historical_process_state_decision)
             process_decision = state_factory(
                 symbol=symbol,
@@ -5467,7 +5488,6 @@ def reopen_historical_symbol_worker_bundle(
         or bundle.get("artifact_total_bytes") != total_bytes
         or bundle.get("artifact_roster_sha256") != _sha256(normalized_artifacts)
         or len(normalized_artifacts) > context.limits.max_artifacts_per_symbol
-        or total_bytes > context.limits.max_symbol_bytes
     ):
         _fail("WORKER_ARTIFACT_ROSTER_INVALID")
     try:
@@ -6881,7 +6901,7 @@ def _make_declared_slot_capture_authority():
         if type(value) is not DeclaredSlotSearchCapture or any(not hasattr(value, k) for k in ("_capture_tag", "context", "request", "source_session", "cell_plan", "fitted_timeframe", "pipeline_config", "_bindings", "_horizon_plan_bodies", "process", "sink", "_source", "_fit", "_horizon_plans", "raw_artifact_namespace", "anchor", "symbol", "regime", "request_body")):
             _fail("DECLARED_SLOT_CAPTURE_INVALID")
         if not any(getattr(value, "_winner_generation", None) is known
-                   for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION)):
+                   for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION, winner_selection.V17_GENERATION)):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
         if not hmac.compare_digest(value._capture_tag, tag(value)):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
@@ -6912,8 +6932,11 @@ def _make_declared_slot_capture_authority():
         if (plan.mode != "DECLARED_SLOT_UNISSUED" or plan._declared_slot_request is not request
                 or (plan.symbol, plan.timeframe, plan.regime) != (body["symbol"], body["timeframe"], body["regime"])):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
-        if not any(_winner_generation is known for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION)):
+        if not any(_winner_generation is known for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION, winner_selection.V17_GENERATION)):
             _fail("WINNER_CAPTURE_GENERATION_INVALID")
+        if _winner_generation is winner_selection.V17_GENERATION:
+            if planner.frozen_search_execution_edition(context, process) != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+                _fail("MATCHED_FLOOR_FROZEN_EXECUTION_EDITION_REQUIRED")
         value = object.__new__(DeclaredSlotSearchCapture)
         value._winner_generation = _winner_generation
         value.context, value.request, value.request_body = context, request, body
@@ -7119,7 +7142,8 @@ def _declared_native_unobserved_no_plan(completion):
     body = completion.get("request_body") if type(completion) is dict else None
     return (type(body) is dict
             and body.get("schema_version") in (orchestration.DECLARED_SLOT_REQUEST_SCHEMA,
-                                               orchestration.DECLARED_SLOT_REQUEST_SCHEMA_V2)
+                                               orchestration.DECLARED_SLOT_REQUEST_SCHEMA_V2,
+                                               orchestration.DECLARED_NATIVE_DEVELOPMENT_SLOT_REQUEST_SCHEMA)
             and completion.get("status") == "NO_TRADE"
             and completion.get("reason_code") == "REGIME_UNOBSERVED"
             and completion.get("plan_transport") is None)
@@ -7391,7 +7415,7 @@ def _reopen_declared_m5_slot_native_source(context, *, body, config, source_sess
 
 
 def _verify_declared_m5_slot_post_source_chain(context, *, precommit, process, completion,
-        parent, config, request, sink, entries, body, source_session, fitted):
+        parent, config, request, sink, entries, body, source_session, fitted, frozen_pipeline_config):
     source = _rebuild_source_decision(completion["source_group"])
     fit = _rebuild_regime_fit_decision(completion["regime_fit"], source)
     source_body, fit_body = source.to_dict(), fit.to_dict()
@@ -7453,7 +7477,8 @@ def _verify_declared_m5_slot_post_source_chain(context, *, precommit, process, c
         request=wr, decision=wd, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
     production = json.loads(production_bytes)
     if (set(production) != {"schema_version", "generation_context_sha256", "run_id", "artifact_namespace", "symbol", "timeframe", "regime", "precommitment_sha256", "attempt_ledger_sha256", "provenance_cross_binding_sha256", "evidence_ledger_sha256", "request_sha256", "decision_receipt_sha256", "artifact_roster"}
-            or production.get("schema_version") != (raw_winner.V16_PRODUCTION_SCHEMA
+            or production.get("schema_version") != (raw_winner.V17_PRODUCTION_SCHEMA
+                if frozen.selection_generation is winner_selection.V17_GENERATION else raw_winner.V16_PRODUCTION_SCHEMA
                 if frozen.selection_generation is winner_selection.V16_GENERATION else raw_winner.CURRENT_PRODUCTION_SCHEMA)
             or production.get("precommitment_sha256") != wr.precommitment.payload_sha256
             or production.get("attempt_ledger_sha256") != wr.attempt_ledger.payload_sha256
@@ -7471,6 +7496,9 @@ def _verify_declared_m5_slot_post_source_chain(context, *, precommit, process, c
             _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
     raw_winner.verify_source_observation_reference_closure(context, frozen=frozen,
         manifest_entries=tuple(entries.values()), production_receipt=production)
+    _verify_declared_matched_floor_chain(context, process=process, producer_request=request,
+        frozen=frozen, winner_request=wr, entries=entries, cross=cross,
+        frozen_pipeline_config=frozen_pipeline_config, m5_fitted=fitted)
     if wd.to_dict().get("winner") is not None:
         chosen = wd.to_dict()["winner"]
         matched = [x for x in cross["mapping"] if x.get("winner_process_candidate_id") == chosen.get("process_candidate_id") and x.get("process_sha256") == chosen.get("process_sha256")]
@@ -7665,7 +7693,8 @@ def _verify_declared_m5_slot_completion_request(context, *, completion, parent, 
             m5_source_context=m5_source_context, verification_only=True)
         return _verify_declared_m5_slot_post_source_chain(context, precommit=precommit,
             process=process, completion=completion, parent=parent, config=config, request=request,
-            sink=sink, entries=entries, body=body, source_session=source_session, fitted=fitted)
+            sink=sink, entries=entries, body=body, source_session=source_session, fitted=fitted,
+            frozen_pipeline_config=frozen_pipeline_config)
     finally:
         if own_context:
             producer._release_declared_m5_reacquired_context(m5_source_context, close_owner=m5_owner is None)
@@ -7819,6 +7848,7 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
         raw_winner.V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v5,
         raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v6,
         raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v7,
+        raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v9,
     }.get(frozen_schema)
     if restore is None:
         _fail("DECLARED_SLOT_FROZEN_SCHEMA_INVALID")
@@ -7889,6 +7919,9 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
     return frozen, cross, cross_bytes, frozen_ids
 
 
+_DECLARED_ROSTER_VERIFY_WORKERS = 8
+
+
 def verify_declared_slot_completion(context, *, precommit, process, completion, artifact_roster, frozen_pipeline_config, m5_source_context=None, m5_owner=None, m5_cost_edition=None):
     """Revalidate committed bytes at the established current-owner assurance level."""
     _declared_m5_completion_reuse_arguments(m5_source_context=m5_source_context,
@@ -7924,8 +7957,8 @@ def verify_declared_slot_completion(context, *, precommit, process, completion, 
     if (witness_entry is not None and witness_entry["descriptor"]["size_bytes"]
             > min(context.limits.max_artifact_bytes, context.limits.max_json_bytes)):
         _fail("DECLARED_NATIVE_UNOBSERVED_WITNESS_INVALID")
-    for entry in entries.values():
-        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+    # Same per-member checks as register_artifact; only the file reads overlap.
+    sink.register_roster(entries.values(), workers=_DECLARED_ROSTER_VERIFY_WORKERS)
     request = orchestration.DeclaredSlotProducerRequest(_canonical_bytes(body), precommit, sink, orchestration._DECLARED_SLOT_SEAL)
     orchestration._register_declared_request(request, context, live=False)
     try:
@@ -8141,7 +8174,8 @@ def _verify_declared_slot_completion_request(context, *, precommit, process, com
         request=wr, decision=wd, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
     production = json.loads(production_bytes)
     if (set(production) != {"schema_version", "generation_context_sha256", "run_id", "artifact_namespace", "symbol", "timeframe", "regime", "precommitment_sha256", "attempt_ledger_sha256", "provenance_cross_binding_sha256", "evidence_ledger_sha256", "request_sha256", "decision_receipt_sha256", "artifact_roster"}
-            or production.get("schema_version") != (raw_winner.V16_PRODUCTION_SCHEMA
+            or production.get("schema_version") != (raw_winner.V17_PRODUCTION_SCHEMA
+                if frozen.selection_generation is winner_selection.V17_GENERATION else raw_winner.V16_PRODUCTION_SCHEMA
                 if frozen.selection_generation is winner_selection.V16_GENERATION else raw_winner.CURRENT_PRODUCTION_SCHEMA)
             or production.get("precommitment_sha256") != wr.precommitment.payload_sha256
             or production.get("attempt_ledger_sha256") != wr.attempt_ledger.payload_sha256
@@ -8159,6 +8193,9 @@ def _verify_declared_slot_completion_request(context, *, precommit, process, com
             _fail("DECLARED_SLOT_RAW_BINDING_MISMATCH")
     raw_winner.verify_source_observation_reference_closure(context, frozen=frozen,
         manifest_entries=tuple(entries.values()), production_receipt=production)
+    _verify_declared_matched_floor_chain(context, process=process, producer_request=request,
+        frozen=frozen, winner_request=wr, entries=entries, cross=cross,
+        frozen_pipeline_config=frozen_pipeline_config)
     if wd.to_dict().get("winner") is not None:
         chosen = wd.to_dict()["winner"]
         matched = [x for x in cross["mapping"] if x.get("winner_process_candidate_id") == chosen.get("process_candidate_id") and x.get("process_sha256") == chosen.get("process_sha256")]
@@ -8322,3 +8359,62 @@ def _declared_m5_unobserved_current_view(*, support, fit_body, window, train_win
         end = _declared_slot_detector_cutoff(window["view_end_exclusive_utc"])
         if not start <= first <= last < end:
             _fail("DECLARED_M5_UNOBSERVED_SUPPORT_INVALID")
+
+
+def open_matched_floor_declared_slot_capture(context, *, request, process, plan, source_session):
+    """The process verifier binds v17 policy before the capture can be sealed."""
+    return open_declared_slot_capture(context, request=request, process=process, plan=plan,
+        source_session=source_session, _winner_generation=winner_selection.V17_GENERATION)
+
+
+def _declared_frozen_selection_complexity(capture, normalized_attempts):
+    import pm_production_search_planner as planner
+    _verify_declared_slot_capture(capture)
+    if capture._winner_generation is not winner_selection.V17_GENERATION:
+        _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
+    planner.verify_frozen_production_search_process(capture.context, capture.process)
+    return _frozen_selection_complexity_from_process(capture.process.to_dict(), normalized_attempts)
+
+
+def _frozen_selection_complexity_from_process(process_body, normalized_attempts):
+    import pm_production_search_planner as planner
+    domains = planner._domain_by_name(process_body)
+    rows = []
+    for ordinal, artifact in enumerate(normalized_attempts):
+        process = artifact["winner_process"]
+        source = domains[process["strategy_id"]]
+        domain = source["parameter_domain"]
+        rows.append({"ordinal": ordinal, "process_candidate_id": process["process_candidate_id"],
+            "strategy_id": process["strategy_id"], "trial_definition_sha256": _sha256(artifact["trial_definition"]),
+            "refit_recipe_sha256": _sha256(artifact["refit_recipe"]),
+            "source_strategy_domain_sha256": source["domain_sha256"],
+            "parameter_domain": domain, "parameter_domain_sha256": _sha256(domain),
+            "finite_domain_cardinality": domain["point_count"],
+            "active_free_parameter_count": sum(len({_canonical_bytes(choice) for choice in axis["choices"]}) > 1
+                for axis in domain["axes"])})
+    return winner_selection.validate_selection_complexity_roster(rows, expected_count=len(normalized_attempts))
+
+
+__all__.append("open_matched_floor_declared_slot_capture")
+
+
+def _verify_declared_matched_floor_chain(context, *, process, producer_request, frozen,
+        winner_request, entries, cross, frozen_pipeline_config, m5_fitted=None):
+    if frozen.selection_generation is not winner_selection.V17_GENERATION:
+        return
+    import pm_production_search_planner as planner
+    import pm_authoritative_search_execution as execution
+    planner.verify_frozen_production_search_process(context, process)
+    if frozen_pipeline_config is None:
+        _fail("MATCHED_FLOOR_FROZEN_CONFIG_REQUIRED")
+    artifacts = json.loads(frozen.attempt_artifacts_bundle_bytes)
+    expected = _frozen_selection_complexity_from_process(process.to_dict(), artifacts)
+    if (expected != frozen.precommitment["selection_complexity_roster"]
+            or winner_request.precommitment.to_dict() != frozen.precommitment):
+        _fail("MATCHED_FLOOR_PRE_EVIDENCE_COMPLEXITY_SPLICE")
+    material = execution._reopen_route_a_matched_source_material(context,
+        request=producer_request, process=process, frozen=frozen,
+        frozen_pipeline_config=frozen_pipeline_config, m5_fitted=m5_fitted)
+    raw_winner.verify_matched_floor_publication_chain(context, frozen=frozen,
+        request=winner_request, producer_request=producer_request, manifest_entries=tuple(entries.values()),
+        cross_binding=cross, source_material=material)

@@ -551,13 +551,59 @@ def store_view_contract(root: Any, body: Mapping[str, Any]) -> str:
         if path.read_bytes() != raw:
             _fail("VIEW_CONTRACT_SHA_COLLISION")
         return sha
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("xb") as handle:
-        handle.write(raw)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    return sha
+    folder_info = folder.stat(follow_symlinks=False)
+    folder_identity = (folder_info.st_dev, folder_info.st_ino)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=folder)
+    temporary = Path(temporary_name)
+    created_identity = None
+    try:
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                _fail("VIEW_CONTRACT_TEMP_CHANGED")
+            created_identity = (opened.st_dev, opened.st_ino)
+            offset = 0
+            while offset < len(raw):
+                written = os.write(descriptor, memoryview(raw)[offset:])
+                if written <= 0:
+                    _fail("VIEW_CONTRACT_WRITE_INCOMPLETE")
+                offset += written
+            os.fsync(descriptor)
+            opened = os.fstat(descriptor)
+            staged_identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+        finally:
+            os.close(descriptor)
+        _refuse_reparse(folder)
+        info = folder.stat(follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != folder_identity:
+            _fail("VIEW_CONTRACT_TEMP_CHANGED")
+        _refuse_reparse(temporary)
+        info = temporary.stat(follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != staged_identity):
+            _fail("VIEW_CONTRACT_TEMP_CHANGED")
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            pass
+        _refuse_reparse(path)
+        if path.read_bytes() != raw:
+            _fail("VIEW_CONTRACT_SHA_COLLISION")
+        return sha
+    finally:
+        if created_identity is not None:
+            _refuse_reparse(folder)
+            info = folder.stat(follow_symlinks=False)
+            if (info.st_dev, info.st_ino) != folder_identity:
+                _fail("VIEW_CONTRACT_TEMP_CHANGED")
+            try:
+                info = temporary.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            if info is not None:
+                if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != created_identity:
+                    _fail("VIEW_CONTRACT_TEMP_CHANGED")
+                temporary.unlink()
 
 
 def load_view_contract(root: Any, sha: Any) -> dict[str, Any]:

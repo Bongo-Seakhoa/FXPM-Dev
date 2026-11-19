@@ -513,6 +513,8 @@ class _BookGeneration:
 
     @property
     def selection_rule(self) -> str:
+        if self.winner_generation is winner.V17_GENERATION:
+            return "WINNER_V17_MATCHED_FLOOR_LOCAL_ADMISSIBILITY_PENDING_CELL_CAMPAIGN_VALIDATION"
         return SELECTION_RULE if self.winner_generation.archived else "WINNER_V15_LOCAL_ADMISSIBILITY_PENDING_CELL_CAMPAIGN_VALIDATION"
 
     @property
@@ -535,6 +537,11 @@ V16_GENERATION: Final = _BookGeneration(
     "fxpm.winner-raw-evidence-production.v6", "fxpm.historical-horizon-winner-cross-binding.v4",
     "fxpm.historical-insufficient-evidence-binding.v4",
 )
+V17_GENERATION: Final = _BookGeneration(
+    "fxpm.book-multiplicity.v17", winner.V17_GENERATION,
+    "fxpm.winner-raw-evidence-production.v7", "fxpm.historical-horizon-winner-cross-binding.v5",
+    "fxpm.historical-insufficient-evidence-binding.v5",
+)
 CURRENT_PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = CURRENT_GENERATION.winner_generation.selection_version
 CURRENT_PINNED_WINNER_SELECTION_REQUEST_VERSION: Final = CURRENT_GENERATION.winner_generation.request_version
 CURRENT_PINNED_WINNER_BOOK_MARGINAL_CONTRACT_VERSION: Final = CURRENT_GENERATION.winner_generation.marginal_version
@@ -545,6 +552,8 @@ CURRENT_WINNER_RAW_EVIDENCE_PRODUCTION_SCHEMA_VERSION: Final = CURRENT_GENERATIO
 
 
 def _book_generation(version: Any) -> _BookGeneration:
+    if version == V17_GENERATION.version:
+        return V17_GENERATION
     if version == V16_GENERATION.version:
         return V16_GENERATION
     if version == CURRENT_GENERATION.version:
@@ -2404,6 +2413,8 @@ def _infer_input_generation(
             versions.append(CURRENT_GENERATION)
         elif version == V16_GENERATION.winner_generation.request_version:
             versions.append(V16_GENERATION)
+        elif version == V17_GENERATION.winner_generation.request_version:
+            versions.append(V17_GENERATION)
         else:
             raise _BookError("WINNER_REQUEST_GENERATION_INVALID")
     if decision is not None:
@@ -2416,6 +2427,8 @@ def _infer_input_generation(
             if decision.to_dict().get("contract_version") == CURRENT_GENERATION.winner_generation.selection_version
             else V16_GENERATION.version
             if decision.to_dict().get("contract_version") == V16_GENERATION.winner_generation.selection_version
+            else V17_GENERATION.version
+            if decision.to_dict().get("contract_version") == V17_GENERATION.winner_generation.selection_version
             else None))
     if process_state is not None:
         if type(process_state) is not HistoricalProcessStateDecision:
@@ -2432,6 +2445,8 @@ def _infer_input_generation(
                 versions.append(CURRENT_GENERATION)
             elif schema == V16_GENERATION.insufficient_schema:
                 versions.append(V16_GENERATION)
+            elif schema == V17_GENERATION.insufficient_schema:
+                versions.append(V17_GENERATION)
             else:
                 raise _BookError("INSUFFICIENT_BINDING_VERSION_INVALID")
     if versions and any(item is not versions[0] for item in versions):
@@ -2440,7 +2455,7 @@ def _infer_input_generation(
         if versions and versions[0] is ARCHIVED_GENERATION:
             raise _BookError("BOOK_MIXED_GENERATIONS")
         if not versions:
-            versions.append(preferred if preferred is CURRENT_GENERATION or preferred is V16_GENERATION else CURRENT_GENERATION)
+            versions.append(preferred if preferred in (CURRENT_GENERATION, V16_GENERATION, V17_GENERATION) else CURRENT_GENERATION)
     return versions[0] if versions else None
 
 
@@ -2485,7 +2500,7 @@ def _create_historical_process_state_decision(
             horizon_plan=horizon_plan, request=process_rejection_request,
             decision=process_rejection_decision, preferred=_generation,
         )
-        if _generation is not None and (_generation is not V16_GENERATION
+        if _generation is not None and (_generation not in (V16_GENERATION, V17_GENERATION)
                 or inferred is not None and inferred is not _generation):
             raise _BookError("BOOK_MIXED_GENERATIONS")
         _generation = inferred or _generation or ARCHIVED_GENERATION
@@ -2843,7 +2858,7 @@ def _winner_record(
     ):
         raise _BookError(f"CELL_{ordinal:04d}_WINNER_INPUT_INVALID")
     current = not _generation.winner_generation.archived
-    released = winner.V16_GENERATION if _generation is V16_GENERATION else None
+    released = _generation.winner_generation if _generation in (V16_GENERATION, V17_GENERATION) else None
     if (
         (released.selection_version if released else winner.CURRENT_WINNER_SELECTION_CONTRACT_VERSION if current else winner.WINNER_SELECTION_CONTRACT_VERSION)
         != _generation.winner_generation.selection_version
@@ -3366,6 +3381,18 @@ def evaluate_transport_historical_book_multiplicity(evidence_family: Any) -> Boo
         return _rejected(str(exc), _generation=V16_GENERATION)
     except Exception:
         return _rejected("EVALUATION_FAILED_CLOSED", _generation=V16_GENERATION)
+
+
+def evaluate_matched_floor_historical_book_multiplicity(evidence_family: Any) -> BookMultiplicityDecision:
+    """Evaluate only the explicit v17 policy and its unchanged complete family."""
+    try:
+        family = tuple(_iter_exact_family(evidence_family))
+        _family_input_generation(family, V17_GENERATION)
+        return _evaluate_historical_book_multiplicity(family, _generation=V17_GENERATION)
+    except _BookError as exc:
+        return _rejected(str(exc), _generation=V17_GENERATION)
+    except Exception:
+        return _rejected("EVALUATION_FAILED_CLOSED", _generation=V17_GENERATION)
 
 
 def _evaluate_historical_book_multiplicity(
@@ -4213,3 +4240,17 @@ __all__ = [
     "verify_historical_book_multiplicity_decision",
     "winner_cell_evidence",
 ]
+
+
+def create_matched_floor_historical_process_state_decision(**kwargs):
+    if "_generation" in kwargs:
+        return None
+    return _create_historical_process_state_decision(**kwargs, _generation=V17_GENERATION)
+
+
+def matched_floor_policy_snapshot():
+    return _policy_snapshot(_generation=V17_GENERATION)
+
+
+__all__.extend(["V17_GENERATION", "create_matched_floor_historical_process_state_decision",
+    "evaluate_matched_floor_historical_book_multiplicity", "matched_floor_policy_snapshot"])

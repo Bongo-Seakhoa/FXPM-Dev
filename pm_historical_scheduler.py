@@ -243,23 +243,35 @@ def _declared_run_descriptor(precommit: Any, row: Mapping[str, Any], body: Mappi
         "sha256": hashlib.sha256(encoded).hexdigest(), "size_bytes": len(encoded)}
 
 
-def _declared_account(context, precommit, process, frozen, config):
+def _declared_account(context, precommit, process, frozen, config, *, _verified_chain=None, _prepared_account=None, _verified_account_out=None):
     from pathlib import Path
     import pm_forward_oos_replay_producer as forward
     import pm_native_prefix_production as native
-    existing = forward.discover_declared_cell_account_artifact(context, precommit=precommit,
-        process=process, frozen_pipeline_config=frozen)
+    import pm_historical_anchor_orchestration as orchestration
+    development = orchestration.declared_slot_development_scope(precommit.to_dict()) is not None
+    prepare = (forward._prepare_declared_native_development_cell_account_artifact if development
+        else forward._prepare_declared_cell_account_artifact)
+    request_native = (forward._declared_native_development_cell_account_request_from_inputs if development
+        else forward._declared_cell_account_native_request_from_inputs)
+    produce_account = (forward._produce_declared_native_development_cell_account_from_inputs if development
+        else forward._produce_declared_cell_account_from_inputs)
+    prepared = _prepared_account if _prepared_account is not None else prepare(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen, _verified_chain=_verified_chain)
+    existing, inputs, account_body = prepared
     if existing is not None:
+        if _verified_account_out is not None:
+            _verified_account_out.clear()
+            _verified_account_out.update(account_body)
         return existing, True
-    request = forward.declared_cell_account_native_request(context, precommit=precommit,
-        process=process, frozen_pipeline_config=frozen)
+    request = request_native(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen, inputs=inputs)
     accessed = _declared_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
     execution = native.produce_activated_native_prefix(data_dir=Path(config.data_dir), context=context,
         symbol=request["symbol"], timeframe=request["execution_timeframe"], cutoff_utc=request["cutoff_utc"],
         source_accessed_at_utc=accessed, production_contract_required=request["production_contract_required"])
     execution = native.reverify_activated_native_prefix_product(execution, context, require_current_activation=True)
-    resolved = forward.declared_cell_account_native_request(context, precommit=precommit,
-        process=process, frozen_pipeline_config=frozen, execution_product=execution)
+    resolved = request_native(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen, inputs=inputs, execution_product=execution)
     if (resolved["symbol"] != request["symbol"] or resolved["cutoff_utc"] != request["cutoff_utc"]
             or not resolved["spread_source_timeframe"]):
         _fail("DECLARED_ACCOUNT_NATIVE_REQUEST_CHANGED")
@@ -267,13 +279,17 @@ def _declared_account(context, precommit, process, frozen, config):
         symbol=resolved["symbol"], timeframe=resolved["spread_source_timeframe"], cutoff_utc=resolved["cutoff_utc"],
         source_accessed_at_utc=accessed, production_contract_required=resolved["production_contract_required"])
     fine = native.reverify_activated_native_prefix_product(fine, context, require_current_activation=True)
-    artifact = forward.produce_declared_cell_account_artifact(context, precommit=precommit, process=process,
-        frozen_pipeline_config=frozen, execution_product=execution, spread_source_product=fine,
+    artifact = produce_account(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen, inputs=inputs, body=account_body,
+        execution_product=execution, spread_source_product=fine,
         frozen_profile_path=Path(resolved["frozen_profile_path"]))
+    if _verified_account_out is not None:
+        _verified_account_out.clear()
+        _verified_account_out.update(account_body)
     return artifact, False
 
 
-def _declared_progress_or_busy(context, precommit, process, frozen, cell_id):
+def _declared_progress_or_busy(context, precommit, process, frozen, cell_id, *, _verified_progress_out=None):
     import os
     import pm_authority_spool as spool
     import pm_historical_search_producer as producer
@@ -285,7 +301,7 @@ def _declared_progress_or_busy(context, precommit, process, frozen, cell_id):
         descriptor = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
         return producer.reopen_declared_cell_owner_progress(context, precommit=precommit,
-            process=process, cell_id=cell_id, frozen_pipeline_config=frozen), False
+            process=process, cell_id=cell_id, frozen_pipeline_config=frozen, _verified_progress_out=_verified_progress_out), False
     with os.fdopen(descriptor, "r+b", buffering=0) as handle:
         spool._reject_reparse_chain(path)
         current, opened = os.stat(path, follow_symlinks=False), os.fstat(handle.fileno())
@@ -295,7 +311,7 @@ def _declared_progress_or_busy(context, precommit, process, frozen, cell_id):
             return None, True
         try:
             return producer.reopen_declared_cell_owner_progress(context, precommit=precommit,
-                process=process, cell_id=cell_id, frozen_pipeline_config=frozen), False
+                process=process, cell_id=cell_id, frozen_pipeline_config=frozen, _verified_progress_out=_verified_progress_out), False
         finally:
             storage._release_kernel_lock(handle)
 
@@ -381,7 +397,8 @@ def _declared_disk_requirement(contract, reserve: int) -> int:
 
 
 def _declared_disk_ready(root, contract, reserve: int) -> bool:
-    return _declared_disk_free_bytes(root) >= _declared_disk_requirement(contract, reserve)
+    """Legacy metadata compatibility; free space is not a scheduler admission gate."""
+    return True
 
 
 def _declared_reopen_process(context, precommit_path):
@@ -404,6 +421,42 @@ def _declared_reopen_process(context, precommit_path):
     receipt = producer._declared_symbol_receipt(context, planner.PROCESS_SPOOL_SYMBOL, manifest[2])
     return planner.reopen_production_search_process(context, spool_receipt=receipt,
         expected_receipt_sha256=hint)
+
+
+
+def _declared_initial_process(context, row, *, development):
+    """Issue a first precommit only over clean, authenticated metadata."""
+    import os
+    import pm_authority_spool as spool
+    import pm_historical_search_producer as producer
+    import pm_production_search_planner as planner
+    namespace = spool._local_path(context.root, "declared-slots")
+    spool._reject_reparse_chain(namespace)
+    if os.path.lexists(namespace):
+        pending = [namespace]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    spool._reject_reparse_chain(entry.path)
+                    if not entry.is_dir(follow_symlinks=False):
+                        _fail("DECLARED_SCHEDULER_PRECOMMIT_MISSING_WITH_PROGRESS")
+                    pending.append(type(namespace)(entry.path))
+    relative = spool._manifest_relative_path(planner.PROCESS_SPOOL_SYMBOL, spool.GENERAL_MANIFEST_DOMAIN)
+    record = producer._read_declared_record(context, relative, maximum_bytes=context.limits.max_manifest_bytes)
+    if record is not None:
+        entries = record[0].get("artifacts")
+        if (type(entries) is not list or len(entries) != 1
+                or entries[0].get("artifact_id") != planner.PROCESS_ARTIFACT_ID):
+            _fail("DECLARED_SCHEDULER_PROCESS_RECORD_INVALID")
+        receipt = producer._declared_symbol_receipt(context, planner.PROCESS_SPOOL_SYMBOL, record[2])
+        process = planner.reopen_production_search_process(context, spool_receipt=receipt,
+            expected_receipt_sha256=entries[0]["descriptor"]["sha256"])
+        if process.to_dict().get("run_id") != row["run_id"]:
+            _fail("DECLARED_SCHEDULER_PROCESS_RECORD_INVALID")
+        return process
+    return (planner.freeze_route_a_full_panel_production_search_process if development
+        else planner.freeze_production_search_process)(context, run_id=row["run_id"])
 
 
 def _declared_native_finalization_paths(policy):
@@ -477,14 +530,13 @@ def _declared_native_finalization_preflight(contract, row, config, limits, *, fr
     root = Path(row["root"])
     if (any(part in {"real_control", "STOP", ".git"} for part in root.parts)
             or any(path == held or path in held.parents or held in path.parents
-                   for path in (root, grid_root, fence_path, receipt_path) for held in protected)
-            or policy["retirement"]["max_bytes"] > limits.max_generation_bytes):
+                   for path in (root, grid_root, fence_path, receipt_path) for held in protected)):
         _fail("DECLARED_NATIVE_FINALIZATION_PATH_OVERLAP")
     spool._reject_reparse_chain(root)
     grid._grid_root(grid_root)
     if not fence_path.parent.is_dir() or not receipt_path.parent.is_dir():
         _fail("DECLARED_NATIVE_FINALIZATION_PARENT_REQUIRED")
-    if fresh and ((root.exists() and (not root.is_dir() or any(root.iterdir())))
+    if fresh and ((root.exists() and not root.is_dir())
                   or any(grid_root.iterdir()) or fence_path.exists() or receipt_path.exists()):
         _fail("DECLARED_NATIVE_FINALIZATION_FRESH_PATH_REQUIRED")
     return (*protected, grid_root, fence_path)
@@ -501,8 +553,10 @@ def _declared_native_archive_binding(record, row, digest):
         _fail("DECLARED_NATIVE_ARCHIVE_CONTRACT_CHANGED")
 
 
-def _declared_native_completed_records(context, *, row, precommit, process, artifact, run_body, profile_sha):
+def _declared_native_completed_records(context, *, row, precommit, process, artifact, run_body, profile_sha,
+        _verified_account_body=None, _verified_chain=None):
     """Join original saved bytes after the native ACCOUNT producer or verifier returns."""
+    import hashlib
     import pm_authority_spool as spool
     import pm_causal_evidence_producer as causal
     import pm_historical_anchor_orchestration as orchestration
@@ -511,9 +565,12 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
 
     parent = precommit.to_dict()
     slots = orchestration.declared_slot_selected_slots(parent)
+    scope = orchestration.declared_slot_development_scope(parent)
+    development = scope is not None
+    expected_run_schema = (producer.DECLARED_DEVELOPMENT_CELL_RUN_SCHEMA if development else producer.DECLARED_CELL_RUN_SCHEMA)
     cell_id, symbol = row["cell"]["cell_id"], row["cell"]["symbol"]
-    if (len(slots) != 13 or type(run_body) is not dict
-            or run_body.get("schema_version") != producer.DECLARED_CELL_RUN_SCHEMA
+    if ((not 1 <= len(slots) <= 3 if development else len(slots) != 13) or type(run_body) is not dict
+            or run_body.get("schema_version") != expected_run_schema
             or run_body.get("terminal_stop") is not False or "terminal_failure" in run_body
             or run_body.get("completed_slots") != len(slots) or run_body.get("declared_slots") != len(slots)
             or run_body.get("generation_context_sha256") != context.context_sha256
@@ -524,9 +581,29 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
     saved = producer._read_declared_record(context, run["relative_path"])
     if saved is None or saved[0] != run_body or saved[1] != run["sha256"] or saved[2]["size_bytes"] != run["size_bytes"]:
         _fail("DECLARED_NATIVE_FINALIZATION_SAVED_RUN_REQUIRED")
-    account = causal._read_descriptor_json(context, artifact.descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
-    causal._verify_declared_cell_account_manifest(context, account, artifact.descriptor)
-    if (account.get("progress_status") != "COMPLETE" or type(account.get("account")) is not dict
+    account = _verified_account_body
+    if account is None:
+        account = causal._read_descriptor_json(context, artifact.descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
+    else:
+        encoded = spool._canonical_json_bytes(account, context.limits.max_artifact_bytes)
+        if (len(encoded) != artifact.descriptor["size_bytes"]
+                or hashlib.sha256(encoded).hexdigest() != artifact.descriptor["sha256"]):
+            _fail("DECLARED_NATIVE_FINALIZATION_ACCOUNT_BINDING_INVALID")
+    if development:
+        import pm_forward_oos_replay_producer as forward
+        if _verified_account_body is None:
+            forward._verify_declared_native_development_cell_manifest(context, account,
+                artifact_descriptor=artifact.descriptor)
+        if (account.get("development_scope") != scope
+                or account.get("development_scope_sha256") != parent["development_scope_sha256"]
+                or run_body.get("development_scope") != scope
+                or run_body.get("development_scope_sha256") != parent["development_scope_sha256"]
+                or run_body.get("accepted_roster_slots") != 13
+                or run_body.get("development_status") != "DEVELOPMENT_COMPLETE"):
+            _fail("DECLARED_DEVELOPMENT_COMPLETION_PREFIX_INVALID")
+    elif _verified_account_body is None:
+        causal._verify_declared_cell_account_manifest(context, account, artifact.descriptor)
+    if (account.get("progress_status") != ("DEVELOPMENT_COMPLETE" if development else "COMPLETE") or type(account.get("account")) is not dict
             or account.get("generation_context_sha256") != context.context_sha256
             or account.get("declared_precommit_sha256") != precommit.receipt_sha256
             or account.get("search_process_receipt_sha256") != process.receipt_sha256
@@ -547,10 +624,15 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
     no_plan_requests = {}
     previous = None
     for ordinal, (slot, entry, summary) in enumerate(zip(slots, entries, summaries, strict=True), 1):
-        stored = producer._read_declared_commit(context, producer._declared_commit_path(precommit, cell_id, ordinal))
+        stored = None if _verified_chain is None else _verified_chain["commits"].get(slot["slot_id"])
+        if stored is None:
+            stored = producer._read_declared_commit(context, producer._declared_commit_path(precommit, cell_id, ordinal))
         if stored is None:
             _fail("DECLARED_NATIVE_FINALIZATION_SLOT_PROOF_REQUIRED")
         commit, commit_sha, descriptor = stored
+        if _verified_chain is not None and (descriptor["sha256"] != commit_sha
+                or hashlib.sha256(spool._canonical_json_bytes(commit, context.limits.max_json_bytes)).hexdigest() != commit_sha):
+            _fail("DECLARED_NATIVE_FINALIZATION_SLOT_PROOF_REQUIRED")
         key = slot["slot_id"]
         if (slot["ordinal"] != ordinal or key in proofs
                 or entry != producer._declared_commit_artifact(slot, descriptor)
@@ -699,7 +781,7 @@ def _declared_native_retirement_intent_present(root, retirement):
 
 
 def _declared_native_retirement_preflight(context, workspace_sha, *, protected, direct, locks,
-        fence_path, fence_sha, retirement):
+        fence_path, fence_sha, retirement, retained_account_result=None):
     """Check retirement bounds without publishing intent or taking write locks."""
     from pathlib import Path, PurePosixPath
     import shutil
@@ -739,6 +821,8 @@ def _declared_native_retirement_preflight(context, workspace_sha, *, protected, 
         "protected_paths": [str(Path(path).resolve()) for path in protected],
         "owned_direct_files": sorted(owned), "unit_lock_paths": list(locks),
         "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes}
+    if retained_account_result is not None:
+        arguments["retained_account_result"] = dict(retained_account_result)
     maximum = min(context.limits.max_json_bytes, 64 * 1024**2)
     control_nodes = 3
     if "segment_max_records" in retirement:
@@ -752,13 +836,47 @@ def _declared_native_retirement_preflight(context, workspace_sha, *, protected, 
         intent = {"schema_version": spool.RETIREMENT_SCHEMA, "generation_context_sha256": context.context_sha256,
             "arguments": arguments, "files": records}
         control_bytes = len(spool._canonical_json_bytes(intent, maximum)) + 2 * spool.MAX_CONTEXT_BYTES
-    if (nodes + control_nodes > max_nodes or root_bytes + control_bytes > min(max_bytes, context.limits.max_generation_bytes)
-            or shutil.disk_usage(context.root).free - control_bytes < context.limits.min_free_bytes):
+    if (nodes + control_nodes > max_nodes or root_bytes + control_bytes > max_bytes):
         _fail("RETIREMENT_CONTROL_CAPACITY")
 
 
+def _declared_retained_grid_contract(root, body, prior):
+    import hashlib
+    import pm_end_grid as grid
+    if not prior:
+        return body
+    if prior[0].metrics not in ({}, _cash_snapshot_reporting()):
+        _fail("DECLARED_FINALIZATION_GRID_CONFLICT")
+    actual = grid.load_view_contract(root, prior[0].view_contract_sha256)
+    if grid.canonical_bytes(actual) == grid.canonical_bytes(body):
+        return actual
+    legacy = {key: value for key, value in body.items() if key != "retained_account_result"}
+    if (grid.canonical_bytes(actual) != grid.canonical_bytes(legacy)
+            or hashlib.sha256(grid.canonical_bytes(legacy)).hexdigest()
+            != prior[0].view_contract_sha256):
+        _fail("DECLARED_FINALIZATION_GRID_CONFLICT")
+    return actual
+
+
+def _declared_retained_completion_fence(path, body, *, maximum_bytes):
+    """Preserve an exact earlier fence that predates the additive account reference."""
+    import os
+    from pathlib import Path
+    import pm_authority_spool as spool
+    path = Path(path)
+    if not os.path.lexists(path):
+        return body
+    actual, digest = spool._retirement_external(path, maximum_bytes)
+    if _declared_m5_hash(body) == digest:
+        return actual
+    legacy = {key: value for key, value in body.items() if key != "retained_account_result"}
+    if _declared_m5_hash(legacy) != digest:
+        _fail("DECLARED_M5_FINAL_RECORD_CHANGED")
+    return actual
+
+
 def _declared_native_finalize_account(result, *, context, contract, row, config, precommit, process,
-                                      artifact, run_body, workspace_sha, cell_contract_sha256, parallel_files=()):
+                                      artifact, run_body, workspace_sha, cell_contract_sha256, parallel_files=(), _verified_account_body=None, _verified_chain=None):
     import hashlib
     import os
     from pathlib import Path
@@ -778,10 +896,12 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
             _fail("DECLARED_NATIVE_FINALIZATION_RENEWAL_NOT_OWNED")
         parent, slots, proofs, summaries, run, no_plan_requests = _declared_native_completed_records(context, row=row,
             precommit=precommit, process=process, artifact=artifact, run_body=run_body,
-            profile_sha=contract["profile_sha256"])
+            profile_sha=contract["profile_sha256"], _verified_account_body=_verified_account_body,
+            _verified_chain=_verified_chain)
         if result["run_receipt"] != run:
             _fail("DECLARED_NATIVE_FINALIZATION_SAVED_RUN_REQUIRED")
         grid_root = policy["end_grid_root"]
+        retained_account = _declared_account_result_reference(context, artifact.descriptor, end_grid_root=grid_root)
         symbol = row["cell"]["symbol"]
         retained = grid.read_end_grid(grid_root, symbol)
         code = dict(parent["source_identity"])
@@ -802,16 +922,18 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
                     "request_sha256": summary["request_sha256"], "slot_commit_sha256": summary["commit_sha256"],
                     "source_session_sha256": session_sha, "native_prefix_index_sha256": index_sha,
                     "source_accessed_at_utc": accessed,
-                    "saved_cell_run_receipt_sha256": run["sha256"]}, "cost_tier_evidence": evidence}
+                    "saved_cell_run_receipt_sha256": run["sha256"]}, "cost_tier_evidence": evidence,
+                "retained_account_result": retained_account}
+            prior = [item for item in retained if item.cell_id == row["cell"]["cell_id"]
+                and item.cycle_start_utc == start and item.process_edition_sha256 == process.receipt_sha256]
+            if len(prior) > 1:
+                _fail("DECLARED_NATIVE_FINALIZATION_GRID_CONFLICT")
+            reconstruction = _declared_retained_grid_contract(grid_root, reconstruction, prior)
             encoded = grid.canonical_bytes(reconstruction)
             if len(encoded) > grid.MAX_CONTRACT_BYTES:
                 _fail("DECLARED_NATIVE_FINALIZATION_VIEW_CONTRACT_BOUND")
             contract_sha = hashlib.sha256(encoded).hexdigest()
             contracts[contract_sha] = reconstruction
-            prior = [item for item in retained if item.cell_id == row["cell"]["cell_id"]
-                and item.cycle_start_utc == start and item.process_edition_sha256 == process.receipt_sha256]
-            if len(prior) > 1:
-                _fail("DECLARED_NATIVE_FINALIZATION_GRID_CONFLICT")
             record = grid.build_end_grid_row(symbol=symbol, timeframe=row["cell"]["timeframe"],
                 regime=row["cell"]["regime"], cycle_start_utc=start, cycle_end_utc=end, information_cutoff_utc=cutoff,
                 source_kind="broker_native", view_key=hashlib.sha256(grid.canonical_bytes(view)).hexdigest(),
@@ -819,7 +941,9 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
                 source_identity={name: view[name] for name in
                     ("activation_id", "activation_manifest_sha256", "activation_entry_sha256", "native_bars_sha256")},
                 no_trade_run_receipt_sha256=run["sha256"] if selection["outcome"] == "NO_TRADE" else None,
-                process_edition_sha256=process.receipt_sha256, code_sha256=code, metrics=_cash_snapshot_reporting(),
+                process_edition_sha256=process.receipt_sha256,
+                code_sha256=prior[0].code_sha256 if prior else code,
+                metrics=prior[0].metrics if prior else _cash_snapshot_reporting(),
                 produced_at_utc=prior[0].produced_at_utc if prior else produced, **selection)
             if prior and prior[0].to_bytes() != record.to_bytes():
                 _fail("DECLARED_NATIVE_FINALIZATION_GRID_CONFLICT")
@@ -831,27 +955,37 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
         symbol_file = grid._symbol_file(grid._grid_root(grid_root), symbol)
         rows = {slot["slot_id"]: {"path": str(symbol_file), "row_sha256": record.row_sha256}
             for slot, record in zip(slots, planned, strict=True)}
-        fence_body = {"schema_version": spool.NATIVE_COMPLETION_FENCE_SCHEMA,
+        import pm_historical_anchor_orchestration as orchestration
+        development_scope = orchestration.declared_slot_development_scope(parent)
+        fence_body = {"schema_version": (spool.NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
+                if development_scope is not None else spool.NATIVE_COMPLETION_FENCE_SCHEMA),
             "workspace_owner_sha256": workspace_sha,
             "binding": {"generation_context_sha256": context.context_sha256, "run_id": row["run_id"],
                 "cell_id": row["cell"]["cell_id"], "cell_contract_sha256": cell_contract_sha256,
                 "search_process_receipt_sha256": process.receipt_sha256, "precommit_sha256": precommit.receipt_sha256},
             "completion": {"cell_run_receipt_sha256": run["sha256"], "account_artifact_sha256": artifact.descriptor["sha256"]},
             "selected_slots": selected_slots, "end_grid_rows": rows,
+            "retained_account_result": retained_account,
             "qualification_authority": False, "capital_authority": False,
             "live_authority": False, "order_authority": False}
+        if development_scope is not None:
+            fence_body.update(development_scope=development_scope,
+                development_scope_sha256=parent["development_scope_sha256"],
+                accepted_slot_ids=[slot["slot_id"] for slot in parent["slot_roster"]["slots"]])
         fence_maximum = 4 * 1024**2
+        fence_body = _declared_retained_completion_fence(fence_path, fence_body, maximum_bytes=fence_maximum)
         fence_sha = hashlib.sha256(spool._canonical_json_bytes(fence_body, fence_maximum)).hexdigest()
         if fence_sha != _declared_m5_hash(fence_body):
             _fail("DECLARED_NATIVE_FINALIZATION_FENCE_ENCODING_UNSUPPORTED")
         direct, locks, _ = _declared_owned_direct_files(context, precommit, row, max_paths=retirement["max_paths"],
             verified_no_plan=lambda slot: no_plan_requests.get(slot["slot_id"]), additional_direct=parallel_files)
         _declared_native_retirement_preflight(context, workspace_sha, protected=protected,
-            direct=direct, locks=locks, fence_path=fence_path, fence_sha=fence_sha, retirement=retirement)
-        if "slot_parallel_workers" not in row and not _declared_disk_ready(
-            context.root, contract, context.limits.min_free_bytes
-        ):
-            _fail("DECLARED_NATIVE_FINALIZATION_DISK_LOW")
+            direct=direct, locks=locks, fence_path=fence_path, fence_sha=fence_sha, retirement=retirement,
+            retained_account_result=retained_account if "retained_account_result" not in fence_body else None)
+        published = _declared_retain_account_result(context, artifact.descriptor, end_grid_root=grid_root)
+        if published != retained_account:
+            _fail("DECLARED_RETAINED_ACCOUNT_CHANGED")
+        result.update(retained_account_result=published, retained_account_bytes=published["size_bytes"])
         writing = True
         for contract_sha, body in contracts.items():
             if grid.store_view_contract(grid_root, body) != contract_sha or grid.load_view_contract(grid_root, contract_sha) != body:
@@ -887,6 +1021,10 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
                 descriptor_assurance="IDENTITY_ONLY_RETIREMENT_INCOMPLETE", genuine_cold_reopen_available=False)
         else:
             reason, diagnostics = _declared_m5_exception_reason(exc)
+            capacity = spool.resource_capacity_reason(exc)
+            if capacity is not None:
+                reason = capacity
+                result.update(status="NOT_RUN", reason_code=capacity)
             result.update(native_finalization_status="INCOMPLETE_RETAINED" if writing else "REFUSED_RETAINED",
                 native_finalization_reason_code=reason,
                 native_finalization_error_type=diagnostics["exception_type"])
@@ -915,9 +1053,16 @@ def _declared_run_one_cell(
     if (slot_dispatch is not None) != ("slot_parallel_workers" in row):
         _fail("DECLARED_SLOT_PARALLEL_CONTRACT_INVALID")
     result = _declared_cell_row(row, "FAILED", pid=os.getpid())
+    development = contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA
+    if development:
+        if row.get("development", {}).get("source_kind") != "broker_native" or "m5_development" in row:
+            _fail("DECLARED_DEVELOPMENT_SOURCE_METADATA_INVALID")
+        result.update(source_kind="broker_native", result_kind="DEVELOPMENT_PARTIAL",
+            design_contaminated=True, pristine_validation=False)
     finalize_native = row.get("native_finalization") is not None
     native_workspace_sha = None
     loaded_config = None
+    context = precommit = None
     try:
         context_root = Path(row["root"])
         limits = None
@@ -925,7 +1070,8 @@ def _declared_run_one_cell(
             limits = _declared_native_spool_limits(row)
             digest = _declared_native_cell_contract_sha256(contract, row, limits)
             archived = spool.read_generation_retirement(context_root,
-                expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
+                expected_completed_fence_schema=(spool.NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
+                    if development else spool.NATIVE_COMPLETION_FENCE_SCHEMA))
             if archived is not None:
                 if archived["status"] != "ARCHIVED_RECORD_ONLY":
                     result.update(status="NOT_RUN", reason_code="RETIREMENT_INCOMPLETE")
@@ -942,18 +1088,20 @@ def _declared_run_one_cell(
                 expected_native_universe_sha256=contract["native_universe_sha256"], expected_config_sha256=contract["config_sha256"])
         else:
             reserve = limits.min_free_bytes if finalize_native else DECLARED_CELL_MIN_FREE_BYTES
-            if slot_dispatch is None and not _declared_disk_ready(context_root, contract, reserve):
-                result.update(status="NOT_RUN", reason_code="DISK_LOW")
-                return result
             ownership = {}
             if finalize_native:
                 loaded_config = binding.load_effective_pipeline_config(Path(contract["active_config_path"]))
                 _declared_native_finalization_preflight(contract, row, loaded_config[1], limits, fresh=True)
                 ownership["owned_workspace"] = {"cell_id": row["cell"]["cell_id"], "cell_contract_sha256": digest}
-            context = spool.freeze_generation_context(context_root, generation_id=row["run_id"],
-                native_universe_sha256=contract["native_universe_sha256"], config_sha256=contract["config_sha256"],
-                limits=limits if finalize_native else spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES),
-                **ownership)
+            try:
+                context = spool.freeze_generation_context(context_root, generation_id=row["run_id"],
+                    native_universe_sha256=contract["native_universe_sha256"], config_sha256=contract["config_sha256"],
+                    limits=limits if finalize_native else spool.SpoolLimits(min_free_bytes=DECLARED_CELL_MIN_FREE_BYTES),
+                    **ownership)
+            except spool.AuthoritySpoolError as exc:
+                if finalize_native and _declared_m5_exception_reason(exc)[0] == "WORKSPACE_ROOT_NOT_EMPTY":
+                    _fail("DECLARED_NATIVE_FINALIZATION_FRESH_PATH_REQUIRED")
+                raise
         if finalize_native:
             if not (context.root / spool.WORKSPACE_OWNER_RELATIVE_PATH).exists():
                 _fail("DECLARED_NATIVE_FINALIZATION_OWNED_WORKSPACE_REQUIRED")
@@ -978,10 +1126,9 @@ def _declared_run_one_cell(
                 precommit = orchestration.reopen_declared_slot_owner_run_precommit(context,
                     receipt_sha256=records[0].parent.name, process=process, frozen_pipeline_config=frozen)
             else:
-                if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-                    result.update(status="NOT_RUN", reason_code="DISK_LOW")
-                    return result
-                process = planner.freeze_production_search_process(context, run_id=row["run_id"])
+                if not development and row.get("final_study_13") is not True:
+                    _fail("DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED")
+                process = _declared_initial_process(context, row, development=development)
                 roster = anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
                     frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs={"config_sha256":context.config_sha256,
                         "effective_config_sha256":frozen.effective_config_sha256},
@@ -991,19 +1138,22 @@ def _declared_run_one_cell(
                 profile = spread.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
                 if profile.sha256 != contract["profile_sha256"]:
                     _fail("DECLARED_SCHEDULER_PROFILE_CHANGED")
-                if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-                    result.update(status="NOT_RUN", reason_code="DISK_LOW")
-                    return result
                 now = _declared_utc_now()
                 policy = row["source_access_window_policy"]
                 window = {"start_utc":(now-timedelta(seconds=policy["lead_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "end_exclusive_utc":(now+timedelta(seconds=policy["validity_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ")}
-                precommit = orchestration.precommit_declared_slot_owner_run_v2(context, run_id=row["run_id"], process=process,
-                    slot_roster=roster, cell_roster=[row["cell"]], frozen_pipeline_config=frozen,
+                issuer = (orchestration.precommit_declared_development_native_slot_owner_run if development
+                    else orchestration.precommit_declared_slot_owner_run_v2)
+                prefix = ({"development_slot_ids": row["development"]["selected_slot_ids"]} if development
+                    else {"final_study_13": True})
+                precommit = issuer(context, run_id=row["run_id"], process=process, slot_roster=roster,
+                    cell_roster=[row["cell"]], frozen_pipeline_config=frozen,
                     spread_profile_identity={"profile_sha256":profile.sha256}, source_access_window_utc=window,
-                    launch_activation_utc=row["launch_activation_utc"])
+                    launch_activation_utc=row["launch_activation_utc"], **prefix)
             parent = precommit.to_dict()
-            if (parent.get("schema_version") != orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2
+            expected_schema = (orchestration.DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA if development
+                else orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2)
+            if (parent.get("schema_version") != expected_schema
                     or type(parent.get("slot_roster")) is not dict
                     or parent["slot_roster"].get("schema_version") != anchors.DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA):
                 _fail("DECLARED_SCHEDULER_PRECOMMIT_V2_REQUIRED")
@@ -1023,8 +1173,13 @@ def _declared_run_one_cell(
                 renewal = context.root / "declared-slots" / precommit.receipt_sha256 / "source-access-renewal"
                 if os.path.lexists(renewal):
                     _fail("DECLARED_NATIVE_FINALIZATION_RENEWAL_NOT_OWNED")
+            if development and (orchestration.declared_slot_development_scope(parent)["selected_slot_ids"]
+                    != row["development"]["selected_slot_ids"]):
+                _fail("DECLARED_DEVELOPMENT_PREFIX_INVALID")
             result["precommit_sha256"] = precommit.receipt_sha256
-            progress, busy = _declared_progress_or_busy(context, precommit, process, frozen, row["cell"]["cell_id"])
+            verified_chain = {}
+            progress, busy = _declared_progress_or_busy(context, precommit, process, frozen, row["cell"]["cell_id"],
+                _verified_progress_out=verified_chain)
             if busy:
                 result.update(status="NOT_RUN", reason_code="BUSY")
                 return result
@@ -1041,23 +1196,26 @@ def _declared_run_one_cell(
                 parallel_files = producer.verify_declared_parallel_slot_files(context, precommit=precommit,
                     process=process, cell_id=row["cell"]["cell_id"], frozen_pipeline_config=frozen)
             existing = None
+            prepared_account = None
             if recorded:
                 import pm_forward_oos_replay_producer as forward
-                existing = forward.discover_declared_cell_account_artifact(context, precommit=precommit,
-                    process=process, frozen_pipeline_config=frozen)
+                prepare = (forward._prepare_declared_native_development_cell_account_artifact if development
+                    else forward._prepare_declared_cell_account_artifact)
+                prepared_account = prepare(context, precommit=precommit, process=process,
+                    frozen_pipeline_config=frozen, _verified_chain=verified_chain)
+                existing = prepared_account[0]
                 if existing is not None:
                     result.update(status="REOPENED", account_descriptor=dict(existing.descriptor))
                     if finalize_native:
                         return _declared_native_finalize_account(result, context=context, contract=contract, row=row,
                             config=config, precommit=precommit, process=process, artifact=existing, run_body=run_body,
-                            workspace_sha=native_workspace_sha, cell_contract_sha256=digest, parallel_files=parallel_files)
+                            workspace_sha=native_workspace_sha, cell_contract_sha256=digest, parallel_files=parallel_files,
+                            _verified_account_body=prepared_account[2], _verified_chain=verified_chain)
                     return result
-            if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-                result.update(status="NOT_RUN", reason_code="DISK_LOW")
-                return result
             # Any unfinished work, including account production after all slots,
             # needs the existing effective access window and native snapshot.
-            access_slot = progress.first_uncommitted_slot or parent["slot_roster"]["slots"][-1]
+            access_slot = progress.first_uncommitted_slot or (orchestration.declared_slot_selected_slots(parent)[-1]
+                if development else parent["slot_roster"]["slots"][-1])
             window, _ = orchestration._declared_slot_effective_access(context, precommit, parent, access_slot)
             now = _declared_utc_now()
             if not datetime.fromisoformat(window["start_utc"].replace("Z", "+00:00")) <= now < datetime.fromisoformat(window["end_exclusive_utc"].replace("Z", "+00:00")):
@@ -1068,15 +1226,15 @@ def _declared_run_one_cell(
                 result.update(status="NOT_RUN", reason_code="NATIVE_DRIFT")
                 return result
             if progress.run_receipt is None:
-                if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-                    result.update(status="NOT_RUN", reason_code="DISK_LOW")
-                    return result
                 parallel = {} if slot_dispatch is None else {
                     "slot_dispatch": slot_dispatch, "slot_worker_limit": slot_worker_limit,
+                    "slot_commit_overlap": True,
                 }
                 run = producer.execute_declared_cell_owner_slots(context=context, precommit=precommit, process=process,
-                    frozen_pipeline_config=frozen, cell_id=row["cell"]["cell_id"], **parallel)
+                    frozen_pipeline_config=frozen, cell_id=row["cell"]["cell_id"],
+                    _verified_progress_out=verified_chain, **parallel)
                 run_body = run.to_dict()
+                prepared_account = None
                 result["run_receipt"] = _declared_run_descriptor(precommit, row, run_body)
                 if run_body["terminal_stop"]:
                     result.update(status="TERMINAL_STOP", reason_code="NEW_TERMINAL_STOP", recorded_before_dispatch=False)
@@ -1084,32 +1242,40 @@ def _declared_run_one_cell(
                 if slot_dispatch is not None and not parallel_files:
                     parallel_files = producer.verify_declared_parallel_slot_files(context, precommit=precommit,
                         process=process, cell_id=row["cell"]["cell_id"], frozen_pipeline_config=frozen)
-            if slot_dispatch is None and not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-                result.update(status="NOT_RUN", reason_code="DISK_LOW")
-                return result
-            artifact, reopened = _declared_account(context, precommit, process, frozen, config)
+            verified_account = {}
+            artifact, reopened = _declared_account(context, precommit, process, frozen, config,
+                _verified_chain=verified_chain, _prepared_account=prepared_account, _verified_account_out=verified_account)
             result.update(status="REOPENED" if reopened else "COMPLETED", account_descriptor=dict(artifact.descriptor))
             if finalize_native:
                 return _declared_native_finalize_account(result, context=context, contract=contract, row=row,
                     config=config, precommit=precommit, process=process, artifact=artifact, run_body=run_body,
-                    workspace_sha=native_workspace_sha, cell_contract_sha256=digest, parallel_files=parallel_files)
+                    workspace_sha=native_workspace_sha, cell_contract_sha256=digest, parallel_files=parallel_files,
+                    _verified_account_body=verified_account, _verified_chain=verified_chain)
             return result
     except Exception as exc:
-        if spool.is_resource_capacity_error(exc):
-            result.update(status="NOT_RUN", reason_code="DISK_LOW")
-        elif getattr(exc, "code", "") in {"DECLARED_SLOT_RUN_ACTIVE", "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE"}:
+        if isinstance(exc, producer.DeclaredParallelSlotCapacityError):
+            reason = exc.capacity_reason
+            if type(reason) is str and reason in {"DISK_LOW", "MEMORY_ERROR"}:
+                result.update(status="NOT_RUN", reason_code=reason, parallel_capacity_code=exc.code)
+            else:
+                result.update(status="FAILED", reason_code="DECLARED_PARALLEL_SLOT_CAPACITY_REASON_INVALID")
+        elif capacity := spool.resource_capacity_reason(exc):
+            result.update(status="NOT_RUN", reason_code=capacity)
+        elif _declared_m5_exception_reason(exc)[0] in {"DECLARED_SLOT_RUN_ACTIVE", "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE", "GENERATION_BOOTSTRAP_BUSY"}:
             result.update(status="NOT_RUN", reason_code="BUSY")
         else:
             result.update(status="FAILED", reason_code=str(getattr(exc,"code",type(exc).__name__))[:256])
         return result
+    finally:
+        _declared_capture_period_facts(result, context, precommit, row)
 
 
 def _declared_cell_deferral(contract, cell, result):
     if result["status"] != "NOT_RUN":
         return None
     reason = result["reason_code"]
-    if reason == "DISK_LOW" or (
-        (contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA or "native_finalization" in cell)
+    if reason in {"DISK_LOW", "MEMORY_ERROR"} or (
+        (contract.get("schema_version") in {DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA, DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA} or "native_finalization" in cell)
         and reason.startswith(("RETIREMENT_", "SPOOL_RETIREMENT_", "WORKSPACE_ROOT_"))
     ):
         return reason
@@ -1132,10 +1298,14 @@ def declared_symbol_worker(contract: Mapping[str, Any], symbol: str) -> dict[str
             _fail("DECLARED_SCHEDULER_SYMBOL_BINDING_MISMATCH")
         try:
             row = (_declared_m5_run_one_cell(contract, cell)
-                if contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
+                if (contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
+                    or contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA and "m5_development" in cell)
                 else _declared_run_one_cell(contract, cell))
         except Exception as exc:
-            row = _declared_cell_row(cell, "FAILED", str(getattr(exc, "code", type(exc).__name__)), pid=os.getpid())
+            import pm_authority_spool as spool
+            capacity = spool.resource_capacity_reason(exc)
+            row = _declared_cell_row(cell, "NOT_RUN" if capacity else "FAILED",
+                capacity or str(getattr(exc, "code", type(exc).__name__)), pid=os.getpid())
             stopped = True
         rows.append(row)
         if deferred := _declared_cell_deferral(contract, cell, row):
@@ -1202,6 +1372,15 @@ def _declared_validate_result(value: Any, cells: Sequence[Mapping[str, Any]], sy
                 _fail("DECLARED_SCHEDULER_ACCOUNT_DESCRIPTOR_INVALID")
         if row["status"] in {"COMPLETED","REOPENED"} and (not _declared_digest(precommit) or receipt is None or account is None):
             _fail("DECLARED_SCHEDULER_COMPLETED_BINDINGS_MISSING")
+        if "period_facts" in row:
+            selected = expected.get("development", {}).get("selected_slot_ids")
+            if selected is None and "m5_development" in expected:
+                selected = expected["m5_development"]["development_slot_ids"]
+            _declared_checked_period_facts(row["period_facts"], selected)
+        if "retained_account_result" in row:
+            _declared_checked_account_reference(row["retained_account_result"])
+            if row.get("retained_account_bytes") != row["retained_account_result"]["size_bytes"]:
+                _fail("DECLARED_RETAINED_ACCOUNT_CHANGED")
         if "cleanup_failure" in row and (type(row["cleanup_failure"]) is not str or not row["cleanup_failure"] or len(row["cleanup_failure"]) > 256):
             _fail("DECLARED_SCHEDULER_CLEANUP_RESULT_INVALID")
     return owned
@@ -1211,25 +1390,28 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
     from pathlib import Path
     import pm_authority_spool as spool
     if row.get("status") == "ARCHIVED":
-        if contract.get("schema_version") == DECLARED_SCHEDULER_SCHEMA and row.get("source_kind") == "broker_native":
+        development = contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA
+        if contract.get("schema_version") in {DECLARED_SCHEDULER_SCHEMA, DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA} and row.get("source_kind") == "broker_native":
             expected = next(cell for cell in contract["cells"] if cell["descriptor_index"] == row["descriptor_index"])
             if "native_finalization" not in expected:
                 _fail("DECLARED_NATIVE_ARCHIVED_RESULT_INVALID")
             limits = _declared_native_spool_limits(expected)
             record = spool.read_generation_retirement(Path(row["root"]),
                 expected_context_sha256=row["generation_context_sha256"],
-                expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
+                expected_completed_fence_schema=(spool.NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
+                    if development else spool.NATIVE_COMPLETION_FENCE_SCHEMA))
             _declared_native_archive_binding(record, expected, _declared_native_cell_contract_sha256(contract, expected, limits))
             if (record["retirement_receipt_sha256"] != row["archive_record"]["sha256"]
                     or record["retirement_receipt_path"] != row["archive_record"]["path"]
                     or record["source_fence"] != row["archived_result_reference"]
                     or record["end_grid_rows"] != row["retained_end_grid_rows"]
-                    or record["precommit_sha256"] != row["precommit_sha256"]):
+                    or record["precommit_sha256"] != row["precommit_sha256"]
+                    or record.get("retained_account_result") != row.get("retained_account_result")):
                 _fail("DECLARED_NATIVE_ARCHIVE_RECORD_CHANGED")
             if type(row) is dict:
                 row["archive_record_confirmed"] = True
             return None
-        if contract.get("schema_version") != DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA:
+        if contract.get("schema_version") not in {DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA, DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA}:
             _fail("DECLARED_M5_ARCHIVED_RESULT_INVALID")
         record = spool.read_generation_retirement(Path(row["root"]),
             expected_context_sha256=row["generation_context_sha256"])
@@ -1238,7 +1420,8 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
                 or record["retirement_receipt_sha256"] != row["archive_record"]["sha256"]
                 or record["retirement_receipt_path"] != row["archive_record"]["path"]
                 or record["retirement_receipt_path"] != expected["m5_development"]["retirement"]["receipt_path"]
-                or record["cell_contract_sha256"] != _declared_m5_cell_contract_sha256(contract, expected)):
+                or record["cell_contract_sha256"] != _declared_m5_cell_contract_sha256(contract, expected)
+                or record.get("retained_account_result") != row.get("retained_account_result")):
             _fail("DECLARED_M5_ARCHIVE_RECORD_CHANGED")
         if type(row) is dict:
             row["archive_record_confirmed"] = True
@@ -1279,16 +1462,18 @@ def run_declared_symbol_scheduler(
         type(cell) is dict and "slot_parallel_workers" in cell for cell in contract["cells"]
     ):
         _fail("DECLARED_SLOT_PARALLEL_CONTRACT_INVALID")
-    owned, groups = (_declared_m5_contract(contract)
-        if is_m5 else _declared_contract(contract))
+    is_development = type(contract) is dict and contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA
+    owned, groups = (_declared_development_contract(contract) if is_development else
+        _declared_m5_contract(contract) if is_m5 else _declared_contract(contract))
     slot_workers = owned["cells"][0].get("slot_parallel_workers")
     if slot_workers is not None and (
         worker is not declared_symbol_worker or type(requested_workers) is not int or requested_workers != slot_workers
     ):
         _fail("DECLARED_SLOT_PARALLEL_CONTRACT_INVALID")
+    if any(type(value) is not int or value < 0 for value in (disk_min_free_bytes, disk_headroom_bytes)):
+        _fail("DECLARED_SCHEDULER_DISK_POLICY_INVALID")
     owned.update(scheduler_disk_min_free_bytes=disk_min_free_bytes,
         scheduler_disk_headroom_bytes=disk_headroom_bytes)
-    _declared_disk_requirement(owned, DECLARED_CELL_MIN_FREE_BYTES)
     if type(telemetry_max_bytes) is not int or telemetry_max_bytes < 4096:
         _fail("DECLARED_SCHEDULER_TELEMETRY_BOUND_INVALID")
     destination = Path(telemetry_path)
@@ -1296,7 +1481,9 @@ def run_declared_symbol_scheduler(
         _fail("DECLARED_SCHEDULER_TELEMETRY_PATH_INVALID")
     worker_limit = memory_governor.recommended_worker_count(requested_workers, 13 if slot_workers else len(groups))
     governor = memory_governor.MemoryGovernor(requested_workers=worker_limit, termination_grace_seconds=TERMINATION_GRACE_SECONDS)
-    policy = memory_governor.GovernorResourcePolicy(soft_ram_hold=soft_ram_hold,
+    if type(soft_ram_hold) is not bool:
+        raise ValueError("soft_ram_hold must be bool")
+    policy = memory_governor.GovernorResourcePolicy(soft_ram_hold=False,
         soft_ram_target_fraction=soft_ram_target_fraction, sample_interval_seconds=telemetry_interval_seconds, disk_path=str(destination.parent))
     gate = {"open":True, "reason":"ADMISSION_CLOSED"}
     pending_group = {"cells":None}
@@ -1325,30 +1512,20 @@ def run_declared_symbol_scheduler(
             yield memory_governor.MemoryTask(key=symbol, args=({**owned,"cells":cells},symbol))
         pending_group["cells"] = None
     def admission_open():
-        if not gate["open"]:
-            return False
-        try:
-            if pending_group["cells"] is not None and any(
-                    not _declared_disk_ready(cell["root"], owned, DECLARED_CELL_MIN_FREE_BYTES)
-                    for cell in pending_group["cells"]):
-                gate.update(open=False, reason="DISK_LOW")
-        except Exception as exc:
-            gate["reason"] = "DISK_PROBE_ERROR"
-            retain_error("DISK_PROBE:"+type(exc).__name__)
         return gate["open"]
 
     def retain_result(value, cells, symbol, worker_pid):
         value = _declared_validate_result(value, cells, symbol, worker_pid=worker_pid)
         result_rows = value["cells"]
-        disk_deferred = any(row["status"] == "NOT_RUN" and row["reason_code"] == "DISK_LOW"
-            for row in result_rows)
+        capacity_deferred = next((row["reason_code"] for row in result_rows
+            if row["status"] == "NOT_RUN" and row["reason_code"] in {"DISK_LOW", "MEMORY_ERROR"}), None)
         failed = any(row["status"] in {"FAILED","UNRESOLVED_CRASH"}
             or row.get("cleanup_failure") or (row["status"]=="TERMINAL_STOP" and not row["recorded_before_dispatch"])
             for row in result_rows)
-        if failed or (value["closes_admission"] and not disk_deferred):
+        if failed or (value["closes_admission"] and capacity_deferred is None):
             retain_error("CELL_FAILURE:"+symbol)
-        elif disk_deferred:
-            gate.update(open=False, reason="DISK_LOW")
+        elif capacity_deferred is not None:
+            gate.update(open=False, reason=capacity_deferred)
         return result_rows
 
     outcomes = None
@@ -1431,9 +1608,11 @@ def run_declared_symbol_scheduler(
         "cells":[rows[index] for index in range(len(owned["cells"]))],"requested_workers":requested_workers,
         "worker_limit":worker_limit,"errors":errors,"admission_deferral_reason":gate["reason"] if not gate["open"] else None,"resource_stats":asdict(stats) if is_dataclass(stats) else dict(stats),
         "qualification_authority":False,"capital_authority":False,"live_authority":False,"order_authority":False}
-    if is_m5:
+    if is_m5 or is_development:
         try:
-            report["development_completion"] = build_declared_m5_development_completion(owned, report).to_dict()
+            completion_builder = (build_declared_development_completion if is_development
+                else build_declared_m5_development_completion)
+            report["development_completion"] = completion_builder(owned, report).to_dict()
         except Exception as exc:
             retain_error("DEVELOPMENT_COMPLETION:" + str(getattr(exc, "code", type(exc).__name__)))
             report["status"] = "FAILED"
@@ -1520,7 +1699,10 @@ def _declared_m5_contract(contract):
     if (owned["scope"] != _DECLARED_M5_SCOPE
             or any(type(owned["scope"].get(k)) is not type(v) for k, v in _DECLARED_M5_SCOPE.items())
             or owned["profile_sha256"] != _DECLARED_M5_PROFILE
-            or type(owned["spool_limits"]) is not dict or owned["spool_limits"] != _DECLARED_M5_LIMITS
+            or type(owned["spool_limits"]) is not dict
+            or set(owned["spool_limits"]) != set(_DECLARED_M5_LIMITS)
+            or any(owned["spool_limits"][key] != value for key, value in _DECLARED_M5_LIMITS.items()
+                if key not in {"max_symbol_bytes", "max_generation_bytes", "min_free_bytes"})
             or any(type(value) is not int for value in owned["spool_limits"].values())
             or type(owned["view_budgets"]) is not dict or set(owned["view_budgets"]) != _DECLARED_M5_BUDGET_KEYS
             or any(type(value) is not int or value <= 0 for value in owned["view_budgets"].values())):
@@ -1605,8 +1787,7 @@ def _declared_m5_contract(contract):
     retirement = dev["retirement"]
     if (type(retirement) is not dict or set(retirement) != {"receipt_path", "max_paths", "max_nodes", "max_bytes"}
             or any(type(retirement[key]) is not int or retirement[key] <= 0
-                for key in ("max_paths", "max_nodes", "max_bytes"))
-            or retirement["max_bytes"] > checked["spool_limits"]["max_generation_bytes"]):
+                for key in ("max_paths", "max_nodes", "max_bytes"))):
         _fail("DECLARED_M5_RETIREMENT_POLICY_REQUIRED")
     external = []
     root = Path(row["root"])
@@ -1699,7 +1880,7 @@ def _declared_m5_cell_contract_sha256(contract, row):
         "cell": {key: value for key, value in row.items() if key != "descriptor_index"}})
 
 
-def _declared_m5_check_roster(row, parent, context, frozen):
+def _declared_m5_check_roster(row, parent, context, frozen, *, profile_sha256=None):
     import pm_historical_anchor_orchestration as orchestration
     import pm_production_anchor_plan as anchors
     dev = row["m5_development"]
@@ -1707,7 +1888,7 @@ def _declared_m5_check_roster(row, parent, context, frozen):
             or orchestration.declared_slot_source_kind(parent) != "m5_derived"
             or parent.get("cells") != [row["cell"]] or parent.get("run_id") != row["run_id"]
             or parent.get("m5_source_pins") != dev["m5_source_pins"]
-            or parent.get("spread_profile_identity") != {"profile_sha256": _DECLARED_M5_PROFILE}):
+            or parent.get("spread_profile_identity") != {"profile_sha256": _DECLARED_M5_PROFILE if profile_sha256 is None else profile_sha256}):
         _fail("DECLARED_M5_PRECOMMIT_BINDING_MISMATCH")
     anchors.verify_declared_owner_slot_roster(parent["slot_roster"],
         launch_activation_utc=row["launch_activation_utc"], frozen_refit_clock=row["frozen_refit_clock"],
@@ -1792,17 +1973,41 @@ def _declared_m5_external_record(path, body, *, maximum_bytes):
         _fail("DECLARED_M5_FINAL_RECORD_BOUND")
     spool._reject_reparse_chain(path)
     created = False
-    try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    except FileExistsError:
-        descriptor = None
-    if descriptor is not None:
-        created = True
-        with os.fdopen(descriptor, "wb") as stream:
-            if stream.write(encoded) != len(encoded):
-                _fail("DECLARED_M5_FINAL_SHORT_WRITE")
-            stream.flush()
-            os.fsync(stream.fileno())
+    if not os.path.lexists(path):
+        import tempfile
+        descriptor, temporary_name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp", dir=path.parent)
+        temporary = Path(temporary_name)
+        opened = None
+        try:
+            opened = os.fstat(descriptor)
+            stream = os.fdopen(descriptor, "wb")
+            descriptor = None
+            with stream:
+                if stream.write(encoded) != len(encoded):
+                    _fail("DECLARED_M5_FINAL_SHORT_WRITE")
+                stream.flush()
+                os.fsync(stream.fileno())
+            current = temporary.stat(follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_size) != (opened.st_dev, opened.st_ino, len(encoded)):
+                _fail("DECLARED_M5_FINAL_RECORD_CHANGED")
+            spool._reject_reparse_chain(path)
+            try:
+                os.link(temporary, path)
+                created = True
+            except FileExistsError:
+                pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if opened is not None:
+                try:
+                    current = temporary.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                        _fail("DECLARED_M5_FINAL_TEMPORARY_CHANGED")
+                    temporary.unlink()
     spool._reject_reparse_chain(path)
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
@@ -1820,20 +2025,28 @@ def _declared_m5_external_record(path, body, *, maximum_bytes):
 
 
 def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row, owner,
-        edition, run_body, artifact):
+        edition, run_body, artifact, _verified_account_body=None, _verified_chain=None):
     from dataclasses import asdict
+    import hashlib
     import pm_causal_evidence_producer as causal_producer
     import pm_authority_spool as spool
     import pm_forward_oos_replay_producer as forward
     import pm_historical_search_producer as producer
     import pm_m5_job_view as views
     dev = row["m5_development"]
-    body = causal_producer._read_descriptor_json(context, artifact.descriptor,
-        code="DECLARED_CELL_RAW_ACCOUNT")
-    causal_producer._verify_declared_cell_account_manifest(context, body, artifact.descriptor,
-        development=True)
-    forward.verify_declared_m5_development_cell_account_transport(context, body, process=process,
-        frozen_pipeline_config=frozen, m5_owner=owner, cost_edition=edition)
+    body = _verified_account_body
+    if body is None:
+        body = causal_producer._read_descriptor_json(context, artifact.descriptor,
+            code="DECLARED_CELL_RAW_ACCOUNT")
+        causal_producer._verify_declared_cell_account_manifest(context, body, artifact.descriptor,
+            development=True)
+        forward.verify_declared_m5_development_cell_account_transport(context, body, process=process,
+            frozen_pipeline_config=frozen, m5_owner=owner, cost_edition=edition)
+    else:
+        encoded = spool._canonical_json_bytes(body, context.limits.max_artifact_bytes)
+        if (len(encoded) != artifact.descriptor["size_bytes"]
+                or hashlib.sha256(encoded).hexdigest() != artifact.descriptor["sha256"]):
+            _fail("DECLARED_M5_ACCOUNT_RESULT_NOT_COMPLETE")
     if (body.get("progress_status") != "DEVELOPMENT_COMPLETE"
             or tuple(body.get("terminal_consumer_binding_sha256", ())) != owner.consumer_bindings_for(dev["terminal_result_key"])):
         _fail("DECLARED_M5_ACCOUNT_RESULT_NOT_COMPLETE")
@@ -1842,9 +2055,14 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
     slot_results, commits = {}, {}
     import pm_historical_anchor_orchestration as orchestration
     for slot in orchestration.declared_slot_selected_slots(precommit.to_dict()):
-        record = producer._read_declared_commit(context,
-            producer._declared_commit_path(precommit, row["cell"]["cell_id"], slot["ordinal"]))
+        record = None if _verified_chain is None else _verified_chain["commits"].get(slot["slot_id"])
+        if record is None:
+            record = producer._read_declared_commit(context,
+                producer._declared_commit_path(precommit, row["cell"]["cell_id"], slot["ordinal"]))
         if record is None or record[0].get("slot_id") != slot["slot_id"]:
+            _fail("DECLARED_M5_FINAL_COMMIT_MISSING")
+        if _verified_chain is not None and (record[2]["sha256"] != record[1]
+                or hashlib.sha256(spool._canonical_json_bytes(record[0], context.limits.max_json_bytes)).hexdigest() != record[1]):
             _fail("DECLARED_M5_FINAL_COMMIT_MISSING")
         slot_results[slot["slot_id"]] = record[1]
         commits[slot["slot_id"]] = record[0]
@@ -1855,13 +2073,13 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
         _fail("DECLARED_M5_ACCOUNT_RUN_BINDING_MISMATCH")
     if owner.pending_view_ids:
         _fail("DECLARED_M5_FINAL_CONSUMERS_INCOMPLETE", *owner.pending_view_ids)
+    retained_account = _declared_retain_account_result(context, artifact.descriptor,
+        end_grid_root=dev["end_grid_root"], account_body=body)
     direct = _declared_m5_owned_direct_files(context, precommit, row, process=process, frozen=frozen,
         m5_owner=owner, cost_edition=edition, commits=commits)
-    if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-        _fail("DECLARED_M5_DISK_LOW")
     grids = _declared_m5_append_grid(context, precommit=precommit, process=process, row=row,
         owner=owner, edition=edition, account_body=body, account_descriptor=artifact.descriptor,
-        run_descriptor=run_descriptor, commits=commits)
+        run_descriptor=run_descriptor, commits=commits, retained_account_result=retained_account)
     results = {key: views.CallerValidatedResultBinding(value, owner.job_binding_sha256,
         owner.consumer_bindings_for(key), result_descriptor_sha256=grids[key]["row_sha256"])
         for key, value in slot_results.items()}
@@ -1874,8 +2092,6 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
         value["readback_row_sha256"]) for key, value in grids.items()}
     end_grid[terminal] = end_grid[last]
     summary = owner.finish(results, end_grid_rows=end_grid)
-    if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-        _fail("DECLARED_M5_DISK_LOW")
     compact = asdict(summary)
     # The current invocation's append/readback assertion has been checked by
     # finish. Keep the immutable row identity instead of an invocation flag.
@@ -1886,19 +2102,21 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
             gaps = coverage.pop("observed_gaps")
             coverage["observed_gap_count"] = None if gaps is None else len(gaps)
             coverage["observed_gaps_sha256"] = None if gaps is None else _declared_m5_hash(gaps)
-    fence = _declared_m5_external_record(dev["source_fence_path"], {
+    fence_body = {
         "schema_version": "fxpm.declared-m5-development-source-fence.v1",
         "workspace_owner_sha256": spool.read_owned_generation_workspace(context)[1],
         "terminal_end_grid_reference_semantics": "FINAL_SELECTED_SLOT_ROW_WITH_SEPARATE_ACCOUNT_BINDING",
         "retirement_ownership": direct[2],
         "end_grid_rows": {key: {name: value[name] for name in ("path", "row_sha256")}
             for key, value in grids.items()}, "source_summary": compact,
-        **_DECLARED_M5_SCOPE}, maximum_bytes=4 * 1024**2)
+        "retained_account_result": retained_account, **_DECLARED_M5_SCOPE}
+    fence_body = _declared_retained_completion_fence(dev["source_fence_path"], fence_body, maximum_bytes=4 * 1024**2)
+    fence = _declared_m5_external_record(dev["source_fence_path"], fence_body, maximum_bytes=4 * 1024**2)
     return grids, fence, direct
 
 
 def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition, account_body,
-        account_descriptor, run_descriptor, commits):
+        account_descriptor, run_descriptor, commits, retained_account_result=None):
     """Use the original project writer; never coerce a run hash to trade evidence."""
     import hashlib
     from pathlib import Path
@@ -1990,12 +2208,15 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
                 "account_consumer_bindings": account_body["m5_account_consumer_bindings"],
                 "actual_terminal_consumer_sha256": account_body["terminal_consumer_binding_sha256"],
                 "account_artifact_sha256": account_descriptor["sha256"], "cell_run_receipt_sha256": run_descriptor["sha256"]}
-        contract_sha = grid.store_view_contract(dev["end_grid_root"], contract_body)
+            if retained_account_result is not None:
+                contract_body["retained_account_result"] = retained_account_result
         prior = [value for value in retained if value.cell_id == row["cell"]["cell_id"]
             and _declared_m5_utc(value.cycle_start_utc) == _declared_m5_utc(slot["activation_utc"])
             and value.process_edition_sha256 == process.receipt_sha256]
         if len(prior) > 1:
             _fail("DECLARED_M5_GRID_READBACK_MISMATCH")
+        contract_body = _declared_retained_grid_contract(dev["end_grid_root"], contract_body, prior)
+        contract_sha = grid.store_view_contract(dev["end_grid_root"], contract_body)
         produced = prior[0].produced_at_utc if prior else _declared_utc_now().strftime("%Y-%m-%dT%H:%M:%SZ")
         record = grid.build_end_grid_row(symbol=row["cell"]["symbol"], timeframe=row["cell"]["timeframe"],
             regime=row["cell"]["regime"], cycle_start_utc=_declared_m5_grid_utc(slot["activation_utc"]),
@@ -2009,7 +2230,8 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
                 "constructor_implementation_sha256": requests[view_id]["constructor_implementation_sha256"],
                 "gap_findings_sha256": requests[view_id]["gap_findings_sha256"]},
             cost_tier=tier, process_edition_sha256=process.receipt_sha256,
-            code_sha256=code, metrics=_cash_snapshot_reporting(), strategy_family=family,
+            code_sha256=prior[0].code_sha256 if prior else code,
+            metrics=prior[0].metrics if prior else _cash_snapshot_reporting(), strategy_family=family,
             configuration_sha256=configuration,
             job_binding_sha256=owner.job_binding_sha256, consumer_binding_sha256=consumers[0], produced_at_utc=_declared_m5_grid_utc(produced))
         planned.append((key, record))
@@ -2125,6 +2347,20 @@ def _declared_m5_source_abort_paths_clear(context, precommit, cell_id):
     return True
 
 
+def _declared_m5_source_resume(context, precommit, cell_id, window_open):
+    """A clean missing header may reacquire only within the same frozen window."""
+    import os
+    import pm_authority_spool as spool
+    import pm_historical_search_producer as producer
+    source = spool._local_path(context.root, producer._declared_m5_cell_source_path(precommit, cell_id))
+    spool._reject_reparse_chain(source)
+    if os.path.lexists(source):
+        return True
+    if not _declared_m5_source_abort_paths_clear(context, precommit, cell_id):
+        _fail("DECLARED_M5_SOURCE_HEADER_MISSING_WITH_PROGRESS")
+    return False if window_open else None
+
+
 def _declared_m5_exception_reason(error):
     """Keep diagnostic exception text outside the canonical STOP reason."""
     import re
@@ -2148,6 +2384,9 @@ def _declared_m5_capture_source_abort(*, owner, context, precommit, process, cel
         source_error, resumed, source_attempted, owner_created, controller_started,
         dispatch_lease_held, phase):
     """Called inside the original held lease, before the ordinary owner close."""
+    import pm_authority_spool as spool
+    if spool.resource_capacity_reason(source_error) is not None:
+        return None
     if not _declared_m5_source_abort_eligible(resumed=resumed, source_attempted=source_attempted,
             owner_created=owner_created, owner_present=owner is not None,
             controller_started=controller_started, dispatch_lease_held=dispatch_lease_held, phase=phase):
@@ -2159,9 +2398,9 @@ def _declared_m5_capture_source_abort(*, owner, context, precommit, process, cel
     if not _declared_m5_source_abort_paths_clear(context, precommit, cell_id):
         _fail("DECLARED_M5_ABORT_PROGRESS_OR_HEADER_PRESENT")
     code, _ = _declared_m5_exception_reason(source_error)
-    reason = ("DISK_LOW" if spool.is_resource_capacity_error(source_error)
-        or code == "DECLARED_M5_DISK_LOW" else "BUSY" if code == "DECLARED_SLOT_RUN_ACTIVE" else code)
-    if reason == "BUSY":
+    reason = (spool.resource_capacity_reason(source_error)
+        or ("DISK_LOW" if code == "DECLARED_M5_DISK_LOW" else "BUSY" if code == "DECLARED_SLOT_RUN_ACTIVE" else code))
+    if reason in {"BUSY", "DISK_LOW", "MEMORY_ERROR"}:
         return None
     report = owner.abort_before_consumption(reason)
     binding = report.get("binding") if type(report) is dict else None
@@ -2231,6 +2470,10 @@ def _declared_m5_refusal_archived_row(result, record):
         precommit_sha256=record["precommit_sha256"], run_receipt=None, account_descriptor=None)
     if record["result_kind"] == "POST_SOURCE_ABORT_SOURCE_NOT_COMPLETED":
         result["source_abort"] = dict(record["source_abort"])
+    if "period_facts" in record:
+        facts = record["period_facts"]
+        result["period_facts"] = _declared_checked_period_facts(facts,
+            [item["slot_id"] for item in facts] if type(facts) is list else None)
     return result
 
 
@@ -2255,11 +2498,12 @@ def _declared_m5_existing_refusal_record(path):
         "reference": {"path": str(path), "sha256": digest,
             "size_bytes": len(spool._canonical_json_bytes(body, 4 * 1024**2)),
             "readback_sha256": digest, "written": False, "read_only_existing": True},
-        "assurance": "EXISTING_BYTES_ONLY_NOT_NEW_SOURCE_VERIFICATION"}
+        "assurance": "EXISTING_BYTES_ONLY_NOT_NEW_SOURCE_VERIFICATION", "body": body}
 
 
 def _declared_m5_reuse_recorded_rows(result, *, end_grid_root, source_fence_path,
-        cell, slots, process_sha256):
+        cell, slots, process_sha256, generation_context_sha256=None, precommit_sha256=None,
+        run_id=None, cell_contract_sha256=None, workspace_owner_sha256=None):
     """Any retained cell/process row stops all new refusal writes."""
     import pm_end_grid as grid
     if not _declared_digest(process_sha256):
@@ -2308,6 +2552,65 @@ def _declared_m5_reuse_recorded_rows(result, *, end_grid_root, source_fence_path
     if observed["status"] == "DURABLE_EXISTING_RECORD":
         result["terminal_refusal_record"] = observed["reference"]
         result["terminal_refusal_existing_record_assurance"] = observed["assurance"]
+        body = observed["body"]
+        if matching_stops and generation_context_sha256 is not None and precommit_sha256 is not None:
+            expected = {"generation_context_sha256": generation_context_sha256,
+                "precommit_sha256": precommit_sha256, "search_process_receipt_sha256": process_sha256,
+                "cell_id": cell["cell_id"]}
+            expected.update({key: value for key, value in (("run_id", run_id),
+                ("cell_contract_sha256", cell_contract_sha256)) if value is not None})
+            if any(body.get("binding", {}).get(key) != value for key, value in expected.items()):
+                _fail("DECLARED_M5_REFUSAL_BINDING_INVALID")
+            if (workspace_owner_sha256 is not None and body.get("workspace_owner_sha256") != workspace_owner_sha256
+                    or any(body.get(key) is not False for key in ("qualification_authority", "capital_authority",
+                        "live_authority", "order_authority"))):
+                _fail("DECLARED_M5_REFUSAL_BINDING_INVALID")
+            if matching_stops:
+                refusal = body.get("refusal")
+                stop = matching_stops.get(refusal.get("slot_id")) if type(refusal) is dict else None
+                if (stop is None or refusal.get("reason_code") != stop["reason_code"]
+                        or refusal.get("scheduler_status") not in {"NOT_RUN", "FAILED", "TERMINAL_STOP"}
+                        or any(refusal.get(key) != cell[key] for key in ("symbol", "timeframe", "regime"))
+                        or body.get("end_grid_rows", {}).get(refusal["slot_id"]) != {
+                            key: stop[key] for key in ("path", "row_sha256")}):
+                    _fail("DECLARED_M5_REFUSAL_BINDING_INVALID")
+                selected_slot = next(item for item in slots if item["slot_id"] == refusal["slot_id"])
+                if any(_declared_m5_grid_utc(refusal.get(left)) != _declared_m5_grid_utc(selected_slot[right])
+                        for left, right in (("cycle_start_utc", "activation_utc"),
+                            ("cycle_end_utc", "end_exclusive_utc"), ("information_cutoff_utc", "native_cutoff_utc"))):
+                    _fail("DECLARED_M5_REFUSAL_BINDING_INVALID")
+                result.update(status=refusal["scheduler_status"], reason_code=refusal["reason_code"],
+                    terminal_refusal=dict(refusal))
+            saved_facts = (_declared_checked_period_facts(body["period_facts"], [item["slot_id"] for item in slots])
+                if "period_facts" in body else result.get("period_facts"))
+            current_facts = result.get("period_facts")
+            if current_facts is not None and saved_facts is not None:
+                current_facts = _declared_checked_period_facts(current_facts, [item["slot_id"] for item in slots])
+                for current, saved in zip(current_facts, saved_facts, strict=True):
+                    if current["commit_sha256"] is not None and any(current[key] != saved[key] for key in (
+                            "commit_sha256", "completion_status", "reason_code")):
+                        _fail("DECLARED_M5_REFUSAL_PERIOD_CONFLICT")
+            if saved_facts is not None:
+                result["period_facts"] = saved_facts
+    if matching_stops:
+        if result.get("terminal_refusal") is None:
+            result.update(status="FAILED", reason_code="DECLARED_M5_RECORDED_STOP_EVIDENCE_UNAVAILABLE",
+                period_fact_error="DECLARED_M5_RECORDED_STOP_EVIDENCE_UNAVAILABLE")
+        facts = result.get("period_facts")
+        if facts is None:
+            facts = _declared_unobserved_period_facts([item["slot_id"] for item in slots])
+        facts = _declared_checked_period_facts(facts, [item["slot_id"] for item in slots])
+        for fact in facts:
+            stopped = matching_stops.get(fact["slot_id"])
+            if stopped is None:
+                continue
+            reference = {key: stopped[key] for key in ("path", "row_sha256")}
+            if fact["end_grid_reference"] is not None and fact["end_grid_reference"] != reference:
+                _fail("DECLARED_M5_REFUSAL_PERIOD_CONFLICT")
+            if fact["commit_sha256"] is None:
+                fact.update(status="STOPPED", completion_status="STOP", reason_code=stopped["reason_code"])
+            fact["end_grid_reference"] = reference
+        result["period_facts"] = _declared_checked_period_facts(facts, [item["slot_id"] for item in slots])
     return True
 
 
@@ -2379,8 +2682,10 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
         frozen, config, contract, row, cell_contract_sha256, resumed, source_attempted, owner_created,
         owner, phase, run_body, abort_report=None):
     """Append honest STOP metadata; retire only an earned explicit slice."""
+    if phase == "FINALIZATION" and result.get("run_receipt") is not None and result.get("account_descriptor") is not None:
+        return
     if (result.get("status") not in {"NOT_RUN", "FAILED", "TERMINAL_STOP"}
-            or not result.get("reason_code") or result.get("reason_code") == "BUSY"
+            or not result.get("reason_code") or result.get("reason_code") in {"BUSY", "DISK_LOW", "MEMORY_ERROR"}
             or result.get("terminal_refusal_workspace_status") == "RELEASED_RECORDING_ONLY"
             or result.get("reason_code") == "RETIREMENT_INCOMPLETE"
             or result.get("end_grid_descriptor") is not None):
@@ -2403,16 +2708,21 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
         if (actual_workspace_sha != workspace_sha or workspace["cell_contract_sha256"] != cell_contract_sha256
                 or workspace["cell_id"] != row["cell"]["cell_id"]):
             _fail("DECLARED_M5_WORKSPACE_OWNER_CHANGED")
-        if not _declared_disk_ready(context.root, contract, context.limits.min_free_bytes):
-            result["terminal_refusal_record_status"] = "DISK_LOW_RETAINED"
-            return
         if _declared_m5_reuse_recorded_rows(result, end_grid_root=row["m5_development"]["end_grid_root"],
                 source_fence_path=row["m5_development"]["source_fence_path"],
-                cell=row["cell"], slots=slots, process_sha256=process.receipt_sha256):
+                cell=row["cell"], slots=slots, process_sha256=process.receipt_sha256,
+                generation_context_sha256=context.context_sha256, precommit_sha256=precommit.receipt_sha256,
+                run_id=row["run_id"], cell_contract_sha256=cell_contract_sha256, workspace_owner_sha256=workspace_sha):
             return
         if slot is None:
             result["terminal_refusal_record_status"] = "CYCLE_UNRESOLVED_RETAINED"
             return
+        facts = result.get("period_facts")
+        if facts is None or result.get("period_fact_error") is not None:
+            _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_REQUIRED")
+        facts = _declared_checked_period_facts(facts, [item["slot_id"] for item in slots])
+        if any(item["status"] == "NOT_OBSERVED" for item in facts):
+            _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_REQUIRED")
         refusal_result = dict(result)
         if result["status"] == "TERMINAL_STOP":
             import pm_historical_search_producer as producer
@@ -2456,6 +2766,13 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
             strategy_family=None, configuration_sha256=None,
             job_binding_sha256=None if abort_report is None else abort_report["job_binding_sha256"],
             consumer_binding_sha256=None, produced_at_utc=produced)
+        compact_reference = {"path": str(grid._symbol_file(grid._grid_root(
+            row["m5_development"]["end_grid_root"]), row["cell"]["symbol"])), "row_sha256": stopped.row_sha256}
+        fact = facts[slot["ordinal"] - 1]
+        if fact["commit_sha256"] is None:
+            fact.update(status="STOPPED", completion_status="STOP", reason_code=stopped.reason_code)
+        fact["end_grid_reference"] = compact_reference
+        facts = _declared_checked_period_facts(facts, [item["slot_id"] for item in slots])
         appended = grid.EndGridWriter(row["m5_development"]["end_grid_root"]).append(stopped)
         matched = [item for item in grid.read_end_grid(row["m5_development"]["end_grid_root"], row["cell"]["symbol"])
             if item.row_sha256 == stopped.row_sha256]
@@ -2463,7 +2780,11 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
             _fail("DECLARED_M5_GRID_READBACK_MISMATCH")
         reference = {**appended, "readback_row_sha256": matched[0].row_sha256}
         result["terminal_refusal_end_grid"] = {slot["slot_id"]: reference}
-        body["end_grid_rows"] = {slot["slot_id"]: {key: reference[key] for key in ("path", "row_sha256")}}
+        if compact_reference != {key: reference[key] for key in ("path", "row_sha256")}:
+            _fail("DECLARED_M5_GRID_READBACK_MISMATCH")
+        body["end_grid_rows"] = {slot["slot_id"]: compact_reference}
+        result["period_facts"] = facts
+        body["period_facts"] = result["period_facts"]
         dev = row["m5_development"]
         saved = _declared_m5_external_record(dev["source_fence_path"], body, maximum_bytes=4 * 1024**2)
         result.update(terminal_refusal_record=saved, terminal_refusal=dict(refusal),
@@ -2498,8 +2819,11 @@ def _declared_m5_run_one_cell(contract, row):
     controller_started, abort_report = False, None
     phase, run_body = "PRE_SOURCE", None
     try:
-        checked, _ = _declared_m5_contract(contract)
-        if row != checked["cells"][0]:
+        development = contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA
+        checked, _ = (_declared_development_contract(contract) if development else _declared_m5_contract(contract))
+        if ((not development and row != checked["cells"][0]) or (development and not any(
+                {key: value for key, value in row.items() if key != "descriptor_index"}
+                == {key: value for key, value in other.items() if key != "descriptor_index"} for other in checked["cells"]))):
             _fail("DECLARED_M5_CELL_DESCRIPTOR_INVALID")
         dev = row["m5_development"]
         _declared_m5_dependencies()
@@ -2525,9 +2849,6 @@ def _declared_m5_run_one_cell(contract, row):
                 return _declared_m5_archived_row(result, archived)
             result.update(status="NOT_RUN", reason_code="RETIREMENT_INCOMPLETE")
             return result
-        if not _declared_disk_ready(root, contract, contract["spool_limits"]["min_free_bytes"]):
-            result.update(status="NOT_RUN", reason_code="DISK_LOW")
-            return result
         resumed = (root / spool.CONTEXT_RELATIVE_PATH).exists()
         if resumed:
             context = spool.reopen_generation_context(root, expected_generation_id=row["run_id"],
@@ -2536,12 +2857,15 @@ def _declared_m5_run_one_cell(contract, row):
             if asdict(context.limits) != contract["spool_limits"]:
                 _fail("DECLARED_M5_CONTEXT_LIMITS_CHANGED")
         else:
-            if root.exists() and any(root.iterdir()):
-                _fail("DECLARED_M5_FRESH_ROOT_NOT_EMPTY")
-            context = spool.freeze_generation_context(root, generation_id=row["run_id"],
-                native_universe_sha256=contract["native_universe_sha256"], config_sha256=contract["config_sha256"],
-                limits=spool.SpoolLimits(**contract["spool_limits"]),
-                owned_workspace={"cell_id": row["cell"]["cell_id"], "cell_contract_sha256": digest})
+            try:
+                context = spool.freeze_generation_context(root, generation_id=row["run_id"],
+                    native_universe_sha256=contract["native_universe_sha256"], config_sha256=contract["config_sha256"],
+                    limits=spool.SpoolLimits(**contract["spool_limits"]),
+                    owned_workspace={"cell_id": row["cell"]["cell_id"], "cell_contract_sha256": digest})
+            except spool.AuthoritySpoolError as exc:
+                if _declared_m5_exception_reason(exc)[0] == "WORKSPACE_ROOT_NOT_EMPTY":
+                    _fail("DECLARED_M5_FRESH_ROOT_NOT_EMPTY")
+                raise
         workspace, workspace_sha = spool.read_owned_generation_workspace(context)
         if workspace["cell_contract_sha256"] != digest or workspace["cell_id"] != row["cell"]["cell_id"]:
             _fail("DECLARED_M5_WORKSPACE_OWNER_CHANGED")
@@ -2557,16 +2881,12 @@ def _declared_m5_run_one_cell(contract, row):
                 records = sorted((context.root / "declared-slots").glob("*/precommit.json"))
                 if len(records) > 1:
                     _fail("DECLARED_SCHEDULER_MULTIPLE_PRECOMMITS")
-                if resumed:
-                    if len(records) != 1:
-                        _fail("DECLARED_M5_RESUME_PRECOMMIT_MISSING")
+                if records:
                     process = _declared_reopen_process(context, records[0])
                     precommit = orchestration.reopen_declared_slot_owner_run_precommit(context,
                         receipt_sha256=records[0].parent.name, process=process, frozen_pipeline_config=frozen)
                 else:
-                    if records:
-                        _fail("DECLARED_M5_FRESH_PRECOMMIT_ALREADY_EXISTS")
-                    process = planner.freeze_production_search_process(context, run_id=row["run_id"])
+                    process = _declared_initial_process(context, row, development=development)
                     roster = anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
                         frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs={
                             "config_sha256": context.config_sha256, "effective_config_sha256": frozen.effective_config_sha256},
@@ -2583,8 +2903,21 @@ def _declared_m5_run_one_cell(contract, row):
                         source_access_window_utc=window, launch_activation_utc=row["launch_activation_utc"],
                         m5_source_pins=dev["m5_source_pins"], development_slot_ids=dev["development_slot_ids"])
                 parent = precommit.to_dict()
-                slots = _declared_m5_check_roster(row, parent, context, frozen)
+                slots = _declared_m5_check_roster(row, parent, context, frozen,
+                    **({"profile_sha256": contract["profile_sha256"]} if development else {}))
                 result["precommit_sha256"] = precommit.receipt_sha256
+                _declared_capture_period_facts(result, context, precommit, row)
+                _declared_m5_reuse_recorded_rows(result, end_grid_root=dev["end_grid_root"],
+                    source_fence_path=dev["source_fence_path"], cell=row["cell"], slots=slots,
+                    process_sha256=process.receipt_sha256, generation_context_sha256=context.context_sha256,
+                    precommit_sha256=precommit.receipt_sha256, run_id=row["run_id"],
+                    cell_contract_sha256=digest, workspace_owner_sha256=workspace_sha)
+                if result.get("terminal_refusal_end_grid"):
+                    if result.get("terminal_refusal") is not None:
+                        result["recorded_before_dispatch"] = True
+                        if result["status"] == "TERMINAL_STOP":
+                            result["reason_code"] = "RECORDED_TERMINAL_STOP"
+                    return result
                 account_request = forward.declared_m5_development_cell_account_request(context, precommit=precommit,
                     process=process, frozen_pipeline_config=frozen)
                 account_axis = next(axis for axis in dev["view_axes"] if axis["view_id"] == dev["account_view_id"])
@@ -2592,7 +2925,8 @@ def _declared_m5_run_one_cell(contract, row):
                     _fail("DECLARED_M5_ACCOUNT_AXIS_MISMATCH")
                 window, _ = orchestration._declared_slot_effective_access(context, precommit, parent, slots[0])
                 window_open = _declared_m5_utc(window["start_utc"]) <= _declared_utc_now() < _declared_m5_utc(window["end_exclusive_utc"])
-                if not window_open and not resumed:
+                source_recorded = _declared_m5_source_resume(context, precommit, row["cell"]["cell_id"], window_open)
+                if source_recorded is None:
                     result.update(status="NOT_RUN", reason_code="WINDOW_EXPIRED")
                     return result
                 snapshot, errors = portfolio.active_native_portfolio_contract(Path(config.data_dir),
@@ -2600,7 +2934,7 @@ def _declared_m5_run_one_cell(contract, row):
                 if orchestration._declared_slot_native_snapshot_status(context, snapshot, errors) != "MATCH":
                     result.update(status="NOT_RUN", reason_code="NATIVE_DRIFT")
                     return result
-                if resumed:
+                if source_recorded:
                     source_attempted, phase = True, "SOURCE_ACQUISITION"
                     source = producer.reopen_declared_m5_cell_source_context(context, precommit=precommit,
                         process=process, frozen_pipeline_config=frozen, cell_id=row["cell"]["cell_id"],
@@ -2616,8 +2950,6 @@ def _declared_m5_run_one_cell(contract, row):
                     # First payload access: the fixed source window already exists.
                     source_attempted, phase = True, "SOURCE_ACQUISITION"
                     edition = costs.open_recorded_derived_costs_route(contract["cost_edition_route"])
-                    if not _declared_disk_ready(root, contract, context.limits.min_free_bytes):
-                        _fail("DECLARED_M5_DISK_LOW")
                     owner = _declared_m5_new_owner(context, precommit=precommit, process=process,
                         frozen=frozen, config=config, contract=contract, row=row, edition=edition)
                     owner_created, phase = True, "SOURCE_HEADER"
@@ -2625,8 +2957,6 @@ def _declared_m5_run_one_cell(contract, row):
                         frozen_pipeline_config=frozen, cell_id=row["cell"]["cell_id"], cell_contract_sha256=digest,
                         m5_owner=owner, slot_view_ids=dev["slot_view_ids"],
                         calibration_view_id=dev["calibration_view_id"], cost_edition=edition)
-                if not _declared_disk_ready(root, contract, context.limits.min_free_bytes):
-                    _fail("DECLARED_M5_DISK_LOW")
                 result["recorded_before_dispatch"] = (context.root / producer._declared_run_path(precommit, row["cell"]["cell_id"])).exists()
                 controller_args = {"precommit": precommit, "process": process, "frozen_pipeline_config": frozen,
                     "cell_id": row["cell"]["cell_id"], "m5_owner": owner, "slot_view_ids": dev["slot_view_ids"],
@@ -2634,11 +2964,14 @@ def _declared_m5_run_one_cell(contract, row):
                     "cell_contract_sha256": digest}
                 controller_started = True
                 phase = "PRODUCER_CONTROLLER"
+                verified_chain = {}
                 if window_open:
-                    run = producer.execute_declared_cell_owner_slots(context=context, **controller_args)
+                    run = producer.execute_declared_cell_owner_slots(context=context,
+                        _verified_progress_out=verified_chain, **controller_args)
                     run_body = run.to_dict()
                 else:
-                    progress = producer.reopen_declared_cell_owner_progress(context, **controller_args)
+                    progress = producer.reopen_declared_cell_owner_progress(context,
+                        _verified_progress_out=verified_chain, **controller_args)
                     if progress.run_receipt is None:
                         result.update(status="NOT_RUN", reason_code="WINDOW_EXPIRED")
                         return result
@@ -2649,25 +2982,31 @@ def _declared_m5_run_one_cell(contract, row):
                         if result["recorded_before_dispatch"] else "NEW_TERMINAL_STOP")
                     return result
                 phase = "ACCOUNT"
-                if not _declared_disk_ready(root, contract, context.limits.min_free_bytes):
-                    _fail("DECLARED_M5_DISK_LOW")
-                if window_open:
-                    artifact = forward.produce_declared_m5_development_cell_account_artifact(context,
+                artifact, account_inputs, account_body = forward._prepare_declared_m5_development_cell_account_artifact(
+                    context, precommit=precommit, process=process, frozen_pipeline_config=frozen,
+                    _verified_chain=verified_chain)
+                account_produced = False
+                if window_open and artifact is None:
+                    artifact = forward._produce_declared_m5_development_cell_account_from_inputs(context,
                         precommit=precommit, process=process, frozen_pipeline_config=frozen,
+                        inputs=account_inputs, body=account_body,
                         m5_owner=owner, account_view_id=dev["account_view_id"], cost_edition=edition)
-                else:
-                    artifact = forward.discover_declared_m5_development_cell_account_artifact(context,
-                        precommit=precommit, process=process, frozen_pipeline_config=frozen)
-                    if artifact is None:
-                        result.update(status="NOT_RUN", reason_code="WINDOW_EXPIRED")
-                        return result
+                    account_produced = True
+                elif artifact is None:
+                    result.update(status="NOT_RUN", reason_code="WINDOW_EXPIRED")
+                    return result
                 result["account_descriptor"] = dict(artifact.descriptor)
                 phase = "FINALIZATION"
                 grid, fence, direct = _declared_m5_finalize(context, precommit=precommit, process=process,
                     frozen=frozen, contract=contract, row=row, owner=owner, edition=edition,
-                    run_body=run_body, artifact=artifact)
+                    run_body=run_body, artifact=artifact,
+                    _verified_account_body=account_body if account_produced else None,
+                    _verified_chain=verified_chain)
+                retained_account = _declared_account_result_reference(context, artifact.descriptor,
+                    end_grid_root=dev["end_grid_root"])
                 result.update(status="REOPENED" if resumed else "COMPLETED", account_descriptor=dict(artifact.descriptor),
-                    end_grid_descriptor=grid, source_fence_descriptor=fence)
+                    end_grid_descriptor=grid, source_fence_descriptor=fence,
+                    retained_account_result=retained_account, retained_account_bytes=retained_account["size_bytes"])
                 protected = _declared_m5_protected_paths(contract, row, config)
                 policy = dev["retirement"]
                 archived = spool.retire_completed_generation(context.root, expected_context_sha256=context.context_sha256,
@@ -2677,6 +3016,8 @@ def _declared_m5_run_one_cell(contract, row):
                     max_paths=policy["max_paths"], max_nodes=policy["max_nodes"], max_bytes=policy["max_bytes"])
                 return _declared_m5_archived_row(result, archived)
             except Exception as source_error:
+                if spool.resource_capacity_reason(source_error) is not None:
+                    raise
                 try:
                     abort_report = _declared_m5_capture_source_abort(owner=owner, context=context,
                         precommit=precommit, process=process, cell_id=row["cell"]["cell_id"],
@@ -2689,9 +3030,10 @@ def _declared_m5_run_one_cell(contract, row):
     except Exception as exc:
         code, diagnostics = _declared_m5_exception_reason(exc)
         result["exception_diagnostics"] = diagnostics
-        if spool.is_resource_capacity_error(exc) or code == "DECLARED_M5_DISK_LOW":
-            result.update(status="NOT_RUN", reason_code="DISK_LOW")
-        elif code == "DECLARED_SLOT_RUN_ACTIVE":
+        capacity = spool.resource_capacity_reason(exc)
+        if capacity is not None or code == "DECLARED_M5_DISK_LOW":
+            result.update(status="NOT_RUN", reason_code=capacity or "DISK_LOW")
+        elif code in {"DECLARED_SLOT_RUN_ACTIVE", "GENERATION_BOOTSTRAP_BUSY"}:
             result.update(status="NOT_RUN", reason_code="BUSY")
         elif code == "GRID_EVIDENCE_KIND_UNSUPPORTED":
             result.update(status="NOT_RUN", reason_code=code)
@@ -2704,6 +3046,7 @@ def _declared_m5_run_one_cell(contract, row):
                 descriptor_assurance="IDENTITY_ONLY_RETIREMENT_INCOMPLETE", genuine_cold_reopen_available=False)
         return result
     finally:
+        _declared_capture_period_facts(result, context, precommit, row)
         try:
             _declared_m5_record_terminal_refusal(result, context=context, workspace_sha=workspace_sha,
                 precommit=precommit, process=process, frozen=frozen, config=config, contract=contract,
@@ -2717,6 +3060,8 @@ def _declared_m5_run_one_cell(contract, row):
                     terminal_refusal_workspace_status="RETIREMENT_INCOMPLETE",
                     genuine_cold_reopen_available=False, run_receipt=None, account_descriptor=None)
         finally:
+            if result.get("status") == "TERMINAL_STOP" and result.get("recorded_before_dispatch") is True:
+                result["reason_code"] = "RECORDED_TERMINAL_STOP"
             if owner is not None:
                 owner.close()
 
@@ -2729,6 +3074,16 @@ def _declared_m5_archived_row(result, record):
         descriptor_assurance="IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE", genuine_cold_reopen_available=False,
         precommit_sha256=record.get("precommit_sha256"),
         run_receipt=None, account_descriptor=None)
+    if record.get("retained_account_result") is not None:
+        from pathlib import Path
+        import pm_authority_spool as spool
+        reference = record["retained_account_result"]
+        body, digest = spool._retirement_external(Path(reference["path"]), reference["size_bytes"])
+        if digest != reference["sha256"]:
+            _fail("DECLARED_RETAINED_ACCOUNT_CHANGED")
+        result.update(retained_account_result=dict(reference), retained_account_bytes=reference["size_bytes"])
+        if body.get("development_scope") is not None:
+            result["period_facts"] = _declared_account_period_facts(body)
     return result
 
 
@@ -3147,3 +3502,385 @@ def _cash_snapshot_reporting():
     """Disclose the existing cash basis without changing execution or conversion."""
     return {"cash_uses_tick_value_snapshot": True,
             "historical_fx_reconstructed": False}
+
+
+DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA = "fxpm.declared-development-cell-scheduler.v1"
+
+
+def _declared_development_contract(contract):
+    """Decode the explicit accepted-cell prefix edition using existing source metadata."""
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_production_search_planner as planner
+    required = {"schema_version", "native_universe_sha256", "config_sha256", "profile_sha256",
+        "active_config_path", "cells", "scope", "execution_edition"}
+    optional = {"spool_limits", "view_budgets", "cost_edition_route",
+        "scheduler_disk_min_free_bytes", "scheduler_disk_headroom_bytes"}
+    if (type(contract) is not dict or not required <= set(contract) or not set(contract) <= required | optional
+            or contract.get("schema_version") != DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA
+            or contract.get("execution_edition") != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION):
+        _fail("DECLARED_DEVELOPMENT_CONTRACT_INVALID")
+    expected_scope = {key: value for key, value in _DECLARED_M5_SCOPE.items() if key != "source_kind"}
+    expected_scope["adopted_symbols"] = list(orchestration.DECLARED_DEVELOPMENT_SYMBOLS)
+    if (contract["scope"] != expected_scope
+            or any(type(contract["scope"][key]) is not type(value) for key, value in expected_scope.items())):
+        _fail("DECLARED_DEVELOPMENT_SCOPE_INVALID")
+    checked, groups = _declared_contract(dict(contract, schema_version=DECLARED_SCHEDULER_SCHEMA))
+    checked["schema_version"] = DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA
+    cells = set()
+    for row in checked["cells"]:
+        cell = row["cell"]
+        key = tuple(cell[name] for name in ("symbol", "timeframe", "regime"))
+        development = row.get("development")
+        kind = "m5_derived" if "m5_development" in row else "broker_native"
+        if (cell["symbol"] not in orchestration.DECLARED_DEVELOPMENT_SYMBOLS or key in cells
+                or type(development) is not dict or set(development) != {"source_kind", "selected_slot_ids"}
+                or development["source_kind"] != kind or "slot_parallel_workers" in row):
+            _fail("DECLARED_DEVELOPMENT_CELL_INVALID")
+        import pm_book_multiplicity as book
+        import pm_winner_selection as selection
+        if (cell["timeframe"] not in book.TIMEFRAME_ORDER or cell["regime"] not in book.REGIME_ORDER
+                or cell["cell_id"] != selection.compute_cell_id(cell["symbol"], cell["timeframe"], cell["regime"])):
+            _fail("DECLARED_DEVELOPMENT_CELL_INVALID")
+        if kind == "broker_native" and "native_finalization" not in row:
+            _fail("DECLARED_DEVELOPMENT_NATIVE_FINALIZATION_REQUIRED")
+        cells.add(key)
+        ids = development["selected_slot_ids"]
+        if (type(ids) is not list or not 1 <= len(ids) <= 3
+                or any(type(value) is not str or not value for value in ids) or len(set(ids)) != len(ids)):
+            _fail("DECLARED_DEVELOPMENT_PREFIX_INVALID")
+        if kind == "m5_derived":
+            if "native_finalization" in row:
+                _fail("DECLARED_DEVELOPMENT_SOURCE_METADATA_INVALID")
+            _declared_development_m5_metadata(checked, row)
+    return checked, groups
+
+
+def _declared_development_m5_metadata(contract, row):
+    """Reconcile the original per-cell view, cost-edition and research-admission fields."""
+    from pathlib import Path
+    import pm_m5_job_view as views
+    import pm_m5_derived_costs as costs
+    import pm_explicit_derived_publication as publication
+    import pm_historical_anchor_orchestration as orchestration
+    if (type(contract.get("spool_limits")) is not dict
+            or set(contract["spool_limits"]) != set(_DECLARED_M5_LIMITS)
+            or any(contract["spool_limits"][key] != value for key, value in _DECLARED_M5_LIMITS.items()
+                if key not in {"max_symbol_bytes", "max_generation_bytes", "min_free_bytes"})
+            or type(contract.get("view_budgets")) is not dict
+            or set(contract["view_budgets"]) != _DECLARED_M5_BUDGET_KEYS
+            or any(type(value) is not int or value <= 0 for value in contract["view_budgets"].values())):
+        _fail("DECLARED_M5_LIMITS_OR_SCOPE_INVALID")
+    pins = costs._decode_cost_reopen_route(contract["cost_edition_route"])
+    if pins.profile_sha256 != contract["profile_sha256"]:
+        _fail("DECLARED_M5_COST_EDITION_MISMATCH")
+    if row["source_access_window_policy"] != {"lead_seconds": 0, "validity_seconds": 172800}:
+        _fail("DECLARED_M5_WINDOW_POLICY_INVALID")
+    dev, cell = row["m5_development"], row["cell"]
+    fields = {"development_slot_ids", "view_axes", "slot_view_ids", "calibration_view_id",
+        "account_view_id", "required_result_keys", "terminal_result_key", "m5_source_pins",
+        "cost_group_metadata", "gap_provenance", "end_grid_root", "source_fence_path", "retirement"}
+    if type(dev) is not dict or set(dev) != fields or dev["development_slot_ids"] != row["development"]["selected_slot_ids"]:
+        _fail("DECLARED_M5_CELL_DESCRIPTOR_INVALID")
+    selected = dev["development_slot_ids"]
+    if type(dev["slot_view_ids"]) is not dict or set(dev["slot_view_ids"]) != set(selected):
+        _fail("DECLARED_M5_VIEW_ROSTER_INVALID")
+    ids = list(dev["slot_view_ids"].values()) + [dev["calibration_view_id"], dev["account_view_id"]]
+    if (any(type(value) is not str or not value for value in ids) or len(set(ids)) != len(ids)
+            or type(dev["terminal_result_key"]) is not str or not dev["terminal_result_key"]
+            or dev["terminal_result_key"] in selected
+            or dev["required_result_keys"] != selected + [dev["terminal_result_key"]]):
+        _fail("DECLARED_M5_VIEW_ROSTER_INVALID")
+    axes = dev["view_axes"]
+    if type(axes) is not list or len(axes) != len(ids):
+        _fail("DECLARED_M5_VIEW_AXES_INVALID")
+    plan_sha = views.declared_view_plan_sha256(tuple(axes))
+    by_id = {axis["view_id"]: axis for axis in axes}
+    if (set(by_id) != set(ids) or any(axis["symbol"] != cell["symbol"] or axis["timeframe"] != cell["timeframe"]
+            or axis["source_kind"] != "m5_derived" or axis["clock_template_sha256"] is not None
+            or axis["clock_axes_sha256"] is not None or axis["recipe_sha256"] != _DECLARED_M5_RECIPE for axis in axes)):
+        _fail("DECLARED_M5_VIEW_AXES_INVALID")
+    for view_id, axis in by_id.items():
+        purpose = "COST_EDITION_REPRODUCTION_ONLY" if view_id == dev["calibration_view_id"] else "FINANCIAL_INPUT"
+        if axis["purpose"] != purpose or not _declared_digest(axis["spread_identification_sha256"]):
+            _fail("DECLARED_M5_VIEW_AXES_INVALID")
+    orchestration._validate_declared_m5_source_pins(dev["m5_source_pins"], cell)
+    if (dev["m5_source_pins"]["cost_edition_identity"] != pins.identity()
+            or dev["m5_source_pins"]["view_plan_sha256"] != plan_sha
+            or any(axis["constructor_implementation_sha256"] != dev["m5_source_pins"]["constructor_identity"].get(
+                "pm_explicit_derived_history.py") for axis in axes)):
+        _fail("DECLARED_M5_SOURCE_PINS_MISMATCH")
+    group = dev["cost_group_metadata"]
+    calibration = by_id[dev["calibration_view_id"]]
+    if (type(group) is not dict or group.get("symbol") != cell["symbol"] or group.get("timeframe") != cell["timeframe"]
+            or group.get("cost_status") != publication.COST_READY or group.get("source_kind") != "m5_derived"
+            or type(group.get("fine_source")) is not dict
+            or group.get("spread_identification_sha256") != calibration["spread_identification_sha256"]
+            or group.get("available_interval") != calibration["interval"]):
+        _fail("DECLARED_M5_RECORDED_CELL_METADATA_INVALID")
+    _declared_development_m5_admission(dev, cell)
+    retirement = dev["retirement"]
+    if (type(retirement) is not dict or set(retirement) != {"receipt_path", "max_paths", "max_nodes", "max_bytes"}
+            or any(type(retirement[key]) is not int or retirement[key] <= 0 for key in ("max_paths", "max_nodes", "max_bytes"))):
+        _fail("DECLARED_M5_RETIREMENT_POLICY_REQUIRED")
+    root, external = Path(row["root"]), []
+    for value in (dev["end_grid_root"], dev["source_fence_path"], retirement["receipt_path"]):
+        if type(value) is not str or not Path(value).is_absolute() or ".." in Path(value).parts:
+            _fail("DECLARED_M5_FINAL_PATH_INVALID")
+        path = Path(value).resolve()
+        if path == root or path.is_relative_to(root) or root.is_relative_to(path):
+            _fail("DECLARED_M5_FINAL_PATH_INVALID")
+        external.append(path)
+    if len(set(external)) != len(external):
+        _fail("DECLARED_M5_FINAL_PATH_INVALID")
+
+
+def _declared_development_m5_admission(dev, cell):
+    """Read existing per-cell admission metadata without transplanting XAG's decision."""
+    import json
+    from pathlib import Path
+    import pm_authority_spool as spool
+    gap = dev["gap_provenance"]
+    fields = {"status", "gap_status", "admission_record", "lineage", "gap_pattern_observations", "control_identification_sha256"}
+    if (type(gap) is not dict or set(gap) != fields or gap["status"] != "AVAILABLE_DATA_ONLY_RESEARCH_ADMISSION"
+            or gap["gap_status"] != "UNCLASSIFIED"
+            or gap["control_identification_sha256"] != dev["cost_group_metadata"]["spread_identification_sha256"]):
+        _fail("DECLARED_M5_GAP_PROVENANCE_INVALID")
+    reference = gap["admission_record"]
+    if (type(reference) is not dict or set(reference) != {"path", "bytes", "sha256"}
+            or type(reference["path"]) is not str or not Path(reference["path"]).is_absolute()
+            or type(reference["bytes"]) is not int or not 0 < reference["bytes"] <= 32 * 1024**2
+            or not _declared_digest(reference["sha256"])):
+        _fail("DECLARED_M5_RESEARCH_ADMISSION_REQUIRED")
+    path = Path(reference["path"])
+    digest, size, encoded = spool._stream_file(path.parent, path.name,
+        maximum_bytes=reference["bytes"], expected_size=reference["bytes"], collect=True)
+    if (digest, size) != (reference["sha256"], reference["bytes"]):
+        _fail("DECLARED_M5_RESEARCH_ADMISSION_CHANGED")
+    record = json.loads(encoded)
+    if (record.get("schema_version") != "fxpm.available-data-research-admission.v1"
+            or record.get("status") != gap["status"] or record.get("gap_status") != "UNCLASSIFIED"
+            or record.get("cell") != {name: cell[name] for name in ("symbol", "timeframe", "regime")}
+            or record.get("selected_periods") != len(dev["development_slot_ids"])
+            or type(record.get("decision_event")) is not str or not record["decision_event"]
+            or not _declared_digest(record.get("decision_event_canonical_sha256"))
+            or record.get("lineage") != gap["lineage"]
+            or record.get("gap_pattern_observations") != gap["gap_pattern_observations"]
+            or gap["lineage"].get("sha256") != dev["m5_source_pins"]["gap_findings_sha256"]
+            or any(axis["gap_findings_sha256"] != gap["lineage"].get("sha256") for axis in dev["view_axes"])
+            or gap["gap_pattern_observations"].get("calendar_causal_classifications_adopted") is not False
+            or record.get("design_contaminated") is not True or record.get("pristine_validation") is not False
+            or any(record.get(key) is not False for key in ("financial_consumer_ready", "full_native_context_eligibility",
+                "qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_M5_RESEARCH_ADMISSION_CHANGED")
+    return record
+
+
+
+def build_declared_development_completion(contract, report):
+    """Project actual commit facts separately from final account retention."""
+    checked, _ = _declared_development_contract(contract)
+    rows = report.get("cells") if type(report) is dict else None
+    if (type(rows) is not list or len(rows) != len(checked["cells"])
+            or len({row.get("descriptor_index") for row in rows}) != len(rows)):
+        _fail("DEVELOPMENT_COMPLETION_CELL_ROSTER_INVALID")
+    by_index = {row["descriptor_index"]: row for row in rows}
+    cells, complete = [], True
+    for cell in checked["cells"]:
+        actual = by_index.get(cell["descriptor_index"])
+        if actual is None or actual.get("cell_id") != cell["cell"]["cell_id"]:
+            _fail("DEVELOPMENT_COMPLETION_CELL_BINDING_INVALID")
+        selected = cell["development"]["selected_slot_ids"]
+        evidence_error = actual.get("period_fact_error")
+        facts = actual.get("period_facts")
+        if facts is None:
+            facts = _declared_unobserved_period_facts(selected)
+        try:
+            facts = _declared_checked_period_facts(facts, selected)
+        except Exception as exc:
+            evidence_error = str(getattr(exc, "code", type(exc).__name__))[:256]
+            facts = _declared_unobserved_period_facts(selected)
+        references = actual.get("retained_end_grid_rows", {})
+        reference = actual.get("retained_account_result")
+        done = (evidence_error is None and actual["status"] == "ARCHIVED" and actual.get("archive_record_confirmed") is True
+            and type(references) is dict and set(references) == set(selected)
+            and reference is not None and all(item["status"] == "COMMITTED"
+                and item["completion_status"] in {"OWNER", "NO_TRADE"} for item in facts))
+        if reference is not None:
+            _declared_checked_account_reference(reference)
+        complete = complete and done
+        periods = [{**item, "end_grid_reference": item["end_grid_reference"] or references.get(item["slot_id"])} for item in facts]
+        stop_reason = next((item["reason_code"] for item in facts
+            if item["status"] == "STOPPED" and item["reason_code"]), None)
+        reason = (evidence_error or actual.get("native_finalization_reason_code") or stop_reason or actual["reason_code"]
+            or ("ACCOUNT_RESULT_NOT_RETAINED" if reference is None else "FINALIZATION_INCOMPLETE"))
+        cells.append({"cell": cell["cell"], "source_kind": cell["development"]["source_kind"],
+            "selected_periods": len(selected), "completed_periods": sum(item["status"] == "COMMITTED"
+                and item["completion_status"] in {"OWNER", "NO_TRADE"} for item in facts),
+            "committed_periods": sum(item["commit_sha256"] is not None for item in facts),
+            "status": "COMPLETED" if done else "NOT_FINALIZED", "reported_status": actual["status"],
+            "reason_code": actual["reason_code"] if done else reason,
+            "periods": periods, "archive_record": actual.get("archive_record"),
+            "period_fact_error": evidence_error,
+            "period_evidence_status": ("UNAVAILABLE" if evidence_error else "NOT_OBSERVED" if all(
+                item["status"] == "NOT_OBSERVED" for item in facts) else "PARTIAL" if any(
+                item["status"] == "NOT_OBSERVED" for item in facts) else "OBSERVED"),
+            "retained_account_result": reference,
+            "retained_account_bytes": None if reference is None else reference["size_bytes"],
+            "financial_outcomes": "RETAINED_VERIFIED_ACCOUNT_RESULT_NO_ORIGINAL_SOURCE_REPLAY" if done else "NOT_FINALIZED"})
+    return _declared_development_report({"schema_version": "fxpm.declared-development-completion.v2",
+        "status": "COMPLETED" if complete else "INCOMPLETE", "cells": cells,
+        "selected_periods": sum(cell["selected_periods"] for cell in cells),
+        "completed_periods": sum(cell["completed_periods"] for cell in cells),
+        "committed_periods": sum(cell["committed_periods"] for cell in cells),
+        "result_kind": "DEVELOPMENT_PARTIAL", "design_contaminated": True, "pristine_validation": False,
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False})
+
+
+__all__ += ["DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA", "build_declared_development_completion"]
+
+
+def _declared_checked_account_reference(reference):
+    from pathlib import Path
+    if (type(reference) is not dict or set(reference) != {"path", "sha256", "size_bytes"}
+            or type(reference["path"]) is not str or not Path(reference["path"]).is_absolute()
+            or not _declared_digest(reference["sha256"])
+            or type(reference["size_bytes"]) is not int or reference["size_bytes"] <= 0):
+        _fail("DECLARED_RETAINED_ACCOUNT_REFERENCE_INVALID")
+    return reference
+
+
+def _declared_account_result_reference(context, descriptor, *, end_grid_root):
+    from pathlib import Path
+    import pm_authority_spool as spool
+    descriptor = spool._validate_descriptor(descriptor, content_addressed=True)
+    if descriptor["format"] != spool.CANONICAL_JSON_FORMAT:
+        _fail("DECLARED_RETAINED_ACCOUNT_FORMAT_INVALID")
+    root, working = Path(end_grid_root).resolve(), Path(context.root).resolve()
+    if root.is_relative_to(working) or working.is_relative_to(root):
+        _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    return {"path": str(root / ("declared-account-" + descriptor["sha256"] + ".json")),
+        "sha256": descriptor["sha256"], "size_bytes": descriptor["size_bytes"]}
+
+
+def _declared_retain_account_result(context, descriptor, *, end_grid_root, account_body=None):
+    """Preserve the actual verified result before its working objects are released."""
+    import hashlib
+    from pathlib import Path
+    import pm_authority_spool as spool
+    import pm_causal_evidence_producer as causal
+    descriptor = spool._validate_descriptor(descriptor, content_addressed=True)
+    if descriptor["format"] != spool.CANONICAL_JSON_FORMAT:
+        _fail("DECLARED_RETAINED_ACCOUNT_FORMAT_INVALID")
+    root, working = Path(end_grid_root).resolve(), Path(context.root).resolve()
+    if root.is_relative_to(working) or working.is_relative_to(root):
+        _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    body = (causal._read_descriptor_json(context, descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
+        if account_body is None else account_body)
+    encoded = spool._canonical_json_bytes(body, descriptor["size_bytes"])
+    if len(encoded) != descriptor["size_bytes"] or hashlib.sha256(encoded).hexdigest() != descriptor["sha256"]:
+        _fail("DECLARED_RETAINED_ACCOUNT_CHANGED")
+    relative = "declared-account-" + descriptor["sha256"] + ".json"
+    digest = spool._retirement_publish_v2(root, relative, body, descriptor["size_bytes"])
+    if digest != descriptor["sha256"]:
+        _fail("DECLARED_RETAINED_ACCOUNT_CHANGED")
+    return {"path": str(root / relative), "sha256": digest, "size_bytes": descriptor["size_bytes"]}
+
+
+def _declared_unobserved_period_facts(selected):
+    return [{"ordinal": ordinal, "slot_id": slot, "status": "NOT_OBSERVED", "reason_code": None,
+        "commit_sha256": None, "completion_status": None, "end_grid_reference": None}
+        for ordinal, slot in enumerate(selected, 1)]
+
+
+def _declared_checked_period_facts(facts, selected):
+    if (type(selected) is not list or type(facts) is not list or len(facts) != len(selected)
+            or len(set(selected)) != len(selected)):
+        _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+    stopped, missing = False, False
+    for ordinal, (slot, item) in enumerate(zip(selected, facts, strict=True), 1):
+        if (type(item) is not dict or set(item) != {"ordinal", "slot_id", "status", "reason_code", "commit_sha256", "completion_status", "end_grid_reference"}
+                or item["ordinal"] != ordinal or item["slot_id"] != slot
+                or item["status"] not in {"COMMITTED", "STOPPED", "NOT_RUN", "NOT_OBSERVED"}
+                or item["reason_code"] is not None and (type(item["reason_code"]) is not str or len(item["reason_code"]) > 256)):
+            _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+        if item["status"] in {"NOT_RUN", "NOT_OBSERVED"}:
+            if (item["commit_sha256"] is not None or item["completion_status"] is not None
+                    or item["end_grid_reference"] is not None):
+                _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+            missing = missing or item["status"] == "NOT_RUN"
+        else:
+            reference = item["end_grid_reference"]
+            if reference is not None:
+                from pathlib import Path
+                if (type(reference) is not dict or set(reference) != {"path", "row_sha256"}
+                        or type(reference["path"]) is not str or not Path(reference["path"]).is_absolute()
+                        or not _declared_digest(reference["row_sha256"])):
+                    _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+            has_commit = _declared_digest(item["commit_sha256"])
+            if (stopped or missing or not has_commit and not (item["status"] == "STOPPED" and reference is not None
+                    and item["commit_sha256"] is None)
+                    or item["completion_status"] not in {"OWNER", "NO_TRADE", "MISSING", "STOP"}
+                    or (item["status"] == "STOPPED") != (item["completion_status"] == "STOP")):
+                _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+            stopped = item["status"] == "STOPPED"
+    return _declared_json_copy(facts)
+
+
+def _declared_account_period_facts(body):
+    summaries = body.get("slot_summaries")
+    if type(summaries) is not list:
+        _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+    facts = [{"ordinal": item["ordinal"], "slot_id": item["slot_id"], "status": "COMMITTED",
+        "reason_code": None, "commit_sha256": item["commit_sha256"], "completion_status": item["status"], "end_grid_reference": None} for item in summaries
+        if type(item) is dict and item.get("status") in {"OWNER", "NO_TRADE"}]
+    if len(facts) != len(summaries):
+        _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+    return _declared_checked_period_facts(facts, [item["slot_id"] for item in summaries])
+
+
+def _declared_capture_period_facts(result, context, precommit, row):
+    """Keep each original commit fact before optional workspace retirement."""
+    if (context is None or precommit is None or result.get("status") == "ARCHIVED"
+            or not ("development" in row or "m5_development" in row)):
+        return
+    import os
+    import pm_authority_spool as spool
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_historical_search_producer as producer
+    if (result.get("reason_code") == "BUSY" or result.get("terminal_refusal_end_grid") and result.get("period_facts") is not None
+            or any(os.path.lexists(context.root / name) for name in (
+            spool.RETIREMENT_RELATIVE_PATH, spool.RETIREMENT_INTENT_RELATIVE_PATH))):
+        return
+    facts, slots = [], []
+    try:
+        slots = orchestration.declared_slot_selected_slots(precommit.to_dict())
+        previous, ended = None, False
+        for ordinal, slot in enumerate(slots, 1):
+            saved = producer._read_declared_commit(context,
+                producer._declared_commit_path(precommit, row["cell"]["cell_id"], ordinal))
+            if saved is None:
+                ended = True
+                facts.append({"ordinal": ordinal, "slot_id": slot["slot_id"], "status": "NOT_RUN",
+                    "reason_code": None, "commit_sha256": None, "completion_status": None, "end_grid_reference": None})
+                continue
+            commit, digest, _ = saved
+            completion = commit.get("completion", {})
+            status = completion.get("status")
+            if (ended or commit.get("schema_version") not in {producer.DECLARED_SLOT_COMMIT_SCHEMA,
+                    producer._DECLARED_SLOT_POST_COMPLETION_COMMIT_SCHEMA}
+                    or commit.get("generation_context_sha256") != context.context_sha256
+                    or commit.get("precommit_sha256") != precommit.receipt_sha256
+                    or commit.get("cell_id") != row["cell"]["cell_id"] or commit.get("slot_id") != slot["slot_id"]
+                    or commit.get("ordinal") != ordinal or commit.get("previous_commit_sha256") != previous
+                    or status not in {"OWNER", "NO_TRADE", "MISSING", "STOP"}):
+                _fail("DEVELOPMENT_COMPLETION_PERIOD_EVIDENCE_INVALID")
+            facts.append({"ordinal": ordinal, "slot_id": slot["slot_id"],
+                "status": "STOPPED" if status == "STOP" else "COMMITTED",
+                "reason_code": completion.get("reason_code"), "commit_sha256": digest, "completion_status": status, "end_grid_reference": None})
+            previous, ended = digest, status == "STOP"
+        result["period_facts"] = _declared_checked_period_facts(facts, [item["slot_id"] for item in slots])
+    except Exception as exc:
+        result["period_fact_error"] = str(getattr(exc, "code", type(exc).__name__))[:256]
+        if slots:
+            remainder = _declared_unobserved_period_facts([item["slot_id"] for item in slots])
+            result["period_facts"] = facts + remainder[len(facts):]

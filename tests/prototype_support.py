@@ -347,9 +347,9 @@ def _synthetic_reopened_declared_prefix(tmp_path, monkeypatch, edition, *, missi
     profile_path = terms / "spread_profile.json"
     (terms / "synthetic_frozen_profile.json").rename(profile_path)
     env.arguments["spread_profile_identity"] = {"profile_sha256": tiers["P75"].descriptor()["profile_sha256"]}
-    issuer = (orchestration.precommit_declared_slot_owner_run_v2 if edition == "v16"
-        else orchestration.precommit_declared_slot_owner_run)
-    env.precommit = issuer(env.context, **env.arguments)
+    env.precommit = (orchestration.precommit_declared_slot_owner_run_v2(
+        env.context, **env.arguments, final_study_13=True) if edition == "v16"
+        else orchestration.precommit_declared_slot_owner_run(env.context, **env.arguments))
     parameters = RegimeParams().to_dict()
     winner_process = {"strategy_id": "EMACrossoverStrategy", "strategy_class": "EMACrossoverStrategy",
         "strategy_module": "pm_strategies"}

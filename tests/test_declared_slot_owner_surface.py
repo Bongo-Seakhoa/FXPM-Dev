@@ -465,11 +465,9 @@ def test_declared_full_canonical_owner_slot_commits_and_cold_reopens(tmp_path):
 
 
 def test_declared_full_canonical_postfreeze_stop_commits_and_cold_reopens(tmp_path):
-    """One labelled fault; real source, canonical freeze, commit and cold verifier."""
+    """One labelled fault on invented inputs; current full-panel freeze, commit and cold verifier."""
     import os
-    from audit_reports.fxpm_workshop_20261007.declared_slot_owner_surface_verification.real_control import (
-        POSTFREEZE_FAULT_CODE, run_first_slot,
-    )
+    from tests.fxpm_current_stop_control import POSTFREEZE_FAULT_CODE, run_first_slot
     work = run_first_slot(tmp_path / "fixed-full300-postfreeze-stop",
         controlled_postfreeze_fault=True)
     actual = json.loads((work / "actual-first-slot-result.json").read_text(encoding="utf-8"))
@@ -514,7 +512,7 @@ def retained_declared_green_stop():
     from pathlib import Path
     import pm_authority_spool as spool
     import pm_production_config_binding as binding
-    from audit_reports.fxpm_workshop_20261007.declared_slot_owner_surface_verification import real_control
+    from tests import fxpm_current_stop_control as real_control
 
     _, protocol = real_control._protocol(controlled_postfreeze_fault=True)
     retained = protocol["retained_postfreeze_stop_capsule"]
@@ -551,145 +549,13 @@ def retained_declared_green_stop():
         native_artifact_descriptors=tuple(dict(item) for item in product.artifact_descriptors))
 
 
-@pytest.fixture(scope="module")
-def retained_declared_write_inputs(retained_declared_green_stop):
-    """Restore actual issued v1 metadata as cold capabilities, without live grants."""
-    import pm_authority_spool as spool
-    retained = retained_declared_green_stop
-    capsule, context = retained.capsule, retained.context
-    process = planner.reopen_production_search_process(
-        context, spool_receipt=capsule["process_spool_receipt"],
-        expected_receipt_sha256=capsule["process_receipt_sha256"],
-    )
-    assert process.to_dict()["schema_version"] == planner.ORIGINAL_PROCESS_SCHEMA
-    precommit = orchestration.reopen_declared_slot_owner_run_precommit(
-        context, receipt_sha256=capsule["precommit_sha256"],
-        process=process, frozen_pipeline_config=retained.frozen,
-    )
-    body = retained.committed["completion"]["request_body"]
-    encoded = orchestration._declared_json(body)
-    orchestration._verify_declared_issued_bytes(context, orchestration._declared_request_path(body), encoded)
-    sink = spool.open_symbol_sink(context, body["symbol"])
-    request = orchestration.DeclaredSlotProducerRequest(
-        encoded, precommit, sink, orchestration._DECLARED_SLOT_SEAL,
-    )
-    orchestration._register_declared_request(request, context, live=False)
-    assert orchestration.verify_declared_slot_producer_request(
-        context, request, precommit=precommit, process=process,
-    ) == body
-    yield SimpleNamespace(context=context, process=process, precommit=precommit, request=request,
-        sink=sink, frozen=retained.frozen, cell_id=capsule["cell_id"],
-        slot=precommit.to_dict()["slot_roster"]["slots"][0],
-        completion=retained.committed["completion"], roster=retained.committed["artifact_roster"])
-    orchestration._release_declared_slot_producer_request(request, context)
-
-
-@pytest.fixture(scope="module")
-def retained_declared_mixed_write_inputs(retained_declared_write_inputs, tmp_path_factory):
-    """Synthetic cross-edition pairing with actual issued bytes and identical identities."""
-    import pm_authority_spool as spool
-    original = retained_declared_write_inputs
-    work = tmp_path_factory.mktemp("synthetic-current-v1-binding")
-    context = spool.freeze_generation_context(
-        work / "spool", generation_id=original.context.generation_id,
-        native_universe_sha256=original.context.native_universe_sha256,
-        config_sha256=original.context.config_sha256, limits=original.context.limits,
-    )
-    assert context.context_sha256 == original.context.context_sha256
-    process = planner.freeze_production_search_process(context, run_id="synthetic-current-v1-binding")
-    assert planner.verify_frozen_production_search_process(context, process) is True
-    precommit_body = original.precommit.to_dict()
-    spool._publish_exact_json(context,
-        f"declared-slots/{original.precommit.receipt_sha256}/precommit.json",
-        precommit_body, context.limits.max_json_bytes)
-    precommit = orchestration.reopen_declared_slot_owner_run_precommit(
-        context, receipt_sha256=original.precommit.receipt_sha256,
-        process=None, frozen_pipeline_config=original.frozen,
-    )
-    assert precommit._body_json == original.precommit._body_json
-    assert orchestration.verify_declared_slot_owner_run_precommit(context, precommit) == precommit_body
-    with pytest.raises(orchestration.HistoricalAnchorOrchestrationError) as caught:
-        orchestration.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
-    assert str(caught.value) == "DECLARED_SLOT_PROCESS_BINDING_MISMATCH"
-    body = original.request.to_dict()
-    spool._publish_exact_json(context, orchestration._declared_request_path(body),
-        body, context.limits.max_json_bytes)
-    encoded = orchestration._declared_json(body)
-    orchestration._verify_declared_issued_bytes(context, orchestration._declared_request_path(body), encoded)
-    sink = spool.open_symbol_sink(context, body["symbol"])
-    request = orchestration.DeclaredSlotProducerRequest(encoded, precommit, sink, orchestration._DECLARED_SLOT_SEAL)
-    orchestration._register_declared_request(request, context, live=False)
-    assert orchestration.verify_declared_slot_producer_request(context, request, precommit=precommit) == body
-    (work / "assurance-provenance.json").write_bytes(_canonical({
-        "classification": "SYNTHETIC_CROSS_EDITION_BINDING_NEGATIVE_NO_TRADING_AUTHORITY",
-        "original_issued_bytes_modified": False, "new_fit_or_evaluation": False,
-        "qualification_authority": False, "capital_authority": False,
-        "live_authority": False, "order_authority": False,
-    }))
-    yield SimpleNamespace(context=context, process=process, precommit=precommit, request=request,
-        sink=sink, frozen=original.frozen, cell_id=original.cell_id, slot=original.slot,
-        completion=original.completion, roster=original.roster)
-    orchestration._release_declared_slot_producer_request(request, context)
-
-
-def _forbid_declared_write_effects(monkeypatch):
-    import pm_authority_spool as spool
-    calls = []
-    def forbidden(*args, **kwargs):
-        calls.append(True)
-        raise AssertionError("retained edition reached a write, lease or write-capable verifier")
-    for name in ("_publish_exact_json", "write_canonical_json_artifact", "open_symbol_sink",
-                 "reserve_transient_publication", "_ensure_directory"):
-        monkeypatch.setattr(spool, name, forbidden)
-    for name in ("put_json", "put_opaque", "seal"):
-        monkeypatch.setattr(spool.SymbolAuthoritySink, name, forbidden)
-    monkeypatch.setattr(adapter, "verify_declared_slot_completion", forbidden)
-    return calls
-
-
-@pytest.mark.parametrize("operation", ["request", "source-execute", "driver", "finalize", "commit", "terminal"])
-@pytest.mark.parametrize("pair", ["original-v1", "mixed-current-with-v1"])
-def test_declared_original_and_mixed_pairs_refuse_before_write(
-    retained_declared_write_inputs, retained_declared_mixed_write_inputs, monkeypatch, operation, pair,
-):
-    env = retained_declared_write_inputs if pair == "original-v1" else retained_declared_mixed_write_inputs
-    process = env.process
-    calls = _forbid_declared_write_effects(monkeypatch)
-    operations = {
-        "request": lambda: orchestration.declared_slot_producer_request(env.context,
-            precommit=env.precommit, process=process, cell_id=env.cell_id,
-            slot_id=env.slot["slot_id"], attempt_id="forbidden-original-reissue", sink=env.sink),
-        "source-execute": lambda: producer.execute_declared_slot_owner_search(env.context,
-            request=env.request, process=process, frozen_pipeline_config=env.frozen),
-        "driver": lambda: producer.execute_declared_cell_owner_slots(context=env.context,
-            precommit=env.precommit, process=process, cell_id=env.cell_id, frozen_pipeline_config=env.frozen),
-        "finalize": lambda: producer._execute_declared_cell_owner_slots_unlocked(context=env.context,
-            precommit=env.precommit, process=process, cell_id=env.cell_id, frozen_pipeline_config=env.frozen),
-        "commit": lambda: producer._commit_declared_slot_completion(env.context,
-            precommit=env.precommit, process=process, cell_id=env.cell_id, slot=env.slot,
-            completion=env.completion, artifact_roster=env.roster, previous_commit_sha256=None,
-            frozen_pipeline_config=env.frozen),
-        "terminal": lambda: producer._commit_declared_terminal_failure(env.context,
-            precommit=env.precommit, process=process, cell_id=env.cell_id, completed=[],
-            last_commit_sha256=None, failure={}),
-    }
-    error_type = (planner.ProductionSearchPlannerError if pair == "original-v1"
-                  else orchestration.HistoricalAnchorOrchestrationError)
-    with pytest.raises(error_type) as caught:
-        operations[operation]()
-    assert str(caught.value) == (
-        "RETAINED_PROCESS_IS_READ_ONLY" if pair == "original-v1" else "DECLARED_SLOT_PROCESS_BINDING_MISMATCH"
-    )
-    assert calls == []
-
-
 def _clone_declared_green_stop(tmp_path, retained):
     """Copy only issued generation closure; reuse unchanged fixed native inputs read-only."""
     from pathlib import Path
     import shutil
     import pm_authority_spool as spool
     import pm_production_config_binding as binding
-    from audit_reports.fxpm_workshop_20261007.declared_slot_owner_surface_verification import real_control
+    from tests import fxpm_current_stop_control as real_control
 
     capsule = retained.capsule
     request_body = retained.committed["completion"]["request_body"]
@@ -891,25 +757,6 @@ def test_declared_green_stop_authenticates_frozen_chain(tmp_path, retained_decla
     assert getattr(caught.value, "code", str(caught.value)) == error_code
     assert observed["native_verified"] is True
     assert observed["frozen_chain_entered"] is (damage != "cross-pointer-missing")
-
-
-@pytest.mark.parametrize("held_v2", [False, True], ids=["ordinary-stop", "v2-held-stop"])
-def test_declared_green_stop_with_compositional_trace_refuses_original_commit(
-    tmp_path, retained_declared_green_stop, held_v2, monkeypatch,
-):
-    env = _clone_declared_green_stop(tmp_path, retained_declared_green_stop)
-    _add_compositional_production_trace(env)
-    post_failure = ({"exception_type": "OSError", "failure_code": "QA_COMPOSITIONAL_POST_COMPLETION_FAILURE",
-        "failure_observed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-        if held_v2 else None)
-    calls = _forbid_declared_write_effects(monkeypatch)
-    with pytest.raises(planner.ProductionSearchPlannerError) as caught:
-        producer._commit_declared_slot_completion(env.context, precommit=env.precommit,
-            process=env.process, cell_id=env.cell_id, slot=env.slot, completion=env.completion,
-            artifact_roster=env.roster, previous_commit_sha256=None, frozen_pipeline_config=env.frozen,
-            post_completion_failure=post_failure)
-    assert caught.value.code == "RETAINED_PROCESS_IS_READ_ONLY"
-    assert calls == []
 
 
 def test_declared_candidate_risk_gate_uses_materialized_original_config(tmp_path, monkeypatch):
@@ -2244,9 +2091,9 @@ def _declared_transport_environment(tmp_path, monkeypatch, edition, *, native_sn
     """Issue real metadata on invented inputs; no source, fit or OWNER evidence."""
     tmp_path.mkdir(parents=True, exist_ok=True)
     env = _declared_environment(tmp_path, monkeypatch, issue=False, native_snapshot=native_snapshot)
-    issuer = (orchestration.precommit_declared_slot_owner_run_v2 if edition == "v16"
-              else orchestration.precommit_declared_slot_owner_run)
-    env.precommit = issuer(env.context, **env.arguments)
+    env.precommit = (orchestration.precommit_declared_slot_owner_run_v2(
+        env.context, **env.arguments, final_study_13=True) if edition == "v16"
+        else orchestration.precommit_declared_slot_owner_run(env.context, **env.arguments))
     return env
 
 

@@ -491,7 +491,7 @@ def test_declared_slot_parallel_preserves_parent_admission_failures(tmp_path, mo
     assert not Path(row["root"]).exists()
 
 
-@pytest.mark.parametrize("case", ["expired", "child-capacity", "live-claim"])
+@pytest.mark.parametrize("case", ["expired", "child-capacity", "child-disk", "child-memory", "live-claim"])
 def test_declared_slot_parallel_real_scheduler_guards(tmp_path, monkeypatch, case):
     from datetime import datetime, timedelta, timezone
 
@@ -556,7 +556,7 @@ def test_declared_slot_parallel_real_scheduler_guards(tmp_path, monkeypatch, cas
             governors.append(self)
 
         def iter_completed(self, worker, tasks, **kwargs):
-            if case != "child-capacity":
+            if not case.startswith("child-"):
                 yield from super().iter_completed(worker, tasks, **kwargs)
                 return
             assert worker is producer.declared_slot_worker
@@ -567,8 +567,13 @@ def test_declared_slot_parallel_real_scheduler_guards(tmp_path, monkeypatch, cas
                 else:
                     yield scheduler.memory_governor.TaskOutcome(task.key, "NOT_RUN")
 
-    if case == "child-capacity":
+    if case.startswith("child-"):
         def fail_capacity(*args, **kwargs):
+            if case == "child-memory":
+                raise MemoryError("INVENTED_RAM_CAPACITY_FAILURE")
+            if case == "child-disk":
+                import errno
+                raise OSError(errno.ENOSPC, "INVENTED_DISK_CAPACITY_FAILURE")
             cause = quota.AuthoritySpoolQuotaError("SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED")
             raise spool.AuthoritySpoolError(str(cause)) from cause
 
@@ -581,7 +586,7 @@ def test_declared_slot_parallel_real_scheduler_guards(tmp_path, monkeypatch, cas
 
     monkeypatch.setattr(scheduler.memory_governor, "MemoryGovernor", ObservedGovernor)
     kwargs = {"contract": contract, "requested_workers": 4, "telemetry_path": tmp_path / "telemetry.jsonl"}
-    if case in {"expired", "child-capacity"}:
+    if case == "expired":
         with pytest.raises(scheduler.DeclaredSymbolSchedulerError) as caught:
             scheduler.run_declared_symbol_scheduler(**kwargs)
         report = caught.value.report
@@ -590,7 +595,9 @@ def test_declared_slot_parallel_real_scheduler_guards(tmp_path, monkeypatch, cas
     result, = report["cells"]
     expected = {
         "expired": ("TERMINAL_STOP", "NEW_TERMINAL_STOP"),
-        "child-capacity": ("FAILED", "DECLARED_PARALLEL_SLOT_RESOURCE_CAPACITY"),
+        "child-capacity": ("NOT_RUN", "DISK_LOW"),
+        "child-disk": ("NOT_RUN", "DISK_LOW"),
+        "child-memory": ("NOT_RUN", "MEMORY_ERROR"),
         "live-claim": ("NOT_RUN", "BUSY"),
     }
     assert (result["status"], result["reason_code"]) == expected[case], result

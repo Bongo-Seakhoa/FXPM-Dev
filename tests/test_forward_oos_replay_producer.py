@@ -1396,10 +1396,10 @@ def test_mixed_current_trial_original_recipe_cannot_launder_archived_code_pins(t
         source_snapshot_sha256=horizon["source_snapshot_sha256"], source_bar_count=horizon["source_bar_count"],
         seed=recipe["seed"])
     current = producer.current_refit.build_current_refit_search_artifacts_v2(parameters=trial["parameters"], **arguments)
-    assert process["strategy_code_sha256"] == producer.current_refit.RETAINED_STRATEGY_SOURCE_V1_SHA256
+    assert process["strategy_code_sha256"] != current.winner_process["strategy_code_sha256"]
     assert current.winner_process == {
         **process,
-        "strategy_code_sha256": producer.current_refit.RETAINED_STRATEGY_V1_SUCCESSOR_SHA256,
+        "strategy_code_sha256": current.winner_process["strategy_code_sha256"],
     }
     assert current.horizon_process == horizon
     assert current.trial_definition != trial
@@ -3456,9 +3456,6 @@ def _prepare_current_raw_inputs(tmp_path):
     assert sum(int(item["prefix_rows"]) for item in all_identities) <= (
         producer._MAX_NATIVE_ROWS_PER_ANCHOR
     ), "CURRENT_RAW_NATIVE_ROW_BOUND_EXCEEDED"
-    assert sum(int(item["prefix_bytes"]) for item in all_identities) <= (
-        producer._MAX_NATIVE_BYTES_PER_ANCHOR
-    ), "CURRENT_RAW_NATIVE_BYTE_BOUND_EXCEEDED"
     global_input = {
         "schema_version": producer.REPLAY_PRECOMMIT_SCHEMA,
         "generation_id": context.generation_id,
@@ -4201,3 +4198,91 @@ def _current_f_owner_capture_arguments(case, *, frozen, cross):
     return {"context": context, "entries": entries, "anchor": index["anchor"],
             "index": index, "record": record, "request": request, "decision": decision,
             "frozen": frozen, "cross": cross, "cell_id": frozen.precommitment["cell_id"]}
+
+
+@pytest.mark.parametrize("drift", [None, "owner", "cost", "source"])
+def test_m5_account_slot_inputs_encode_stable_metadata_once_and_check_each_source(
+    monkeypatch, drift,
+):
+    """INVENTED metadata joins only; no native source/account authority is claimed."""
+    import pm_historical_search_producer as historical_producer
+
+    cutoffs = ["2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"]
+    owner_metadata = {"product_cutoffs": cutoffs, "fixture": "INVENTED_OWNER"}
+    cost_route = {"fixture": "INVENTED_COST_ROUTE"}
+    routes = [{"cutoff_utc": cutoff, "fixture": "INVENTED_SOURCE"} for cutoff in cutoffs]
+    calls = {"owner": 0, "cost": 0, "products": [], "reads": [], "encoded": []}
+
+    def reopen_metadata():
+        calls["owner"] += 1
+        return owner_metadata
+
+    def reopen_route():
+        calls["cost"] += 1
+        return cost_route
+
+    def product_at(cutoff):
+        calls["products"].append(cutoff)
+        return routes[cutoffs.index(cutoff)]
+
+    owner = SimpleNamespace(reopen_metadata=reopen_metadata, product_at=product_at)
+    cost_edition = SimpleNamespace(reopen_route=reopen_route)
+    saved_entries, commits, expected = {}, [], []
+    for ordinal in (1, 2):
+        slot_id = f"invented-slot-{ordinal}"
+        session_id, saved_id = f"session-{ordinal}", f"saved-{ordinal}"
+        request_sha = str(ordinal) * 64
+        session = {"request_sha256": request_sha, "m5_reopen_context_entry": saved_id,
+                   "m5_request_view_id": f"request-{ordinal}",
+                   "m5_calibration_view_id": f"calibration-{ordinal}",
+                   "m5_request_view_observation": {"slot": ordinal, "kind": "request"},
+                   "m5_calibration_view_observation": {"slot": ordinal, "kind": "calibration"}}
+        saved = {"owner_metadata": copy.deepcopy(owner_metadata),
+                 "cost_edition_route": copy.deepcopy(cost_route),
+                 "fine_product_routes": copy.deepcopy(routes),
+                 "m5_request_view_id": session["m5_request_view_id"],
+                 "m5_calibration_view_id": session["m5_calibration_view_id"]}
+        saved_entries[session_id], saved_entries[saved_id] = session, saved
+        commits.append({"completion": {"request_body": {"slot_id": slot_id},
+                        "request_sha256": request_sha, "source_session_entry": session_id}})
+        expected.append({"slot_id": slot_id, "request_sha256": request_sha,
+                         "request_view_id": session["m5_request_view_id"],
+                         "calibration_view_id": session["m5_calibration_view_id"],
+                         "request_observation": session["m5_request_view_observation"],
+                         "calibration_observation": session["m5_calibration_view_observation"]})
+    if drift == "owner":
+        saved_entries["saved-2"]["owner_metadata"]["fixture"] = "CHANGED"
+    elif drift == "cost":
+        saved_entries["saved-2"]["cost_edition_route"]["fixture"] = "CHANGED"
+    elif drift == "source":
+        saved_entries["saved-2"]["fine_product_routes"][0]["fixture"] = "CHANGED"
+
+    def read_entry(context, entry, **kwargs):
+        calls["reads"].append((entry, kwargs["body"]["slot_id"]))
+        return copy.deepcopy(saved_entries[entry]), None
+
+    original_encode = producer._canonical_bytes
+
+    def counted_encode(value, *args, **kwargs):
+        if value is owner_metadata or value is cost_route:
+            calls["encoded"].append(id(value))
+        return original_encode(value, *args, **kwargs)
+
+    monkeypatch.setattr(historical_producer, "_read_declared_m5_reopen_entry", read_entry)
+    monkeypatch.setattr(historical_producer, "_prefix_route", lambda product: dict(product))
+    monkeypatch.setattr(producer.historical, "declared_slot_selected_slots", lambda parent: parent["slots"])
+    monkeypatch.setattr(producer, "_canonical_bytes", counted_encode)
+    inputs = {"commits": commits, "parent": {"slots": [1, 2]}}
+    if drift is None:
+        assert producer._declared_m5_account_slot_inputs(
+            None, inputs=inputs, owner=owner, cost_edition=cost_edition) == expected
+    else:
+        with pytest.raises(producer.ForwardOOSReplayProductionError,
+                           match="DECLARED_M5_ACCOUNT_SLOT_SOURCE_CHANGED"):
+            producer._declared_m5_account_slot_inputs(
+                None, inputs=inputs, owner=owner, cost_edition=cost_edition)
+    assert calls["owner"] == calls["cost"] == 1
+    assert calls["encoded"] == [id(owner_metadata), id(cost_route)]
+    assert calls["reads"] == [("session-1", "invented-slot-1"), ("saved-1", "invented-slot-1"),
+                              ("session-2", "invented-slot-2"), ("saved-2", "invented-slot-2")]
+    assert calls["products"] == cutoffs * (2 if drift in {None, "source"} else 1)

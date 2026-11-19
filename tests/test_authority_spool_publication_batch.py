@@ -5,6 +5,7 @@ import os
 import threading
 import unittest
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -219,17 +220,14 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(len(tree(ctx.root)), 2)
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
 
-    def test_generation_cap_refuses_inside_a_batch_and_keeps_earlier_objects(self):
+    def test_legacy_generation_cap_does_not_truncate_a_batch(self):
         ctx = self.capped("cap", 3, slack=100)
-        with self.assertRaises(spool.AuthoritySpoolError) as caught:
-            with spool.publication_batch(ctx):
-                for i in range(6):
-                    spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
-        self.assertIn("SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED", str(caught.exception))
-        self.assertIsInstance(caught.exception.__cause__, quota.AuthoritySpoolQuotaError)
-        self.assertFalse(spool.is_resource_capacity_error(caught.exception))
-        self.assertQuota(ctx, 3 * SIZE)
-        self.assertEqual(len(tree(ctx.root)), 3)
+        with spool.publication_batch(ctx):
+            for i in range(6):
+                spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
+        self.assertQuota(ctx, 6 * SIZE)
+        self.assertEqual(len(tree(ctx.root)), 6)
+        self.assertGreater(state(ctx.root)["committed_bytes"], ctx.limits.max_generation_bytes)
 
     def test_small_remaining_quota_is_used_exactly(self):
         ctx = self.capped("exact", 3)
@@ -239,17 +237,14 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertQuota(ctx, 3 * SIZE)
         self.assertEqual(state(ctx.root)["committed_bytes"], ctx.limits.max_generation_bytes)
 
-    def test_free_space_reserve_breach_is_a_capacity_error(self):
+    def test_legacy_free_space_reserve_does_not_block_a_batch(self):
         free = 10**9
         self.fixed_disk_free(free)
-        ctx = self.context("floor", min_free_bytes=free - 2_000)   # the context file fits, one payload does not
-        with self.assertRaises(spool.AuthoritySpoolError) as caught:
-            with spool.publication_batch(ctx):
-                spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
-        self.assertIn("SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED", str(caught.exception))
-        self.assertTrue(spool.is_resource_capacity_error(caught.exception))
-        self.assertEqual(len(tree(ctx.root)), 0)
-        self.assertQuota(ctx, 0)
+        ctx = self.context("floor", min_free_bytes=free - 2_000)
+        with spool.publication_batch(ctx):
+            spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
+        self.assertEqual(len(tree(ctx.root)), 1)
+        self.assertQuota(ctx, SIZE)
 
     def test_free_space_headroom_smaller_than_the_window_is_still_usable(self):
         free = 10**9
@@ -350,20 +345,20 @@ class PublicationBatchTests(unittest.TestCase):
     # Regressions for Root E5725.
 
     def test_context_drift_refuses_the_next_object_before_any_write(self):
+        """Explicit changed binding must not reuse an admitted batch context."""
         ctx = self.context("drift")
         path = ctx.root / spool.CONTEXT_RELATIVE_PATH
         original = path.read_bytes()
         self.assertEqual(original.count(b'"cut1"'), 1)
         with spool.publication_batch(ctx):
             spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
-            os.chmod(path, 0o600); path.write_bytes(original.replace(b'"cut1"', b'"cut2"'))   # same length, different content
+            changed = replace(ctx, generation_id="cut2")
             with self.assertRaises(spool.AuthoritySpoolError) as caught:
-                spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
+                spool.write_opaque_artifact(changed, [payload(2)], format=FORMAT)
             self.assertNotIn("SPOOL_QUOTA", str(caught.exception))
             self.assertEqual(len(tree(ctx.root)), 1)
             self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
             self.assertEqual(state(ctx.root)["reservations"][0]["materialized_bytes"], 0)   # nothing reported for object 2
-            path.write_bytes(original)
             spool.write_opaque_artifact(ctx, [payload(3)], format=FORMAT)
         self.assertQuota(ctx, 2 * SIZE)
         self.assertEqual(len(tree(ctx.root)), 2)
@@ -404,7 +399,7 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertQuota(ctx, 2 * SIZE)
         self.assertEqual(len(tree(ctx.root)), 2)
 
-    def test_declining_free_space_does_not_double_count_published_bytes(self):
+    def test_declining_reported_free_space_does_not_truncate_or_double_count(self):
         ctx = self.context("declining")
         free_at_start = 100_000
 
@@ -415,15 +410,13 @@ class PublicationBatchTests(unittest.TestCase):
         original = quota._disk_free
         quota._disk_free = declining
         self.addCleanup(setattr, quota, "_disk_free", original)
-        fits = free_at_start // SIZE
-        self.assertEqual(fits, 21)
-        with self.assertRaises(spool.AuthoritySpoolError) as caught:
-            with spool.publication_batch(ctx):
-                for i in range(fits + 1):
-                    spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
-        self.assertTrue(spool.is_resource_capacity_error(caught.exception))
-        self.assertEqual(len(tree(ctx.root)), fits)                          # every object that fits is published
-        self.assertQuota(ctx, fits * SIZE)
+        formerly_fits = free_at_start // SIZE
+        self.assertEqual(formerly_fits, 21)
+        with spool.publication_batch(ctx):
+            for i in range(formerly_fits + 1):
+                spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
+        self.assertEqual(len(tree(ctx.root)), formerly_fits + 1)
+        self.assertQuota(ctx, (formerly_fits + 1) * SIZE)
 
     def test_failure_after_the_link_leaves_the_record_for_the_rescan(self):
         ctx = self.context("afterlink")
@@ -601,20 +594,20 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(tree(ctx.root), expected)
         self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
 
-    def test_terminal_control_refuses_new_object_inside_open_batch(self):
+    def test_terminal_control_refuses_new_batch_before_any_new_object(self):
         """INVENTED terminal control: existence of any shape must refuse admission."""
         ctx = self.context("terminal_during_batch")
         terminal = ctx.root / quota.GENERATION_TERMINAL_NAME
-        with spool.publication_batch(ctx):
-            descriptor = spool.write_opaque_artifact(ctx, [payload(0)], format=FORMAT)
-            before_tree = tree(ctx.root)
-            before_state = state(ctx.root)
-            terminal.write_bytes(b"INVENTED terminal refusal fixture")
-            with self.assertRaisesRegex(spool.AuthoritySpoolError, "GENERATION_WORKSPACE_TERMINAL"):
+        descriptor = spool.write_opaque_artifact(ctx, [payload(0)], format=FORMAT)
+        before_tree = tree(ctx.root)
+        before_state = state(ctx.root)
+        terminal.write_bytes(b"INVENTED terminal refusal fixture")
+        with self.assertRaisesRegex(spool.AuthoritySpoolError, "GENERATION_WORKSPACE_TERMINAL"):
+            with spool.publication_batch(ctx):
                 spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
-            self.assertEqual(tree(ctx.root), before_tree)
-            self.assertEqual(state(ctx.root), before_state)
-            self.assertEqual((ctx.root / descriptor["relative_path"]).read_bytes(), payload(0))
+        self.assertEqual(tree(ctx.root), before_tree)
+        self.assertEqual(state(ctx.root), before_state)
+        self.assertEqual((ctx.root / descriptor["relative_path"]).read_bytes(), payload(0))
         self.assertQuota(ctx, SIZE)
         self.assertEqual(terminal.read_bytes(), b"INVENTED terminal refusal fixture")
         self.assertEqual(list((ctx.root / "tmp").iterdir()), [])

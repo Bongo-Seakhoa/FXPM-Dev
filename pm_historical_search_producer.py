@@ -44,6 +44,7 @@ import pm_core
 import pm_historical_anchor_orchestration as historical
 import pm_historical_production_adapter as historical_adapter
 import pm_historical_scheduler as historical_scheduler
+import pm_broker_terms as broker_terms
 import pm_native_prefix_production as native_prefix
 import pm_production_config_binding as config_binding
 import pm_production_search_planner as search_planner
@@ -74,13 +75,24 @@ _MAX_WORKER_BUNDLE_BYTES: Final = (
 
 
 class HistoricalSearchProducerError(RuntimeError):
-    """Typed non-economic failure; callers must abort the generation."""
+    """Typed non-economic production failure."""
 
     def __init__(self, code: str, details: Sequence[Any] = ()) -> None:
         self.code = str(code)
         self.details = tuple(str(value)[:512] for value in tuple(details)[:32])
         suffix = ":" + "|".join(self.details) if self.details else ""
         super().__init__(self.code + suffix)
+
+
+class DeclaredParallelSlotCapacityError(HistoricalSearchProducerError):
+    """A validated child's observed disk or memory capacity deferral."""
+
+    def __init__(self, reason, slot_id, exception_type, failure_code):
+        if reason not in {"DISK_LOW", "MEMORY_ERROR"}:
+            raise ValueError("DECLARED_PARALLEL_CAPACITY_REASON_INVALID")
+        self.capacity_reason = reason
+        super().__init__("DECLARED_PARALLEL_SLOT_RESOURCE_CAPACITY",
+            (slot_id, exception_type, failure_code))
 
 
 def _fail(code: str, *details: Any) -> None:
@@ -2060,7 +2072,7 @@ def _declared_base_completion(request, *, status, reason_code, source_entry):
     return result
 
 
-def _verify_declared_completion_transport(context, *, completion, expected_edition):
+def _verify_declared_completion_transport(context, *, completion, expected_edition, process=None):
     code = "DECLARED_SLOT_TRANSPORT_EDITION_MISMATCH"
     if type(completion) is not dict:
         _fail(code)
@@ -2088,6 +2100,15 @@ def _verify_declared_completion_transport(context, *, completion, expected_editi
         if expected_edition == historical.DECLARED_WINNER_TRANSPORT_V16 else {
         historical_adapter.raw_winner.CURRENT_FROZEN_PLAN_SCHEMA,
         historical_adapter.raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA})
+    if process is not None:
+        # Every caller authenticates this process against its original request/precommit first.
+        search_planner._require_current_process(process)
+        process_body = process.to_dict()
+        if process_body.get("schema_version") == search_planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA:
+            if (process_body.get("execution_edition") != search_planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION
+                    or completion["request_body"].get("search_process_receipt_sha256") != process.receipt_sha256):
+                _fail(code)
+            expected_schemas = {historical_adapter.raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA}
     if receipt.get("schema_version") not in expected_schemas:
         _fail(code)
 
@@ -2297,6 +2318,19 @@ def reacquire_declared_m5_source(context, *, request, process, frozen_pipeline_c
 
 
 
+def _declared_observed_cell_executor(context, *, process, transport_edition):
+    """Choose execution only from an authenticated frozen process edition."""
+    if transport_edition not in {historical.DECLARED_WINNER_TRANSPORT_V15,
+            historical.DECLARED_WINNER_TRANSPORT_V16}:
+        _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
+    edition = search_planner.frozen_search_execution_edition(context, process)
+    if edition == search_planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+        return search_execution.execute_route_a_full_panel_historical_observed_cell
+    return (search_execution.execute_transport_historical_observed_cell
+        if transport_edition == historical.DECLARED_WINNER_TRANSPORT_V16
+        else search_execution.execute_historical_observed_cell)
+
+
 def _make_declared_slot_source_authority():
     sessions = {}
 
@@ -2331,7 +2365,7 @@ def _make_declared_slot_source_authority():
         return verify(context, request=request, process=process, source_session=row[0])
 
     def execute_m5(context, *, request, process, frozen_pipeline_config, config,
-                   body, edition, m5_owner, m5_request_view_id,
+                   body, edition, execute_cell, m5_owner, m5_request_view_id,
                    m5_calibration_view_id, m5_cost_edition):
         from dataclasses import asdict
         import pm_m5_job_view as job_view
@@ -2339,7 +2373,8 @@ def _make_declared_slot_source_authority():
         capture = None
         phase = "PRE_SOURCE"
         def finish(completion):
-            _verify_declared_completion_transport(context, completion=completion, expected_edition=edition)
+            _verify_declared_completion_transport(context, completion=completion, expected_edition=edition,
+                process=process)
             return completion
 
         def run_fitted(fitted, session, entry, restored_plan=None):
@@ -2360,9 +2395,9 @@ def _make_declared_slot_source_authority():
                 search_planner.build_declared_slot_m5_derived_observed_cell_plan(context, process=process, request=request, fitted=fitted))
             if edition != historical.DECLARED_WINNER_TRANSPORT_V16:
                 _fail("DECLARED_M5_TRANSPORT_EDITION_INVALID")
-            capture = historical_adapter.open_transport_declared_slot_capture(
+            capture = _declared_capture_opener(context, process=process, transport_edition=edition)(
                 context, request=request, process=process, plan=plan, source_session=session)
-            search_execution.execute_transport_historical_observed_cell(capture=capture, fitted=fitted,
+            execute_cell(capture=capture, fitted=fitted,
                 regime=body["regime"], search_process=process, cell_plan=plan, config=config)
             return finish(capture.completion)
 
@@ -2538,6 +2573,9 @@ def _make_declared_slot_source_authority():
                 if lease is not None:
                     lease.release()
 
+    @native_prefix._owned_native_resolution_call
+    @broker_terms._owned_swap_source_call
+    @search_planner._owned_process_verification_call
     def execute(context, *, request, process, frozen_pipeline_config,
                 m5_owner=None, m5_request_view_id=None, m5_calibration_view_id=None,
                 m5_cost_edition=None):
@@ -2546,10 +2584,13 @@ def _make_declared_slot_source_authority():
         _declared_completion_schema(body)
         edition = historical.declared_slot_transport_edition(body)
         historical._verify_declared_request_identity(request, context, require_live=True)
+        execute_cell = _declared_observed_cell_executor(context, process=process, transport_edition=edition)
+        if execute_cell is search_execution.execute_route_a_full_panel_historical_observed_cell:
+            search_execution._require_fresh_route_a_full_panel_request(context, request)
 
         def finish(completion):
             _verify_declared_completion_transport(context, completion=completion,
-                expected_edition=edition)
+                expected_edition=edition, process=process)
             return completion
 
         if request.receipt_sha256 in sessions:
@@ -2571,7 +2612,7 @@ def _make_declared_slot_source_authority():
                     or any(value is None for value in m5_arguments)):
                 _fail("DECLARED_M5_SOURCE_ARGUMENTS_REQUIRED")
             return execute_m5(context, request=request, process=process,
-                frozen_pipeline_config=frozen_pipeline_config, config=config, body=body, edition=edition,
+                frozen_pipeline_config=frozen_pipeline_config, config=config, body=body, edition=edition, execute_cell=execute_cell,
                 m5_owner=m5_owner, m5_request_view_id=m5_request_view_id,
                 m5_calibration_view_id=m5_calibration_view_id, m5_cost_edition=m5_cost_edition)
         if source_kind != "broker_native" or any(value is not None for value in m5_arguments):
@@ -2637,12 +2678,7 @@ def _make_declared_slot_source_authority():
                 return completion
             plan = restored_plan if restored_plan is not None else search_planner.build_declared_slot_observed_cell_plan(
                 context, process=process, request=request, fitted=fitted)
-            open_capture = (historical_adapter.open_transport_declared_slot_capture
-                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
-                else historical_adapter.open_declared_slot_capture)
-            execute_cell = (search_execution.execute_transport_historical_observed_cell
-                if edition == historical.DECLARED_WINNER_TRANSPORT_V16
-                else search_execution.execute_historical_observed_cell)
+            open_capture = _declared_capture_opener(context, process=process, transport_edition=edition)
             capture = open_capture(context, request=request, process=process, plan=plan, source_session=session)
             execute_cell(capture=capture, fitted=fitted, regime=body["regime"],
                 search_process=process, cell_plan=plan, config=config)
@@ -2860,7 +2896,7 @@ def _read_declared_record(context, path, *, maximum_bytes=None):
     return body, digest, descriptor
 
 
-def _read_declared_commit(context, path):
+def _read_declared_commit(context, path, *, _verified_objects=None):
     item = _read_declared_record(context, path)
     if item is None:
         return None
@@ -2871,7 +2907,10 @@ def _read_declared_commit(context, path):
     descriptor = authority_spool._validate_descriptor(pointer["commit_descriptor"], content_addressed=True)
     if descriptor["format"] != authority_spool.CANONICAL_JSON_FORMAT:
         _fail("DECLARED_SLOT_COMMIT_POINTER_INVALID")
-    item = _read_declared_record(context, descriptor["relative_path"])
+    key = (descriptor["relative_path"], descriptor["sha256"], descriptor["size_bytes"], descriptor["format"])
+    item = None if _verified_objects is None else _verified_objects.get(key)
+    if item is None:
+        item = _read_declared_record(context, descriptor["relative_path"])
     if item is None or item[2] != descriptor:
         _fail("DECLARED_SLOT_COMMIT_INTEGRITY_MISMATCH")
     return item
@@ -2927,15 +2966,17 @@ def _declared_symbol_receipt(context, symbol, descriptor):
         "generation_context_sha256": context.context_sha256, "symbol_manifest": descriptor}
 
 
+@search_planner._owned_process_verification_call
 def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id, frozen_pipeline_config,
                                         m5_owner=None, slot_view_ids=None, calibration_view_id=None,
-                                        cost_edition=None, cell_contract_sha256=None):
+                                        cost_edition=None, cell_contract_sha256=None, _verified_progress_out=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
         _fail("DECLARED_SLOT_CONFIG_INVALID")
     frozen_pipeline_config.verify_current(context)
+    config = frozen_pipeline_config.materialize(context)
     if (frozen_pipeline_config.effective_config_sha256 != parent["effective_config_sha256"]
-            or frozen_pipeline_config.materialize(context).discovery_risk_per_trade_pct != 1.0):
+            or config.discovery_risk_per_trade_pct != 1.0):
         _fail("DECLARED_SLOT_CONFIG_BINDING_MISMATCH")
     if len(parent["cells"]) != 1 or parent["cells"][0]["cell_id"] != cell_id:
         _fail("DECLARED_SLOT_CELL_INVALID")
@@ -2961,17 +3002,21 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
     manifest_path = authority_spool._manifest_relative_path(symbol, authority_spool.GENERAL_MANIFEST_DOMAIN)
     manifest = _read_declared_record(context, manifest_path, maximum_bytes=context.limits.max_manifest_bytes)
     symbol_receipt, run_receipt, verified_manifest = None, None, None
+    verified_commit_objects = {}
     if manifest is not None:
         symbol_receipt = _declared_symbol_receipt(context, symbol, manifest[2])
         verified_manifest = authority_spool.verify_symbol_receipt(context.root, symbol_receipt,
             expected_generation_id=context.generation_id, expected_symbol=symbol,
             expected_native_universe_sha256=context.native_universe_sha256,
-            expected_config_sha256=context.config_sha256, expected_manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
+            expected_config_sha256=context.config_sha256, expected_manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN,
+            _verified_commit_objects=verified_commit_objects)
     completed, commit_artifacts, previous = [], [], None
+    verified_commits = {}
     namespaces = set()
     first, terminal, terminal_failure = None, False, None
     for slot in historical.declared_slot_selected_slots(parent):
-        item = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"]))
+        item = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"]),
+            _verified_objects=verified_commit_objects)
         if item is None:
             if first is None:
                 first = dict(slot)
@@ -2993,7 +3038,7 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
                 or body["ordinal"] != slot["ordinal"] or body["previous_commit_sha256"] != previous):
             _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
         _verify_declared_completion_transport(context, completion=body["completion"],
-            expected_edition=historical.declared_slot_transport_edition(parent))
+            expected_edition=historical.declared_slot_transport_edition(parent), process=process)
         verified = historical_adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
             completion=body["completion"], artifact_roster=body["artifact_roster"], frozen_pipeline_config=frozen_pipeline_config, **reuse)
         if verified["slot_id"] != slot["slot_id"] or verified["cell_id"] != cell_id:
@@ -3005,6 +3050,7 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
         for entry in body["artifact_roster"]:
             if not entry["artifact_id"].startswith(namespace):
                 _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
+        verified_commits[slot["slot_id"]] = (body, digest, descriptor)
         completed.append(_declared_slot_summary(body, digest))
         commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
         previous, terminal = digest, verified["status"] == "STOP"
@@ -3043,13 +3089,20 @@ def reopen_declared_cell_owner_progress(context, *, precommit, process, cell_id,
         if run[0] != expected:
             _fail("DECLARED_SLOT_RUN_RECEIPT_BINDING_MISMATCH")
         run_receipt = run[0]
-    return DeclaredCellOwnerProgress(tuple(completed), tuple(commit_artifacts), first, terminal, previous,
+    progress = DeclaredCellOwnerProgress(tuple(completed), tuple(commit_artifacts), first, terminal, previous,
         terminal_failure, symbol_receipt, run_receipt)
+    if _verified_progress_out is not None:
+        _verified_progress_out.clear()
+        _verified_progress_out.update(context=context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id, parent=parent, config=config,
+            progress=progress, commits=verified_commits, cell_source_entry=cell_source_entry)
+    return progress
 
 
 def _commit_declared_slot_completion(context, *, precommit, process, cell_id, slot, completion,
                                       artifact_roster, previous_commit_sha256, frozen_pipeline_config,
-                                      post_completion_failure=None, m5_owner=None, cost_edition=None):
+                                      post_completion_failure=None, m5_owner=None, cost_edition=None,
+                                      _verified_commits=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     search_planner._require_current_process(process)
     if historical.declared_slot_development_scope(parent) is not None and slot not in historical.declared_slot_selected_slots(parent):
@@ -3063,7 +3116,7 @@ def _commit_declared_slot_completion(context, *, precommit, process, cell_id, sl
     except authority_spool.AuthoritySpoolError as exc:
         raise HistoricalSearchProducerError("DECLARED_SLOT_COMMIT_ROSTER_BOUND_EXCEEDED", (str(exc)[:128],)) from exc
     _verify_declared_completion_transport(context, completion=completion,
-        expected_edition=historical.declared_slot_transport_edition(parent))
+        expected_edition=historical.declared_slot_transport_edition(parent), process=process)
     provided = _declared_m5_reuse_arguments(m5_owner=m5_owner, cost_edition=cost_edition)
     reuse = {"m5_owner": m5_owner, "m5_cost_edition": cost_edition} if provided else {}
     verified = historical_adapter.verify_declared_slot_completion(context, precommit=precommit, process=process,
@@ -3080,7 +3133,10 @@ def _commit_declared_slot_completion(context, *, precommit, process, cell_id, sl
         if previous_commit_sha256 is not None:
             _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
     else:
-        prior = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"] - 1))
+        prior_slot = historical.declared_slot_selected_slots(parent)[slot["ordinal"] - 2]
+        prior = None if _verified_commits is None else _verified_commits.get(prior_slot["slot_id"])
+        if prior is None:
+            prior = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"] - 1))
         if prior is None or prior[1] != previous_commit_sha256:
             _fail("DECLARED_SLOT_PREFIX_BINDING_MISMATCH")
         if (prior[0]["completion"]["status"] == "STOP"
@@ -3107,12 +3163,18 @@ def _commit_declared_slot_completion(context, *, precommit, process, cell_id, sl
     descriptor = authority_spool.write_canonical_json_artifact(context, body)
     pointer = {"schema_version": _DECLARED_SLOT_POINTER_SCHEMA, "commit_descriptor": descriptor}
     authority_spool._publish_exact_json(context, path, pointer, context.limits.max_json_bytes)
+    if _verified_commits is not None:
+        _verified_commits[slot["slot_id"]] = (body, descriptor["sha256"], descriptor)
     return _declared_slot_summary(body, descriptor["sha256"]), descriptor
 
 
 
 def _declared_pending_unit_attempt(context, precommit, cell_id, slot):
-    """Select an original started request, never an orphan object or outcome."""
+    """Select the same authenticated started request, including before its first unit."""
+    import os
+    import stat
+    import pm_native_storage as storage
+
     pending = []
     for marker in _declared_prior_attempt_starts(context, precommit, cell_id, slot):
         start = search_execution._read_declared_unit_json(context, marker["relative_path"])
@@ -3120,17 +3182,55 @@ def _declared_pending_unit_attempt(context, precommit, cell_id, slot):
         relative = (f"declared-slots/{precommit.receipt_sha256}/requests/"
                     f"{cell_id}/{slot['slot_id']}/{attempt_id}.json")
         body = search_execution._read_declared_unit_json(context, relative)
-        if body is None or start.get("request_sha256") != hashlib.sha256(_canonical_bytes(body)).hexdigest():
+        if (type(start) is not dict or body is None
+                or start.get("request_sha256") != hashlib.sha256(_canonical_bytes(body)).hexdigest()):
             _fail("DECLARED_UNIT_ORIGINAL_REQUEST_MISSING")
+        if (body.get("cell_id") != cell_id or body.get("slot_id") != slot["slot_id"]
+                or body.get("precommit_sha256") != precommit.receipt_sha256
+                or body.get("attempt_id") != attempt_id):
+            _fail("DECLARED_UNIT_OWNER_INVALID")
         header = search_execution._read_declared_unit_header(context, body)
         raw = search_execution._read_declared_unit_json(context,
             search_execution._declared_unit_relative(body, "raw-completion.json"))
-        if header is not None or raw is not None:
-            if (body.get("cell_id") != cell_id or body.get("slot_id") != slot["slot_id"]
-                    or body.get("precommit_sha256") != precommit.receipt_sha256
-                    or body.get("attempt_id") != attempt_id):
-                _fail("DECLARED_UNIT_OWNER_INVALID")
-            pending.append(attempt_id)
+        if header is None and raw is not None:
+            _fail("DECLARED_UNIT_PREUNIT_NAMESPACE_UNRESOLVED")
+        if header is None and raw is None:
+            namespace = authority_spool._local_path(context.root,
+                search_execution._declared_unit_relative(body, "header.json")).parent
+            authority_spool._reject_reparse_chain(namespace)
+            if os.path.lexists(namespace):
+                if not stat.S_ISDIR(namespace.lstat().st_mode):
+                    _fail("DECLARED_UNIT_PREUNIT_NAMESPACE_UNRESOLVED")
+                with os.scandir(namespace) as entries:
+                    names = [item.name for _, item in zip(range(2), entries)]
+                if names != ["units.lock"]:
+                    _fail("DECLARED_UNIT_PREUNIT_NAMESPACE_UNRESOLVED")
+                lock = namespace / "units.lock"
+                authority_spool._reject_reparse_chain(lock)
+                before = lock.lstat()
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size != 1:
+                    _fail("DECLARED_UNIT_PREUNIT_NAMESPACE_UNRESOLVED")
+                flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                with os.fdopen(os.open(lock, flags), "r+b", buffering=0) as handle:
+                    opened = os.fstat(handle.fileno())
+                    identity = authority_spool._file_identity(before)
+                    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                            or authority_spool._file_identity(opened) != identity):
+                        _fail("DECLARED_UNIT_PREUNIT_NAMESPACE_UNRESOLVED")
+                    if not storage._try_kernel_lock(handle):
+                        _fail("DECLARED_SLOT_RUN_ACTIVE")
+                    try:
+                        authority_spool._reject_reparse_chain(lock)
+                        with os.scandir(namespace) as entries:
+                            names = [item.name for _, item in zip(range(2), entries)]
+                        handle.seek(0)
+                        if (names != ["units.lock"] or handle.read(2) != b"0"
+                                or authority_spool._file_identity(lock.lstat()) != identity
+                                or authority_spool._file_identity(os.fstat(handle.fileno())) != identity):
+                            _fail("DECLARED_UNIT_PREUNIT_NAMESPACE_UNRESOLVED")
+                    finally:
+                        storage._release_kernel_lock(handle)
+        pending.append(attempt_id)
     if len(pending) > 1:
         _fail("DECLARED_UNIT_OWNER_AMBIGUOUS")
     return pending[0] if pending else None
@@ -3215,6 +3315,7 @@ def _reopen_declared_source_material(context, *, request, process, frozen_pipeli
     return fitted, source, entry, plan, validation
 
 
+@search_planner._owned_process_verification_call
 def _declared_saved_raw_completion(context, *, request, process, frozen_pipeline_config, m5_owner=None, cost_edition=None):
     """Cold-verify a committed Raw unit before normal original outer publication."""
     body = request.to_dict()
@@ -3242,7 +3343,7 @@ def _declared_saved_raw_completion(context, *, request, process, frozen_pipeline
         **({"m5_owner": m5_owner, "m5_cost_edition": cost_edition} if is_m5 else {}))
     sink = request.symbol_sink(body["symbol"])
     for entry in saved["artifact_roster"]:
-        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+        sink._admit(*sink._checked_metadata(entry["artifact_id"], entry["artifact_type"], entry["descriptor"]))
     return saved["completion"]
 
 
@@ -3285,6 +3386,8 @@ def _declared_slot_attempt(context, *, precommit, process, frozen_pipeline_confi
 
 _PARALLEL_CLAIM_SCHEMA = "fxpm.declared-parallel-slot-claim.v1"
 _PARALLEL_RESULT_SCHEMA = "fxpm.declared-parallel-slot-result.v1"
+_PARALLEL_FAILURE_RESULT_SCHEMA = "fxpm.declared-parallel-slot-result.v2"
+_PARALLEL_RECOVERY_CLAIM_SCHEMA = "fxpm.declared-parallel-slot-claim.v2"
 _PARALLEL_CLAIM_MAX = 128 * 1024
 _PARALLEL_SLOT_WORKER_LIMIT = 4
 _PARALLEL_CAPACITY_FAILURE = "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED"
@@ -3292,6 +3395,7 @@ _PARALLEL_SPEC_KEYS = frozenset({"root", "generation_id", "generation_context_sh
     "native_universe_sha256", "config_sha256", "active_config_path", "effective_config_sha256",
     "process_spool_receipt", "process_sha256", "precommit_sha256", "cell_id", "slot_id",
     "ordinal", "attempt_id"})
+_PARALLEL_RECOVERY_KEY = "prior_capacity_result_sha256"
 
 
 def _parallel_slot_root(precommit_sha256, cell_id):
@@ -3314,15 +3418,18 @@ def _parallel_slot_no_renewal(context, precommit_sha256):
         _fail("DECLARED_PARALLEL_SLOT_RENEWAL_FORBIDDEN")
 
 
-def _parallel_slot_spec(context, precommit, process, frozen, cell_id, slot, attempt_id):
-    return {"root": str(context.root), "generation_id": context.generation_id,
+def _parallel_slot_spec(context, precommit, process, frozen, cell_id, slot, attempt_id, *, prior_capacity=None):
+    spec = {"root": str(context.root), "generation_id": context.generation_id,
         "generation_context_sha256": context.context_sha256,
         "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
         "active_config_path": str(frozen.active_config_path),
         "effective_config_sha256": frozen.effective_config_sha256,
-            "process_spool_receipt": process.spool_receipt, "process_sha256": process.receipt_sha256,
+        "process_spool_receipt": process.spool_receipt, "process_sha256": process.receipt_sha256,
         "precommit_sha256": precommit.receipt_sha256, "cell_id": cell_id,
         "slot_id": slot["slot_id"], "ordinal": slot["ordinal"], "attempt_id": attempt_id}
+    if prior_capacity is not None:
+        spec[_PARALLEL_RECOVERY_KEY] = _hex64(prior_capacity, "DECLARED_PARALLEL_SLOT_BINDING_INVALID")
+    return spec
 
 
 @contextmanager
@@ -3349,12 +3456,16 @@ def _locked_parallel_slot_claim(context, relative):
                     or authority_spool._file_identity(os.fstat(handle.fileno())) != identity):
                 _fail("DECLARED_PARALLEL_SLOT_CLAIM_INVALID")
             claim = authority_spool._strict_json_bytes(encoded, maximum)
+            spec = claim.get("binding") if type(claim) is dict else None
+            recovery = type(spec) is dict and _PARALLEL_RECOVERY_KEY in spec
+            expected_keys = _PARALLEL_SPEC_KEYS | ({_PARALLEL_RECOVERY_KEY} if recovery else set())
             if (type(claim) is not dict or set(claim) != {"schema_version", "binding"}
-                    or claim["schema_version"] != _PARALLEL_CLAIM_SCHEMA
-                    or type(claim["binding"]) is not dict or set(claim["binding"]) != _PARALLEL_SPEC_KEYS
+                    or claim["schema_version"] != (_PARALLEL_RECOVERY_CLAIM_SCHEMA if recovery else _PARALLEL_CLAIM_SCHEMA)
+                    or type(spec) is not dict or set(spec) != expected_keys
+                    or recovery and not _is_parallel_digest(spec[_PARALLEL_RECOVERY_KEY])
                     or authority_spool._canonical_json_bytes(claim, maximum) != encoded):
                 _fail("DECLARED_PARALLEL_SLOT_CLAIM_INVALID")
-            yield claim["binding"], hashlib.sha256(encoded).hexdigest()
+            yield spec, hashlib.sha256(encoded).hexdigest()
         finally:
             storage._release_kernel_lock(handle)
 
@@ -3362,16 +3473,17 @@ def _locked_parallel_slot_claim(context, relative):
 def _parallel_slot_check_binding(context, spec, precommit, process, frozen, cell_id, slot):
     historical._safe_id(spec["attempt_id"], "DECLARED_PARALLEL_SLOT_BINDING_INVALID")
     if (type(spec["ordinal"]) is not int
-            or spec != _parallel_slot_spec(context, precommit, process, frozen, cell_id, slot, spec["attempt_id"])):
+            or spec != _parallel_slot_spec(context, precommit, process, frozen, cell_id, slot,
+                spec["attempt_id"], prior_capacity=spec.get(_PARALLEL_RECOVERY_KEY))):
         _fail("DECLARED_PARALLEL_SLOT_BINDING_INVALID")
 
 
 
 def _parallel_slot_failure(exc):
-    failure_code = _PARALLEL_CAPACITY_FAILURE if authority_spool.is_resource_capacity_error(exc) else (
-        str(getattr(exc, "code", None) or exc) or type(exc).__name__)
+    reason = authority_spool.resource_capacity_reason(exc)
+    failure_code = reason or (str(getattr(exc, "code", None) or exc) or type(exc).__name__)
     return {"exception_type": f"{type(exc).__module__}.{type(exc).__name__}"[:128],
-        "failure_code": failure_code[:128],
+        "failure_code": failure_code[:128], "resource_capacity_reason": reason,
         "failure_observed_at_utc": _now_utc_seconds()}
 
 
@@ -3382,15 +3494,23 @@ def _parallel_slot_read_result(context, relative, claim_sha, spec, *, expected_s
     body, digest, _ = record
     if (type(body) is not dict or set(body) != {"schema_version", "claim_sha256", "completion",
             "artifact_roster", "post_completion_failure", "failure"}
-            or body["schema_version"] != _PARALLEL_RESULT_SCHEMA or body["claim_sha256"] != claim_sha
+            or body["schema_version"] not in {_PARALLEL_RESULT_SCHEMA, _PARALLEL_FAILURE_RESULT_SCHEMA}
+            or body["claim_sha256"] != claim_sha
             or (expected_sha is not None and expected_sha != digest)
             or hashlib.sha256(authority_spool._canonical_json_bytes(body, context.limits.max_json_bytes)).hexdigest() != digest):
         _fail("DECLARED_PARALLEL_SLOT_RESULT_INVALID", spec["slot_id"])
     failure = body["failure"]
     if failure is not None:
-        if (type(failure) is not dict or set(failure) != {"exception_type", "failure_code", "failure_observed_at_utc"}
+        fields = {"exception_type", "failure_code", "failure_observed_at_utc"}
+        if body["schema_version"] == _PARALLEL_FAILURE_RESULT_SCHEMA:
+            fields.add("resource_capacity_reason")
+        if (type(failure) is not dict or set(failure) != fields
                 or any(type(failure[key]) is not str or not 1 <= len(failure[key]) <= 128
                        for key in ("exception_type", "failure_code"))
+                or failure.get("resource_capacity_reason") is not None and (
+                    type(failure["resource_capacity_reason"]) is not str
+                    or failure["resource_capacity_reason"] not in {"DISK_LOW", "MEMORY_ERROR"}
+                    or failure["failure_code"] != failure["resource_capacity_reason"])
                 or body["completion"] is not None or body["artifact_roster"] != []
                 or body["post_completion_failure"] is not None):
             _fail("DECLARED_PARALLEL_SLOT_RESULT_INVALID", spec["slot_id"])
@@ -3398,13 +3518,109 @@ def _parallel_slot_read_result(context, relative, claim_sha, spec, *, expected_s
     else:
         completion, roster = body["completion"], body["artifact_roster"]
         request = completion.get("request_body") if type(completion) is dict else None
-        if (type(request) is not dict or any(request.get(key) != spec[key]
-                for key in ("precommit_sha256", "cell_id", "slot_id", "attempt_id"))
+        if (body["schema_version"] != _PARALLEL_RESULT_SCHEMA or type(request) is not dict
+                or any(request.get(key) != spec[key]
+                    for key in ("precommit_sha256", "cell_id", "slot_id", "attempt_id"))
                 or completion.get("status") not in {"OWNER", "NO_TRADE", "MISSING", "STOP"}
                 or type(roster) is not list or len(roster) > context.limits.max_artifacts_per_symbol):
             _fail("DECLARED_PARALLEL_SLOT_RESULT_INVALID", spec["slot_id"])
         authority_spool._canonical_json_bytes(roster, min(context.limits.max_json_bytes, context.limits.max_manifest_bytes))
     return body, digest
+
+
+def _is_parallel_digest(value):
+    return type(value) is str and len(value) == 64 and all(char in _HEX for char in value)
+
+
+def _parallel_slot_capacity(result):
+    failure = result["failure"]
+    if failure is None:
+        return False, None
+    if "resource_capacity_reason" in failure:
+        reason = failure["resource_capacity_reason"]
+        return reason is not None, reason
+    if failure["exception_type"] == "builtins.MemoryError":
+        return True, "MEMORY_ERROR"
+    if (failure["exception_type"] == "pm_authority_spool_quota.AuthoritySpoolQuotaError"
+            and failure["failure_code"] == _PARALLEL_CAPACITY_FAILURE):
+        return True, "DISK_LOW"
+    return False, None
+
+
+def _parallel_slot_recovery_window(parent):
+    window = parent["source_access_window_utc"]
+    current = _utc(_now_utc_seconds(), "DECLARED_PARALLEL_SLOT_SOURCE_WINDOW_INVALID")
+    if not (_utc(window["start_utc"], "DECLARED_PARALLEL_SLOT_SOURCE_WINDOW_INVALID") <= current
+            < _utc(window["end_exclusive_utc"], "DECLARED_PARALLEL_SLOT_SOURCE_WINDOW_INVALID")):
+        _fail("DECLARED_PARALLEL_SLOT_SOURCE_WINDOW_EXPIRED")
+
+
+def _parallel_slot_spec_root(spec):
+    root = _parallel_slot_root(spec["precommit_sha256"], spec["cell_id"])
+    prior = spec.get(_PARALLEL_RECOVERY_KEY)
+    if prior is not None:
+        root += f"/reentries/{spec['ordinal']:02d}/" + _hex64(prior, "DECLARED_PARALLEL_SLOT_BINDING_INVALID")
+    return root
+
+
+def _parallel_slot_reentries(context, root, slots):
+    import os
+
+    relative = root + "/reentries"
+    if not _parallel_slot_exists(context, relative):
+        return {}
+    allowed = {f"{ordinal:02d}": ordinal for ordinal in range(1, 14)}
+    names = _parallel_slot_record_names(context, relative, set(allowed))
+    result = {}
+    for name in names:
+        directory = authority_spool._local_path(context.root, relative + "/" + name)
+        authority_spool._reject_reparse_chain(directory)
+        with os.scandir(directory) as stream:
+            children = [entry.name for entry in stream]
+        if (len(children) > context.limits.max_artifacts_per_symbol
+                or any(not _is_parallel_digest(value) for value in children)):
+            _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+        entries = {}
+        for digest in children:
+            child = relative + "/" + name + "/" + digest
+            _parallel_slot_record_names(context, child, {"claims", "results"})
+            expected = {name + ".json"}
+            claims = _parallel_slot_record_names(context, child + "/claims", expected)
+            results = _parallel_slot_record_names(context, child + "/results", expected)
+            if not results.issubset(claims):
+                _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+            entries[digest] = bool(claims)
+        result[allowed[name]] = entries
+    return result
+
+
+def _parallel_slot_chain(context, precommit, process, frozen, cell_id, slot, root, locks, *, through_sha=None):
+    entries = _parallel_slot_reentries(context, root, (slot,)).get(slot["ordinal"], {})
+    selected, prior, visited, paths = root, None, set(), []
+    while True:
+        claim_path = _parallel_slot_path(selected, "claims", slot["ordinal"])
+        spec, claim_sha = locks.enter_context(_locked_parallel_slot_claim(context, claim_path))
+        _parallel_slot_check_binding(context, spec, precommit, process, frozen, cell_id, slot)
+        if spec.get(_PARALLEL_RECOVERY_KEY) != prior:
+            _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+        result_path = _parallel_slot_path(selected, "results", slot["ordinal"])
+        body, digest = _parallel_slot_read_result(context, result_path, claim_sha, spec)
+        paths.extend((claim_path, result_path))
+        if through_sha is not None and digest == through_sha:
+            if set(entries) != visited | {digest} or not entries.get(digest):
+                _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+            return selected, spec, claim_sha, body, digest, paths
+        if digest in entries:
+            if digest in visited or not _parallel_slot_capacity(body)[0]:
+                _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+            visited.add(digest)
+            if entries[digest]:
+                prior = digest
+                selected = root + f"/reentries/{slot['ordinal']:02d}/" + digest
+                continue
+        if through_sha is not None or visited != set(entries):
+            _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+        return selected, spec, claim_sha, body, digest, paths
 
 
 def _declared_slot_worker_checkpoint():
@@ -3413,12 +3629,14 @@ def _declared_slot_worker_checkpoint():
 
 def declared_slot_worker(spec):
     """Execute one admitted native slot; only its durable result digest crosses IPC."""
-    if type(spec) is not dict or set(spec) != _PARALLEL_SPEC_KEYS:
+    recovery = type(spec) is dict and _PARALLEL_RECOVERY_KEY in spec
+    expected = _PARALLEL_SPEC_KEYS | ({_PARALLEL_RECOVERY_KEY} if recovery else set())
+    if type(spec) is not dict or set(spec) != expected:
         _fail("DECLARED_PARALLEL_SLOT_BINDING_INVALID")
     ordinal = spec["ordinal"]
     if type(ordinal) is not int or not 1 <= ordinal <= 13:
         _fail("DECLARED_PARALLEL_SLOT_BINDING_INVALID")
-    root = _parallel_slot_root(spec["precommit_sha256"], spec["cell_id"])
+    root = _parallel_slot_spec_root(spec)
     context = authority_spool.reopen_generation_context(Path(spec["root"]),
         expected_generation_id=spec["generation_id"], expected_native_universe_sha256=spec["native_universe_sha256"],
         expected_config_sha256=spec["config_sha256"])
@@ -3447,14 +3665,25 @@ def declared_slot_worker(spec):
                 _fail("DECLARED_PARALLEL_SLOT_BINDING_INVALID")
             slot = slots[ordinal - 1]
             _parallel_slot_check_binding(context, spec, precommit, process, frozen, spec["cell_id"], slot)
+            resumed = False
+            if recovery:
+                from contextlib import ExitStack
+                with ExitStack() as locks:
+                    original_root = _parallel_slot_root(spec["precommit_sha256"], spec["cell_id"])
+                    _, _, _, prior, _, _ = _parallel_slot_chain(context, precommit, process, frozen,
+                        spec["cell_id"], slot, original_root, locks, through_sha=spec[_PARALLEL_RECOVERY_KEY])
+                    if not _parallel_slot_capacity(prior)[0]:
+                        _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+                _parallel_slot_recovery_window(parent)
+                resumed = _declared_pending_unit_attempt(context, precommit, spec["cell_id"], slot) == spec["attempt_id"]
             _declared_slot_worker_checkpoint()
             with _declared_slot_attempt(context, precommit=precommit, process=process, frozen_pipeline_config=frozen,
                     cell_id=spec["cell_id"], slot=slot, symbol=parent["cells"][0]["symbol"],
-                    attempt_id=spec["attempt_id"], parallel=True) as (completion, roster, post_failure):
+                    attempt_id=spec["attempt_id"], resumed=resumed, parallel=True) as (completion, roster, post_failure):
                 result.update(completion=completion, artifact_roster=roster, post_completion_failure=post_failure)
         except Exception as exc:
-            result.update(completion=None, artifact_roster=[], post_completion_failure=None,
-                failure=_parallel_slot_failure(exc))
+            result.update(schema_version=_PARALLEL_FAILURE_RESULT_SCHEMA,
+                completion=None, artifact_roster=[], post_completion_failure=None, failure=_parallel_slot_failure(exc))
         return authority_spool._publish_exact_json(context, result_path, result,
             context.limits.max_json_bytes)["sha256"]
 
@@ -3477,22 +3706,28 @@ def _parallel_slot_record_names(context, relative, allowed):
 
 def _parallel_slot_records(context, precommit, cell_id, slots):
     root = _parallel_slot_root(precommit.receipt_sha256, cell_id)
-    _parallel_slot_record_names(context, root, {"claims", "results"})
+    _parallel_slot_record_names(context, root, {"claims", "results", "reentries"})
     allowed = {f"{slot['ordinal']:02d}.json" for slot in slots}
     claims = _parallel_slot_record_names(context, f"{root}/claims", allowed)
     results = _parallel_slot_record_names(context, f"{root}/results", allowed)
-    if not results.issubset(claims) or claims != {f"{index:02d}.json" for index in range(1, len(claims) + 1)}:
+    reentries = _parallel_slot_reentries(context, root, slots)
+    if (not results.issubset(claims)
+            or claims != {f"{index:02d}.json" for index in range(1, len(claims) + 1)}
+            or any(f"{ordinal:02d}.json" not in claims for ordinal in reentries)):
         _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
     return root, claims, results
 
 
 @contextmanager
 def _bound_parallel_slot_result(context, precommit, process, frozen, cell_id, slot, root, *, expected_sha=None):
-    ordinal = slot["ordinal"]
-    with _locked_parallel_slot_claim(context, _parallel_slot_path(root, "claims", ordinal)) as (spec, claim_sha):
-        _parallel_slot_check_binding(context, spec, precommit, process, frozen, cell_id, slot)
-        yield _parallel_slot_read_result(context, _parallel_slot_path(root, "results", ordinal),
-            claim_sha, spec, expected_sha=expected_sha)
+    from contextlib import ExitStack
+
+    with ExitStack() as locks:
+        _, _, _, body, digest, _ = _parallel_slot_chain(context, precommit, process, frozen,
+            cell_id, slot, root, locks)
+        if expected_sha is not None and digest != expected_sha:
+            _fail("DECLARED_PARALLEL_SLOT_RESULT_INVALID", slot["slot_id"])
+        yield body, digest
 
 
 
@@ -3525,19 +3760,20 @@ def _parallel_slot_existing(context, precommit, process, frozen, cell_id, slots,
                 if ordinal <= len(completed):
                     _parallel_slot_match_commit(context, precommit, cell_id, slot, result,
                         expected_sha=completed[ordinal - 1]["commit_sha256"])
-                else:
+                elif not _parallel_slot_capacity(result)[0]:
                     ready[ordinal] = digest
         except (HistoricalSearchProducerError, historical.HistoricalAnchorOrchestrationError,
                 authority_spool.AuthoritySpoolError, OSError) as exc:
             if ordinal <= len(completed) or getattr(exc, "code", None) == "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE":
                 raise
-            # A later custody failure cannot suppress an earlier durable terminal.
             ready[ordinal] = exc
     return root, ready
 
 
 def verify_declared_parallel_slot_files(context, *, precommit, process, cell_id, frozen_pipeline_config):
-    """Verify and name only the claim/result files of a completed native chain."""
+    """Verify and retain every claim/result, including prior capacity attempts."""
+    from contextlib import ExitStack
+
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     slots = historical.declared_slot_selected_slots(parent)
     _parallel_slot_no_renewal(context, precommit.receipt_sha256)
@@ -3557,8 +3793,9 @@ def verify_declared_parallel_slot_files(context, *, precommit, process, cell_id,
     paths, previous, statuses = [], None, []
     for slot in slots:
         ordinal = slot["ordinal"]
-        with _bound_parallel_slot_result(context, precommit, process, frozen_pipeline_config,
-                cell_id, slot, root) as (result, _):
+        with ExitStack() as locks:
+            _, _, _, result, _, retained = _parallel_slot_chain(context, precommit, process,
+                frozen_pipeline_config, cell_id, slot, root, locks)
             commit, digest, _ = _parallel_slot_match_commit(context, precommit, cell_id, slot, result)
             if (commit.get("schema_version") != DECLARED_SLOT_COMMIT_SCHEMA
                     or commit.get("previous_commit_sha256") != previous or commit.get("slot_id") != slot["slot_id"]
@@ -3569,7 +3806,7 @@ def verify_declared_parallel_slot_files(context, *, precommit, process, cell_id,
                 _fail("DECLARED_PARALLEL_SLOT_COMMIT_BINDING_INVALID", slot["slot_id"])
             previous = digest
             statuses.append({"slot_id": slot["slot_id"], "status": result["completion"]["status"]})
-        paths.extend((_parallel_slot_path(root, "claims", ordinal), _parallel_slot_path(root, "results", ordinal)))
+            paths.extend(retained)
     if previous != run.get("last_commit_sha256") or statuses != run.get("slot_commits"):
         _fail("DECLARED_PARALLEL_SLOT_COMMIT_BINDING_INVALID")
     return tuple(paths)
@@ -3577,7 +3814,7 @@ def verify_declared_parallel_slot_files(context, *, precommit, process, cell_id,
 
 def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipeline_config, cell_id,
                                     slots, completed, commit_artifacts, previous, terminal_failure,
-                                    terminal_stop, slot_dispatch, slot_worker_limit):
+                                    terminal_stop, slot_dispatch, slot_worker_limit, slot_commit_overlap=False, _verified_commits=None):
     import secrets
     from pm_memory_governor import MemoryTask
 
@@ -3586,6 +3823,8 @@ def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipe
     next_ordinal = len(completed) + 1
     failure = None
     admitting = not terminal_stop
+    # Overlap lets one further pool of completed slots wait while their seats are refilled.
+    lookahead = slot_worker_limit * (2 if slot_commit_overlap else 1)
 
     def bound_result(ordinal, digest):
         return _bound_parallel_slot_result(context, precommit, process, frozen, cell_id,
@@ -3603,18 +3842,26 @@ def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipe
                     child_failure = result["failure"]
                     if child_failure is not None:
                         failure_code = child_failure["failure_code"]
-                        code = ("DECLARED_PARALLEL_SLOT_RESOURCE_CAPACITY" if failure_code == _PARALLEL_CAPACITY_FAILURE
+                        capacity, reason = _parallel_slot_capacity(result)
+                        if capacity:
+                            raise DeclaredParallelSlotCapacityError(reason, slot["slot_id"],
+                                child_failure["exception_type"], failure_code)
+                        code = ("DECLARED_PARALLEL_SLOT_LEGACY_FAILURE_UNRESOLVED"
+                            if result["schema_version"] == _PARALLEL_RESULT_SCHEMA
+                            and failure_code == _PARALLEL_CAPACITY_FAILURE
                             else "DECLARED_PARALLEL_SLOT_WORKER_FAILED")
                         _fail(code, slot["slot_id"], child_failure["exception_type"], failure_code)
                     summary, descriptor = _commit_declared_slot_completion(context, precommit=precommit, process=process,
                         cell_id=cell_id, slot=slot, completion=result["completion"], artifact_roster=result["artifact_roster"],
                         previous_commit_sha256=previous, frozen_pipeline_config=frozen,
-                        post_completion_failure=result["post_completion_failure"])
+                        post_completion_failure=result["post_completion_failure"], _verified_commits=_verified_commits)
                     previous = descriptor["sha256"]
                     completed.append(summary)
                     commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
                     if result["post_completion_failure"] is not None:
-                        committed = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, next_ordinal))
+                        committed = None if _verified_commits is None else _verified_commits.get(slot["slot_id"])
+                        if committed is None:
+                            committed = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, next_ordinal))
                         if committed is None or committed[1] != previous:
                             _fail("DECLARED_SLOT_COMMIT_INTEGRITY_MISMATCH")
                         terminal_failure = _declared_terminal_failure_from_commit(committed[0], context=context,
@@ -3632,11 +3879,37 @@ def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipe
     if terminal_stop or next_ordinal > len(slots):
         return previous, terminal_failure
 
-    specs = {slot["ordinal"]: _parallel_slot_spec(context, precommit, process, frozen, cell_id, slot,
-        "attempt-" + secrets.token_hex(16)) for slot in slots[next_ordinal - 1:]}
+    specs = {}
+    for slot in slots[next_ordinal - 1:]:
+        if slot["ordinal"] in ready:
+            continue
+        prior_capacity = None
+        if _parallel_slot_exists(context, _parallel_slot_path(root, "claims", slot["ordinal"])):
+            with _bound_parallel_slot_result(context, precommit, process, frozen, cell_id, slot, root) as (saved, digest):
+                if not _parallel_slot_capacity(saved)[0]:
+                    _fail("DECLARED_PARALLEL_SLOT_CUSTODY_INVALID")
+                prior_capacity = digest
+            _parallel_slot_recovery_window(precommit.to_dict())
+        pending = (_declared_pending_unit_attempt(context, precommit, cell_id, slot)
+            if prior_capacity is not None else None)
+        specs[slot["ordinal"]] = _parallel_slot_spec(context, precommit, process, frozen, cell_id, slot,
+            pending or ("attempt-" + secrets.token_hex(16)), prior_capacity=prior_capacity)
     ordinals = {f"{ordinal:02d}": ordinal for ordinal in specs}
     admitted, observed = set(), set()
     stream_error = None
+
+    def commit_due():
+        # A ready prefix waits only while a free seat can still be refilled first.
+        if next_ordinal not in ready:
+            return False
+        waiting = min(set(specs) - admitted, default=None)
+        return (not admitting or waiting is None or len(admitted - observed) >= slot_worker_limit
+                or waiting >= next_ordinal + lookahead)
+
+    def admission():
+        if slot_commit_overlap and commit_due():
+            advance()
+        return admitting
 
     def task_ready(task):
         key = task.key
@@ -3645,23 +3918,28 @@ def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipe
         ordinal = ordinals[key]
         if task.args != (specs[ordinal],):
             _fail("DECLARED_PARALLEL_SLOT_ADMISSION_INVALID")
-        if not admitting or ordinal >= next_ordinal + slot_worker_limit:
+        if (not admitting or ordinal >= next_ordinal + lookahead
+                or (slot_commit_overlap and len(admitted - observed) >= slot_worker_limit)):
             return False
         if ordinal != min(set(specs) - admitted, default=0):
             _fail("DECLARED_PARALLEL_SLOT_ADMISSION_INVALID")
         _parallel_slot_no_renewal(context, precommit.receipt_sha256)
-        path = _parallel_slot_path(root, "claims", ordinal)
+        spec = specs[ordinal]
+        if _PARALLEL_RECOVERY_KEY in spec:
+            _parallel_slot_recovery_window(precommit.to_dict())
+        path = _parallel_slot_path(_parallel_slot_spec_root(spec), "claims", ordinal)
         if _parallel_slot_exists(context, path):
             _fail("DECLARED_PARALLEL_SLOT_CLAIM_EXISTS")
         authority_spool._publish_exact_json(context, path,
-            {"schema_version": _PARALLEL_CLAIM_SCHEMA, "binding": specs[ordinal]},
+            {"schema_version": (_PARALLEL_RECOVERY_CLAIM_SCHEMA
+                if _PARALLEL_RECOVERY_KEY in spec else _PARALLEL_CLAIM_SCHEMA), "binding": spec},
             min(_PARALLEL_CLAIM_MAX, context.limits.max_json_bytes))
         # The claim records admission, not proof that the process started.
         admitted.add(ordinal)
         return True
 
     tasks = (MemoryTask(key=key, args=(specs[ordinal],)) for key, ordinal in ordinals.items())
-    for outcome in slot_dispatch(tasks, lambda: admitting, task_ready):
+    for outcome in slot_dispatch(tasks, admission, task_ready):
         key = outcome.task_key
         if type(key) is not str or key not in ordinals or ordinals[key] in observed:
             admitting = False
@@ -3687,8 +3965,11 @@ def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipe
             del result
         except Exception as exc:
             ready[ordinal], admitting = exc, False
-        advance()
+        if not slot_commit_overlap or commit_due():
+            advance()
 
+    if slot_commit_overlap:
+        advance()
     if stream_error is not None:
         raise stream_error
     if failure is not None:
@@ -3696,7 +3977,8 @@ def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipe
     if not admitted.issubset(observed):
         _fail("DECLARED_PARALLEL_SLOT_OUTCOME_MISSING")
     for ordinal in sorted(admitted):
-        with _locked_parallel_slot_claim(context, _parallel_slot_path(root, "claims", ordinal)):
+        claim_root = _parallel_slot_spec_root(specs[ordinal])
+        with _locked_parallel_slot_claim(context, _parallel_slot_path(claim_root, "claims", ordinal)):
             pass
     if not terminal_stop and next_ordinal <= len(slots):
         _fail("DECLARED_PARALLEL_SLOT_OUTCOME_MISSING")
@@ -3706,7 +3988,8 @@ def _execute_parallel_declared_slots(context, *, precommit, process, frozen_pipe
 def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, frozen_pipeline_config, cell_id,
                                                m5_owner=None, slot_view_ids=None, calibration_view_id=None,
                                                 cost_edition=None, cell_contract_sha256=None,
-                                                slot_dispatch=None, slot_worker_limit=1):
+                                                slot_dispatch=None, slot_worker_limit=1, slot_commit_overlap=False,
+                                                _verified_progress_out=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     search_planner._require_current_process(process)
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
@@ -3724,7 +4007,8 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
     slots = historical.declared_slot_selected_slots(parent)
     parallel_root = _parallel_slot_root(precommit.receipt_sha256, cell_id)
     if (type(slot_worker_limit) is not int or not 1 <= slot_worker_limit <= _PARALLEL_SLOT_WORKER_LIMIT
-            or (slot_dispatch is None and slot_worker_limit != 1)):
+            or (slot_dispatch is None and slot_worker_limit != 1)
+            or type(slot_commit_overlap) is not bool or (slot_dispatch is None and slot_commit_overlap)):
         _fail("DECLARED_PARALLEL_SLOT_DISPATCH_INVALID")
     if slot_dispatch is None:
         if _parallel_slot_exists(context, parallel_root):
@@ -3733,13 +4017,17 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
         _fail("DECLARED_PARALLEL_SLOT_DISPATCH_INVALID")
     else:
         _parallel_slot_no_renewal(context, precommit.receipt_sha256)
+    chain = {}
     progress = reopen_declared_cell_owner_progress(context, precommit=precommit, process=process,
-        cell_id=cell_id, frozen_pipeline_config=frozen_pipeline_config, **arguments)
+        cell_id=cell_id, frozen_pipeline_config=frozen_pipeline_config, _verified_progress_out=chain, **arguments)
     symbol = parent["cells"][0]["symbol"]
     if progress.run_receipt is not None:
         if slot_dispatch is not None:
             _parallel_slot_existing(context, precommit, process, frozen_pipeline_config, cell_id, slots,
                 progress.slot_summaries)
+        if _verified_progress_out is not None:
+            _verified_progress_out.clear()
+            _verified_progress_out.update(chain)
         return DeclaredCellOwnerRunReceipt(_canonical_bytes(progress.run_receipt))
     previous = progress.last_commit_sha256
     completed = list(progress.slot_summaries)
@@ -3749,7 +4037,8 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
         previous, terminal_failure = _execute_parallel_declared_slots(context, precommit=precommit, process=process,
             frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id, slots=slots,
             completed=completed, commit_artifacts=commit_artifacts, previous=previous, terminal_failure=terminal_failure,
-            terminal_stop=progress.terminal_stop, slot_dispatch=slot_dispatch, slot_worker_limit=slot_worker_limit)
+            terminal_stop=progress.terminal_stop, slot_dispatch=slot_dispatch, slot_worker_limit=slot_worker_limit,
+            slot_commit_overlap=slot_commit_overlap, _verified_commits=chain["commits"])
     elif not progress.terminal_stop and progress.first_uncommitted_slot is not None:
         start = progress.first_uncommitted_slot["ordinal"]
         for slot in slots[start - 1:]:
@@ -3766,14 +4055,14 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
                 summary, descriptor = _commit_declared_slot_completion(context, precommit=precommit, process=process,
                     cell_id=cell_id, slot=slot, completion=completion, artifact_roster=roster,
                     previous_commit_sha256=previous, frozen_pipeline_config=frozen_pipeline_config,
-                    post_completion_failure=post_completion_failure,
+                    post_completion_failure=post_completion_failure, _verified_commits=chain["commits"],
                     **({"m5_owner": m5_owner, "cost_edition": cost_edition} if is_m5 else {}))
                 previous = descriptor["sha256"]
                 completed.append(summary)
                 commit_artifacts.append(_declared_commit_artifact(slot, descriptor))
             del roster
             if post_completion_failure is not None:
-                committed = _read_declared_commit(context, _declared_commit_path(precommit, cell_id, slot["ordinal"]))
+                committed = chain["commits"].get(slot["slot_id"])
                 if committed is None or committed[1] != previous:
                     _fail("DECLARED_SLOT_COMMIT_INTEGRITY_MISMATCH")
                 terminal_failure = _declared_terminal_failure_from_commit(committed[0], context=context,
@@ -3788,29 +4077,36 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
         _fail("DECLARED_SLOT_FINALIZED_INCOMPLETE_PREFIX")
     sink = authority_spool.open_symbol_sink(context, symbol)
     if is_m5:
-        _, cell_source_entry = _read_declared_m5_cell_source_context(context, precommit=precommit,
-            parent=parent, cell_id=cell_id, cell_contract_sha256=cell_contract_sha256)
-        sink.register_artifact(cell_source_entry["artifact_id"], cell_source_entry["artifact_type"],
-            cell_source_entry["descriptor"])
+        cell_source_entry = chain["cell_source_entry"]
+        sink._admit(*sink._checked_metadata(cell_source_entry["artifact_id"], cell_source_entry["artifact_type"],
+            cell_source_entry["descriptor"]))
     for entry in commit_artifacts:
-        sink.register_artifact(entry["artifact_id"], entry["artifact_type"], entry["descriptor"])
+        sink._admit(*sink._checked_metadata(entry["artifact_id"], entry["artifact_type"], entry["descriptor"]))
     symbol_receipt = sink.seal()
     body = _declared_run_body(context, precommit=precommit, cell_id=cell_id, summaries=completed,
         declared_slots=len(historical.declared_slot_selected_slots(parent)), terminal_stop=terminal_stop, previous=previous,
         symbol_receipt=symbol_receipt, terminal_failure=terminal_failure)
     authority_spool._publish_exact_json(context, _declared_run_path(precommit, cell_id), body, context.limits.max_json_bytes)
+    chain["progress"] = DeclaredCellOwnerProgress(tuple(completed), tuple(commit_artifacts), None,
+        terminal_stop, previous, terminal_failure, symbol_receipt, body)
+    if _verified_progress_out is not None:
+        _verified_progress_out.clear()
+        _verified_progress_out.update(chain)
     return DeclaredCellOwnerRunReceipt(_canonical_bytes(body))
 
 
 __all__ += ["DECLARED_CELL_RUN_SCHEMA", "DECLARED_SLOT_COMMIT_SCHEMA", "DeclaredCellOwnerRunReceipt",
+            "DeclaredParallelSlotCapacityError",
     "DeclaredCellOwnerProgress", "execute_declared_slot_owner_search", "execute_declared_cell_owner_slots",
     "reopen_declared_cell_owner_progress", "declared_slot_worker", "verify_declared_parallel_slot_files"]
 
 
+@search_planner._owned_process_verification_call
 def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pipeline_config, cell_id,
                                     m5_owner=None, slot_view_ids=None, calibration_view_id=None,
                                      cost_edition=None, cell_contract_sha256=None,
-                                     slot_dispatch=None, slot_worker_limit=1):
+                                     slot_dispatch=None, slot_worker_limit=1, slot_commit_overlap=False,
+                                     _verified_progress_out=None):
     """Hold the existing nonblocking OS primitive through restore and commit."""
     import os
     import pm_native_storage as storage
@@ -3850,7 +4146,8 @@ def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pip
                 process=process, frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id,
                 m5_owner=m5_owner, slot_view_ids=slot_view_ids, calibration_view_id=calibration_view_id,
                 cost_edition=cost_edition, cell_contract_sha256=cell_contract_sha256,
-                slot_dispatch=slot_dispatch, slot_worker_limit=slot_worker_limit)
+                slot_dispatch=slot_dispatch, slot_worker_limit=slot_worker_limit, slot_commit_overlap=slot_commit_overlap,
+                _verified_progress_out=_verified_progress_out)
         finally:
             storage._release_kernel_lock(handle)
 
@@ -4188,3 +4485,12 @@ def _reopen_declared_m5_source_material(context, *, request, process, frozen_pip
         process=process, completion=header, sink=sink, m5_fitted=fitted)
     _require_reopened_declared_plan(header, validation, plan)
     return fitted, source, entry, plan, validation
+
+
+def _declared_capture_opener(context, *, process, transport_edition):
+    edition = search_planner.frozen_search_execution_edition(context, process)
+    if edition == search_planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+        return historical_adapter.open_matched_floor_declared_slot_capture
+    return (historical_adapter.open_transport_declared_slot_capture
+        if transport_edition == historical.DECLARED_WINNER_TRANSPORT_V16
+        else historical_adapter.open_declared_slot_capture)

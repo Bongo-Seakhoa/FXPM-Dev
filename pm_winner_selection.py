@@ -531,6 +531,39 @@ V16_GENERATION: Final = replace(
     evidence_version="fxpm.winner-evidence-ledger.v8", marginal_version="fxpm.winner-book-marginal.v3",
     shared_partition_version="fxpm.winner-shared-oos-partition.v4", transport=V16_TRANSPORT_ENVELOPE,
 )
+V17_SELECTION_ADDENDUM_CONTRACT: Final = MappingProxyType({
+    "schema_version": "fxpm.matched-floor-selection-contract.v1",
+    "floor": "MEAN_ACTUAL_INITIAL_RISK_BASE_NET_R_GE_MEAN_MATCHED_P95_SPREAD_COST_R",
+    "base_trade_set": "UNCHANGED_FINAL_LOCKBOX_P75_COMPLETED_POSITIONS",
+    "fill_witness": "EXACT_P75_FIRST_FILL_AND_POSITION_PARITY_REQUIRED",
+    "mismatch_scope": "ANY_PARTITION_PARITY_MISMATCH_MAKES_CELL_FLOOR_UNAVAILABLE",
+    "risk_normalization": "EXISTING_CANONICAL_R_E12_HALF_EVEN",
+    "swap": "RETAINED_IN_BASE_NET_R",
+    "fill_and_commission": "NONE_ADDED",
+    "dated_fx_gate": False,
+    "full_witness_transport": "CONTENT_ADDRESSED_ARTIFACTS_WITH_MANDATORY_DECLARED_SOURCE_REPLAY",
+    "winner_request_authority": "SEMANTIC_CONTENT_ONLY_NO_SOURCE_OR_QUALIFICATION_AUTHORITY",
+    "tie": "STATISTICAL_TIE_THEN_MAX_BASE_HAC_NEFF_THEN_POOL_COMPLEXITY_THEN_STABLE_ID",
+    "complexity": "ALL_REMAINING_DOMAIN_CARDINALITIES_ELSE_ALL_ACTIVE_FREE_AXIS_COUNTS_ELSE_ID",
+    "active_free_axis_count": "COUNT_NONCONSTANT_ACTIVE_FROZEN_LEGAL_AXES",
+    "neff": "EXISTING_P75_COMPLETED_TRADE_HAC_EFFECTIVE_COUNT_WITH_RETAINED_RAW_R_BASIS",
+})
+V17_SELECTION_ADDENDUM_CONTRACT_SHA256: Final = _sha256_json(dict(V17_SELECTION_ADDENDUM_CONTRACT))
+V17_SELECTION_POLICY: Final = MappingProxyType({
+    **CURRENT_SELECTION_POLICY,
+    "policy_version": "fxpm.winner-statistical-policy.v13",
+    "selection_addendum_contract_sha256": V17_SELECTION_ADDENDUM_CONTRACT_SHA256,
+    "candidate_admissibility_gate_codes": (*CURRENT_SELECTION_POLICY["candidate_admissibility_gate_codes"],
+        "MATCHED_STRESS_FLOOR_UNAVAILABLE", "BELOW_MATCHED_STRESS_ECONOMIC_FLOOR"),
+    "winner_rule": "UNCHANGED_FULL_PANEL_GATES_THEN_MATCHED_BASE_COST_FLOOR_AND_DECLARED_STATISTICAL_TIE",
+})
+V17_GENERATION: Final = replace(V16_GENERATION,
+    selection_version="fxpm.winner-selection.v17", request_version="fxpm.winner-selection-request.v5",
+    precommitment_version="fxpm.winner-precommitment.v6", evidence_version="fxpm.winner-evidence-ledger.v9",
+    marginal_version="fxpm.winner-book-marginal.v4", shared_partition_version="fxpm.winner-shared-oos-partition.v5",
+    policy=V17_SELECTION_POLICY, policy_sha256=_sha256_json(dict(V17_SELECTION_POLICY)))
+
+
 CURRENT_WINNER_SELECTION_CONTRACT_VERSION: Final = CURRENT_GENERATION.selection_version
 CURRENT_WINNER_SELECTION_REQUEST_VERSION: Final = CURRENT_GENERATION.request_version
 CURRENT_WINNER_BOOK_MARGINAL_CONTRACT_VERSION: Final = CURRENT_GENERATION.marginal_version
@@ -541,6 +574,8 @@ CURRENT_SHARED_OOS_PARTITION_VERSION: Final = CURRENT_GENERATION.shared_partitio
 
 def _generation_for_precommitment(value: Mapping[str, Any]) -> _ContractGeneration:
     version = value.get("contract_version")
+    if version == V17_GENERATION.precommitment_version:
+        return V17_GENERATION
     if version == V16_GENERATION.precommitment_version:
         return V16_GENERATION
     if version == CURRENT_GENERATION.precommitment_version:
@@ -556,7 +591,7 @@ def winner_generation_for_precommitment(value: Mapping[str, Any]) -> _ContractGe
 
 def winner_request_byte_limit(contract_version: str) -> int:
     """Assembled Winner request bound; metadata artifacts keep their own bounds."""
-    for generation in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION):
+    for generation in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION):
         if contract_version in (generation.selection_version, generation.request_version,
                 generation.precommitment_version, generation.evidence_version, generation.marginal_version):
             return generation.transport.max_request_bytes
@@ -564,13 +599,13 @@ def winner_request_byte_limit(contract_version: str) -> int:
 
 
 def _payload_transport(generation, payload_type):
-    if generation is V16_GENERATION and payload_type is not WinnerEvidenceLedgerPayload:
+    if generation in (V16_GENERATION, V17_GENERATION) and payload_type is not WinnerEvidenceLedgerPayload:
         return V16_METADATA_ENVELOPE
     return generation.transport
 
 
 def check_completed_trade_transport_count(total: int, *, generation: _ContractGeneration = CURRENT_GENERATION) -> None:
-    if not any(generation is known for known in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION)):
+    if not any(generation is known for known in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION)):
         raise _ContractError("WINNER_TRANSPORT_GENERATION_INVALID")
     if type(total) is not int or total < 0:
         raise _ContractError("COMPLETED_TRADE_COUNT_INVALID")
@@ -590,6 +625,11 @@ def _generation_keys(
         result |= {"frozen_tier_pair_contract", "partition_cost_precommitments_sha256"}
     elif keys is _ATTEMPT_LEDGER_KEYS or keys is _EVIDENCE_LEDGER_KEYS:
         result |= {"partition_cost_precommitments_sha256"}
+    if generation is V17_GENERATION:
+        if keys is _PRECOMMITMENT_KEYS:
+            result |= {"selection_addendum_contract", "selection_complexity_roster", "selection_complexity_roster_sha256"}
+        elif keys is _EVIDENCE_LEDGER_KEYS:
+            result |= {"selection_addendum"}
     return frozenset(result)
 
 
@@ -1070,7 +1110,7 @@ def _create_winner_selection_request(
         )
     )
     request = WinnerSelectionRequest(precommitment, attempt_ledger, evidence_ledger, request_sha256)
-    if _generation is V16_GENERATION:
+    if _generation in (V16_GENERATION, V17_GENERATION):
         _owned_json(request.to_dict(), _generation.transport.max_request_bytes,
             _envelope=_generation.transport, _copy_owned=False)
     elif len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes:
@@ -1084,6 +1124,8 @@ def create_winner_selection_request(precommitment_payload: Any, attempt_ledger_p
         generation = _generation_for_precommitment(precommitment_payload)
     except Exception:
         return None
+    if generation is V17_GENERATION:
+        return create_winner_selection_request_v17(precommitment_payload, attempt_ledger_payload, evidence_ledger_payload)
     if generation is V16_GENERATION:
         return create_winner_selection_request_v16(precommitment_payload, attempt_ledger_payload, evidence_ledger_payload)
     try:
@@ -1100,6 +1142,15 @@ def create_winner_selection_request_v16(precommitment_payload: Any, attempt_ledg
         raise _ContractError("V16_PRECOMMITMENT_VERSION_REQUIRED")
     return _create_winner_selection_request(precommitment_payload, attempt_ledger_payload, evidence_ledger_payload,
         _generation=V16_GENERATION)
+
+
+def create_winner_selection_request_v17(precommitment_payload: Any, attempt_ledger_payload: Any,
+        evidence_ledger_payload: Any) -> WinnerSelectionRequest:
+    """Build the explicit economic-selection successor with the retained envelope."""
+    if _generation_for_precommitment(precommitment_payload) is not V17_GENERATION:
+        raise _ContractError("V17_PRECOMMITMENT_VERSION_REQUIRED")
+    return _create_winner_selection_request(precommitment_payload, attempt_ledger_payload,
+        evidence_ledger_payload, _generation=V17_GENERATION)
 
 
 def _payload_from_wrapper(
@@ -1160,13 +1211,13 @@ def _request_payloads(
             policy_sha, attempt_sha, evidence_sha, _generation=_generation
         )
     )
-    if _generation is V16_GENERATION:
+    if _generation in (V16_GENERATION, V17_GENERATION):
         _owned_json(request.to_dict(), _generation.transport.max_request_bytes,
             _envelope=_generation.transport, _copy_owned=False)
     if (
         type(request.request_sha256) is not str
         or request.request_sha256 != expected_request_sha
-        or (_generation is not V16_GENERATION
+        or (_generation not in (V16_GENERATION, V17_GENERATION)
             and len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes)
     ):
         raise _ContractError("REQUEST_BINDING_INVALID")
@@ -1470,6 +1521,181 @@ def _validate_causal_fold_plan(
     return plan, latest_boundary
 
 
+def validate_selection_complexity_roster(roster, *, attempts=None, expected_count=None):
+    """Validate only frozen legal axes; ordinary parameter-key counts are irrelevant."""
+    from pm_current_refit_parameters import validate_parameter_domain_member
+    if type(roster) is not list or expected_count is not None and len(roster) != expected_count:
+        raise _ContractError("SELECTION_COMPLEXITY_ROSTER_INVALID")
+    fields = frozenset({"ordinal", "process_candidate_id", "strategy_id", "trial_definition_sha256",
+        "refit_recipe_sha256", "source_strategy_domain_sha256", "parameter_domain", "parameter_domain_sha256",
+        "finite_domain_cardinality", "active_free_parameter_count"})
+    result = []
+    for ordinal, raw in enumerate(roster):
+        row = _exact_dict(raw, fields, "SELECTION_COMPLEXITY_ROW_INVALID")
+        if type(row["ordinal"]) is not int or row["ordinal"] != ordinal:
+            raise _ContractError("SELECTION_COMPLEXITY_ORDER_INVALID")
+        _hex(row["process_candidate_id"], _HEX40, "SELECTION_COMPLEXITY_CANDIDATE_INVALID")
+        _safe_id(row["strategy_id"], "SELECTION_COMPLEXITY_STRATEGY_INVALID")
+        for key in ("trial_definition_sha256", "refit_recipe_sha256"):
+            _hex(row[key], _HEX64, "SELECTION_COMPLEXITY_RECIPE_INVALID")
+        domain = row["parameter_domain"]
+        if domain is not None:
+            first_member = dict(domain["defaults"])
+            for axis in domain["axes"]:
+                first_member.update(zip(axis["names"], axis["choices"][0], strict=True))
+            validate_parameter_domain_member(domain, first_member)
+            active = sum(len({_canonical_bytes(choice) for choice in axis["choices"]}) > 1
+                for axis in domain["axes"])
+            if (row["parameter_domain_sha256"] != _sha256_json(domain)
+                    or type(row["finite_domain_cardinality"]) is not int
+                    or row["finite_domain_cardinality"] != domain["point_count"]
+                    or type(row["active_free_parameter_count"]) is not int
+                    or row["active_free_parameter_count"] != active):
+                raise _ContractError("SELECTION_COMPLEXITY_RECOMPUTATION_MISMATCH")
+            _hex(row["source_strategy_domain_sha256"], _HEX64, "SELECTION_COMPLEXITY_DOMAIN_INVALID")
+        elif any(row[key] is not None for key in ("parameter_domain_sha256", "finite_domain_cardinality",
+                "active_free_parameter_count", "source_strategy_domain_sha256")):
+            raise _ContractError("SELECTION_COMPLEXITY_UNAVAILABLE_MISMATCH")
+        if attempts is not None:
+            attempt = attempts[ordinal]
+            for key in ("ordinal", "process_candidate_id", "strategy_id", "trial_definition_sha256", "refit_recipe_sha256"):
+                if row[key] != attempt[key]:
+                    raise _ContractError("SELECTION_COMPLEXITY_ATTEMPT_SPLICE")
+        result.append(json.loads(_canonical_bytes(row)))
+    return result
+
+
+def _v17_statistical_tie(candidates):
+    maximum = max(c["lane_statistics"]["P75"]["completed_trade_hac_effective_count"] for c in candidates)
+    remaining = [c for c in candidates
+        if c["lane_statistics"]["P75"]["completed_trade_hac_effective_count"] == maximum]
+    rows = [c["selection_complexity"] for c in remaining]
+    if all(type(r["finite_domain_cardinality"]) is int for r in rows):
+        minimum = min(r["finite_domain_cardinality"] for r in rows)
+        remaining = [c for c in remaining if c["selection_complexity"]["finite_domain_cardinality"] == minimum]
+    elif all(type(r["active_free_parameter_count"]) is int for r in rows):
+        minimum = min(r["active_free_parameter_count"] for r in rows)
+        remaining = [c for c in remaining if c["selection_complexity"]["active_free_parameter_count"] == minimum]
+    return min(remaining, key=lambda c: c["process_candidate_id"])
+
+
+def _v17_below_matched_stress_economic_floor(base_net_r, matched_p95_cost_r):
+    """Compare same-count canonical R vectors exactly, preserving their reported means."""
+    return sum(_encode_r_e12(value, MAX_ABS_TRADE_R, "MATCHED_FLOOR_R_GRID_INVALID")
+        for value in base_net_r) < sum(
+        _encode_r_e12(value, MAX_ABS_TRADE_R, "MATCHED_FLOOR_R_GRID_INVALID")
+        for value in matched_p95_cost_r)
+
+
+def _validate_v17_selection_addendum(value, *, policy, policy_sha, attempt_sha, attempts, entries, shared_axis):
+    """Validate compact semantics; original source authority requires declared cold replay."""
+    import pm_authority_spool as spool
+    fields = frozenset({"contract_version", "precommitment_payload_sha256", "attempt_ledger_payload_sha256",
+        "selection_complexity_roster_sha256", "entries", "entries_sha256"})
+    body = _exact_dict(value, fields, "MATCHED_FLOOR_ADDENDUM_SCHEMA_INVALID")
+    if (body["contract_version"] != "fxpm.matched-floor-selection-evidence.v1"
+            or body["precommitment_payload_sha256"] != policy_sha
+            or body["attempt_ledger_payload_sha256"] != attempt_sha
+            or body["selection_complexity_roster_sha256"] != policy["selection_complexity_roster_sha256"]
+            or type(body["entries"]) is not list or len(body["entries"]) != len(attempts)
+            or body["entries_sha256"] != _sha256_json(body["entries"])):
+        raise _ContractError("MATCHED_FLOOR_ADDENDUM_BINDING_INVALID")
+    complexity = validate_selection_complexity_roster(policy["selection_complexity_roster"],
+        attempts=attempts, expected_count=len(attempts))
+    cell_parity_failure = False
+    statuses = {"AVAILABLE_MATCHED_BASE_VERIFIED", "UNAVAILABLE_NO_COMPLETED_BASE_TRADES",
+        "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH", "REFUSED_P95_BELOW_P75"}
+    for ordinal, (raw, attempt, entry) in enumerate(zip(body["entries"], attempts, entries, strict=True)):
+        row = _exact_dict(raw, frozenset({"ordinal", "attempt_id", "process_candidate_id", "stage_origin_binding",
+            "partition_witnesses_descriptor", "full_witnesses_sha256", "partition_statuses", "final_folds"}),
+            "MATCHED_FLOOR_ATTEMPT_SCHEMA_INVALID")
+        if any(row[key] != attempt[key] for key in ("ordinal", "attempt_id", "process_candidate_id")):
+            raise _ContractError("MATCHED_FLOOR_ATTEMPT_SPLICE")
+        entry["selection_complexity"] = complexity[ordinal]
+        entry["matched_floor"] = {"status": "UNAVAILABLE", "reason_codes": ["NO_COMPLETED_BASE_FLOOR_VECTOR"],
+            "completed_base_count": 0, "mean_base_net_r": None, "mean_matched_p95_cost_r": None}
+        if attempt["precommitted_evidence_role"] == "PRESEARCH_PROCESS_REJECTED":
+            if (row["stage_origin_binding"] is not None or row["partition_witnesses_descriptor"] is not None
+                    or row["full_witnesses_sha256"] is not None or row["partition_statuses"] != [] or row["final_folds"] != []):
+                raise _ContractError("MATCHED_FLOOR_REJECTED_ATTEMPT_CARRIES_EVIDENCE")
+            continue
+        origin_fields = frozenset({"schema_version", "producer_request_sha256", "process_receipt_sha256",
+            "frozen_receipt_sha256", "precommitment_sha256", "declared_unit_binding_sha256",
+            "preparation_contract_sha256", "unit", "stage_content_sha256", "stage_size_bytes",
+            "raw_body_sha256", "matched_base_facts_sha256"})
+        origin = _exact_dict(row["stage_origin_binding"], origin_fields, "MATCHED_FLOOR_STAGE_ORIGIN_SCHEMA_INVALID")
+        if (origin["schema_version"] != "fxpm.matched-floor-stage-origin-binding.v1"
+                or origin["precommitment_sha256"] != policy_sha
+                or type(origin["unit"]) is not dict or origin["unit"].get("ordinal") != ordinal
+                or origin["unit"].get("raw_attempt_id") != attempt["attempt_id"]
+                or origin["matched_base_facts_sha256"] != row["full_witnesses_sha256"]):
+            raise _ContractError("MATCHED_FLOOR_STAGE_ORIGIN_BINDING_INVALID")
+        for key in origin_fields - {"schema_version", "unit", "stage_size_bytes"}:
+            _hex(origin[key], _HEX64, "MATCHED_FLOOR_STAGE_ORIGIN_HASH_INVALID")
+        _exact_int(origin["stage_size_bytes"], 1, 2**63 - 1, "MATCHED_FLOOR_STAGE_SIZE_INVALID")
+        reference = _exact_dict(row["partition_witnesses_descriptor"], frozenset({"artifact_id", "artifact_type", "descriptor"}),
+            "MATCHED_FLOOR_WITNESS_REFERENCE_INVALID")
+        if reference["artifact_type"] != "winner_matched_base_witnesses" or type(reference["artifact_id"]) is not str:
+            raise _ContractError("MATCHED_FLOOR_WITNESS_REFERENCE_INVALID")
+        spool._validate_descriptor(reference["descriptor"], content_addressed=True)
+        if reference["descriptor"]["format"] != "fxpm-ascii-json-v1":
+            raise _ContractError("MATCHED_FLOOR_WITNESS_REFERENCE_INVALID")
+        if (type(row["partition_statuses"]) is not list
+                or len(row["partition_statuses"]) != len(shared_axis) * 3):
+            raise _ContractError("MATCHED_FLOOR_PARTITION_ROSTER_INVALID")
+        for index, raw_status in enumerate(row["partition_statuses"]):
+            status = _exact_dict(raw_status, frozenset({"fold_ordinal", "partition_role", "floor_status",
+                "floor_reason_codes", "witness_sha256"}), "MATCHED_FLOOR_PARTITION_STATUS_INVALID")
+            fold, role = divmod(index, 3);role = ("optimizer_train", "tuning_validation", "final_lockbox")[role]
+            if (status["fold_ordinal"] != fold or status["partition_role"] != role
+                    or status["floor_status"] not in statuses or type(status["floor_reason_codes"]) is not list
+                    or any(type(code) is not str for code in status["floor_reason_codes"])):
+                raise _ContractError("MATCHED_FLOOR_PARTITION_STATUS_INVALID")
+            _hex(status["witness_sha256"], _HEX64, "MATCHED_FLOOR_PARTITION_HASH_INVALID")
+            if status["floor_status"] == "REFUSED_P95_BELOW_P75":
+                raise _ContractError("P95_BELOW_P75")
+            cell_parity_failure |= status["floor_status"] == "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH"
+        if type(row["final_folds"]) is not list or len(row["final_folds"]) != len(shared_axis):
+            raise _ContractError("MATCHED_FLOOR_FINAL_ROSTER_INVALID")
+        net, costs = [], []
+        for fold_ordinal, raw_final in enumerate(row["final_folds"]):
+            final = _exact_dict(raw_final, frozenset({"fold_ordinal", "shared_fold_axis_row_sha256",
+                "raw_shared_oos_partition_sha256", "base_position_identity_sha256", "base_position_identity",
+                "floor_status", "floor_reason_codes", "base_actual_initial_risk_net_r", "matched_p95_spread_cost_r"}),
+                "MATCHED_FLOOR_FINAL_SCHEMA_INVALID")
+            axis = shared_axis[fold_ordinal]
+            if (final["fold_ordinal"] != fold_ordinal or final["shared_fold_axis_row_sha256"] != _sha256_json(axis)
+                    or final["raw_shared_oos_partition_sha256"] != _sha256_json(axis["shared_oos_partition"])):
+                raise _ContractError("MATCHED_FLOOR_FINAL_AXIS_SPLICE")
+            account = entry["folds"][fold_ordinal]["tier_evidence"]["P75"]
+            identity = {key: account[key] for key in ("completed_trade_position_ids", "completed_trade_open_utc",
+                "completed_trade_close_utc", "completed_trade_open_event_order", "completed_trade_close_event_order")}
+            status = row["partition_statuses"][fold_ordinal * 3 + 2]
+            if (final["base_position_identity"] != identity or final["base_position_identity_sha256"] != _sha256_json(identity)
+                    or any(final[key] != status[key] for key in ("floor_status", "floor_reason_codes"))):
+                raise _ContractError("MATCHED_FLOOR_POSITION_IDENTITY_SPLICE")
+            values, spread = final["base_actual_initial_risk_net_r"], final["matched_p95_spread_cost_r"]
+            if final["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED":
+                count = len(identity["completed_trade_position_ids"])
+                if (type(values) is not list or type(spread) is not list or not count
+                        or len(values) != count or len(spread) != count):
+                    raise _ContractError("MATCHED_FLOOR_COMPLETE_VECTOR_REQUIRED")
+                net.extend(values);costs.extend(spread)
+            elif values is not None or spread is not None:
+                raise _ContractError("MATCHED_FLOOR_UNAVAILABLE_PARTIAL_VECTOR")
+        if net:
+            if len(net) != len(costs) or any(not math.isfinite(x) for x in (*net,*costs)) or any(x < 0 for x in costs):
+                raise _ContractError("MATCHED_FLOOR_VECTOR_INVALID")
+            below_floor = _v17_below_matched_stress_economic_floor(net, costs)
+            entry["matched_floor"] = {"status": "AVAILABLE", "reason_codes": [], "completed_base_count": len(net),
+                "mean_base_net_r": _mean(net), "mean_matched_p95_cost_r": _mean(costs),
+                "_below_matched_stress_economic_floor": below_floor}
+    if cell_parity_failure:
+        for entry in entries:
+            entry["matched_floor"] = {"status": "UNAVAILABLE", "reason_codes": ["CELL_BASE_FILL_OR_POSITION_PARITY_MISMATCH"],
+                "completed_base_count": 0, "mean_base_net_r": None, "mean_matched_p95_cost_r": None}
+
+
 def _validate_precommitment(
     payload: dict[str, Any], *, _generation: _ContractGeneration = ARCHIVED_GENERATION
 ) -> tuple[
@@ -1545,6 +1771,12 @@ def _validate_precommitment(
         declared_latest_boundary=value["latest_evidence_boundary_utc"],
         _generation=_generation,
     )
+    if _generation is V17_GENERATION:
+        if value["selection_addendum_contract"] != dict(V17_SELECTION_ADDENDUM_CONTRACT):
+            raise _ContractError("SELECTION_ADDENDUM_CONTRACT_MISMATCH")
+        roster = validate_selection_complexity_roster(value["selection_complexity_roster"], expected_count=attempts)
+        if value["selection_complexity_roster_sha256"] != _sha256_json(roster):
+            raise _ContractError("SELECTION_COMPLEXITY_HASH_MISMATCH")
     return precommitted_at, cell, attempts, fold_plan, latest_boundary
 
 
@@ -2689,6 +2921,9 @@ def _validate_evidence_ledger(
 
     if technical_failure:
         raise _ContractError("ATTEMPT_EVIDENCE_INCOMPLETE_TECHNICAL_FAILURE")
+    if _generation is V17_GENERATION:
+        _validate_v17_selection_addendum(value["selection_addendum"], policy=policy, policy_sha=policy_sha,
+            attempt_sha=attempt_payload_sha, attempts=attempts, entries=entries, shared_axis=shared_axis)
     return generated_at, entries, shared_axis
 
 def _mean(values: list[float]) -> float:
@@ -3860,7 +4095,10 @@ def _validate_primary_policy_contract(
     }
     if not _generation.archived:
         expected.update({
-            "policy_version": "fxpm.winner-statistical-policy.v12",
+            "policy_version": (
+                "fxpm.winner-statistical-policy.v13" if _generation is V17_GENERATION
+                else "fxpm.winner-statistical-policy.v12"
+            ),
             "primary_pairwise_inference": "INDEPENDENT_P75_P95_PAIRED_DAILY_DIFFERENCES_SEPARATE_TIER_HOLM",
             "pbo_lane_rule": "INDEPENDENT_FROZEN_TIER_ACCOUNTS",
         })
@@ -4041,6 +4279,9 @@ def _candidate_statistics(
         "refit_recipe_sha256": attempt["refit_recipe_sha256"],
         "evidence_status": entry["evidence_status"],
     }
+    if _generation is V17_GENERATION:
+        identity["selection_complexity"] = entry["selection_complexity"]
+        identity["matched_floor"] = entry["matched_floor"]
     unavailable_tiers = {
         tier: {
             "tier": tier,
@@ -4294,6 +4535,11 @@ def _candidate_statistics(
             "MOVING_BLOCK_BOOTSTRAP_LOWER_BOUND_FAILED": bootstrap_tier["status"]
             == "FAIL",
         }
+        if _generation is V17_GENERATION:
+            floor = entry["matched_floor"]
+            gate_results["MATCHED_STRESS_FLOOR_UNAVAILABLE"] = floor["status"] != "AVAILABLE"
+            gate_results["BELOW_MATCHED_STRESS_ECONOMIC_FLOOR"] = (floor["status"] == "AVAILABLE"
+                and floor["_below_matched_stress_economic_floor"])
         if tuple(gate_results) != declared_candidate_gates:
             raise _ContractError("CANDIDATE_GATE_POLICY_IMPLEMENTATION_MISMATCH")
         failures = [code for code, failed in gate_results.items() if failed]
@@ -4581,7 +4827,8 @@ def _resolve_tier(
             status = "UNRESOLVED_NONDOMINATED_SET"
             reasons = ["STATISTICALLY_DIFFERENT_PRIMARY_UTILITY_ORDER_CONFLICT"]
         else:
-            winner = min(nondominated, key=_simplicity_key)
+            winner = (_v17_statistical_tie(nondominated) if _generation is V17_GENERATION
+                else min(nondominated, key=_simplicity_key))
             reporting = winner
             status = "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY"
             reasons = [
@@ -5345,6 +5592,17 @@ def verify_historical_cell_winner_decision(decision: Any, request: Any) -> bool:
     return _verify_historical_decision_core(decision, request)
 
 
+def _historical_book_marginal_from_body(body, receipt_sha256):
+    """Format a verified local body; callers retain verification responsibility."""
+    try:
+        marginal = body["historical_book_marginal_receipt"]
+        if marginal is None:
+            return None
+        return {**marginal, "upstream_evidence_receipt_sha256": receipt_sha256}
+    except Exception:
+        return None
+
+
 def historical_book_marginal_receipt(
     decision: Any, request: Any
 ) -> dict[str, Any] | None:
@@ -5357,11 +5615,7 @@ def historical_book_marginal_receipt(
             json.loads(decision._body_json.decode("ascii")),
             MAX_DECISION_BYTES,
         )
-        marginal = body["historical_book_marginal_receipt"]
-        return {
-            **marginal,
-            "upstream_evidence_receipt_sha256": decision._receipt_sha256,
-        }
+        return _historical_book_marginal_from_body(body, decision._receipt_sha256)
     except Exception:
         return None
 
@@ -5413,3 +5667,6 @@ __all__ = [
 def current_policy_snapshot() -> dict[str, Any]:
     """Declared independent-account candidate policy; no campaign authority."""
     return json.loads(_canonical_bytes(dict(CURRENT_SELECTION_POLICY)).decode("ascii"))
+
+__all__.extend(["V17_GENERATION", "V17_SELECTION_POLICY", "V17_SELECTION_ADDENDUM_CONTRACT",
+    "V17_SELECTION_ADDENDUM_CONTRACT_SHA256", "validate_selection_complexity_roster", "create_winner_selection_request_v17"])

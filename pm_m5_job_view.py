@@ -351,16 +351,12 @@ def _encoded_bytes(value) -> int:
 def _cache_limit(budgets: ViewBudgets, rows: int, size: int) -> None:
     if rows > budgets.max_cache_rows:
         _fail("M5_VIEW_CACHE_ROW_BUDGET")
-    if size > budgets.max_cache_bytes:
-        _fail("M5_VIEW_CACHE_BYTE_BUDGET")
 
 
 def _view_limit(budgets: ViewBudgets, rows: int, size: int,
                 retained_rows: int, retained_bytes: int) -> None:
     if rows > budgets.max_view_rows:
         _fail("M5_VIEW_ROW_BUDGET")
-    if size > budgets.max_view_bytes:
-        _fail("M5_VIEW_BYTE_BUDGET")
     _cache_limit(budgets, retained_rows + rows, retained_bytes + size)
 
 
@@ -645,8 +641,6 @@ def _build_view(binding: DerivedJobBinding, request: ViewRequest, rows: tuple[Ba
         _fail("M5_VIEW_SOURCE_BINDING_INVALID")
     if len(rows) > budgets.max_source_rows:
         _fail("M5_VIEW_SOURCE_ROW_BUDGET")
-    if sum(_encoded_bytes(asdict(row)) for row in rows) > budgets.max_source_bytes:
-        _fail("M5_VIEW_SOURCE_BYTE_BUDGET")
     start, end = _bounds(request.interval)
     examined_start, examined_end = _bounds(examined_interval)
     source_start, source_end = _bounds(source.prefix_interval)
@@ -781,8 +775,6 @@ class _JobState:
         total = sum(value[1] for value in self.source_usage.values()) + size
         if rows > self.budgets.max_source_rows:
             _fail("M5_VIEW_SOURCE_ROW_BUDGET")
-        if total > self.budgets.max_source_bytes:
-            _fail("M5_VIEW_SOURCE_BYTE_BUDGET")
         cached_rows, cached_bytes = self._cache_totals()
         _cache_limit(self.budgets, cached_rows + 1, cached_bytes + size)
         previous = self.source_usage.get(key, (0, 0))

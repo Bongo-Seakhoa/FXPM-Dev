@@ -1,11 +1,12 @@
-"""Cross-process aggregate byte governance for one authority spool root.
+"""Cross-process publication byte accounting for one authority spool root.
 
 The quota is operational routing state, not evidence.  Writers durably reserve
 bytes under a short root lock, then compute and stage outside that lock.  A
 kernel-held per-reservation guard distinguishes live writers from crashed
 writers without trusting reusable process identifiers.  Once no writer is
 live, abandoned reservations are reconciled by one exact inode-deduplicated
-rescan before more bytes are admitted.
+rescan before another publication. Legacy generation-byte and free-space
+fields remain decodable metadata and do not admit or reject writes.
 """
 
 from __future__ import annotations
@@ -218,15 +219,6 @@ def _state(
     records.sort(key=lambda value: value["token"])
     if len({value["token"] for value in records}) != len(records):
         _fail("SPOOL_QUOTA_RESERVATION_DUPLICATE")
-    projected = committed + sum(
-        int(value["reserved_bytes"]) for value in records
-    )
-    if projected > maximum:
-        _fail(
-            "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-            projected,
-            maximum,
-        )
     result: dict[str, Any] = {
         "schema_version": QUOTA_STATE_SCHEMA,
         "status": "DIRTY" if records else "CLEAN",
@@ -641,22 +633,11 @@ def _load_state_locked(
             min_free_bytes=reserve,
             committed_bytes=committed,
         )
-    elif (
-        current["max_generation_bytes"] != maximum
-        or current["min_free_bytes"] != reserve
-    ):
-        _fail("SPOOL_QUOTA_LIMITS_CHANGED")
     records = list(current["reservations"])
     if records and not any(
         _guard_is_live(root, str(record["token"])) for record in records
     ):
         committed = _scan_committed_bytes(root)
-        if committed > maximum:
-            _fail(
-                "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-                committed,
-                maximum,
-            )
         current = _state(
             max_generation_bytes=maximum,
             min_free_bytes=reserve,
@@ -670,12 +651,6 @@ def _load_state_locked(
                 )
             except OSError:
                 pass
-    if int(current["committed_bytes"]) > maximum:
-        _fail(
-            "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-            current["committed_bytes"],
-            maximum,
-        )
     return current
 
 
@@ -744,26 +719,6 @@ class PublicationLease:
             )
             index, record = _record_for(current, self._token)
             records = [dict(value) for value in current["reservations"]]
-            projected = (
-                int(current["committed_bytes"])
-                + sum(int(value["reserved_bytes"]) for value in records)
-                + count
-            )
-            if projected > self._max_generation_bytes:
-                _fail(
-                    "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-                    projected,
-                    self._max_generation_bytes,
-                )
-            free_bytes = _disk_free(self._root)
-            promised = _unmaterialized(records) + count
-            if free_bytes - promised < self._min_free_bytes:
-                _fail(
-                    "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
-                    free_bytes,
-                    promised,
-                    self._min_free_bytes,
-                )
             if count:
                 record["reserved_bytes"] = int(record["reserved_bytes"]) + count
                 records[index] = record
@@ -863,24 +818,6 @@ class PublicationLease:
             records = [dict(value) for value in current["reservations"]]
             del records[index]
             committed = int(current["committed_bytes"]) + unique
-            projected = committed + sum(
-                int(value["reserved_bytes"]) for value in records
-            )
-            if projected > self._max_generation_bytes:
-                _fail(
-                    "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-                    projected,
-                    self._max_generation_bytes,
-                )
-            free_bytes = _disk_free(self._root)
-            promised = _unmaterialized(records)
-            if free_bytes - promised < self._min_free_bytes:
-                _fail(
-                    "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
-                    free_bytes,
-                    promised,
-                    self._min_free_bytes,
-                )
             _write_state(
                 self._root,
                 _state(
@@ -1013,19 +950,8 @@ class PublicationBatch:
         needed = self._published_bytes + sum(self._in_flight_publications.values()) + count - self._reserved_bytes
         if needed <= 0:
             return
-        # Bytes already on disk have lowered the free space; report them so
-        # the free-space check does not also count them as promised.
         self._report()
-        requested = max(needed, self._window_bytes)
-        try:
-            self._lease.consume(requested)
-        except AuthoritySpoolQuotaError as exc:
-            if requested == needed or exc.code not in {
-                "SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-                "SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED",
-            }:
-                raise
-            self._lease.consume(needed)
+        self._lease.consume(max(needed, self._window_bytes))
         self._reserved_bytes = self._lease.in_progress_bytes
 
     def _publication_started(self, byte_count: int) -> object:

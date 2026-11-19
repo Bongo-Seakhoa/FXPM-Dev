@@ -214,8 +214,6 @@ _MAX_LEDGER_BYTES_TOTAL: Final = 256 * 1024 * 1024
 _MAX_CANDIDATE_POSITIONS_PER_ANCHOR: Final = 10_000
 _MAX_WINNERS_PER_ANCHOR: Final = book.FAMILY_SIZE
 _MAX_NATIVE_ROWS_PER_ANCHOR: Final = 25_000_000
-_MAX_NATIVE_BYTES_PER_ANCHOR: Final = 8 * 1024 * 1024 * 1024
-_MAX_ACTIVE_SYMBOL_NATIVE_BYTES: Final = 512 * 1024 * 1024
 _MAX_CANDIDATE_MARKS_PER_ANCHOR: Final = 2_000_000
 _MAX_CANDIDATE_MARK_BYTES_PER_ANCHOR: Final = 256 * 1024 * 1024
 _ESTIMATED_CANDIDATE_MARK_BYTES: Final = 128
@@ -2799,13 +2797,6 @@ def _open_m5_valuation_tape(
         or not bool((opens <= forward_start).any())
     ):
         _fail("FORWARD_M5_VALUATION_GEOMETRY_INVALID", expected_identity.get("role"))
-    memory_bytes = int(frame.memory_usage(index=True, deep=True).sum())
-    if memory_bytes > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
-        _fail(
-            "FORWARD_M5_VALUATION_MEMORY_BOUND_EXCEEDED",
-            expected_identity.get("symbol"),
-            memory_bytes,
-        )
     backtester = Backtester(config)
     try:
         entry_half, intrabar_half, spread_meta = backtester._build_half_spread_arrays(
@@ -3404,8 +3395,7 @@ def _execute_anchor_replay(
     valuation_ids = identities("valuation_m5_products", valuation_products)
     source_ids = identities("spread_source_products", spread_source_products)
     all_identities = (*execution_ids.values(), *valuation_ids.values(), *source_ids.values())
-    if (sum(int(value["prefix_rows"]) for value in all_identities) > _MAX_NATIVE_ROWS_PER_ANCHOR
-            or sum(int(value["prefix_bytes"]) for value in all_identities) > _MAX_NATIVE_BYTES_PER_ANCHOR):
+    if sum(int(value["prefix_rows"]) for value in all_identities) > _MAX_NATIVE_ROWS_PER_ANCHOR:
         _fail("FROZEN_TIER_NATIVE_RESOURCE_BOUND_EXCEEDED")
     key = native_product_key(owner.symbol, owner.timeframe)
     valuation_key = native_product_key(owner.symbol, "M5")
@@ -3445,8 +3435,6 @@ def _execute_anchor_replay(
     frame = opened.loc[closes <= end].copy(deep=True)
     _selection_prefix_match(frame, owner)
     features, signals = _features_and_prefix_parity(frame, [owner])
-    if int(features.memory_usage(index=True, deep=True).sum()) > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
-        _fail("FORWARD_ACTIVE_SYMBOL_FEATURE_MEMORY_BOUND_EXCEEDED")
     opens, _ = _frame_interval(features)
     warmup = int(opens.searchsorted(start, side="left"))
     if not 1 <= warmup < len(features):
@@ -3551,6 +3539,28 @@ def _run_declared_cell_account(*, config, features, symbol, timeframe, spec, war
         entry_spread_observations=entry_spread_observations, terminal_policy="MARK_OPEN")
 
 
+def _declared_account_verified_progress(context, *, precommit, process,
+        frozen_pipeline_config, _verified_chain=None):
+    """Use one call's actual producer output; cold calls perform their own admission."""
+    import pm_historical_search_producer as producer
+
+    cell_id = precommit.to_dict()["cells"][0]["cell_id"]
+    chain = _verified_chain
+    if chain is None:
+        chain = {}
+        producer.reopen_declared_cell_owner_progress(context, precommit=precommit,
+            process=process, cell_id=cell_id, frozen_pipeline_config=frozen_pipeline_config,
+            _verified_progress_out=chain)
+    if (type(chain) is not dict or chain.get("context") is not context
+            or chain.get("precommit") is not precommit or chain.get("process") is not process
+            or chain.get("frozen_pipeline_config") is not frozen_pipeline_config
+            or chain.get("cell_id") != cell_id
+            or type(chain.get("progress")) is not producer.DeclaredCellOwnerProgress
+            or type(chain.get("commits")) is not dict):
+        _fail("DECLARED_CELL_OWNER_PROGRESS_INVALID")
+    return chain
+
+
 def _declared_cell_measurement(parent):
     slots = parent["slot_roster"]["slots"]
     if type(slots) is not list or len(slots) != 13:
@@ -3569,21 +3579,21 @@ def _declared_cell_measurement(parent):
         "end_exclusive_utc": slots[-1]["end_exclusive_utc"]}
 
 
-def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline_config):
-    import pm_historical_search_producer as producer
-
+def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline_config,
+        _verified_chain=None):
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
         _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
     try:
-        parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        chain = _declared_account_verified_progress(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, _verified_chain=_verified_chain)
+        parent = chain["parent"]
         if historical.declared_slot_source_kind(parent) != "broker_native" or historical.declared_slot_development_scope(parent) is not None:
             _fail("DECLARED_NATIVE_ACCOUNT_SOURCE_KIND_REQUIRED")
-        config = frozen_pipeline_config.materialize(context)
+        config = chain["config"]
         _declared_cell_measured_config(config)
         _declared_cell_measurement(parent)
         cell = parent["cells"][0]
-        progress = producer.reopen_declared_cell_owner_progress(context, precommit=precommit,
-            process=process, cell_id=cell["cell_id"], frozen_pipeline_config=frozen_pipeline_config)
+        progress = chain["progress"]
     except ForwardOOSReplayProductionError:
         raise
     except Exception as exc:
@@ -3593,8 +3603,12 @@ def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline
         _fail("DECLARED_CELL_COMMIT_ROSTER_INVALID")
     commits, records, schedule = [], [], []
     for summary, entry in zip(progress.slot_summaries, progress.slot_commit_artifacts, strict=True):
-        commit = _read_descriptor_json(context, entry["descriptor"], code="DECLARED_CELL_COMMIT")
-        if (entry["descriptor"]["sha256"] != summary["commit_sha256"]
+        commit, digest, descriptor = chain["commits"][summary["slot_id"]]
+        encoded_commit = authority_spool._canonical_json_bytes(commit, context.limits.max_json_bytes)
+        if (hashlib.sha256(encoded_commit).hexdigest() != digest
+                or len(encoded_commit) != descriptor["size_bytes"]
+                or descriptor != entry["descriptor"] or digest != summary["commit_sha256"]
+                or entry["descriptor"]["sha256"] != summary["commit_sha256"]
                 or commit["cell_id"] != cell["cell_id"] or commit["slot_id"] != summary["slot_id"]
                 or commit["ordinal"] != summary["ordinal"]
                 or commit["completion"]["status"] != summary["status"]):
@@ -3676,7 +3690,15 @@ def _declared_cell_specialist(record, cell):
 
 def _declared_cell_native_frames(*, inputs, execution_frame, fine_frame, profile, spec,
                                  execution_identity, spread_identity):
-    cell, measurement = inputs["parent"]["cells"][0], _declared_cell_measurement(inputs["parent"])
+    return _declared_native_account_frames(inputs=inputs,
+        measurement=_declared_cell_measurement(inputs["parent"]), execution_frame=execution_frame,
+        fine_frame=fine_frame, profile=profile, spec=spec,
+        execution_identity=execution_identity, spread_identity=spread_identity)
+
+
+def _declared_native_account_frames(*, inputs, measurement, execution_frame, fine_frame, profile, spec,
+                                    execution_identity, spread_identity):
+    cell = inputs["parent"]["cells"][0]
     start = _timestamp(measurement["start_utc"], "DECLARED_CELL_WINDOW_INVALID")
     end = _timestamp(measurement["end_exclusive_utc"], "DECLARED_CELL_WINDOW_INVALID")
     _, closes = _frame_interval(execution_frame)
@@ -3715,9 +3737,6 @@ def _declared_cell_native_frames(*, inputs, execution_frame, fine_frame, profile
         owners.append(ContinuousEntryOwner(owner["owner_id"], _strategy(specialist),
             own_features, own_signals[cell["cell_id"]], tier))
     features = owners[0].features if owners else frame
-    feature_bytes = sum(int(owner.features.memory_usage(index=True, deep=True).sum()) for owner in owners)
-    if max(feature_bytes, int(features.memory_usage(index=True, deep=True).sum())) > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
-        _fail("FORWARD_ACTIVE_SYMBOL_FEATURE_MEMORY_BOUND_EXCEEDED")
     observations, matched_closes = spread_profile.align_prior_completed_spreads(
         features.index, fine_frame, tiers["P75"].source_timeframe, include_matched_closes=True)
     schedule = ContinuousEntrySchedule(tuple(owners), tuple(ContinuousEntrySlot(
@@ -4059,7 +4078,47 @@ def _declared_cell_body(context, *, precommit, process, frozen_pipeline_config, 
         "live_authority": False, "order_authority": False}
 
 
-def _discover_declared_cell_account_output(context, *, expected, process, frozen_pipeline_config):
+def _read_declared_account_output_with_inputs(context, descriptor, *, process,
+        frozen_pipeline_config, precommit, inputs, development=False, _manifest_record=None):
+    """Retain the existing manifest/source/math checks without reopening this call's inputs."""
+    body = causal_producer._read_descriptor_json(context, descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
+    schema = DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA if development else DECLARED_CELL_RAW_ACCOUNT_SCHEMA
+    if body.get("schema_version") != schema:
+        raise causal_producer.CausalEvidenceProductionError("DECLARED_CELL_RAW_SCHEMA_UNSUPPORTED")
+    try:
+        symbol = (_declared_development_cell_transport_symbol(body) if development
+            else _declared_cell_transport_symbol(body))
+        _verify_declared_account_output_manifest(context, body, symbol=symbol,
+            artifact_descriptor=descriptor,
+            binding_code="DECLARED_CELL_RAW_MANIFEST_BINDING_MISMATCH",
+            invalid_code="DECLARED_CELL_RAW_MANIFEST_INVALID",
+            _manifest_record=_manifest_record,
+            _verified_artifact_descriptors={(descriptor["relative_path"], descriptor["sha256"],
+                descriptor["size_bytes"], descriptor["format"])})
+        if development:
+            verified = _verify_declared_m5_development_cell_account_transport_with_inputs(
+                context, body, process=process, frozen_pipeline_config=frozen_pipeline_config,
+                _precommit=precommit, _inputs=inputs)
+            unchanged = (causal_producer._canonical_bytes(verified, causal_producer._MAX_RAW_ARTIFACT_BYTES)
+                == causal_producer._canonical_bytes(body, causal_producer._MAX_RAW_ARTIFACT_BYTES))
+        else:
+            def reopen_source(source_context, identity, config):
+                return causal_producer._reopen_frozen_transport_source(
+                    source_context, identity, config, pin_consumed_activation=True)
+
+            verified = _verify_declared_cell_account_transport_with_inputs(context, body,
+                process=process, frozen_pipeline_config=frozen_pipeline_config,
+                reopen_source=reopen_source, _precommit=precommit, _inputs=inputs)
+            unchanged = verified == body
+    except ForwardOOSReplayProductionError as exc:
+        raise causal_producer.CausalEvidenceProductionError(exc.code) from exc
+    if not unchanged:
+        raise causal_producer.CausalEvidenceProductionError("DECLARED_CELL_RAW_ACCOUNT_INVALID")
+    return verified
+
+
+def _discover_declared_cell_account_output(context, *, expected, process, frozen_pipeline_config,
+        _precommit=None, _inputs=None, _verified_body_out=None):
     """Read only the canonical publication; unsealed content objects are not output."""
     try:
         root = authority_spool._validate_root(context.root, create=False)
@@ -4073,9 +4132,10 @@ def _discover_declared_cell_account_output(context, *, expected, process, frozen
             return None
         if authority_spool._is_reparse(path) or not stat.S_ISREG(info.st_mode):
             _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_NOT_REGULAR")
-        _, _, encoded = authority_spool._stream_file(
+        manifest_record = authority_spool._stream_file(
             root, relative, maximum_bytes=context.limits.max_manifest_bytes,
             collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+        _, _, encoded = manifest_record
         manifest = authority_spool._strict_json_bytes(encoded, context.limits.max_manifest_bytes)
         entries = manifest.get("artifacts") if type(manifest) is dict else None
         if (type(entries) is not list or len(entries) != 1
@@ -4086,12 +4146,20 @@ def _discover_declared_cell_account_output(context, *, expected, process, frozen
             _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_ROSTER")
         descriptor = _descriptor(entries[0]["descriptor"], "DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
         artifact = causal_producer.DeclaredCellRawAccountArtifact(descriptor)
-        projection = causal_producer.read_declared_cell_account_artifact(
-            context, artifact, process=process, frozen_pipeline_config=frozen_pipeline_config)
-        verified = json.loads(projection._verified_body_json)
+        if _inputs is None:
+            projection = causal_producer.read_declared_cell_account_artifact(
+                context, artifact, process=process, frozen_pipeline_config=frozen_pipeline_config)
+            verified = json.loads(projection._verified_body_json)
+        else:
+            verified = _read_declared_account_output_with_inputs(context, descriptor,
+                process=process, frozen_pipeline_config=frozen_pipeline_config,
+                precommit=_precommit, inputs=_inputs, _manifest_record=manifest_record)
         for name in _DECLARED_CELL_FIELDS - set(_DECLARED_CELL_MARKET_FIELDS) - {"account"}:
             if verified[name] != expected[name]:
                 _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "CALLER_BINDING", name)
+        if _verified_body_out is not None:
+            _verified_body_out.clear()
+            _verified_body_out.update(verified)
         return artifact
     except ForwardOOSReplayProductionError:
         raise
@@ -4108,12 +4176,20 @@ def discover_declared_cell_account_artifact(context, *, precommit, process, froz
     the ordinary native/source and arithmetic verifier. An unsealed orphan object
     is not a committed account and is left for the existing create-once writer.
     """
+    return _prepare_declared_cell_account_artifact(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config)[0]
+
+
+def _prepare_declared_cell_account_artifact(context, *, precommit, process,
+        frozen_pipeline_config, _verified_chain=None):
     inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
-        frozen_pipeline_config=frozen_pipeline_config)
+        frozen_pipeline_config=frozen_pipeline_config, _verified_chain=_verified_chain)
     expected = _declared_cell_body(context, precommit=precommit, process=process,
         frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
-    return _discover_declared_cell_account_output(context, expected=expected, process=process,
-        frozen_pipeline_config=frozen_pipeline_config)
+    existing = _discover_declared_cell_account_output(context, expected=expected, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, _precommit=precommit, _inputs=inputs,
+        _verified_body_out=expected)
+    return existing, inputs, expected
 
 
 def declared_cell_account_native_request(context, *, precommit, process,
@@ -4124,13 +4200,23 @@ def declared_cell_account_native_request(context, *, precommit, process,
     product also resolves the bound P75 profile's finest source timeframe. Native
     production and account execution remain the existing canonical operations.
     """
+    return _declared_cell_account_native_request_from_inputs(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen_pipeline_config, inputs=None,
+        execution_product=execution_product)
+
+
+def _declared_cell_account_native_request_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs, execution_product=None):
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
         _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
     try:
-        parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        if inputs is None:
+            parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        else:
+            parent = inputs["parent"]
         if historical.declared_slot_source_kind(parent) != "broker_native" or historical.declared_slot_development_scope(parent) is not None:
             _fail("DECLARED_NATIVE_ACCOUNT_SOURCE_KIND_REQUIRED")
-        config = frozen_pipeline_config.materialize(context)
+        config = frozen_pipeline_config.materialize(context) if inputs is None else inputs["config"]
         _declared_cell_measured_config(config)
         measurement = _declared_cell_measurement(parent)
         cell = parent["cells"][0]
@@ -4164,14 +4250,19 @@ def declared_cell_account_native_request(context, *, precommit, process,
 def produce_declared_cell_account_artifact(context, *, precommit, process, frozen_pipeline_config,
         execution_product=None, spread_source_product=None, frozen_profile_path=None):
     """Write a raw historical cell account, never a qualified trading decision."""
-    inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
-        frozen_pipeline_config=frozen_pipeline_config)
-    body = _declared_cell_body(context, precommit=precommit, process=process,
-        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
-    existing = _discover_declared_cell_account_output(context, expected=body, process=process,
-        frozen_pipeline_config=frozen_pipeline_config)
+    existing, inputs, body = _prepare_declared_cell_account_artifact(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen_pipeline_config)
     if existing is not None:
         return existing
+    return _produce_declared_cell_account_from_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs, body=body,
+        execution_product=execution_product, spread_source_product=spread_source_product,
+        frozen_profile_path=frozen_profile_path)
+
+
+def _produce_declared_cell_account_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs, body, execution_product=None, spread_source_product=None,
+        frozen_profile_path=None):
     if inputs["progress_status"] == "COMPLETE":
         if execution_product is None or spread_source_product is None or frozen_profile_path is None:
             _fail("DECLARED_CELL_NATIVE_INPUTS_REQUIRED")
@@ -4229,14 +4320,23 @@ def produce_declared_cell_account_artifact(context, *, precommit, process, froze
 
 
 def verify_declared_cell_account_transport(context, body, *, process, frozen_pipeline_config, reopen_source):
+    return _verify_declared_cell_account_transport_with_inputs(context, body, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, reopen_source=reopen_source)
+
+
+def _verify_declared_cell_account_transport_with_inputs(context, body, *, process,
+        frozen_pipeline_config, reopen_source, _precommit=None, _inputs=None):
     if type(body) is not dict or set(body) != _DECLARED_CELL_FIELDS or body.get("schema_version") != DECLARED_CELL_RAW_ACCOUNT_SCHEMA:
         _fail("DECLARED_CELL_TRANSPORT_FIELDS_INVALID")
     try:
-        precommit = historical.reopen_declared_slot_owner_run_precommit(context,
-            receipt_sha256=body["declared_precommit_sha256"], process=process,
-            frozen_pipeline_config=frozen_pipeline_config)
-        inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
-            frozen_pipeline_config=frozen_pipeline_config)
+        if _inputs is None:
+            precommit = historical.reopen_declared_slot_owner_run_precommit(context,
+                receipt_sha256=body["declared_precommit_sha256"], process=process,
+                frozen_pipeline_config=frozen_pipeline_config)
+            inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
+                frozen_pipeline_config=frozen_pipeline_config)
+        else:
+            precommit, inputs = _precommit, _inputs
         expected = _declared_cell_body(context, precommit=precommit, process=process,
             frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
         for name in _DECLARED_CELL_FIELDS - set(_DECLARED_CELL_MARKET_FIELDS) - {"account"}:
@@ -4831,7 +4931,6 @@ def _product_roster_identities(
         execution_rows: list[dict[str, Any]] = []
         valuation_rows: list[dict[str, Any]] = []
         anchor_rows = 0
-        anchor_bytes = 0
         for key in expected_execution:
             symbol, timeframe = key.split("|", 1)
             identity = _native_product_identity(
@@ -4843,7 +4942,6 @@ def _product_roster_identities(
             )
             execution_rows.append(identity)
             anchor_rows += identity["prefix_rows"]
-            anchor_bytes += identity["prefix_bytes"]
         for key in expected_valuation:
             symbol, timeframe = key.split("|", 1)
             if timeframe != "M5":
@@ -4857,15 +4955,8 @@ def _product_roster_identities(
             )
             valuation_rows.append(identity)
             anchor_rows += identity["prefix_rows"]
-            anchor_bytes += identity["prefix_bytes"]
         if anchor_rows > _MAX_NATIVE_ROWS_PER_ANCHOR:
             _fail("FORWARD_PRECOMMIT_NATIVE_ROW_BOUND_EXCEEDED", anchor_id, anchor_rows)
-        if anchor_bytes > _MAX_NATIVE_BYTES_PER_ANCHOR:
-            _fail(
-                "FORWARD_PRECOMMIT_NATIVE_BYTE_BOUND_EXCEEDED",
-                anchor_id,
-                anchor_bytes,
-            )
         rows.append(
             {
                 "anchor_id": anchor_id,
@@ -5074,9 +5165,10 @@ _DECLARED_DEVELOPMENT_CELL_FIELDS = _DECLARED_CELL_FIELDS | frozenset({
 })
 
 
-def _declared_development_cell_measurement(parent):
+def _declared_development_cell_measurement(parent, *, expected_source_kind="m5_derived"):
     scope = historical.declared_slot_development_scope(parent)
-    if scope is None or historical.declared_slot_source_kind(parent) != "m5_derived":
+    if (expected_source_kind not in ("m5_derived", "broker_native") or scope is None
+            or historical.declared_slot_source_kind(parent) != expected_source_kind):
         _fail("DECLARED_DEVELOPMENT_ACCOUNT_SCOPE_REQUIRED")
     slots = historical.declared_slot_selected_slots(parent)
     if not 1 <= len(slots) <= 3:
@@ -5097,21 +5189,23 @@ def _declared_development_cell_measurement(parent):
         "design_contaminated": True, "pristine_validation": False}
 
 
-def _reopen_declared_development_cell_inputs(context, *, precommit, process, frozen_pipeline_config):
-    import pm_historical_search_producer as producer
-
+def _reopen_declared_development_cell_inputs(context, *, precommit, process, frozen_pipeline_config,
+        expected_source_kind="m5_derived", _verified_chain=None):
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
         _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
     try:
-        parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
-        if historical.declared_slot_development_scope(parent) is None or historical.declared_slot_source_kind(parent) != "m5_derived":
+        chain = _declared_account_verified_progress(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, _verified_chain=_verified_chain)
+        parent = chain["parent"]
+        if (expected_source_kind not in ("m5_derived", "broker_native")
+                or historical.declared_slot_development_scope(parent) is None
+                or historical.declared_slot_source_kind(parent) != expected_source_kind):
             _fail("DECLARED_DEVELOPMENT_ACCOUNT_SCOPE_REQUIRED")
-        config = frozen_pipeline_config.materialize(context)
+        config = chain["config"]
         _declared_cell_measured_config(config)
-        _declared_development_cell_measurement(parent)
+        _declared_development_cell_measurement(parent, expected_source_kind=expected_source_kind)
         cell = parent["cells"][0]
-        progress = producer.reopen_declared_cell_owner_progress(context, precommit=precommit,
-            process=process, cell_id=cell["cell_id"], frozen_pipeline_config=frozen_pipeline_config)
+        progress = chain["progress"]
     except ForwardOOSReplayProductionError:
         raise
     except Exception as exc:
@@ -5121,8 +5215,12 @@ def _reopen_declared_development_cell_inputs(context, *, precommit, process, fro
         _fail("DECLARED_CELL_COMMIT_ROSTER_INVALID")
     commits, records, schedule = [], [], []
     for summary, entry in zip(progress.slot_summaries, progress.slot_commit_artifacts, strict=True):
-        commit = _read_descriptor_json(context, entry["descriptor"], code="DECLARED_CELL_COMMIT")
-        if (entry["descriptor"]["sha256"] != summary["commit_sha256"]
+        commit, digest, descriptor = chain["commits"][summary["slot_id"]]
+        encoded_commit = authority_spool._canonical_json_bytes(commit, context.limits.max_json_bytes)
+        if (hashlib.sha256(encoded_commit).hexdigest() != digest
+                or len(encoded_commit) != descriptor["size_bytes"]
+                or descriptor != entry["descriptor"] or digest != summary["commit_sha256"]
+                or entry["descriptor"]["sha256"] != summary["commit_sha256"]
                 or commit["cell_id"] != cell["cell_id"] or commit["slot_id"] != summary["slot_id"]
                 or commit["ordinal"] != summary["ordinal"]
                 or commit["completion"]["status"] != summary["status"]):
@@ -5199,7 +5297,8 @@ def _declared_development_cell_transport_symbol(body):
 
 
 
-def _discover_declared_development_cell_account_output(context, *, expected, process, frozen_pipeline_config):
+def _discover_declared_development_cell_account_output(context, *, expected, process, frozen_pipeline_config,
+        _precommit=None, _inputs=None, _verified_body_out=None):
     """Read only the canonical publication; unsealed content objects are not output."""
     try:
         root = authority_spool._validate_root(context.root, create=False)
@@ -5213,9 +5312,10 @@ def _discover_declared_development_cell_account_output(context, *, expected, pro
             return None
         if authority_spool._is_reparse(path) or not stat.S_ISREG(info.st_mode):
             _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_NOT_REGULAR")
-        _, _, encoded = authority_spool._stream_file(
+        manifest_record = authority_spool._stream_file(
             root, relative, maximum_bytes=context.limits.max_manifest_bytes,
             collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+        _, _, encoded = manifest_record
         manifest = authority_spool._strict_json_bytes(encoded, context.limits.max_manifest_bytes)
         entries = manifest.get("artifacts") if type(manifest) is dict else None
         if (type(entries) is not list or len(entries) != 1
@@ -5226,12 +5326,21 @@ def _discover_declared_development_cell_account_output(context, *, expected, pro
             _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_ROSTER")
         descriptor = _descriptor(entries[0]["descriptor"], "DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
         artifact = causal_producer.DeclaredCellRawAccountArtifact(descriptor)
-        projection = causal_producer.read_declared_cell_account_artifact(
-            context, artifact, process=process, frozen_pipeline_config=frozen_pipeline_config)
-        verified = json.loads(projection._verified_body_json)
+        if _inputs is None:
+            projection = causal_producer.read_declared_cell_account_artifact(
+                context, artifact, process=process, frozen_pipeline_config=frozen_pipeline_config)
+            verified = json.loads(projection._verified_body_json)
+        else:
+            verified = _read_declared_account_output_with_inputs(context, descriptor,
+                process=process, frozen_pipeline_config=frozen_pipeline_config,
+                precommit=_precommit, inputs=_inputs, development=True,
+                _manifest_record=manifest_record)
         for name in _DECLARED_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
             if verified[name] != expected[name]:
                 _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "CALLER_BINDING", name)
+        if _verified_body_out is not None:
+            _verified_body_out.clear()
+            _verified_body_out.update(verified)
         return artifact
     except ForwardOOSReplayProductionError:
         raise
@@ -5245,20 +5354,38 @@ def _discover_declared_development_cell_account_output(context, *, expected, pro
 
 def discover_declared_m5_development_cell_account_artifact(context, *, precommit, process,
                                                           frozen_pipeline_config):
+    return _prepare_declared_m5_development_cell_account_artifact(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen_pipeline_config)[0]
+
+
+def _prepare_declared_m5_development_cell_account_artifact(context, *, precommit, process,
+        frozen_pipeline_config, _verified_chain=None):
     inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit,
-        process=process, frozen_pipeline_config=frozen_pipeline_config)
+        process=process, frozen_pipeline_config=frozen_pipeline_config, _verified_chain=_verified_chain)
     expected = _declared_development_cell_body(context, precommit=precommit, process=process,
         frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
-    return _discover_declared_development_cell_account_output(context, expected=expected,
-        process=process, frozen_pipeline_config=frozen_pipeline_config)
+    existing = _discover_declared_development_cell_account_output(context, expected=expected,
+        process=process, frozen_pipeline_config=frozen_pipeline_config,
+        _precommit=precommit, _inputs=inputs, _verified_body_out=expected)
+    return existing, inputs, expected
 
 
 def declared_m5_development_cell_account_request(context, *, precommit, process, frozen_pipeline_config):
-    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+    return _declared_m5_development_cell_account_request_from_inputs(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen_pipeline_config, inputs=None)
+
+
+def _declared_m5_development_cell_account_request_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs):
+    parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process) if inputs is None else inputs["parent"]
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
         _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
-    frozen_pipeline_config.verify_current(context)
-    _declared_cell_measured_config(frozen_pipeline_config.materialize(context))
+    if inputs is None:
+        frozen_pipeline_config.verify_current(context)
+        config = frozen_pipeline_config.materialize(context)
+    else:
+        config = inputs["config"]
+    _declared_cell_measured_config(config)
     measurement = _declared_development_cell_measurement(parent)
     return {"schema_version": "fxpm.declared-development-m5-account-request.v1",
         "source_kind": "m5_derived", "cell": parent["cells"][0], "measurement": measurement,
@@ -5346,6 +5473,9 @@ def _validate_declared_m5_account_owner(context, *, precommit, process, inputs, 
 def _declared_m5_account_slot_inputs(context, *, inputs, owner, cost_edition):
     import pm_historical_search_producer as producer
     records = []
+    if inputs["commits"]:
+        owner_metadata_bytes = _canonical_bytes(owner.reopen_metadata())
+        cost_edition_route_bytes = _canonical_bytes(cost_edition.reopen_route())
     for commit in inputs["commits"]:
         completion = commit["completion"]
         body = completion["request_body"]
@@ -5354,8 +5484,8 @@ def _declared_m5_account_slot_inputs(context, *, inputs, owner, cost_edition):
         saved, _ = producer._read_declared_m5_reopen_entry(context, session["m5_reopen_context_entry"],
             body=body, artifact_type="declared_m5_reopen_context", suffix="/m5-reopen-context")
         if (session["request_sha256"] != completion["request_sha256"]
-                or _canonical_bytes(saved["owner_metadata"]) != _canonical_bytes(owner.reopen_metadata())
-                or _canonical_bytes(saved["cost_edition_route"]) != _canonical_bytes(cost_edition.reopen_route())
+                or _canonical_bytes(saved["owner_metadata"]) != owner_metadata_bytes
+                or _canonical_bytes(saved["cost_edition_route"]) != cost_edition_route_bytes
                 or _canonical_bytes(saved["fine_product_routes"]) != _canonical_bytes([
                     producer._prefix_route(owner.product_at(cutoff)) for cutoff in saved["owner_metadata"]["product_cutoffs"]])
                 or saved["m5_request_view_id"] != session["m5_request_view_id"]
@@ -5544,9 +5674,6 @@ def _declared_m5_account_frame_inputs(context, *, precommit, process, inputs, ow
                 "selection_view_window": selection_window,
                 "frozen_spread_tier": dict(saved_owner["selected_tier_contract"]["frozen_spread_tier"])})
         features = owners[0].features if owners else frame
-        feature_bytes = sum(int(value.features.memory_usage(index=True, deep=True).sum()) for value in owners)
-        if max(feature_bytes, int(features.memory_usage(index=True, deep=True).sum())) > _MAX_ACTIVE_SYMBOL_NATIVE_BYTES:
-            _fail("FORWARD_ACTIVE_SYMBOL_FEATURE_MEMORY_BOUND_EXCEEDED")
         fine_frame = native_prefix.open_verified_prefix_frame(product)
         observations, matched = spread_profile.align_prior_completed_spreads(features.index, fine_frame,
             account_tiers["P75"].source_timeframe, include_matched_closes=True)
@@ -5584,14 +5711,17 @@ def _declared_m5_account_observations(material, *, config, measured):
 def produce_declared_m5_development_cell_account_artifact(context, *, precommit, process,
         frozen_pipeline_config, m5_owner=None, account_view_id=None, cost_edition=None):
     """Produce one explicit partial development account using the original account engine."""
-    inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
-        frozen_pipeline_config=frozen_pipeline_config)
-    body = _declared_development_cell_body(context, precommit=precommit, process=process,
-        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
-    existing = _discover_declared_development_cell_account_output(context, expected=body,
-        process=process, frozen_pipeline_config=frozen_pipeline_config)
+    existing, inputs, body = _prepare_declared_m5_development_cell_account_artifact(context,
+        precommit=precommit, process=process, frozen_pipeline_config=frozen_pipeline_config)
     if existing is not None:
         return existing
+    return _produce_declared_m5_development_cell_account_from_inputs(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen_pipeline_config, inputs=inputs, body=body,
+        m5_owner=m5_owner, account_view_id=account_view_id, cost_edition=cost_edition)
+
+
+def _produce_declared_m5_development_cell_account_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs, body, m5_owner=None, account_view_id=None, cost_edition=None):
     if inputs["progress_status"] == "DEVELOPMENT_COMPLETE":
         material = _declared_m5_account_frame_inputs(context, precommit=precommit, process=process,
             inputs=inputs, owner=m5_owner, account_view_id=account_view_id, cost_edition=cost_edition)
@@ -5625,6 +5755,13 @@ def produce_declared_m5_development_cell_account_artifact(context, *, precommit,
 def verify_declared_m5_development_cell_account_transport(context, body, *, process,
         frozen_pipeline_config, m5_owner=None, cost_edition=None):
     """Reopen actual source and reconcile stored arithmetic; never rerun the account engine."""
+    return _verify_declared_m5_development_cell_account_transport_with_inputs(context, body,
+        process=process, frozen_pipeline_config=frozen_pipeline_config,
+        m5_owner=m5_owner, cost_edition=cost_edition)
+
+
+def _verify_declared_m5_development_cell_account_transport_with_inputs(context, body, *, process,
+        frozen_pipeline_config, m5_owner=None, cost_edition=None, _precommit=None, _inputs=None):
     if (type(body) is not dict or set(body) != _DECLARED_DEVELOPMENT_CELL_FIELDS
             or body.get("schema_version") != DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA
             or body.get("source_kind") != "m5_derived" or body.get("result_kind") != "DEVELOPMENT_PARTIAL"
@@ -5632,10 +5769,13 @@ def verify_declared_m5_development_cell_account_transport(context, body, *, proc
             or any(body.get(key) is not False for key in
                    ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
         _fail("DECLARED_DEVELOPMENT_ACCOUNT_FIELDS_INVALID")
-    precommit = historical.reopen_declared_slot_owner_run_precommit(context,
-        receipt_sha256=body["declared_precommit_sha256"], process=process, frozen_pipeline_config=frozen_pipeline_config)
-    inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
-        frozen_pipeline_config=frozen_pipeline_config)
+    if _inputs is None:
+        precommit = historical.reopen_declared_slot_owner_run_precommit(context,
+            receipt_sha256=body["declared_precommit_sha256"], process=process, frozen_pipeline_config=frozen_pipeline_config)
+        inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config)
+    else:
+        precommit, inputs = _precommit, _inputs
     expected = _declared_development_cell_body(context, precommit=precommit, process=process,
         frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
     for name in _DECLARED_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
@@ -5695,3 +5835,447 @@ def verify_declared_m5_development_cell_account_transport(context, body, *, proc
 __all__ += ["DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA",
     "declared_m5_development_cell_account_request", "produce_declared_m5_development_cell_account_artifact",
     "discover_declared_m5_development_cell_account_artifact", "verify_declared_m5_development_cell_account_transport"]
+
+
+DECLARED_NATIVE_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA = "fxpm.declared-development-native-cell-raw-account.v1"
+_DECLARED_NATIVE_DEVELOPMENT_CELL_FIELDS = _DECLARED_CELL_FIELDS | frozenset({
+    "source_kind", "result_kind", "development_scope", "development_scope_sha256",
+    "design_contaminated", "pristine_validation", "saved_cell_run_receipt_sha256",
+})
+
+
+def _declared_native_development_cell_measurement(parent):
+    return _declared_development_cell_measurement(parent, expected_source_kind="broker_native")
+
+
+def _reopen_declared_native_development_cell_inputs(context, *, precommit, process, frozen_pipeline_config,
+        _verified_chain=None):
+    return _reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, expected_source_kind="broker_native",
+        _verified_chain=_verified_chain)
+
+
+def _declared_native_development_cell_frames(*, inputs, execution_frame, fine_frame, profile, spec,
+        execution_identity, spread_identity):
+    return _declared_native_account_frames(inputs=inputs,
+        measurement=_declared_native_development_cell_measurement(inputs["parent"]),
+        execution_frame=execution_frame, fine_frame=fine_frame, profile=profile, spec=spec,
+        execution_identity=execution_identity, spread_identity=spread_identity)
+
+
+def _declared_native_development_cell_body(context, *, precommit, process, frozen_pipeline_config, inputs):
+    result = {"schema_version": DECLARED_NATIVE_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA,
+        "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
+        "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
+        "declared_precommit_sha256": precommit.receipt_sha256,
+        "search_process_receipt_sha256": process.receipt_sha256, "cell": inputs["parent"]["cells"][0],
+        "pipeline_config_binding": {"active_config_path": str(frozen_pipeline_config.active_config_path),
+            "config_sha256": frozen_pipeline_config.config_sha256,
+            "effective_config_sha256": frozen_pipeline_config.effective_config_sha256},
+        "declared_commit_artifacts": list(inputs["progress"].slot_commit_artifacts),
+        "slot_summaries": list(inputs["progress"].slot_summaries),
+        "slot_schedule": inputs["slot_schedule"], "progress_status": inputs["progress_status"],
+        "reason_code": inputs["reason_code"], "measurement": _declared_native_development_cell_measurement(inputs["parent"]),
+        "genesis": {"mode": NEW_SIMULATED_FLAT_GENESIS, "initial_cash": 10000.0, "initial_inventory": []},
+        "owner_records": inputs["owner_records"], **{name: None for name in _DECLARED_CELL_MARKET_FIELDS},
+        "account": None, "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+
+    parent = inputs["parent"]
+    result.update(source_kind="broker_native", result_kind="DEVELOPMENT_PARTIAL",
+        development_scope=historical.declared_slot_development_scope(parent),
+        development_scope_sha256=parent["development_scope_sha256"],
+        design_contaminated=True, pristine_validation=False,
+        saved_cell_run_receipt_sha256=(None if inputs["progress"].run_receipt is None
+                                      else _sha(inputs["progress"].run_receipt)))
+    return result
+
+
+def _declared_native_development_cell_transport_symbol(body):
+    identity = {"schema_version": DECLARED_NATIVE_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA,
+        "precommit_sha256": body["declared_precommit_sha256"], "cell_id": body["cell"]["cell_id"],
+        "commit_sha256s": [row["commit_sha256"] for row in body["slot_summaries"]],
+        "progress_status": body["progress_status"], "development_scope_sha256": body["development_scope_sha256"]}
+    return "DECLARED_DEV_NATIVE_ACCOUNT:" + _sha(identity)
+
+
+def _discover_declared_native_development_cell_account_output(context, *, expected, process, frozen_pipeline_config,
+        _precommit=None, _inputs=None, _verified_body_out=None):
+    """Read only the canonical publication; unsealed content objects are not output."""
+    try:
+        root = authority_spool._validate_root(context.root, create=False)
+        relative = authority_spool._manifest_relative_path(
+            _declared_native_development_cell_transport_symbol(expected), authority_spool.GENERAL_MANIFEST_DOMAIN)
+        path = authority_spool._local_path(root, relative)
+        authority_spool._reject_reparse_chain(path)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return None
+        if authority_spool._is_reparse(path) or not stat.S_ISREG(info.st_mode):
+            _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_NOT_REGULAR")
+        manifest_record = authority_spool._stream_file(
+            root, relative, maximum_bytes=context.limits.max_manifest_bytes,
+            collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+        _, _, encoded = manifest_record
+        manifest = authority_spool._strict_json_bytes(encoded, context.limits.max_manifest_bytes)
+        entries = manifest.get("artifacts") if type(manifest) is dict else None
+        if (type(entries) is not list or len(entries) != 1
+                or type(entries[0]) is not dict
+                or set(entries[0]) != {"artifact_id", "artifact_type", "descriptor"}
+                or entries[0]["artifact_id"] != "declared-cell-account"
+                or entries[0]["artifact_type"] != "declared_cell_raw_account"):
+            _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "MANIFEST_ROSTER")
+        descriptor = _descriptor(entries[0]["descriptor"], "DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
+        artifact = causal_producer.DeclaredCellRawAccountArtifact(descriptor)
+        verified = _read_descriptor_json(context, descriptor, code="DECLARED_NATIVE_DEVELOPMENT_ACCOUNT")
+
+        def reopen_source(source_context, identity, config):
+            return causal_producer._reopen_frozen_transport_source(source_context, identity, config,
+                pin_consumed_activation=True)
+
+        _verify_declared_native_development_cell_account_transport_with_inputs(context, verified, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, reopen_source=reopen_source,
+            artifact_descriptor=descriptor, _precommit=_precommit, _inputs=_inputs,
+            _manifest_record=manifest_record,
+            _verified_artifact_descriptors={(descriptor["relative_path"], descriptor["sha256"],
+                descriptor["size_bytes"], descriptor["format"])})
+        for name in _DECLARED_NATIVE_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_CELL_MARKET_FIELDS) - {"account"}:
+            if verified[name] != expected[name]:
+                _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "CALLER_BINDING", name)
+        if _verified_body_out is not None:
+            _verified_body_out.clear()
+            _verified_body_out.update(verified)
+        return artifact
+    except ForwardOOSReplayProductionError:
+        raise
+    except (authority_spool.AuthoritySpoolError, causal_producer.CausalEvidenceProductionError,
+            OSError, KeyError, TypeError, ValueError, ArithmeticError, RecursionError) as exc:
+        raise ForwardOOSReplayProductionError(
+            "DECLARED_CELL_EXISTING_OUTPUT_INVALID", (type(exc).__name__, getattr(exc, "code", ""))) from exc
+
+
+def discover_declared_native_development_cell_account_artifact(context, *, precommit, process, frozen_pipeline_config):
+    """Reopen matching committed output without simulating or replacing its account.
+
+    None means the exact GENERAL manifest is absent. Existing output still passes
+    the ordinary native/source and arithmetic verifier. An unsealed orphan object
+    is not a committed account and is left for the existing create-once writer.
+    """
+    return _prepare_declared_native_development_cell_account_artifact(context,
+        precommit=precommit, process=process, frozen_pipeline_config=frozen_pipeline_config)[0]
+
+
+def _prepare_declared_native_development_cell_account_artifact(context, *, precommit, process,
+        frozen_pipeline_config, _verified_chain=None):
+    inputs = _reopen_declared_native_development_cell_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, _verified_chain=_verified_chain)
+    expected = _declared_native_development_cell_body(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    existing = _discover_declared_native_development_cell_account_output(context, expected=expected, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, _precommit=precommit, _inputs=inputs,
+        _verified_body_out=expected)
+    return existing, inputs, expected
+
+
+def declared_native_development_cell_account_request(context, *, precommit, process,
+        frozen_pipeline_config, execution_product=None):
+    """Describe canonical account inputs; this metadata grants no source authority.
+
+    First request the execution timeframe at cutoff_utc. Supplying its verified
+    product also resolves the bound P75 profile's finest source timeframe. Native
+    production and account execution remain the existing canonical operations.
+    """
+    return _declared_native_development_cell_account_request_from_inputs(context,
+        precommit=precommit, process=process, frozen_pipeline_config=frozen_pipeline_config,
+        inputs=None, execution_product=execution_product)
+
+
+def _declared_native_development_cell_account_request_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs, execution_product=None):
+    if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
+        _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
+    try:
+        if inputs is None:
+            parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
+        else:
+            parent = inputs["parent"]
+        if historical.declared_slot_source_kind(parent) != "broker_native" or historical.declared_slot_development_scope(parent) is None:
+            _fail("DECLARED_NATIVE_ACCOUNT_SOURCE_KIND_REQUIRED")
+        config = frozen_pipeline_config.materialize(context) if inputs is None else inputs["config"]
+        _declared_cell_measured_config(config)
+        measurement = _declared_native_development_cell_measurement(parent)
+        cell = parent["cells"][0]
+        profile_path = Path(config.data_dir) / "native" / "terms" / "spread_profile.json"
+        profile = spread_profile.load_spread_profile(profile_path)
+        if profile.sha256 != parent["spread_profile_identity"]["profile_sha256"]:
+            _fail("DECLARED_CELL_PROFILE_CHANGED")
+        source_timeframe = None
+        if execution_product is not None:
+            identity = _native_product_identity(execution_product, expected_symbol=cell["symbol"],
+                expected_timeframe=cell["timeframe"], expected_cutoff_utc=measurement["end_exclusive_utc"],
+                role="DECLARED_CELL_EXECUTION")
+            product = _reopen_bound_native_product(context=context, product=execution_product,
+                expected_identity=identity, config=config,
+                production_contract_required=not config.research_mode, pin_consumed_activation=True)
+            spec, _ = _freeze_execution_spec(product=product, config=config,
+                deployment=_deployment_config(config, declared_research_account=True))
+            source_timeframe = profile.resolve(cell["symbol"], cell["timeframe"], "P75", point=spec.point,
+                source_identity_sha256=identity["source_identity_sha256"]).source_timeframe
+        return {"schema_version": "fxpm.declared-development-native-account-request.v1",
+            "symbol": cell["symbol"], "execution_timeframe": cell["timeframe"],
+            "source_kind": "broker_native", "result_kind": "DEVELOPMENT_PARTIAL",
+            "cell": cell, "measurement": measurement,
+            "development_scope_sha256": parent["development_scope_sha256"],
+            "cutoff_utc": measurement["end_exclusive_utc"], "spread_source_timeframe": source_timeframe,
+            "frozen_profile_path": str(profile_path), "profile_sha256": profile.sha256,
+            "production_contract_required": not config.research_mode}
+    except ForwardOOSReplayProductionError:
+        raise
+    except Exception as exc:
+        raise ForwardOOSReplayProductionError("DECLARED_CELL_NATIVE_REQUEST_INVALID",
+            (type(exc).__name__, getattr(exc, "code", ""))) from exc
+
+
+def produce_declared_native_development_cell_account_artifact(context, *, precommit, process, frozen_pipeline_config,
+        execution_product=None, spread_source_product=None, frozen_profile_path=None):
+    """Write a partial native development account using the original account engine."""
+    existing, inputs, body = _prepare_declared_native_development_cell_account_artifact(context,
+        precommit=precommit, process=process, frozen_pipeline_config=frozen_pipeline_config)
+    if existing is not None:
+        return existing
+    return _produce_declared_native_development_cell_account_from_inputs(context, precommit=precommit,
+        process=process, frozen_pipeline_config=frozen_pipeline_config, inputs=inputs, body=body,
+        execution_product=execution_product, spread_source_product=spread_source_product,
+        frozen_profile_path=frozen_profile_path)
+
+
+def _produce_declared_native_development_cell_account_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs, body, execution_product=None, spread_source_product=None,
+        frozen_profile_path=None):
+    if inputs["progress_status"] == "DEVELOPMENT_COMPLETE":
+        if execution_product is None or spread_source_product is None or frozen_profile_path is None:
+            _fail("DECLARED_CELL_NATIVE_INPUTS_REQUIRED")
+        config = inputs["config"]
+        measured = _declared_cell_measured_config(config)
+        deployment = _deployment_config(config, declared_research_account=True)
+        cell, end = body["cell"], body["measurement"]["end_exclusive_utc"]
+        execution_identity = _native_product_identity(execution_product, expected_symbol=cell["symbol"],
+            expected_timeframe=cell["timeframe"], expected_cutoff_utc=end, role="DECLARED_CELL_EXECUTION")
+        profile = spread_profile.load_spread_profile(frozen_profile_path)
+        if profile.sha256 != inputs["parent"]["spread_profile_identity"]["profile_sha256"]:
+            _fail("DECLARED_CELL_PROFILE_CHANGED")
+        product = _reopen_bound_native_product(context=context, product=execution_product,
+            expected_identity=execution_identity, config=config,
+            production_contract_required=not config.research_mode, pin_consumed_activation=True)
+        spec, execution_receipt = _freeze_execution_spec(product=product, config=config, deployment=deployment)
+        source_tf = profile.resolve(cell["symbol"], cell["timeframe"], "P75", point=spec.point,
+            source_identity_sha256=execution_identity["source_identity_sha256"]).source_timeframe
+        source_identity = _native_product_identity(spread_source_product, expected_symbol=cell["symbol"],
+            expected_timeframe=source_tf, expected_cutoff_utc=end, role="DECLARED_CELL_SPREAD")
+        fine = _reopen_bound_native_product(context=context, product=spread_source_product,
+            expected_identity=source_identity, config=config,
+            production_contract_required=not config.research_mode, pin_consumed_activation=True)
+        fine_spec, fine_receipt = _freeze_execution_spec(product=fine, config=config, deployment=deployment)
+        if asdict(spec) != asdict(fine_spec):
+            _fail("DECLARED_CELL_EXECUTION_SOURCE_TERMS_MISMATCH")
+        frame, owners, schedule, observations, matched, warmup = _declared_native_development_cell_frames(
+            inputs=inputs, execution_frame=native_prefix.open_verified_prefix_frame(product),
+            fine_frame=native_prefix.open_verified_prefix_frame(fine), profile=profile, spec=spec,
+            execution_identity=execution_identity, spread_identity=source_identity)
+        # All external inputs are bound before entering the single continuous account.
+        body.update({"execution_source": execution_identity, "spread_source": source_identity,
+            "execution_spec_receipt": execution_receipt, "spread_source_execution_spec_receipt": fine_receipt,
+            "frozen_profile_descriptor": _persist_frozen_profile(context, frozen_profile_path, profile.sha256),
+            "deployment_source_descriptors": _persist_deployment_sources(context, deployment),
+            "original_config_identity": _pipeline_config_identity(config),
+            "measured_config_identity": _pipeline_config_identity(measured)})
+        result = _raw_json(_run_declared_cell_account(config=measured, features=frame,
+            symbol=cell["symbol"], timeframe=cell["timeframe"], spec=spec, warmup_bars=warmup,
+            entry_schedule=schedule, entry_spread_observations=observations))
+        account = _declared_account_payload(result=result, frame=frame, owner_inputs=owners,
+            spec=spec, config=measured, observations=observations, matched_closes=matched,
+            timeframe=cell["timeframe"], warmup_bars=warmup)
+        _reconcile_declared_cell_account(account, frame=frame, owner_inputs=owners, spec=spec,
+            config=measured, observations=observations, matched_closes=matched,
+            timeframe=cell["timeframe"], schedule=schedule)
+        body["account"] = account
+        _assert_deployment_config_unchanged(deployment, config, declared_research_account=True)
+    _canonical_bytes(body, _DECLARED_CELL_MAX_RAW_BYTES)
+    sink = authority_spool.open_symbol_sink(context, _declared_native_development_cell_transport_symbol(body),
+        manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
+    entry = sink.put_json("declared-cell-account", "declared_cell_raw_account", body)
+    sink.seal()
+    return causal_producer.DeclaredCellRawAccountArtifact(dict(entry["descriptor"]))
+
+
+def verify_declared_native_development_cell_account_transport(context, body, *, process, frozen_pipeline_config, reopen_source,
+        artifact_descriptor=None):
+    return _verify_declared_native_development_cell_account_transport_with_inputs(context, body,
+        process=process, frozen_pipeline_config=frozen_pipeline_config, reopen_source=reopen_source,
+        artifact_descriptor=artifact_descriptor)
+
+
+def _verify_declared_native_development_cell_account_transport_with_inputs(context, body, *, process,
+        frozen_pipeline_config, reopen_source, artifact_descriptor=None, _precommit=None, _inputs=None,
+        _verified_artifact_descriptors=None, _manifest_record=None):
+    if type(body) is not dict or set(body) != _DECLARED_NATIVE_DEVELOPMENT_CELL_FIELDS or body.get("schema_version") != DECLARED_NATIVE_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA:
+        _fail("DECLARED_CELL_TRANSPORT_FIELDS_INVALID")
+    if (body.get("source_kind") != "broker_native" or body.get("result_kind") != "DEVELOPMENT_PARTIAL"
+            or body.get("design_contaminated") is not True or body.get("pristine_validation") is not False
+            or any(body.get(name) is not False for name in
+                ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
+        _fail("DECLARED_NATIVE_DEVELOPMENT_ACCOUNT_FIELDS_INVALID")
+    _verify_declared_native_development_cell_manifest(context, body,
+        artifact_descriptor=artifact_descriptor,
+        _verified_artifact_descriptors=_verified_artifact_descriptors,
+        _manifest_record=_manifest_record)
+    try:
+        if _inputs is None:
+            precommit = historical.reopen_declared_slot_owner_run_precommit(context,
+                receipt_sha256=body["declared_precommit_sha256"], process=process,
+                frozen_pipeline_config=frozen_pipeline_config)
+            inputs = _reopen_declared_native_development_cell_inputs(context, precommit=precommit, process=process,
+                frozen_pipeline_config=frozen_pipeline_config)
+        else:
+            precommit, inputs = _precommit, _inputs
+        expected = _declared_native_development_cell_body(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+        for name in _DECLARED_NATIVE_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_CELL_MARKET_FIELDS) - {"account"}:
+            if body[name] != expected[name]:
+                _fail("DECLARED_CELL_TRANSPORT_BINDING_MISMATCH", name)
+        if inputs["progress_status"] != "DEVELOPMENT_COMPLETE":
+            if body["account"] is not None or any(body[name] is not None for name in _DECLARED_CELL_MARKET_FIELDS):
+                _fail("DECLARED_CELL_INCOMPLETE_ACCOUNT_FORBIDDEN")
+            return body
+        if type(body["account"]) is not dict or not callable(reopen_source):
+            _fail("DECLARED_CELL_COMPLETE_ACCOUNT_REQUIRED")
+        config, cell = inputs["config"], body["cell"]
+        measured = _declared_cell_measured_config(config)
+        if (body["original_config_identity"] != _pipeline_config_identity(config)
+                or body["measured_config_identity"] != _pipeline_config_identity(measured)):
+            _fail("DECLARED_CELL_CONFIG_DERIVATION_CHANGED")
+        deployment = _deployment_config(config, declared_research_account=True)
+        sources = body["deployment_source_descriptors"]
+        if type(sources) is not dict or set(sources) != {"config", "broker"}:
+            _fail("DECLARED_CELL_DEPLOYMENT_SOURCES_INVALID")
+        for role, digest, size in (("config", deployment.config_sha256, deployment.config_size_bytes),
+                ("broker", deployment.broker_sha256, deployment.broker_size_bytes)):
+            descriptor = _descriptor(sources[role], "DECLARED_CELL_DEPLOYMENT_DESCRIPTOR_INVALID")
+            observed, actual_size, _ = authority_spool._stream_file(context.root, descriptor["relative_path"],
+                maximum_bytes=size, expected_size=size, collect=False)
+            if (descriptor["format"] != "json-" + role or descriptor["sha256"] != digest
+                    or descriptor["size_bytes"] != size or observed != digest or actual_size != size):
+                _fail("DECLARED_CELL_DEPLOYMENT_SOURCES_CHANGED")
+        execution_identity, spread_identity = body["execution_source"], body["spread_source"]
+        if (execution_identity["role"] != "DECLARED_CELL_EXECUTION"
+                or spread_identity["role"] != "DECLARED_CELL_SPREAD"
+                or execution_identity["symbol"] != cell["symbol"] or execution_identity["timeframe"] != cell["timeframe"]
+                or spread_identity["symbol"] != cell["symbol"]
+                or any(identity["cutoff_utc"] != body["measurement"]["end_exclusive_utc"]
+                    for identity in (execution_identity, spread_identity))):
+            _fail("DECLARED_CELL_NATIVE_WINDOW_INVALID")
+        execution_frame, product = reopen_source(context, execution_identity, config)
+        fine_frame, fine = reopen_source(context, spread_identity, config)
+        spec, receipt = _freeze_execution_spec(product=product, config=config, deployment=deployment)
+        fine_spec, fine_receipt = _freeze_execution_spec(product=fine, config=config, deployment=deployment)
+        if (receipt != body["execution_spec_receipt"] or fine_receipt != body["spread_source_execution_spec_receipt"]
+                or asdict(spec) != asdict(fine_spec)):
+            _fail("DECLARED_CELL_EXECUTION_SPEC_CHANGED")
+        profile_descriptor = _descriptor(body["frozen_profile_descriptor"], "DECLARED_CELL_PROFILE_DESCRIPTOR_INVALID")
+        profile_sha = inputs["parent"]["spread_profile_identity"]["profile_sha256"]
+        observed, size, _ = authority_spool._stream_file(context.root, profile_descriptor["relative_path"],
+            maximum_bytes=_DECLARED_CELL_MAX_RAW_BYTES, expected_size=profile_descriptor["size_bytes"], collect=False)
+        if (profile_descriptor["format"] != "json-profile" or profile_descriptor["sha256"] != profile_sha
+                or observed != profile_sha or size != profile_descriptor["size_bytes"]):
+            _fail("DECLARED_CELL_PROFILE_CHANGED")
+        profile = spread_profile.load_spread_profile(Path(context.root) / profile_descriptor["relative_path"])
+        frame, owners, schedule, observations, matched, warmup = _declared_native_development_cell_frames(
+            inputs=inputs, execution_frame=execution_frame, fine_frame=fine_frame, profile=profile, spec=spec,
+            execution_identity=execution_identity, spread_identity=spread_identity)
+        if body["account"]["warmup_bars"] != warmup:
+            _fail("DECLARED_CELL_ACCOUNT_WARMUP_INVALID")
+        _reconcile_declared_cell_account(body["account"], frame=frame, owner_inputs=owners, spec=spec,
+            config=measured, observations=observations, matched_closes=matched,
+            timeframe=cell["timeframe"], schedule=schedule)
+        return body
+    except ForwardOOSReplayProductionError:
+        raise
+    except Exception as exc:
+        raise ForwardOOSReplayProductionError("DECLARED_CELL_TRANSPORT_REVERIFY_FAILED",
+            (type(exc).__name__, getattr(exc, "code", ""))) from exc
+
+
+__all__ += ["DECLARED_NATIVE_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA",
+    "declared_native_development_cell_account_request",
+    "discover_declared_native_development_cell_account_artifact",
+    "produce_declared_native_development_cell_account_artifact",
+    "verify_declared_native_development_cell_account_transport"]
+
+
+
+def _verify_declared_native_development_cell_manifest(context, body, *, artifact_descriptor=None,
+        _verified_artifact_descriptors=None, _manifest_record=None):
+    """Use the existing sealed publication contract for the explicit native prefix namespace."""
+    try:
+        symbol = _declared_native_development_cell_transport_symbol(body)
+    except ForwardOOSReplayProductionError:
+        raise
+    except (authority_spool.AuthoritySpoolError, OSError, KeyError, TypeError, ValueError) as exc:
+        raise ForwardOOSReplayProductionError("DECLARED_NATIVE_DEVELOPMENT_MANIFEST_INVALID",
+            (type(exc).__name__, getattr(exc, "code", ""))) from exc
+    return _verify_declared_account_output_manifest(context, body,
+        symbol=symbol,
+        artifact_descriptor=artifact_descriptor,
+        binding_code="DECLARED_NATIVE_DEVELOPMENT_MANIFEST_BINDING_MISMATCH",
+        invalid_code="DECLARED_NATIVE_DEVELOPMENT_MANIFEST_INVALID",
+        _verified_artifact_descriptors=_verified_artifact_descriptors,
+        _manifest_record=_manifest_record)
+
+
+def _verify_declared_account_output_manifest(context, body, *, symbol, artifact_descriptor,
+        binding_code, invalid_code, _verified_artifact_descriptors=None, _manifest_record=None):
+    """Share the original receipt/roster checks; only an actual read avoids a second payload read."""
+    try:
+        relative = authority_spool._manifest_relative_path(symbol, authority_spool.GENERAL_MANIFEST_DOMAIN)
+        if _manifest_record is None:
+            _manifest_record = authority_spool._stream_file(context.root, relative,
+                maximum_bytes=context.limits.max_manifest_bytes, collect=True,
+                chunk_bytes=context.limits.stream_chunk_bytes)
+        digest, size, _ = _manifest_record
+        receipt = {"schema_version": authority_spool.COMPACT_RECEIPT_SCHEMA,
+            "generation_id": context.generation_id, "symbol": symbol,
+            "manifest_domain": authority_spool.GENERAL_MANIFEST_DOMAIN,
+            "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
+            "generation_context_sha256": context.context_sha256,
+            "symbol_manifest": {"schema_version": authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
+                "relative_path": relative, "sha256": digest, "size_bytes": size,
+                "format": authority_spool.CANONICAL_JSON_FORMAT}}
+        manifest = authority_spool.verify_symbol_receipt(context.root, receipt,
+            expected_generation_id=context.generation_id, expected_symbol=symbol,
+            expected_native_universe_sha256=context.native_universe_sha256,
+            expected_config_sha256=context.config_sha256,
+            expected_manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN,
+            _verified_artifact_descriptors=_verified_artifact_descriptors,
+            _manifest_record=_manifest_record)
+        entries = manifest["artifacts"]
+        if (type(entries) is not list or len(entries) != 1 or type(entries[0]) is not dict
+                or set(entries[0]) != {"artifact_id", "artifact_type", "descriptor"}
+                or entries[0]["artifact_id"] != "declared-cell-account"
+                or entries[0]["artifact_type"] != "declared_cell_raw_account"):
+            _fail(binding_code)
+        descriptor = _descriptor(entries[0]["descriptor"], "DECLARED_CELL_RAW_DESCRIPTOR_INVALID")
+        if artifact_descriptor is not None and _descriptor(artifact_descriptor,
+                "DECLARED_CELL_RAW_DESCRIPTOR_INVALID") != descriptor:
+            _fail(binding_code)
+        key = (descriptor["relative_path"], descriptor["sha256"], descriptor["size_bytes"], descriptor["format"])
+        if _verified_artifact_descriptors is None or key not in _verified_artifact_descriptors:
+            stored = _read_descriptor_json(context, descriptor, code="DECLARED_NATIVE_DEVELOPMENT_ACCOUNT")
+            if _canonical_bytes(stored, _DECLARED_CELL_MAX_RAW_BYTES) != _canonical_bytes(body, _DECLARED_CELL_MAX_RAW_BYTES):
+                _fail(binding_code)
+        return descriptor
+    except ForwardOOSReplayProductionError:
+        raise
+    except (authority_spool.AuthoritySpoolError, OSError, KeyError, TypeError, ValueError) as exc:
+        raise ForwardOOSReplayProductionError(invalid_code,
+            (type(exc).__name__, getattr(exc, "code", ""))) from exc

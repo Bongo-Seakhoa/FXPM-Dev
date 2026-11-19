@@ -1375,3 +1375,143 @@ def test_real_backtester_position_events_feed_daily_surface() -> None:
             for event in result["position_events"]
         )
     )
+
+
+
+def _tiny_matched_cold_read_case(tmp_path, monkeypatch):
+    """INVENTED one-period transport only; semantic/origin stubs issue no authority.
+
+    Real Spool payloads, the cold publication reader and packed-witness expansion
+    execute. No fitted source, strategy, trade study or model is produced.
+    """
+    from collections import Counter
+    import pm_authoritative_search_execution as execution
+
+    carrier = _source_observation_transport_case(tmp_path)
+    context, sink = carrier["context"], carrier["sink"]
+    attempt = {"ordinal": 0, "attempt_id": "INVENTED-RAW", "process_candidate_id": "INVENTED-CANDIDATE",
+               "precommitted_evidence_role": "INVENTED_SOFTWARE_TRANSPORT"}
+    precommitment = {"causal_fold_plan": [{"fixture_provenance": "INVENTED_ONE_PERIOD"}]}
+    frozen = SimpleNamespace(selection_generation=winner.V17_GENERATION,
+        artifact_namespace="invented-cold-transport", timeframe="H1", regime="TREND",
+        precommitment=precommitment, attempt_ledger={"attempts": [attempt]},
+        partition_cost_precommitments={}, frozen_tier_pair_contract={},
+        frozen_receipt_entry={"descriptor": {"sha256": "a" * 64}})
+    root = raw._artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    frame = pd.DataFrame({"Open": [100.0, 101.0], "High": [102.0, 103.0],
+        "Low": [99.0, 100.0], "Close": [101.0, 102.0]},
+        index=pd.date_range("2020-01-01", periods=2, freq="h", tz="UTC"))
+    geometry = [{"role": role, "frame_start_utc": frame.index[0].isoformat(),
+        "end_exclusive_utc": (frame.index[-1] + pd.Timedelta(hours=1)).isoformat(),
+        "receipt_sha256": str(index + 1) * 64, "frame_sha256": execution._frame_sha256(frame)}
+        for index, role in enumerate(raw._PARTITIONS)]
+    codecs = {role: execution._route_a_encode_spread_array(np.array([0.25, 0.5]), role)
+        for role in ("entry_half_spread", "intrabar_half_spread")}
+    witnesses = [{"fold_ordinal": 0, "partition_role": row["role"],
+        "partition_geometry_receipt_sha256": row["receipt_sha256"],
+        "partition_frame_sha256": row["frame_sha256"], "facts": {
+            "fixture_provenance": "INVENTED_NO_KERNEL_OR_RAW_AUTHORITY", "trades": [],
+            "half_spread_arrays": {tier: copy.deepcopy(codecs) for tier in ("P75", "P95")}}}
+        for row in geometry]
+    packed, array_entries = raw._pack_matched_floor_witnesses(sink=sink, frozen=frozen,
+        attempt=attempt, witnesses=witnesses, array_entries={})
+    entries = list(array_entries.values())
+    prefix = root + "/attempt-0000/fold-000"
+    lanes = {lane: {key: [] for key in execution._RAW_LANE_KEYS} for lane in raw._LANE_KEYS}
+    provenance = {role: ({"partition_geometry": geometry} if role == "anchor_horizon_decision"
+                        else {"fixture_provenance": "INVENTED_SHARED_PROVENANCE"})
+                  for role in raw._PROVENANCE_KEYS}
+    for lane, value in lanes.items():
+        entries.append(raw._put_ascii_json(sink, prefix + "/raw/" + lane, "winner_raw_lane",
+            {**value, "schema_version": raw.CURRENT_RAW_LANE_SCHEMA, "lane": lane}))
+    for role, value in provenance.items():
+        entries.append(raw._put_ascii_json(sink, prefix + "/provenance/" + role,
+                                          "winner_provenance", value))
+    packed_entry = raw._put_ascii_json(sink, root + "/attempt-0000/matched-base-witnesses",
+                                     "winner_matched_base_witnesses", packed)
+    entries.append(packed_entry)
+    raw_body = {"attempt_id": attempt["attempt_id"], "folds": [
+        {"fold_ordinal": 0, "lanes": lanes, "provenance": provenance}]}
+    binding = {"fixture_provenance": "INVENTED_ORIGIN_STAND_IN"}
+    origin = {"producer_request_sha256": "b" * 64, "process_receipt_sha256": "c" * 64,
+        "frozen_receipt_sha256": "a" * 64, "declared_unit_binding_sha256": _sha(binding),
+        "preparation_contract_sha256": "d" * 64, "unit": {"ordinal": 0, "raw_attempt_id": attempt["attempt_id"]}}
+    envelope = {"schema_version": "fxpm.route-a-prepared-full-panel-unit.v1",
+        "declared_unit_binding_sha256": origin["declared_unit_binding_sha256"],
+        "preparation_contract_sha256": origin["preparation_contract_sha256"],
+        "attempt_evidence": raw_body, "matched_base_facts": witnesses}
+    origin.update(stage_content_sha256=_sha(envelope), stage_size_bytes=len(_canonical(envelope)))
+    added = {"ordinal": 0, "attempt_id": attempt["attempt_id"], "process_candidate_id": attempt["process_candidate_id"],
+        "stage_origin_binding": origin, "partition_witnesses_descriptor": packed_entry,
+        "full_witnesses_sha256": _sha(witnesses), "partition_statuses": [], "final_folds": []}
+    ledger = {"selection_addendum": {"entries": [added]}, "shared_fold_axis": [{}]}
+    request = SimpleNamespace(precommitment=SimpleNamespace(to_dict=lambda: copy.deepcopy(precommitment)),
+        attempt_ledger=SimpleNamespace(to_dict=lambda: copy.deepcopy(frozen.attempt_ledger)),
+        evidence_ledger=SimpleNamespace(to_dict=lambda: copy.deepcopy(ledger)))
+    producer_request = SimpleNamespace(receipt_sha256="b" * 64,
+        to_dict=lambda: {"search_process_receipt_sha256": "c" * 64})
+    captured, reads, decodes = [], Counter(), Counter()
+    original_stream, original_decode = spool._stream_file, execution._route_a_decode_spread_array
+
+    def stream(root, relative, **kwargs):
+        reads[relative] += 1
+        return original_stream(root, relative, **kwargs)
+
+    def decode(encoded, role):
+        decodes[role, _sha(encoded)] += 1
+        return original_decode(encoded, role)
+
+    def semantic_record(**kwargs):
+        captured.append(kwargs["witnesses"])
+        return {**copy.deepcopy(added), "partition_witnesses_descriptor": None}
+
+    monkeypatch.setattr(spool, "_stream_file", stream)
+    monkeypatch.setattr(execution, "_route_a_decode_spread_array", decode)
+    monkeypatch.setattr(execution, "_read_declared_unit_header", lambda *args: {"binding": binding})
+    monkeypatch.setattr(execution, "_read_declared_completed_unit", lambda *args: ({}, copy.deepcopy(raw_body)))
+    monkeypatch.setattr(execution, "_verify_route_a_matched_fact_source", lambda *args, **kwargs: True)
+    monkeypatch.setattr(raw, "_validated_partition_cost_precommitments", lambda *args, **kwargs: {})
+    monkeypatch.setattr(raw, "_index_partition_cost_precommitments", lambda *args: None)
+    monkeypatch.setattr(raw, "_matched_floor_attempt_record", semantic_record)
+
+    def run():
+        return raw.verify_matched_floor_publication_chain(context, frozen=frozen, request=request,
+            producer_request=producer_request, manifest_entries=entries,
+            cross_binding={"mapping": [{}]}, source_material=(frame, None, {}, None))
+
+    return SimpleNamespace(run=run, context=context, entries=entries, reads=reads,
+                           decodes=decodes, captured=captured, array_entries=array_entries)
+
+
+def test_matched_cold_call_reads_each_descriptor_once_and_reuses_shared_codec_decode(tmp_path, monkeypatch):
+    case = _tiny_matched_cold_read_case(tmp_path, monkeypatch)
+    assert case.run() is True
+    expected = {entry["descriptor"]["relative_path"] for entry in case.entries}
+    assert set(case.reads) == expected and set(case.reads.values()) == {1}
+    assert sum(case.decodes.values()) == 1
+    assert all(key[0] == "intrabar_half_spread" for key in case.decodes)
+    first = case.captured[0]
+    first[0]["facts"]["half_spread_arrays"]["P75"]["intrabar_half_spread"]["shape"][0] = 99
+    assert first[0]["facts"]["half_spread_arrays"]["P95"]["intrabar_half_spread"]["shape"] == [2]
+    assert first[1]["facts"]["half_spread_arrays"]["P75"]["intrabar_half_spread"]["shape"] == [2]
+    case.reads.clear()
+    case.decodes.clear()
+    assert case.run() is True
+    assert set(case.reads) == expected and set(case.reads.values()) == {1}
+    assert sum(case.decodes.values()) == 1
+    assert case.captured[1][0]["facts"]["half_spread_arrays"]["P75"]["intrabar_half_spread"]["shape"] == [2]
+
+
+def test_new_matched_cold_call_refuses_actual_changed_payload_bytes(tmp_path, monkeypatch):
+    case = _tiny_matched_cold_read_case(tmp_path, monkeypatch)
+    assert case.run() is True
+    entry = next(iter(case.array_entries.values()))
+    path = case.context.root / entry["descriptor"]["relative_path"]
+    encoded = bytearray(path.read_bytes())
+    encoded[-2] ^= 1
+    path.write_bytes(encoded)
+    case.reads.clear()
+    with pytest.raises(spool.AuthoritySpoolError) as caught:
+        case.run()
+    assert str(caught.value) == "ARTIFACT_INTEGRITY_MISMATCH"
+    assert case.reads[path.relative_to(case.context.root).as_posix()] == 1

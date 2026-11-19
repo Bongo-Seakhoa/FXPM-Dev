@@ -26,8 +26,6 @@ from pm_current_refit_parameters import (
     parameter_domain_point,
     parameter_domain_default_ordinal,
     iter_parameter_domain_projection,
-    load_retained_strategy_domain_v1,
-    decode_retained_parameter_metadata,
 )
 from pm_strategies import StrategyRegistry
 
@@ -248,32 +246,6 @@ def test_domain_projection_keeps_complete_legal_witness_without_cartesian_cross_
     assert all(validate_parameter_domain_member(repeated, witness) == witness for witness, _ in projected)
 
 
-def test_original_v1_table_preserves_all_metadata_except_explicit_five_domain_editions():
-    table = load_retained_strategy_domain_v1()
-    allowed = {"RegimeTransitionBreakoutStrategy", "EMARibbonADXStrategy",
-               "StochRSITrendGateStrategy", "SessionVWAPReversionStrategy",
-               "MACDHistogramMomentumStrategy"}
-    assert StrategyRegistry.list_all() == table["strategy_names"]
-    changed = set()
-    for record in table["strategies"]:
-        name = record["strategy_id"]
-        strategy = StrategyRegistry.get(name)
-        defaults = decode_retained_parameter_metadata(record["typed_metadata"]["defaults"])
-        grid = decode_retained_parameter_metadata(record["typed_metadata"]["grid"])
-        assert canonical_parameter_bytes(strategy.get_default_params()) == canonical_parameter_bytes(defaults)
-        if strategy.get_param_grid() != grid or strategy.get_param_couplings():
-            changed.add(name)
-    assert changed == allowed
-
-
-def test_retained_v1_loader_refuses_changed_source_side_bytes(monkeypatch):
-    import io
-    import pm_current_refit_parameters as codec
-    monkeypatch.setattr(codec.Path, "open", lambda *args, **kwargs: io.BytesIO(b"{}"))
-    with pytest.raises(CurrentRefitParameterCodecError, match="RETAINED_STRATEGY_DOMAIN_IDENTITY_CHANGED"):
-        load_retained_strategy_domain_v1()
-
-
 def test_parameter_domain_requires_explicit_grouping_keyword():
     assert inspect.signature(build_parameter_domain).parameters["coupled_groups"].default is inspect.Parameter.empty
     with pytest.raises(TypeError, match="coupled_groups"):
@@ -379,3 +351,27 @@ def test_production_grid_consumer_census_and_group_routing_is_exhaustive():
 def test_grid_consumer_guard_rejects_unreviewed_or_uncoupled_enumeration(source, policy, error):
     with pytest.raises(AssertionError, match=error):
         _assert_grid_consumer_ast_contract({"fixture.py": ast.parse(source)}, policy)
+
+
+def test_coupled_domain_preserves_exact_wire_choices_after_encoding_reuse():
+    # Invented parameter-only domain; no price data or model execution.
+    domain = build_parameter_domain(
+        {"fast": 1, "slow": 3, "enabled": True},
+        {"fast": [1, 2], "slow": [3, 4], "enabled": [True, False]},
+        coupled_groups=[{"names": ["fast", "slow"], "choices": [[1, 3], [2, 4]]}],
+    )
+    expected = {
+        "schema_version": "fxpm.parameter-domain.v1",
+        "defaults": {"fast": 1, "slow": 3, "enabled": True},
+        "axes": [
+            {"names": ["fast", "slow"], "choices": [[1, 3], [2, 4]]},
+            {"names": ["enabled"], "choices": [[True], [False]]},
+        ],
+        "point_count": 4,
+    }
+    assert canonical_artifact_bytes(domain) == canonical_artifact_bytes(expected)
+    for fast, slow in [(1, 3), (2, 4)]:
+        for enabled in [True, False]:
+            validate_parameter_domain_member(domain, {"fast": fast, "slow": slow, "enabled": enabled})
+    with pytest.raises(CurrentRefitParameterCodecError):
+        validate_parameter_domain_member(domain, {"fast": 1, "slow": 4, "enabled": True})

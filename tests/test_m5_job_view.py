@@ -305,15 +305,26 @@ class M5JobViewTests(unittest.TestCase):
         self.assert_code("M5_VIEW_BUDGET_BINDING_MISMATCH", self.state,
             budgets=_budgets(max_source_rows=17), binding=self.binding)
 
-    def test_each_logical_row_or_byte_bound_refuses_before_view_exposure(self):
+    def test_logical_rows_refuse_but_legacy_byte_metadata_does_not_block_view(self):
         for field, code in (("max_source_rows", "M5_VIEW_SOURCE_ROW_BUDGET"),
-                ("max_source_bytes", "M5_VIEW_SOURCE_BYTE_BUDGET"), ("max_view_rows", "M5_VIEW_ROW_BUDGET"),
-                ("max_view_bytes", "M5_VIEW_BYTE_BUDGET"), ("max_cache_rows", "M5_VIEW_CACHE_ROW_BUDGET"),
-                ("max_cache_bytes", "M5_VIEW_CACHE_BYTE_BUDGET")):
+                ("max_view_rows", "M5_VIEW_ROW_BUDGET"), ("max_cache_rows", "M5_VIEW_CACHE_ROW_BUDGET")):
             with self.subTest(field=field):
                 budgets = _budgets(**{field: 1})
                 self.assert_code(code, job._build_view, _binding(budgets), self.request, _rows(),
                     source=_archive(), examined_interval=_interval(), budgets=budgets)
+        for field in ("max_source_bytes", "max_view_bytes", "max_cache_bytes"):
+            with self.subTest(retired_byte_field=field):
+                budgets = _budgets(**{field: 1})
+                state = self.state(budgets=budgets)
+                lease = state.acquire("view-a", _UnitLoader(state.binding, budgets))
+                self.assertTrue(lease.view.rows)
+                self.assertGreater(sum(job._encoded_bytes(asdict(row)) for row in lease.view.rows), 1)
+                self.assertTrue(state.cache)
+                lease.release()
+                state.close()
+                self.assertEqual(state.cache, {})
+                self.assertEqual(state.cache_usage, {})
+                self.assertEqual(state.source_usage, {})
 
     def test_source_retention_guard_is_preappend_and_discard_releases_logical_usage(self):
         budgets = _budgets(max_source_rows=1);state = self.state(budgets=budgets)
@@ -323,13 +334,16 @@ class M5JobViewTests(unittest.TestCase):
         state._discard_source("UNIT_SOURCE");self.assertEqual(state.source_usage, {})
         state._retain_source_row("UNIT_SOURCE", _rows()[1]);state.close()
         self.assertEqual(state.source_usage, {})
-        for limits, code in (({"max_source_bytes": 1}, "M5_VIEW_SOURCE_BYTE_BUDGET"),
-                            ({"max_cache_bytes": 1}, "M5_VIEW_CACHE_BYTE_BUDGET")):
-            with self.subTest(limits=limits):
+        for limits in ({"max_source_bytes": 1}, {"max_cache_bytes": 1}):
+            with self.subTest(retired_byte_fields=limits):
                 state = self.state(budgets=_budgets(**limits))
-                self.assert_code(code, state._retain_source_row, "UNIT_SOURCE", _rows()[0])
+                state._retain_source_row("UNIT_SOURCE", _rows()[0])
+                self.assertEqual(state.source_usage["UNIT_SOURCE"][0], 1)
+                self.assertGreater(state.source_usage["UNIT_SOURCE"][1], 1)
+                state._discard_source("UNIT_SOURCE")
                 self.assertEqual(state.source_usage, {})
                 state.close()
+                self.assertEqual(state.cache, {})
 
     def test_cache_row_budget_counts_source_and_unique_derived_values_together(self):
         budgets = _budgets(max_cache_rows=2);state = self.state(budgets=budgets)

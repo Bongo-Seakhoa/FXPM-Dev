@@ -21,9 +21,10 @@ import pm_memory_governor as memory
 
 
 def _contract(tmp_path, symbols=("AUDUSD", "AUDUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCAD")):
+    """Explicit full-13 METADATA fixtures with fake execution, never a financial study."""
     cells=[]
     for index,symbol in enumerate(symbols):
-        cells.append({"root":str(tmp_path/f"cell-{index}"),"run_id":f"synthetic-cell-{index}",
+        cells.append({"root":str(tmp_path/f"cell-{index}"),"run_id":f"synthetic-cell-{index}","final_study_13":True,
             "cell":{"cell_id":hashlib.sha256(f"{symbol}:{index}".encode()).hexdigest(),
                 "symbol":symbol,"timeframe":"H1","regime":"TREND"},
             "launch_activation_utc":"2023-06-24T00:00:00Z",
@@ -122,11 +123,22 @@ def _synthetic_declared_worker(contract,symbol):
         milestones.add("native-checked")
         return "MISMATCH" if contract.get("synthetic_native_drift") else "MATCH"
     def capacity_failure():
+        if "synthetic_parallel_capacity_reason" in contract:
+            reason = contract["synthetic_parallel_capacity_reason"]
+            if reason == "LEGACY_UNRESOLVED":
+                raise producer.HistoricalSearchProducerError("DECLARED_PARALLEL_SLOT_LEGACY_FAILURE_UNRESOLVED")
+            error = producer.DeclaredParallelSlotCapacityError("DISK_LOW" if reason == "INVALID_TYPED_REASON" else reason,
+                "invented-slot", "INVENTED_CHILD_TYPE", "INVENTED_VALIDATED_FAILURE")
+            if reason == "INVALID_TYPED_REASON":
+                error.capacity_reason = None
+            raise error
         import pm_authority_spool_quota as quota
         failure=quota.AuthoritySpoolQuotaError("SPOOL_QUOTA_FREE_SPACE_RESERVE_BREACHED")
         raise spool.AuthoritySpoolError(str(failure)) from failure
     def issue(context,**kwargs):
         note("issue")
+        if contract.get("synthetic_capacity_stage")=="precommit":
+            capacity_failure()
         body={"schema_version":orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2,"run_id":kwargs["run_id"],"search_process_receipt_sha256":kwargs["process"].receipt_sha256,"cells":kwargs["cell_roster"],
             "spread_profile_identity":kwargs["spread_profile_identity"],
             "source_access_window_utc":kwargs["source_access_window_utc"],
@@ -157,7 +169,7 @@ def _synthetic_declared_worker(contract,symbol):
         body=json.loads(path.read_text()) if path.exists() else None
         return SimpleNamespace(run_receipt=body,terminal_stop=bool(body and body["terminal_stop"]),
             first_uncommitted_slot=None if body else {"ordinal":1})
-    def execute(*,context,precommit,process,frozen_pipeline_config,cell_id):
+    def execute(*,context,precommit,process,frozen_pipeline_config,cell_id,_verified_progress_out=None):
         assert contexts[precommit.receipt_sha256] is context
         note("search")
         if contract.get("synthetic_capacity_stage")=="execute":
@@ -188,7 +200,17 @@ def _synthetic_declared_worker(contract,symbol):
         note("discover")
         path=context.root/"synthetic-account-descriptor.json"
         return causal.DeclaredCellRawAccountArtifact(json.loads(path.read_text())) if path.exists() else None
+    def prepare_account(context,**kwargs):
+        artifact=discover(context,**kwargs)
+        body=(json.loads((context.root/artifact.descriptor["relative_path"]).read_bytes())
+            if artifact is not None else {})
+        inputs={"classification":"SYNTHETIC_METADATA_ONLY","context":context,
+            "precommit":kwargs["precommit"],"body":body}
+        return artifact,inputs,body
     def write_account(context,**kwargs):
+        assert kwargs["inputs"]["context"] is context
+        assert kwargs["inputs"]["precommit"] is kwargs["precommit"]
+        assert kwargs["inputs"]["body"] is kwargs["body"]
         note("account")
         if contract.get("synthetic_capacity_stage")=="account":
             capacity_failure()
@@ -197,11 +219,14 @@ def _synthetic_declared_worker(contract,symbol):
             raise RuntimeError("labelled synthetic account publication failure")
         if contract.get("synthetic_forbid_replay"):
             raise AssertionError("Completed account was simulated again")
-        descriptor=spool.write_canonical_json_artifact(context,{"classification":"SYNTHETIC_METADATA_ONLY",
-            "cell_id":kwargs["precommit"].to_dict()["cells"][0]["cell_id"],"qualification_authority":False})
+        kwargs["body"].update(classification="SYNTHETIC_METADATA_ONLY",
+            cell_id=kwargs["precommit"].to_dict()["cells"][0]["cell_id"],qualification_authority=False)
+        descriptor=spool.write_canonical_json_artifact(context,kwargs["body"])
         (context.root/"synthetic-account-descriptor.json").write_bytes(_encoded(descriptor))
         return causal.DeclaredCellRawAccountArtifact(descriptor)
     def request(context,**kwargs):
+        assert kwargs["inputs"]["context"] is context
+        assert kwargs["inputs"]["precommit"] is kwargs["precommit"]
         note("native-request")
         if contract.get("synthetic_forbid_native_request"):
             raise AssertionError("Known lapse reached new native production")
@@ -223,9 +248,9 @@ def _synthetic_declared_worker(contract,symbol):
         (portfolio,"active_native_portfolio_contract",lambda *args,**kwargs:({},[])),
         (producer,"reopen_declared_cell_owner_progress",progress),
         (producer,"execute_declared_cell_owner_slots",execute),
-        (forward,"discover_declared_cell_account_artifact",discover),
-        (forward,"declared_cell_account_native_request",request),
-        (forward,"produce_declared_cell_account_artifact",write_account),
+        (forward,"_prepare_declared_cell_account_artifact",prepare_account),
+        (forward,"_declared_cell_account_native_request_from_inputs",request),
+        (forward,"_produce_declared_cell_account_from_inputs",write_account),
         (native,"produce_activated_native_prefix",lambda **kwargs:SimpleNamespace()),
         (native,"reverify_activated_native_prefix_product",lambda product,*args,**kwargs:product),
         (FeatureComputer,"clear_cache",lambda:None)]
@@ -239,6 +264,13 @@ def _synthetic_declared_worker(contract,symbol):
                 time.sleep(.02)
             assert len(list(board.glob("*.arrived")))==2
         return scheduler.declared_symbol_worker(contract,symbol)
+
+
+# Import the identical fixture through its ordinary filename module so stdlib
+# spawn can resolve it when pytest importlib gives this file a _tmp.* name.
+# The qualified launcher puts this exact candidate/tests directory first.
+if __name__ != "test_declared_symbol_scheduler":
+    from test_declared_symbol_scheduler import _synthetic_declared_worker
 
 
 def test_real_entry_drains_three_children_retains_healthy_same_symbol_cells_and_not_run(tmp_path):
@@ -528,52 +560,56 @@ def test_dispatch_lease_released_after_exception_in_same_live_process(tmp_path):
 
 
 
-def test_parent_disk_low_defers_without_launching_or_creating_cells(tmp_path,monkeypatch):
-    contract=_contract(tmp_path,("AUDUSD","EURUSD"));probes=[]
+def test_zero_reported_parent_free_space_does_not_block_dispatch(tmp_path,monkeypatch):
+    contract=_contract(tmp_path,("AUDUSD","EURUSD"));probes=[];started=[]
+    launch=memory._launch_task_process
     def low(root): probes.append(Path(root));return 0
-    def forbidden(*args,**kwargs): raise AssertionError("Parent DISK_LOW launched a worker")
+    def actual_launch(*args,**kwargs):
+        pair=launch(*args,**kwargs);started.append(pair[0].pid);return pair
     monkeypatch.setattr(scheduler,"_declared_disk_free_bytes",low)
-    monkeypatch.setattr(memory,"_launch_task_process",forbidden)
+    monkeypatch.setattr(memory,"_launch_task_process",actual_launch)
     result=scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker,contract=contract,
         requested_workers=2,telemetry_path=tmp_path/"low-parent.jsonl")
     assert result["status"]=="COMPLETED"
-    assert result["admission_deferral_reason"]=="DISK_LOW"
-    assert [(r["status"],r["reason_code"],r["worker_pid"]) for r in result["cells"]]==[("NOT_RUN","DISK_LOW",None)]*2
-    assert probes and all(path in [Path(r["root"]) for r in contract["cells"]] for path in probes)
-    assert all(not Path(row["root"]).exists() for row in contract["cells"])
+    assert result["admission_deferral_reason"] is None
+    assert len(started)==2 and probes==[]
+    assert all(r["status"]=="COMPLETED" and r["run_receipt_confirmed"] and r["worker_pid"] for r in result["cells"])
+    assert all((Path(row["root"])/"synthetic-account-descriptor.json").is_file() for row in contract["cells"])
 
 
-def test_parent_disk_deferral_drains_actual_active_job_without_refill(tmp_path,monkeypatch):
-    contract=_contract(tmp_path,("AUDUSD","EURUSD","GBPUSD"));started=[];launch=memory._launch_task_process
+def test_reported_free_space_drop_does_not_stop_refill_or_drain(tmp_path,monkeypatch):
+    contract=_contract(tmp_path,("AUDUSD","EURUSD","GBPUSD"));started=[];probes=[]
+    launch=memory._launch_task_process
     def actual_launch(*args,**kwargs):
         pair=launch(*args,**kwargs);started.append(pair[0].pid);return pair
+    def reported_free(root):
+        probes.append(Path(root));return 0 if started else 2**60
     monkeypatch.setattr(memory,"_launch_task_process",actual_launch)
-    monkeypatch.setattr(scheduler,"_declared_disk_free_bytes",lambda root:0 if started else 2**60)
+    monkeypatch.setattr(scheduler,"_declared_disk_free_bytes",reported_free)
     result=scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker,contract=contract,
         requested_workers=2,telemetry_path=tmp_path/"active-drain.jsonl")
-    assert len(started)==1
-    assert [row["status"] for row in result["cells"]]==["COMPLETED","NOT_RUN","NOT_RUN"]
-    assert result["cells"][0]["run_receipt_confirmed"] is True
-    assert all(row["reason_code"]=="DISK_LOW" and row["worker_pid"] is None for row in result["cells"][1:])
-    assert all(not Path(row["root"]).exists() for row in contract["cells"][1:])
+    assert len(started)==3 and probes==[]
+    assert [row["status"] for row in result["cells"]]==["COMPLETED"]*3
+    assert result["admission_deferral_reason"] is None
+    assert all(row["run_receipt_confirmed"] and row["worker_pid"] for row in result["cells"])
+    assert all((Path(row["root"])/"synthetic-account-descriptor.json").is_file() for row in contract["cells"])
 
 
 @pytest.mark.parametrize("stage",["new-context","execute","account"])
-def test_child_disk_check_preserves_unconsumed_or_finalised_state(tmp_path,stage):
+def test_legacy_child_free_space_hints_do_not_block_any_stage(tmp_path,stage):
     contract=_contract(tmp_path,("AUDUSD","AUDUSD"))
     if stage=="new-context": contract["synthetic_child_free_bytes"]=0
     else: contract["synthetic_disk_low_stage"]=stage
+    contract["synthetic_forbid_disk_probe"]=True
     result=scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker,contract=contract,
         requested_workers=1,telemetry_path=tmp_path/"child-low.jsonl")
-    assert [(r["status"],r["reason_code"]) for r in result["cells"]]==[("NOT_RUN","DISK_LOW")]*2
-    assert not Path(contract["cells"][1]["root"]).exists()
-    root=Path(contract["cells"][0]["root"])
-    if stage=="new-context": assert not root.exists()
-    elif stage=="execute": assert not list(root.rglob("run-receipt.json"))
-    else:
+    assert [r["status"] for r in result["cells"]]==["COMPLETED"]*2
+    assert all(row["run_receipt_confirmed"] for row in result["cells"])
+    assert result["cells"][0]["worker_pid"]==result["cells"][1]["worker_pid"]
+    for row in contract["cells"]:
+        root=Path(row["root"])
         assert len(list(root.rglob("run-receipt.json")))==1
-        assert result["cells"][0]["run_receipt_confirmed"] is True
-        assert not (root/"synthetic-account-descriptor.json").exists()
+        assert (root/"synthetic-account-descriptor.json").is_file()
 
 
 @pytest.mark.parametrize("stage",["execute","account"])
@@ -604,27 +640,29 @@ def test_verified_saved_output_reuse_is_read_only_before_disk_block(tmp_path,ter
     assert first["cells"][0]["run_receipt"]==second["cells"][0]["run_receipt"]
 
 
-def test_disk_threshold_never_waives_verified_context_reserve_and_headroom(tmp_path):
+def test_legacy_context_reserve_and_headroom_do_not_gate_dispatch(tmp_path):
     import pm_authority_spool as spool
     contract=_contract(tmp_path,("AUDUSD",));row=contract["cells"][0]
     reserve=scheduler.DECLARED_CELL_MIN_FREE_BYTES+1024**3
-    spool.freeze_generation_context(Path(row["root"]),generation_id=row["run_id"],
+    context=spool.freeze_generation_context(Path(row["root"]),generation_id=row["run_id"],
         native_universe_sha256=contract["native_universe_sha256"],config_sha256=contract["config_sha256"],
         limits=spool.SpoolLimits(min_free_bytes=reserve))
-    contract["synthetic_child_free_bytes"]=reserve-1
+    context_path=context.root/spool.CONTEXT_RELATIVE_PATH;frozen_bytes=context_path.read_bytes()
+    contract.update(synthetic_child_free_bytes=reserve-1,synthetic_forbid_disk_probe=True)
     result=scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker,contract=contract,
         disk_min_free_bytes=0,disk_headroom_bytes=1,requested_workers=1,telemetry_path=tmp_path/"reserve.jsonl")
-    assert result["cells"][0]["reason_code"]=="DISK_LOW"
-    assert not list(Path(row["root"]).glob("declared-slots/*/precommit.json"))
-    assert scheduler._declared_disk_requirement({"scheduler_disk_min_free_bytes":1,
-        "scheduler_disk_headroom_bytes":5},reserve)==reserve+5
+    assert result["cells"][0]["status"]=="COMPLETED"
+    assert result["cells"][0]["run_receipt_confirmed"] is True
+    assert context_path.read_bytes()==frozen_bytes
+    assert len(list(context.root.glob("declared-slots/*/precommit.json")))==1
+    assert (context.root/"synthetic-account-descriptor.json").is_file()
 
 
 @pytest.mark.parametrize("free_bytes,expected_status", [
-    (5 * 1024**3 - 1, "NOT_RUN"),
+    (5 * 1024**3 - 1, "COMPLETED"),
     (5 * 1024**3, "COMPLETED"),
 ])
-def test_reopened_lower_reserve_context_obeys_five_gib_worker_floor(tmp_path,free_bytes,expected_status):
+def test_reopened_lower_reserve_context_completes_across_old_floor(tmp_path,free_bytes,expected_status):
     import pm_authority_spool as spool
     contract,_=scheduler._declared_contract(_contract(tmp_path,("AUDUSD",)))
     row=contract["cells"][0];root=Path(row["root"])
@@ -634,30 +672,27 @@ def test_reopened_lower_reserve_context_obeys_five_gib_worker_floor(tmp_path,fre
     context_path=root/spool.CONTEXT_RELATIVE_PATH;frozen_bytes=context_path.read_bytes()
     assert context.limits.min_free_bytes < free_bytes
     contract.update(scheduler_disk_min_free_bytes=0,scheduler_disk_headroom_bytes=0,
-        synthetic_child_free_bytes=free_bytes)
-    if expected_status=="NOT_RUN": contract["synthetic_forbid_process_freeze"]=True
+        synthetic_child_free_bytes=free_bytes,synthetic_forbid_disk_probe=True)
     result=_synthetic_declared_worker(contract,"AUDUSD")
     assert result["cells"][0]["status"]==expected_status
     assert context_path.read_bytes()==frozen_bytes
-    if expected_status=="NOT_RUN":
-        assert result["cells"][0]["reason_code"]=="DISK_LOW"
-        assert not list(root.glob("declared-slots/*/precommit.json"))
-        assert not (tmp_path/"board").exists()
-    else:
-        assert result["cells"][0]["run_receipt"] is not None
-        assert (root/"synthetic-account-descriptor.json").exists()
+    assert result["cells"][0]["run_receipt"] is not None
+    assert (root/"synthetic-account-descriptor.json").exists()
 
 
-def test_parent_disk_probe_error_remains_technical(tmp_path,monkeypatch):
-    contract=_contract(tmp_path,("AUDUSD",))
-    def probe(root): raise OSError("labelled unavailable target volume")
+def test_unused_free_space_probe_error_does_not_block_dispatch(tmp_path,monkeypatch):
+    contract=_contract(tmp_path,("AUDUSD",));probes=[]
+    contract["synthetic_child_disk_probe_error"]=True
+    def probe(root):
+        probes.append(Path(root));raise OSError("labelled unavailable target volume")
     monkeypatch.setattr(scheduler,"_declared_disk_free_bytes",probe)
-    with pytest.raises(scheduler.DeclaredSymbolSchedulerError) as caught:
-        scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker,contract=contract,
-            requested_workers=1,telemetry_path=tmp_path/"probe-error.jsonl")
-    assert caught.value.report["status"]=="FAILED"
-    assert caught.value.report["cells"][0]["reason_code"]=="DISK_PROBE_ERROR"
-    assert not Path(contract["cells"][0]["root"]).exists()
+    result=scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker,contract=contract,
+        requested_workers=1,telemetry_path=tmp_path/"probe-error.jsonl")
+    assert result["status"]=="COMPLETED"
+    assert result["cells"][0]["status"]=="COMPLETED"
+    assert result["cells"][0]["run_receipt_confirmed"] is True
+    assert probes==[]
+    assert (Path(contract["cells"][0]["root"])/"synthetic-account-descriptor.json").is_file()
 
 
 def test_probe_uses_nearest_existing_target_ancestor_without_creating_root(tmp_path,monkeypatch):
@@ -670,13 +705,66 @@ def test_probe_uses_nearest_existing_target_ancestor_without_creating_root(tmp_p
 
 
 @pytest.mark.parametrize("available,expected", [
-    (5 * 1024**3 - 1, False),
+    (5 * 1024**3 - 1, True),
     (5 * 1024**3, True),
     (5 * 1024**3 + 1, True),
 ])
-def test_operator_five_gib_floor_boundary(tmp_path, monkeypatch, available, expected):
-    assert scheduler.DECLARED_CELL_MIN_FREE_BYTES == 5 * 1024**3
-    monkeypatch.setattr(scheduler, "_declared_disk_free_bytes", lambda root: available)
-    for reserve in (0, 1536 * 1024**2, scheduler.DECLARED_CELL_MIN_FREE_BYTES):
+def test_legacy_free_space_hint_boundary_never_controls_admission(tmp_path, monkeypatch, available, expected):
+    def forbidden_probe(root):
+        raise AssertionError("Legacy free-space hint caused a host admission probe")
+    monkeypatch.setattr(scheduler, "_declared_disk_free_bytes", forbidden_probe)
+    for reserve in (0, 1536 * 1024**2, available):
         assert scheduler._declared_disk_ready(tmp_path, {}, reserve) is expected
-    assert scheduler._declared_disk_requirement({"scheduler_disk_headroom_bytes":5},0)==5 * 1024**3 + 5
+
+
+@pytest.mark.parametrize("reason,expected", [("DISK_LOW", "DISK_LOW"), ("MEMORY_ERROR", "MEMORY_ERROR")])
+def test_validated_parallel_capacity_closes_admission_as_truthful_deferral(tmp_path, reason, expected):
+    contract = _contract(tmp_path, ("AUDUSD", "AUDUSD"))
+    contract.update(synthetic_capacity_stage="execute", synthetic_parallel_capacity_reason=reason)
+    report = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+        requested_workers=1, telemetry_path=tmp_path/"invented-capacity.jsonl")
+    assert report["admission_deferral_reason"] == expected
+    assert [(row["status"], row["reason_code"]) for row in report["cells"]] == [("NOT_RUN", expected)] * 2
+    assert not Path(contract["cells"][1]["root"]).exists()
+
+
+def test_capacity_before_first_precommit_reuses_context_and_sealed_process(tmp_path):
+    contract = _contract(tmp_path, ("AUDUSD",))
+    checked, _ = scheduler._declared_contract(contract)
+    checked["synthetic_capacity_stage"] = "precommit"
+    first = _synthetic_declared_worker(checked, "AUDUSD")["cells"][0]
+    assert first["status"] == "NOT_RUN" and first["reason_code"] == "DISK_LOW"
+    root = Path(checked["cells"][0]["root"])
+    assert not list((root/"declared-slots").glob("*/precommit.json"))
+    context_before = (root/"generation-context.json").read_bytes()
+    checked.pop("synthetic_capacity_stage")
+    checked["synthetic_forbid_process_freeze"] = True
+    second = _synthetic_declared_worker(checked, "AUDUSD")["cells"][0]
+    assert second["status"] == "COMPLETED"
+    assert (root/"generation-context.json").read_bytes() == context_before
+    assert len(list((root/"declared-slots").glob("*/precommit.json"))) == 1
+
+
+def test_held_bootstrap_lock_is_busy_without_native_work_or_stop(tmp_path, monkeypatch):
+    import pm_authority_spool as spool
+    contract, _ = scheduler._declared_contract(_contract(tmp_path, ("AUDUSD",)))
+    def busy(*args, **kwargs):
+        raise spool.AuthoritySpoolError("GENERATION_BOOTSTRAP_BUSY")
+    monkeypatch.setattr(spool, "freeze_generation_context", busy)
+    row = _synthetic_declared_worker(contract, "AUDUSD")["cells"][0]
+    assert row["status"] == "NOT_RUN" and row["reason_code"] == "BUSY"
+    assert row["run_receipt"] is None and row["account_descriptor"] is None
+    assert not Path(contract["cells"][0]["root"]).exists()
+
+
+@pytest.mark.parametrize("reason,expected", [
+    ("LEGACY_UNRESOLVED", "DECLARED_PARALLEL_SLOT_LEGACY_FAILURE_UNRESOLVED"),
+    ("INVALID_TYPED_REASON", "DECLARED_PARALLEL_SLOT_CAPACITY_REASON_INVALID"),
+])
+def test_unresolved_or_invalid_parallel_reason_never_admits_capacity(tmp_path, reason, expected):
+    contract, _ = scheduler._declared_contract(_contract(tmp_path, ("AUDUSD",)))
+    contract.update(synthetic_capacity_stage="execute", synthetic_parallel_capacity_reason=reason)
+    row = _synthetic_declared_worker(contract, "AUDUSD")["cells"][0]
+    assert row["status"] == "FAILED" and row["reason_code"] == expected
+    assert scheduler._declared_cell_deferral(contract, contract["cells"][0], row) is None
+    assert row["run_receipt"] is None and row["account_descriptor"] is None

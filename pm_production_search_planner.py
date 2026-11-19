@@ -20,7 +20,10 @@ causal, capital, publication, demo, or live authority.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from enum import Enum
 import csv
@@ -47,13 +50,10 @@ import pm_regime
 import pm_state_contract as state_contract
 import pm_training_horizon as training_horizon
 from pm_current_refit_parameters import (
-    RETAINED_STRATEGY_SOURCE_V1_SHA256,
-    RETAINED_STRATEGY_V1_SUCCESSOR_SHA256,
     build_parameter_domain,
     canonicalize_parameter_mapping,
     canonicalize_parameter_value,
     decode_parameter_mapping,
-    load_retained_strategy_domain_v1,
     parameter_domain_default_ordinal,
     parameter_domain_point,
     parameter_values_equal,
@@ -63,9 +63,9 @@ from pm_strategies import StrategyRegistry
 
 
 UTC: Final = timezone.utc
-ORIGINAL_PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v1"
-ORIGINAL_DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v2"
 PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v2"
+ROUTE_A_FULL_PANEL_PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v3"
+ROUTE_A_FULL_PANEL_EXECUTION_EDITION: Final = "fxpm.route-a-full-planned-owner-execution.v1"
 PROCESS_SEMANTICS_SCHEMA: Final = "fxpm.production-search-process-semantics.v2"
 DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v3"
 ATTEMPT_POLICY_SCHEMA: Final = "fxpm.production-attempt-design-policy.v2"
@@ -89,7 +89,6 @@ STATE_ERROR_ENVELOPE_SCHEMA: Final = (
 EFFECTIVE_STATE_DOMAIN_SCHEMA: Final = (
     "fxpm.production-effective-state-domain.v2"
 )
-ORIGINAL_EFFECTIVE_STATE_DOMAIN_SCHEMA: Final = "fxpm.production-effective-state-domain.v1"
 STATE_DOMAIN_CEILING_RECORD_SCHEMA: Final = (
     "fxpm.production-state-domain-ceiling-record.v1"
 )
@@ -135,20 +134,13 @@ BASELINE_ATTEMPTS: Final = 100
 # Every registered strategy receives this many deterministic, outcome-blind
 # non-default grid points, in addition to its registry default.
 #
-# It was formerly a flat 28 points shared across the whole 100-strategy pool, so
-# 72 strategies were never tuned at all and the remaining 28 saw exactly one
-# alternative each. Measured grids: the smallest strategy admits 165 distinct
-# parameter combinations, the median 4,455, the largest 1,267,200. Sampling
-# 0.28 tuned points per strategy against a median space of 4,455 is not a search;
-# it means the DSR/PBO gates adjudicate registry defaults. Every strategy can
-# supply at least 8 distinct non-default points, so 2 is well inside the grids.
+# Legal grids of the 100 strategies (cartesian_grid_size): the smallest
+# admits 165 distinct parameter combinations, the median 4,455, the
+# largest 27,500, so these points are well inside every grid.
 #
-# Widening is statistically safe because deflation scales with the trial count
-# rather than being bounded by it: pm_statistics deflates by
-# effective_independent_trials = min(n, 1 + (n-1)(1 - avg_correlation)), so more
-# attempts automatically raise the bar a winner must clear. The 128 ceiling was
-# never a statistical guard - MAX_ATTEMPTS sits in pm_winner_selection beside
-# MAX_JSON_NODES and MAX_CONTAINER_ITEMS as a payload bound.
+# Deflation in pm_statistics scales with the effective independent trial count,
+# so more attempts raise the bar a winner must clear. MAX_ATTEMPTS in
+# pm_winner_selection is a payload bound, not a statistical guard.
 VARIANTS_PER_STRATEGY: Final = 2
 VARIANT_ATTEMPTS: Final = BASELINE_ATTEMPTS * VARIANTS_PER_STRATEGY
 ATTEMPT_COUNT: Final = BASELINE_ATTEMPTS + VARIANT_ATTEMPTS
@@ -614,7 +606,80 @@ def _process_semantics(domains: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+_PROCESS_VERIFICATION_STATE = ContextVar("fxpm_owned_process_verification", default=None)
+
+
+@contextmanager
+def _process_verification_scope():
+    if _PROCESS_VERIFICATION_STATE.get() is not None:
+        yield
+        return
+    token = _PROCESS_VERIFICATION_STATE.set({"verified": {}, "expected": {}})
+    try:
+        yield
+    finally:
+        _PROCESS_VERIFICATION_STATE.reset(token)
+
+
+def _owned_process_verification_call(function):
+    @wraps(function)
+    def owned(*args, **kwargs):
+        with _process_verification_scope():
+            return function(*args, **kwargs)
+    return owned
+
+
+def _process_context_binding(context):
+    if type(context) is not authority_spool.GenerationSpoolContext:
+        _fail("GENERATION_CONTEXT_INVALID")
+    return (str(context.root), context.generation_id, context.context_sha256,
+        context.native_universe_sha256, context.config_sha256)
+
+
+def _process_source_generation():
+    import pm_winner_selection as selection
+    return (PRODUCTION_SEARCH_PLANNER_RELEASE_SHA256,
+        search_execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+        historical_adapter.HISTORICAL_PRODUCER_RELEASE_SHA256,
+        state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256,
+        state_contract.DEFAULT_AUTHORITY.registry_hash,
+        tuple(state_contract.ACTUAL_STRATEGY_NAMES),
+        selection.V17_GENERATION.selection_version, selection.V17_GENERATION.request_version,
+        selection.V17_GENERATION.policy_sha256,
+        selection.V17_SELECTION_ADDENDUM_CONTRACT_SHA256,
+        tuple(StrategyRegistry.list_all()),
+        _canonical_bytes(causal.pinned_process_policy()),
+        PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA,
+        ROUTE_A_FULL_PANEL_EXECUTION_EDITION, PROCESS_SEMANTICS_SCHEMA,
+        ATTEMPT_POLICY_SCHEMA, book.CURRENT_PINNED_WINNER_SELECTION_CONTRACT_VERSION,
+        search_execution.MAX_ATTEMPTS, ATTEMPT_COUNT, BASELINE_ATTEMPTS,
+        VARIANT_ATTEMPTS, GROUPED_PARAMETER_DESIGN_SEED,
+        tuple((timeframe, tuple(FIT_CALENDAR_DAY_LADDERS[timeframe])) for timeframe in TIMEFRAMES),
+        CAUSAL_FOLD_COUNT, CAUSAL_FOLD_MIN_DAYS)
+
+
 def _expected_process_body(
+    context: authority_spool.GenerationSpoolContext,
+    *,
+    run_id: str,
+    schema_version: str = PROCESS_SCHEMA,
+) -> dict[str, Any]:
+    run_id = _identity(run_id, "RUN_ID_INVALID")
+    if schema_version not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA):
+        _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
+    state = _PROCESS_VERIFICATION_STATE.get()
+    if state is None:
+        return _derive_expected_process_body(context, run_id=run_id, schema_version=schema_version)
+    key = (_process_context_binding(context), run_id, schema_version, _process_source_generation())
+    cached = state["expected"].get(key)
+    if cached is None:
+        body = _derive_expected_process_body(context, run_id=run_id, schema_version=schema_version)
+        cached = _canonical_bytes(body)
+        state["expected"][key] = cached
+    return json.loads(cached.decode("ascii"))
+
+
+def _derive_expected_process_body(
     context: authority_spool.GenerationSpoolContext,
     *,
     run_id: str,
@@ -628,24 +693,15 @@ def _expected_process_body(
     )
     if observed.context_sha256 != context.context_sha256:
         _fail("GENERATION_CONTEXT_CHANGED")
-    if schema_version == ORIGINAL_PROCESS_SCHEMA:
-        _require_retained_registry_successor()
-        template = load_retained_strategy_domain_v1()["process_template"]
-        state_contract.retained_v1_authority()
-        return {
-            **template,
-            "run_id": _identity(run_id, "RUN_ID_INVALID"),
-            "generation_id": context.generation_id,
-            "generation_context_sha256": context.context_sha256,
-            "native_universe_sha256": context.native_universe_sha256,
-            "config_sha256": context.config_sha256,
-        }
-    if schema_version != PROCESS_SCHEMA:
+    if schema_version not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA}:
         _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
     domains = _strategy_domains()
     semantics = _process_semantics(domains)
-    return {
-        "schema_version": PROCESS_SCHEMA,
+    if schema_version == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA:
+        import pm_winner_selection as selection
+        semantics["attempt_policy"]["winner_contract_version"] = selection.V17_GENERATION.selection_version
+    body = {
+        "schema_version": schema_version,
         "authority_scope": "FROZEN_SEARCH_PROCESS_ONLY",
         "run_id": _identity(run_id, "RUN_ID_INVALID"),
         "generation_id": context.generation_id,
@@ -669,12 +725,23 @@ def _expected_process_body(
         "confers_winner_causal_current_capital_publication_or_live_authority": False,
     }
 
+    if schema_version == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA:
+        body["execution_edition"] = ROUTE_A_FULL_PANEL_EXECUTION_EDITION
+        import pm_winner_selection as selection
+        body["winner_selection_binding"] = {
+            "selection_version": selection.V17_GENERATION.selection_version,
+            "request_version": selection.V17_GENERATION.request_version,
+            "selection_policy_sha256": selection.V17_GENERATION.policy_sha256,
+            "selection_addendum_contract_sha256": selection.V17_SELECTION_ADDENDUM_CONTRACT_SHA256,
+        }
+    return body
 
 @dataclass(frozen=True, slots=True)
 class FrozenProductionSearchProcess:
     _body_json: bytes
     _spool_receipt_json: bytes
     _seal: object
+    _semantic_admission: tuple | None = field(default=None, init=False, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return json.loads(self._body_json.decode("ascii"))
@@ -763,16 +830,18 @@ class ProductionCellSearchPlan:
         return str(self.cell_receipt["receipt_sha256"])
 
 
-def freeze_production_search_process(
+@_owned_process_verification_call
+def _freeze_production_search_process(
     context: authority_spool.GenerationSpoolContext,
     *,
     run_id: str,
+    schema_version: str,
 ) -> FrozenProductionSearchProcess:
     """Freeze the complete search domain before any anchor callback runs."""
 
     if type(context) is not authority_spool.GenerationSpoolContext:
         _fail("GENERATION_CONTEXT_INVALID")
-    body = _expected_process_body(context, run_id=run_id)
+    body = _expected_process_body(context, run_id=run_id, schema_version=schema_version)
     encoded = _canonical_bytes(body)
     sink = authority_spool.open_symbol_sink(context, PROCESS_SPOOL_SYMBOL)
     entry = sink.put_json(PROCESS_ARTIFACT_ID, PROCESS_ARTIFACT_TYPE, body)
@@ -793,6 +862,27 @@ def freeze_production_search_process(
     return result
 
 
+def freeze_production_search_process(context: authority_spool.GenerationSpoolContext, *, run_id: str) -> FrozenProductionSearchProcess:
+    """Freeze the existing default edition without selecting Route A execution."""
+    return _freeze_production_search_process(context, run_id=run_id, schema_version=PROCESS_SCHEMA)
+
+
+def freeze_route_a_full_panel_production_search_process(context: authority_spool.GenerationSpoolContext, *, run_id: str) -> FrozenProductionSearchProcess:
+    """Freeze the explicit full-panel edition before creating declared requests."""
+    return _freeze_production_search_process(context, run_id=run_id,
+        schema_version=ROUTE_A_FULL_PANEL_PROCESS_SCHEMA)
+
+
+def frozen_search_execution_edition(context: authority_spool.GenerationSpoolContext,
+        process: FrozenProductionSearchProcess) -> str | None:
+    """Authenticate the process before selecting its frozen execution path."""
+    verify_frozen_production_search_process(context, process)
+    body = process.to_dict()
+    return (body["execution_edition"]
+        if body["schema_version"] == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA else None)
+
+
+@_owned_process_verification_call
 def verify_frozen_production_search_process(
     context: authority_spool.GenerationSpoolContext,
     process: FrozenProductionSearchProcess,
@@ -805,14 +895,24 @@ def verify_frozen_production_search_process(
         or process._seal is not _PROCESS_SEAL
     ):
         _fail("PROCESS_OBJECT_INVALID")
+    if type(process._body_json) is not bytes or type(process._spool_receipt_json) is not bytes:
+        _fail("PROCESS_OBJECT_INVALID")
+    state = _PROCESS_VERIFICATION_STATE.get()
+    context_binding, source_generation = _process_context_binding(context), _process_source_generation()
+    key = (context_binding, process._body_json, process._spool_receipt_json, source_generation)
+    admission = (context_binding, source_generation, process._body_json)
+    if state is not None and key in state["verified"]:
+        object.__setattr__(process, "_semantic_admission", admission)
+        return True
     body = process.to_dict()
     if _canonical_bytes(body) != process._body_json:
         _fail("PROCESS_BYTES_NONCANONICAL")
-    expected = _expected_process_body(
-        context, run_id=body.get("run_id"), schema_version=body.get("schema_version"),
-    )
-    if body != expected:
-        _fail("PROCESS_SEMANTICS_CHANGED")
+    if process._semantic_admission != admission:
+        expected = _expected_process_body(
+            context, run_id=body.get("run_id"), schema_version=body.get("schema_version"),
+        )
+        if body != expected:
+            _fail("PROCESS_SEMANTICS_CHANGED")
     manifest = authority_spool.verify_symbol_receipt(
         context.root,
         process.spool_receipt,
@@ -832,6 +932,9 @@ def verify_frozen_production_search_process(
         or entry.get("descriptor", {}).get("size_bytes") != len(process._body_json)
     ):
         _fail("PROCESS_SPOOL_ROSTER_MISMATCH")
+    object.__setattr__(process, "_semantic_admission", admission)
+    if state is not None:
+        state["verified"][key] = True
     return True
 
 
@@ -2305,9 +2408,6 @@ def _domain_by_name(process_body: Mapping[str, Any]) -> dict[str, dict[str, Any]
 
 
 def _state_authority_for_candidate(candidate_domain_sha256: str):
-    if candidate_domain_sha256 == state_contract.ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256:
-        _require_retained_registry_successor()
-        return state_contract.retained_v1_authority()
     if (
         state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256 is not None
         and candidate_domain_sha256 == state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
@@ -2316,17 +2416,10 @@ def _state_authority_for_candidate(candidate_domain_sha256: str):
     _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
 
 
-def _require_retained_registry_successor() -> None:
-    if _source_sha256(StrategyRegistry) not in {
-        RETAINED_STRATEGY_SOURCE_V1_SHA256, RETAINED_STRATEGY_V1_SUCCESSOR_SHA256,
-    }:
-        _fail("RETAINED_STRATEGY_SUCCESSOR_CHANGED")
-
-
 def _require_current_process(process: FrozenProductionSearchProcess) -> None:
     if type(process) is not FrozenProductionSearchProcess or process._seal is not _PROCESS_SEAL:
         _fail("PROCESS_OBJECT_INVALID")
-    if process.to_dict().get("schema_version") != PROCESS_SCHEMA:
+    if process.to_dict().get("schema_version") not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA}:
         _fail("RETAINED_PROCESS_IS_READ_ONLY")
 
 
@@ -2386,7 +2479,6 @@ def _nondefault_parameters(
     ``variant_ordinal`` selects which point, so a strategy can contribute several
     distinct designs to a cell plan without any of them depending on an outcome.
     The current edition traverses a seeded coprime permutation of legal points.
-    Retained processes may be reopened but cannot generate new designs.
     """
     if domain is None:
         domain = _strategy_domain(strategy_name, 0)
@@ -3011,13 +3103,8 @@ def _effective_state_domains(
         defaults = domain.get("defaults")
         axes = domain.get("grid_axes")
         features = domain.get("required_feature_union")
-        grouped = domain.get("schema_version") == DOMAIN_SCHEMA
-        expected_domain_schema = (
-            DOMAIN_SCHEMA if candidate_domain_sha256 == state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
-            else ORIGINAL_DOMAIN_SCHEMA
-        )
         if (
-            domain.get("schema_version") != expected_domain_schema
+            domain.get("schema_version") != DOMAIN_SCHEMA
             or domain.get("ordinal") != ordinal
             or type(defaults) is not dict
             or not defaults
@@ -3027,8 +3114,7 @@ def _effective_state_domains(
             or any(type(value) is not str or not value for value in features)
             or features != sorted(set(features))
             or domain.get("required_feature_union_derivation")
-            != ("DEFAULT_PLUS_EVERY_LEGAL_ATOMIC_ROW_WITH_EXHAUSTIVE_LEGAL_RELEASE_PROOF"
-                if grouped else "DEFAULT_PLUS_EVERY_SINGLE_AXIS_VALUE_WITH_EXHAUSTIVE_CARTESIAN_RELEASE_PROOF")
+            != "DEFAULT_PLUS_EVERY_LEGAL_ATOMIC_ROW_WITH_EXHAUSTIVE_LEGAL_RELEASE_PROOF"
             or domain.get("domain_sha256")
             != _sha(
                 {
@@ -3053,18 +3139,13 @@ def _effective_state_domains(
             ):
                 _fail("EFFECTIVE_STATE_DOMAIN_AXIS_INVALID", ordinal)
             parameter_domains[axis["name"]] = list(axis["choices"])
-        if grouped:
-            parameter_domain = domain.get("parameter_domain")
-            validate_parameter_domain_member(parameter_domain, defaults)
-            full_count = parameter_domain["point_count"]
-        else:
-            parameter_domain = None
-            full_count = math.prod(len(values) for values in parameter_domains.values())
+        parameter_domain = domain.get("parameter_domain")
+        validate_parameter_domain_member(parameter_domain, defaults)
+        full_count = parameter_domain["point_count"]
         if full_count != domain.get("grid_size"):
             _fail("EFFECTIVE_STATE_DOMAIN_COUNT_INVALID", ordinal)
         body = {
-            "schema_version": (EFFECTIVE_STATE_DOMAIN_SCHEMA if grouped
-                               else ORIGINAL_EFFECTIVE_STATE_DOMAIN_SCHEMA),
+            "schema_version": EFFECTIVE_STATE_DOMAIN_SCHEMA,
             "cell": {
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -3082,8 +3163,7 @@ def _effective_state_domains(
             ],
             "outcome_or_protected_value_dependent": False,
         }
-        if grouped:
-            body["parameter_domain"] = parameter_domain
+        body["parameter_domain"] = parameter_domain
         effective.append({**body, "effective_domain_sha256": _sha(body)})
     if (
         len(effective) != BASELINE_ATTEMPTS
@@ -5685,3 +5765,95 @@ def describe_route_a_evaluation_design(*, frozen_domains: Any,
 
 __all__.append("describe_route_a_evaluation_design")
 
+
+def _route_a_full_panel_preparation_contract(*, owner_snapshot,
+                                            partition_cost_precommitments):
+    """Describe the complete frozen panel; this metadata issues no authority."""
+    prefix = "ROUTE_A_FULL_PANEL_"
+    def encode(value):
+        # Frozen evidence already has its own bounds; it is not a process body.
+        return json.dumps(value, allow_nan=False, ensure_ascii=True,
+            separators=(",", ":"), sort_keys=True).encode("ascii")
+    try:
+        if (type(owner_snapshot) is not dict
+                or owner_snapshot.get("schema_version") != "fxpm.route-a-owner-membership-snapshot.v2"
+                or owner_snapshot.get("provenance_scope") != "CURRENT_OWNER_METADATA_PROJECTION_ONLY"
+                or type(owner_snapshot.get("attempt_roster")) is not list
+                or not owner_snapshot["attempt_roster"]
+                or type(partition_cost_precommitments) is not dict):
+            _fail(prefix + "SOURCE_INVALID")
+        binding = owner_snapshot["declared_unit_binding"]
+        encoded_precommitments = encode(partition_cost_precommitments)
+        if (type(binding) is not dict
+                or binding["cost_precommitments_sha256"]
+                    != hashlib.sha256(encoded_precommitments).hexdigest()
+                or type(owner_snapshot["original_trial_count"]) is not int
+                or owner_snapshot["original_trial_count"] != len(owner_snapshot["attempt_roster"])):
+            _fail(prefix + "PRECOMMITMENT_BINDING_INVALID")
+        precommitted_rows = {(row["attempt_ordinal"], row["fold_ordinal"], row["partition"]): row
+            for row in partition_cost_precommitments["rows"]}
+        if len(precommitted_rows) != len(partition_cost_precommitments["rows"]):
+            _fail(prefix + "PRECOMMITMENT_BINDING_INVALID")
+        rows, rejected = [], []
+        for ordinal, attempt in enumerate(owner_snapshot["attempt_roster"]):
+            if (type(attempt) is not dict or attempt["ordinal"] != ordinal
+                    or type(attempt["raw_attempt_id"]) is not str
+                    or not attempt["raw_attempt_id"]
+                    or len(attempt["source_folds"]) != 4
+                    or len(attempt["folds"]) != 4):
+                _fail(prefix + "ROSTER_INVALID")
+            if attempt["status"] == "PROCESS_REJECTED":
+                if (type(attempt["rejection"]) is not dict
+                        or any(fold["partitions"] != {"status": "UNSCHEDULED"}
+                               for fold in attempt["folds"])):
+                    _fail(prefix + "REJECTION_INVALID")
+                rejected.append({"attempt_ordinal": ordinal,
+                    "raw_attempt_id": attempt["raw_attempt_id"],
+                    "horizon_attempt_id": attempt["horizon_attempt_id"],
+                    "rejection": attempt["rejection"]})
+                continue
+            if attempt["status"] != "PLANNED" or attempt["rejection"] is not None:
+                _fail(prefix + "ROSTER_INVALID")
+            for fold_ordinal, (fold, source) in enumerate(zip(
+                    attempt["folds"], attempt["source_folds"], strict=True)):
+                if (fold["fold_id"] != source["fold_id"]
+                        or fold["role"] != "CAUSAL_ROLLING_ORIGIN_INNER"
+                        or source["role"] != fold["role"]
+                        or set(fold["partitions"]) != {
+                            "optimizer_train", "tuning_validation", "final_lockbox"}):
+                    _fail(prefix + "FOLD_INVALID")
+                for role in ("optimizer_train", "tuning_validation", "final_lockbox"):
+                    identity = fold["partitions"][role]
+                    geometry_sha = identity["partition_geometry_receipt_sha256"]
+                    record = partition_cost_precommitments["records"][geometry_sha]
+                    if (identity["precommitment_row"] != precommitted_rows[ordinal, fold_ordinal, role]
+                            or identity["partition_frame_sha256"] != record["partition_frame_sha256"]
+                            or set(identity["tier_refs"]) != {"P75", "P95"}):
+                        _fail(prefix + "PARTITION_INVALID")
+                    for tier in ("P75", "P95"):
+                        expected_ref = "|".join((partition_cost_precommitments["schema_version"],
+                            partition_cost_precommitments["receipt_sha256"], geometry_sha, tier))
+                        if identity["tier_refs"][tier] != expected_ref:
+                            _fail(prefix + "PARTITION_INVALID")
+                        rows.append({"attempt_ordinal": ordinal,
+                            "raw_attempt_id": attempt["raw_attempt_id"],
+                            "horizon_attempt_id": attempt["horizon_attempt_id"],
+                            "fold_ordinal": fold_ordinal, "fold_id": fold["fold_id"],
+                            "partition_role": role, "spread_tier": tier,
+                            "partition_geometry_receipt_sha256": identity["partition_geometry_receipt_sha256"],
+                            "partition_frame_sha256": identity["partition_frame_sha256"]})
+        if not rows or len(rows) != (len(owner_snapshot["attempt_roster"]) - len(rejected)) * 24:
+            _fail(prefix + "PANEL_INCOMPLETE")
+        return json.loads(encode({
+            "schema_version": "fxpm.route-a-full-planned-owner-preparation.v1",
+            "declared_unit_binding": binding,
+            "original_trial_count": owner_snapshot["original_trial_count"],
+            "requests": rows, "process_rejections": rejected}).decode("ascii"))
+    except ProductionSearchPlannerError:
+        raise
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError) as exc:
+        raise ProductionSearchPlannerError(prefix + "SOURCE_INVALID") from exc
+
+
+__all__.extend(["ROUTE_A_FULL_PANEL_PROCESS_SCHEMA", "ROUTE_A_FULL_PANEL_EXECUTION_EDITION",
+    "freeze_route_a_full_panel_production_search_process", "frozen_search_execution_edition"])

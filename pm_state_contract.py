@@ -33,13 +33,11 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from pm_current_refit_parameters import (
     iter_parameter_domain_projection,
-    load_retained_strategy_domain_v1,
     validate_parameter_domain_member,
 )
 
 
 STATE_CONTRACT_SCHEMA_VERSION = "fxpm.state-contract.v2"
-ORIGINAL_STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION = "fxpm.state-candidate-domain.v1"
 STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION = "fxpm.state-candidate-domain.v2"
 STATE_DOMAIN_CEILING_SCHEMA_VERSION = "fxpm.state-domain-ceiling.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1094,12 +1092,8 @@ ACTUAL_STRATEGY_NAMES: tuple[str, ...] = (
 
 # SHA-256 of the exact sorted StrategyRegistry candidate-domain document:
 # schema version plus every strategy name, normalized defaults, grid axes and
-# coupled_groups. The retained v1 document omits groups. The authority stays
-# independent of strategy imports while
+# coupled_groups. The authority stays independent of strategy imports while
 # tests make any candidate addition, removal, or value drift explicit.
-ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256 = (
-    "d4d8ae2deee050989bdc8e93b21d779c8d68ddb4666668a9c34c5d65177803e3"
-)
 STRATEGY_CANDIDATE_DOMAIN_SHA256 = (
     "a4305a9d256602158563c9edb8eb4ee2c857eba710825555a3f621327f0f25ef"
 )
@@ -1377,31 +1371,6 @@ DEFAULT_AUTHORITY = StateContractAuthority(
 DEFAULT_REGISTRY_HASH = DEFAULT_AUTHORITY.registry_hash
 
 
-def retained_v1_authority() -> StateContractAuthority:
-    """Reconstruct only the pinned original authority, with unchanged rules."""
-
-    retained = load_retained_strategy_domain_v1()
-    contracts = (*_feature_contracts(), *_strategy_contracts())
-    canonical = sorted(
-        (contract.canonical() for contract in contracts),
-        key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":"), allow_nan=False),
-    )
-    body = {
-        "schema_version": STATE_CONTRACT_SCHEMA_VERSION,
-        "candidate_domain_hash": ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256,
-        "contracts": canonical,
-        "ambiguous_names": [],
-    }
-    if body != retained["canonical_contracts"]["state_registry"]:
-        raise ValueError("retained state contracts differ from the accepted original")
-    authority = StateContractAuthority(
-        contracts, candidate_domain_hash=ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256,
-    )
-    if authority.registry_hash != retained["process_template"]["state_contract_registry_sha256"]:
-        raise ValueError("retained state registry identity differs")
-    return authority
-
-
 __all__ = [
     "ACTUAL_STRATEGY_NAMES",
     "ContractionFormula",
@@ -1413,13 +1382,10 @@ __all__ = [
     "RecursiveRule",
     "ResolvedNode",
     "STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION",
-    "ORIGINAL_STATE_CANDIDATE_DOMAIN_SCHEMA_VERSION",
     "STATE_CONTRACT_SCHEMA_VERSION",
     "STATE_DOMAIN_CEILING_SCHEMA_VERSION",
     "STATE_FEATURE_ALIASES",
     "STRATEGY_CANDIDATE_DOMAIN_SHA256",
-    "ORIGINAL_STRATEGY_CANDIDATE_DOMAIN_SHA256",
-    "retained_v1_authority",
     "StateContract",
     "StateContractAuthority",
     "StateDomainCeiling",

@@ -17,7 +17,7 @@ import pm_historical_scheduler as scheduler
 import pm_historical_search_producer as producer
 
 
-def _invented_completed_cell(tmp_path, monkeypatch, obstruction):
+def _invented_completed_cell(tmp_path, monkeypatch, obstruction, *, before_first_completion=None, first_observed=False):
     root = tmp_path / "working"
     grid_root = tmp_path / "grid"
     grid_root.mkdir()
@@ -50,8 +50,9 @@ def _invented_completed_cell(tmp_path, monkeypatch, obstruction):
         spool._publish_exact_json(context, relative, payload, context.limits.max_json_bytes)
 
     publish(slot_root + "/precommit.json", label)
-    publish(base + "/run.lock", label)
-    publish(run["relative_path"], label)
+    if before_first_completion is None:
+        publish(base + "/run.lock", label)
+        publish(run["relative_path"], label)
     slots, proofs, summaries, no_plan = [], {}, [], {}
     start = datetime(2023, 6, 24, tzinfo=timezone.utc)
     sink = spool.open_symbol_sink(context, "XAGUSD")
@@ -67,14 +68,42 @@ def _invented_completed_cell(tmp_path, monkeypatch, obstruction):
                    "precommit_sha256": precommit.receipt_sha256, "cell_id": cell["cell_id"],
                    "slot_id": slot_id, "attempt_id": attempt,
                    "artifact_namespace": f"invented/{slot_id}", "anchor": {"selection_cutoff_utc": cutoff}}
+        if ordinal == 1 and first_observed:
+            request["source_access_window_utc"] = {
+                "start_utc": "2026-11-01T00:00:00Z", "end_exclusive_utc": "2026-12-01T00:00:00Z"}
         req_sha = scheduler._declared_m5_hash(request)
         request_root = f"{slot_root}/requests/{cell['cell_id']}/{slot_id}"
         start_root = f"{base}/attempts/{slot_id}"
-        publish(f"{request_root}/{attempt}.json", request)
-        publish(f"{start_root}/{attempt}.json", {"schema_version": "fxpm.declared-slot-attempt-start.v1",
-                                                "slot_id": slot_id, "request_sha256": req_sha})
+        if ordinal == 1 and before_first_completion is not None:
+            before_first_completion(context, precommit, process, cell, slot, request)
+        else:
+            publish(f"{request_root}/{attempt}.json", request)
+            publish(f"{start_root}/{attempt}.json", {"schema_version": "fxpm.declared-slot-attempt-start.v1",
+                                                    "slot_id": slot_id, "request_sha256": req_sha})
         publish(producer._declared_commit_path(precommit, cell["cell_id"], ordinal), label)
-        no_plan[slot_id] = {"request_sha256": req_sha}
+        if ordinal == 1 and first_observed:
+            # Invented observed-completion proof data; the header reader and retirement are real.
+            reference = sink.put_json(request["artifact_namespace"] + "/invented-bound-fit",
+                "invented_bound_fit_reference", label)
+            header = {"schema_version": execution._DECLARED_UNIT_HEADER_SCHEMA,
+                "request_body": request, "fitted_state_entry": reference,
+                "fit_state_origin_contract": "RECOMPUTED_OR_REOPENED_FROM_PRECOMMITTED_BOUND_STATE",
+                "plan_transport": dict(label), "horizon_plan": dict(label),
+                "binding": {"generation_context_sha256": context.context_sha256,
+                    "producer_request_sha256": req_sha,
+                    "executor_release_sha256": execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+                    "producer_source_sha256": execution._file_sha256(Path(execution.__file__).with_name(
+                        "pm_historical_search_producer.py")),
+                    "fitted_state_reference_sha256": scheduler._declared_m5_hash(reference), **label},
+                "qualification_authority": False, "live_authority": False, **label}
+            publish(execution._declared_unit_relative(request, "header.json"), header)
+            publish(execution._declared_unit_relative(request, "evidence-completed.json"), {
+                "binding_sha256": scheduler._declared_m5_hash(header["binding"]), "unit_count": 0,
+                "unit_receipt_sha256": [], "evidence_access_completed_at_utc": cutoff})
+            publish(execution._declared_unit_relative(request, "raw-completion.json"), label)
+            assert execution._read_declared_unit_header(context, request) == header
+        else:
+            no_plan[slot_id] = {"request_sha256": req_sha}
         summaries.append({"status": "NO_TRADE", "request_sha256": req_sha,
                           "commit_sha256": scheduler._declared_m5_hash({"invented_slot": slot_id})})
         view = {"schema_version": "fxpm.broker-native-end-grid-view.v1", "symbol": "XAGUSD",
@@ -86,7 +115,7 @@ def _invented_completed_cell(tmp_path, monkeypatch, obstruction):
                 "bound_baseline_descriptor": label}
         selection = {"outcome": "NO_TRADE", "reason_code": "REGIME_UNOBSERVED", "cost_tier": "P75",
                      "source_contract_sha256": "e" * 64, "strategy_family": None, "configuration_sha256": None}
-        if ordinal == 1:
+        if ordinal == 1 and not first_observed:
             # The original verifier and the twelve unrelated slot proofs are fixture seams.
             # The first slot exercises the actual Grid proof and exact source/session/index joins.
             index = {"symbol": "XAGUSD", "timeframe": "H1", "cutoff_utc": cutoff, "source_state": "AVAILABLE",
@@ -134,13 +163,107 @@ def _invented_completed_cell(tmp_path, monkeypatch, obstruction):
                 publish(start_root + "/attempt-earlier.json", {"schema_version": "fxpm.declared-slot-attempt-start.v1",
                     "slot_id": slot_id, "request_sha256": scheduler._declared_m5_hash(prior)})
         else:
+            if ordinal == 1 and first_observed:
+                selection = {**selection, "reason_code": "INVENTED_OBSERVED_NO_WINNER"}
             proofs[slot_id] = (view, tier, "0" * 64, "1" * 64, cutoff, selection)
+    if before_first_completion is not None:
+        publish(base + "/run.lock", label)
+        publish(run["relative_path"], label)
     monkeypatch.setattr(orchestration, "declared_slot_selected_slots", lambda parent: slots)
     monkeypatch.setattr(scheduler, "_declared_native_completed_records",
         lambda *args, **kwargs: (precommit.to_dict(), slots, proofs, summaries, run, no_plan))
     owner_sha = spool.read_owned_generation_workspace(context)[1]
-    artifact = SimpleNamespace(descriptor={"sha256": "2" * 64})
+    account = {"schema_version": "fxpm.declared-cell-raw-account.v4", **label,
+        "progress_status": "COMPLETE", "generation_id": context.generation_id,
+        "generation_context_sha256": context.context_sha256,
+        "declared_precommit_sha256": precommit.receipt_sha256,
+        "search_process_receipt_sha256": process.receipt_sha256,
+        "saved_cell_run_receipt_sha256": run["sha256"], "cell": cell,
+        "account": dict(label), "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+    account_entry = sink.put_json("invented/final-account", "invented_final_account", account)
+    sink.seal()
+    artifact = SimpleNamespace(descriptor=account_entry["descriptor"])
     return context, row, contract, config, precommit, process, artifact, run, owner_sha, contract_sha
+
+
+def test_invented_pre_header_attempt_recovery_reaches_original_grid_and_retirement(tmp_path, monkeypatch):
+    """Real dispatch, lease, header reader and retirement; issuer/fit/completion proofs are invented."""
+    observed = {}
+
+    def capacity_then_resume(context, precommit, process, cell, slot, body):
+        request_path = (f"declared-slots/{precommit.receipt_sha256}/requests/"
+                        f"{cell['cell_id']}/{slot['slot_id']}/{body['attempt_id']}.json")
+        start_path = (f"declared-slots/{precommit.receipt_sha256}/{cell['cell_id']}/"
+                      f"attempts/{slot['slot_id']}/{body['attempt_id']}.json")
+        calls = []
+
+        def invented_issuer(_context, **kwargs):
+            assert _context is context and kwargs["attempt_id"] == body["attempt_id"]
+            assert kwargs["cell_id"] == cell["cell_id"] and kwargs["slot_id"] == slot["slot_id"]
+            spool._publish_exact_json(context, request_path, body, context.limits.max_json_bytes)
+            return SimpleNamespace(to_dict=lambda: dict(body), receipt_sha256=scheduler._declared_m5_hash(body))
+
+        def invented_fit_boundary(_context, **kwargs):
+            assert _context is context
+            assert kwargs["request"].to_dict() == body
+            with execution._declared_unit_lease(context, body):
+                calls.append(kwargs["request"].receipt_sha256)
+                if len(calls) == 1:
+                    raise MemoryError("INVENTED_SOFTWARE_PRE_HEADER_FIT_CAPACITY")
+                return {"status": "NO_TRADE", "fixture_provenance": "INVENTED_OBSERVED_OWNER_COMPLETION_QA"}
+
+        arguments = dict(precommit=precommit, process=process, frozen_pipeline_config=None,
+                         cell_id=cell["cell_id"], slot=slot, symbol=cell["symbol"], attempt_id=body["attempt_id"])
+        with monkeypatch.context() as patch:
+            patch.setattr(orchestration, "declared_slot_producer_request", invented_issuer)
+            patch.setattr(orchestration, "_release_declared_slot_producer_request", lambda *args: None)
+            patch.setattr(producer, "execute_declared_slot_owner_search", invented_fit_boundary)
+            with pytest.raises(MemoryError, match="INVENTED_SOFTWARE_PRE_HEADER_FIT_CAPACITY"):
+                with producer._declared_slot_attempt(context, **arguments):
+                    pytest.fail("capacity stop must occur before a completion is yielded")
+            unit_directory = spool._local_path(context.root, execution._declared_unit_relative(body, "header.json")).parent
+            assert {path.name for path in unit_directory.iterdir()} == {"units.lock"}
+            assert (unit_directory / "units.lock").read_bytes() == b"0"
+            assert not spool._local_path(context.root, producer._declared_commit_path(precommit, cell["cell_id"], 1)).exists()
+            assert not spool._local_path(context.root, producer._declared_run_path(precommit, cell["cell_id"])).exists()
+            before = {name: spool._local_path(context.root, name).read_bytes() for name in (request_path, start_path)}
+            assert producer._declared_pending_unit_attempt(context, precommit, cell["cell_id"], slot) == body["attempt_id"]
+            with producer._declared_slot_attempt(context, **arguments, resumed=True) as (completion, _, failure):
+                assert completion["status"] == "NO_TRADE" and failure is None
+            assert len(calls) == 2 and calls[0] == calls[1]
+            assert {name: spool._local_path(context.root, name).read_bytes() for name in before} == before
+            starts = producer._declared_prior_attempt_starts(context, precommit, cell["cell_id"], slot)
+            assert len(starts) == 1 and starts[0]["relative_path"] == start_path
+            observed.update(attempt_id=body["attempt_id"], original=before,
+                request=dict(body), lock=execution._declared_unit_relative(body, "units.lock"))
+
+    context, row, contract, config, precommit, process, artifact, run, owner_sha, contract_sha = (
+        _invented_completed_cell(tmp_path, monkeypatch, None,
+            before_first_completion=capacity_then_resume, first_observed=True))
+    assert observed["attempt_id"] == "attempt-invented"
+    assert all(spool._local_path(context.root, name).read_bytes() == value for name, value in observed["original"].items())
+    _, slots, _, _, _, no_plan = scheduler._declared_native_completed_records(context)
+    direct, locks, observations = scheduler._declared_owned_direct_files(context, precommit, row,
+        max_paths=row["native_finalization"]["retirement"]["max_paths"],
+        verified_no_plan=lambda slot: no_plan.get(slot["slot_id"]))
+    assert set(observed["original"]).issubset(direct)
+    assert locks == (observed["lock"],)
+    assert observations[0]["route"] == "ORIGINAL_OBSERVED_UNIT_METADATA" and observations[0]["unit_count"] == 0
+    assert slots[0]["slot_id"] not in no_plan
+    assert observed["request"]["source_access_window_utc"] == {
+        "start_utc": "2026-11-01T00:00:00Z", "end_exclusive_utc": "2026-12-01T00:00:00Z"}
+    result = scheduler._declared_native_finalize_account(
+        {"status": "REOPENED", "run_receipt": run, "account_descriptor": artifact.descriptor},
+        context=context, contract=contract, row=row, config=config, precommit=precommit, process=process,
+        artifact=artifact, run_body={"fixture_provenance": "INVENTED_PRE_HEADER_RECOVERY_QA"},
+        workspace_sha=owner_sha, cell_contract_sha256=contract_sha)
+    assert result["status"] == "ARCHIVED"
+    assert len(grid.read_end_grid(tmp_path / "grid", row["cell"]["symbol"])) == 13
+    archived = spool.read_generation_retirement(context.root, expected_completed_fence_schema=spool.NATIVE_COMPLETION_FENCE_SCHEMA)
+    assert archived["status"] == "ARCHIVED_RECORD_ONLY"
+    assert archived["retained_account_result"] == result["retained_account_result"]
+    assert archived["retained_unit_locks"] == [observed["lock"]]
 
 
 @pytest.mark.parametrize(("obstruction", "reason"), [

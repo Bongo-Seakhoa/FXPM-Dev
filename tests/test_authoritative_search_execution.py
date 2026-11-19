@@ -172,7 +172,6 @@ def test_content_addressed_attempt_stage_round_trips_and_rejects_tamper(
         stage=stage,
         ordinal=0,
         value=body,
-        remaining_cell_bytes=1024 * 1024,
         reservation=reservation,
     )
     assert reservation.consumed == row.size_bytes
@@ -191,29 +190,25 @@ def test_content_addressed_attempt_stage_round_trips_and_rejects_tamper(
     assert not stage.exists()
 
 
-def test_stage_byte_bound_fails_without_leaving_partial_file(tmp_path) -> None:
+def test_stage_small_payload_is_not_refused_by_aggregate_cap(tmp_path, monkeypatch) -> None:
+    """INVENTED bytes; the retired aggregate policy is not an admission control."""
+    monkeypatch.setattr(execution, "MAX_CELL_EVIDENCE_BYTES", 1, raising=False)
     stage = tmp_path / "stage"
     stage.mkdir()
-    reservation = SimpleNamespace(
-        consume=lambda _count: pytest.fail("oversize write reserved bytes"),
-        materialize=lambda _count: pytest.fail("oversize write materialized bytes"),
-    )
-    with pytest.raises(
-        execution.AuthoritativeSearchExecutionError,
-        match="ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED",
-    ):
-        execution._write_staged_attempt(
-            stage=stage,
-            ordinal=3,
-            value={"attempt_id": "x", "folds": [{"payload": "too-large"}]},
-            remaining_cell_bytes=8,
-            reservation=reservation,
-        )
-    assert list(stage.iterdir()) == []
-    execution._cleanup_stage(stage, [])
+    reservation = SimpleNamespace(consumed=0, materialized=0)
+    reservation.consume = lambda count: setattr(reservation, "consumed", reservation.consumed + count)
+    reservation.materialize = lambda count: setattr(reservation, "materialized", reservation.materialized + count)
+    body = {"attempt_id": "INVENTED", "folds": [{"payload": "small-real-file"}]}
+    row = execution._write_staged_attempt(stage=stage, ordinal=3, value=body, reservation=reservation)
+    assert row.size_bytes > 1
+    assert reservation.consumed == reservation.materialized == row.size_bytes
+    assert execution._reopen_staged_attempt(row) == body
+    execution._cleanup_stage(stage, [row])
+    assert not stage.exists()
 
 
-def test_stage_and_publication_share_one_generation_quota(tmp_path) -> None:
+
+def test_stage_and_publication_share_accounting_without_generation_byte_cap(tmp_path) -> None:
     limits = execution.authority_spool.SpoolLimits(
         max_artifact_bytes=4096,
         max_symbol_bytes=4096,
@@ -239,18 +234,13 @@ def test_stage_and_publication_share_one_generation_quota(tmp_path) -> None:
         stage=stage,
         ordinal=0,
         value={"attempt_id": "x", "payload": "a" * 2500},
-        remaining_cell_bytes=4096,
         reservation=reservation,
     )
-    with pytest.raises(
-        execution.authority_spool.AuthoritySpoolError,
-        match="SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-    ):
-        execution.authority_spool.write_opaque_artifact(
-            context,
-            [b"b" * 2500],
-            format="binary-v1",
-        )
+    published = execution.authority_spool.write_opaque_artifact(
+        context, [b"b" * 2500], format="binary-v1")
+    assert row.size_bytes + published["size_bytes"] > limits.max_generation_bytes
+    assert (context.root / published["relative_path"]).read_bytes() == b"b" * 2500
+    execution.authority_spool._verify_artifact_file(context, published)
     execution._close_reserved_stage(
         stage=stage,
         rows=[row],
@@ -265,6 +255,7 @@ def test_stage_and_publication_share_one_generation_quota(tmp_path) -> None:
         )
     )
     assert state["reservations"] == []
+
 
 
 def test_shared_fit_adequacy_preserves_train_tuning_methodological_floor() -> None:
@@ -457,7 +448,7 @@ def _partition_cost_transport_fixture(*, attempt_count=2, fold_count=4, unique_g
 
 
 def test_partition_cost_precommitment_builds_source_body_once_per_geometry(monkeypatch):
-    """Synthetic geometry/call-count seam with real cost-policy construction, no fit."""
+    """Invented geometry seam; real cost/Raw bytes, no strategy, fit or financial claim."""
     pair, results = _pair_fixture(include_results=True)
     frame = _d1_frame(4)
     frame["Spread"] = 12
@@ -465,7 +456,12 @@ def test_partition_cost_precommitment_builds_source_body_once_per_geometry(monke
         geometry_receipt={"receipt_sha256": execution._sha256(["geometry", partition]),
             "frame_sha256": execution._sha256(["frame", partition])})
         for partition in ("optimizer_train", "tuning_validation", "final_lockbox"))
-    monkeypatch.setattr(execution, "_fold_partitions", lambda **_kwargs: partitions)
+    fold_calls = []
+    def derive_partitions(**kwargs):
+        fold_calls.append((kwargs["attempt"].ordinal, dict(kwargs["fold"])))
+        assert kwargs["frame"] is frame
+        return partitions
+    monkeypatch.setattr(execution, "_fold_partitions", derive_partitions)
     calls = []
     def source_receipt(_fitted, target):
         calls.append(tuple(target))
@@ -477,21 +473,81 @@ def test_partition_cost_precommitment_builds_source_body_once_per_geometry(monke
     fitted = SimpleNamespace(_frame=frame, _spread_tiers=tiers,
         _entry_spread_observations=pd.Series(12.0, index=frame.index),
         frozen_tier_pair_contract=pair, instrument_spec=spec)
-    attempts = tuple(replace(_verified_attempt_with_folds(count=2), ordinal=ordinal) for ordinal in range(2))
+    original = _verified_attempt_with_folds(count=2)
+    folds = [{**fold,
+        "fit_start_utc": (pd.Timestamp(fold["validation_start_utc"]) - pd.Timedelta(days=30)).isoformat(),
+        "fit_end_exclusive_utc": fold["validation_start_utc"],
+        "validation_warmup_start_utc": (pd.Timestamp(fold["validation_start_utc"]) - pd.Timedelta(days=1)).isoformat()}
+        for fold in original.candidate["folds"]]
+    attempts = tuple(replace(original, ordinal=ordinal, candidate={"folds": folds},
+        artifacts=SimpleNamespace(refit_recipe={"data_requirements": {"warmup_bars": 1}}))
+        for ordinal in range(2))
+    config = execution.PipelineConfig(research_mode=True, backtest_spread_mode="conservative_max")
+    def produce(selected, target_cache):
+        return execution._partition_cost_precommitments(attempts=selected,
+            fold_plan=[{"fold_ordinal": 0}, {"fold_ordinal": 1}],
+            plan_body={"derived_dependency_geometry": {"warmup_bars": 0},
+                "cell": {"symbol": "EURUSD", "timeframe": "D1"}}, fitted=fitted,
+            config=config, source_observation_cache=target_cache)
     source_cache = {}
-    produced = execution._partition_cost_precommitments(attempts=attempts,
-        fold_plan=[{"fold_ordinal": 0}, {"fold_ordinal": 1}],
-        plan_body={"derived_dependency_geometry": {"warmup_bars": 0},
-            "cell": {"symbol": "EURUSD", "timeframe": "D1"}}, fitted=fitted,
-        config=execution.PipelineConfig(research_mode=True, backtest_spread_mode="conservative_max"),
-        source_observation_cache=source_cache)
+    produced = produce(attempts, source_cache)
     assert len(produced["rows"]) == 12
     assert len(calls) == 3
+    assert len(fold_calls) == 2
     assert set(source_cache) == {partition.geometry_receipt["receipt_sha256"] for partition in partitions}
     for logical_sha, encoded in source_cache.values():
         body = execution.json.loads(encoded)
         assert body["receipt_sha256"] == logical_sha
         assert encoded == execution._canonical_bytes(body)
+
+    # Independent calls cannot share summaries. Collect their original full
+    # rows through the real Raw builder, then compare the exact combined bytes.
+    raw_build = execution.raw_winner.build_partition_cost_precommitments
+    unshared_rows = []
+    def capture_rows(rows, *, pair):
+        unshared_rows.extend(rows)
+        return raw_build(rows, pair=pair)
+    monkeypatch.setattr(execution.raw_winner, "build_partition_cost_precommitments", capture_rows)
+    baseline_cache = {}
+    fold_calls.clear()
+    for attempt in attempts:
+        produce((attempt,), baseline_cache)
+    assert len(fold_calls) == 4
+    monkeypatch.setattr(execution.raw_winner, "build_partition_cost_precommitments", raw_build)
+    baseline = raw_build(unshared_rows, pair=pair)
+    assert execution._canonical_bytes(produced) == execution._canonical_bytes(baseline)
+    assert source_cache == baseline_cache
+    assert [(row["attempt_ordinal"], row["fold_ordinal"]) for row in produced["rows"]] == [
+        (attempt, fold) for attempt in range(2) for fold in range(2) for _ in range(3)]
+
+    # Every boundary participates, even when validation axes are unchanged.
+    for name in ("fit_start_utc", "fit_end_exclusive_utc", "validation_warmup_start_utc",
+            "validation_start_utc", "validation_end_exclusive_utc"):
+        changed_folds = [dict(fold) for fold in folds]
+        changed_folds[0][name] = (pd.Timestamp(changed_folds[0][name]) + pd.Timedelta(hours=1)).isoformat()
+        changed = replace(attempts[1], candidate={"folds": changed_folds})
+        fold_calls.clear()
+        produce((attempts[0], changed), {})
+        assert len(fold_calls) == 3, name
+    for warmup in (2, True, "1"):
+        changed = replace(attempts[1], artifacts=SimpleNamespace(
+            refit_recipe={"data_requirements": {"warmup_bars": warmup}}))
+        fold_calls.clear()
+        produce((attempts[0], changed), {})
+        assert len(fold_calls) == 4, warmup
+
+    # Missing/non-string boundaries reach the existing geometry seam each time;
+    # a successful synthetic stub must not turn malformed raw inputs into hits.
+    for value in (None, True, 1):
+        changed_folds = [dict(fold) for fold in folds]
+        if value is None:
+            changed_folds[0].pop("fit_start_utc")
+        else:
+            changed_folds[0]["fit_start_utc"] = value
+        malformed = tuple(replace(attempt, candidate={"folds": changed_folds}) for attempt in attempts)
+        fold_calls.clear()
+        produce(malformed, {})
+        assert len(fold_calls) == 3, value
 
 
 def test_source_observation_publication_releases_bodies_and_stage_keeps_exact_refs(tmp_path, monkeypatch):
@@ -530,7 +586,7 @@ def test_source_observation_publication_releases_bodies_and_stage_keeps_exact_re
     reservation.consume = lambda count: setattr(reservation, "consumed", reservation.consumed + count)
     reservation.materialize = lambda count: setattr(reservation, "materialized", reservation.materialized + count)
     staged = execution._write_staged_attempt(stage=stage, ordinal=0, value=value,
-        remaining_cell_bytes=65536, reservation=reservation)
+        reservation=reservation)
     assert execution._reopen_staged_attempt(staged) == value
     assert b'"source_observation_references"' in staged.path.read_bytes()
     assert b'"source_observation_receipts"' not in staged.path.read_bytes()
@@ -3748,15 +3804,44 @@ def _prepare_owned_invented_native_source(tmp_path):
         fixture_provenance="FRESH_MODULE_OWNED_INVENTED_SOURCE_NO_RETAINED_QA_REUSE")
 
 
+def _reopen_invented_native_source_for_new_issuers(tmp_path, native_root):
+    """Reuse only completed synthetic raw inputs; allocate every issuer in a new root."""
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from tests import test_historical_production_adapter as fixture
+
+    _require_invented_fixture_real_clocks()
+    native_root = Path(native_root).resolve(strict=True)
+    creation_path = native_root / "synthetic_fixture_creation.json"
+    record = json.loads(creation_path.read_bytes())
+    helper_path = Path(fixture.__file__).with_name("native_v5_support.py")
+    inputs = fixture._current_native_generator_inputs(selected_owner=False)
+    fixture._validated_current_native_creation(record, native_root=native_root,
+        helper_sha256=hashlib.sha256(helper_path.read_bytes()).hexdigest(), generator_inputs=inputs)
+    data_dir = native_root.parent
+    profile_path = (native_root / "terms" / "spread_profile.json").resolve(strict=True)
+    assert profile_path.is_relative_to(native_root)
+    owned_root = Path(tmp_path).resolve(strict=True) / "invented-new-issuers-reused-inputs"
+    assert not owned_root.exists(), "Every reuse observation needs a new issuer workspace"
+    owned_root.mkdir()
+    return SimpleNamespace(owned_root=owned_root, data_dir=data_dir,
+        symbol=inputs["write_v5_run"]["dense_symbol"],
+        cutoff_utc=inputs["write_v5_run"]["information_cutoff_utc"], profile_path=profile_path,
+        reused_native_root=native_root, source_inputs_reused=True,
+        source_creation_record=creation_path,
+        fixture_provenance="REUSED_IMMUTABLE_SYNTHETIC_RAW_INPUTS_NEW_ISSUERS_NO_FINANCIAL_AUTHORITY")
+
+
 def _build_owned_invented_declared_inputs(tmp_path, *, source_access_window_utc,
         regime="TREND", native_fixture=None):
-    """Compose proposed SOFTWARE-issued inputs from fresh INVENTED sources only.
+    """Compose SOFTWARE-issued inputs from explicitly classified INVENTED sources.
 
     The caller supplies an explicit fixture-only access window containing the
     ordinary current UTC time. This function changes no clock or issuer policy.
     It does not execute a strategy or call Backtester.run. The real producer will
     re-produce/reverify/fit against these owned bytes inside the live observer.
-    The optional module fixture shares fresh source bytes only; every context, process,
+    The optional module fixture shares raw source bytes only; every context, process,
     precommit, producer request, fit and capture/header lifecycle remains fresh.
     """
     import json
@@ -3783,7 +3868,10 @@ def _build_owned_invented_declared_inputs(tmp_path, *, source_access_window_utc,
         native_fixture = _prepare_owned_invented_native_source(tmp_path)
     owned_root = Path(native_fixture.owned_root).resolve(strict=True)
     data_dir = Path(native_fixture.data_dir).resolve(strict=True)
-    assert data_dir.is_relative_to(owned_root)
+    if getattr(native_fixture, "source_inputs_reused", False):
+        assert (data_dir / "native").resolve(strict=True) == native_fixture.reused_native_root
+    else:
+        assert data_dir.is_relative_to(owned_root)
     lifecycle_root = owned_root / "lifecycles" / Path(tmp_path).name
     assert not lifecycle_root.exists(), "Each observation requires a fresh lifecycle subtree"
     lifecycle_root.mkdir(parents=True)
@@ -3936,11 +4024,17 @@ def _run_owned_invented_issued_observation(tmp_path, monkeypatch, *,
 
 @pytest.fixture(scope="module")
 def _route_a_owned_invented_native_source(tmp_path_factory):
-    """One new owned source generation; no retained root or authority reuse."""
+    """Classify fresh or explicitly reused raw bytes; later issuers are always new."""
+    import os
     with pytest.MonkeyPatch.context() as scoped:
         with _invented_fixture_external_io_guard(scoped) as external_io_attempts:
-            source = _prepare_owned_invented_native_source(
-                tmp_path_factory.mktemp("invented-route-a-module-source"))
+            reused = os.environ.get("FXPM_QA_REUSED_INVENTED_NATIVE_ROOT")
+            if reused:
+                source = _reopen_invented_native_source_for_new_issuers(
+                    tmp_path_factory.mktemp("invented-route-a-reused-inputs"), reused)
+            else:
+                source = _prepare_owned_invented_native_source(
+                    tmp_path_factory.mktemp("invented-route-a-module-source"))
             assert not external_io_attempts
             return source
 
@@ -4951,6 +5045,9 @@ def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkey
     progress = _route_a_batch_progress(path)
     record_property("route_a_unit_batch_progress_path", str(path))
     record_property("fixture_provenance", "INVENTED_SOFTWARE_ONLY_NO_FINANCIAL_OR_PERFORMANCE_AUTHORITY")
+    record_property("synthetic_source_input_provenance", _route_a_owned_invented_native_source.fixture_provenance)
+    record_property("synthetic_native_input_root", str(_route_a_owned_invented_native_source.data_dir / "native"))
+    record_property("source_inputs_reused", str(getattr(_route_a_owned_invented_native_source, "source_inputs_reused", False)).lower())
     retained, receipts = [], []
     progress("STARTED", "normal-owner-two-keys-plus-duplicate")
 
@@ -5111,8 +5208,8 @@ def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkey
             "uncached_working_geometry": 2}
         first_batch_owner_intervals = copy.deepcopy(calls.owner_intervals[before_owner_intervals:])
         assert all(row["observed_duration_ns"] >= 0 for row in first_batch_owner_intervals)
-        assert calls.counts["full_capture"] - before_model_counts.get("full_capture", 0) == 1
-        assert calls.counts["unit_binding"] - before_model_counts.get("unit_binding", 0) == 1
+        assert calls.counts["full_capture"] - before_model_counts.get("full_capture", 0) == 0
+        assert calls.counts["unit_binding"] - before_model_counts.get("unit_binding", 0) == 0
         successful_commit_deltas = {name: calls.counts[name] - before_model_counts.get(name, 0)
             for name in ("full_capture", "unit_binding")}
         assert specifications == before and counts == admitted
@@ -5160,40 +5257,38 @@ def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkey
         retained.append(evaluate_batch)
         terminal_specifications = copy.deepcopy(specifications[:2])
         original_clock = execution._now_utc_seconds
-        original_hash = execution._route_a_pandas_content_sha256
-        terminal_hash_returns, advanced = [], []
+        original_scope = execution._route_a_require_scope_current
+        terminal_window_returns, advanced = [], []
         before_terminal = dict(calls.counts)
         window_end = witness["capture"].request.to_dict()["source_access_window_utc"]["end_exclusive_utc"]
 
-        def hash_then_advance_clock(value):
-            digest = original_hash(value)
-            if (calls.counts["full_capture"] > before_terminal.get("full_capture", 0)
-                    and calls.counts["unit_binding"] > before_terminal.get("unit_binding", 0)):
-                terminal_hash_returns.append(True)
-                if not advanced:
-                    advanced.append(True)
-                    progress("ADVANCED_TEST_CLOCK_AFTER_ACTUAL_HASH", "FINAL_COMMIT_ORIGINAL_WINDOW_END_NO_WAIT")
-            return digest
+        def scope_then_advance_clock(**arguments):
+            result = original_scope(**arguments)
+            terminal_window_returns.append(True)
+            if not advanced:
+                advanced.append(True)
+                progress("ADVANCED_TEST_CLOCK_AFTER_ACTUAL_WINDOW_CHECK", "ORIGINAL_WINDOW_END_NO_WAIT")
+            return result
 
         def clock():
             return window_end if advanced else original_clock()
 
         with monkeypatch.context() as scoped:
-            scoped.setattr(execution, "_route_a_pandas_content_sha256", hash_then_advance_clock)
+            scoped.setattr(execution, "_route_a_require_scope_current", scope_then_advance_clock)
             scoped.setattr(execution, "_now_utc_seconds", clock)
             refused = evaluate_batch(specifications=terminal_specifications,
                 metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1")
         _assert_route_a_batch_refusal(refused, "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_CLOSED")
-        assert advanced == [True] and terminal_hash_returns
+        assert advanced == [True] and terminal_window_returns
         assert all(calls.counts[name] == before_terminal[name]
             for name in ("model_run", "runtime_strategy", "surface"))
         terminal_commit_deltas = {name: calls.counts[name] - before_terminal.get(name, 0)
             for name in ("full_capture", "unit_binding")}
-        assert terminal_commit_deltas == {"full_capture": 1, "unit_binding": 1}
+        assert terminal_commit_deltas == {"full_capture": 0, "unit_binding": 0}
         assert counts == admitted
         _assert_route_a_batch_refusal(evaluate_batch(specifications=specifications,
             metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1"), "ROUTE_A_UNIT_BATCH_CLOSED")
-        progress("COMPLETED_TERMINAL_LATE_HASH_EXPIRY", "ATOMIC_REFUSAL_NO_NEW_MODELS_NO_CLOCK_WAIT")
+        progress("COMPLETED_TERMINAL_WINDOW_EXPIRY", "ATOMIC_REFUSAL_NO_NEW_MODELS_NO_CLOCK_WAIT")
         receipts.append({"named_interval": "SECOND_NORMAL_EXECUTOR_RESTORE_THEN_POST_LOOP_CONSUMER_AND_TWO_UNIQUE_KEYS",
             "adoption_count": 1, "original_header_count": 1,
             "owner_membership_snapshot": owner_snapshot_receipt,
@@ -5238,8 +5333,8 @@ def test_route_a_unit_batch_normal_owner_two_keys_and_duplicate(tmp_path, monkey
         admitted = dict(counts)
         before_commit = dict(calls.counts)
         empty = evaluate_batch(specifications=[], metadata_recipe="ROUTE_A_APPLIED_SPREAD_POLICY_V1")
-        assert calls.counts["full_capture"] - before_commit.get("full_capture", 0) == 1
-        assert calls.counts["unit_binding"] - before_commit.get("unit_binding", 0) == 1
+        assert calls.counts["full_capture"] - before_commit.get("full_capture", 0) == 0
+        assert calls.counts["unit_binding"] - before_commit.get("unit_binding", 0) == 0
         assert empty["requests"] == empty["request_to_unique"] == empty["unique_evaluations"] == empty["pair_checks"] == []
         assert counts == admitted and calls.unique_intervals == []
         assert calls.counts["model_run"] == calls.counts["runtime_strategy"] == calls.counts["surface"] == 0
@@ -6350,18 +6445,18 @@ def _owner_snapshot_validate(snapshot):
 
 
 _OWNER_SNAPSHOT_SITES = {
-    "V0": ("_route_a_validate_mapping_snapshot", 7475, "ROUTE_A_MAPPING_SNAPSHOT_INVALID"),
-    "OS-SOURCE": ("_route_a_owner_membership_snapshot", 7874, "ROUTE_A_OWNER_SNAPSHOT_SOURCE_INVALID"),
-    "OS-BINDING": ("_route_a_owner_membership_snapshot", 7874, "ROUTE_A_OWNER_SNAPSHOT_SOURCE_INVALID"),
-    "OS-PRECOMMIT": ("_route_a_owner_partition_identity", 7820, "ROUTE_A_OWNER_SNAPSHOT_PRECOMMITMENT_INVALID"),
-    "OS-REBIND": ("_route_a_rebind_owner_membership", 7922, "ROUTE_A_OWNER_SNAPSHOT_REBIND_INVALID"),
-    "OS-GEOMETRY": ("_route_a_rebind_owner_membership", 7939, "ROUTE_A_OWNER_SNAPSHOT_GEOMETRY_MISMATCH"),
-    "PROPAGATED-BOUNDARY": ("_winner_fold_plan", 2000, "PLANNED_ATTEMPT_HAS_NO_CAUSAL_FOLDS"),
+    "V0": ("_route_a_validate_mapping_snapshot", "ROUTE_A_MAPPING_SNAPSHOT_INVALID"),
+    "OS-SOURCE": ("_route_a_owner_membership_snapshot", "ROUTE_A_OWNER_SNAPSHOT_SOURCE_INVALID"),
+    "OS-BINDING": ("_route_a_owner_membership_snapshot", "ROUTE_A_OWNER_SNAPSHOT_SOURCE_INVALID"),
+    "OS-PRECOMMIT": ("_route_a_owner_partition_identity", "ROUTE_A_OWNER_SNAPSHOT_PRECOMMITMENT_INVALID"),
+    "OS-REBIND": ("_route_a_rebind_owner_membership", "ROUTE_A_OWNER_SNAPSHOT_REBIND_INVALID"),
+    "OS-GEOMETRY": ("_route_a_rebind_owner_membership", "ROUTE_A_OWNER_SNAPSHOT_GEOMETRY_MISMATCH"),
+    "PROPAGATED-BOUNDARY": ("_winner_fold_plan", "PLANNED_ATTEMPT_HAS_NO_CAUSAL_FOLDS"),
 }
 
 
 def _owner_snapshot_expect_site(call, site_id):
-    function, line, code = _OWNER_SNAPSHOT_SITES[site_id]
+    function, code = _OWNER_SNAPSHOT_SITES[site_id]
     with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
         call()
     assert caught.value.code == code
@@ -6370,7 +6465,7 @@ def _owner_snapshot_expect_site(call, site_id):
     reached = False
     while trace is not None:
         current = trace.tb_frame.f_code
-        reached |= current.co_filename == filename and current.co_name == function and trace.tb_lineno == line
+        reached |= current.co_filename == filename and current.co_name == function
         trace = trace.tb_next
     assert reached, f"INVENTED fixture did not reach owner refusal site {site_id}"
 
@@ -6795,3 +6890,1161 @@ def test_route_a_owner_snapshot_direct_projection_refuses_all_rejected_roster(mo
     case["declared_unit_binding"]["attempt_roster_sha256"] = _owner_snapshot_sha(case["plan_body"]["attempts"])
     _owner_snapshot_expect_site(lambda: _owner_snapshot_build(case), "OS-SOURCE")
     assert case["derive_calls"] == []
+
+
+def _full_panel_preparation_invented_inputs(monkeypatch):
+    """INVENTED metadata only; not an issued process or financial evidence."""
+    case = _owner_snapshot_inputs(monkeypatch)
+    case["declared_unit_binding"]["cost_precommitments_sha256"] = execution._sha256(case["precommitments"])
+    return case, _owner_snapshot_build(case)
+
+
+def test_route_a_full_panel_preparation_contract_covers_all_planned_folds_and_lanes(monkeypatch):
+    case, snapshot = _full_panel_preparation_invented_inputs(monkeypatch)
+    contract = search_planner._route_a_full_panel_preparation_contract(
+        owner_snapshot=snapshot, partition_cost_precommitments=case["precommitments"])
+    planned = [row for row in snapshot["attempt_roster"] if row["status"] == "PLANNED"]
+    rejected = [row for row in snapshot["attempt_roster"] if row["status"] == "PROCESS_REJECTED"]
+    assert contract["original_trial_count"] == len(case["attempts"])
+    assert len(contract["requests"]) == len(planned) * 4 * 6
+    assert len(contract["process_rejections"]) == len(rejected)
+    assert {row["raw_attempt_id"] for row in contract["requests"]} == {row["raw_attempt_id"] for row in planned}
+    identities = {(row["attempt_ordinal"], row["fold_ordinal"], row["partition_role"], row["spread_tier"])
+        for row in contract["requests"]}
+    assert len(identities) == len(contract["requests"])
+    for row in planned:
+        assert {(fold, role, tier) for attempt, fold, role, tier in identities if attempt == row["ordinal"]} == {
+            (fold, role, tier) for fold in range(4)
+            for role in ("optimizer_train", "tuning_validation", "final_lockbox") for tier in ("P75", "P95")}
+    public = {key: value for key, value in case["specification"].items() if key != "request_ordinal"}
+    public["partition_role"] = "final_lockbox"
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._route_a_batch_specifications([public])
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_LOCKBOX_REFUSED"
+
+
+def test_route_a_full_panel_preparation_contract_refuses_crossed_precommitment(monkeypatch):
+    case, snapshot = _full_panel_preparation_invented_inputs(monkeypatch)
+    snapshot["declared_unit_binding"]["cost_precommitments_sha256"] = "0" * 64
+    with pytest.raises(search_planner.ProductionSearchPlannerError) as caught:
+        search_planner._route_a_full_panel_preparation_contract(
+            owner_snapshot=snapshot, partition_cost_precommitments=case["precommitments"])
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_PRECOMMITMENT_BINDING_INVALID"
+
+
+@pytest.mark.parametrize("drift", ["own-row", "frame", "tier-ref"])
+def test_route_a_full_panel_preparation_contract_refuses_partition_join_drift(monkeypatch, drift):
+    case, snapshot = _full_panel_preparation_invented_inputs(monkeypatch)
+    row = next(row for row in snapshot["attempt_roster"] if row["status"] == "PLANNED")
+    identity = row["folds"][0]["partitions"]["optimizer_train"]
+    if drift == "own-row":
+        identity["precommitment_row"]["attempt_ordinal"] = 999
+    elif drift == "frame":
+        identity["partition_frame_sha256"] = "0" * 64
+    else:
+        identity["tier_refs"]["P95"] = "INVENTED-CROSSED-TIER-REFERENCE"
+    with pytest.raises(search_planner.ProductionSearchPlannerError) as caught:
+        search_planner._route_a_full_panel_preparation_contract(
+            owner_snapshot=snapshot, partition_cost_precommitments=case["precommitments"])
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_PARTITION_INVALID"
+
+
+def test_route_a_full_panel_lane_capture_refuses_unmatched_stress_metadata():
+    """INVENTED collector inputs exercise joins, never kernel authentication."""
+    capture = execution._FullPanelLaneCapture(lambda: None)
+    facts = {"partition_role": "optimizer_train",
+        "numerical_execution_cost_attestations": {"P95": {"INVENTED": "expected"}}}
+    capture.record_lane(0, "optimizer_train", "P75", {}, facts)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        capture.record_lane(0, "optimizer_train", "P95",
+            {"numerical_execution_cost_attestation": {"INVENTED": "crossed"}}, {})
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_STRESS_ATTESTATION_DRIFT"
+    capture.close()
+
+
+def test_route_a_full_panel_lane_capture_closes_without_retaining_owner_guard():
+    capture = execution._FullPanelLaneCapture(lambda: None)
+    capture.close()
+    assert capture._require_current is None
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        capture.require_current()
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_CAPTURE_CLOSED"
+
+
+def _full_panel_preparation_invented_stage(tmp_path):
+    """INVENTED codec envelope; its empty folds are not authentic Raw evidence."""
+    unit = {"ordinal": 0, "raw_attempt_id": "INVENTED-RAW-UNIT",
+        "plan_attempt_sha256": "a" * 64, "status": "PLANNED"}
+    raw_body = {"attempt_id": unit["raw_attempt_id"], "folds": []}
+    facts = [{"fixture_provenance": "INVENTED_METADATA_ONLY_NOT_KERNEL_EVIDENCE"}]
+    envelope = {"schema_version": "fxpm.route-a-prepared-full-panel-unit.v1",
+        "declared_unit_binding_sha256": "b" * 64, "preparation_contract_sha256": "c" * 64,
+        "attempt_evidence": raw_body, "matched_base_facts": facts}
+    encoded = execution._canonical_bytes(envelope)
+    path = tmp_path / "invented-prepared-envelope.json"
+    path.write_bytes(encoded)
+    row = execution._StagedAttemptEvidence(0, "RAW_FOLDS", path, len(encoded), hashlib.sha256(encoded).hexdigest())
+    prepared = execution._PreparedRouteAFullPanelStage((row,), "b" * 64, "c" * 64,
+        execution._canonical_bytes([unit]))
+    return prepared, unit, raw_body, facts
+
+
+def test_route_a_full_panel_prepared_stage_separates_facts_from_legacy_raw_body(tmp_path):
+    prepared, unit, raw_body, facts = _full_panel_preparation_invented_stage(tmp_path)
+    body = prepared.unit_body(unit)
+    assert body == raw_body and set(body) == {"attempt_id", "folds"}
+    assert not {"matched_base_facts", "stress_cost_scalar", "actual_initial_risk_dollars"} & set(body)
+    assert prepared.matched_base_facts(0) == facts
+
+
+def test_route_a_full_panel_prepared_stage_refuses_same_raw_id_with_crossed_unit_identity(tmp_path):
+    prepared, unit, _, _ = _full_panel_preparation_invented_stage(tmp_path)
+    unit["plan_attempt_sha256"] = "d" * 64
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        prepared.unit_body(unit)
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_UNIT_IDENTITY_CHANGED"
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["python", "numba"])
+@pytest.mark.parametrize("direction", [1, -1], ids=["long", "short"])
+@pytest.mark.parametrize("case_id, stop_distance, executed_lots, actual_risk", [
+    ("N26_ROUNDING_REQUESTED_VS_EXECUTED_STOP_RISK", 12.0, 2.0, 24.0),
+    ("N28_MAX_LOT_CAP_REQUESTED_VS_EXECUTED_STOP_RISK", 10.0, 1.5, 15.0),
+], ids=["rounded", "capped"])
+def test_route_a_full_panel_actual_initial_risk_preserves_requested_budget(
+        monkeypatch, compiled, direction, case_id, stop_distance, executed_lots, actual_risk):
+    """INVENTED price fixture: genuine fixed-control kernel calls, no financial evidence."""
+    from test_frozen_spread_execution import _continuous_case
+    from test_backtester_cost_timing import _OneShotAtrStrategy
+
+    assert execution.pm_core.NUMBA_AVAILABLE, "Both execution backends are required"
+    backtester, fixture, _expected = _continuous_case(case_id)
+    owners = fixture["entry_schedule"].owners
+    base = next(owner for owner in owners if owner.spread_tier.tier == "P75")
+    stress = next(owner for owner in owners if owner.spread_tier.tier == "P95")
+    features = base.features.copy(deep=True)
+    features["ATR_14"] = stop_distance / 2.0
+    features["REGIME_LIVE"] = "TRENDING"
+    strategy = _OneShotAtrStrategy(direction)
+    signals = strategy.generate_signals(features, fixture["symbol"])
+    monkeypatch.setattr(execution.pm_core, "NUMBA_AVAILABLE", compiled)
+    ordinary = backtester.run(features, signals, fixture["symbol"], strategy,
+        spec=fixture["spec"], timeframe=fixture["timeframe"], warmup_bars=fixture["warmup_bars"],
+        spread_tier=base.spread_tier, entry_spread_observations=fixture["entry_spread_observations"])
+    source_sha = execution._source_identity(
+        execution.raw_winner.build_trade_source_contract_from_backtester_result(ordinary))
+    partition = execution._PartitionSlice("optimizer_train", features, fixture["warmup_bars"],
+        features.index[fixture["warmup_bars"]].isoformat(),
+        features["_BAR_CLOSE_TS"].iloc[-1].isoformat(), {})
+    facts, decision = {}, {}
+    result, _features, _signals, _backtester = execution._run_tier_partition(
+        partition=partition,
+        full_prefix_surface=execution._FullPrefixStrategySurface(features, signals),
+        backtester=backtester, strategy=strategy, symbol=fixture["symbol"],
+        timeframe=fixture["timeframe"], regime="TRENDING", config=backtester.config,
+        spec=fixture["spec"], expected_source_contract_sha256=source_sha,
+        spread_tier=base.spread_tier,
+        entry_spread_observations=fixture["entry_spread_observations"],
+        decision_result_out=decision, _matched_base_facts_out=facts,
+        _matched_stress_tier=stress.spread_tier)
+    assert len(result["trades"]) == len(facts["trades"]) == 1
+    trade, witness = result["trades"][0], facts["trades"][0]
+    assert trade["position_size"] == executed_lots
+    assert trade["risk_amount"] == 25.0
+    assert trade["stop_loss"] == trade["entry_price"] - direction * stop_distance
+    assert witness["recorded_stop_price"] == trade["stop_loss"]
+    assert witness["executed_volume"] == executed_lots
+    assert witness["actual_initial_risk_dollars"] == actual_risk
+    assert witness["risk_at_recorded_stop_dollars"] == actual_risk
+    assert witness["actual_initial_risk_dollars"] != trade["risk_amount"]
+    assert witness["initial_stop_status"] == "ORIGINAL_ENTRY_STOP_FIXED_CONTROL"
+    assert decision["trade_identity_pnl"] == execution.build_backtest_trade_identity_pnl_evidence(ordinary["trades"])
+    binding = facts["initial_risk_source_binding"]
+    assert binding["executor_release_sha256"] == execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
+    assert binding["backtest_source_contract_sha256"] == source_sha
+    assert binding["instrument_spec_sha256"] == execution._sha256(vars(fixture["spec"]))
+    assert binding["caller"] == "pm_authoritative_search_execution._run_tier_partition"
+    assert binding["governance_policy"] is binding["entry_schedule"] is None
+    assert binding["terminal_policy"] == "LIQUIDATE"
+    assert facts["stress_cost_scalar"] is None and facts["dated_fx_vector"] is None
+    assert facts["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED"
+    assert facts["dated_fx_status"] == "NOT_REQUIRED_PRICE_RATIO_FLOOR"
+    exact = witness["executed_price_swap_capture"]
+    expected_base_r = direction * (exact["exit_price"] - exact["entry_price"]) / stop_distance + exact["swap_dollars_exact"] / actual_risk
+    assert facts["base_actual_initial_risk_net_r"] == [execution.pm_core.canonical_backtest_winner_r(expected_base_r, 1.0)]
+    assert result == ordinary
+    assert facts["matched_p95_spread_cost_r"] == [execution.pm_core.canonical_backtest_winner_r(4.0, stop_distance)]
+    unbound = execution._route_a_matched_base_trade_facts(
+        result=result, features=features, backtester=backtester, spec=fixture["spec"],
+        base_tier=base.spread_tier, stress_tier=stress.spread_tier,
+        timeframe=fixture["timeframe"], partition_role="optimizer_train")
+    assert "initial_risk_source_binding" not in unbound
+    assert unbound["trades"][0]["actual_initial_risk_dollars"] is None
+
+
+@pytest.mark.parametrize("fold_ordinal", [0, 3], ids=["first", "last"])
+def test_route_a_full_panel_private_rebind_keeps_original_lockbox(monkeypatch, fold_ordinal):
+    """INVENTED metadata joins; no process issuance or kernel authentication."""
+    case, snapshot = _full_panel_preparation_invented_inputs(monkeypatch)
+    contract = search_planner._route_a_full_panel_preparation_contract(
+        owner_snapshot=snapshot, partition_cost_precommitments=case["precommitments"])
+    rows = execution._route_a_full_panel_specifications(snapshot=snapshot, contract=contract, attempt_ordinal=0)
+    assert len(rows) == 24
+    row = next(row for row in rows if row["fold_ordinal"] == fold_ordinal
+        and row["partition_role"] == "final_lockbox" and row["spread_tier"] == "P75")
+    selected, fold, partition, parameters = execution._route_a_rebind_full_panel_owner_membership(
+        specification=row, snapshot=snapshot, **{key: case[key] for key in (
+            "attempts", "owner_attempts", "raw_ids", "frame", "dependency_warmup_bars", "precommitments")})
+    assert selected is case["attempts"][0]
+    assert fold == selected.candidate["folds"][fold_ordinal]
+    assert partition.role == "final_lockbox" and parameters == row["parameters"]
+    assert case["derive_calls"] == [(0, fold_ordinal)]
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._route_a_batch_specifications([{key: value for key, value in row.items() if key != "request_ordinal"}])
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_LOCKBOX_REFUSED"
+
+
+@pytest.mark.parametrize("drift", ["footprint", "raw-id", "owner", "precommit"],
+    ids=["footprint", "raw-id", "owner", "precommit"])
+def test_route_a_full_panel_private_rebind_refuses_crossed_original_metadata(monkeypatch, drift):
+    """INVENTED mutation of one frozen join, never financial evidence."""
+    case, snapshot = _full_panel_preparation_invented_inputs(monkeypatch)
+    contract = search_planner._route_a_full_panel_preparation_contract(
+        owner_snapshot=snapshot, partition_cost_precommitments=case["precommitments"])
+    if drift == "footprint":
+        contract["requests"].pop()
+        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+            execution._route_a_full_panel_specifications(snapshot=snapshot, contract=contract, attempt_ordinal=0)
+        assert caught.value.code == "ROUTE_A_FULL_PANEL_REQUEST_ROSTER_CHANGED"
+        return
+    row = execution._route_a_full_panel_specifications(snapshot=snapshot, contract=contract, attempt_ordinal=0)[4]
+    if drift == "raw-id":
+        case["raw_ids"] = ("INVENTED-CROSSED-RAW", case["raw_ids"][1])
+    elif drift == "owner":
+        case["owner_attempts"][0].plan_attempt["attempt_id"] = "INVENTED-CROSSED-HORIZON"
+    else:
+        geometry = snapshot["attempt_roster"][0]["folds"][0]["partitions"]["final_lockbox"]["partition_geometry_receipt_sha256"]
+        case["precommitments"]["records"][geometry]["partition_frame_sha256"] = "0" * 64
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._route_a_rebind_full_panel_owner_membership(specification=row, snapshot=snapshot,
+            **{key: case[key] for key in ("attempts", "owner_attempts", "raw_ids", "frame", "dependency_warmup_bars", "precommitments")})
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_OWNER_REBIND_INVALID"
+
+
+def _full_panel_assembly_invented_entries(monkeypatch):
+    """INVENTED codec/call-wiring fixture. It authenticates no kernel or Raw evidence."""
+    case, snapshot = _full_panel_preparation_invented_inputs(monkeypatch)
+    spec = execution.InstrumentSpec("INVENTED", 0, pip_value=1.0,
+        tick_size=1.0, tick_value=1.0, point=1.0, volume_step=0.5)
+    fitted = SimpleNamespace(_frame=case["frame"], instrument_spec=spec,
+        source_contract_seeds={"P75": {"INVENTED_SOURCE": True}},
+        frozen_tier_pair_contract={"INVENTED_PAIR": True})
+    source_sha = "d" * 64
+    def source_identity(seed):
+        assert seed == {"INVENTED_SOURCE": True}
+        return source_sha
+    monkeypatch.setattr(execution, "_source_identity", source_identity)
+    binding = {"executor_release_sha256": execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+        "backtest_source_contract_sha256": source_sha, "instrument_spec_sha256": execution._sha256(vars(spec)),
+        "caller": "pm_authoritative_search_execution._run_tier_partition", "backtester": "pm_core.Backtester.run",
+        "governance_policy": None, "entry_schedule": None, "terminal_policy": "LIQUIDATE",
+        "stop_provenance": "ORIGINAL_ENTRY_STOP_PRESERVED_BOTH_FIXED_CONTROL_BACKENDS"}
+    entries = {}
+    for fold in range(4):
+        for role in ("optimizer_train", "tuning_validation", "final_lockbox"):
+            trade = {"entry_bar": 1, "exit_bar": 2, "signal_bar": 0,
+                "entry_time": "2019-01-01T01:00:00Z", "exit_time": "2019-01-01T02:00:00Z",
+                "direction": "LONG", "entry_price": 101.0, "stop_loss": 89.0,
+                "position_size": 2.0, "risk_amount": 25.0, "pnl_dollars": -4.0, "exit_reason": "closed_eod"}
+            identity = execution.build_backtest_trade_identity_pnl_evidence([trade])[0]
+            costs = {tier: {"INVENTED_COST": tier} for tier in ("P75", "P95")}
+            axis = {"INVENTED_AXIS": role}
+            matched = {"partition_role": role, "initial_risk_source_binding": copy.deepcopy(binding),
+                "instrument_spec": vars(spec).copy(), "trade_power_partition_axis": axis.copy(),
+                "numerical_execution_cost_attestations": copy.deepcopy(costs),
+                "trades": [{"base_trade_identity": identity, "entry_price": 101.0,
+                    "recorded_stop_price": 89.0, "executed_volume": 2.0,
+                    "actual_initial_risk_dollars": 24.0, "risk_at_recorded_stop_dollars": 24.0,
+                    "initial_stop_status": "ORIGINAL_ENTRY_STOP_FIXED_CONTROL"}]}
+            for tier in ("P75", "P95"):
+                lane = {key: {"INVENTED_LANE_FIELD": key} for key in execution._RAW_LANE_KEYS}
+                lane["trade_identity_pnl"] = [copy.deepcopy(identity)]
+                lane["numerical_execution_cost_attestation"] = costs[tier].copy()
+                entries[fold, role, tier] = {"matched_base_facts": copy.deepcopy(matched) if tier == "P75" else None,
+                    "result": {"trades": [trade.copy()], "trade_power_partition_axis": axis.copy(),
+                        "numerical_execution_cost_attestation": costs[tier].copy()},
+                    "decision": lane, "pair_check": {"status": "VERIFIED", "missing_tiers": []},
+                    "signals": pd.Series([0, 1, 0])}
+    calls = []
+    def receipt(lanes, pair):
+        assert len(lanes) == 6 and pair == fitted.frozen_tier_pair_contract
+        return {"INVENTED_RECEIPT_SPY": True}
+    def provenance(**kwargs):
+        assert kwargs["independent_tier_execution_receipt"] == {"INVENTED_RECEIPT_SPY": True}
+        assert set(kwargs["partition_signals"]) == {"optimizer_train", "tuning_validation", "final_lockbox"}
+        assert len(kwargs["source_observation_references"]) == 3
+        calls.append(kwargs["fold_ordinal"])
+        return {"INVENTED_PROVENANCE_SPY": kwargs["fold_ordinal"]}
+    monkeypatch.setattr(execution, "_independent_tier_execution_receipt", receipt)
+    monkeypatch.setattr(execution, "_fold_provenance", provenance)
+    monkeypatch.setattr(execution, "_partition_source_observation_reference", lambda **kwargs: {"INVENTED_REFERENCE_SPY": kwargs["partition"].role})
+    def forbidden(*args, **kwargs):
+        raise AssertionError("assembly must not execute another strategy/kernel")
+    monkeypatch.setattr(execution, "_build_planned_attempt_evidence", forbidden)
+    monkeypatch.setattr(execution, "_run_tier_partition", forbidden)
+    kwargs = {"attempt": case["attempts"][0], "raw_attempt_id": case["raw_ids"][0],
+        "plan_body": case["plan_body"], "fitted": fitted, "entries": entries,
+        "partition_cost_precommitments": case["precommitments"], "source_observation_references": {"INVENTED": True}}
+    return kwargs, calls
+
+
+def test_route_a_full_panel_assembly_uses_existing_provenance_without_kernel_replay(monkeypatch):
+    kwargs, calls = _full_panel_assembly_invented_entries(monkeypatch)
+    body, facts = execution._route_a_assemble_full_panel_attempt(**kwargs)
+    assert calls == [0, 1, 2, 3]
+    assert set(body) == {"attempt_id", "folds"} and body["attempt_id"] == kwargs["raw_attempt_id"]
+    assert len(body["folds"]) == 4 and len(facts) == 12
+    for fold in body["folds"]:
+        assert set(fold) == {"fold_ordinal", "provenance", "lanes"}
+        assert len(fold["lanes"]) == 6
+        for lane in fold["lanes"].values():
+            assert set(lane) == set(execution._RAW_LANE_KEYS)
+            assert lane["trade_identity_pnl"][0]["risk_amount"] == 25.0
+    assert all(row["facts"]["trades"][0]["actual_initial_risk_dollars"] == 24.0 for row in facts)
+    assert not {"matched_base_facts", "initial_risk_source_binding"} & set(body)
+
+
+@pytest.mark.parametrize("drift", ["risk", "identity", "p95-cost"], ids=["risk", "identity", "p95-cost"])
+def test_route_a_full_panel_assembly_refuses_crossed_matched_base_witness(monkeypatch, drift):
+    kwargs, calls = _full_panel_assembly_invented_entries(monkeypatch)
+    entry = kwargs["entries"][0, "optimizer_train", "P75"]
+    if drift == "risk":
+        entry["matched_base_facts"]["trades"][0]["actual_initial_risk_dollars"] = 25.0
+    elif drift == "identity":
+        entry["matched_base_facts"]["trades"][0]["base_trade_identity"]["direction"] = "SHORT"
+    else:
+        kwargs["entries"][0, "optimizer_train", "P95"]["result"]["numerical_execution_cost_attestation"] = {"INVENTED_CROSSED_COST": True}
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._route_a_assemble_full_panel_attempt(**kwargs)
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_MATCHED_BASE_WITNESS_CHANGED"
+    assert calls == []
+
+
+
+def _full_panel_matched_fill_invented_inputs(direction, scenario):
+    """INVENTED integer-price fixture reusing N26 rounding/core810 branch anchors."""
+    from test_frozen_spread_execution import _continuous_case
+    from test_backtester_cost_timing import _OneShotAtrStrategy
+    backtester, fixture, _expected = _continuous_case("N26_ROUNDING_REQUESTED_VS_EXECUTED_STOP_RISK")
+    owners = fixture["entry_schedule"].owners
+    base = next(owner for owner in owners if owner.spread_tier.tier == "P75")
+    stress = next(owner for owner in owners if owner.spread_tier.tier == "P95")
+    frame = base.features.copy(deep=True)
+    frame["ATR_14"] = 6.0
+    frame["REGIME_LIVE"] = "TRENDING"
+    bar = 1 if scenario.startswith("samebar") else 2
+    if scenario == "gap_sl":
+        price = 80.0 if direction == 1 else 120.0
+        frame.loc[frame.index[bar], ["Open", "High", "Low", "Close"]] = price
+    elif scenario == "touch_sl":
+        frame.loc[frame.index[bar], "Low" if direction == 1 else "High"] = 88.0 if direction == 1 else 112.0
+    elif scenario == "touch_tp":
+        frame.loc[frame.index[bar], "High" if direction == 1 else "Low"] = 114.0 if direction == 1 else 86.0
+    elif scenario == "tp_gap":
+        price = 130.0 if direction == 1 else 70.0
+        frame.loc[frame.index[bar], ["Open", "High", "Low", "Close"]] = price
+    elif scenario == "samebar_both":
+        frame.loc[frame.index[bar], ["High", "Low"]] = [120.0, 80.0]
+    elif scenario in ("samebar_spread_gap", "exit_spike"):
+        frame.loc[frame.index[bar], "SpreadMax"] = 32.0
+    elif scenario != "eod":
+        raise AssertionError("Unknown invented branch fixture")
+    strategy = _OneShotAtrStrategy(direction)
+    signals = strategy.generate_signals(frame, fixture["symbol"])
+    return backtester, fixture, frame, strategy, signals, base.spread_tier, stress.spread_tier
+
+
+def _full_panel_run_matched_invented_fixture(monkeypatch, compiled, direction, scenario,
+        mutate_result=None, empty_signals=False, mutate_features=None, stress_override=None):
+    """Run genuine tiny kernels; optional corruption is labelled refusal-only evidence."""
+    assert execution.pm_core.NUMBA_AVAILABLE, "Both execution backends are required"
+    backtester, fixture, frame, strategy, signals, base, stress = _full_panel_matched_fill_invented_inputs(direction, scenario)
+    if mutate_features is not None:
+        mutate_features(frame)
+    if stress_override is not None:
+        stress = stress_override
+    if empty_signals:
+        signals[:] = 0
+    monkeypatch.setattr(execution.pm_core, "NUMBA_AVAILABLE", compiled)
+    def ordinary_run(*args, **kwargs):
+        return original_run(*args, **kwargs)
+    original_run = backtester.run
+    ordinary = ordinary_run(frame, signals, fixture["symbol"], strategy,
+        spec=fixture["spec"], timeframe=fixture["timeframe"], warmup_bars=fixture["warmup_bars"],
+        spread_tier=base, entry_spread_observations=fixture["entry_spread_observations"])
+    source_sha = execution._source_identity(execution.raw_winner.build_trade_source_contract_from_backtester_result(ordinary))
+    if mutate_result is not None:
+        def corrupted_run(*args, **kwargs):
+            result = copy.deepcopy(original_run(*args, **kwargs))
+            mutate_result(result)
+            return result
+        monkeypatch.setattr(backtester, "run", corrupted_run)
+    partition = execution._PartitionSlice("final_lockbox", frame, fixture["warmup_bars"],
+        frame.index[fixture["warmup_bars"]].isoformat(), frame["_BAR_CLOSE_TS"].iloc[-1].isoformat(), {})
+    facts, decision = {}, {}
+    result, features, _signals, _backtester = execution._run_tier_partition(
+        partition=partition, full_prefix_surface=execution._FullPrefixStrategySurface(frame, signals),
+        backtester=backtester, strategy=strategy, symbol=fixture["symbol"], timeframe=fixture["timeframe"],
+        regime="TRENDING", config=backtester.config, spec=fixture["spec"],
+        expected_source_contract_sha256=source_sha, spread_tier=base,
+        entry_spread_observations=fixture["entry_spread_observations"], decision_result_out=decision,
+        _matched_base_facts_out=facts, _matched_stress_tier=stress)
+    return result, facts, features, decision, backtester, fixture, base, stress
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["python", "numba"])
+@pytest.mark.parametrize("direction", [1, -1], ids=["long", "short"])
+@pytest.mark.parametrize("scenario, branch", [
+    ("eod", "EOD"), ("gap_sl", "GAP_SL"), ("touch_sl", "TOUCH_SL"),
+    ("touch_tp", "TOUCH_TP"), ("tp_gap", "TOUCH_TP"),
+    ("samebar_both", "TOUCH_SL"), ("samebar_spread_gap", "GAP_SL"), ("exit_spike", "GAP_SL"),
+], ids=["eod", "gap-sl", "touch-sl", "touch-tp", "tp-gap-level", "samebar-sl-first", "samebar-spread-gap", "exit-spike"])
+def test_route_a_matched_base_fill_and_price_ratio_exact_kernel_parity(monkeypatch, compiled, direction, scenario, branch):
+    result, facts, features, decision, backtester, fixture, base, stress = _full_panel_run_matched_invented_fixture(
+        monkeypatch, compiled, direction, scenario)
+    assert len(result["trades"]) == len(facts["trades"]) == 1
+    trade, row = result["trades"][0], facts["trades"][0]
+    witness = row["base_fill_witness"]
+    assert witness["status"] == "VERIFIED" and witness["branch"] == branch
+    assert witness["expected_entry_price"] == trade["entry_price"]
+    assert witness["expected_exit_price"] == trade["exit_price"]
+    assert witness["original_stop_price"] == trade["stop_loss"]
+    assert witness["original_target_price"] == trade["take_profit"]
+    assert witness["same_bar"] == (scenario.startswith("samebar"))
+    assert witness["held_bars_scanned"] == trade["exit_bar"] - trade["entry_bar"] + 1
+    assert [item["bar"] for item in witness["held_bar_inputs"]] == list(range(trade["entry_bar"], trade["exit_bar"] + 1))
+    assert witness["held_bar_inputs_sha256"] == execution._sha256(witness["held_bar_inputs"])
+    assert witness["exit_bar_ohlc"] == {key: float(features[key].iloc[trade["exit_bar"]]) for key in ("Open", "High", "Low", "Close")}
+    assert facts["base_fill_witness_sha256"] == execution._sha256([witness])
+    assert facts["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED"
+    assert facts["floor_reason_codes"] == [] and facts["position_event_bijection_status"] == "VERIFIED"
+    assert row["base_position_event"] == result["position_events"][0]
+    assert facts["completed_position_ids"] == [result["position_events"][0]["position_id"]]
+    assert facts["completed_position_open_event_order"] == [trade["entry_bar"] * 4 + 1]
+    assert facts["completed_position_close_event_order"] == [trade["exit_bar"] * 4 + 3]
+    assert pd.Timestamp(facts["completed_position_open_utc"][0]) == pd.Timestamp(trade["entry_time"])
+    assert pd.Timestamp(facts["completed_position_close_utc"][0]) == pd.Timestamp(trade["exit_time"])
+    entry, intrabar, _metadata = backtester._build_half_spread_arrays(features, fixture["spec"], spread_tier=stress, timeframe=fixture["timeframe"])
+    numerator = float(entry[trade["entry_bar"]]) + float(intrabar[trade["exit_bar"]])
+    distance = abs(trade["entry_price"] - trade["stop_loss"])
+    assert row["matched_p95_cost_inputs"]["numerator_price"] == numerator
+    assert row["matched_p95_cost_inputs"]["original_initial_stop_distance_price"] == distance
+    assert row["matched_p95_spread_cost_r_unrounded"] == numerator / distance
+    assert row["matched_p95_spread_cost_r"] == execution.pm_core.canonical_backtest_winner_r(numerator, distance)
+    assert facts["matched_p95_spread_cost_r"] == [row["matched_p95_spread_cost_r"]]
+    exact = row["executed_price_swap_capture"]
+    expected_base_r = direction * (exact["exit_price"] - exact["entry_price"]) / distance + exact["swap_dollars_exact"] / row["actual_initial_risk_dollars"]
+    assert facts["base_actual_initial_risk_net_r"] == [execution.pm_core.canonical_backtest_winner_r(expected_base_r, 1.0)]
+    assert row["actual_initial_risk_dollars"] == 24.0 and trade["risk_amount"] == 25.0
+    assert facts["dated_fx_status"] == "NOT_REQUIRED_PRICE_RATIO_FLOOR"
+    assert facts["cash_conversion_limitation"] == "INSTRUMENT_SPEC_ACQUISITION_SNAPSHOT_NO_DATED_FX_SERIES"
+    verified = execution._verify_route_a_matched_base_facts(facts)
+    assert verified["authenticates_origin"] is False
+    assert all(verified[key] == facts[key] for key in verified if key != "authenticates_origin")
+    assert set(decision) == set(execution._RAW_LANE_KEYS)
+
+
+@pytest.mark.parametrize("corruption", ["entry-fill", "exit-fill", "position-id"], ids=["entry-fill", "exit-fill", "position-id"])
+def test_route_a_matched_floor_is_wholly_unavailable_after_kernel_witness_mismatch(monkeypatch, corruption):
+    """INVENTED corruption after genuine tiny kernel; it grants no owner authenticity."""
+    def corrupt(result):
+        if corruption == "entry-fill":
+            result["trades"][0]["entry_price"] += 1.0
+        elif corruption == "exit-fill":
+            result["trades"][0]["exit_price"] += 1.0
+        else:
+            result["position_events"][0]["position_id"] = "INVENTED-CROSSED-ID"
+    result, facts, *_ = _full_panel_run_matched_invented_fixture(monkeypatch, False, 1, "eod", mutate_result=corrupt)
+    assert len(result["trades"]) == 1
+    assert facts["floor_status"] == "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH"
+    assert facts["floor_reason_codes"]
+    assert facts["completed_position_ids"] is None
+    assert facts["base_actual_initial_risk_net_r"] is facts["matched_p95_spread_cost_r"] is None
+
+
+def test_route_a_matched_floor_empty_completed_base_is_explicitly_unavailable(monkeypatch):
+    result, facts, *_ = _full_panel_run_matched_invented_fixture(monkeypatch, False, 1, "eod", empty_signals=True)
+    assert result["trades"] == result["position_events"] == facts["trades"] == []
+    assert facts["floor_status"] == "UNAVAILABLE_NO_COMPLETED_BASE_TRADES"
+    assert facts["base_fill_witness_status"] == "NO_COMPLETED_BASE_TRADES"
+    assert facts["completed_position_ids"] is facts["matched_p95_spread_cost_r"] is None
+
+
+def test_route_a_matched_base_fill_replay_refuses_hidden_earlier_trigger(monkeypatch):
+    result, facts, features, _decision, backtester, fixture, base, _stress = _full_panel_run_matched_invented_fixture(monkeypatch, False, 1, "eod")
+    changed = features.copy(deep=True)
+    changed.loc[changed.index[2], "Low"] = 80.0
+    entry, intrabar, _metadata = backtester._build_half_spread_arrays(changed, fixture["spec"], spread_tier=base, timeframe=fixture["timeframe"])
+    witness = execution._route_a_base_fill_witness(trade=result["trades"][0], identity=facts["trades"][0]["base_trade_identity"],
+        features=changed, base_entry_half=entry, base_intrabar_half=intrabar)
+    assert witness["status"] == "MISMATCH"
+    assert witness["reason_code"] == "BASE_FIRST_TRIGGER_OR_EXIT_FILL_MISMATCH"
+
+
+
+@pytest.mark.parametrize("role", ["entry_half_spread", "intrabar_half_spread"])
+def test_route_a_spread_array_codec_preserves_exact_sentinels_and_signed_zero(role):
+    """INVENTED binary payload; no new sentinel or numerical policy."""
+    import struct
+    raw = struct.pack("<QQQQ", 0x8000000000000000, 0x7FF8000000000042, 0x3FF0000000000000, 0)
+    array = execution.np.frombuffer(raw, dtype="<f8")
+    encoded = execution._route_a_encode_spread_array(array, role)
+    assert encoded["dtype"] == "<f8" and encoded["shape"] == [4]
+    decoded = execution._route_a_decode_spread_array(encoded, role)
+    assert decoded.tobytes() == raw
+    assert encoded["array_sha256"] == execution.Backtester._spread_array_sha256(role, array)
+    wrong_role = "intrabar_half_spread" if role == "entry_half_spread" else "entry_half_spread"
+    with pytest.raises(ValueError):
+        execution._route_a_decode_spread_array(encoded, wrong_role)
+
+
+@pytest.mark.parametrize("corruption", ["shape", "bytes", "fill-path", "cost", "risk", "claimed-verdict"],
+    ids=["shape", "bytes", "fill-path", "cost", "risk", "claimed-verdict"])
+def test_route_a_serialized_matched_witness_recomputes_data_and_refuses_tampering(monkeypatch, corruption):
+    """INVENTED corruption after genuine tiny kernel; validator issues no origin authority."""
+    import base64
+    result, facts, *_ = _full_panel_run_matched_invented_fixture(monkeypatch, False, 1, "eod")
+    changed = copy.deepcopy(facts)
+    if corruption == "shape":
+        changed["half_spread_arrays"]["P75"]["entry_half_spread"]["shape"][0] += 1
+    elif corruption == "bytes":
+        encoded = changed["half_spread_arrays"]["P95"]["intrabar_half_spread"]
+        values = bytearray(base64.b64decode(encoded["values_base64"]))
+        values[-1] ^= 1
+        encoded["values_base64"] = base64.b64encode(values).decode("ascii")
+    elif corruption == "fill-path":
+        witness = changed["trades"][0]["base_fill_witness"]
+        witness["held_bar_inputs"][1]["ohlc"]["Low"] = 80.0
+        witness["held_bar_inputs_sha256"] = execution._sha256(witness["held_bar_inputs"])
+        changed["base_fill_witness_sha256"] = execution._sha256([witness])
+    elif corruption == "cost":
+        changed["trades"][0]["matched_p95_spread_cost_r"] += 1.0
+    elif corruption == "risk":
+        changed["trades"][0]["actual_initial_risk_dollars"] = 25.0
+    else:
+        changed["trades"][0]["base_fill_witness"]["status"] = "MISMATCH"
+        changed["base_fill_witness_sha256"] = execution._sha256([changed["trades"][0]["base_fill_witness"]])
+    verified = execution._verify_route_a_matched_base_facts(changed)
+    assert verified["authenticates_origin"] is False
+    assert verified["floor_status"] == "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH"
+    assert verified["floor_reason_codes"]
+    assert verified["base_actual_initial_risk_net_r"] is verified["matched_p95_spread_cost_r"] is None
+    assert result["trades"][0]["risk_amount"] == 25.0
+
+
+
+@pytest.mark.parametrize("role", ["entry_half_spread", "intrabar_half_spread"])
+def test_route_a_non_improvement_checks_unused_bars_in_both_spread_legs(role):
+    """INVENTED vectors; an unused finite inversion still violates E5872."""
+    arrays = {tier: {name: execution.np.array([1.0, 1.0, 1.0]) for name in ("entry_half_spread", "intrabar_half_spread")}
+        for tier in ("P75", "P95")}
+    arrays["P95"][role][0] = 0.5
+    assert execution._route_a_spread_non_improvement(arrays) == {"status": "REFUSED_P95_BELOW_P75", "role": role, "bar": 0}
+
+
+@pytest.mark.parametrize("inversion", [False, True], ids=["unused-sentinel", "sentinel-does-not-hide-inversion"])
+def test_route_a_non_improvement_preserves_unknown_sentinels_without_new_finiteness_gate(inversion):
+    """INVENTED warmup sentinel; it is preserved and disclosed, never normalized."""
+    arrays = {tier: {role: execution.np.array([float("nan"), 1.0, 2.0]) for role in ("entry_half_spread", "intrabar_half_spread")}
+        for tier in ("P75", "P95")}
+    if inversion:
+        arrays["P95"]["intrabar_half_spread"][2] = 1.0
+    observed = execution._route_a_spread_non_improvement(arrays)
+    if inversion:
+        assert observed == {"status": "REFUSED_P95_BELOW_P75", "role": "intrabar_half_spread", "bar": 2}
+    else:
+        assert observed == {"status": "NO_FINITE_INVERSION_WITH_SENTINELS",
+            "unknown_indices": {"entry_half_spread": [0], "intrabar_half_spread": [0]}}
+
+
+def test_route_a_live_matched_capture_refuses_unused_warmup_tier_inversion(monkeypatch):
+    """INVENTED frozen-tier mutation after accepted N26 fixture; no policy authority."""
+    import json
+    _backtester, _fixture, _frame, _strategy, _signals, _base, stress = _full_panel_matched_fill_invented_inputs(1, "eod")
+    descriptor = stress.descriptor()
+    descriptor["full_spread_price"], descriptor["spread_points"] = 1.0, 1
+    inverted = execution.spread_profile.FrozenSpreadTier(json.dumps(descriptor, sort_keys=True, separators=(",", ":")))
+    def warmup(frame):
+        frame.loc[frame.index[0], ["SpreadOpen", "SpreadMax"]] = 0.0
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        _full_panel_run_matched_invented_fixture(monkeypatch, False, 1, "eod",
+            mutate_features=warmup, stress_override=inverted)
+    assert caught.value.code == "ROUTE_A_FULL_PANEL_P95_SPREAD_NON_IMPROVEMENT_VIOLATION"
+
+
+
+def _exact_floor_fractional_invented_fixture(monkeypatch, compiled, direction, capped=False, legacy=False):
+    """INVENTED fractional/swap fixture; genuine tiny kernels, no financial evidence."""
+    assert execution.pm_core.NUMBA_AVAILABLE, "Both execution backends are required"
+    original_swap_inputs = execution.Backtester._build_causal_swap_inputs
+    label = "INVENTED_SOURCE_ENVELOPE_NO_AUTHORITY"
+
+    def invented_source_envelope(self, *args, **kwargs):
+        inputs = original_swap_inputs(self, *args, **kwargs)
+        # Invented provenance only; real kernel, costs and exact swap arrays remain.
+        swap = dict(inputs[-1])
+        swap.update(fixture_provenance=label, status="AVAILABLE", provenance_status="AUTHENTICATED",
+            source_provenance_authenticated=True, historical_rates_authenticated=True,
+            execution_state_compounding=True, timestamp_source="_BAR_CLOSE_TS",
+            projection_contract="fxpm-swap-preopen-close-projection-v1",
+            projection_sha256=execution._sha256([label, "projection"]))
+        for name in ("price_activation_manifest_sha256", "terms_activation_manifest_sha256",
+                     "terms_snapshot_sha256", "schedule_sha256", "target_bars_sha256",
+                     "target_sidecar_sha256", "historical_rates_sha256"):
+            swap[name] = execution._sha256([label, name])
+        return (*inputs[:-1], swap)
+
+    monkeypatch.setattr(execution.Backtester, "_build_causal_swap_inputs", invented_source_envelope)
+    backtester, fixture, frame, strategy, signals, base, stress = _full_panel_matched_fill_invented_inputs(direction, "eod")
+    frame.index = pd.date_range("2026-01-05T22:00:00Z", periods=len(frame), freq="h")
+    frame["_BAR_CLOSE_TS"] = frame.index + pd.Timedelta(hours=1)
+    frame.loc[frame.index[-1], ["High", "Close"]] = 100.00371
+    if legacy:
+        frame = frame.drop(columns=["_BAR_CLOSE_TS"])
+    fixture["entry_spread_observations"] = pd.Series(2.0, index=frame.index)
+    fixture["spec"].max_lot = 1.5 if capped else 100.0
+    fixture["spec"].swap_mode = 4
+    fixture["spec"].swap_long, fixture["spec"].swap_short = -0.001731, 0.002913
+    backtester.config.swap_model_enabled = True
+    signals.index = frame.index
+    monkeypatch.setattr(execution.pm_core, "NUMBA_AVAILABLE", compiled)
+    ordinary = backtester.run(frame, signals, fixture["symbol"], strategy,
+        spec=fixture["spec"], timeframe=fixture["timeframe"], warmup_bars=fixture["warmup_bars"],
+        spread_tier=base, entry_spread_observations=fixture["entry_spread_observations"])
+    source_sha = execution._source_identity(execution.raw_winner.build_trade_source_contract_from_backtester_result(ordinary))
+    end = frame.index[-1] + pd.Timedelta(hours=1)
+    partition = execution._PartitionSlice("final_lockbox", frame, fixture["warmup_bars"],
+        frame.index[fixture["warmup_bars"]].isoformat(), end.isoformat(), {})
+    facts = {}
+    refusal = None
+    try:
+        result, features, _signals, _backtester = execution._run_tier_partition(
+            partition=partition, full_prefix_surface=execution._FullPrefixStrategySurface(frame, signals),
+            backtester=backtester, strategy=strategy, symbol=fixture["symbol"], timeframe=fixture["timeframe"],
+            regime="TRENDING", config=backtester.config, spec=fixture["spec"], expected_source_contract_sha256=source_sha,
+            spread_tier=base, entry_spread_observations=fixture["entry_spread_observations"],
+            _matched_base_facts_out=facts, _matched_stress_tier=stress)
+    except execution.AuthoritativeSearchExecutionError as exc:
+        if legacy is not True:
+            raise
+        if not facts or not facts.get("trades") or not facts.get("initial_risk_source_binding"):
+            raise
+        refusal = exc
+    if legacy:
+        return ordinary, facts, frame, backtester, fixture, base, stress, end, refusal
+    assert result == ordinary
+    return result, facts, features, backtester, fixture, base, stress, end
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["python", "numba"])
+@pytest.mark.parametrize("direction", [1, -1], ids=["long", "short"])
+@pytest.mark.parametrize("capped", [False, True], ids=["lot-rounded", "lot-capped"])
+def test_exact_executed_floor_fractional_cash_swap_and_public_output_parity(monkeypatch, compiled, direction, capped):
+    result, facts, frame, backtester, fixture, base, stress, end = _exact_floor_fractional_invented_fixture(
+        monkeypatch, compiled, direction, capped)
+    trade, row = result["trades"][0], facts["trades"][0]
+    exact = row["executed_price_swap_capture"]
+    assert len(result["trades"]) == 1 and exact["backend"] == ("NUMBA" if compiled else "PYTHON")
+    assert exact["executed_volume"] == (1.5 if capped else 2.0)
+    assert row["actual_initial_risk_dollars"] == (18.0 if capped else 24.0)
+    assert trade["risk_amount"] == 25.0
+    assert exact["swap_dollars_exact"] != round(exact["swap_dollars_exact"], 2)
+    assert trade["swap_dollars"] == round(exact["swap_dollars_exact"], 2)
+    assert exact["swap_source_kind"] == "CAUSAL_KERNEL" and exact["swap_cash_steps"]
+    assert facts["exact_swap_accrual_contract"] == result["swap_accrual_contract"]
+    distance = abs(exact["entry_price"] - exact["initial_stop_price"])
+    wanted = direction * (exact["exit_price"] - exact["entry_price"]) / distance + exact["swap_dollars_exact"] / row["actual_initial_risk_dollars"]
+    actual = execution.pm_core.canonical_backtest_winner_r(wanted, 1.0)
+    assert facts["base_actual_initial_risk_net_r"] == [actual]
+    assert actual != execution.pm_core.canonical_backtest_winner_r(trade["pnl_dollars"], row["actual_initial_risk_dollars"])
+    verified = execution._verify_route_a_matched_base_facts(facts)
+    assert verified["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED" and verified["authenticates_origin"] is False
+    assert verified["base_actual_initial_risk_net_r"] == [actual]
+    geometry = {"frame_start_utc": frame.index[0].isoformat(), "end_exclusive_utc": end.isoformat(),
+        "frame_rows": len(frame), "frame_sha256": execution._frame_sha256(frame)}
+    def forbidden_run(*args, **kwargs):
+        raise AssertionError("cold witness source verification must not execute a kernel")
+    monkeypatch.setattr(execution.Backtester, "run", forbidden_run)
+    assert execution._verify_route_a_matched_fact_source(facts, geometry, source_frame=frame, spec=fixture["spec"],
+        tiers={"P75": base, "P95": stress}, config=backtester.config, timeframe=fixture["timeframe"])
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["python", "numba"])
+def test_exact_executed_floor_legacy_swap_preserves_public_reporting(monkeypatch, compiled):
+    ordinary, facts, frame, backtester, fixture, _base, _stress, _end, refusal = _exact_floor_fractional_invented_fixture(
+        monkeypatch, compiled, 1, legacy=True)
+    assert isinstance(refusal, execution.AuthoritativeSearchExecutionError)
+    assert refusal.code == "BACKTEST_DECISION_RELEVANT_RESULT_INCOMPLETE"
+    row = facts["trades"][0]
+    exact = row["executed_price_swap_capture"]
+    assert exact["swap_source_kind"] == "LEGACY_MODEL" and exact["swap_cash_steps"]
+    assert exact["swap_cash_steps"][0]["phase"] == "LEGACY_AT_EXIT"
+    assert exact["swap_dollars_exact"] != round(exact["swap_dollars_exact"], 2)
+    assert ordinary["trades"][0]["swap_dollars"] == round(exact["swap_dollars_exact"], 2)
+    assert execution._verify_route_a_exact_swap_source(facts, frame, spec=fixture["spec"], pricing=backtester,
+        timeframe=fixture["timeframe"])
+    assert execution._verify_route_a_matched_base_facts(facts)["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED"
+
+
+@pytest.mark.parametrize("corruption", ["missing", "ordinal", "backend", "entry", "stop", "volume", "swap-cash", "swap-unit", "swap-step"])
+def test_exact_executed_floor_serialized_capture_tampering_is_unavailable(monkeypatch, corruption):
+    _result, original, *_rest = _exact_floor_fractional_invented_fixture(monkeypatch, False, 1)
+    facts = copy.deepcopy(original)
+    exact = facts["trades"][0]["executed_price_swap_capture"]
+    if corruption == "missing":
+        facts["trades"][0]["executed_price_swap_capture"] = None
+    elif corruption == "backend":
+        exact["backend"] = "PUBLIC_FLAG"
+    elif corruption == "swap-step":
+        exact["swap_cash_steps"][0]["phase"] = "PRE_OPEN"
+    else:
+        field = {"ordinal": "ordinal", "entry": "entry_price", "stop": "initial_stop_price", "volume": "executed_volume",
+            "swap-cash": "swap_dollars_exact", "swap-unit": "swap_rollover_units"}[corruption]
+        exact[field] += 1
+    verified = execution._verify_route_a_matched_base_facts(facts)
+    assert verified["floor_status"] == "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH"
+    assert verified["authenticates_origin"] is False and verified["base_actual_initial_risk_net_r"] is None
+
+
+@pytest.mark.parametrize("corruption", ["self-consistent-rate", "contract"])
+def test_exact_swap_source_rejects_self_consistent_public_capture_changes(monkeypatch, corruption):
+    _result, original, frame, pricing, fixture, _base, _stress, _end = _exact_floor_fractional_invented_fixture(monkeypatch, False, 1)
+    facts = copy.deepcopy(original)
+    if corruption == "contract":
+        facts["exact_swap_accrual_contract"]["mode"] = "INVENTED_FORGED_SOURCE"
+        expected = "MATCHED_FLOOR_SWAP_CONTRACT_SOURCE_CHANGED"
+    else:
+        row = facts["trades"][0]
+        exact = row["executed_price_swap_capture"]
+        for step in exact["swap_cash_steps"]:
+            step["rate_per_lot_dollars"] *= 1.37
+            step["cash"] = step["rate_per_lot_dollars"] * exact["executed_volume"] * step["rollover_units"]
+        exact["swap_dollars_exact"] = sum(step["cash"] for step in exact["swap_cash_steps"])
+        components = execution._route_a_exact_base_return_components(row, spec=fixture["spec"], ordinal=0, swap_model_enabled=True)
+        row["base_return_components"] = components
+        row["base_actual_initial_risk_net_r"] = components["canonical_net_r"]
+        facts["base_actual_initial_risk_net_r"] = [components["canonical_net_r"]]
+        assert execution._verify_route_a_matched_base_facts(facts)["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED"
+        expected = "MATCHED_FLOOR_EXACT_SWAP_SOURCE_CHANGED"
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._verify_route_a_exact_swap_source(facts, frame, spec=fixture["spec"], pricing=pricing,
+            timeframe=fixture["timeframe"])
+    assert caught.value.code == expected
+
+
+@pytest.mark.parametrize("argument", ["governance", "scheduled", "mark-open", "nonempty"])
+def test_exact_trade_companion_refuses_non_fixed_control_or_existing_output(argument):
+    """INVENTED invalid invocation stops before signal/data access or execution."""
+    pricing = execution.Backtester(execution.PipelineConfig())
+    output, kwargs = {}, {}
+    if argument == "governance": kwargs["governance_policy"] = {"kind": "INVENTED"}
+    elif argument == "scheduled": kwargs["entry_schedule"] = object()
+    elif argument == "mark-open": kwargs["terminal_policy"] = "MARK_OPEN"
+    else: output["foreign"] = "INVENTED_DRAFT"
+    with pytest.raises(ValueError, match="EXACT_TRADE_CAPTURE_FIXED_CONTROL_ARGUMENT_INVALID"):
+        pricing.run(None, None, "INVENTED", None, _exact_trade_facts_out=output, **kwargs)
+
+
+
+def _attempt_boundary_invented_continuation(tmp_path, monkeypatch, *, full_panel=True,
+                                           damage=None, expiry=None, attempt_count=1):
+    """INVENTED one-period call-routing fixture, never an authenticated owner/model witness.
+
+    Authentication, source probes and the kernel are labelled stand-ins. The actual
+    continuation, preparation boundary method, request coordinator and working-copy
+    fingerprints execute; no fitting, market data or ordinary programme is run.
+    """
+    from dataclasses import dataclass
+    import json
+    import pm_historical_search_producer as producer
+    import pm_production_config_binding as config_binding
+
+    events, reads = [], {"config": 0, "stream": 0}
+    state = {"expired": expiry == "admission", "working": None}
+    frame = _d1_frame(2)
+    fitted = _route_a_invented_fingerprint_namespace()
+    fitted._frame = frame
+    fitted._entry_spread_observations = pd.Series([1.0, 1.0], index=frame.index)
+    fitted.frame_sha256 = execution._frame_sha256(frame)
+    fitted._spread_tiers["P95"] = copy.deepcopy(fitted._spread_tiers["P75"])
+    fitted.source_contract_seeds["P95"] = copy.deepcopy(fitted.source_contract_seeds["P75"])
+    config = SimpleNamespace(use_spread=True, fixture_value=1)
+    payload = {"fixture_provenance": "INVENTED_ONE_PERIOD_NO_AUTHORITY"}
+    frozen_config = SimpleNamespace(active_config_path=tmp_path / "invented-config.json",
+        config_sha256="c" * 64, effective_config_sha256="d" * 64,
+        _payload_json=execution._canonical_bytes(payload),
+        _snapshot_json=execution._canonical_bytes({"pipeline_config": vars(config)}), _seal=object())
+
+    @dataclass
+    class InventedLimits:
+        max_json_bytes: int = 65536
+        max_artifact_bytes: int = 65536
+
+    @dataclass
+    class InventedFrozen:
+        partition_cost_precommitments: dict
+        source_contract_seeds: dict
+        frozen_tier_pair_contract: dict
+
+    descriptor = {"relative_path": "invented-frozen.json", "sha256": "b" * 64, "size_bytes": 2}
+    frozen = InventedFrozen({}, copy.deepcopy(fitted.source_contract_seeds),
+                           copy.deepcopy(fitted.frozen_tier_pair_contract))
+    handle = SimpleNamespace(frozen=frozen, frozen_descriptor_graph=descriptor,
+        cross_binding_descriptor=descriptor, frozen_receipt_descriptor=descriptor,
+        symbol="INVENTED", timeframe="D1", regime="INVENTED", artifact_namespace="invented",
+        _cross_binding_bytes=b"{}", _attempt_artifacts=(), _horizon_execution_contracts=(),
+        _source_count_receipts=(), _capture_nonce=None)
+    context = SimpleNamespace(root=tmp_path, generation_id="INVENTED-ONE-PERIOD",
+        context_sha256="a" * 64, config_sha256="c" * 64,
+        native_universe_sha256="e" * 64, limits=InventedLimits())
+    body = {"artifact_namespace": "invented", "cell_id": "invented-cell",
+        "slot_id": "invented-slot", "attempt_id": "invented-attempt", "precommit_sha256": "7" * 64,
+        "source_access_window_utc": {
+        "start_utc": "2020-01-01T00:00:00+00:00", "end_exclusive_utc": "2020-01-02T00:00:00+00:00"}}
+    request = SimpleNamespace(receipt_sha256="f" * 64, to_dict=lambda: copy.deepcopy(body),
+        _precommit=SimpleNamespace(to_dict=lambda: {"fixture": "INVENTED_PRECOMMIT"}))
+    domain = {"strategy_id": "INVENTED_STRATEGY", "strategy_family": "INVENTED_FAMILY",
+        "domain_sha256": "1" * 64, "parameter_domain": {
+            "schema_version": "fxpm.parameter-domain.v1", "defaults": {"period": 2},
+            "axes": [{"names": ["period"], "choices": [[2]]}], "point_count": 1}}
+    process = SimpleNamespace(receipt_sha256="2" * 64,
+        to_dict=lambda: {"semantics": {"strategy_domains": [domain]}})
+    plan = {"cell": {"symbol": "INVENTED", "timeframe": "D1", "regime": "INVENTED"},
+        "anchor": {"anchor_id": "INVENTED", "selection_cutoff_utc": "2020-01-01T00:00:00Z"},
+        "derived_dependency_geometry": {"warmup_bars": 0}}
+    cell_plan = SimpleNamespace(receipt_sha256="3" * 64, cell_receipt={}, spool_entry={},
+        horizon_plan=SimpleNamespace(to_dict=lambda: {}), attempt_artifacts=lambda: (),
+        state_requirements=lambda: ())
+    session = SimpleNamespace(_frozen_config=frozen_config, _entry={"descriptor": descriptor})
+    capture = SimpleNamespace(context=context, request=request, source_session=session,
+        sink=SimpleNamespace(artifact_roster=lambda: ()), process=process, cell_plan=cell_plan,
+        pipeline_config=config, fitted_timeframe=fitted, _finished=False, _completion=None,
+        _require_active=lambda current: events.append(("owner", current is handle)))
+    header = {"artifact_roster": [], "frozen_plan_receipt": descriptor,
+        "frozen_descriptor_graph": descriptor, "horizon_winner_cross_binding": descriptor,
+        "source_session_entry": session._entry, "horizon_plan": {"descriptor": descriptor}}
+    attempts = tuple(SimpleNamespace(ordinal=ordinal, plan_attempt={"status": "PLANNED",
+        "attempt_id": "INVENTED-ATTEMPT" + (f"-{ordinal}" if ordinal else "")},
+        artifacts=SimpleNamespace(winner_process={"strategy_id": "INVENTED_STRATEGY"}))
+        for ordinal in range(attempt_count))
+    raw_ids = tuple("INVENTED-RAW" + (f"-{ordinal}" if ordinal else "")
+        for ordinal in range(attempt_count))
+    binding = {"executor_release_sha256": execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256}
+    snapshot = {"declared_unit_binding": binding,
+        "attempt_roster": [{"raw_attempt_id": raw_id} for raw_id in raw_ids]}
+    rows = [{"strategy_id": "INVENTED_STRATEGY", "parameters": {"period": 2},
+        "fold_ordinal": fold, "partition_role": role, "spread_tier": tier,
+        "request_ordinal": index, "bookkeeping": {"attempt_ordinal": 0}}
+        for index, (fold, role, tier) in enumerate((fold, role, tier)
+            for fold in range(4) for role in ("optimizer_train", "tuning_validation", "final_lockbox")
+            for tier in ("P75", "P95"))]
+
+    def specifications(attempt_ordinal):
+        selected = copy.deepcopy(rows)
+        for row in selected:
+            row["bookkeeping"]["attempt_ordinal"] = attempt_ordinal
+        return selected
+
+    def read_config(path):
+        reads["config"] += 1
+        events.append(("full", reads["config"]))
+        return copy.deepcopy(payload), None
+
+    def stream_file(root, relative, **kwargs):
+        reads["stream"] += 1
+        raw = execution._canonical_bytes(header) if relative.endswith("header.json") else b"{}"
+        return "b" * 64, len(raw), raw if kwargs.get("collect") else None
+
+    def partitions(*, frame, fold, **kwargs):
+        return tuple(SimpleNamespace(role=role, frame=frame,
+            geometry_receipt={"fixture_fold": fold["ordinal"], "fixture_role": role})
+            for role in ("optimizer_train", "tuning_validation", "final_lockbox"))
+
+    def rebind(*, specification, frame, **kwargs):
+        fold = {"fold_id": "INVENTED-" + str(specification["fold_ordinal"]),
+                "ordinal": specification["fold_ordinal"]}
+        partition = next(row for row in partitions(frame=frame, fold=fold)
+                         if row.role == specification["partition_role"])
+        return attempts[specification["bookkeeping"]["attempt_ordinal"]], fold, partition, {"period": 2}
+
+    def probe_mutation(config, frame):
+        state["working"] = (config, frame)
+        if damage == "frame_probe":
+            frame.iloc[0, 0] += 1.0
+        elif damage == "config_probe":
+            config.fixture_value += 1
+        if expiry == "after_probe":
+            state["expired"] = True
+
+    class InventedProbeBacktester:
+        def __init__(self, config):
+            self.config = config
+
+        def build_evidence_source_seed_result(self, features, symbol, *, spec=None,
+                                             timeframe="", spread_tier=None,
+                                             entry_spread_observations=None):
+            events.append(("probe", reads["config"], reads["stream"]))
+            probe_mutation(self.config, features)
+            return {"spread_model": "INVENTED"}
+
+    def run_partition(*, backtester, partition, decision_result_out, **kwargs):
+        events.append(("run", reads["config"], reads["stream"]))
+        state["working"] = (backtester.config, partition.frame)
+        if damage == "frame_run":
+            partition.frame.iloc[0, 0] += 1.0
+        elif damage == "config_run":
+            backtester.config.fixture_value += 1
+        if expiry == "after_run":
+            state["expired"] = True
+        if kwargs.get("_matched_base_facts_out") is not None:
+            kwargs["_matched_base_facts_out"]["half_spread_arrays"] = {}
+        decision_result_out["fixture_provenance"] = "INVENTED_KERNEL_STAND_IN"
+        return {"spread_model": "INVENTED"}, None, pd.Series([0, 0]), None
+
+    source_identity = SimpleNamespace(source_contract_sha256="4" * 64,
+                                     partition_source_contract_sha256="5" * 64)
+    monkeypatch.setattr(config_binding, "_read_config", read_config)
+    monkeypatch.setattr(config_binding, "_snapshot", lambda value: vars(value).copy())
+    monkeypatch.setattr(execution.authority_spool, "_stream_file", stream_file)
+    monkeypatch.setattr(execution, "_file_sha256", lambda path: "6" * 64)
+    invented_contract = {"dependency_source_sha256": {"pm_production_search_planner": "6" * 64}}
+    original_sha256 = execution._sha256
+    monkeypatch.setattr(execution, "authoritative_search_execution_contract", lambda: invented_contract)
+    monkeypatch.setattr(execution, "_sha256", lambda value:
+        execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256 if value is invented_contract else original_sha256(value))
+    monkeypatch.setattr(execution, "_declared_unit_binding", lambda *args: copy.deepcopy(binding))
+    monkeypatch.setattr(execution, "_route_a_working_fitted", copy.deepcopy)
+    monkeypatch.setattr(execution, "_route_a_owner_membership_snapshot", lambda **kwargs: copy.deepcopy(snapshot))
+    monkeypatch.setattr(search_planner, "_route_a_full_panel_preparation_contract", lambda **kwargs: {"fixture": "INVENTED"})
+    monkeypatch.setattr(execution, "_route_a_full_panel_specifications", lambda **kwargs:
+                        specifications(kwargs["attempt_ordinal"]))
+    monkeypatch.setattr(execution, "_route_a_rebind_full_panel_owner_membership", rebind)
+    monkeypatch.setattr(execution, "_route_a_rebind_owner_membership", rebind)
+    monkeypatch.setattr(execution, "_fold_partitions", partitions)
+    monkeypatch.setattr(execution, "_source_identity", lambda seed: source_identity.source_contract_sha256)
+    monkeypatch.setattr(producer, "_verified_declared_slot_source_session_current", lambda *args, **kwargs: None)
+    monkeypatch.setattr(execution.historical_adapter, "_verify_declared_slot_capture_current", lambda capture: None)
+    monkeypatch.setattr(execution.historical_adapter, "_verify_declared_slot_capture", lambda capture: None)
+    monkeypatch.setattr(execution, "_now_utc_seconds", lambda: "2020-01-02T00:00:00+00:00"
+                        if state["expired"] else "2020-01-01T12:00:00+00:00")
+    monkeypatch.setattr(execution, "Backtester", InventedProbeBacktester)
+    monkeypatch.setattr(execution.raw_winner, "build_trade_source_contract_from_backtester_result", lambda result: {})
+    monkeypatch.setattr(execution.trade_power, "build_trade_sample_evidence", lambda *args, **kwargs:
+                        SimpleNamespace(source_contract=source_identity))
+    monkeypatch.setattr(execution.pm_core, "build_backtest_spread_mode", lambda value: "INVENTED")
+    monkeypatch.setattr(execution, "_verify_partition_precommitment", lambda **kwargs: events.append(("provenance",)))
+    monkeypatch.setattr(execution, "_runtime_strategy", lambda attempt: (object(), None))
+    monkeypatch.setattr(execution, "_build_full_prefix_strategy_surface", lambda **kwargs: object())
+    monkeypatch.setattr(execution, "_run_tier_partition", run_partition)
+    monkeypatch.setattr(execution, "_route_a_pair_check", lambda **kwargs: {"status": "VERIFIED", "missing_tiers": []})
+    monkeypatch.setattr(execution, "_route_a_assemble_full_panel_attempt", lambda **kwargs:
+        ({"attempt_id": kwargs["raw_attempt_id"], "folds": [{"fixture": ordinal} for ordinal in range(4)]},
+         [{"fixture_provenance": "INVENTED_NOT_KERNEL_EVIDENCE"} for _ in range(12)]))
+    monkeypatch.setattr(execution, "_read_declared_unit_json", lambda *args: None)
+    monkeypatch.setattr(search_planner, "describe_route_a_evaluation_design", lambda **kwargs: {
+        "requests": [{"shared_evaluation_key": {"parameters": value["parameters"],
+             "evaluation_binding": value["evaluation_binding"]}, "bookkeeping": value["bookkeeping"]}
+            for value in kwargs["configurations"]]})
+
+    stage = tmp_path / "invented-stage"
+    stage.mkdir()
+    info = stage.stat()
+    reservation = SimpleNamespace(consume=lambda size: None, materialize=lambda size: None)
+    custody = execution._StageCapacityCustody(tmp_path, (info.st_dev, info.st_ino), (0, 0), None,
+        {"generation_context_sha256": context.context_sha256,
+         "producer_request_sha256": request.receipt_sha256,
+         "frozen_receipt_descriptor": descriptor, "original_stage_directory": stage.name})
+    staged = []
+    consumer = execution._FullPanelOwnerPreparation(capture=capture, handle=handle, binding=binding,
+        stage_custody=custody, reservation=reservation, staged_rows=staged, source_observation_references={})
+    legacy_observation = {}
+    if not full_panel:
+        specifications = [{key: value for key, value in row.items() if key != "request_ordinal"}
+                          for row in (rows[0], rows[1], rows[0])]
+
+        def consumer(*, evaluate_batch):
+            legacy_observation["before"] = reads["config"]
+            result = evaluate_batch(specifications=specifications)
+            legacy_observation["after"] = reads["config"]
+            return result
+
+    def run():
+        return execution._run_route_a_owned_unit_continuation(config=config, handle=handle,
+            search_process=process, cell_plan=cell_plan, binding=binding, refreshed=fitted,
+            attempts=attempts, request_body=body, declared_header=header, capture=capture,
+            normalized_regime="INVENTED", route_a_consumer=consumer, fitted=fitted,
+            raw_ids=raw_ids, plan_body=plan, timeframe="D1", fold_plan=(), symbol="INVENTED")
+
+    return SimpleNamespace(run=run, events=events, reads=reads, staged=staged,
+        original_frame=frame.copy(deep=True), fitted=fitted, config=config,
+        legacy_observation=legacy_observation)
+
+
+def test_route_a_full_panel_checks_whole_state_at_owned_unit_boundaries_not_nested_requests(tmp_path, monkeypatch):
+    case = _attempt_boundary_invented_continuation(tmp_path, monkeypatch)
+    result = case.run()
+    assert type(result) is execution._PreparedRouteAFullPanelStage and len(case.staged) == 1
+    probes = [row for row in case.events if row[0] == "probe"]
+    runs = [row for row in case.events if row[0] == "run"]
+    assert len(probes) == len(runs) == 24
+    # One initial admitted snapshot and one completion snapshot for the owned unit.
+    assert case.reads == {"config": 2, "stream": 4}
+    assert {row[1:] for row in probes + runs} == {(1, 2)}
+    assert sum(row[0] == "owner" for row in case.events) > len(probes)
+    assert sum(row[0] == "provenance" for row in case.events) == 48
+
+
+@pytest.mark.parametrize("damage", ("frame_probe", "config_probe", "frame_run", "config_run"))
+def test_route_a_full_panel_nested_request_keeps_actual_working_copy_mutation_refusal(tmp_path, monkeypatch, damage):
+    case = _attempt_boundary_invented_continuation(tmp_path, monkeypatch, damage=damage)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        case.run()
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_SHARED_CONTENT_CHANGED"
+    assert sum(row[0] == "probe" for row in case.events) == 1
+    assert sum(row[0] == "run" for row in case.events) == (1 if damage.endswith("run") else 0)
+    pd.testing.assert_frame_equal(case.fitted._frame, case.original_frame)
+    assert case.config.fixture_value == 1 and case.staged == []
+
+
+@pytest.mark.parametrize("expiry, probes, runs", (("admission", 0, 0), ("after_probe", 1, 0), ("after_run", 1, 1)))
+def test_route_a_full_panel_nested_request_keeps_original_window_expiry_points(tmp_path, monkeypatch, expiry, probes, runs):
+    case = _attempt_boundary_invented_continuation(tmp_path, monkeypatch, expiry=expiry)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        case.run()
+    assert caught.value.code == "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_CLOSED"
+    assert sum(row[0] == "probe" for row in case.events) == probes
+    assert sum(row[0] == "run" for row in case.events) == runs
+    assert case.staged == []
+
+
+def test_route_a_legacy_nested_requests_keep_outputs_and_only_boundary_whole_state_checks(tmp_path, monkeypatch):
+    case = _attempt_boundary_invented_continuation(tmp_path, monkeypatch, full_panel=False)
+    result = case.run()
+    assert result["status"] == "EVALUATED_DIAGNOSTIC_ONLY", result
+    assert len(result["requests"]) == 3 and result["requests"][2]["cache_hit"] is True
+    assert case.legacy_observation == {"before": 1, "after": 1}
+    assert case.reads == {"config": 2, "stream": 4}
+    probes = [row for row in case.events if row[0] == "probe"]
+    assert len(probes) == 2 and {row[1:] for row in probes} == {(1, 2)}
+    assert case.staged == []
+
+
+
+def _tiny_prepared_matched_source_case(monkeypatch):
+    """INVENTED one-period fixed-kernel witness; no fits, model search or financial evidence."""
+    result, facts, frame, backtester, fixture, base, stress, end = _exact_floor_fractional_invented_fixture(
+        monkeypatch, False, 1)
+    geometry = {"frame_start_utc": frame.index[0].isoformat(), "end_exclusive_utc": end.isoformat(),
+        "frame_rows": len(frame), "frame_sha256": execution._frame_sha256(frame)}
+    build_calls, swap_calls, frame_hash_calls = [], [], []
+    original_build = execution.Backtester._build_half_spread_arrays
+    original_swap = execution._verify_route_a_exact_swap_source
+    original_frame_sha256 = execution._frame_sha256
+
+    def build(self, *args, **kwargs):
+        build_calls.append(kwargs["spread_tier"].tier)
+        return original_build(self, *args, **kwargs)
+
+    def swap(*args, **kwargs):
+        swap_calls.append(True)
+        return original_swap(*args, **kwargs)
+
+    def frame_hash(frame):
+        frame_hash_calls.append(True)
+        return original_frame_sha256(frame)
+
+    def forbidden_run(*args, **kwargs):
+        raise AssertionError("cold source proof must not execute another kernel")
+
+    monkeypatch.setattr(execution.Backtester, "_build_half_spread_arrays", build)
+    monkeypatch.setattr(execution, "_verify_route_a_exact_swap_source", swap)
+    monkeypatch.setattr(execution, "_frame_sha256", frame_hash)
+    monkeypatch.setattr(execution.Backtester, "run", forbidden_run)
+    arguments = {"source_frame": frame, "spec": fixture["spec"],
+        "tiers": {"P75": base, "P95": stress}, "config": backtester.config, "timeframe": fixture["timeframe"]}
+    return SimpleNamespace(facts=facts, geometry=geometry, arguments=arguments,
+                           build_calls=build_calls, swap_calls=swap_calls, frame_hash_calls=frame_hash_calls, result=result)
+
+
+def test_matched_source_preparation_reuses_only_identical_geometry_config_spec_and_tiers(monkeypatch):
+    case = _tiny_prepared_matched_source_case(monkeypatch)
+    cache = {}
+    for facts in (case.facts, copy.deepcopy(case.facts)):
+        assert execution._verify_route_a_matched_fact_source(facts, case.geometry,
+            **case.arguments, _prepared_source_cache=cache)
+    assert case.build_calls == ["P75", "P95"] and len(case.swap_calls) == 2
+    assert len(case.frame_hash_calls) == 1
+    # Each different bound source input must prepare its own pair, even when its
+    # numerical values agree. Every witness still receives exact swap verification.
+    variants = []
+    for field in ("config", "spec"):
+        variants.append((case.geometry, {**case.arguments, field: copy.deepcopy(case.arguments[field])}))
+    variants.append((case.geometry, {**case.arguments, "tiers": {
+        tier: execution.spread_profile.FrozenSpreadTier(value._json)
+        for tier, value in case.arguments["tiers"].items()}}))
+    variants.append(({**case.geometry, "receipt_sha256": "e" * 64}, case.arguments))
+    for ordinal, (geometry, arguments) in enumerate(variants, 2):
+        assert execution._verify_route_a_matched_fact_source(copy.deepcopy(case.facts), geometry,
+            **arguments, _prepared_source_cache=cache)
+        assert case.build_calls == ["P75", "P95"] * ordinal
+        assert len(case.frame_hash_calls) == ordinal
+    assert len(case.swap_calls) == 6
+
+
+@pytest.mark.parametrize("corruption", ("instrument", "spread", "entry", "held", "swap-contract", "swap-cash", "initial-risk"))
+def test_matched_source_cached_preparation_still_checks_each_witness(monkeypatch, corruption):
+    case = _tiny_prepared_matched_source_case(monkeypatch)
+    cache = {}
+    assert execution._verify_route_a_matched_fact_source(case.facts, case.geometry,
+        **case.arguments, _prepared_source_cache=cache)
+    original = copy.deepcopy(case.facts)
+    changed = copy.deepcopy(case.facts)
+    if corruption == "instrument":
+        changed["instrument_spec"]["symbol"] = "INVENTED_CROSSED_SPEC"
+    elif corruption == "spread":
+        changed["half_spread_arrays"]["P75"]["entry_half_spread"]["shape"][0] += 1
+    elif corruption == "entry":
+        changed["trades"][0]["base_fill_witness"]["entry_mid_open"] += 0.5
+    elif corruption == "held":
+        changed["trades"][0]["base_fill_witness"]["held_bar_inputs"][0]["ohlc"]["Low"] -= 0.5
+    elif corruption == "swap-contract":
+        changed["exact_swap_accrual_contract"]["fixture_splice"] = True
+    elif corruption == "swap-cash":
+        changed["trades"][0]["executed_price_swap_capture"]["swap_dollars_exact"] += 0.5
+    else:
+        changed["trades"][0]["actual_initial_risk_dollars"] += 0.5
+    if corruption == "initial-risk":
+        # Source origin and executed-risk math remain separate existing gates.
+        assert execution._verify_route_a_matched_fact_source(changed, case.geometry,
+            **case.arguments, _prepared_source_cache=cache)
+        verified = execution._verify_route_a_matched_base_facts(changed)
+        assert verified["floor_status"] == "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH"
+        assert verified["authenticates_origin"] is False and verified["floor_reason_codes"]
+    else:
+        with pytest.raises((execution.AuthoritativeSearchExecutionError, ValueError)):
+            execution._verify_route_a_matched_fact_source(changed, case.geometry,
+                **case.arguments, _prepared_source_cache=cache)
+    assert case.build_calls == ["P75", "P95"]
+    assert case.facts == original
+
+
+def test_fresh_matched_source_call_rechecks_changed_original_frame(monkeypatch):
+    case = _tiny_prepared_matched_source_case(monkeypatch)
+    assert execution._verify_route_a_matched_fact_source(case.facts, case.geometry,
+        **case.arguments, _prepared_source_cache={})
+    changed = case.arguments["source_frame"].copy(deep=True)
+    changed.iloc[0, changed.columns.get_loc("Close")] += 0.5
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._verify_route_a_matched_fact_source(case.facts, case.geometry,
+            **{**case.arguments, "source_frame": changed}, _prepared_source_cache={})
+    assert caught.value.code == "MATCHED_FLOOR_PARTITION_SOURCE_CHANGED"

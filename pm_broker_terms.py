@@ -17,7 +17,10 @@ import os
 import secrets
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from copy import deepcopy
+from contextvars import ContextVar
+from functools import wraps
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1188,12 +1191,17 @@ def _receipt_backed_price_authority_scope(
     """Open the sole receipt-backed price authority scope for one operation."""
 
     from pm_native_activation import (
+        _PRODUCTION_NATIVE_AUTHORITY_SCOPE,
         production_native_authority_verification_scope,
     )
 
     native_root = Path(native_root).resolve()
+    current = _PRODUCTION_NATIVE_AUTHORITY_SCOPE.get()
     try:
-        with production_native_authority_verification_scope() as scope:
+        with (nullcontext(current) if current is not None
+                else production_native_authority_verification_scope()) as scope:
+            if current is not None:
+                scope._assert_live_owner()
             authority = scope.verify_receipt_backed_authority(native_root.parent)
             price = _receipt_backed_price_view(native_root, authority)
 
@@ -3466,6 +3474,32 @@ def _resolve_active_swap_contract_with_price_authority(
     }
 
 
+_SWAP_CONTRACT_STATE = ContextVar("fxpm_owned_swap_contracts", default=None)
+
+
+@contextmanager
+def _owned_swap_source_scope():
+    current = _SWAP_CONTRACT_STATE.get()
+    if current is not None:
+        yield current
+        return
+    state = {}
+    token = _SWAP_CONTRACT_STATE.set(state)
+    try:
+        yield state
+    finally:
+        state.clear()
+        _SWAP_CONTRACT_STATE.reset(token)
+
+
+def _owned_swap_source_call(function):
+    @wraps(function)
+    def owned(*args, **kwargs):
+        with _owned_swap_source_scope():
+            return function(*args, **kwargs)
+    return owned
+
+
 def resolve_active_swap_contract(
     native_root: Path,
     symbol: str,
@@ -3473,18 +3507,32 @@ def resolve_active_swap_contract(
 ) -> Dict[str, Any]:
     """Resolve one terms contract without reopening any raw price leaf."""
 
+    from pm_native_activation import _PRODUCTION_NATIVE_AUTHORITY_SCOPE
+
     native_root = Path(native_root).resolve()
+    scope = _PRODUCTION_NATIVE_AUTHORITY_SCOPE.get()
+    state = _SWAP_CONTRACT_STATE.get()
+    key = (os.path.normcase(str(native_root)), str(symbol or "").strip().casefold(),
+        str(timeframe or "").strip().upper())
+    if state is not None:
+        if scope is not None:
+            scope._assert_live_owner()
+        if key in state:
+            return deepcopy(state[key])
     with _receipt_backed_price_authority_scope(native_root) as (
         price,
         revalidate_price_authority,
     ):
-        return _resolve_active_swap_contract_with_price_authority(
+        resolved = _resolve_active_swap_contract_with_price_authority(
             native_root,
             symbol,
             timeframe,
             price=price,
             revalidate_price_authority=revalidate_price_authority,
         )
+    if state is not None and type(resolved) is dict and resolved.get("status") == "AVAILABLE":
+        state[key] = deepcopy(resolved)
+    return resolved
 
 
 def write_capture_request(

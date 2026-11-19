@@ -86,12 +86,24 @@ def recorded_case(root, *, outcomes=("NO_TRADE",), retire=True, account_payload=
         native_universe_sha256=contract["native_universe_sha256"], config_sha256=contract["config_sha256"],
         limits=spool.SpoolLimits(**contract["spool_limits"]), owned_workspace={"cell_id": cell["cell"]["cell_id"],
             "cell_contract_sha256": scheduler._declared_m5_cell_contract_sha256(contract, cell)})
+    run_sha, process_sha, precommit_sha = sha("invented-run"), sha("invented-process"), sha("invented-precommit")
+    scope = orchestration._declared_development_scope_body(roster, dev["development_slot_ids"])
     sink = spool.open_symbol_sink(context, "SOFTWARE_COMPLETION_FIXTURE")
-    payload = {"fixture_provenance": PROVENANCE, "account": account_payload}
+    payload = {"schema_version": "fxpm.declared-development-m5-cell-raw-account.v1",
+        "fixture_provenance": PROVENANCE, "account": account_payload if account_payload is not None else {"fixture_provenance": PROVENANCE},
+        "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
+        "declared_precommit_sha256": precommit_sha, "search_process_receipt_sha256": process_sha,
+        "cell": cell["cell"], "source_kind": "m5_derived", "result_kind": "DEVELOPMENT_PARTIAL",
+        "design_contaminated": True, "pristine_validation": False,
+        "progress_status": "DEVELOPMENT_COMPLETE", "development_scope": scope,
+        "development_scope_sha256": sha(scope), "saved_cell_run_receipt_sha256": run_sha,
+        "slot_summaries": [{"slot_id": slot["slot_id"], "ordinal": slot["ordinal"],
+            "status": "OWNER" if outcome == "WINNER" else "NO_TRADE", "commit_sha256": sha("invented-commit-" + slot["slot_id"])}
+            for slot, outcome in zip(slots, outcomes, strict=True)],
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False}
     account_entry = sink.put_json("invented-account", "software_fixture", payload)
     sink.seal()
     account_sha = account_entry["descriptor"]["sha256"]
-    run_sha, process_sha, precommit_sha = sha("invented-run"), sha("invented-process"), sha("invented-precommit")
     binding = {"m5_view_contract_sha256": sha("invented-view-contract"),
         "generation_context_sha256": context.context_sha256, "config_sha256": contract["config_sha256"],
         "effective_config_sha256": "e" * 64, "search_process_receipt_sha256": process_sha,
@@ -102,6 +114,8 @@ def recorded_case(root, *, outcomes=("NO_TRADE",), retire=True, account_payload=
     terminal_consumer = sha("invented-terminal-consumer")
     grid_root = Path(dev["end_grid_root"])
     grid_root.mkdir(parents=True, exist_ok=True)
+    retained_account = scheduler._declared_retain_account_result(context, account_entry["descriptor"],
+        end_grid_root=grid_root, account_body=payload)
     for slot, outcome in zip(slots, outcomes):
         slot_id = slot["slot_id"]
         commit_sha, consumer = sha("invented-commit-" + slot_id), sha("invented-consumer-" + slot_id)
@@ -118,6 +132,7 @@ def recorded_case(root, *, outcomes=("NO_TRADE",), retire=True, account_payload=
             body["terminal_account_reference"] = {"semantics": "FINAL_SELECTED_SLOT_ROW_WITH_SEPARATE_ACCOUNT_BINDING",
                 "account_artifact_sha256": account_sha, "cell_run_receipt_sha256": run_sha,
                 "actual_terminal_consumer_sha256": [terminal_consumer]}
+            body["retained_account_result"] = retained_account
         result = outcome in {"WINNER", "NO_TRADE"}
         view_sha = grid.store_view_contract(grid_root, body) if result else None
         row = grid.build_end_grid_row(symbol="XAGUSD", timeframe="H1", regime="TREND",
@@ -148,6 +163,7 @@ def recorded_case(root, *, outcomes=("NO_TRADE",), retire=True, account_payload=
     fence_path = Path(dev["source_fence_path"])
     fence = {"schema_version": "fxpm.declared-m5-development-source-fence.v1", "fixture_provenance": PROVENANCE,
         "workspace_owner_sha256": spool.read_owned_generation_workspace(context)[1], "end_grid_rows": references,
+        "retained_account_result": retained_account,
         "source_summary": {"binding": binding, "results": results, "owned_values_released": True,
             "release_eligible": True, "full_native_context_eligibility": False, "financial_consumer_ready": False},
         **scheduler._DECLARED_M5_SCOPE}
@@ -169,7 +185,8 @@ def recorded_case(root, *, outcomes=("NO_TRADE",), retire=True, account_payload=
         "errors": [], "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False}
     return {"contract": contract, "dispatch": dispatch, "rows": rows, "context": context,
         "archive": archived if retire else None, "roster": roster,
-        "retirement": retirement, "fence": fence, "fence_path": fence_path, "account_sha": account_sha}
+        "retirement": retirement, "fence": fence, "fence_path": fence_path, "account_sha": account_sha,
+        "retained_account_result": retained_account, "account_body": payload}
 
 
 def projected_periods(env):
@@ -316,3 +333,33 @@ def test_native_dispatch_is_not_silently_shortened(tmp_path):
     contract["schema_version"] = scheduler.DECLARED_SCHEDULER_SCHEMA
     with pytest.raises(scheduler.HistoricalSchedulerError, match="DECLARED_M5_CONTRACT_INVALID"):
         scheduler._declared_development_expected(contract)
+
+
+def test_m5_final_account_survives_real_retirement_as_original_json(tmp_path):
+    """Retirement must keep account data, rather than only a dangling descriptor."""
+    env = recorded_case(tmp_path, account_payload={"engine_result": {"fixture_provenance": PROVENANCE,
+        "trades": [], "equity_curve": [10000.0, 10000.0], "cash": 10000.0}})
+    reference = env["archive"]["retained_account_result"]
+    raw = Path(reference["path"]).read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == env["account_sha"] == reference["sha256"]
+    assert len(raw) == reference["size_bytes"]
+    assert json.loads(raw) == env["account_body"]
+    assert not Path(reference["path"]).is_relative_to(env["context"].root)
+    reopened = spool.read_generation_retirement(env["context"].root)
+    assert reopened["retained_account_result"] == reference
+    assert reopened["genuine_cold_reopen_available"] is False
+
+
+@pytest.mark.parametrize("change", ["missing", "changed"])
+def test_m5_missing_or_changed_final_account_prevents_retirement(tmp_path, change):
+    """The source workspace cannot be deleted after the only account copy is lost."""
+    env = recorded_case(tmp_path, retire=False)
+    path = Path(env["retained_account_result"]["path"])
+    if change == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b"{}")
+    with pytest.raises(spool.AuthoritySpoolError):
+        spool.retire_completed_generation(env["context"].root, **env["retirement"])
+    assert (env["context"].root / spool.CONTEXT_RELATIVE_PATH).exists()
+    assert not (env["context"].root / spool.RETIREMENT_RELATIVE_PATH).exists()

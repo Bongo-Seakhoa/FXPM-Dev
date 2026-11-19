@@ -3850,3 +3850,85 @@ def test_symbol_worker_bundle_coherent_symbol_tamper_fails_before_registration(
             coherently_resealed,
         )
     assert parent_sink.artifact_roster() == []
+
+
+def _use_low_legacy_symbol_context(monkeypatch):
+    def low_context(tmp_path):
+        return spool.freeze_generation_context(tmp_path / "authority",
+            generation_id="historical-adapter-generation-001", native_universe_sha256="b" * 64,
+            config_sha256="c" * 64, limits=spool.SpoolLimits(max_symbol_bytes=1))
+    monkeypatch.setitem(globals(), "_context", low_context)
+
+
+def test_real_descriptor_graph_replay_keeps_all_entries_above_legacy_symbol_cap(tmp_path, monkeypatch):
+    # Reuse the complete existing graph/bijection oracle with a legitimately frozen low limit.
+    _use_low_legacy_symbol_context(monkeypatch)
+    test_terminal_technical_persisted_adapter_graph_replays_exact_cell_bijection(tmp_path, monkeypatch)
+    context = spool.reopen_generation_context(tmp_path / "authority")
+    assert context.limits.max_symbol_bytes == 1
+    assert spool.spool_quota._read_state(context.root)["committed_bytes"] > 1
+
+
+def test_real_worker_bundle_reopen_keeps_roster_and_digest_checks_above_legacy_symbol_cap(tmp_path, monkeypatch):
+    _use_low_legacy_symbol_context(monkeypatch)
+    context, anchor, worker_request, symbol, descriptor, worker_product = _spool_terminal_worker_bundle(tmp_path, monkeypatch)
+    worker_roster = worker_request.symbol_sink(symbol).artifact_roster()
+    assert sum(entry["descriptor"]["size_bytes"] for entry in worker_roster) > context.limits.max_symbol_bytes
+    parent_request = _request(context, anchor)
+    reopened = adapter.reopen_historical_symbol_worker_bundle(context, parent_request, descriptor)
+    assert _worker_bridge_product_surface(reopened) == _worker_bridge_product_surface(worker_product)
+    assert parent_request.symbol_sink(symbol).artifact_roster() == worker_roster
+    changed = _read_descriptor_json(context, descriptor)
+    changed["artifact_total_bytes"] += 1
+    wrong_descriptor = spool.write_canonical_json_artifact(context, changed)
+    fresh_request = _request(context, anchor)
+    with pytest.raises(adapter.HistoricalProductionAdapterError, match="WORKER_ARTIFACT_ROSTER_INVALID"):
+        adapter.reopen_historical_symbol_worker_bundle(context, fresh_request, wrong_descriptor)
+    assert fresh_request.symbol_sink(symbol).artifact_roster() == []
+
+
+def test_forward_prefix_byte_metadata_does_not_gate_real_roster_or_row_checks(monkeypatch):
+    """Invented prefix identity counts test this helper, not native authentication."""
+    import pm_forward_oos_replay_producer as forward
+
+    anchor = "invented-byte-admission"
+    plan = {"anchor_id": anchor, "forward_end_date": "2026-01-31"}
+    key = "AUDUSD|M5"
+    identity_rows = 1
+    def identity(product, **kwargs):
+        return {"role": kwargs["role"], "prefix_rows": identity_rows, "prefix_bytes": 9 * 1024**3}
+    monkeypatch.setattr(forward, "_native_product_identity", identity)
+    kwargs = dict(plans=[plan], capital_phase_windows_by_anchor={anchor: {}},
+        required={anchor: {"execution_product_keys": [key], "valuation_m5_product_keys": [key]}},
+        execution_products_by_anchor={anchor: {key: object()}}, valuation_products_by_anchor={anchor: {key: object()}})
+    result = forward._product_roster_identities(**kwargs)
+    assert result[0]["execution_products"][0]["prefix_bytes"] == 9 * 1024**3
+    assert result[0]["valuation_m5_products"][0]["prefix_bytes"] == 9 * 1024**3
+    identity_rows = forward._MAX_NATIVE_ROWS_PER_ANCHOR + 1
+    with pytest.raises(forward.ForwardOOSReplayProductionError, match="FORWARD_PRECOMMIT_NATIVE_ROW_BOUND_EXCEEDED"):
+        forward._product_roster_identities(**kwargs)
+    kwargs["valuation_products_by_anchor"] = {anchor: {}}
+    with pytest.raises(forward.ForwardOOSReplayProductionError, match="FORWARD_M5_VALUATION_PRODUCT_ROSTER_MISMATCH"):
+        forward._product_roster_identities(**kwargs)
+
+
+# Existing invented-authentication fixture; no market source or model fitting is introduced.
+from tests.test_declared_cell_account_transport import synthetic_declared_transport, synthetic_declared_complete_inputs
+
+
+def test_actual_native_account_frame_helper_ignores_retired_byte_accounting(synthetic_declared_complete_inputs, monkeypatch):
+    import pandas as pd
+    import pm_forward_oos_replay_producer as forward
+
+    env = synthetic_declared_complete_inputs
+    profile = forward.spread_profile.load_spread_profile(env.profile_path)
+    monkeypatch.setattr(pd.DataFrame, "memory_usage", lambda self, *args, **kwargs: pd.Series([9 * 1024**3]))
+    kwargs = dict(inputs=env.inputs, execution_frame=env.execution_frame, fine_frame=env.fine_frame,
+        profile=profile, spec=env.spec, execution_identity=env.identities["H1"], spread_identity=env.identities["M5"])
+    features, owners, _, observations, matched, warmup = forward._declared_cell_native_frames(**kwargs)
+    pd.testing.assert_index_equal(features.index, env.execution_frame.index)
+    assert len(owners) == 1 and warmup == 220 and observations.notna().all()
+    assert len(matched) == len(features)
+    kwargs["execution_frame"] = env.execution_frame.iloc[:-1].copy(deep=True)
+    with pytest.raises(forward.ForwardOOSReplayProductionError, match="DECLARED_CELL_TERMINAL_BOUNDARY_UNAVAILABLE"):
+        forward._declared_cell_native_frames(**kwargs)

@@ -10,6 +10,7 @@ import struct
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -62,6 +63,7 @@ CURRENT_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v4"
 V16_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v5"
 BOUND_FIT_V15_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v6"
 BOUND_FIT_V16_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v7"
+BOUND_FIT_V17_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v9"
 FROZEN_COST_LADDER_CONTRACT_SCHEMA = BACKTEST_COST_LADDER_CONTRACT_SCHEMA_VERSION
 ARCHIVED_RAW_LANE_SCHEMA = "fxpm.winner-raw-backtester-lane.v4"
 RAW_LANE_SCHEMA = ARCHIVED_RAW_LANE_SCHEMA
@@ -77,6 +79,7 @@ ARCHIVED_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v4"
 PRODUCTION_SCHEMA = ARCHIVED_PRODUCTION_SCHEMA
 CURRENT_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v5"
 V16_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v6"
+V17_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v7"
 ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v3"
 AUTHORITATIVE_PROVENANCE_SCHEMA = ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA
 CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v4"
@@ -91,6 +94,8 @@ HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3 = "fxpm.historical-horizon-win
 CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 = "fxpm.horizon-winner-cross-binding.v4"
 HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 = "fxpm.historical-horizon-winner-cross-binding.v4"
 CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 = "fxpm.horizon-winner-cross-binding.v5"
+HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 = "fxpm.historical-horizon-winner-cross-binding.v5"
+CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6 = "fxpm.horizon-winner-cross-binding.v6"
 HISTORICAL_CROSS_BINDING_MODE = "HISTORICAL"
 CURRENT_CROSS_BINDING_MODE = "CURRENT"
 PARTITION_GEOMETRY_SCHEMA = "fxpm.winner-partition-geometry.v1"
@@ -1755,6 +1760,10 @@ def _restored_frozen_context_identity(context_identity: Any) -> dict[str, str]:
 
 
 def _bound_frozen_schema(generation, present):
+    if generation is winner.V17_GENERATION:
+        if not present:
+            _fail("MATCHED_FLOOR_BOUND_FIT_REQUIRED")
+        return BOUND_FIT_V17_FROZEN_PLAN_SCHEMA
     if present:
         return BOUND_FIT_V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else BOUND_FIT_V15_FROZEN_PLAN_SCHEMA
     return V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA
@@ -1819,6 +1828,18 @@ def _build_frozen_winner_search_plan_receipt(
     }
 
 
+def _plan_freeze_publication_batch(function):
+    @wraps(function)
+    def freeze(*args, **kwargs):
+        sink = args[0] if args else kwargs.get("sink")
+        if type(sink) is not SymbolAuthoritySink:
+            return function(*args, **kwargs)
+        with authority_spool.publication_batch(sink.context):
+            return function(*args, **kwargs)
+    return freeze
+
+
+@_plan_freeze_publication_batch
 def _freeze_winner_search_plan(
     sink: SymbolAuthoritySink,
     *,
@@ -1837,6 +1858,7 @@ def _freeze_winner_search_plan(
     partition_cost_precommitments: Mapping[str, Any],
     artifact_namespace: Optional[str] = None,
     bound_fitted_state_entry=None,
+    selection_complexity_roster=None,
     _generation=winner.CURRENT_GENERATION,
 ) -> FrozenWinnerSearchPlan:
     """Freeze exact attempt/fold truth and persist it before evaluation.
@@ -1953,6 +1975,13 @@ def _freeze_winner_search_plan(
         "causal_fold_plan": normalized_folds,
         "latest_evidence_boundary_utc": latest_boundary,
     }
+    if _generation is winner.V17_GENERATION:
+        complexity = winner.validate_selection_complexity_roster(selection_complexity_roster,
+            attempts=attempts, expected_count=len(attempts))
+        precommitment.update(selection_addendum_contract=dict(winner.V17_SELECTION_ADDENDUM_CONTRACT),
+            selection_complexity_roster=complexity, selection_complexity_roster_sha256=_sha_json(complexity))
+    elif selection_complexity_roster is not None:
+        _fail("LEGACY_SELECTION_COMPLEXITY_FORBIDDEN")
     precommitment_sha = _sha_json(precommitment)
     attempt_ledger = {
         "contract_version": winner.ATTEMPT_LEDGER_VERSION,
@@ -3571,6 +3600,7 @@ def _validated_horizon_winner_cross_binding(
     schema = binding.get("schema_version")
     current_pair = bool(frozen.frozen_tier_pair_contract_bytes)
     transport_v16 = frozen.selection_generation is winner.V16_GENERATION
+    matched_v17 = frozen.selection_generation is winner.V17_GENERATION
     m5_window = None
     if current_pair:
         pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
@@ -3578,9 +3608,9 @@ def _validated_horizon_winner_cross_binding(
             [item["frozen_spread_tier"] for item in pair["tiers"]],
             symbol=frozen.symbol, timeframe=frozen.timeframe,
         )
-    historical_schema = (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if transport_v16
+    historical_schema = (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 if matched_v17 else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if transport_v16
         else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3 if current_pair else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
-    current_schema = (CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 if transport_v16
+    current_schema = (CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6 if matched_v17 else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 if transport_v16
         else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if current_pair else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
     if schema == historical_schema:
         mode = HISTORICAL_CROSS_BINDING_MODE
@@ -5590,12 +5620,14 @@ def verify_historical_frozen_winner_cross_binding(
         CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA,
         CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
         CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5,
+        CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6,
     }:
         _fail("HISTORICAL_CROSS_BINDING_CURRENT_PLAN_FORBIDDEN")
     receipt = _decode_object(frozen.frozen_receipt_bytes, "FROZEN_RECEIPT_INVALID")
     if (receipt.get("schema_version") != _bound_frozen_schema(generation, bool(frozen.bound_fitted_state_entry_bytes))
             or not frozen.frozen_tier_pair_contract_bytes
-            or binding.get("schema_version") != (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
+            or binding.get("schema_version") != (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
+                if generation is winner.V17_GENERATION else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
                 if generation is winner.V16_GENERATION else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3)):
         _fail("PROVENANCE_CROSS_BINDING_SCHEMA_INVALID")
     attempts = _verified_frozen_attempt_bundle(frozen=frozen,
@@ -5612,10 +5644,61 @@ def _check_cumulative_completed_trades(total, generation):
 
 
 def _verify_produced_winner_decision(decision, request, generation):
-    if not winner.verify_historical_cell_winner_decision(decision, request):
-        if generation is winner.V16_GENERATION:
-            _fail("WINNER_V16_DECISION_VERIFICATION_FAILED", ",".join(decision.reason_codes))
-        _fail("WINNER_V15_DECISION_VERIFICATION_FAILED")
+    # This call owns the just-built request and the evaluator's immutable result.
+    body = None
+    try:
+        if (type(decision) is winner.WinnerSelectionDecision
+                and type(request) is winner.WinnerSelectionRequest
+                and type(request.precommitment) is winner.WinnerPrecommitmentPayload
+                and type(request.attempt_ledger) is winner.WinnerAttemptLedgerPayload
+                and type(request.evidence_ledger) is winner.WinnerEvidenceLedgerPayload):
+            encoded = decision._body_json
+            if type(encoded) is bytes and len(encoded) <= winner.MAX_DECISION_BYTES:
+                body = _decode_object(encoded, "WINNER_DECISION_BODY_INVALID")
+                payload_hashes = (
+                    request.precommitment.payload_sha256,
+                    request.attempt_ledger.payload_sha256,
+                    request.evidence_ledger.payload_sha256,
+                )
+                expected_request_sha = _sha_json(winner._request_binding_body(
+                    *payload_hashes, _generation=generation))
+                if (all(type(value) is str for value in payload_hashes)
+                        and type(request.request_sha256) is str
+                        and type(decision._receipt_sha256) is str
+                        and decision._receipt_sha256 == hashlib.sha256(encoded).hexdigest()
+                        and body.get("status") != "REJECTED"
+                        and body.get("validated") is True
+                        and body.get("selection_scope") == winner.WINNER_SELECTION_SCOPE
+                        and body.get("evidence_scope") == "PROCESS_LEVEL_ONLY"
+                        and body.get("parameter_evidence_inherited") is False
+                        and body.get("contract_version") == generation.selection_version
+                        and body.get("request_contract_version") == generation.request_version
+                        and all(body.get(flag) is False for flag in (
+                            "live_authorized", "capital_sizing_authorized",
+                            "profitability_claimed", "production_integrated"))
+                        and request.request_sha256 == expected_request_sha
+                        and body.get("request_sha256") == expected_request_sha
+                        and body.get("precommitment_payload_sha256") == payload_hashes[0]
+                        and body.get("attempt_ledger_payload_sha256") == payload_hashes[1]
+                        and body.get("evidence_ledger_payload_sha256") == payload_hashes[2]):
+                    return body
+    except Exception:
+        pass
+    reasons = body.get("reason_codes", ()) if type(body) is dict else ()
+    detail = ",".join(reasons) if type(reasons) in (list, tuple) and all(
+        type(reason) is str for reason in reasons) else ""
+    if generation is winner.V17_GENERATION:
+        _fail("WINNER_V17_DECISION_VERIFICATION_FAILED", detail)
+    if generation is winner.V16_GENERATION:
+        _fail("WINNER_V16_DECISION_VERIFICATION_FAILED", detail)
+    _fail("WINNER_V15_DECISION_VERIFICATION_FAILED")
+
+
+def _evaluate_produced_winner_decision(request, generation):
+    decision = winner.evaluate_historical_cell_winner(request)
+    body = _verify_produced_winner_decision(decision, request, generation)
+    marginal = winner._historical_book_marginal_from_body(body, decision._receipt_sha256)
+    return decision, marginal
 
 
 def _produce_winner_raw_evidence(
@@ -5700,6 +5783,8 @@ def _produce_winner_raw_evidence(
         _fail("EVIDENCE_ACCESS_INTERVAL_INVALID")
     raw_iterator = iter(attempt_evidence)
     evidence_entries: list[dict[str, Any]] = []
+    matched_entries = []
+    matched_array_entries = {}
     spool_entries: dict[str, dict[str, Any]] = {}
     source_observation_entries: dict[str, dict[str, Any]] = {}
     provenance_schemas: set[str] = set()
@@ -5749,10 +5834,15 @@ def _produce_winner_raw_evidence(
                 evidence_entries.append(
                     _evidence_entry(attempt, status=status, folds=[])
                 )
+                if _generation is winner.V17_GENERATION:
+                    matched_entries.append({"ordinal": ordinal, "attempt_id": attempt["attempt_id"],
+                        "process_candidate_id": attempt["process_candidate_id"], "stage_origin_binding": None, "partition_witnesses_descriptor": None,
+                        "full_witnesses_sha256": None, "partition_statuses": [], "final_folds": []})
                 continue
             if attempt["precommitted_evidence_role"] != "EVALUATION_REQUIRED":
                 _fail(f"ATTEMPT_{ordinal:04d}_PRESEARCH_REJECTED_CARRIES_RAW_FOLDS")
-            if set(raw) != {"attempt_id", "folds"}:
+            if set(raw) != ({"attempt_id", "folds", "selection_addendum"}
+                    if _generation is winner.V17_GENERATION else {"attempt_id", "folds"}):
                 _fail(f"ATTEMPT_{ordinal:04d}_EVIDENCE_SCHEMA_INVALID")
             raw_folds = raw.get("folds")
             planned_folds = precommitment["causal_fold_plan"]
@@ -5836,6 +5926,13 @@ def _produce_winner_raw_evidence(
                     folds=finalized_folds,
                 )
             )
+            if _generation is winner.V17_GENERATION:
+                added, proof_entries = _build_matched_floor_attempt_addendum(sink=sink,
+                    frozen=frozen, attempt=attempt, witnesses=raw["selection_addendum"], raw_folds=raw_folds,
+                    shared_axis=attempt_shared_axis, partition_cost_index=partition_cost_index,
+                    cross_binding_attempt=cross_binding_attempt, array_entries=matched_array_entries)
+                matched_entries.append(added)
+                spool_entries.update(proof_entries)
     try:
         next(raw_iterator)
     except StopIteration:
@@ -5889,29 +5986,34 @@ def _produce_winner_raw_evidence(
         "evidence_scope": "PROCESS_LEVEL_ONLY",
         "parameter_evidence_inherited": False,
     }
+    if _generation is winner.V17_GENERATION:
+        evidence_ledger["selection_addendum"] = {"contract_version": "fxpm.matched-floor-selection-evidence.v1",
+            "precommitment_payload_sha256": _sha_json(precommitment),
+            "attempt_ledger_payload_sha256": _sha_json(attempt_ledger),
+            "selection_complexity_roster_sha256": precommitment["selection_complexity_roster_sha256"],
+            "entries": matched_entries, "entries_sha256": _sha_json(matched_entries)}
     partition_cost_index.source_inputs.finish(frozen=frozen, sink=sink)
-    request_builder = (winner.create_winner_selection_request_v16 if _generation is winner.V16_GENERATION
+    request_builder = (winner.create_winner_selection_request_v17 if _generation is winner.V17_GENERATION
+        else winner.create_winner_selection_request_v16 if _generation is winner.V16_GENERATION
         else winner.create_winner_selection_request)
     try:
         request = request_builder(precommitment, attempt_ledger, evidence_ledger)
     except ValueError as exc:
         raise WinnerRawEvidenceError(str(exc)) from exc
-    if _generation is not winner.V16_GENERATION:
+    if _generation not in (winner.V16_GENERATION, winner.V17_GENERATION):
         if request is None:
             _fail("WINNER_V15_REQUEST_REJECTED")
         if len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes:
             _fail("WINNER_V15_REQUEST_BYTE_BOUND_EXCEEDED")
-    decision = winner.evaluate_historical_cell_winner(request)
-    _verify_produced_winner_decision(decision, request, _generation)
-    marginal = winner.historical_book_marginal_receipt(decision, request)
+    decision, marginal = _evaluate_produced_winner_decision(request, _generation)
     prefix = (
         f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}"
         "/authority"
     )
     final_bodies = {
         "evidence-ledger": ("winner_evidence_ledger", evidence_ledger),
-        "winner-request": ("winner_v16_request" if _generation is winner.V16_GENERATION else "winner_v15_request", request.to_dict()),
-        "winner-decision": ("winner_v16_decision" if _generation is winner.V16_GENERATION else "winner_v15_decision", decision.to_dict()),
+        "winner-request": ("winner_v17_request" if _generation is winner.V17_GENERATION else "winner_v16_request" if _generation is winner.V16_GENERATION else "winner_v15_request", request.to_dict()),
+        "winner-decision": ("winner_v17_decision" if _generation is winner.V17_GENERATION else "winner_v16_decision" if _generation is winner.V16_GENERATION else "winner_v15_decision", decision.to_dict()),
     }
     if marginal is not None:
         final_bodies["book-marginal-receipt"] = (
@@ -5923,7 +6025,7 @@ def _produce_winner_raw_evidence(
             sink, f"{prefix}/{name}", artifact_type, body
         )
     production = {
-        "schema_version": V16_PRODUCTION_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_PRODUCTION_SCHEMA,
+        "schema_version": V17_PRODUCTION_SCHEMA if _generation is winner.V17_GENERATION else V16_PRODUCTION_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_PRODUCTION_SCHEMA,
         "generation_context_sha256": sink.context.context_sha256,
         "run_id": precommitment["run_id"],
         "artifact_namespace": frozen.artifact_namespace,
@@ -6079,3 +6181,345 @@ __all__ = [
 __all__ += ["BOUND_FIT_V15_FROZEN_PLAN_SCHEMA", "BOUND_FIT_V16_FROZEN_PLAN_SCHEMA",
     "freeze_winner_search_plan_v6", "freeze_winner_search_plan_v7",
     "restore_frozen_winner_search_plan_v6", "restore_frozen_winner_search_plan_v7"]
+
+
+def freeze_winner_search_plan_v9(sink, *, symbol, timeframe, regime, precommitted_at_utc, attempts_frozen_at_utc,
+        fold_plan, attempt_artifacts, precommitted_evidence_roles, horizon_execution_contracts, source_contract_seeds,
+        frozen_tier_pair_contract, risk_unit_contract, partition_cost_precommitments, bound_fitted_state_entry,
+        selection_complexity_roster, artifact_namespace=None):
+    if bound_fitted_state_entry is None:
+        _fail("BOUND_FIT_REFERENCE_REQUIRED")
+    return _freeze_winner_search_plan(**locals(), _generation=winner.V17_GENERATION)
+
+
+def restore_frozen_winner_search_plan_v9(*, context_identity, symbol, timeframe, regime, artifact_namespace, manifest_entries, body_bytes):
+    return _restore_frozen_winner_search_plan(**locals(), _generation=winner.V17_GENERATION, _bound_fit=True)
+
+
+def produce_winner_v17_raw_evidence(sink, *, frozen, attempt_evidence, evidence_access_started_at_utc,
+        evidence_access_completed_at_utc, provenance_cross_binding_bytes=None, production_cell_search_plan=None,
+        production_search_process=None, artifact_namespace=None):
+    return _produce_winner_raw_evidence(**locals(), _generation=winner.V17_GENERATION)
+
+
+__all__.extend(["V17_PRODUCTION_SCHEMA", "BOUND_FIT_V17_FROZEN_PLAN_SCHEMA",
+    "HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5", "CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6",
+    "freeze_winner_search_plan_v9", "restore_frozen_winner_search_plan_v9", "produce_winner_v17_raw_evidence"])
+
+
+def _build_matched_floor_attempt_addendum(*, sink, frozen, attempt, witnesses, raw_folds,
+        shared_axis, partition_cost_index, cross_binding_attempt, array_entries):
+    import pm_authoritative_search_execution as execution
+    if type(witnesses) is not dict or set(witnesses) != {"capture", "prepared_stage", "unit"}:
+        _fail("MATCHED_FLOOR_AUTHENTICATED_STAGE_REQUIRED")
+    capture = witnesses["capture"]
+    if getattr(capture, "sink", None) is not sink:
+        _fail("MATCHED_FLOOR_ORIGINAL_CAPTURE_SINK_REQUIRED")
+    facts, origin = execution._verify_route_a_prepared_stage_origin(witnesses["prepared_stage"],
+        capture=capture, frozen=frozen, unit=witnesses["unit"],
+        raw_body={"attempt_id": attempt["attempt_id"], "folds": raw_folds})
+    record = _matched_floor_attempt_record(frozen=frozen, attempt=attempt, witnesses=facts,
+        origin=origin, raw_folds=raw_folds, shared_axis=shared_axis,
+        partition_cost_index=partition_cost_index, cross_binding_attempt=cross_binding_attempt)
+    packed, proof_entries = _pack_matched_floor_witnesses(sink=sink, frozen=frozen, attempt=attempt,
+        witnesses=facts, array_entries=array_entries)
+    artifact_id = f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}/attempt-{attempt['ordinal']:04d}/matched-base-witnesses"
+    entry = _put_ascii_json(sink, artifact_id, "winner_matched_base_witnesses", packed)
+    record["partition_witnesses_descriptor"] = entry
+    proof_entries[f"attempt-{attempt['ordinal']:04d}-matched-base-witnesses"] = entry
+    return record, proof_entries
+
+
+def _matched_floor_attempt_record(*, frozen, attempt, witnesses, origin, raw_folds,
+        shared_axis, partition_cost_index, cross_binding_attempt):
+    import pm_authoritative_search_execution as execution
+    if type(witnesses) is not list or len(witnesses) != len(raw_folds) * 3:
+        _fail("MATCHED_FLOOR_COMPLETE_PARTITION_ROSTER_REQUIRED")
+    if (origin.get("precommitment_sha256") != _sha_json(frozen.precommitment)
+            or origin.get("matched_base_facts_sha256") != _sha_json(witnesses)
+            or origin.get("raw_body_sha256") != _sha_json({"attempt_id": attempt["attempt_id"], "folds": raw_folds})
+            or origin.get("unit", {}).get("ordinal") != attempt["ordinal"]
+            or origin.get("unit", {}).get("raw_attempt_id") != attempt["attempt_id"]):
+        _fail("MATCHED_FLOOR_STAGE_IDENTITY_SPLICE")
+    fields = {"attempt_ordinal", "raw_attempt_id", "horizon_attempt_id", "fold_ordinal", "partition_role",
+        "partition_geometry_receipt_sha256", "partition_frame_sha256", "partition_axis_sha256",
+        "cost_precommitment_receipt_sha256", "facts"}
+    verified_partitions, partition_statuses = {}, []
+    for index, item in enumerate(witnesses):
+        fold_ordinal, role_index = divmod(index, 3)
+        role = _PARTITIONS[role_index]
+        raw_fold = raw_folds[fold_ordinal]
+        lanes = raw_fold["lanes"]
+        geometries = _validated_partition_geometry(raw_fold["provenance"]["anchor_horizon_decision"]["partition_geometry"], lanes=lanes)
+        geometry = geometries[role_index]
+        cost_row = _selected_partition_cost_precommitments(frozen=frozen, attempt=attempt,
+            planned_fold=frozen.precommitment["causal_fold_plan"][fold_ordinal],
+            partition_cost_index=partition_cost_index)[role_index]
+        base = lanes[role + "_p75"]
+        facts = item.get("facts") if type(item) is dict else None
+        if (type(item) is not dict or set(item) != fields or type(facts) is not dict
+                or item["attempt_ordinal"] != attempt["ordinal"] or item["raw_attempt_id"] != attempt["attempt_id"]
+                or item["horizon_attempt_id"] != cross_binding_attempt["horizon_attempt_id"]
+                or item["fold_ordinal"] != fold_ordinal or item["partition_role"] != role
+                or item["partition_geometry_receipt_sha256"] != geometry["receipt_sha256"]
+                or item["partition_frame_sha256"] != geometry["frame_sha256"]
+                or item["partition_axis_sha256"] != _sha_json(base["trade_power_partition_axis"])
+                or item["cost_precommitment_receipt_sha256"] != frozen.partition_cost_precommitments["receipt_sha256"]
+                or cost_row["partition_geometry_receipt_sha256"] != geometry["receipt_sha256"]
+                or cost_row["partition_frame_sha256"] != geometry["frame_sha256"]
+                or facts.get("partition_role") != role
+                or facts.get("trade_power_partition_axis") != base["trade_power_partition_axis"]
+                or facts.get("base_position_events") != base["position_events"]
+                or facts.get("exact_swap_accrual_contract") != base["swap_accrual_contract"]):
+            _fail("MATCHED_FLOOR_FROZEN_PARTITION_OR_RAW_SPLICE")
+        expected_source = {"executor_release_sha256": execution.AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+            "backtest_source_contract_sha256": _validated_source_identity(frozen.source_contract_seeds["P75"]),
+            "instrument_spec_sha256": _sha_json(facts.get("instrument_spec")),
+            "caller": "pm_authoritative_search_execution._run_tier_partition", "backtester": "pm_core.Backtester.run",
+            "governance_policy": None, "entry_schedule": None, "terminal_policy": "LIQUIDATE",
+            "stop_provenance": "ORIGINAL_ENTRY_STOP_PRESERVED_BOTH_FIXED_CONTROL_BACKENDS"}
+        if (facts.get("initial_risk_source_binding") != expected_source
+                or [row.get("base_trade_identity") for row in facts.get("trades", [])]
+                    != _trade_identity_pnl_evidence(base, lane=role + "_p75")):
+            _fail("MATCHED_FLOOR_SOURCE_OR_TRADE_SPLICE")
+        for tier in _TIERS:
+            lane = lanes[role + "_" + tier.lower()]
+            attestation = lane["numerical_execution_cost_attestation"]
+            if (facts.get("numerical_execution_cost_attestations", {}).get(tier) != attestation
+                    or cost_row["tiers"][tier]["numerical_execution_cost_attestation"] != attestation):
+                _fail("MATCHED_FLOOR_COST_PRECOMMITMENT_OR_LANE_SPLICE")
+        verified = execution._verify_route_a_matched_base_facts(facts)
+        if verified.get("authenticates_origin") is not False:
+            _fail("MATCHED_FLOOR_SERIALIZED_VALIDATOR_SCOPE_INVALID")
+        if verified["floor_status"] == "REFUSED_P95_BELOW_P75":
+            _fail("P95_BELOW_P75")
+        verified_partitions[fold_ordinal, role] = verified
+        partition_statuses.append({"fold_ordinal": fold_ordinal, "partition_role": role,
+            "floor_status": verified["floor_status"], "floor_reason_codes": list(verified["floor_reason_codes"]),
+            "witness_sha256": _sha_json(item)})
+    finals = []
+    for ordinal, (raw_fold, axis) in enumerate(zip(raw_folds, shared_axis, strict=True)):
+        start = datetime.combine(_day(axis["oos_start_date_utc"], "MATCHED_FLOOR_AXIS_INVALID"), datetime.min.time(), tzinfo=timezone.utc)
+        end = datetime.combine(_day(axis["oos_end_date_utc"], "MATCHED_FLOOR_AXIS_INVALID") + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+        opens, closes, ids, opening, closing, _ = _tier_event_vectors(raw_fold["lanes"]["final_lockbox_p75"]["position_events"],
+            fold_start=start, fold_end_exclusive=end)
+        identity = dict(completed_trade_position_ids=ids, completed_trade_open_utc=opens,
+            completed_trade_close_utc=closes, completed_trade_open_event_order=opening,
+            completed_trade_close_event_order=closing)
+        verified = verified_partitions[ordinal, "final_lockbox"]
+        finals.append({"fold_ordinal": ordinal, "shared_fold_axis_row_sha256": _sha_json(axis),
+            "raw_shared_oos_partition_sha256": _sha_json(axis["shared_oos_partition"]),
+            "base_position_identity_sha256": _sha_json(identity), "base_position_identity": identity,
+            **{key: verified[key] for key in ("floor_status", "floor_reason_codes",
+                "base_actual_initial_risk_net_r", "matched_p95_spread_cost_r")}})
+    return {"ordinal": attempt["ordinal"], "attempt_id": attempt["attempt_id"],
+        "process_candidate_id": attempt["process_candidate_id"], "stage_origin_binding": origin,
+        "partition_witnesses_descriptor": None, "full_witnesses_sha256": _sha_json(witnesses),
+        "partition_statuses": partition_statuses, "final_folds": finals}
+
+
+def verify_matched_floor_publication_chain(context, *, frozen, request, producer_request,
+        manifest_entries, cross_binding, source_material):
+    """Cold-replay v17 witnesses against original published lanes and reopened source."""
+    import copy
+    import pm_authoritative_search_execution as execution
+    if frozen.selection_generation is not winner.V17_GENERATION:
+        _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
+    precommitment = request.precommitment.to_dict()
+    ledger = request.evidence_ledger.to_dict()
+    if precommitment != frozen.precommitment or request.attempt_ledger.to_dict() != frozen.attempt_ledger:
+        _fail("MATCHED_FLOOR_COLD_FROZEN_SPLICE")
+    entries = {entry["artifact_id"]: entry for entry in manifest_entries}
+    payload_cache, decoded_array_cache, prepared_source_cache = {}, {}, {}
+    def read(artifact_id):
+        entry = entries.get(artifact_id)
+        if entry is None:
+            _fail("MATCHED_FLOOR_PUBLISHED_ARTIFACT_MISSING")
+        descriptor = authority_spool._validate_descriptor(dict(entry["descriptor"]), content_addressed=True)
+        if descriptor["size_bytes"] > context.limits.max_artifact_bytes:
+            authority_spool._fail("ARTIFACT_SIZE_BOUND_EXCEEDED")
+        canonical_json = descriptor["format"] == authority_spool.CANONICAL_JSON_FORMAT
+        if canonical_json and descriptor["size_bytes"] > context.limits.max_json_bytes:
+            authority_spool._fail("JSON_SIZE_BOUND_EXCEEDED")
+        key = (_canonical_bytes(descriptor), entry.get("artifact_type"))
+        if key not in payload_cache:
+            digest, size, encoded = authority_spool._stream_file(context.root, descriptor["relative_path"],
+                maximum_bytes=context.limits.max_artifact_bytes, expected_size=descriptor["size_bytes"],
+                collect=True, chunk_bytes=context.limits.stream_chunk_bytes)
+            if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
+                authority_spool._fail("ARTIFACT_INTEGRITY_MISMATCH")
+            if canonical_json:
+                authority_spool._strict_json_bytes(encoded, context.limits.max_json_bytes)
+            payload_cache[key] = _decode_object(encoded, "MATCHED_FLOOR_PUBLISHED_ARTIFACT_INVALID")
+        return copy.deepcopy(payload_cache[key])
+    body = producer_request.to_dict()
+    header = execution._read_declared_unit_header(context, body)
+    if header is None:
+        _fail("MATCHED_FLOOR_ORIGINAL_HEADER_MISSING")
+    source_frame, spec, tiers, config = source_material
+    precommits = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
+        pair=frozen.frozen_tier_pair_contract, attempts=frozen.attempt_ledger["attempts"],
+        folds=precommitment["causal_fold_plan"])
+    index = _index_partition_cost_precommitments(frozen, precommits)
+    root = _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    for attempt, added, mapping in zip(frozen.attempt_ledger["attempts"],
+            ledger["selection_addendum"]["entries"], cross_binding["mapping"], strict=True):
+        if attempt["precommitted_evidence_role"] == "PRESEARCH_PROCESS_REJECTED":
+            continue
+        origin = added["stage_origin_binding"]
+        if (origin["producer_request_sha256"] != producer_request.receipt_sha256
+                or origin["process_receipt_sha256"] != body["search_process_receipt_sha256"]
+                or origin["frozen_receipt_sha256"] != frozen.frozen_receipt_entry["descriptor"]["sha256"]
+                or origin["declared_unit_binding_sha256"] != _sha_json(header["binding"])):
+            _fail("MATCHED_FLOOR_ORIGINAL_STAGE_CHAIN_CHANGED")
+        folds = []
+        for ordinal, planned in enumerate(precommitment["causal_fold_plan"]):
+            prefix = f"{root}/attempt-{attempt['ordinal']:04d}/fold-{ordinal:03d}"
+            lanes = {}
+            for lane in _LANE_KEYS:
+                published = read(prefix + "/raw/" + lane)
+                if (published.get("schema_version") != CURRENT_RAW_LANE_SCHEMA or published.get("lane") != lane
+                        or set(published) != {*execution._RAW_LANE_KEYS, "schema_version", "lane"}):
+                    _fail("MATCHED_FLOOR_PUBLISHED_LANE_SCHEMA_INVALID")
+                lanes[lane] = {key: published[key] for key in execution._RAW_LANE_KEYS}
+            folds.append({"fold_ordinal": ordinal, "lanes": lanes,
+                "provenance": {role: read(prefix + "/provenance/" + role) for role in _PROVENANCE_KEYS}})
+        packed_entry = added["partition_witnesses_descriptor"]
+        expected_id = f"{root}/attempt-{attempt['ordinal']:04d}/matched-base-witnesses"
+        if (packed_entry.get("artifact_id") != expected_id or packed_entry.get("artifact_type") != "winner_matched_base_witnesses"
+                or entries.get(expected_id) != packed_entry):
+            _fail("MATCHED_FLOOR_WITNESS_PUBLICATION_REFERENCE_CHANGED")
+        packed = read(expected_id)
+        witnesses = _expand_matched_floor_witnesses(packed, frozen=frozen, attempt=attempt,
+            raw_folds=folds, source_frame=source_frame, read=read, entries=entries,
+            _decoded_array_cache=decoded_array_cache)
+        if _sha_json(witnesses) != added["full_witnesses_sha256"]:
+            _fail("MATCHED_FLOOR_EXPANDED_WITNESS_HASH_CHANGED")
+        raw_body = {"attempt_id": attempt["attempt_id"], "folds": folds}
+        original = execution._read_declared_completed_unit(context, body,
+            origin["declared_unit_binding_sha256"], origin["unit"])
+        if original is None or _canonical_bytes(original[1]) != _canonical_bytes(raw_body):
+            _fail("MATCHED_FLOOR_ORIGINAL_COMPLETED_UNIT_CHANGED")
+        envelope = {"schema_version": "fxpm.route-a-prepared-full-panel-unit.v1",
+            "declared_unit_binding_sha256": origin["declared_unit_binding_sha256"],
+            "preparation_contract_sha256": origin["preparation_contract_sha256"],
+            "attempt_evidence": raw_body, "matched_base_facts": witnesses}
+        encoded = _canonical_bytes(envelope)
+        if hashlib.sha256(encoded).hexdigest() != origin["stage_content_sha256"] or len(encoded) != origin["stage_size_bytes"]:
+            _fail("MATCHED_FLOOR_ORIGINAL_STAGE_CONTENT_CHANGED")
+        for witness in witnesses:
+            fold = folds[witness["fold_ordinal"]]
+            geometry = next(row for row in fold["provenance"]["anchor_horizon_decision"]["partition_geometry"]
+                if row["role"] == witness["partition_role"])
+            execution._verify_route_a_matched_fact_source(witness["facts"], geometry,
+                source_frame=source_frame, spec=spec, tiers=tiers, config=config, timeframe=frozen.timeframe,
+                _prepared_source_cache=prepared_source_cache)
+        replay = _matched_floor_attempt_record(frozen=frozen, attempt=attempt,
+            witnesses=witnesses, origin=origin, raw_folds=folds,
+            shared_axis=ledger["shared_fold_axis"], partition_cost_index=index, cross_binding_attempt=mapping)
+        replay["partition_witnesses_descriptor"] = packed_entry
+        if _canonical_bytes(replay) != _canonical_bytes(added):
+            _fail("MATCHED_FLOOR_COLD_PUBLICATION_BINDING_CHANGED")
+    return True
+
+
+__all__.append("verify_matched_floor_publication_chain")
+
+
+def _pack_matched_floor_witnesses(*, sink, frozen, attempt, witnesses, array_entries):
+    """Reference identical array bytes and original source bars without weakening full hashes."""
+    root = _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    packed_rows, proof_entries = [], {}
+    for witness in witnesses:
+        facts = witness["facts"]
+        arrays = {}
+        for tier, legs in facts["half_spread_arrays"].items():
+            arrays[tier] = {}
+            for role, codec in legs.items():
+                digest = _sha_json(codec)
+                entry = array_entries.get(digest)
+                if entry is None:
+                    entry = _put_ascii_json(sink, root + "/matched-floor-arrays/" + digest,
+                        "winner_matched_spread_array", codec)
+                    array_entries[digest] = entry
+                if entry["descriptor"]["sha256"] != digest:
+                    _fail("MATCHED_FLOOR_ARRAY_CONTENT_ADDRESS_CHANGED")
+                arrays[tier][role] = entry
+                proof_entries["matched-array-" + digest] = entry
+        trades = []
+        for trade in facts["trades"]:
+            fill = dict(trade["base_fill_witness"])
+            held = fill.get("held_bar_inputs")
+            if (type(held) is list and held and all(type(row) is dict and type(row.get("bar")) is int for row in held)
+                    and [row["bar"] for row in held] == list(range(held[0]["bar"], held[-1]["bar"] + 1))):
+                fill["held_bar_inputs"] = {"schema_version": "fxpm.matched-floor-original-source-bars-reference.v1",
+                    "partition_geometry_receipt_sha256": witness["partition_geometry_receipt_sha256"],
+                    "partition_frame_sha256": witness["partition_frame_sha256"],
+                    "first_bar": held[0]["bar"], "last_bar": held[-1]["bar"], "expanded_rows_sha256": _sha_json(held)}
+            trades.append({**trade, "base_fill_witness": fill})
+        packed_rows.append({**witness, "facts": {**facts, "half_spread_arrays": arrays, "trades": trades}})
+    return {"schema_version": "fxpm.matched-floor-packed-witnesses.v1",
+        "precommitment_sha256": _sha_json(frozen.precommitment), "attempt_id": attempt["attempt_id"],
+        "full_witnesses_sha256": _sha_json(witnesses), "rows": packed_rows}, proof_entries
+
+
+def _expand_matched_floor_witnesses(packed, *, frozen, attempt, raw_folds, source_frame, read, entries,
+        _decoded_array_cache=None):
+    import pm_authoritative_search_execution as execution
+    if (type(packed) is not dict or set(packed) != {"schema_version", "precommitment_sha256", "attempt_id", "full_witnesses_sha256", "rows"}
+            or packed["schema_version"] != "fxpm.matched-floor-packed-witnesses.v1"
+            or packed["precommitment_sha256"] != _sha_json(frozen.precommitment)
+            or packed["attempt_id"] != attempt["attempt_id"] or type(packed["rows"]) is not list):
+        _fail("MATCHED_FLOOR_PACKED_WITNESS_BINDING_INVALID")
+    root = _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    decoded_arrays = {} if _decoded_array_cache is None else _decoded_array_cache
+    result = []
+    for witness in packed["rows"]:
+        facts = witness["facts"]
+        arrays = {}
+        for tier, legs in facts["half_spread_arrays"].items():
+            arrays[tier] = {}
+            for role, entry in legs.items():
+                artifact_id = entry["artifact_id"]
+                if (entry.get("artifact_type") != "winner_matched_spread_array" or entries.get(artifact_id) != entry
+                        or artifact_id != root + "/matched-floor-arrays/" + entry["descriptor"]["sha256"]):
+                    _fail("MATCHED_FLOOR_ARRAY_PUBLICATION_REFERENCE_CHANGED")
+                codec = read(artifact_id)
+                if _sha_json(codec) != entry["descriptor"]["sha256"]:
+                    _fail("MATCHED_FLOOR_ARRAY_CONTENT_ADDRESS_CHANGED")
+                arrays[tier][role] = codec
+        geometry = next(row for row in raw_folds[witness["fold_ordinal"]]["provenance"]["anchor_horizon_decision"]["partition_geometry"]
+            if row["role"] == witness["partition_role"])
+        frame = source_frame.loc[(source_frame.index >= pd.Timestamp(geometry["frame_start_utc"]))
+            & (source_frame.index < pd.Timestamp(geometry["end_exclusive_utc"]))]
+        codec = arrays["P75"]["intrabar_half_spread"]
+        key = ("intrabar_half_spread", _canonical_bytes(codec))
+        if key not in decoded_arrays:
+            decoded_arrays[key] = execution._route_a_decode_spread_array(codec, "intrabar_half_spread")
+        p75_intrabar = decoded_arrays[key]
+        trades = []
+        for trade in facts["trades"]:
+            fill = dict(trade["base_fill_witness"])
+            reference = fill.get("held_bar_inputs")
+            if type(reference) is dict:
+                if (set(reference) != {"schema_version", "partition_geometry_receipt_sha256", "partition_frame_sha256",
+                        "first_bar", "last_bar", "expanded_rows_sha256"}
+                        or reference["schema_version"] != "fxpm.matched-floor-original-source-bars-reference.v1"
+                        or reference["partition_geometry_receipt_sha256"] != geometry["receipt_sha256"]
+                        or reference["partition_frame_sha256"] != geometry["frame_sha256"]
+                        or type(reference["first_bar"]) is not int or type(reference["last_bar"]) is not int
+                        or not 0 <= reference["first_bar"] <= reference["last_bar"] < len(frame)
+                        or len(p75_intrabar) != len(frame)):
+                    _fail("MATCHED_FLOOR_ORIGINAL_SOURCE_BAR_REFERENCE_CHANGED")
+                held = [{"bar": bar, "open_utc": pd.Timestamp(frame.index[bar]).isoformat(),
+                    "ohlc": {name: float(frame[name].iloc[bar]) for name in ("Open", "High", "Low", "Close")},
+                    "p75_intrabar_half_price": float(p75_intrabar[bar])}
+                    for bar in range(reference["first_bar"], reference["last_bar"] + 1)]
+                if _sha_json(held) != reference["expanded_rows_sha256"]:
+                    _fail("MATCHED_FLOOR_ORIGINAL_SOURCE_BAR_CONTENT_CHANGED")
+                fill["held_bar_inputs"] = held
+            trades.append({**trade, "base_fill_witness": fill})
+        result.append({**witness, "facts": {**facts, "half_spread_arrays": arrays, "trades": trades}})
+    if _sha_json(result) != packed["full_witnesses_sha256"]:
+        _fail("MATCHED_FLOOR_EXPANDED_WITNESS_HASH_CHANGED")
+    return result

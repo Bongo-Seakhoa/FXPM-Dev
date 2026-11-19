@@ -36,6 +36,11 @@ def _caused(outer, inner):
 
 
 def _capacity(wrapped=False):
+    if wrapped in ("actual_disk", "actual_memory"):
+        error = OSError(errno.ENOSPC, "synthetic actual disk failure") if wrapped == "actual_disk" else MemoryError("synthetic allocation failure")
+        outer = spool.AuthoritySpoolError("synthetic resource wrapper")
+        outer.__context__ = error
+        return outer
     error = quota.AuthoritySpoolQuotaError(FREE_SPACE, "synthetic owned spool")
     return _caused(spool.AuthoritySpoolError(str(error)), error) if wrapped else error
 
@@ -55,7 +60,7 @@ def test_capacity_classifier_follows_only_actual_explicit_typed_cause(wrapper):
 
 
 @pytest.mark.parametrize("kind", ["generation", "digest", "limits", "reservation",
-                                  "spool_text", "runtime_text", "oserror", "memory", "lookalike"])
+                                  "spool_text", "runtime_text", "oserror", "permission", "lookalike"])
 def test_capacity_classifier_does_not_exempt_other_failures(kind):
     error = {
         "generation": lambda: quota.AuthoritySpoolQuotaError(GENERATION_BYTES),
@@ -64,8 +69,8 @@ def test_capacity_classifier_does_not_exempt_other_failures(kind):
         "reservation": lambda: quota.AuthoritySpoolQuotaError("SPOOL_QUOTA_RESERVATION_NOT_ACTIVE"),
         "spool_text": lambda: spool.AuthoritySpoolError(FREE_SPACE),
         "runtime_text": lambda: RuntimeError(FREE_SPACE),
-        "oserror": lambda: OSError(errno.ENOSPC, FREE_SPACE),
-        "memory": lambda: MemoryError(FREE_SPACE),
+        "oserror": lambda: OSError(errno.EIO, FREE_SPACE),
+        "permission": lambda: PermissionError(errno.EACCES, FREE_SPACE),
         "lookalike": lambda: SimpleNamespace(code=FREE_SPACE),
     }[kind]()
     assert spool.is_resource_capacity_error(error) is False
@@ -126,7 +131,7 @@ def _source_path(tmp_path, monkeypatch, *, completed=False):
 
 
 @pytest.mark.parametrize("phase", ["snapshot", "source_session"])
-@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True, "actual_disk", "actual_memory"])
 def test_source_capacity_preserves_original_error_without_refusal_or_commit(tmp_path, monkeypatch, phase, wrapped):
     env, request, _, _ = _source_path(tmp_path, monkeypatch)
     original, attempted = env.sink.put_json, []
@@ -170,7 +175,7 @@ def test_noncapacity_source_failure_keeps_existing_technical_stop(tmp_path, monk
     assert source["failure_code"] == code
 
 
-@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True, "actual_disk", "actual_memory"])
 def test_postcompletion_capacity_is_not_terminal_wrapper_and_drops_live_session(tmp_path, monkeypatch, wrapped):
     env, request, capture, fitted = _source_path(tmp_path, monkeypatch, completed=True)
     error, computed = _capacity(wrapped), {"classification": "SYNTHETIC_COMPUTED_BRANCH_NOT_OWNER"}
@@ -520,7 +525,7 @@ def _executor_custody_case(tmp_path):
         })
     row = execution._write_staged_attempt(stage=stage, ordinal=0,
         value={'attempt_id': 'SYNTHETIC-ROW', 'classification': 'SYNTHETIC-NONFINANCIAL-NO-AUTHORITY'},
-        remaining_cell_bytes=execution.MAX_CELL_EVIDENCE_BYTES, reservation=reservation)
+        reservation=reservation)
     return execution, context, stage, scope, reservation, custody, row
 
 
@@ -690,3 +695,51 @@ def test_quota_rescan_rejects_fresh_stat_disagreement(tmp_path, monkeypatch, fau
         quota._scan_committed_bytes(root)
     assert caught.value.code == "SPOOL_QUOTA_RESCAN_FAILED"
     assert observed == [fault]
+
+
+@pytest.mark.parametrize("kind", ["disk", "memory"])
+def test_scheduler_external_record_fsync_failure_leaves_no_final_poison(tmp_path, monkeypatch, kind):
+    import json
+    import errno
+    import os
+    import pm_historical_scheduler as scheduler
+    path = (tmp_path/"invented-retained-control.json").resolve()
+    body = {"classification": "INVENTED_CONTROL_IO_ONLY", "text": "retained \u00e9"}
+    actual_fsync = os.fsync
+    calls = []
+    def interrupted(descriptor):
+        calls.append(descriptor)
+        if len(calls) == 1:
+            raise OSError(errno.ENOSPC, "INVENTED_DISK_FULL") if kind == "disk" else MemoryError("INVENTED_ALLOCATION_FAILURE")
+        return actual_fsync(descriptor)
+    monkeypatch.setattr(os, "fsync", interrupted)
+    with pytest.raises((OSError, MemoryError)):
+        scheduler._declared_m5_external_record(path, body, maximum_bytes=4096)
+    assert not path.exists() and not list(tmp_path.glob(".*.tmp"))
+    result = scheduler._declared_m5_external_record(path, body, maximum_bytes=4096)
+    assert result["written"] is True and json.loads(path.read_bytes()) == body
+    assert scheduler._declared_m5_external_record(path, body, maximum_bytes=4096)["written"] is False
+
+
+@pytest.mark.parametrize("same", [True, False])
+def test_scheduler_external_record_never_replaces_a_concurrent_final(tmp_path, monkeypatch, same):
+    import json
+    import os
+    import pm_historical_scheduler as scheduler
+    path = (tmp_path/"invented-control.json").resolve()
+    body = {"classification": "INVENTED_CONCURRENT_CONTROL", "value": 1}
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    competing = encoded if same else b'{"INVENTED_FOREIGN_FINAL":true}'
+    linked = []
+    def race(source, destination):
+        linked.append(True)
+        Path(destination).write_bytes(competing)
+        raise FileExistsError("INVENTED_COMPETING_FINAL")
+    monkeypatch.setattr(os, "link", race)
+    if same:
+        assert scheduler._declared_m5_external_record(path, body, maximum_bytes=4096)["written"] is False
+    else:
+        with pytest.raises(scheduler.HistoricalSchedulerError, match="FINAL_RECORD_CHANGED"):
+            scheduler._declared_m5_external_record(path, body, maximum_bytes=4096)
+    assert linked == [True] and path.read_bytes() == competing
+    assert not list(tmp_path.glob(".*.tmp"))

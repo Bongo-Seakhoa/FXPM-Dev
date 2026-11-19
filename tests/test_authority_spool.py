@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+import errno
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict
 import hashlib
 import json
@@ -264,7 +266,7 @@ def test_opaque_replay_preserves_artifact_id_conflict(
         ("truncated", "ARTIFACT_SIZE_MISMATCH"),
     ],
 )
-def test_exact_opaque_replay_rejects_damaged_registered_cas(
+def test_new_sink_admission_rejects_damaged_registered_cas(
     tmp_path: Path,
     damage: str,
     error: str,
@@ -288,16 +290,16 @@ def test_exact_opaque_replay_rejects_damaged_registered_cas(
     else:
         path.write_bytes(payload[:-1])
 
+    cold_sink = spool.open_symbol_sink(context, "EURUSD")
     with pytest.raises(spool.AuthoritySpoolError, match=error):
-        sink.put_opaque(
+        cold_sink.register_artifact(
             "cell/frozen",
             "winner_attempt_process",
-            (payload,),
-            format="fxpm-ascii-json-v1",
+            entry["descriptor"],
         )
 
 
-def test_exact_opaque_replay_rejects_registered_cas_reparse_point(
+def test_new_sink_admission_rejects_registered_cas_reparse_point(
     tmp_path: Path,
 ) -> None:
     context = _context(tmp_path)
@@ -320,12 +322,12 @@ def test_exact_opaque_replay_rejects_registered_cas_reparse_point(
     except (OSError, NotImplementedError):
         pytest.skip("symlink creation unavailable")
 
+    cold_sink = spool.open_symbol_sink(context, "EURUSD")
     with pytest.raises(spool.AuthoritySpoolError, match="REPARSE_POINT|SAFE_REGULAR"):
-        sink.put_opaque(
+        cold_sink.register_artifact(
             "cell/frozen",
             "winner_attempt_process",
-            (payload,),
-            format="fxpm-ascii-json-v1",
+            entry["descriptor"],
         )
 
 
@@ -352,6 +354,75 @@ def test_exact_opaque_replay_preserves_stream_validation(tmp_path: Path) -> None
         sink.put_opaque("cell", "evidence", ("invalid",), format="binary-v1")
     with pytest.raises(spool.AuthoritySpoolError, match="SIZE_BOUND_EXCEEDED"):
         sink.put_opaque("cell", "evidence", (b"x" * 1025,), format="binary-v1")
+
+
+@pytest.mark.parametrize("kind", ["json", "opaque"])
+@pytest.mark.parametrize("batched", [False, True])
+def test_sink_reuses_admitted_bytes_and_new_sink_reads_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, batched: bool,
+) -> None:
+    """INVENTED software payloads: own publication is not read back for admission."""
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    payload_reads = []
+    original_stream = spool._stream_file
+
+    def counted_stream(root, relative_path, **kwargs):
+        if relative_path.startswith("objects/"):
+            payload_reads.append(relative_path)
+        return original_stream(root, relative_path, **kwargs)
+
+    monkeypatch.setattr(spool, "_stream_file", counted_stream)
+
+    def put(artifact_id):
+        if kind == "json":
+            return sink.put_json(artifact_id, "software_fixture", {"invented": [1, "é"]})
+        return sink.put_opaque(artifact_id, "software_fixture", (b"invented-", b"bytes"),
+                               format="binary-v1")
+
+    with spool.publication_batch(context) if batched else nullcontext():
+        first = put("one")
+        exact = copy.deepcopy(first)
+        assert put("one") == exact
+        assert put("two")["descriptor"] == exact["descriptor"]
+        assert sink.register_artifact("three", "software_fixture", exact["descriptor"])["descriptor"] == exact["descriptor"]
+    assert payload_reads == []
+
+    # Neither an input descriptor nor any returned entry can mutate admission facts.
+    detached = sink.register_artifact("one", "software_fixture", exact["descriptor"])
+    detached["descriptor"]["sha256"] = "f" * 64
+    first["descriptor"]["size_bytes"] = 0
+    assert sink.artifact_roster()[0] == exact
+
+    cold_sink = spool.open_symbol_sink(context, "EURUSD")
+    descriptor = copy.deepcopy(exact["descriptor"])
+    assert cold_sink.register_artifact("one", "software_fixture", descriptor) == exact
+    descriptor["size_bytes"] = 0
+    assert cold_sink.register_artifact("one", "software_fixture", exact["descriptor"]) == exact
+    assert cold_sink.register_artifact("two", "software_fixture", exact["descriptor"])["descriptor"] == exact["descriptor"]
+    assert payload_reads == [exact["descriptor"]["relative_path"]]
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_opaque_generator_context_change_is_not_hidden_by_sink_reuse(
+    tmp_path: Path, replay: bool,
+) -> None:
+    """INVENTED mutable generator: its real context change must still refuse."""
+    context = _context(tmp_path)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    if replay:
+        sink.put_opaque("one", "software_fixture", (b"invented",), format="binary-v1")
+
+    def changing_chunks():
+        yield b"invented"
+        path = context.root / spool.CONTEXT_RELATIVE_PATH
+        body = json.loads(path.read_bytes())
+        body["config_sha256"] = "c" * 64
+        path.write_bytes(spool._canonical_json_bytes(body, spool.MAX_CONTEXT_BYTES))
+
+    with pytest.raises(spool.AuthoritySpoolError, match="GENERATION_CONTEXT_CONFIG_MISMATCH"):
+        sink.put_opaque("one", "software_fixture", changing_chunks(), format="binary-v1")
+    assert len(sink._artifacts) == int(replay)
 
 
 def test_fresh_opaque_put_preserves_stream_before_identity_validation(
@@ -559,9 +630,10 @@ def test_bounds_fail_instead_of_sampling_or_truncating(tmp_path: Path) -> None:
         )
 
     sink = spool.open_symbol_sink(context, "EURUSD")
-    sink.put_opaque("one", "events", [b"12345"], format="binary-v1")
-    with pytest.raises(spool.AuthoritySpoolError, match="SYMBOL_BYTE_BOUND_EXCEEDED"):
-        sink.put_opaque("two", "events", [b"6"], format="binary-v1")
+    first = sink.put_opaque("one", "events", [b"12345"], format="binary-v1")
+    second = sink.put_opaque("two", "events", [b"6"], format="binary-v1")
+    assert context.root.joinpath(*Path(first["descriptor"]["relative_path"]).parts).read_bytes() == b"12345"
+    assert context.root.joinpath(*Path(second["descriptor"]["relative_path"]).parts).read_bytes() == b"6"
 
     count_context = spool.freeze_generation_context(
         tmp_path / "count-bound",
@@ -576,7 +648,7 @@ def test_bounds_fail_instead_of_sampling_or_truncating(tmp_path: Path) -> None:
         count_sink.put_json("two", "evidence", {"two": 2})
 
 
-def test_generation_quota_is_enforced_across_real_spool_publications(
+def test_real_spool_publications_remain_accounted_above_legacy_generation_cap(
     tmp_path: Path,
 ) -> None:
     limits = spool.SpoolLimits(
@@ -595,16 +667,11 @@ def test_generation_quota_is_enforced_across_real_spool_publications(
         [b"a" * 1000],
         format="binary-v1",
     )
-    with pytest.raises(
-        spool.AuthoritySpoolError,
-        match="SPOOL_QUOTA_GENERATION_BYTES_EXCEEDED",
-    ):
-        spool.write_opaque_artifact(
-            context,
-            [b"b" * 1000],
-            format="binary-v1",
-        )
-    assert context.root.joinpath(*Path(first["relative_path"]).parts).is_file()
+    second = spool.write_opaque_artifact(context, [b"b" * 1000], format="binary-v1")
+    assert context.root.joinpath(*Path(first["relative_path"]).parts).read_bytes() == b"a" * 1000
+    assert context.root.joinpath(*Path(second["relative_path"]).parts).read_bytes() == b"b" * 1000
+    assert spool_quota._read_state(context.root)["committed_bytes"] > limits.max_generation_bytes
+    assert spool_quota._read_state(context.root)["reservations"] == []
     assert not list((context.root / "tmp").glob("*.part"))
 
 
@@ -859,3 +926,225 @@ def test_distinct_authenticated_manifest_domains_coexist_for_one_symbol(
             historical_receipt,
             manifest_domain=spool.CURRENT_REFIT_MANIFEST_DOMAIN,
         )
+
+
+@pytest.mark.parametrize("fault", ["partial-write", "fsync"])
+def test_v1_control_failure_cleans_only_its_owned_temporary(tmp_path, monkeypatch, fault):
+    """Invented control IO: an interrupted write cannot poison later completion."""
+    root = tmp_path / "v1-control"
+    root.mkdir()
+    (root / "tmp").mkdir()
+    foreign = root / "tmp" / "foreign.part"
+    foreign.write_bytes(b"UNKNOWN_EXISTING_DRAFT_PRESERVE")
+    body = {"fixture_provenance": "INVENTED_CONTROL_IO_ONLY", "value": 1}
+    expected = hashlib.sha256(spool._canonical_json_bytes(body, 4096)).hexdigest()
+    with monkeypatch.context() as controlled:
+        if fault == "partial-write":
+            def partial(descriptor, value):
+                assert os.write(descriptor, value[:7]) == 7
+                raise OSError(errno.ENOSPC, "INVENTED_DISK_FULL")
+            controlled.setattr(spool, "_write_all", partial)
+        else:
+            def fail_fsync(_descriptor):
+                raise OSError(errno.ENOSPC, "INVENTED_FSYNC_DISK_FULL")
+            controlled.setattr(spool.os, "fsync", fail_fsync)
+        with pytest.raises(OSError):
+            spool._retirement_publish(root, "control.json", body, 4096)
+    assert not (root / "control.json").exists()
+    assert list((root / "tmp").iterdir()) == [foreign]
+    assert foreign.read_bytes() == b"UNKNOWN_EXISTING_DRAFT_PRESERVE"
+    assert spool._retirement_publish(root, "control.json", body, 4096) == expected
+    assert spool._retirement_control(root, "control.json", 4096) == (body, expected)
+
+
+@pytest.mark.parametrize("same", [True, False], ids=["identical-final", "conflicting-final"])
+def test_v1_control_exclusive_publication_preserves_concurrent_final(tmp_path, monkeypatch, same):
+    """A concurrently appeared final is verified, never replaced or removed."""
+    root = tmp_path / "v1-race"
+    root.mkdir()
+    body = {"fixture_provenance": "INVENTED_CONTROL_PUBLICATION_RACE", "value": 1}
+    incoming = spool._canonical_json_bytes(body if same else {"foreign": "PRESERVE"}, 4096)
+    original = spool._publish_temp_exclusive
+    appeared = []
+    def arrive(parent, temporary, relative):
+        target = parent / relative
+        target.write_bytes(incoming)
+        info = target.stat()
+        appeared.append((info.st_dev, info.st_ino))
+        return original(parent, temporary, relative)
+    monkeypatch.setattr(spool, "_publish_temp_exclusive", arrive)
+    if same:
+        assert spool._retirement_publish(root, "control.json", body, 4096) == hashlib.sha256(incoming).hexdigest()
+    else:
+        with pytest.raises(spool.AuthoritySpoolError, match="RETIREMENT_CONTROL_CONFLICT"):
+            spool._retirement_publish(root, "control.json", body, 4096)
+    target = root / "control.json"
+    info = target.stat()
+    assert appeared == [(info.st_dev, info.st_ino)]
+    assert target.read_bytes() == incoming
+    assert not list((root / "tmp").iterdir())
+
+
+def test_exclusive_temp_fstat_failure_closes_the_owned_descriptor(tmp_path, monkeypatch):
+    target = tmp_path / "owned.part"
+    opened = []
+    original_open, original_fstat = spool.os.open, spool.os.fstat
+    def observe_open(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+    expected = OSError(errno.EIO, "INVENTED_FSTAT_FAILURE")
+    with monkeypatch.context() as controlled:
+        controlled.setattr(spool.os, "open", observe_open)
+        controlled.setattr(spool.os, "fstat", lambda descriptor: (_ for _ in ()).throw(expected))
+        with pytest.raises(OSError) as caught:
+            spool._open_exclusive(target)
+        assert caught.value is expected
+    assert len(opened) == 1
+    with pytest.raises(OSError) as closed:
+        original_fstat(opened[0])
+    assert closed.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("stage", ["owner", "context"])
+@pytest.mark.parametrize("failure", ["disk", "memory"])
+def test_failed_owned_bootstrap_removes_only_its_unpublished_controls(tmp_path, monkeypatch, stage, failure):
+    """Invented bootstrap IO; a failed initial call must not strand its own workspace."""
+    root = tmp_path / "owned-bootstrap"
+    workspace = {"cell_id": "c" * 64, "cell_contract_sha256": "d" * 64}
+    schema = spool.WORKSPACE_OWNER_SCHEMA if stage == "owner" else spool.GENERATION_CONTEXT_SCHEMA
+    original_write = spool._write_all
+    with monkeypatch.context() as controlled:
+        def fail_control(descriptor, value):
+            body = json.loads(bytes(value).decode("utf-8"))
+            if body.get("schema_version") == schema:
+                assert os.write(descriptor, value[:7]) == 7
+                if failure == "disk":
+                    raise OSError(errno.ENOSPC, "INVENTED_BOOTSTRAP_DISK_FULL")
+                raise MemoryError("INVENTED_BOOTSTRAP_ALLOCATION_FAILURE")
+            return original_write(descriptor, value)
+        controlled.setattr(spool, "_write_all", fail_control)
+        with pytest.raises((spool.AuthoritySpoolError, OSError, MemoryError)) as caught:
+            spool.freeze_generation_context(root, generation_id=GENERATION,
+                native_universe_sha256=NATIVE, config_sha256=CONFIG, owned_workspace=workspace)
+        assert spool.resource_capacity_reason(caught.value) == ("DISK_LOW" if failure == "disk" else "MEMORY_ERROR")
+    assert list(root.iterdir()) == []
+    context = spool.freeze_generation_context(root, generation_id=GENERATION,
+        native_universe_sha256=NATIVE, config_sha256=CONFIG, owned_workspace=workspace)
+    assert spool.read_owned_generation_workspace(context)[0]["cell_id"] == workspace["cell_id"]
+
+
+def test_owned_bootstrap_first_publication_accounts_for_both_control_files(tmp_path):
+    root = tmp_path / "owned-accounting"
+    context = spool.freeze_generation_context(root, generation_id=GENERATION,
+        native_universe_sha256=NATIVE, config_sha256=CONFIG,
+        owned_workspace={"cell_id": "c" * 64, "cell_contract_sha256": "d" * 64})
+    control_bytes = sum((root / name).stat().st_size
+        for name in (spool.CONTEXT_RELATIVE_PATH, spool.WORKSPACE_OWNER_RELATIVE_PATH))
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    entry = sink.put_json("fixture", "software_fixture", {"fixture_provenance": "INVENTED_BOOTSTRAP_ACCOUNTING"})
+    receipt = sink.seal()
+    state = spool_quota._read_state(root)
+    assert state["committed_bytes"] == spool_quota._scan_committed_bytes(root)
+    assert state["committed_bytes"] >= control_bytes + entry["descriptor"]["size_bytes"]
+    assert spool.verify_symbol_receipt(root, receipt, expected_generation_id=GENERATION,
+        expected_symbol="EURUSD", expected_native_universe_sha256=NATIVE,
+        expected_config_sha256=CONFIG)["artifacts"] == [entry]
+
+
+def test_owned_bootstrap_failure_preserves_foreign_appeared_file(tmp_path, monkeypatch):
+    root = tmp_path / "foreign-bootstrap"
+    foreign = root / "UNKNOWN-DRAFT.txt"
+    original_write = spool._write_all
+    def foreign_then_fail(descriptor, value):
+        body = json.loads(bytes(value).decode("utf-8"))
+        if body.get("schema_version") == spool.WORKSPACE_OWNER_SCHEMA:
+            foreign.write_bytes(b"UNKNOWN_DRAFT_PRESERVE")
+            raise OSError(errno.ENOSPC, "INVENTED_BOOTSTRAP_FAILURE")
+        return original_write(descriptor, value)
+    monkeypatch.setattr(spool, "_write_all", foreign_then_fail)
+    with pytest.raises((spool.AuthoritySpoolError, OSError)):
+        spool.freeze_generation_context(root, generation_id=GENERATION,
+            native_universe_sha256=NATIVE, config_sha256=CONFIG,
+            owned_workspace={"cell_id": "c" * 64, "cell_contract_sha256": "d" * 64})
+    assert foreign.read_bytes() == b"UNKNOWN_DRAFT_PRESERVE"
+    with pytest.raises(spool.AuthoritySpoolError, match="WORKSPACE_ROOT_NOT_EMPTY"):
+        spool.freeze_generation_context(root, generation_id=GENERATION,
+            native_universe_sha256=NATIVE, config_sha256=CONFIG,
+            owned_workspace={"cell_id": "c" * 64, "cell_contract_sha256": "d" * 64})
+
+
+def test_late_bootstrap_error_preserves_pair_already_observed_by_consumer(tmp_path, monkeypatch):
+    """A visible context must never be rolled back from under an actual reader."""
+    root = tmp_path / "visible-bootstrap"
+    original_publish = spool._publish_temp_exclusive
+    observed = []
+    def publish_then_fail(parent, temporary, relative):
+        original_publish(parent, temporary, relative)
+        if relative == spool.CONTEXT_RELATIVE_PATH:
+            consumer = spool.reopen_generation_context(root, expected_generation_id=GENERATION,
+                expected_native_universe_sha256=NATIVE, expected_config_sha256=CONFIG)
+            observed.append(spool.read_owned_generation_workspace(consumer)[0])
+            raise OSError(errno.ENOSPC, "INVENTED_FAILURE_AFTER_CONTEXT_VISIBILITY")
+    monkeypatch.setattr(spool, "_publish_temp_exclusive", publish_then_fail)
+    with pytest.raises((spool.AuthoritySpoolError, OSError)):
+        spool.freeze_generation_context(root, generation_id=GENERATION,
+            native_universe_sha256=NATIVE, config_sha256=CONFIG,
+            owned_workspace={"cell_id": "c" * 64, "cell_contract_sha256": "d" * 64})
+    assert len(observed) == 1
+    reopened = spool.reopen_generation_context(root, expected_generation_id=GENERATION,
+        expected_native_universe_sha256=NATIVE, expected_config_sha256=CONFIG)
+    assert spool.read_owned_generation_workspace(reopened)[0] == observed[0]
+
+
+def test_held_bootstrap_lock_refuses_without_waiting_or_publishing(tmp_path):
+    """A live bootstrap owner is BUSY; a later explicit software call can succeed."""
+    root = tmp_path / "busy-bootstrap"
+    lock_path = root.parent / f".{root.name}.generation-bootstrap.lock"
+    entered, release = threading.Event(), threading.Event()
+    def hold():
+        with spool_quota._exclusive_file_lock(lock_path, timeout_seconds=0):
+            entered.set()
+            assert release.wait(timeout=5)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(hold)
+        assert entered.wait(timeout=5)
+        before = lock_path.stat()
+        try:
+            with pytest.raises(spool.AuthoritySpoolError, match="^GENERATION_BOOTSTRAP_BUSY$"):
+                spool.freeze_generation_context(root, generation_id=GENERATION,
+                    native_universe_sha256=NATIVE, config_sha256=CONFIG,
+                    owned_workspace={"cell_id": "c" * 64, "cell_contract_sha256": "d" * 64})
+            assert not list(root.iterdir())
+        finally:
+            release.set()
+        future.result(timeout=5)
+    context = spool.freeze_generation_context(root, generation_id=GENERATION,
+        native_universe_sha256=NATIVE, config_sha256=CONFIG,
+        owned_workspace={"cell_id": "c" * 64, "cell_contract_sha256": "d" * 64})
+    after = lock_path.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert spool.read_owned_generation_workspace(context)[0]["cell_id"] == "c" * 64
+
+
+def test_existing_context_freeze_reopen_creates_no_bootstrap_neighbor(tmp_path, monkeypatch):
+    """An already issued context never acquires or creates the new parent lock."""
+    issued = _context(tmp_path)
+    root = tmp_path / "existing-context"
+    root.mkdir()
+    (root / spool.CONTEXT_RELATIVE_PATH).write_bytes(
+        (issued.root / spool.CONTEXT_RELATIVE_PATH).read_bytes())
+    lock_path = root.parent / f".{root.name}.generation-bootstrap.lock"
+    original_lock = spool_quota._exclusive_file_lock
+    observed = []
+    def inside_root_only(path, **kwargs):
+        path = Path(path)
+        assert path.parent == root
+        observed.append(path)
+        return original_lock(path, **kwargs)
+    monkeypatch.setattr(spool_quota, "_exclusive_file_lock", inside_root_only)
+    reopened = spool.freeze_generation_context(root, generation_id=GENERATION,
+        native_universe_sha256=NATIVE, config_sha256=CONFIG)
+    assert reopened.context_sha256 == issued.context_sha256
+    assert not lock_path.exists()
+    assert all(path.parent == root for path in observed)

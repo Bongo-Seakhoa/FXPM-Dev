@@ -625,5 +625,79 @@ class SchemaVersionTests(unittest.TestCase):
         self.assertEqual(legacy.to_dict(), v1)
 
 
+class ContractPublicationRecoveryTests(unittest.TestCase):
+    def test_interrupted_contract_write_or_fsync_cleans_owned_temp(self):
+        """Invented contract IO; failed publication leaves no permanent poison."""
+        import errno
+        from unittest.mock import patch
+        for fault in ("partial-write", "fsync"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                body = {"fixture_provenance": "INVENTED_GRID_IO_ONLY", "value": 1}
+                raw = grid.canonical_bytes(body)
+                digest = hashlib.sha256(raw).hexdigest()
+                original_write = grid.os.write
+                def partial(descriptor, value):
+                    self.assertEqual(original_write(descriptor, value[:7]), 7)
+                    raise OSError(errno.ENOSPC, "INVENTED_DISK_FULL")
+                def fail_fsync(_descriptor):
+                    raise OSError(errno.ENOSPC, "INVENTED_FSYNC_DISK_FULL")
+                target = "write" if fault == "partial-write" else "fsync"
+                replacement = partial if fault == "partial-write" else fail_fsync
+                with patch.object(grid.os, target, replacement), self.assertRaises(OSError):
+                    grid.store_view_contract(root, body)
+                self.assertFalse((root / grid.CONTRACTS_DIR / (digest + ".json")).exists())
+                self.assertEqual(list((root / grid.CONTRACTS_DIR).iterdir()), [])
+                self.assertEqual(grid.store_view_contract(root, body), digest)
+                self.assertEqual(grid.load_view_contract(root, digest), body)
+
+    def test_unknown_fixed_temporary_is_preserved_without_blocking_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            body = {"fixture_provenance": "INVENTED_GRID_FOREIGN_TEMP", "value": 1}
+            digest = hashlib.sha256(grid.canonical_bytes(body)).hexdigest()
+            folder = root / grid.CONTRACTS_DIR
+            folder.mkdir()
+            foreign = folder / (digest + ".json.tmp")
+            foreign.write_bytes(b"UNKNOWN_DRAFT_PRESERVE")
+            self.assertEqual(grid.store_view_contract(root, body), digest)
+            self.assertEqual(foreign.read_bytes(), b"UNKNOWN_DRAFT_PRESERVE")
+            self.assertEqual(grid.load_view_contract(root, digest), body)
+
+    def test_concurrent_final_is_never_replaced(self):
+        """Inject the same arrival at either old or current publication boundary."""
+        from unittest.mock import patch
+        for same in (True, False):
+            with self.subTest(same=same), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                body = {"fixture_provenance": "INVENTED_GRID_PUBLICATION_RACE", "value": 1}
+                raw = grid.canonical_bytes(body)
+                digest = hashlib.sha256(raw).hexdigest()
+                incoming = raw if same else b'{"foreign":"PRESERVE"}'
+                appeared = []
+                original_link, original_replace = grid.os.link, grid.os.replace
+                def arrive(target):
+                    Path(target).write_bytes(incoming)
+                    info = Path(target).stat()
+                    appeared.append((info.st_dev, info.st_ino))
+                def link(source, target, **kwargs):
+                    arrive(target)
+                    return original_link(source, target, **kwargs)
+                def replace(source, target):
+                    arrive(target)
+                    return original_replace(source, target)
+                with patch.object(grid.os, "link", link), patch.object(grid.os, "replace", replace):
+                    if same:
+                        self.assertEqual(grid.store_view_contract(root, body), digest)
+                    else:
+                        with self.assertRaisesRegex(grid.EndGridError, "VIEW_CONTRACT_SHA_COLLISION"):
+                            grid.store_view_contract(root, body)
+                final = root / grid.CONTRACTS_DIR / (digest + ".json")
+                info = final.stat()
+                self.assertEqual(appeared, [(info.st_dev, info.st_ino)])
+                self.assertEqual(final.read_bytes(), incoming)
+                self.assertEqual(list(final.parent.glob("*.tmp")), [])
+
+
 if __name__ == "__main__":
     unittest.main()

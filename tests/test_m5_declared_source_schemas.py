@@ -202,7 +202,7 @@ class DeclaredDevelopmentScopeTests(unittest.TestCase):
                 o._declared_roster(roster, launch_activation_utc=parent["launch_activation_utc"],
                     protected_end_exclusive_utc="2024-07-14T08:05:00Z")
 
-    def test_development_schema_remains_explicit_m5_and_v16(self):
+    def test_development_schemas_keep_m5_and_native_explicit_on_v16(self):
         parent = _development_parent()
         for schema in (o.DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA, o.DECLARED_M5_DEVELOPMENT_SLOT_REQUEST_SCHEMA):
             body = deepcopy(parent); body["schema_version"] = schema
@@ -212,8 +212,16 @@ class DeclaredDevelopmentScopeTests(unittest.TestCase):
                          o.DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA)
         self.assertEqual(o._declared_request_schema(o.DECLARED_WINNER_TRANSPORT_V16, "m5_derived", development=True),
                          o.DECLARED_M5_DEVELOPMENT_SLOT_REQUEST_SCHEMA)
-        with self.assertRaisesRegex(o.HistoricalAnchorOrchestrationError, "DECLARED_DEVELOPMENT_SCOPE_INVALID"):
-            o._declared_request_schema(o.DECLARED_WINNER_TRANSPORT_V16, "broker_native", development=True)
+        self.assertEqual(o._declared_request_schema(o.DECLARED_WINNER_TRANSPORT_V16, "broker_native", development=True),
+                         o.DECLARED_NATIVE_DEVELOPMENT_SLOT_REQUEST_SCHEMA)
+        self.assertEqual(o._declared_precommit_schema(o.DECLARED_WINNER_TRANSPORT_V16, "broker_native", development=True),
+                         o.DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA)
+        for schema in (o.DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA, o.DECLARED_NATIVE_DEVELOPMENT_SLOT_REQUEST_SCHEMA):
+            body = deepcopy(parent); body["schema_version"] = schema
+            for key in ("source_kind", "m5_source_pins", "m5_view_contract_sha256"):
+                body.pop(key, None)
+            self.assertEqual(o.declared_slot_source_kind(body), "broker_native")
+            self.assertEqual(o.declared_slot_transport_edition(body), o.DECLARED_WINNER_TRANSPORT_V16)
 
     def test_decoded_scope_is_detached_and_parent_prefix_is_rechecked(self):
         parent = _development_parent(); scope = o.declared_slot_development_scope(parent)

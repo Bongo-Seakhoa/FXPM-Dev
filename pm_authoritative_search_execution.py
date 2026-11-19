@@ -99,7 +99,6 @@ MIN_DAYS_PER_FOLD: Final = int(winner.CURRENT_SELECTION_POLICY["min_days_per_fol
 MAX_DAYS_PER_FOLD: Final = winner.MAX_DAYS_PER_FOLD
 MIN_PARTITION_SCORED_BARS: Final = 2
 MAX_ATTEMPT_EVIDENCE_BYTES: Final = 512 * 1024**2
-MAX_CELL_EVIDENCE_BYTES: Final = 8 * 1024**3
 MAX_CAPACITY_CUSTODY_BYTES: Final = 128 * 1024
 CAPACITY_CUSTODY_SCHEMA: Final = "fxpm.authoritative-search-capacity-custody.v1"
 MAX_DEPLOYMENT_CONFIG_BYTES: Final = 32 * 1024**2
@@ -621,7 +620,9 @@ def _native_spread_inputs(
         fine_spec, _receipt = _freeze_bound_execution_spec(product=fine, config=config)
         if asdict(fine_spec) != asdict(spec):
             _fail("FROZEN_TIER_PRIOR_FINE_SPEC_MISMATCH")
-        fine_frame = native_prefix.open_verified_prefix_frame(fine)
+        fine_frame = (frame if _reopened_fine_product is None
+            and source_timeframe == native["timeframe"]
+            else native_prefix.open_verified_prefix_frame(fine))
         observations = spread_profile.align_prior_completed_spreads(
             frame.index, fine_frame, source_timeframe,
         )
@@ -2060,16 +2061,20 @@ def _partition_slice(
     scored_start_utc: str,
     end_exclusive_utc: str,
     minimum_warmup_bars: int,
+    _full_frame_time_axes: tuple[pd.DatetimeIndex, pd.DatetimeIndex] | None = None,
 ) -> _PartitionSlice:
     start = pd.Timestamp(_utc(frame_start_utc, "PARTITION_FRAME_START_INVALID"))
     scored = pd.Timestamp(_utc(scored_start_utc, "PARTITION_SCORE_START_INVALID"))
     end = pd.Timestamp(_utc(end_exclusive_utc, "PARTITION_END_INVALID"))
     if not start <= scored < end:
         _fail("PARTITION_INTERVAL_INVALID", role)
-    opens = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="coerce"))
-    closes = pd.DatetimeIndex(
-        pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
-    )
+    if _full_frame_time_axes is None:
+        opens = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True, errors="coerce"))
+        closes = pd.DatetimeIndex(
+            pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
+        )
+    else:
+        opens, closes = _full_frame_time_axes
     mask = (opens >= start) & (opens < end) & (closes <= end)
     selected = frame.loc[mask].copy(deep=True)
     if selected.empty:
@@ -2150,6 +2155,7 @@ def _fold_partitions(
     closes = pd.DatetimeIndex(
         pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True, errors="coerce")
     )
+    full_frame_time_axes = opens, closes
     fit_mask = (opens >= fit_start) & (opens < fit_end) & (closes <= fit_end)
     fit_frame = frame.loc[fit_mask]
     if fit_frame.empty or pd.Timestamp(fit_frame["_BAR_CLOSE_TS"].iloc[-1]) != fit_end:
@@ -2186,6 +2192,7 @@ def _fold_partitions(
         scored_start_utc=train_score_start.isoformat(),
         end_exclusive_utc=train_end.isoformat(),
         minimum_warmup_bars=minimum_warmup,
+        _full_frame_time_axes=full_frame_time_axes,
     )
     tuning = _partition_slice(
         frame,
@@ -2194,6 +2201,7 @@ def _fold_partitions(
         scored_start_utc=tuning_score_start.isoformat(),
         end_exclusive_utc=fit_end.isoformat(),
         minimum_warmup_bars=minimum_warmup,
+        _full_frame_time_axes=full_frame_time_axes,
     )
     final = _partition_slice(
         frame,
@@ -2202,6 +2210,7 @@ def _fold_partitions(
         scored_start_utc=fold.get("validation_start_utc"),
         end_exclusive_utc=fold.get("validation_end_exclusive_utc"),
         minimum_warmup_bars=minimum_warmup,
+        _full_frame_time_axes=full_frame_time_axes,
     )
     return train, tuning, final
 
@@ -2290,6 +2299,7 @@ def _partition_cost_precommitments(
         _fail("FROZEN_TIER_FITTED_INPUTS_UNAVAILABLE")
     backtester = Backtester(config)
     cache: dict[str, dict[str, Any]] = {}
+    fold_summaries: dict[tuple[Any, ...], tuple[dict[str, Any], ...]] = {}
     source_cache = {} if source_observation_cache is None else source_observation_cache
     rows = []
     for attempt in attempts:
@@ -2298,7 +2308,24 @@ def _partition_cost_precommitments(
         causal_folds = _causal_folds(attempt)
         if len(causal_folds) != len(fold_plan):
             _fail("PARTITION_COST_PRECOMMIT_FOLD_ROSTER_INVALID", attempt.ordinal)
+        recipe = getattr(attempt.artifacts, "refit_recipe", None)
+        requirements = recipe.get("data_requirements") if isinstance(recipe, Mapping) else None
+        recipe_warmup = requirements.get("warmup_bars") if isinstance(requirements, Mapping) else None
         for fold_ordinal, fold in enumerate(causal_folds):
+            bounds = tuple(fold.get(name) for name in (
+                "fit_start_utc", "fit_end_exclusive_utc", "validation_warmup_start_utc",
+                "validation_start_utc", "validation_end_exclusive_utc"))
+            # Only exact input types may share successful geometry. Other inputs
+            # still reach the original fold validation/conversion without reuse.
+            key = ((*bounds, recipe_warmup, geometry["warmup_bars"])
+                if all(type(value) is str for value in bounds)
+                and type(recipe_warmup) is int and type(geometry["warmup_bars"]) is int else None)
+            summaries = fold_summaries.get(key) if key is not None else None
+            if summaries is not None:
+                rows.extend({"attempt_ordinal": attempt.ordinal, "fold_ordinal": fold_ordinal,
+                    **summary} for summary in summaries)
+                continue
+            first_row = len(rows)
             partitions = _fold_partitions(frame=fitted._frame, fold=fold, attempt=attempt,
                 dependency_warmup_bars=geometry["warmup_bars"])
             for partition in partitions:
@@ -2332,6 +2359,12 @@ def _partition_cost_precommitments(
                     "partition_frame_sha256": partition.geometry_receipt["frame_sha256"],
                     "source_observation_receipt_sha256": source_receipt[0],
                     "tiers": tiers})
+            if key is not None:
+                # Retain metadata only; strategy frames/working copies never
+                # enter this call-local cache or escape through its summaries.
+                fold_summaries[key] = tuple({name: value for name, value in row.items()
+                    if name not in {"attempt_ordinal", "fold_ordinal"}}
+                    for row in rows[first_row:])
     try:
         return raw_winner.build_partition_cost_precommitments(rows,
             pair=fitted.frozen_tier_pair_contract)
@@ -2367,13 +2400,31 @@ def _require_source_observation_references(value):
     return value
 
 
+def _index_partition_precommitment_rows(precommitments):
+    """Index already private rows once; keep duplicate cardinality for existing refusals."""
+    try:
+        rows = precommitments.get("rows")
+        if type(rows) is not list:
+            return None
+        indexed = {}
+        for row in rows:
+            key = row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition")
+            indexed.setdefault(key, []).append(row)
+    except (AttributeError, TypeError):
+        return None
+    return {key: tuple(values) for key, values in indexed.items()}
+
+
 def _partition_source_observation_reference(*, references, precommitments, pair,
-        attempt, fold_ordinal, partition):
+        attempt, fold_ordinal, partition, _partition_row_lookup=None):
     geometry = partition.geometry_receipt
     reference = references.get(geometry["receipt_sha256"])
-    rows = precommitments.get("rows")
-    matches = [row for row in rows if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
-        == (attempt.ordinal, fold_ordinal, partition.role)] if type(rows) is list else []
+    if _partition_row_lookup is None:
+        rows = precommitments.get("rows")
+        matches = [row for row in rows if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
+            == (attempt.ordinal, fold_ordinal, partition.role)] if type(rows) is list else []
+    else:
+        matches = _partition_row_lookup.get((attempt.ordinal, fold_ordinal, partition.role), ())
     if not isinstance(reference, Mapping) or len(matches) != 1:
         _fail("SOURCE_OBSERVATION_REFERENCE_GEOMETRY_MISMATCH")
     try:
@@ -2391,10 +2442,14 @@ def _verify_partition_precommitment(
     *, precommitments: Mapping[str, Any], attempt: _VerifiedAttempt,
     fold_ordinal: int, partition: _PartitionSlice, tier: str,
     result: Mapping[str, Any], pair: Mapping[str, Any],
+    _partition_row_lookup=None,
 ) -> None:
-    rows = precommitments.get("rows")
-    matches = [row for row in rows if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
-        == (attempt.ordinal, fold_ordinal, partition.role)] if type(rows) is list else []
+    if _partition_row_lookup is None:
+        rows = precommitments.get("rows")
+        matches = [row for row in rows if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
+            == (attempt.ordinal, fold_ordinal, partition.role)] if type(rows) is list else []
+    else:
+        matches = _partition_row_lookup.get((attempt.ordinal, fold_ordinal, partition.role), ())
     if len(matches) != 1:
         _fail("PARTITION_COST_PRECOMMIT_ROW_UNAVAILABLE")
     try:
@@ -2619,6 +2674,8 @@ def _run_tier_partition(
     entry_spread_observations: pd.Series,
     decision_result_out: dict[str, Any] | None = None,
     _entry_admission_preparation: Any = None,
+    _matched_base_facts_out: dict[str, Any] | None = None,
+    _matched_stress_tier: spread_profile.FrozenSpreadTier | None = None,
 ) -> tuple[dict[str, Any], pd.DataFrame, pd.Series, Backtester]:
     try:
         features, raw_signals = _slice_full_prefix_strategy_surface(
@@ -2635,6 +2692,7 @@ def _run_tier_partition(
                 if partition.role in {"optimizer_train", "tuning_validation"} else None)
             if _entry_admission_preparation is not None else nullcontext()
         )
+        exact_trade_capture = {} if _matched_base_facts_out is not None else None
         with admission_scope:
             result = backtester.run(
                 features,
@@ -2646,6 +2704,7 @@ def _run_tier_partition(
                 warmup_bars=partition.warmup_bars,
                 spread_tier=spread_tier,
                 entry_spread_observations=entry_spread_observations.loc[features.index],
+                **({"_exact_trade_facts_out": exact_trade_capture} if exact_trade_capture is not None else {}),
             )
     except AuthoritativeSearchExecutionError:
         raise
@@ -2681,6 +2740,72 @@ def _run_tier_partition(
         ) from exc
     if _source_identity(source_contract) != expected_source_contract_sha256:
         _fail("BACKTEST_SOURCE_CONTRACT_DRIFT", partition.role)
+    if _matched_base_facts_out is not None:
+        facts = _route_a_matched_base_trade_facts(
+            result=result, features=features, backtester=backtester, spec=spec,
+            base_tier=spread_tier, stress_tier=_matched_stress_tier,
+            timeframe=timeframe, partition_role=partition.role, exact_trade_capture=exact_trade_capture)
+        # This call omits governance/schedules: both fixed-control backends keep
+        # the entry stop unchanged through ordinary and terminal trade emission.
+        facts["initial_risk_source_binding"] = {
+            "executor_release_sha256": AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+            "backtest_source_contract_sha256": expected_source_contract_sha256,
+            "instrument_spec_sha256": _sha256(facts["instrument_spec"]),
+            "caller": "pm_authoritative_search_execution._run_tier_partition",
+            "backtester": "pm_core.Backtester.run",
+            "governance_policy": None, "entry_schedule": None,
+            "terminal_policy": "LIQUIDATE",
+            "stop_provenance": "ORIGINAL_ENTRY_STOP_PRESERVED_BOTH_FIXED_CONTROL_BACKENDS",
+        }
+        for trade_ordinal, trade_facts in enumerate(facts["trades"]):
+            trade_facts["actual_initial_risk_dollars"] = trade_facts["risk_at_recorded_stop_dollars"]
+            trade_facts["initial_stop_status"] = "ORIGINAL_ENTRY_STOP_FIXED_CONTROL"
+            try:
+                components = _route_a_exact_base_return_components(trade_facts,
+                    spec=spec, ordinal=trade_ordinal,
+                    swap_model_enabled=facts["exact_swap_model_enabled"])
+                trade_facts["base_return_components"] = components
+                trade_facts["base_actual_initial_risk_net_r"] = components["canonical_net_r"]
+            except (KeyError, TypeError, ValueError, IndexError, OverflowError, ZeroDivisionError):
+                trade_facts["base_return_components"] = None
+                trade_facts["base_actual_initial_risk_net_r"] = None
+                facts["floor_reason_codes"].append("EXACT_EXECUTED_PRICE_SWAP_CAPTURE_MISMATCH")
+            trade_facts["matched_p95_spread_cost_r_unrounded"] = None
+            if trade_facts["base_fill_witness"]["status"] == "VERIFIED":
+                sides = trade_facts["spread_sides"]["P95"]
+                numerator = sides["entry_half_spread_at_entry"] + sides["intrabar_half_spread_at_exit"]
+                distance = abs(trade_facts["entry_price"] - trade_facts["recorded_stop_price"])
+                trade_facts["matched_p95_cost_inputs"] = {
+                    "entry_half_price": sides["entry_half_spread_at_entry"],
+                    "exit_intrabar_half_price": sides["intrabar_half_spread_at_exit"],
+                    "numerator_price": numerator if math.isfinite(numerator) else None,
+                    "original_initial_stop_distance_price": distance if math.isfinite(distance) else None}
+                try:
+                    ratio = numerator / distance
+                    if not math.isfinite(ratio):
+                        raise ValueError("nonfinite matched cost")
+                    trade_facts["matched_p95_spread_cost_r_unrounded"] = ratio
+                    trade_facts["matched_p95_spread_cost_r"] = pm_core.canonical_backtest_winner_r(numerator, distance)
+                except (ValueError, ZeroDivisionError, OverflowError):
+                    facts["floor_reason_codes"].append("MATCHED_COST_RATIO_INVALID")
+        if not facts["trades"]:
+            facts["floor_status"] = "UNAVAILABLE_NO_COMPLETED_BASE_TRADES"
+        elif facts["floor_reason_codes"] or facts["base_fill_witness_status"] != "VERIFIED":
+            facts["floor_status"] = "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH"
+        else:
+            facts["floor_status"] = "AVAILABLE_MATCHED_BASE_VERIFIED"
+            facts["completed_position_ids"] = [row["base_position_event"]["position_id"] for row in facts["trades"]]
+            for target, source in (("completed_position_open_utc", "entry_time"), ("completed_position_close_utc", "exit_time")):
+                facts[target] = [pd.Timestamp(row["base_position_event"][source]).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    for row in facts["trades"]]
+            for target, source in (("completed_position_open_event_order", "entry_event_order"),
+                                   ("completed_position_close_event_order", "exit_event_order")):
+                facts[target] = [row["base_position_event"][source] for row in facts["trades"]]
+            facts["base_actual_initial_risk_net_r"] = [row["base_actual_initial_risk_net_r"] for row in facts["trades"]]
+            facts["matched_p95_spread_cost_r"] = [row["matched_p95_spread_cost_r"] for row in facts["trades"]]
+        facts["stress_cost_status"] = "PER_TRADE_MATCHED_PRICE_RATIO"
+        facts["r_transport_normalization"] = "pm_core.canonical_backtest_winner_r"
+        _matched_base_facts_out.update(facts)
     decision_result = _decision_relevant_result(result, partition.role)
     if decision_result_out is not None:
         decision_result_out.update(decision_result)
@@ -2858,7 +2983,11 @@ def _build_planned_attempt_evidence(
     partition_cost_precommitments: Mapping[str, Any],
     source_observation_references: Mapping[str, Mapping[str, Any]] | None,
     _entry_admission_preparation: Any = None,
+    _full_panel_lane_capture: Any = None,
 ) -> dict[str, Any]:
+    if (_full_panel_lane_capture is not None
+            and type(_full_panel_lane_capture) is not _FullPanelLaneCapture):
+        _fail("ROUTE_A_FULL_PANEL_CAPTURE_INVALID")
     strategy, _parameters = _runtime_strategy(attempt)
     frame = fitted._frame
     symbol, timeframe, regime = (plan_body["cell"][key] for key in ("symbol", "timeframe", "regime"))
@@ -2883,6 +3012,9 @@ def _build_planned_attempt_evidence(
             actual_results = {}
             for tier in ("P75", "P95"):
                 decision_result = {}
+                matched_base_facts = {} if _full_panel_lane_capture is not None and tier == "P75" else None
+                if _full_panel_lane_capture is not None:
+                    _full_panel_lane_capture.require_current()
                 result, _features, signals, _backtester = _run_tier_partition(
                     partition=partition, full_prefix_surface=full_prefix_surface,
                     backtester=backtester, strategy=strategy, symbol=symbol,
@@ -2894,10 +3026,16 @@ def _build_planned_attempt_evidence(
                     decision_result_out=decision_result,
                     **({"_entry_admission_preparation": _entry_admission_preparation}
                        if _entry_admission_preparation is not None else {}),
+                    **({"_matched_base_facts_out": matched_base_facts,
+                        "_matched_stress_tier": fitted._spread_tiers["P95"]}
+                       if _full_panel_lane_capture is not None and tier == "P75" else {}),
                 )
                 _verify_partition_precommitment(precommitments=partition_cost_precommitments,
                     attempt=attempt, fold_ordinal=fold_ordinal, partition=partition,
                     tier=tier, result=result, pair=fitted.frozen_tier_pair_contract)
+                if _full_panel_lane_capture is not None:
+                    _full_panel_lane_capture.record_lane(fold_ordinal, partition.role,
+                        tier, decision_result, matched_base_facts)
                 if partition.role in partition_signals and not partition_signals[partition.role].equals(signals):
                     _fail("PARTITION_SIGNAL_VECTOR_TIER_MISMATCH")
                 partition_signals[partition.role] = signals
@@ -3042,7 +3180,8 @@ def _bound_fit_frozen_chain(context, body, header):
     schema = json.loads(_bound_fit_entry_bytes(context, receipt_entry,
         expected_format=raw_winner.ASCII_JSON_FORMAT).decode("ascii")).get("schema_version")
     restorers = {raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v6,
-        raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v7}
+        raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v7,
+        raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v9}
     restore = restorers.get(schema)
     if restore is None:
         _fail("BOUND_FIT_LEGACY_FROZEN_PLAN_FORBIDDEN")
@@ -3659,27 +3798,15 @@ def _declared_fitted_for_execution(capture, fitted, config):
     _require_executable_bound_fit(fitted)
     owner = getattr(fitted, "_bound_fit_owner", None)
     if owner is None:
-        # Replaces the one existing call; this is not an additional fit/replay.
-        refreshed = _reverify_fitted_timeframe(fitted, config)
+        # The declared capture already owns this exact producer-fitted object/config.
+        refreshed = fitted
         issued = object.__new__(_FreshFitOwner)
         issued.seal, issued.fitted = _BOUND_FIT_OWNER_SEAL, refreshed
         issued.context_id, issued.request_sha256 = id(capture.context), capture.request.receipt_sha256
         issued.original_fitted, issued.config = fitted, config
         return refreshed, issued
     bound_fitted_state_reference(fitted, context=capture.context, request=capture.request)
-    if type(fitted._derived_binding) is _DerivedSearchBinding:
-        derived = fitted._derived_binding
-        source_context = {"owner": derived.owner, "request_lease": derived.request_lease,
-            "calibration_lease": derived.calibration_lease, "cost_edition": derived.cost_edition,
-            "source_session": capture.source_session.to_dict(), "source_session_entry": dict(capture.source_session._entry)}
-        reopened, _ = reopen_bound_fitted_timeframe(capture.context, request=capture.request, process=capture.process,
-            frozen_pipeline_config=capture.source_session._frozen_config,
-            header=json.loads(owner.header_bytes.decode("ascii")), m5_source_context=source_context)
-        return reopened, reopened._bound_fit_owner
-    reopened, _ = reopen_bound_fitted_timeframe(capture.context, request=capture.request, process=capture.process,
-        frozen_pipeline_config=capture.source_session._frozen_config,
-        header=json.loads(owner.header_bytes.decode("ascii")))
-    return reopened, reopened._bound_fit_owner
+    return fitted, owner
 
 
 def _reverify_cell_state_error_envelope(
@@ -3921,12 +4048,11 @@ def _declared_completed_prefix(context: Any, body: Mapping[str, Any],
 
 
 def _publish_declared_completed_unit(context: Any, body: Mapping[str, Any],
-        binding_sha256: str, unit: Mapping[str, Any], value: Mapping[str, Any],
-        *, remaining_cell_bytes: int) -> dict[str, Any]:
+        binding_sha256: str, unit: Mapping[str, Any], value: Mapping[str, Any]) -> dict[str, Any]:
     if _read_declared_completed_unit(context, body, binding_sha256, unit) is not None:
         _fail("DECLARED_UNIT_ALREADY_COMPLETE", unit["ordinal"])
     _, size = _canonical_digest_and_size(value)
-    if size > MAX_ATTEMPT_EVIDENCE_BYTES or size > remaining_cell_bytes:
+    if size > MAX_ATTEMPT_EVIDENCE_BYTES:
         _fail("ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED", unit["ordinal"])
     if value.get("attempt_id") != unit["raw_attempt_id"]:
         _fail("DECLARED_UNIT_PAYLOAD_INVALID", unit["ordinal"])
@@ -4012,14 +4138,9 @@ def _continue_declared_attempt_units(context: Any, body: Mapping[str, Any],
         now = _now_utc_seconds()
         if not window["start_utc"] <= now < window["end_exclusive_utc"]:
             _fail("DECLARED_UNIT_ORIGINAL_WINDOW_CLOSED")
-    total_bytes = sum(row["payload"]["size_bytes"] for row in records)
-    if total_bytes > MAX_CELL_EVIDENCE_BYTES:
-        _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
     for unit in units[len(records):]:
         value = produce(unit)
-        row = _publish_declared_completed_unit(context, body, binding_sha256, unit, value,
-            remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes)
-        total_bytes += row["payload"]["size_bytes"]
+        row = _publish_declared_completed_unit(context, body, binding_sha256, unit, value)
         records.append(row)
         del value
     completed = {"binding_sha256": binding_sha256, "unit_count": len(units),
@@ -4222,18 +4343,12 @@ def _write_staged_attempt(
     stage: Path,
     ordinal: int,
     value: Mapping[str, Any],
-    remaining_cell_bytes: int,
     reservation: Any,
 ) -> _StagedAttemptEvidence:
     if type(ordinal) is not int or ordinal < 0 or not isinstance(value, Mapping):
         _fail("STAGE_ATTEMPT_INPUT_INVALID")
-    if remaining_cell_bytes <= 0:
-        _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
     expected_sha256, expected_size = _canonical_digest_and_size(value)
-    if (
-        expected_size > MAX_ATTEMPT_EVIDENCE_BYTES
-        or expected_size > remaining_cell_bytes
-    ):
+    if expected_size > MAX_ATTEMPT_EVIDENCE_BYTES:
         _fail("ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED", ordinal)
     reservation.consume(expected_size)
     encoder = json.JSONEncoder(
@@ -4260,7 +4375,7 @@ def _write_staged_attempt(
                 for piece in pieces:
                     encoded = piece.encode("ascii")
                     size += len(encoded)
-                    if size > MAX_ATTEMPT_EVIDENCE_BYTES or size > remaining_cell_bytes:
+                    if size > MAX_ATTEMPT_EVIDENCE_BYTES:
                         _fail("ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED", ordinal)
                     stream.write(encoded)
                     digest.update(encoded)
@@ -5421,7 +5536,6 @@ def _execute_current_observed_cell(
             cell_plan=cell_plan,
             frozen=frozen,
         )
-        total_bytes = 0
         horizon_plan_receipt_sha256 = _sha256(plan_body)
         for attempt, raw_id in zip(attempts, raw_ids, strict=True):
             if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
@@ -5443,9 +5557,6 @@ def _execute_current_observed_cell(
                         sha256=outcome_sha,
                     )
                 )
-                total_bytes += outcome_size
-                if total_bytes > MAX_CELL_EVIDENCE_BYTES:
-                    _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
                 continue
             body = _build_planned_attempt_evidence(
                 attempt=attempt,
@@ -5461,13 +5572,11 @@ def _execute_current_observed_cell(
                 stage=stage,
                 ordinal=attempt.ordinal,
                 value=body,
-                remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes,
                 reservation=stage_reservation,
             )
             staged.append(row)
-            total_bytes += row.size_bytes
             del body
-        if len(staged) != len(attempts) or total_bytes > MAX_CELL_EVIDENCE_BYTES:
+        if len(staged) != len(attempts):
             _fail("STAGED_ATTEMPT_ROSTER_INCOMPLETE")
         evidence_completed = _now_utc_seconds()
 
@@ -5662,6 +5771,7 @@ def execute_historical_observed_cell(
     search_process: Any,
     cell_plan: Any,
     config: PipelineConfig,
+    _execution_edition: str | None = None,
 ) -> HistoricalObservedCellExecution:
     """Run one observed historical cell through genuine raw Winner evidence.
 
@@ -5712,6 +5822,15 @@ def execute_historical_observed_cell(
         regime=normalized_regime,
         horizon_plan=horizon_plan,
     )
+    import pm_production_search_planner as planner
+    frozen_execution_edition = search_process.to_dict().get("execution_edition")
+    if _execution_edition != frozen_execution_edition:
+        _fail("HISTORICAL_EXECUTION_EDITION_MISMATCH")
+    full_panel_execution = frozen_execution_edition == planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION
+    if full_panel_execution and type(capture) is not historical_adapter.DeclaredSlotSearchCapture:
+        _fail("ROUTE_A_FULL_PANEL_DECLARED_CAPTURE_REQUIRED")
+    if full_panel_execution and capture._winner_generation is not winner.V17_GENERATION:
+        _fail("ROUTE_A_FULL_PANEL_MATCHED_FLOOR_GENERATION_REQUIRED")
     attempted_exact = (
         len(attempt_artifacts) if isinstance(attempt_artifacts, Sequence) else 0
     )
@@ -5737,6 +5856,8 @@ def execute_historical_observed_cell(
         declared_scope = _declared_unit_lease(capture.context, capture.request.to_dict())
         declared_scope.__enter__()
     try:
+        if full_panel_execution:
+            _require_fresh_route_a_full_panel_request(capture.context, capture.request)
         if declared_mode:
             refreshed, bound_fit_issue_owner = _declared_fitted_for_execution(capture, fitted, config)
         else:
@@ -5832,7 +5953,35 @@ def execute_historical_observed_cell(
             declared_binding_sha256 = _sha256(binding)
             declared_units = [_declared_unit_identity(attempt, raw_id)
                 for attempt, raw_id in zip(attempts, raw_ids, strict=True)]
+            prepared_full_panel = None
+            if full_panel_execution:
+                reservation_scope = authority_spool.reserve_transient_publication(capture.context)
+                stage_reservation = reservation_scope.__enter__()
+                stage_reservation_scope = reservation_scope
+                stage = _stage_directory(capture, handle)
+                stage_custody = _create_stage_capacity_custody(root=capture.context.root,
+                    stage=stage, reservation=stage_reservation,
+                    binding={"generation_context_sha256": capture.context.context_sha256,
+                        "producer_request_sha256": capture.request.receipt_sha256,
+                        "precommit_sha256": request_body.get("precommit_sha256"),
+                        "process_receipt_sha256": request_body.get("search_process_receipt_sha256"),
+                        "attempt_id": request_body.get("attempt_id"),
+                        "cell_id": request_body.get("cell_id"), "slot_id": request_body.get("slot_id"),
+                        "artifact_namespace": request_body.get("artifact_namespace"),
+                        "source_access_window_utc": request_body.get("source_access_window_utc"),
+                        "cell": [handle.symbol, handle.timeframe, handle.regime],
+                        "frozen_receipt_descriptor": dict(handle.frozen_receipt_descriptor)})
+                prepared_full_panel = _prepare_route_a_full_panel_owner_evidence(
+                    config=config, handle=handle, search_process=search_process,
+                    cell_plan=cell_plan, binding=binding, refreshed=refreshed, attempts=attempts,
+                    request_body=request_body, declared_header=declared_header, capture=capture,
+                    normalized_regime=normalized_regime, fitted=fitted, raw_ids=raw_ids,
+                    plan_body=plan_body, timeframe=timeframe, fold_plan=fold_plan, symbol=symbol,
+                    stage_custody=stage_custody, reservation=stage_reservation, staged_rows=staged,
+                    source_observation_references=source_observation_references)
             def produce_unit(unit):
+                if prepared_full_panel is not None:
+                    return prepared_full_panel.unit_body(unit)
                 attempt = attempts[unit["ordinal"]]
                 if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
                     outcome = _process_rejection_outcome(attempt=attempt, symbol=symbol,
@@ -5844,10 +5993,14 @@ def execute_historical_observed_cell(
                     partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
                     source_observation_references=source_observation_references,
                     _entry_admission_preparation=entry_admission_preparation)
-            with pm_core._EntryAdmissionPreparation(
-                    refreshed._entry_spread_observations) as entry_admission_preparation:
+            if prepared_full_panel is not None:
                 declared_records, evidence_completed = _continue_declared_attempt_units(
                     capture.context, request_body, declared_binding_sha256, declared_units, produce_unit)
+            else:
+                with pm_core._EntryAdmissionPreparation(
+                        refreshed._entry_spread_observations) as entry_admission_preparation:
+                    declared_records, evidence_completed = _continue_declared_attempt_units(
+                        capture.context, request_body, declared_binding_sha256, declared_units, produce_unit)
         else:
             reservation_scope = authority_spool.reserve_transient_publication(
                 capture.context
@@ -5868,7 +6021,6 @@ def execute_historical_observed_cell(
                     "source_access_window_utc": request_body.get("source_access_window_utc"),
                     "cell": [handle.symbol, handle.timeframe, handle.regime],
                     "frozen_receipt_descriptor": dict(handle.frozen_receipt_descriptor)})
-            total_bytes = 0
             plan_receipt_sha256 = _sha256(plan_body)
             for attempt, raw_id in zip(attempts, raw_ids, strict=True):
                 if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
@@ -5890,9 +6042,6 @@ def execute_historical_observed_cell(
                             sha256=outcome_sha,
                         )
                     )
-                    total_bytes += outcome_size
-                    if total_bytes > MAX_CELL_EVIDENCE_BYTES:
-                        _fail("CELL_EVIDENCE_BYTE_BOUND_EXCEEDED")
                     continue
                 body = _build_planned_attempt_evidence(
                     attempt=attempt,
@@ -5908,13 +6057,11 @@ def execute_historical_observed_cell(
                     stage=stage,
                     ordinal=attempt.ordinal,
                     value=body,
-                    remaining_cell_bytes=MAX_CELL_EVIDENCE_BYTES - total_bytes,
                     reservation=stage_reservation,
                 )
                 staged.append(row)
-                total_bytes += row.size_bytes
                 del body
-            if len(staged) != len(attempts) or total_bytes > MAX_CELL_EVIDENCE_BYTES:
+            if len(staged) != len(attempts):
                 _fail("STAGED_ATTEMPT_ROSTER_INCOMPLETE")
             evidence_completed = _now_utc_seconds()
 
@@ -5933,7 +6080,11 @@ def execute_historical_observed_cell(
                             _fail("PROCESS_REJECTION_STAGE_BINDING_CHANGED", attempt.ordinal)
                         yield {"attempt_id": unit["raw_attempt_id"], "outcome": outcome}
                     else:
-                        yield body
+                        if prepared_full_panel is not None:
+                            yield {**body, "selection_addendum": {"capture": capture,
+                                "prepared_stage": prepared_full_panel, "unit": unit}}
+                        else:
+                            yield body
                 return
             for attempt, raw_id, row in zip(attempts, raw_ids, staged, strict=True):
                 if row.ordinal != attempt.ordinal:
@@ -5960,405 +6111,29 @@ def execute_historical_observed_cell(
                     _fail("STAGED_ATTEMPT_IDENTITY_CHANGED", attempt.ordinal)
                 yield body
 
-        if declared_mode:
+        if declared_mode and not full_panel_execution:
             route_a_consumer = _consume_route_a_unit
             if route_a_consumer is not _route_a_noop_consumer:
-                try:
-                    import pm_historical_search_producer as producer
-                    import pm_production_config_binding as config_binding
-                    import pm_production_search_planner as planner
-                    import pm_strategies as strategy_module
-
-                    lifecycle = _RouteABatchLifecycle()
-                    owner_process, owner_thread = os.getpid(), threading.get_ident()
-                    original_handle, original_frozen = handle, handle.frozen
-                    original_context, original_request = capture.context, capture.request
-                    original_session, original_sink = capture.source_session, capture.sink
-                    original_process, original_plan = search_process, cell_plan
-                    original_config = config
-                    original_frozen_config = original_session._frozen_config
-                    unit_binding_bytes = _canonical_bytes(binding)
-                    private_fitted = _route_a_working_fitted(refreshed)
-                    private_config = copy.deepcopy(config)
-                    private_attempts = copy.deepcopy(attempts)
-                    private_plan = json.loads(_canonical_bytes(plan_body).decode("ascii"))
-                    private_domains = json.loads(_canonical_bytes(
-                        search_process.to_dict()["semantics"]["strategy_domains"]).decode("ascii"))
-                    private_precommitments = original_frozen.partition_cost_precommitments
-                    window = request_body["source_access_window_utc"]
-                    window_start = _utc(window["start_utc"], "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID")
-                    window_end = _utc(window["end_exclusive_utc"], "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID")
-                    header_relative = _declared_unit_relative(request_body, "header.json")
-                    frozen_prefix = (request_body["artifact_namespace"] + "/winner-search/"
-                        + timeframe + "/" + normalized_regime + "/frozen/")
-                    descriptors = {}
-                    for entry in declared_header["artifact_roster"]:
-                        if entry["artifact_id"].startswith(frozen_prefix):
-                            descriptor = entry["descriptor"]
-                            descriptors[descriptor["relative_path"]] = copy.deepcopy(descriptor)
-                    for descriptor in (original_handle.frozen_descriptor_graph,
-                            original_handle.cross_binding_descriptor, original_session._entry["descriptor"],
-                            declared_header["horizon_plan"]["descriptor"]):
-                        descriptors[descriptor["relative_path"]] = copy.deepcopy(descriptor)
-                    source_paths = (Path(__file__), Path(pm_core.__file__), Path(current_refit.__file__),
-                        Path(authority_spool.__file__), Path(historical.__file__),
-                        Path(historical_adapter.__file__), Path(native_prefix.__file__),
-                        Path(trade_power.__file__), Path(raw_winner.__file__), Path(winner.__file__),
-                        Path(producer.__file__), Path(planner.__file__), Path(config_binding.__file__),
-                        Path(pm_regime.__file__), Path(spread_profile.__file__),
-                        Path(strategy_module.__file__))
-                    unique_entries, selection_to_unique = [], {}
-                    issued_evaluator = None
-                    owner_snapshot_bytes = None
-
-                    def close_route_a_scope():
-                        nonlocal owner_snapshot_bytes
-                        owner_snapshot_bytes = None
-                        lifecycle.close()
-                        selection_to_unique.clear()
-                        unique_entries.clear()
-
-                    def physical_content():
-                        config_payload, _ = config_binding._read_config(original_frozen_config.active_config_path)
-                        if _canonical_bytes(config_payload) != original_frozen_config._payload_json:
-                            _fail("ROUTE_A_UNIT_BATCH_ORIGINAL_CONFIG_CHANGED")
-                        _, _, header_bytes = authority_spool._stream_file(original_context.root,
-                            header_relative, maximum_bytes=original_context.limits.max_json_bytes, collect=True)
-                        if _canonical_bytes(authority_spool._strict_json_bytes(header_bytes,
-                                original_context.limits.max_json_bytes)) != _canonical_bytes(declared_header):
-                            _fail("ROUTE_A_UNIT_BATCH_ORIGINAL_HEADER_CHANGED")
-                        observed_descriptors = []
-                        for relative, descriptor in sorted(descriptors.items()):
-                            digest, size, _ = authority_spool._stream_file(original_context.root, relative,
-                                maximum_bytes=original_context.limits.max_artifact_bytes,
-                                expected_size=descriptor["size_bytes"])
-                            if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
-                                _fail("ROUTE_A_UNIT_BATCH_FROZEN_BYTES_CHANGED")
-                            observed_descriptors.append((relative, digest, size))
-                        return header_bytes, observed_descriptors
-
-                    def shared_content():
-                        return hashlib.sha256(pickle.dumps({
-                            "fitted": _route_a_fitted_shared_content(fitted),
-                            "refreshed": _route_a_fitted_shared_content(refreshed),
-                            "private_fitted": _route_a_fitted_shared_content(private_fitted),
-                            "config": vars(config), "private_config": vars(private_config),
-                            "request": capture.request.to_dict(), "precommit": capture.request._precommit.to_dict(),
-                            "process": search_process.to_dict(),
-                            "plan": (cell_plan.receipt_sha256, cell_plan.cell_receipt, cell_plan.spool_entry,
-                                cell_plan.horizon_plan.to_dict(), cell_plan.attempt_artifacts(),
-                                cell_plan.state_requirements()),
-                            "private_attempts": private_attempts, "private_plan": private_plan,
-                            "private_domains": private_domains, "precommitments": private_precommitments,
-                            "frozen": asdict(handle.frozen), "handle": (
-                                handle.symbol, handle.timeframe, handle.regime, handle.artifact_namespace,
-                                handle.frozen_receipt_descriptor, handle.frozen_descriptor_graph,
-                                handle.cross_binding_descriptor, handle._cross_binding_bytes,
-                                handle._attempt_artifacts, handle._horizon_execution_contracts,
-                                handle._source_count_receipts, handle._capture_nonce),
-                            "roster": capture.sink.artifact_roster(),
-                            "context": (capture.context.generation_id, capture.context.context_sha256,
-                                capture.context.config_sha256, capture.context.native_universe_sha256,
-                                str(capture.context.root), asdict(capture.context.limits)),
-                            "frozen_config": (str(original_frozen_config.active_config_path),
-                                original_frozen_config.config_sha256, original_frozen_config.effective_config_sha256,
-                                original_frozen_config._payload_json, original_frozen_config._snapshot_json,
-                                id(original_frozen_config._seal)),
-                            "config_file": _file_sha256(Path(original_frozen_config.active_config_path)),
-                            "sources": [(str(path), _file_sha256(path)) for path in source_paths],
-                            "physical": physical_content()}, protocol=5)).hexdigest()
-
-                    if (_canonical_bytes(declared_header["frozen_plan_receipt"])
-                                != _canonical_bytes(handle.frozen_receipt_descriptor)
-                            or _canonical_bytes(declared_header["frozen_descriptor_graph"])
-                                != _canonical_bytes(handle.frozen_descriptor_graph)
-                            or _canonical_bytes(declared_header["horizon_winner_cross_binding"])
-                                != _canonical_bytes(handle.cross_binding_descriptor)
-                            or _canonical_bytes(declared_header["source_session_entry"])
-                                != _canonical_bytes(dict(original_session._entry))
-                            or _canonical_bytes(original_frozen.source_contract_seeds)
-                                != _canonical_bytes(refreshed.source_contract_seeds)
-                            or _canonical_bytes(original_frozen.frozen_tier_pair_contract)
-                                != _canonical_bytes(refreshed.frozen_tier_pair_contract)
-                            or _canonical_bytes(_declared_unit_binding(capture, refreshed, cell_plan,
-                            attempts, fold_plan, handle)) != unit_binding_bytes
-                            or _frame_sha256(refreshed._frame) != refreshed.frame_sha256
-                            or config_binding._snapshot(config) != json.loads(
-                                original_frozen_config._snapshot_json.decode("ascii"))["pipeline_config"]
-                            or _sha256(authoritative_search_execution_contract())
-                                != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256):
-                        _fail("ROUTE_A_UNIT_BATCH_ADMISSION_CHANGED")
-                    admitted_content = shared_content()
-
-                    def require_route_a_owner_window():
-                        if lifecycle.closed:
-                            _fail("ROUTE_A_UNIT_BATCH_CLOSED")
-                        if (capture.context is not original_context or capture.request is not original_request
-                                or capture.source_session is not original_session or capture.sink is not original_sink
-                                or capture.process is not original_process or search_process is not original_process
-                                or capture.cell_plan is not original_plan or cell_plan is not original_plan
-                                or config is not original_config or capture.pipeline_config is not original_config
-                                or capture.fitted_timeframe is not fitted
-                                or capture.source_session._frozen_config is not original_frozen_config
-                                or handle is not original_handle or handle.frozen is not original_frozen
-                                or capture._finished or capture._completion is not None):
-                            _fail("ROUTE_A_UNIT_BATCH_OWNER_MISMATCH")
-                        producer._verified_declared_slot_source_session_current(original_context,
-                            request=original_request, process=original_process,
-                            source_session=original_session)
-                        capture._require_active(original_handle)
-                        _route_a_require_scope_current(closed=lifecycle.closed,
-                            owner_process=owner_process, owner_thread=owner_thread,
-                            current_process=os.getpid(), current_thread=threading.get_ident(),
-                            window_start=window_start, window_end=window_end,
-                            observed=_utc(_now_utc_seconds(), "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID"))
-
-                    def require_route_a_current():
-                        require_route_a_owner_window()
-                        historical_adapter._verify_declared_slot_capture_current(capture)
-                        _route_a_require_unchanged(expected=admitted_content, observed=shared_content())
-                        require_route_a_owner_window()
-
-                    owner_snapshot_bytes = _canonical_bytes(_route_a_owner_membership_snapshot(
-                        declared_unit_binding=json.loads(unit_binding_bytes.decode("ascii")),
-                        frozen_domains=private_domains, plan_body=private_plan, attempts=private_attempts,
-                        raw_ids=raw_ids, precommitments=private_precommitments))
-
-                    def select_request(specification):
-                        selected_attempt, fold, partition, parameters = _route_a_rebind_owner_membership(
-                            specification=specification, snapshot=json.loads(owner_snapshot_bytes.decode("ascii")),
-                            attempts=private_attempts, owner_attempts=attempts, raw_ids=raw_ids,
-                            frame=private_fitted._frame,
-                            dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"],
-                            precommitments=private_precommitments)
-                        selection, group = _route_a_owner_selection_bytes(
-                            strategy_id=selected_attempt.artifacts.winner_process["strategy_id"], parameters=parameters,
-                            attempt_ordinal=selected_attempt.ordinal, fold_ordinal=specification["fold_ordinal"],
-                            fold_id=fold["fold_id"], partition_geometry=partition.geometry_receipt,
-                            declared_unit_binding=json.loads(unit_binding_bytes.decode("ascii")),
-                            spread_tier=specification["spread_tier"])
-                        return selected_attempt, fold, partition, parameters, selection, group
-
-                    def describe_request(specification, parameters, evaluation_binding):
-                        described = planner.describe_route_a_evaluation_design(frozen_domains=private_domains,
-                            configurations=[{"strategy_id": specification["strategy_id"], "parameters": parameters,
-                                "evaluation_binding": evaluation_binding,
-                                "bookkeeping": specification["bookkeeping"]}])["requests"][0]
-                        described["request_ordinal"] = specification["request_ordinal"]
-                        return described
-
-                    def evaluate_route_a_batch(*, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
-                        try:
-                            lifecycle.enter()
-                            require_route_a_current()
-                            if type(metadata_recipe) is not str or metadata_recipe != _ROUTE_A_UNIT_BATCH_RECIPE:
-                                _fail("ROUTE_A_UNIT_BATCH_RECIPE_INVALID")
-                            rows = _route_a_batch_specifications(specifications)
-                            requests, mapping, first_requests = [], [], {}
-                            for specification in rows:
-                                require_route_a_current()
-                                selected_attempt, fold, partition, parameters, selection, group = select_request(specification)
-                                tier = specification["spread_tier"]
-                                index = selection_to_unique.get(selection)
-                                cache_hit = index is not None
-                                if cache_hit:
-                                    entry = unique_entries[index]
-                                    described = describe_request(specification, parameters,
-                                        json.loads(entry["binding_bytes"].decode("ascii")))
-                                    if _canonical_bytes(described["shared_evaluation_key"]) != entry["key_bytes"]:
-                                        _fail("ROUTE_A_UNIT_BATCH_REQUEST_INVALID")
-                                    require_route_a_current()
-                                else:
-                                    working_fitted = _route_a_working_fitted(private_fitted)
-                                    working_config = copy.deepcopy(private_config)
-                                    working_partitions = _fold_partitions(frame=working_fitted._frame, fold=fold,
-                                        attempt=selected_attempt,
-                                        dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"])
-                                    working_partition = next(value for value in working_partitions
-                                        if value.role == specification["partition_role"])
-                                    _route_a_require_unchanged(expected=_canonical_bytes(partition.geometry_receipt),
-                                        observed=_canonical_bytes(working_partition.geometry_receipt))
-                                    stable_source = _source_identity(working_fitted.source_contract_seeds[tier])
-                                    prepared = {}
-                                    working_content = (_route_a_fitted_shared_content(working_fitted),
-                                        pickle.dumps(vars(working_config), protocol=5))
-
-                                    def require_working_current():
-                                        require_route_a_current()
-                                        _route_a_require_unchanged(expected=working_content,
-                                            observed=(_route_a_fitted_shared_content(working_fitted),
-                                                pickle.dumps(vars(working_config), protocol=5)))
-                                        require_route_a_owner_window()
-
-                                    def source_identity(result):
-                                        contract = raw_winner.build_trade_source_contract_from_backtester_result(result)
-                                        sample = trade_power.build_trade_sample_evidence([], source_contract=contract,
-                                            minimum_observations=raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS)
-                                        if sample.source_contract is None:
-                                            _fail("ROUTE_A_UNIT_BATCH_SOURCE_CONTRACT_UNAVAILABLE")
-                                        return sample.source_contract
-
-                                    def prepare_probe():
-                                        probe_backtester = Backtester(working_config)
-                                        if getattr(probe_backtester, "_entry_admission_preparation", None) is not None:
-                                            _fail("ROUTE_A_UNIT_BATCH_ENTRY_ADMISSION_POOL_REFUSED")
-                                        return probe_backtester.build_evidence_source_seed_result(
-                                            working_partition.frame, symbol, spec=working_fitted.instrument_spec,
-                                            timeframe=timeframe, spread_tier=working_fitted._spread_tiers[tier],
-                                            entry_spread_observations=working_fitted._entry_spread_observations.loc[
-                                                working_partition.frame.index])
-
-                                    def verify_probe(probe):
-                                        _verify_partition_precommitment(precommitments=private_precommitments,
-                                            attempt=selected_attempt, fold_ordinal=specification["fold_ordinal"],
-                                            partition=working_partition, tier=tier, result=probe,
-                                            pair=working_fitted.frozen_tier_pair_contract)
-                                        identity = source_identity(probe)
-                                        if identity.source_contract_sha256 != stable_source:
-                                            _fail("ROUTE_A_UNIT_BATCH_SOURCE_IDENTITY_MISMATCH")
-                                        evaluation_binding = {"symbol": symbol, "timeframe": timeframe,
-                                            "regime": normalized_regime, "anchor_id": private_plan["anchor"]["anchor_id"],
-                                            "selection_cutoff_utc": private_plan["anchor"]["selection_cutoff_utc"],
-                                            "search_process_receipt_sha256": original_process.receipt_sha256,
-                                            "config_sha256": original_context.config_sha256,
-                                            "effective_config_sha256": original_frozen_config.effective_config_sha256,
-                                            "declared_unit_binding": json.loads(unit_binding_bytes.decode("ascii")),
-                                            "fold_ordinal": specification["fold_ordinal"], "fold_id": fold["fold_id"],
-                                            "partition_geometry": working_partition.geometry_receipt, "spread_tier": tier,
-                                            "source_contract_sha256": stable_source,
-                                            "partition_source_contract_sha256": identity.partition_source_contract_sha256,
-                                            "spread_model_sha256": hashlib.sha256(_ROUTE_A_UNIT_BATCH_POLICY_DOMAIN
-                                                + pm_core.build_backtest_spread_mode(probe["spread_model"]).encode("ascii")).hexdigest()}
-                                        prepared["identity"] = identity
-                                        prepared["described"] = describe_request(specification, parameters, evaluation_binding)
-
-                                    def run_strategy(strategy, probe):
-                                        surface = _build_full_prefix_strategy_surface(frame=working_fitted._frame,
-                                            strategy=strategy, fitted=working_fitted, symbol=symbol, timeframe=timeframe)
-                                        decision = {}
-                                        backtester = Backtester(working_config)
-                                        if getattr(backtester, "_entry_admission_preparation", None) is not None:
-                                            _fail("ROUTE_A_UNIT_BATCH_ENTRY_ADMISSION_POOL_REFUSED")
-                                        result, _features, signals, _ = _run_tier_partition(partition=working_partition,
-                                            full_prefix_surface=surface, backtester=backtester, strategy=strategy,
-                                            symbol=symbol, timeframe=timeframe, regime=normalized_regime, config=working_config,
-                                            spec=working_fitted.instrument_spec, expected_source_contract_sha256=stable_source,
-                                            spread_tier=working_fitted._spread_tiers[tier],
-                                            entry_spread_observations=working_fitted._entry_spread_observations,
-                                            decision_result_out=decision)
-                                        return {"result": result, "signals": signals, "decision": decision}
-
-                                    def verify_realized(realized, probe):
-                                        _verify_partition_precommitment(precommitments=private_precommitments,
-                                            attempt=selected_attempt, fold_ordinal=specification["fold_ordinal"],
-                                            partition=working_partition, tier=tier, result=realized["result"],
-                                            pair=working_fitted.frozen_tier_pair_contract)
-                                        actual = source_identity(realized["result"])
-                                        expected = prepared["identity"]
-                                        if (actual.source_contract_sha256 != expected.source_contract_sha256
-                                                or actual.partition_source_contract_sha256
-                                                    != expected.partition_source_contract_sha256):
-                                            _fail("ROUTE_A_UNIT_BATCH_REALIZED_PARTITION_SOURCE_IDENTITY_MISMATCH")
-
-                                    realized = _route_a_evaluate_prepared_request(prepare_probe=prepare_probe,
-                                        verify_probe=verify_probe, require_current=require_working_current,
-                                        make_strategy=lambda: _runtime_strategy(selected_attempt)[0],
-                                        run_strategy=run_strategy, verify_realized=verify_realized)
-                                    described = prepared["described"]
-                                    index = len(unique_entries)
-                                    diagnostic = {"schema_version": "fxpm.route-a-unit-request-diagnostic.v1",
-                                        "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
-                                        "request_ordinal": specification["request_ordinal"],
-                                        "shared_evaluation_key": described["shared_evaluation_key"],
-                                        "matched_attempt_ordinal": selected_attempt.ordinal,
-                                        "matched_horizon_attempt_id": selected_attempt.plan_attempt["attempt_id"],
-                                        "decision_lane": copy.deepcopy(realized["decision"]),
-                                        "signal_vector": realized["signals"].copy(deep=True),
-                                        "signal_comparison": "INCOMPLETE_MISSING_PARTNER",
-                                        "unique_evaluation_ordinal": index, "cache_hit": False,
-                                        **_route_a_diagnostic_authorities()}
-                                    entry = {"diagnostic": diagnostic, "result": copy.deepcopy(realized["result"]),
-                                        "group": group, "tier": tier,
-                                        "binding_bytes": _canonical_bytes(described["shared_evaluation_key"]["evaluation_binding"]),
-                                        "key_bytes": _canonical_bytes(described["shared_evaluation_key"])}
-                                    unique_entries.append(entry)
-                                    selection_to_unique[selection] = index
-                                require_route_a_current()
-                                key_bytes = entry["key_bytes"]
-                                diagnostic = copy.deepcopy(entry["diagnostic"])
-                                diagnostic.update(request_ordinal=specification["request_ordinal"],
-                                    same_identity_as_request_ordinal=first_requests.get(key_bytes),
-                                    bookkeeping=copy.deepcopy(described["bookkeeping"]), cache_hit=cache_hit)
-                                first_requests.setdefault(key_bytes, specification["request_ordinal"])
-                                requests.append(diagnostic)
-                                mapping.append(index)
-                            groups = {}
-                            for entry in unique_entries:
-                                groups.setdefault(entry["group"], {})[entry["tier"]] = entry
-                            pair_checks = []
-                            for group, entries in groups.items():
-                                check = _route_a_pair_check(
-                                    signals_by_tier={tier: entry["diagnostic"]["signal_vector"]
-                                        for tier, entry in entries.items()},
-                                    results_by_tier={tier: entry["result"] for tier, entry in entries.items()},
-                                    spec=copy.deepcopy(private_fitted.instrument_spec),
-                                    use_spread=bool(private_config.use_spread),
-                                    frozen_pair=copy.deepcopy(private_fitted.frozen_tier_pair_contract))
-                                pair_checks.append({"evaluation_group_sha256": hashlib.sha256(group).hexdigest(), **check})
-                                for entry in entries.values():
-                                    entry["diagnostic"]["signal_comparison"] = check["status"]
-                            for diagnostic in requests:
-                                diagnostic["signal_comparison"] = unique_entries[
-                                    diagnostic["unique_evaluation_ordinal"]]["diagnostic"]["signal_comparison"]
-                            staged_output = {"schema_version": "fxpm.route-a-unit-batch-diagnostic.v1",
-                                "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
-                                "requests": copy.deepcopy(requests), "request_to_unique": list(mapping),
-                                "unique_evaluations": [copy.deepcopy(entry["diagnostic"]) for entry in unique_entries],
-                                "pair_checks": copy.deepcopy(pair_checks), **_route_a_diagnostic_authorities()}
-                            historical_adapter._verify_declared_slot_capture(capture)
-                            _route_a_require_unchanged(expected=unit_binding_bytes,
-                                observed=_canonical_bytes(_declared_unit_binding(capture, refreshed,
-                                    cell_plan, attempts, fold_plan, original_handle)))
-                            require_route_a_current()
-                            require_route_a_owner_window()
-                            return staged_output
-                        except Exception as exc:
-                            close_route_a_scope()
-                            return _route_a_contain_consumer_failure(exc)
-                        except BaseException:
-                            close_route_a_scope()
-                            raise
-                        finally:
-                            lifecycle.leave()
-
-                    class UnitEvaluator:
-                        __slots__ = ()
-
-                        def __call__(self, *, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
-                            if self is not issued_evaluator:
-                                close_route_a_scope()
-                                _fail("ROUTE_A_UNIT_BATCH_OWNER_MISMATCH")
-                            return evaluate_route_a_batch(specifications=specifications, metadata_recipe=metadata_recipe)
-
-                        def __copy__(self):
-                            close_route_a_scope()
-                            _route_a_refuse_transfer(lifecycle)
-
-                        def __deepcopy__(self, memo):
-                            return self.__copy__()
-
-                        def __reduce_ex__(self, protocol):
-                            return self.__copy__()
-
-                    issued_evaluator = UnitEvaluator()
-                    try:
-                        require_route_a_current()
-                        route_a_consumer_outcome = route_a_consumer(evaluate_batch=issued_evaluator)
-                        require_route_a_current()
-                    finally:
-                        close_route_a_scope()
-                except Exception as exc:
-                    route_a_consumer_outcome = _route_a_contain_consumer_failure(exc)
+                route_a_consumer_outcome = _run_route_a_owned_unit_continuation(
+                    config=config,
+                    handle=handle,
+                    search_process=search_process,
+                    cell_plan=cell_plan,
+                    binding=binding,
+                    refreshed=refreshed,
+                    attempts=attempts,
+                    request_body=request_body,
+                    declared_header=declared_header,
+                    capture=capture,
+                    normalized_regime=normalized_regime,
+                    route_a_consumer=route_a_consumer,
+                    fitted=fitted,
+                    raw_ids=raw_ids,
+                    plan_body=plan_body,
+                    timeframe=timeframe,
+                    fold_plan=fold_plan,
+                    symbol=symbol,
+                )
         production = capture.complete_observed_cell(
             handle,
             attempt_evidence=evidence_stream(),
@@ -6461,6 +6236,30 @@ def execute_transport_historical_observed_cell(**kwargs: Any) -> HistoricalObser
     if getattr(capture, "_winner_generation", None) is not winner.V16_GENERATION:
         _fail("TRANSPORT_CAPTURE_GENERATION_REQUIRED")
     return execute_historical_observed_cell(**kwargs)
+
+
+def _require_fresh_route_a_full_panel_request(context, request):
+    """Refuse prior execution metadata without reopening or rekeying old work."""
+    if (type(context) is not authority_spool.GenerationSpoolContext
+            or type(request) is not historical.DeclaredSlotProducerRequest):
+        _fail("ROUTE_A_FULL_PANEL_REQUEST_INVALID")
+    body = request.to_dict()
+    for name in ("header.json", "raw-completion.json", "evidence-completed.json"):
+        if _read_declared_unit_json(context, _declared_unit_relative(body, name)) is not None:
+            _fail("ROUTE_A_FULL_PANEL_EXISTING_HEADER_REENTRY_REFUSED")
+
+
+def execute_route_a_full_panel_historical_observed_cell(**kwargs: Any) -> HistoricalObservedCellExecution:
+    """Execute only the explicitly frozen fresh full-panel edition."""
+    import pm_production_search_planner as planner
+    capture = kwargs.get("capture")
+    if (type(capture) is not historical_adapter.DeclaredSlotSearchCapture
+            or "_execution_edition" in kwargs):
+        _fail("ROUTE_A_FULL_PANEL_DECLARED_CAPTURE_REQUIRED")
+    edition = planner.frozen_search_execution_edition(capture.context, kwargs.get("search_process"))
+    if edition != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+        _fail("ROUTE_A_FULL_PANEL_PROCESS_EDITION_REQUIRED")
+    return execute_historical_observed_cell(_execution_edition=edition, **kwargs)
 
 
 def _make_bounded_raw_winner_canary_executor():
@@ -7042,6 +6841,7 @@ def _make_bounded_raw_winner_canary_executor():
 def authoritative_search_execution_contract() -> dict[str, Any]:
     dependency_sources = {
         "pm_authoritative_search_execution": _file_sha256(Path(__file__)),
+        "pm_production_search_planner": _file_sha256(Path(__file__).with_name("pm_production_search_planner.py")),
         "pm_core": _file_sha256(Path(pm_core.__file__)),
         "pm_current_refit_artifacts": _file_sha256(Path(current_refit.__file__)),
         "pm_historical_production_adapter": _file_sha256(
@@ -7073,7 +6873,6 @@ def authoritative_search_execution_contract() -> dict[str, Any]:
         "bounded_canary_accepts_prebuilt_source_or_fit": False,
         "bounded_canary_returns_only_sealed_nonauthorizing_receipt": True,
         "maximum_attempt_evidence_bytes": MAX_ATTEMPT_EVIDENCE_BYTES,
-        "maximum_cell_evidence_bytes": MAX_CELL_EVIDENCE_BYTES,
         "technical_failures_are_market_verdicts": False,
         "confers_causal_current_capital_publication_or_live_authority": False,
     }
@@ -7788,14 +7587,16 @@ def _compile_route_a_request_attempt_mapping(*, unit_metadata, frozen_domains, a
 
 
 
-def _route_a_owner_partition_identity(*, precommitments, attempt_ordinal, fold_ordinal, partition_role):
+def _route_a_owner_partition_identity(*, precommitments, attempt_ordinal, fold_ordinal, partition_role,
+        _partition_row_lookup=None):
     """Name the owner's existing V2 row; this is not an authenticator."""
     valid = False
     try:
         hexadecimal = lambda value: type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
-        matches = [row for row in precommitments["rows"]
+        matches = ([row for row in precommitments["rows"]
             if (row.get("attempt_ordinal"), row.get("fold_ordinal"), row.get("partition"))
-                == (attempt_ordinal, fold_ordinal, partition_role)]
+                == (attempt_ordinal, fold_ordinal, partition_role)] if _partition_row_lookup is None else
+            _partition_row_lookup.get((attempt_ordinal, fold_ordinal, partition_role), ()))
         row = matches[0] if len(matches) == 1 else None
         identity = row["partition_geometry_receipt_sha256"] if row is not None else None
         record = precommitments["records"].get(identity)
@@ -7824,7 +7625,8 @@ def _route_a_owner_partition_identity(*, precommitments, attempt_ordinal, fold_o
             for tier in ("P75", "P95")}}).decode("ascii"))
 
 
-def _route_a_owner_membership_snapshot(*, declared_unit_binding, frozen_domains, plan_body, attempts, raw_ids, precommitments):
+def _route_a_owner_membership_snapshot(*, declared_unit_binding, frozen_domains, plan_body, attempts, raw_ids, precommitments,
+        _partition_row_lookup=None):
     """Project the admitted real declared route without deriving partition geometry."""
     rows, valid = [], False
     try:
@@ -7856,7 +7658,7 @@ def _route_a_owner_membership_snapshot(*, declared_unit_binding, frozen_domains,
                 "state_context_disposition_sha256": source_plan["state_context_disposition_sha256"]}
             folds = [{"role": fold["role"], "fold_id": fold["fold_id"], "partitions":
                 ({role: _route_a_owner_partition_identity(precommitments=precommitments, attempt_ordinal=ordinal,
-                    fold_ordinal=fold_ordinal, partition_role=role)
+                    fold_ordinal=fold_ordinal, partition_role=role, _partition_row_lookup=_partition_row_lookup)
                     for role in ("optimizer_train", "tuning_validation", "final_lockbox")}
                     if status == "PLANNED" else {"status": "UNSCHEDULED"})}
                 for fold_ordinal, fold in enumerate(source_folds)]
@@ -7881,7 +7683,7 @@ def _route_a_owner_membership_snapshot(*, declared_unit_binding, frozen_domains,
 
 
 def _route_a_rebind_owner_membership(*, specification, snapshot, attempts, owner_attempts, raw_ids,
-        frame, dependency_warmup_bars, precommitments):
+        frame, dependency_warmup_bars, precommitments, _partition_row_lookup=None):
     """Rebind plain membership and derive only the selected current fold."""
     valid = False
     try:
@@ -7926,7 +7728,8 @@ def _route_a_rebind_owner_membership(*, specification, snapshot, attempts, owner
     geometry_valid = partition is not None
     if geometry_valid:
         identity = _route_a_owner_partition_identity(precommitments=precommitments, attempt_ordinal=selected_attempt.ordinal,
-            fold_ordinal=specification["fold_ordinal"], partition_role=specification["partition_role"])
+            fold_ordinal=specification["fold_ordinal"], partition_role=specification["partition_role"],
+            _partition_row_lookup=_partition_row_lookup)
         expected = resolved["partition_identity"]
         geometry = partition.geometry_receipt
         geometry_valid = (fold["fold_id"] == resolved["fold_id"]
@@ -7948,3 +7751,1649 @@ def _route_a_owner_selection_bytes(*, strategy_id, parameters, attempt_ordinal, 
         "declared_unit_binding": declared_unit_binding}
     selection = {**group, "spread_tier": spread_tier, "metadata_recipe": _ROUTE_A_UNIT_BATCH_RECIPE}
     return _canonical_bytes(selection), _canonical_bytes(group)
+
+
+def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell_plan, binding, refreshed, attempts, request_body, declared_header, capture, normalized_regime, route_a_consumer, fitted, raw_ids, plan_body, timeframe, fold_plan, symbol):
+    """Run the existing continuation inside its unchanged owner scope."""
+    try:
+        import pm_historical_search_producer as producer
+        import pm_production_config_binding as config_binding
+        import pm_production_search_planner as planner
+        import pm_strategies as strategy_module
+
+        lifecycle = _RouteABatchLifecycle()
+        owner_process, owner_thread = os.getpid(), threading.get_ident()
+        original_handle, original_frozen = handle, handle.frozen
+        original_context, original_request = capture.context, capture.request
+        original_session, original_sink = capture.source_session, capture.sink
+        original_process, original_plan = search_process, cell_plan
+        original_config = config
+        original_frozen_config = original_session._frozen_config
+        unit_binding_bytes = _canonical_bytes(binding)
+        private_fitted = _route_a_working_fitted(refreshed)
+        private_config = copy.deepcopy(config)
+        private_attempts = copy.deepcopy(attempts)
+        private_plan = json.loads(_canonical_bytes(plan_body).decode("ascii"))
+        private_domains = json.loads(_canonical_bytes(
+            search_process.to_dict()["semantics"]["strategy_domains"]).decode("ascii"))
+        private_precommitments = original_frozen.partition_cost_precommitments
+        private_partition_rows = _index_partition_precommitment_rows(private_precommitments)
+        window = request_body["source_access_window_utc"]
+        window_start = _utc(window["start_utc"], "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID")
+        window_end = _utc(window["end_exclusive_utc"], "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID")
+        header_relative = _declared_unit_relative(request_body, "header.json")
+        frozen_prefix = (request_body["artifact_namespace"] + "/winner-search/"
+            + timeframe + "/" + normalized_regime + "/frozen/")
+        descriptors = {}
+        for entry in declared_header["artifact_roster"]:
+            if entry["artifact_id"].startswith(frozen_prefix):
+                descriptor = entry["descriptor"]
+                descriptors[descriptor["relative_path"]] = copy.deepcopy(descriptor)
+        for descriptor in (original_handle.frozen_descriptor_graph,
+                original_handle.cross_binding_descriptor, original_session._entry["descriptor"],
+                declared_header["horizon_plan"]["descriptor"]):
+            descriptors[descriptor["relative_path"]] = copy.deepcopy(descriptor)
+        source_paths = (Path(__file__), Path(pm_core.__file__), Path(current_refit.__file__),
+            Path(authority_spool.__file__), Path(historical.__file__),
+            Path(historical_adapter.__file__), Path(native_prefix.__file__),
+            Path(trade_power.__file__), Path(raw_winner.__file__), Path(winner.__file__),
+            Path(producer.__file__), Path(planner.__file__), Path(config_binding.__file__),
+            Path(pm_regime.__file__), Path(spread_profile.__file__),
+            Path(strategy_module.__file__))
+        unique_entries, selection_to_unique = [], {}
+        private_pair_groups, private_pair_checks, private_codec_strings = {}, {}, {}
+        issued_evaluator = None
+        owner_snapshot_bytes = owner_snapshot = None
+        owner_partition_templates = {}
+        owner_current_attempt_ordinal = None
+
+        def close_route_a_scope():
+            nonlocal owner_snapshot_bytes, owner_snapshot, owner_current_attempt_ordinal
+            owner_snapshot_bytes = owner_snapshot = owner_current_attempt_ordinal = None
+            owner_partition_templates.clear()
+            if private_partition_rows is not None:
+                private_partition_rows.clear()
+            lifecycle.close()
+            selection_to_unique.clear()
+            private_pair_groups.clear()
+            private_pair_checks.clear()
+            private_codec_strings.clear()
+            unique_entries.clear()
+
+        def physical_content():
+            config_payload, _ = config_binding._read_config(original_frozen_config.active_config_path)
+            if _canonical_bytes(config_payload) != original_frozen_config._payload_json:
+                _fail("ROUTE_A_UNIT_BATCH_ORIGINAL_CONFIG_CHANGED")
+            _, _, header_bytes = authority_spool._stream_file(original_context.root,
+                header_relative, maximum_bytes=original_context.limits.max_json_bytes, collect=True)
+            if _canonical_bytes(authority_spool._strict_json_bytes(header_bytes,
+                    original_context.limits.max_json_bytes)) != _canonical_bytes(declared_header):
+                _fail("ROUTE_A_UNIT_BATCH_ORIGINAL_HEADER_CHANGED")
+            observed_descriptors = []
+            for relative, descriptor in sorted(descriptors.items()):
+                digest, size, _ = authority_spool._stream_file(original_context.root, relative,
+                    maximum_bytes=original_context.limits.max_artifact_bytes,
+                    expected_size=descriptor["size_bytes"])
+                if digest != descriptor["sha256"] or size != descriptor["size_bytes"]:
+                    _fail("ROUTE_A_UNIT_BATCH_FROZEN_BYTES_CHANGED")
+                observed_descriptors.append((relative, digest, size))
+            return header_bytes, observed_descriptors
+
+        def shared_content():
+            return hashlib.sha256(pickle.dumps({
+                "fitted": _route_a_fitted_shared_content(fitted),
+                "refreshed": _route_a_fitted_shared_content(refreshed),
+                "private_fitted": _route_a_fitted_shared_content(private_fitted),
+                "config": vars(config), "private_config": vars(private_config),
+                "request": capture.request.to_dict(), "precommit": capture.request._precommit.to_dict(),
+                "process": search_process.to_dict(),
+                "plan": (cell_plan.receipt_sha256, cell_plan.cell_receipt, cell_plan.spool_entry,
+                    cell_plan.horizon_plan.to_dict(), cell_plan.attempt_artifacts(),
+                    cell_plan.state_requirements()),
+                "private_attempts": private_attempts, "private_plan": private_plan,
+                "private_domains": private_domains, "precommitments": private_precommitments,
+                "frozen": asdict(handle.frozen), "handle": (
+                    handle.symbol, handle.timeframe, handle.regime, handle.artifact_namespace,
+                    handle.frozen_receipt_descriptor, handle.frozen_descriptor_graph,
+                    handle.cross_binding_descriptor, handle._cross_binding_bytes,
+                    handle._attempt_artifacts, handle._horizon_execution_contracts,
+                    handle._source_count_receipts, handle._capture_nonce),
+                "roster": capture.sink.artifact_roster(),
+                "context": (capture.context.generation_id, capture.context.context_sha256,
+                    capture.context.config_sha256, capture.context.native_universe_sha256,
+                    str(capture.context.root), asdict(capture.context.limits)),
+                "frozen_config": (str(original_frozen_config.active_config_path),
+                    original_frozen_config.config_sha256, original_frozen_config.effective_config_sha256,
+                    original_frozen_config._payload_json, original_frozen_config._snapshot_json,
+                    id(original_frozen_config._seal)),
+                "sources": [(str(path), _file_sha256(path)) for path in source_paths],
+                "physical": physical_content()}, protocol=5)).hexdigest()
+
+        if (_canonical_bytes(declared_header["frozen_plan_receipt"])
+                    != _canonical_bytes(handle.frozen_receipt_descriptor)
+                or _canonical_bytes(declared_header["frozen_descriptor_graph"])
+                    != _canonical_bytes(handle.frozen_descriptor_graph)
+                or _canonical_bytes(declared_header["horizon_winner_cross_binding"])
+                    != _canonical_bytes(handle.cross_binding_descriptor)
+                or _canonical_bytes(declared_header["source_session_entry"])
+                    != _canonical_bytes(dict(original_session._entry))
+                or _canonical_bytes(original_frozen.source_contract_seeds)
+                    != _canonical_bytes(refreshed.source_contract_seeds)
+                or _canonical_bytes(original_frozen.frozen_tier_pair_contract)
+                    != _canonical_bytes(refreshed.frozen_tier_pair_contract)
+                or _canonical_bytes(_declared_unit_binding(capture, refreshed, cell_plan,
+                attempts, fold_plan, handle)) != unit_binding_bytes
+                or _frame_sha256(refreshed._frame) != refreshed.frame_sha256
+                or config_binding._snapshot(config) != json.loads(
+                    original_frozen_config._snapshot_json.decode("ascii"))["pipeline_config"]
+                or _sha256(authoritative_search_execution_contract())
+                    != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256):
+            _fail("ROUTE_A_UNIT_BATCH_ADMISSION_CHANGED")
+        admitted_content = shared_content()
+
+        def require_route_a_owner_window():
+            if lifecycle.closed:
+                _fail("ROUTE_A_UNIT_BATCH_CLOSED")
+            if (capture.context is not original_context or capture.request is not original_request
+                    or capture.source_session is not original_session or capture.sink is not original_sink
+                    or capture.process is not original_process or search_process is not original_process
+                    or capture.cell_plan is not original_plan or cell_plan is not original_plan
+                    or config is not original_config or capture.pipeline_config is not original_config
+                    or capture.fitted_timeframe is not fitted
+                    or capture.source_session._frozen_config is not original_frozen_config
+                    or handle is not original_handle or handle.frozen is not original_frozen
+                    or capture._finished or capture._completion is not None):
+                _fail("ROUTE_A_UNIT_BATCH_OWNER_MISMATCH")
+            producer._verified_declared_slot_source_session_current(original_context,
+                request=original_request, process=original_process,
+                source_session=original_session)
+            capture._require_active(original_handle)
+            _route_a_require_scope_current(closed=lifecycle.closed,
+                owner_process=owner_process, owner_thread=owner_thread,
+                current_process=os.getpid(), current_thread=threading.get_ident(),
+                window_start=window_start, window_end=window_end,
+                observed=_utc(_now_utc_seconds(), "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_INVALID"))
+
+        def require_route_a_current():
+            require_route_a_owner_window()
+            historical_adapter._verify_declared_slot_capture(capture)
+            _route_a_require_unchanged(expected=unit_binding_bytes,
+                observed=_canonical_bytes(_declared_unit_binding(capture, refreshed,
+                    cell_plan, attempts, fold_plan, original_handle)))
+            _route_a_require_unchanged(expected=admitted_content, observed=shared_content())
+            require_route_a_owner_window()
+
+        request_guard = require_route_a_owner_window
+
+        owner_snapshot_bytes = _canonical_bytes(_route_a_owner_membership_snapshot(
+            declared_unit_binding=json.loads(unit_binding_bytes.decode("ascii")),
+            frozen_domains=private_domains, plan_body=private_plan, attempts=private_attempts,
+            raw_ids=raw_ids, precommitments=private_precommitments,
+            _partition_row_lookup=private_partition_rows))
+        owner_snapshot = json.loads(owner_snapshot_bytes.decode("ascii"))
+
+        def select_request(specification):
+            rebind = (_route_a_rebind_full_panel_owner_membership
+                if type(route_a_consumer) is _FullPanelOwnerPreparation
+                else _route_a_rebind_owner_membership)
+            selected_attempt, fold, partition, parameters = rebind(
+                specification=specification, snapshot=owner_snapshot,
+                attempts=private_attempts, owner_attempts=attempts, raw_ids=raw_ids,
+                frame=private_fitted._frame,
+                dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"],
+                precommitments=private_precommitments, _partition_row_lookup=private_partition_rows,
+                **({"_partition_templates": owner_partition_templates}
+                    if type(route_a_consumer) is _FullPanelOwnerPreparation else {}))
+            selection, group = _route_a_owner_selection_bytes(
+                strategy_id=selected_attempt.artifacts.winner_process["strategy_id"], parameters=parameters,
+                attempt_ordinal=selected_attempt.ordinal, fold_ordinal=specification["fold_ordinal"],
+                fold_id=fold["fold_id"], partition_geometry=partition.geometry_receipt,
+                declared_unit_binding=json.loads(unit_binding_bytes.decode("ascii")),
+                spread_tier=specification["spread_tier"])
+            return selected_attempt, fold, partition, parameters, selection, group
+
+        def describe_request(specification, parameters, evaluation_binding):
+            if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                domain = next(value for value in private_domains
+                    if value["strategy_id"] == specification["strategy_id"])
+                checked = _route_a_mapping_validate_member(domain["parameter_domain"], parameters)
+                key = {"strategy_id": domain["strategy_id"],
+                    "strategy_family": domain["strategy_family"], "domain_sha256": domain["domain_sha256"],
+                    "parameters": checked, "evaluation_binding": copy.deepcopy(evaluation_binding)}
+                return {"request_ordinal": specification["request_ordinal"],
+                    "shared_evaluation_key": key, "bookkeeping": copy.deepcopy(specification["bookkeeping"])}
+            described = planner.describe_route_a_evaluation_design(frozen_domains=private_domains,
+                configurations=[{"strategy_id": specification["strategy_id"], "parameters": parameters,
+                    "evaluation_binding": evaluation_binding,
+                    "bookkeeping": specification["bookkeeping"]}])["requests"][0]
+            described["request_ordinal"] = specification["request_ordinal"]
+            return described
+
+        def evaluate_route_a_batch(*, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
+            try:
+                lifecycle.enter()
+                request_guard()
+                if type(metadata_recipe) is not str or metadata_recipe != _ROUTE_A_UNIT_BATCH_RECIPE:
+                    _fail("ROUTE_A_UNIT_BATCH_RECIPE_INVALID")
+                if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                    if not specifications:
+                        _fail("ROUTE_A_FULL_PANEL_REQUEST_ROSTER_CHANGED")
+                    ordinal = specifications[0]["bookkeeping"]["attempt_ordinal"]
+                    rows = _route_a_full_panel_specifications(
+                        snapshot=owner_snapshot,
+                        contract=full_panel_contract, attempt_ordinal=ordinal)
+                    if _canonical_bytes(specifications) != _canonical_bytes(rows):
+                        _fail("ROUTE_A_FULL_PANEL_REQUEST_ROSTER_CHANGED")
+                else:
+                    rows = _route_a_batch_specifications(specifications)
+                requests, mapping, first_requests = [], [], {}
+                for specification in rows:
+                    request_guard()
+                    selected_attempt, fold, partition, parameters, selection, group = select_request(specification)
+                    tier = specification["spread_tier"]
+                    index = selection_to_unique.get(selection)
+                    cache_hit = index is not None
+                    if cache_hit:
+                        entry = unique_entries[index]
+                        described = describe_request(specification, parameters,
+                            json.loads(entry["binding_bytes"].decode("ascii")))
+                        if _canonical_bytes(described["shared_evaluation_key"]) != entry["key_bytes"]:
+                            _fail("ROUTE_A_UNIT_BATCH_REQUEST_INVALID")
+                        if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                            _verify_partition_precommitment(precommitments=private_precommitments,
+                                attempt=selected_attempt, fold_ordinal=specification["fold_ordinal"],
+                                partition=partition, tier=tier, result=entry["result"],
+                                pair=private_fitted.frozen_tier_pair_contract,
+                                _partition_row_lookup=private_partition_rows)
+                    else:
+                        working_fitted = _route_a_working_fitted(private_fitted)
+                        working_config = copy.deepcopy(private_config)
+                        working_partitions = _fold_partitions(frame=working_fitted._frame, fold=fold,
+                            attempt=selected_attempt,
+                            dependency_warmup_bars=private_plan["derived_dependency_geometry"]["warmup_bars"])
+                        working_partition = next(value for value in working_partitions
+                            if value.role == specification["partition_role"])
+                        _route_a_require_unchanged(expected=_canonical_bytes(partition.geometry_receipt),
+                            observed=_canonical_bytes(working_partition.geometry_receipt))
+                        stable_source = _source_identity(working_fitted.source_contract_seeds[tier])
+                        prepared = {}
+                        working_content = None
+
+                        def require_working_current():
+                            nonlocal working_content
+                            request_guard()
+                            observed = (_route_a_fitted_shared_content(working_fitted),
+                                pickle.dumps(vars(working_config), protocol=5))
+                            if working_content is None:
+                                working_content = observed
+                            else:
+                                _route_a_require_unchanged(expected=working_content, observed=observed)
+                            require_route_a_owner_window()
+
+                        def source_identity(result):
+                            contract = raw_winner.build_trade_source_contract_from_backtester_result(result)
+                            sample = trade_power.build_trade_sample_evidence([], source_contract=contract,
+                                minimum_observations=raw_winner.PRODUCTION_TRADE_POWER_MINIMUM_OBSERVATIONS)
+                            if sample.source_contract is None:
+                                _fail("ROUTE_A_UNIT_BATCH_SOURCE_CONTRACT_UNAVAILABLE")
+                            return sample.source_contract
+
+                        def prepare_probe():
+                            probe_backtester = Backtester(working_config)
+                            if getattr(probe_backtester, "_entry_admission_preparation", None) is not None:
+                                _fail("ROUTE_A_UNIT_BATCH_ENTRY_ADMISSION_POOL_REFUSED")
+                            return probe_backtester.build_evidence_source_seed_result(
+                                working_partition.frame, symbol, spec=working_fitted.instrument_spec,
+                                timeframe=timeframe, spread_tier=working_fitted._spread_tiers[tier],
+                                entry_spread_observations=working_fitted._entry_spread_observations.loc[
+                                    working_partition.frame.index])
+
+                        def verify_probe(probe):
+                            _verify_partition_precommitment(precommitments=private_precommitments,
+                                attempt=selected_attempt, fold_ordinal=specification["fold_ordinal"],
+                                partition=working_partition, tier=tier, result=probe,
+                                pair=working_fitted.frozen_tier_pair_contract,
+                                _partition_row_lookup=private_partition_rows)
+                            identity = source_identity(probe)
+                            if identity.source_contract_sha256 != stable_source:
+                                _fail("ROUTE_A_UNIT_BATCH_SOURCE_IDENTITY_MISMATCH")
+                            evaluation_binding = {"symbol": symbol, "timeframe": timeframe,
+                                "regime": normalized_regime, "anchor_id": private_plan["anchor"]["anchor_id"],
+                                "selection_cutoff_utc": private_plan["anchor"]["selection_cutoff_utc"],
+                                "search_process_receipt_sha256": original_process.receipt_sha256,
+                                "config_sha256": original_context.config_sha256,
+                                "effective_config_sha256": original_frozen_config.effective_config_sha256,
+                                "declared_unit_binding": json.loads(unit_binding_bytes.decode("ascii")),
+                                "fold_ordinal": specification["fold_ordinal"], "fold_id": fold["fold_id"],
+                                "partition_geometry": working_partition.geometry_receipt, "spread_tier": tier,
+                                "source_contract_sha256": stable_source,
+                                "partition_source_contract_sha256": identity.partition_source_contract_sha256,
+                                "spread_model_sha256": hashlib.sha256(_ROUTE_A_UNIT_BATCH_POLICY_DOMAIN
+                                    + pm_core.build_backtest_spread_mode(probe["spread_model"]).encode("ascii")).hexdigest()}
+                            prepared["identity"] = identity
+                            prepared["described"] = describe_request(specification, parameters, evaluation_binding)
+
+                        def run_strategy(strategy, probe):
+                            surface = _build_full_prefix_strategy_surface(frame=working_fitted._frame,
+                                strategy=strategy, fitted=working_fitted, symbol=symbol, timeframe=timeframe)
+                            decision = {}
+                            matched_facts = {} if type(route_a_consumer) is _FullPanelOwnerPreparation and tier == "P75" else None
+                            backtester = Backtester(working_config)
+                            if getattr(backtester, "_entry_admission_preparation", None) is not None:
+                                _fail("ROUTE_A_UNIT_BATCH_ENTRY_ADMISSION_POOL_REFUSED")
+                            result, _features, signals, _ = _run_tier_partition(partition=working_partition,
+                                full_prefix_surface=surface, backtester=backtester, strategy=strategy,
+                                symbol=symbol, timeframe=timeframe, regime=normalized_regime, config=working_config,
+                                spec=working_fitted.instrument_spec, expected_source_contract_sha256=stable_source,
+                                spread_tier=working_fitted._spread_tiers[tier],
+                                entry_spread_observations=working_fitted._entry_spread_observations,
+                                decision_result_out=decision,
+                                **({"_matched_base_facts_out": matched_facts,
+                                    "_matched_stress_tier": working_fitted._spread_tiers["P95"]}
+                                   if matched_facts is not None else {}))
+                            return {"result": result, "signals": signals, "decision": decision,
+                                "matched_base_facts": matched_facts}
+
+                        def verify_realized(realized, probe):
+                            _verify_partition_precommitment(precommitments=private_precommitments,
+                                attempt=selected_attempt, fold_ordinal=specification["fold_ordinal"],
+                                partition=working_partition, tier=tier, result=realized["result"],
+                                pair=working_fitted.frozen_tier_pair_contract,
+                                _partition_row_lookup=private_partition_rows)
+                            actual = source_identity(realized["result"])
+                            expected = prepared["identity"]
+                            if (actual.source_contract_sha256 != expected.source_contract_sha256
+                                    or actual.partition_source_contract_sha256
+                                        != expected.partition_source_contract_sha256):
+                                _fail("ROUTE_A_UNIT_BATCH_REALIZED_PARTITION_SOURCE_IDENTITY_MISMATCH")
+
+                        realized = _route_a_evaluate_prepared_request(prepare_probe=prepare_probe,
+                            verify_probe=verify_probe, require_current=require_working_current,
+                            make_strategy=lambda: _runtime_strategy(selected_attempt)[0],
+                            run_strategy=run_strategy, verify_realized=verify_realized)
+                        described = prepared["described"]
+                        index = len(unique_entries)
+                        diagnostic = {"schema_version": "fxpm.route-a-unit-request-diagnostic.v1",
+                            "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
+                            "request_ordinal": specification["request_ordinal"],
+                            "shared_evaluation_key": described["shared_evaluation_key"],
+                            "matched_attempt_ordinal": selected_attempt.ordinal,
+                            "matched_horizon_attempt_id": selected_attempt.plan_attempt["attempt_id"],
+                            **({"decision_lane": copy.deepcopy(realized["decision"]),
+                                "signal_vector": realized["signals"].copy(deep=True)}
+                               if type(route_a_consumer) is not _FullPanelOwnerPreparation else {}),
+                            "signal_comparison": "INCOMPLETE_MISSING_PARTNER",
+                            "unique_evaluation_ordinal": index, "cache_hit": False,
+                            **_route_a_diagnostic_authorities()}
+                        entry = {"diagnostic": diagnostic, "result": copy.deepcopy(realized["result"]),
+                            "decision": copy.deepcopy(realized["decision"]),
+                            "signals": realized["signals"].copy(deep=True),
+                            "attempt_ordinal": selected_attempt.ordinal, "pair_check": None,
+                            "matched_base_facts": copy.deepcopy(realized["matched_base_facts"]),
+                            "group": group, "tier": tier,
+                            "binding_bytes": _canonical_bytes(described["shared_evaluation_key"]["evaluation_binding"]),
+                            "key_bytes": _canonical_bytes(described["shared_evaluation_key"])}
+                        if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                            _route_a_intern_matched_codec_strings(entry["matched_base_facts"], private_codec_strings)
+                        unique_entries.append(entry)
+                        selection_to_unique[selection] = index
+                        if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                            private_pair_groups.setdefault(group, {})[tier] = entry
+                            private_pair_checks.pop(group, None)
+                    request_guard()
+                    key_bytes = entry["key_bytes"]
+                    if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                        mapping.append(index)
+                        continue
+                    diagnostic = copy.deepcopy(entry["diagnostic"])
+                    diagnostic.update(request_ordinal=specification["request_ordinal"],
+                        same_identity_as_request_ordinal=first_requests.get(key_bytes),
+                        bookkeeping=copy.deepcopy(described["bookkeeping"]), cache_hit=cache_hit)
+                    first_requests.setdefault(key_bytes, specification["request_ordinal"])
+                    requests.append(diagnostic)
+                    mapping.append(index)
+                full_panel = type(route_a_consumer) is _FullPanelOwnerPreparation
+                groups = private_pair_groups if full_panel else {}
+                if not full_panel:
+                    for entry in unique_entries:
+                        groups.setdefault(entry["group"], {})[entry["tier"]] = entry
+                pair_checks = []
+                for group, entries in groups.items():
+                    signature = tuple((tier, id(entry), id(entry["result"]), id(entry["signals"]),
+                        entry["key_bytes"], entry["binding_bytes"]) for tier, entry in sorted(entries.items()))
+                    cached = private_pair_checks.get(group) if full_panel else None
+                    if cached is not None and cached[0] == signature:
+                        check = json.loads(cached[1])
+                    else:
+                        check = _route_a_pair_check(
+                            signals_by_tier={tier: entry["signals"] for tier, entry in entries.items()},
+                            results_by_tier={tier: entry["result"] for tier, entry in entries.items()},
+                            spec=copy.deepcopy(private_fitted.instrument_spec),
+                            use_spread=bool(private_config.use_spread),
+                            frozen_pair=copy.deepcopy(private_fitted.frozen_tier_pair_contract))
+                        if full_panel:
+                            private_pair_checks[group] = (signature, _canonical_bytes(check))
+                    pair_checks.append({"evaluation_group_sha256": hashlib.sha256(group).hexdigest(), **check})
+                    for entry in entries.values():
+                        entry["diagnostic"]["signal_comparison"] = check["status"]
+                        entry["pair_check"] = copy.deepcopy(check)
+                for diagnostic in requests:
+                    diagnostic["signal_comparison"] = unique_entries[
+                        diagnostic["unique_evaluation_ordinal"]]["diagnostic"]["signal_comparison"]
+                request_guard()
+                if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                    return tuple(mapping), tuple(pair_checks)
+                return {"schema_version": "fxpm.route-a-unit-batch-diagnostic.v1",
+                    "status": "EVALUATED_DIAGNOSTIC_ONLY", "metadata_recipe": metadata_recipe,
+                    "requests": copy.deepcopy(requests), "request_to_unique": list(mapping),
+                    "unique_evaluations": [copy.deepcopy(entry["diagnostic"]) for entry in unique_entries],
+                    "pair_checks": copy.deepcopy(pair_checks), **_route_a_diagnostic_authorities()}
+            except Exception as exc:
+                close_route_a_scope()
+                if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                    raise
+                return _route_a_contain_consumer_failure(exc)
+            except BaseException:
+                close_route_a_scope()
+                raise
+            finally:
+                lifecycle.leave()
+
+        class UnitEvaluator:
+            __slots__ = ()
+
+            def __call__(self, *, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
+                if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                    _fail("ROUTE_A_FULL_PANEL_PRIVATE_EVALUATOR_NOT_PUBLIC")
+                if self is not issued_evaluator:
+                    close_route_a_scope()
+                    _fail("ROUTE_A_UNIT_BATCH_OWNER_MISMATCH")
+                return evaluate_route_a_batch(specifications=specifications, metadata_recipe=metadata_recipe)
+
+            def __copy__(self):
+                close_route_a_scope()
+                _route_a_refuse_transfer(lifecycle)
+
+            def __deepcopy__(self, memo):
+                return self.__copy__()
+
+            def __reduce_ex__(self, protocol):
+                return self.__copy__()
+
+        full_panel_contract = None
+        if type(route_a_consumer) is _FullPanelOwnerPreparation:
+            full_panel_contract = planner._route_a_full_panel_preparation_contract(
+                owner_snapshot=owner_snapshot,
+                partition_cost_precommitments=private_precommitments)
+
+        def prepare_full_panel_attempt(ordinal):
+            nonlocal owner_current_attempt_ordinal
+            request_guard()
+            rows = _route_a_full_panel_specifications(snapshot=owner_snapshot,
+                contract=full_panel_contract, attempt_ordinal=ordinal)
+            if owner_current_attempt_ordinal != ordinal:
+                # Preserve current-attempt replay; earlier attempts have distinct selection keys.
+                unique_entries.clear()
+                selection_to_unique.clear()
+                private_pair_groups.clear()
+                private_pair_checks.clear()
+                private_codec_strings.clear()
+                owner_current_attempt_ordinal = ordinal
+            mapping, pair_checks = evaluate_route_a_batch(specifications=rows)
+            if len(mapping) != 24 or len(rows) != 24:
+                _fail("ROUTE_A_FULL_PANEL_EVALUATION_ROSTER_CHANGED", ordinal)
+            entries = {}
+            groups = set()
+            for row, index in zip(rows, mapping, strict=True):
+                if type(index) is not int or not 0 <= index < len(unique_entries):
+                    _fail("ROUTE_A_FULL_PANEL_EVALUATION_MAPPING_INVALID", ordinal)
+                entry = unique_entries[index]
+                selected, fold, partition, parameters, selection, group = select_request(row)
+                if (selection_to_unique.get(selection) != index or entry["group"] != group
+                        or entry["tier"] != row["spread_tier"]
+                        or entry["attempt_ordinal"] != ordinal
+                        or entry["pair_check"]["status"] != "VERIFIED"):
+                    _fail("ROUTE_A_FULL_PANEL_EVALUATION_MAPPING_INVALID", ordinal)
+                identity = row["fold_ordinal"], row["partition_role"], row["spread_tier"]
+                if identity in entries:
+                    _fail("ROUTE_A_FULL_PANEL_EVALUATION_MAPPING_INVALID", ordinal)
+                entries[identity] = entry
+                groups.add(hashlib.sha256(group).hexdigest())
+            checks = {check["evaluation_group_sha256"]: check for check in pair_checks}
+            if (len(groups) != 12 or any(group not in checks or checks[group]["status"] != "VERIFIED"
+                    or checks[group]["missing_tiers"] for group in groups)):
+                _fail("ROUTE_A_FULL_PANEL_PAIR_CHECK_INCOMPLETE", ordinal)
+            request_guard()
+            evidence, facts = _route_a_assemble_full_panel_attempt(
+                attempt=private_attempts[ordinal], raw_attempt_id=raw_ids[ordinal],
+                plan_body=private_plan, fitted=private_fitted, entries=entries,
+                partition_cost_precommitments=private_precommitments,
+                source_observation_references=route_a_consumer.source_observation_references,
+                _partition_row_lookup=private_partition_rows)
+            request_guard()
+            return evidence, facts
+
+        issued_evaluator = UnitEvaluator()
+        try:
+            require_route_a_owner_window()
+            historical_adapter._verify_declared_slot_capture_current(capture)
+            require_route_a_owner_window()
+            if type(route_a_consumer) is _FullPanelOwnerPreparation:
+                route_a_consumer_outcome = route_a_consumer.prepare_owned(
+                    require_current=require_route_a_owner_window,
+                    prepare_attempt=prepare_full_panel_attempt, private_attempts=private_attempts,
+                    private_plan=private_plan, private_precommitments=private_precommitments,
+                    owner_snapshot=copy.deepcopy(owner_snapshot))
+            else:
+                route_a_consumer_outcome = route_a_consumer(evaluate_batch=issued_evaluator)
+            require_route_a_current()
+        finally:
+            close_route_a_scope()
+    except Exception as exc:
+        if type(route_a_consumer) is _FullPanelOwnerPreparation:
+            raise
+        route_a_consumer_outcome = _route_a_contain_consumer_failure(exc)
+    return route_a_consumer_outcome
+
+
+def _route_a_matched_base_trade_facts(*, result, features, backtester, spec,
+                                     base_tier, stress_tier, timeframe, partition_role, exact_trade_capture=None):
+    """Retain matched kernel facts without inventing a charged-cost scalar."""
+    if (not isinstance(base_tier, spread_profile.FrozenSpreadTier)
+            or not isinstance(stress_tier, spread_profile.FrozenSpreadTier)
+            or base_tier.tier != "P75" or stress_tier.tier != "P95"
+            or type(result.get("trades")) is not list):
+        _fail("ROUTE_A_MATCHED_BASE_FACTS_UNAVAILABLE")
+    arrays, attestations, spread_metadata = {}, {}, {}
+    for name, tier in (("P75", base_tier), ("P95", stress_tier)):
+        entry, intrabar, metadata = backtester._build_half_spread_arrays(
+            features, spec, spread_tier=tier, timeframe=timeframe)
+        arrays[name] = (entry, intrabar)
+        spread_metadata[name] = metadata
+        attestations[name] = backtester._numerical_execution_cost_attestation(
+            entry_half_spread=entry, intrabar_half_spread=intrabar,
+            spread_meta=metadata, spec=spec)
+    if attestations["P75"] != result.get("numerical_execution_cost_attestation"):
+        _fail("ROUTE_A_MATCHED_BASE_COST_ATTESTATION_DRIFT")
+    non_improvement = _route_a_spread_non_improvement({tier: {
+        "entry_half_spread": pair[0], "intrabar_half_spread": pair[1]} for tier, pair in arrays.items()})
+    if non_improvement["status"] == "REFUSED_P95_BELOW_P75":
+        _fail("ROUTE_A_FULL_PANEL_P95_SPREAD_NON_IMPROVEMENT_VIOLATION")
+    identities = build_backtest_trade_identity_pnl_evidence(result["trades"])
+    if exact_trade_capture is not None and (type(exact_trade_capture) is not dict
+            or exact_trade_capture.get("schema_version") != "fxpm.backtest-exact-executed-trades.v1"
+            or exact_trade_capture.get("swap_accrual_contract") != result.get("swap_accrual_contract")
+            or type(exact_trade_capture.get("trades")) is not list):
+        _fail("ROUTE_A_EXACT_EXECUTED_TRADE_CAPTURE_INVALID")
+    exact_rows = [] if exact_trade_capture is None else exact_trade_capture["trades"]
+    rows = []
+    for ordinal, (trade, identity) in enumerate(zip(result["trades"], identities, strict=True)):
+        if identity["direction"] not in {"LONG", "SHORT"}:
+            _fail("ROUTE_A_MATCHED_BASE_TRADE_INVALID", ordinal)
+        direction = 1 if identity["direction"] == "LONG" else -1
+        opened, closed = identity["entry_bar"], identity["exit_bar"]
+        if (type(opened) is not int or type(closed) is not int
+                or not 0 <= opened <= closed < len(features)):
+            _fail("ROUTE_A_MATCHED_BASE_TRADE_AXIS_INVALID", ordinal)
+        try:
+            entry_price, stop_price = float(trade["entry_price"]), float(trade["stop_loss"])
+            volume = float(trade["position_size"])
+            recorded_risk = float(spec.calculate_loss_at_stop(
+                entry_price, stop_price, volume, direction))
+            if (not all(math.isfinite(value) for value in (entry_price, stop_price, volume, recorded_risk))
+                    or volume <= 0 or recorded_risk <= 0):
+                raise ValueError("invalid executed risk geometry")
+            spread_sides = {}
+            for tier, (entry, intrabar) in arrays.items():
+                values = {"entry_half_spread_at_entry": float(entry[opened]),
+                    "intrabar_half_spread_at_entry": float(intrabar[opened]),
+                    "entry_half_spread_at_exit": float(entry[closed]),
+                    "intrabar_half_spread_at_exit": float(intrabar[closed])}
+                if any(not math.isfinite(value) or value < 0 for value in values.values()):
+                    raise ValueError("invalid spread side")
+                spread_sides[tier] = values
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise AuthoritativeSearchExecutionError(
+                "ROUTE_A_MATCHED_BASE_RECORDED_RISK_UNAVAILABLE", (str(ordinal),)) from exc
+        fill = _route_a_base_fill_witness(trade=trade, identity=identity, features=features,
+            base_entry_half=arrays["P75"][0], base_intrabar_half=arrays["P75"][1])
+        rows.append({"base_trade_identity": identity,
+            "entry_price": entry_price, "recorded_stop_price": stop_price,
+            "executed_volume": volume, "risk_at_recorded_stop_dollars": recorded_risk,
+            "actual_initial_risk_dollars": None,
+            "initial_stop_status": "UNPROVEN_BACKEND_CONTROL_BINDING",
+            "executed_price_swap_capture": copy.deepcopy(exact_rows[ordinal]) if ordinal < len(exact_rows) else None,
+            "base_return_components": None,
+            "base_fill_witness": fill, "base_position_event": None,
+            "base_actual_initial_risk_net_r": None, "matched_p95_spread_cost_r": None,
+            "spread_sides": spread_sides})
+    events = result.get("position_events")
+    position_join = type(events) is list and len(events) == len(rows)
+    seen_ids = set()
+    if position_join:
+        try:
+            for row, event in zip(rows, events, strict=True):
+                identity = row["base_trade_identity"]
+                if (type(event) is not dict or type(event.get("position_id")) is not str
+                        or event.get("trade_record_schema_version") != pm_core.BACKTEST_POSITION_EVENT_SCHEMA_VERSION
+                        or raw_winner._BACKTEST_POSITION_ID.fullmatch(event["position_id"]) is None
+                        or event["position_id"] in seen_ids
+                        or pd.Timestamp(event.get("entry_time")) != pd.Timestamp(identity["entry_time"])
+                        or pd.Timestamp(event.get("exit_time")) != pd.Timestamp(identity["exit_time"])
+                        or event.get("entry_event_order") != identity["entry_bar"] * 4 + 1
+                        or event.get("exit_event_order") != identity["exit_bar"] * 4 + 3
+                        or event.get("pnl_dollars") != identity["pnl_dollars"]
+                        or event.get("risk_amount") != identity["risk_amount"]):
+                    position_join = False
+                    break
+                row["base_position_event"] = copy.deepcopy(event)
+                seen_ids.add(event["position_id"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            position_join = False
+    reasons = ([] if position_join else ["BASE_POSITION_EVENT_BIJECTION_INVALID"])
+    if exact_trade_capture is not None and len(exact_rows) != len(identities):
+        reasons.append("EXACT_EXECUTED_PRICE_SWAP_CAPTURE_COUNT_MISMATCH")
+    reasons.extend(row["base_fill_witness"]["reason_code"] for row in rows
+        if row["base_fill_witness"]["status"] != "VERIFIED")
+    return json.loads(_canonical_bytes({
+        "schema_version": "fxpm.route-a-matched-base-kernel-facts.v3",
+        "partition_role": partition_role,
+        "exact_execution_capture_schema": "fxpm.backtest-exact-executed-trades.v1",
+        "exact_swap_accrual_contract": copy.deepcopy(result.get("swap_accrual_contract")),
+        "exact_swap_model_enabled": None if exact_trade_capture is None else exact_trade_capture.get("swap_model_enabled"),
+        "exact_capture_backend": None if exact_trade_capture is None else exact_trade_capture.get("backend"),
+        "exact_capture_count_matches": exact_trade_capture is not None and len(exact_rows) == len(identities),
+        "base_return_policy_reference": "E-00005908",
+        "swap_conversion_scope": ("SWAP_MODE_1_PRICE_RATIO_FX_FREE" if getattr(spec, "swap_mode", None) == 1
+            else "CURRENT_TERMS_SWAP_TICK_VALUE_SNAPSHOT_NO_DATED_FX_PROOF"),
+        "trade_power_partition_axis": result["trade_power_partition_axis"],
+        "numerical_execution_cost_attestations": attestations,
+        "half_spread_arrays": {tier: {"entry_half_spread": _route_a_encode_spread_array(pair[0], "entry_half_spread"),
+            "intrabar_half_spread": _route_a_encode_spread_array(pair[1], "intrabar_half_spread")} for tier, pair in arrays.items()},
+        "use_spread": bool(backtester.config.use_spread),
+        "spread_model_metadata": spread_metadata,
+        "instrument_spec": vars(spec), "trades": rows,
+        "base_position_events": copy.deepcopy(events),
+        "position_event_bijection_status": "VERIFIED" if position_join else "MISMATCH",
+        "base_fill_witness_status": ("NO_COMPLETED_BASE_TRADES" if not rows else "VERIFIED" if not reasons else "MISMATCH"),
+        "base_fill_witness_sha256": _sha256([row["base_fill_witness"] for row in rows]),
+        "tier_non_improvement": non_improvement,
+        "floor_reason_codes": sorted(set(reasons)),
+        "matched_cost_policy_reference": "E-00005870",
+        "stress_cost_scalar": None, "stress_cost_status": "PER_TRADE_PRICE_RATIO_PENDING_OWNER_BINDING",
+        "completed_position_ids": None, "completed_position_open_utc": None,
+        "completed_position_close_utc": None, "completed_position_open_event_order": None,
+        "completed_position_close_event_order": None, "base_actual_initial_risk_net_r": None,
+        "matched_p95_spread_cost_r": None,
+        "dated_fx_vector": None, "dated_fx_status": "NOT_REQUIRED_PRICE_RATIO_FLOOR",
+        "cash_conversion_limitation": "INSTRUMENT_SPEC_ACQUISITION_SNAPSHOT_NO_DATED_FX_SERIES",
+        "floor_status": "UNAVAILABLE_OWNER_INITIAL_RISK_BINDING_REQUIRED"}).decode("ascii"))
+
+
+class _FullPanelLaneCapture:
+    """Owner-local collector; never returned with a prepared evidence stage."""
+
+    def __init__(self, require_current):
+        self._require_current = require_current
+        self.seen = []
+        self.base_facts = {}
+
+    def require_current(self):
+        if self._require_current is None:
+            _fail("ROUTE_A_FULL_PANEL_CAPTURE_CLOSED")
+        self._require_current()
+
+    def record_lane(self, fold_ordinal, role, tier, decision, matched_base_facts):
+        self.require_current()
+        key = fold_ordinal, role
+        self.seen.append((fold_ordinal, role, tier))
+        if tier == "P75":
+            if (key in self.base_facts or type(matched_base_facts) is not dict
+                    or matched_base_facts.get("partition_role") != role):
+                _fail("ROUTE_A_FULL_PANEL_BASE_FACTS_INVALID")
+            self.base_facts[key] = copy.deepcopy(matched_base_facts)
+        elif (tier != "P95" or key not in self.base_facts
+                or self.base_facts[key]["numerical_execution_cost_attestations"]["P95"]
+                    != decision["numerical_execution_cost_attestation"]):
+            _fail("ROUTE_A_FULL_PANEL_STRESS_ATTESTATION_DRIFT")
+
+    def close(self):
+        self._require_current = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRouteAFullPanelStage:
+    rows: tuple[_StagedAttemptEvidence, ...]
+    declared_unit_binding_sha256: str
+    preparation_contract_sha256: str
+    unit_identities_bytes: bytes
+
+    def _envelope(self, ordinal):
+        if type(ordinal) is not int or not 0 <= ordinal < len(self.rows):
+            _fail("ROUTE_A_FULL_PANEL_UNIT_INVALID")
+        row = self.rows[ordinal]
+        envelope = _reopen_staged_attempt(row)
+        if (row.ordinal != ordinal or set(envelope) != {"schema_version",
+                "declared_unit_binding_sha256", "preparation_contract_sha256",
+                "attempt_evidence", "matched_base_facts"}
+                or envelope["schema_version"] != "fxpm.route-a-prepared-full-panel-unit.v1"
+                or envelope["declared_unit_binding_sha256"] != self.declared_unit_binding_sha256
+                or envelope["preparation_contract_sha256"] != self.preparation_contract_sha256):
+            _fail("ROUTE_A_FULL_PANEL_STAGE_BINDING_CHANGED", ordinal)
+        return envelope
+
+    def unit_body(self, unit):
+        if type(unit) is not dict or type(unit.get("ordinal")) is not int:
+            _fail("ROUTE_A_FULL_PANEL_UNIT_INVALID")
+        envelope = self._envelope(unit["ordinal"])
+        identities = json.loads(self.unit_identities_bytes.decode("ascii"))
+        if (type(identities) is not list or len(identities) != len(self.rows)
+                or unit != identities[unit["ordinal"]]):
+            _fail("ROUTE_A_FULL_PANEL_UNIT_IDENTITY_CHANGED", unit["ordinal"])
+        body = envelope["attempt_evidence"]
+        expected_keys = {"attempt_id", "outcome"} if unit["status"] == "PROCESS_REJECTED" else {"attempt_id", "folds"}
+        if (type(body) is not dict or set(body) != expected_keys
+                or body["attempt_id"] != unit["raw_attempt_id"]):
+            _fail("ROUTE_A_FULL_PANEL_UNIT_IDENTITY_CHANGED", unit["ordinal"])
+        return body
+
+    def matched_base_facts(self, ordinal):
+        return self._envelope(ordinal)["matched_base_facts"]
+
+
+class _FullPanelOwnerPreparation:
+    def __init__(self, *, capture, handle, binding, stage_custody, reservation,
+                 staged_rows, source_observation_references):
+        self.capture, self.handle, self.binding = capture, handle, binding
+        self.custody, self.reservation, self.rows = stage_custody, reservation, staged_rows
+        self.source_observation_references = copy.deepcopy(source_observation_references)
+        self.completed = None
+
+    def prepare_owned(self, *, require_current, prepare_attempt,
+                      private_attempts, private_plan, private_precommitments, owner_snapshot):
+        import pm_production_search_planner as planner
+
+        require_current()
+        if (_file_sha256(Path(planner.__file__)) != authoritative_search_execution_contract()[
+                "dependency_source_sha256"]["pm_production_search_planner"]):
+            _fail("ROUTE_A_FULL_PANEL_PLANNER_CODE_IDENTITY_MISMATCH")
+        capture, handle, custody = self.capture, self.handle, self.custody
+        body = capture.request.to_dict()
+        if (type(custody) is not _StageCapacityCustody or type(self.rows) is not list or self.rows
+                or _canonical_bytes(owner_snapshot["declared_unit_binding"]) != _canonical_bytes(self.binding)
+                or self.binding["executor_release_sha256"] != AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256
+                or custody.root.resolve(strict=True) != Path(capture.context.root).resolve(strict=True)
+                or custody.binding.get("generation_context_sha256") != capture.context.context_sha256
+                or custody.binding.get("producer_request_sha256") != capture.request.receipt_sha256
+                or custody.binding.get("frozen_receipt_descriptor") != dict(handle.frozen_receipt_descriptor)):
+            _fail("ROUTE_A_FULL_PANEL_STAGE_CUSTODY_INVALID")
+        stage = custody.root / custody.binding["original_stage_directory"]
+        info = stage.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or _is_reparse(info)
+                or (info.st_dev, info.st_ino) != custody.stage_identity
+                or stage.resolve(strict=True).parent != custody.root.resolve(strict=True)):
+            _fail("ROUTE_A_FULL_PANEL_STAGE_CUSTODY_INVALID")
+        for name in ("raw-completion.json", "evidence-completed.json"):
+            if _read_declared_unit_json(capture.context, _declared_unit_relative(body, name)) is not None:
+                _fail("ROUTE_A_FULL_PANEL_EXISTING_UNIT_REENTRY_REFUSED")
+        for ordinal in range(len(private_attempts)):
+            if _read_declared_unit_json(capture.context,
+                    _declared_unit_relative(body, f"{ordinal:06d}.json")) is not None:
+                _fail("ROUTE_A_FULL_PANEL_EXISTING_UNIT_REENTRY_REFUSED", ordinal)
+        contract = planner._route_a_full_panel_preparation_contract(
+            owner_snapshot=owner_snapshot, partition_cost_precommitments=private_precommitments)
+        contract_sha = _sha256(contract)
+        binding_sha = _sha256(self.binding)
+        for ordinal, attempt in enumerate(private_attempts):
+            require_current()
+            raw_id = owner_snapshot["attempt_roster"][ordinal]["raw_attempt_id"]
+            if attempt.plan_attempt["status"] == "PROCESS_REJECTED":
+                outcome = _process_rejection_outcome(attempt=attempt,
+                    symbol=private_plan["cell"]["symbol"], timeframe=private_plan["cell"]["timeframe"],
+                    regime=private_plan["cell"]["regime"])
+                evidence = {"attempt_id": raw_id, "outcome": outcome.to_dict()}
+                facts = []
+            else:
+                evidence, facts = prepare_attempt(ordinal)
+                if (evidence.get("attempt_id") != raw_id or len(evidence.get("folds", [])) != 4
+                        or len(facts) != 12):
+                    _fail("ROUTE_A_FULL_PANEL_EVALUATION_ROSTER_CHANGED", ordinal)
+            require_current()
+            envelope = {"schema_version": "fxpm.route-a-prepared-full-panel-unit.v1",
+                "declared_unit_binding_sha256": binding_sha,
+                "preparation_contract_sha256": contract_sha,
+                "attempt_evidence": evidence, "matched_base_facts": facts}
+            row = _write_staged_attempt(stage=stage, ordinal=ordinal, value=envelope,
+                reservation=self.reservation)
+            self.rows.append(row)
+        require_current()
+        identities = [_declared_unit_identity(attempt,
+            owner_snapshot["attempt_roster"][ordinal]["raw_attempt_id"])
+            for ordinal, attempt in enumerate(private_attempts)]
+        self.completed = _PreparedRouteAFullPanelStage(tuple(self.rows), binding_sha, contract_sha,
+            _canonical_bytes(identities))
+        return self.completed
+
+
+def _prepare_route_a_full_panel_owner_evidence(*, config, handle, search_process,
+        cell_plan, binding, refreshed, attempts, request_body, declared_header,
+        capture, normalized_regime, fitted, raw_ids, plan_body, timeframe, fold_plan,
+        symbol, stage_custody, reservation, staged_rows, source_observation_references):
+    """Prepare a fresh full panel; caller retains existing stage custody/cleanup.
+
+    Unit publication may start only after this function returns and the owner
+    evaluator has closed. Legacy/default callers do not invoke this entry.
+    """
+    if (type(capture) is not historical_adapter.DeclaredSlotSearchCapture
+            or not historical_adapter._verify_declared_slot_capture(capture)
+            or fitted is not capture.verified_fitted_timeframe
+            or config is not capture.verified_pipeline_config):
+        _fail("ROUTE_A_FULL_PANEL_ORIGINAL_OWNER_REQUIRED")
+    if (_canonical_bytes(source_observation_references)
+            != _canonical_bytes(declared_header.get("source_observation_references"))):
+        _fail("ROUTE_A_FULL_PANEL_SOURCE_OBSERVATION_BINDING_CHANGED")
+    consumer = _FullPanelOwnerPreparation(capture=capture, handle=handle, binding=binding,
+        stage_custody=stage_custody, reservation=reservation, staged_rows=staged_rows,
+        source_observation_references=source_observation_references)
+    result = _run_route_a_owned_unit_continuation(config=config, handle=handle,
+        search_process=search_process, cell_plan=cell_plan, binding=binding,
+        refreshed=refreshed, attempts=attempts, request_body=request_body,
+        declared_header=declared_header, capture=capture, normalized_regime=normalized_regime,
+        route_a_consumer=consumer, fitted=fitted, raw_ids=raw_ids, plan_body=plan_body,
+        timeframe=timeframe, fold_plan=fold_plan, symbol=symbol)
+    if type(result) is not _PreparedRouteAFullPanelStage or result is not consumer.completed:
+        _fail("ROUTE_A_FULL_PANEL_PREPARATION_INCOMPLETE")
+    return result
+
+__all__.append("execute_route_a_full_panel_historical_observed_cell")
+
+
+
+def _route_a_full_panel_specifications(*, snapshot, contract, attempt_ordinal):
+    """Derive the exact frozen production footprint, never caller-selected rows."""
+    if (type(attempt_ordinal) is not int or not 0 <= attempt_ordinal < len(snapshot["attempt_roster"])
+            or _canonical_bytes(contract["declared_unit_binding"])
+                != _canonical_bytes(snapshot["declared_unit_binding"])):
+        _fail("ROUTE_A_FULL_PANEL_REQUEST_ROSTER_CHANGED")
+    attempt = snapshot["attempt_roster"][attempt_ordinal]
+    if attempt["ordinal"] != attempt_ordinal or attempt["status"] != "PLANNED":
+        _fail("ROUTE_A_FULL_PANEL_REQUEST_ROSTER_CHANGED")
+    parameters = decode_parameter_mapping(attempt["parameters"],
+        copy.deepcopy(StrategyRegistry.get(attempt["strategy_id"]).get_default_params()))
+    footprint = [row for row in contract["requests"] if row["attempt_ordinal"] == attempt_ordinal]
+    expected = [(fold, role, tier) for fold in range(4)
+        for role in ("optimizer_train", "tuning_validation", "final_lockbox") for tier in ("P75", "P95")]
+    if ([(row["fold_ordinal"], row["partition_role"], row["spread_tier"]) for row in footprint] != expected
+            or any(row["raw_attempt_id"] != attempt["raw_attempt_id"]
+                or row["horizon_attempt_id"] != attempt["horizon_attempt_id"] for row in footprint)):
+        _fail("ROUTE_A_FULL_PANEL_REQUEST_ROSTER_CHANGED")
+    return tuple({"request_ordinal": ordinal, "strategy_id": attempt["strategy_id"],
+        "parameters": copy.deepcopy(parameters), "fold_ordinal": row["fold_ordinal"],
+        "partition_role": row["partition_role"], "spread_tier": row["spread_tier"],
+        "bookkeeping": {"request_ordinal": ordinal, "attempt_ordinal": attempt_ordinal,
+            "horizon_attempt_id": attempt["horizon_attempt_id"]}}
+        for ordinal, row in enumerate(footprint))
+
+
+def _route_a_detached_owner_partition(partition):
+    return _PartitionSlice(role=partition.role, frame=partition.frame.copy(deep=True),
+        warmup_bars=partition.warmup_bars, scored_start_utc=partition.scored_start_utc,
+        end_exclusive_utc=partition.end_exclusive_utc,
+        geometry_receipt=copy.deepcopy(partition.geometry_receipt))
+
+
+def _route_a_owner_fold_partitions(*, frame, fold, attempt, dependency_warmup_bars,
+        fold_ordinal, templates, partition_role=None):
+    """Retain at most the current private attempt's four fold templates."""
+    recipe = getattr(attempt.artifacts, "refit_recipe", None)
+    requirements = recipe.get("data_requirements") if isinstance(recipe, Mapping) else None
+    recipe_warmup = requirements.get("warmup_bars") if isinstance(requirements, Mapping) else None
+    bounds = tuple(fold.get(name) for name in (
+        "fit_start_utc", "fit_end_exclusive_utc", "validation_warmup_start_utc",
+        "validation_start_utc", "validation_end_exclusive_utc"))
+    if (type(templates) is not dict or type(fold_ordinal) is not int
+            or not 0 <= fold_ordinal < 4 or not all(type(value) is str for value in bounds)
+            or type(recipe_warmup) is not int or type(dependency_warmup_bars) is not int):
+        partitions = _fold_partitions(frame=frame, fold=fold, attempt=attempt,
+            dependency_warmup_bars=dependency_warmup_bars)
+        return (partitions if partition_role is None else next(
+            partition for partition in partitions if partition.role == partition_role))
+    if templates.get("attempt") is not attempt or templates.get("frame") is not frame:
+        templates.clear()
+        templates.update(attempt=attempt, frame=frame, folds={})
+    key = (*bounds, recipe_warmup, dependency_warmup_bars)
+    cached = templates["folds"].get(fold_ordinal)
+    if cached is None or cached[0] != key:
+        partitions = _fold_partitions(frame=frame, fold=fold, attempt=attempt,
+            dependency_warmup_bars=dependency_warmup_bars)
+        templates["folds"][fold_ordinal] = (key, partitions)
+    else:
+        partitions = cached[1]
+    if partition_role is not None:
+        return _route_a_detached_owner_partition(next(
+            partition for partition in partitions if partition.role == partition_role))
+    return tuple(_route_a_detached_owner_partition(partition) for partition in partitions)
+
+
+def _route_a_rebind_full_panel_owner_membership(*, specification, snapshot, attempts,
+        owner_attempts, raw_ids, frame, dependency_warmup_bars, precommitments,
+        _partition_templates=None, _partition_row_lookup=None):
+    """Rebind a closed production row to both original owners and V2 geometry."""
+    try:
+        flags = _route_a_diagnostic_authorities()
+        fields = {"request_ordinal", "strategy_id", "parameters", "fold_ordinal",
+            "partition_role", "spread_tier", "bookkeeping"}
+        if (type(snapshot) is not dict
+                or snapshot["schema_version"] != "fxpm.route-a-owner-membership-snapshot.v2"
+                or snapshot["provenance_scope"] != "CURRENT_OWNER_METADATA_PROJECTION_ONLY"
+                or any(snapshot[name] is not False for name in flags)
+                or type(specification) is not dict or set(specification) != fields
+                or type(specification["bookkeeping"]) is not dict
+                or set(specification["bookkeeping"]) != {"request_ordinal", "attempt_ordinal", "horizon_attempt_id"}
+                or type(specification["request_ordinal"]) is not int
+                or not 0 <= specification["request_ordinal"] < 24
+                or specification["bookkeeping"]["request_ordinal"] != specification["request_ordinal"]
+                or type(specification["fold_ordinal"]) is not int or not 0 <= specification["fold_ordinal"] < 4
+                or specification["partition_role"] not in ("optimizer_train", "tuning_validation", "final_lockbox")
+                or specification["spread_tier"] not in ("P75", "P95")):
+            raise ValueError("invalid closed production row")
+        index = specification["bookkeeping"]["attempt_ordinal"]
+        if (type(index) is not int or not 0 <= index < len(attempts)
+                or len(attempts) != len(owner_attempts) or len(attempts) != len(raw_ids)
+                or len(attempts) != snapshot["original_trial_count"]
+                or len(attempts) != len(snapshot["attempt_roster"])):
+            raise ValueError("crossed production roster")
+        row, selected, original = snapshot["attempt_roster"][index], attempts[index], owner_attempts[index]
+        if (row["ordinal"] != index or row["status"] != "PLANNED"
+                or row["raw_attempt_id"] != raw_ids[index]
+                or row["horizon_attempt_id"] != specification["bookkeeping"]["horizon_attempt_id"]
+                or row["strategy_id"] != specification["strategy_id"]):
+            raise ValueError("crossed original attempt")
+        defaults = copy.deepcopy(StrategyRegistry.get(row["strategy_id"]).get_default_params())
+        domain = next(value for value in snapshot["frozen_domains"] if value["strategy_id"] == row["strategy_id"])
+        parameters = _route_a_mapping_validate_member(domain["parameter_domain"], specification["parameters"])
+        for current in (selected, original):
+            if (type(current.ordinal) is not int or current.ordinal != index
+                    or current.plan_attempt["status"] != "PLANNED"
+                    or current.plan_attempt["attempt_id"] != row["horizon_attempt_id"]
+                    or _sha256(current.plan_attempt) != row["plan_attempt_sha256"]
+                    or _canonical_bytes(current.plan_attempt) != _canonical_bytes(row["source_plan_attempt"])
+                    or _canonical_bytes(current.candidate["folds"]) != _canonical_bytes(row["source_folds"])
+                    or current.artifacts.winner_process["strategy_id"] != row["strategy_id"]
+                    or _canonical_bytes(decode_parameter_mapping(current.artifacts.trial_definition["parameters"], defaults))
+                        != _canonical_bytes(parameters)):
+                raise ValueError("original attempt changed")
+        if _canonical_bytes(decode_parameter_mapping(row["parameters"], defaults)) != _canonical_bytes(parameters):
+            raise ValueError("crossed frozen parameters")
+        fold_ordinal = specification["fold_ordinal"]
+        fold = _causal_folds(selected)[fold_ordinal]
+        partition = _route_a_owner_fold_partitions(frame=frame, fold=fold, attempt=selected,
+            dependency_warmup_bars=dependency_warmup_bars, fold_ordinal=fold_ordinal,
+            templates=_partition_templates, partition_role=specification["partition_role"])
+        identity = _route_a_owner_partition_identity(precommitments=precommitments,
+            attempt_ordinal=index, fold_ordinal=fold_ordinal, partition_role=partition.role,
+            _partition_row_lookup=_partition_row_lookup)
+        expected = row["folds"][fold_ordinal]
+        geometry = partition.geometry_receipt
+        if (fold["fold_id"] != expected["fold_id"]
+                or _canonical_bytes(identity) != _canonical_bytes(expected["partitions"][partition.role])
+                or geometry["receipt_sha256"] != identity["partition_geometry_receipt_sha256"]
+                or geometry["frame_sha256"] != identity["partition_frame_sha256"]
+                or _sha256({key: value for key, value in geometry.items() if key != "receipt_sha256"})
+                    != geometry["receipt_sha256"]):
+            raise ValueError("original geometry changed")
+    except (AuthoritativeSearchExecutionError, ValueError, TypeError, KeyError, AttributeError,
+            IndexError, StopIteration, OverflowError, RecursionError) as exc:
+        raise AuthoritativeSearchExecutionError("ROUTE_A_FULL_PANEL_OWNER_REBIND_INVALID") from exc
+    return selected, fold, partition, parameters
+
+
+def _route_a_assemble_full_panel_attempt(*, attempt, raw_attempt_id, plan_body,
+        fitted, entries, partition_cost_precommitments, source_observation_references,
+        _partition_row_lookup=None):
+    """Assemble strict Raw from private verified entries without another execution."""
+    expected = {(fold, role, tier) for fold in range(4)
+        for role in ("optimizer_train", "tuning_validation", "final_lockbox") for tier in ("P75", "P95")}
+    if set(entries) != expected:
+        _fail("ROUTE_A_FULL_PANEL_EVALUATION_ROSTER_CHANGED", attempt.ordinal)
+    folds, facts = [], []
+    for fold_ordinal, fold in enumerate(_causal_folds(attempt)):
+        partitions = _fold_partitions(frame=fitted._frame, fold=fold, attempt=attempt,
+            dependency_warmup_bars=plan_body["derived_dependency_geometry"]["warmup_bars"])
+        lanes, partition_signals = {}, {}
+        for partition in partitions:
+            base = entries[fold_ordinal, partition.role, "P75"]
+            stress = entries[fold_ordinal, partition.role, "P95"]
+            matched = base["matched_base_facts"]
+            identities = build_backtest_trade_identity_pnl_evidence(base["result"]["trades"])
+            expected_binding = {"executor_release_sha256": AUTHORITATIVE_SEARCH_EXECUTION_RELEASE_SHA256,
+                "backtest_source_contract_sha256": _source_identity(fitted.source_contract_seeds["P75"]),
+                "instrument_spec_sha256": _sha256(vars(fitted.instrument_spec)),
+                "caller": "pm_authoritative_search_execution._run_tier_partition",
+                "backtester": "pm_core.Backtester.run", "governance_policy": None,
+                "entry_schedule": None, "terminal_policy": "LIQUIDATE",
+                "stop_provenance": "ORIGINAL_ENTRY_STOP_PRESERVED_BOTH_FIXED_CONTROL_BACKENDS"}
+            if (type(matched) is not dict or matched.get("partition_role") != partition.role
+                    or matched.get("initial_risk_source_binding") != expected_binding
+                    or _canonical_bytes(matched.get("instrument_spec")) != _canonical_bytes(vars(fitted.instrument_spec))
+                    or matched.get("trade_power_partition_axis") != base["result"]["trade_power_partition_axis"]
+                    or matched.get("numerical_execution_cost_attestations") != {
+                        "P75": base["result"]["numerical_execution_cost_attestation"],
+                        "P95": stress["result"]["numerical_execution_cost_attestation"]}
+                    or len(matched.get("trades", [])) != len(identities)):
+                _fail("ROUTE_A_FULL_PANEL_MATCHED_BASE_WITNESS_CHANGED", attempt.ordinal)
+            for witness, trade, identity in zip(matched["trades"], base["result"]["trades"], identities, strict=True):
+                direction = 1 if identity["direction"] == "LONG" else -1
+                actual_risk = float(fitted.instrument_spec.calculate_loss_at_stop(
+                    float(trade["entry_price"]), float(trade["stop_loss"]), float(trade["position_size"]), direction))
+                if (witness["base_trade_identity"] != identity
+                        or witness["entry_price"] != trade["entry_price"]
+                        or witness["recorded_stop_price"] != trade["stop_loss"]
+                        or witness["executed_volume"] != trade["position_size"]
+                        or witness["initial_stop_status"] != "ORIGINAL_ENTRY_STOP_FIXED_CONTROL"
+                        or not math.isfinite(actual_risk) or actual_risk <= 0
+                        or witness["actual_initial_risk_dollars"] != actual_risk
+                        or witness["risk_at_recorded_stop_dollars"] != actual_risk):
+                    _fail("ROUTE_A_FULL_PANEL_MATCHED_BASE_WITNESS_CHANGED", attempt.ordinal)
+            for tier in ("P75", "P95"):
+                entry = entries[fold_ordinal, partition.role, tier]
+                lanes[f"{partition.role}_{tier.lower()}"] = copy.deepcopy(entry["decision"])
+                if (entry["pair_check"]["status"] != "VERIFIED"
+                        or not entry["signals"].equals(base["signals"])):
+                    _fail("ROUTE_A_FULL_PANEL_PAIR_CHECK_INCOMPLETE", attempt.ordinal)
+            partition_signals[partition.role] = base["signals"].copy(deep=True)
+            facts.append({"attempt_ordinal": attempt.ordinal, "raw_attempt_id": raw_attempt_id,
+                "horizon_attempt_id": attempt.plan_attempt["attempt_id"],
+                "fold_ordinal": fold_ordinal, "partition_role": partition.role,
+                "partition_geometry_receipt_sha256": partition.geometry_receipt["receipt_sha256"],
+                "partition_frame_sha256": partition.geometry_receipt["frame_sha256"],
+                "partition_axis_sha256": _sha256(matched["trade_power_partition_axis"]),
+                "cost_precommitment_receipt_sha256": partition_cost_precommitments["receipt_sha256"],
+                "facts": copy.deepcopy(matched)})
+        receipt = _independent_tier_execution_receipt(lanes, fitted.frozen_tier_pair_contract)
+        provenance = _fold_provenance(plan_body=plan_body, plan_receipt_sha256=_sha256(plan_body),
+            attempt=attempt, fold=fold, fold_ordinal=fold_ordinal, partitions=partitions,
+            lanes=lanes, fitted=fitted, independent_tier_execution_receipt=receipt,
+            partition_signals=partition_signals,
+            source_observation_receipts=({partition.role: _source_observation_receipt(fitted, partition.frame.index)
+                for partition in partitions} if source_observation_references is None else None),
+            source_observation_references=({partition.role: _partition_source_observation_reference(
+                references=source_observation_references, precommitments=partition_cost_precommitments,
+                pair=fitted.frozen_tier_pair_contract, attempt=attempt,
+                fold_ordinal=fold_ordinal, partition=partition,
+                _partition_row_lookup=_partition_row_lookup) for partition in partitions}
+                if source_observation_references is not None else None))
+        folds.append({"fold_ordinal": fold_ordinal, "provenance": provenance, "lanes": lanes})
+    return {"attempt_id": raw_attempt_id, "folds": folds}, facts
+
+
+
+def _route_a_base_fill_witness(*, trade, identity, features, base_entry_half, base_intrabar_half):
+    """Capture actual inputs and reproduce the fixed-control fill before projection."""
+    try:
+        opened, closed = identity["entry_bar"], identity["exit_bar"]
+        if (not 0 <= opened <= closed < len(features)
+                or len(base_entry_half) != len(features) or len(base_intrabar_half) != len(features)):
+            raise ValueError("invalid actual bar axis")
+        inputs = {"direction": identity["direction"], "entry_bar": opened, "exit_bar": closed,
+            "partition_bar_count": len(features), "entry_time_utc": identity["entry_time"],
+            "exit_time_utc": identity["exit_time"], "entry_mid_open": float(features["Open"].iloc[opened]),
+            "p75_entry_half_price": float(base_entry_half[opened]),
+            "observed_entry_price": float(trade["entry_price"]), "observed_exit_price": float(trade["exit_price"]),
+            "original_stop_price": float(trade["stop_loss"]), "original_target_price": float(trade["take_profit"]),
+            "exit_reason": trade["exit_reason"], "held_bar_inputs": [
+                {"bar": bar, "open_utc": pd.Timestamp(features.index[bar]).isoformat(),
+                 "ohlc": {name: float(features[name].iloc[bar]) for name in ("Open", "High", "Low", "Close")},
+                 "p75_intrabar_half_price": float(base_intrabar_half[bar])}
+                for bar in range(opened, closed + 1)]}
+        _canonical_bytes(inputs)
+        return {**inputs, **_route_a_replay_base_fill_inputs(inputs),
+            "held_bar_inputs_sha256": _sha256(inputs["held_bar_inputs"])}
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+        return {"status": "MISMATCH", "reason_code": "BASE_FILL_WITNESS_INPUT_INVALID"}
+
+
+def _route_a_replay_base_fill_inputs(inputs):
+    """Pure exact branch reference shared by capture and serialized verification."""
+    try:
+        opened, closed, count = (inputs[key] for key in ("entry_bar", "exit_bar", "partition_bar_count"))
+        if (any(type(value) is not int for value in (opened, closed, count))
+                or not 0 <= opened <= closed < count or inputs["direction"] not in {"LONG", "SHORT"}):
+            raise ValueError("invalid literal axis")
+        direction = 1 if inputs["direction"] == "LONG" else -1
+        entry, exit_price, stop, target, entry_mid, entry_half = (float(inputs[key]) for key in (
+            "observed_entry_price", "observed_exit_price", "original_stop_price", "original_target_price", "entry_mid_open", "p75_entry_half_price"))
+        path = inputs["held_bar_inputs"]
+        if (not all(math.isfinite(value) for value in (entry, exit_price, stop, target, entry_mid, entry_half))
+                or entry_half < 0 or direction * (entry - stop) <= 0 or direction * (target - entry) <= 0
+                or type(path) is not list or len(path) != closed - opened + 1
+                or [row["bar"] for row in path] != list(range(opened, closed + 1))
+                or pd.Timestamp(path[0]["open_utc"]) != pd.Timestamp(inputs["entry_time_utc"])
+                or pd.Timestamp(path[-1]["open_utc"]) != pd.Timestamp(inputs["exit_time_utc"])
+                or float(path[0]["ohlc"]["Open"]) != entry_mid):
+            raise ValueError("invalid literal input")
+        expected_entry = entry_mid + entry_half if direction == 1 else entry_mid - entry_half
+        if expected_entry != entry:
+            return {"status": "MISMATCH", "reason_code": "BASE_ENTRY_FILL_MISMATCH"}
+        trigger, scanned = None, 0
+        for row in path:
+            mid, half = row["ohlc"], float(row["p75_intrabar_half_price"])
+            if (type(mid) is not dict or set(mid) != {"Open", "High", "Low", "Close"}
+                    or not all(math.isfinite(float(value)) for value in (*mid.values(), half)) or half < 0):
+                raise ValueError("invalid trigger input")
+            scanned += 1
+            if direction == 1:
+                quote_open, adverse, favorable = mid["Open"] - half, mid["Low"] - half, mid["High"] - half
+                if quote_open <= stop:
+                    trigger = (row["bar"], "GAP_SL", quote_open, pm_core.TradeStatus.CLOSED_SL.value, mid, half)
+                elif adverse <= stop:
+                    trigger = (row["bar"], "TOUCH_SL", stop, pm_core.TradeStatus.CLOSED_SL.value, mid, half)
+                elif favorable >= target:
+                    trigger = (row["bar"], "TOUCH_TP", target, pm_core.TradeStatus.CLOSED_TP.value, mid, half)
+            else:
+                quote_open, adverse, favorable = mid["Open"] + half, mid["High"] + half, mid["Low"] + half
+                if quote_open >= stop:
+                    trigger = (row["bar"], "GAP_SL", quote_open, pm_core.TradeStatus.CLOSED_SL.value, mid, half)
+                elif adverse >= stop:
+                    trigger = (row["bar"], "TOUCH_SL", stop, pm_core.TradeStatus.CLOSED_SL.value, mid, half)
+                elif favorable <= target:
+                    trigger = (row["bar"], "TOUCH_TP", target, pm_core.TradeStatus.CLOSED_TP.value, mid, half)
+            if trigger is not None:
+                break
+        if trigger is None:
+            if closed != count - 1 or inputs["exit_reason"] != pm_core.TradeStatus.CLOSED_EOD.value:
+                return {"status": "MISMATCH", "reason_code": "BASE_EXIT_TRIGGER_UNAVAILABLE"}
+            expected_exit = mid["Close"] - half if direction == 1 else mid["Close"] + half
+            trigger_bar, branch, reason = closed, "EOD", pm_core.TradeStatus.CLOSED_EOD.value
+        else:
+            trigger_bar, branch, expected_exit, reason, mid, half = trigger
+        if trigger_bar != closed or reason != inputs["exit_reason"] or expected_exit != exit_price:
+            return {"status": "MISMATCH", "reason_code": "BASE_FIRST_TRIGGER_OR_EXIT_FILL_MISMATCH"}
+        return {"status": "VERIFIED", "reason_code": None, "branch": branch, "same_bar": opened == closed,
+            "held_bars_scanned": scanned, "expected_entry_price": expected_entry,
+            "exit_bar_ohlc": mid.copy(), "p75_exit_intrabar_half_price": half,
+            "expected_exit_price": expected_exit}
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError):
+        return {"status": "MISMATCH", "reason_code": "BASE_FILL_WITNESS_INPUT_INVALID"}
+
+
+
+def _verify_route_a_matched_base_facts(facts):
+    """Recompute serialized witness data; the caller must authenticate its origin."""
+    empty = {"completed_position_ids": None, "completed_position_open_utc": None,
+        "completed_position_close_utc": None, "completed_position_open_event_order": None,
+        "completed_position_close_event_order": None, "base_actual_initial_risk_net_r": None,
+        "matched_p95_spread_cost_r": None}
+    unavailable = {"floor_status": "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH",
+        "floor_reason_codes": [], **empty, "authenticates_origin": False}
+    reasons = []
+    try:
+        if (type(facts) is not dict or facts.get("schema_version") != "fxpm.route-a-matched-base-kernel-facts.v3"
+                or type(facts.get("use_spread")) is not bool
+                or facts.get("matched_cost_policy_reference") != "E-00005870"
+                or facts.get("base_return_policy_reference") != "E-00005908"
+                or facts.get("exact_execution_capture_schema") != "fxpm.backtest-exact-executed-trades.v1"
+                or type(facts.get("exact_swap_model_enabled")) is not bool
+                or facts.get("exact_capture_count_matches") is not True):
+            raise ValueError("invalid witness schema")
+        spec = InstrumentSpec(**facts["instrument_spec"])
+        if _canonical_bytes(vars(spec)) != _canonical_bytes(facts["instrument_spec"]):
+            raise ValueError("instrument snapshot changed")
+        encoded_arrays = facts["half_spread_arrays"]
+        if type(encoded_arrays) is not dict or set(encoded_arrays) != {"P75", "P95"}:
+            raise ValueError("invalid spread roster")
+        arrays, count = {}, None
+        for tier in ("P75", "P95"):
+            encoded_pair = encoded_arrays[tier]
+            if type(encoded_pair) is not dict or set(encoded_pair) != {"entry_half_spread", "intrabar_half_spread"}:
+                raise ValueError("invalid spread vector pair")
+            pair = {role: _route_a_decode_spread_array(encoded_pair[role], role)
+                for role in ("entry_half_spread", "intrabar_half_spread")}
+            arrays[tier] = pair
+            for values in pair.values():
+                if count is None:
+                    count = len(values)
+                elif count != len(values):
+                    raise ValueError("crossed spread axes")
+            rebuilt = trade_power.build_numerical_execution_cost_attestation(
+                use_spread=facts["use_spread"],
+                spread_mode=pm_core.build_backtest_spread_mode(facts["spread_model_metadata"][tier]),
+                entry_half_spread_values_sha256=Backtester._spread_array_sha256("entry_half_spread", pair["entry_half_spread"]),
+                intrabar_half_spread_values_sha256=Backtester._spread_array_sha256("intrabar_half_spread", pair["intrabar_half_spread"]),
+                instrument_spec_sha256=Backtester._cost_attestation_json_sha256({
+                    "schema_version": pm_core.BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION, "instrument_spec": vars(spec)}))
+            if rebuilt != facts["numerical_execution_cost_attestations"][tier]:
+                raise ValueError("spread vector attestation changed")
+        non_improvement = _route_a_spread_non_improvement(arrays)
+        if non_improvement["status"] == "REFUSED_P95_BELOW_P75":
+            return {**unavailable, "floor_status": "REFUSED_P95_BELOW_P75", "floor_reason_codes": ["P95_BELOW_P75"]}
+        if non_improvement != facts["tier_non_improvement"]:
+            raise ValueError("tier comparison changed")
+        rows, events = facts["trades"], facts["base_position_events"]
+        if type(rows) is not list or type(events) is not list:
+            raise ValueError("invalid completed position roster")
+        joined = len(rows) == len(events)
+        ids, opens, closes, open_orders, close_orders, net_r, costs_r = [], [], [], [], [], [], []
+        source = facts["initial_risk_source_binding"]
+        if (source.get("instrument_spec_sha256") != _sha256(vars(spec))
+                or source.get("caller") != "pm_authoritative_search_execution._run_tier_partition"
+                or source.get("backtester") != "pm_core.Backtester.run"
+                or source.get("governance_policy") is not None or source.get("entry_schedule") is not None
+                or source.get("terminal_policy") != "LIQUIDATE"
+                or source.get("stop_provenance") != "ORIGINAL_ENTRY_STOP_PRESERVED_BOTH_FIXED_CONTROL_BACKENDS"):
+            raise ValueError("fixed-control source semantics changed")
+        for ordinal, row in enumerate(rows):
+            identity = row["base_trade_identity"]
+            if build_backtest_trade_identity_pnl_evidence([identity]) != [identity]:
+                raise ValueError("invalid trade identity")
+            direction = 1 if identity["direction"] == "LONG" else -1
+            actual_risk = float(spec.calculate_loss_at_stop(row["entry_price"], row["recorded_stop_price"], row["executed_volume"], direction))
+            if (row["executed_volume"] != identity["position_size"] or not math.isfinite(actual_risk) or actual_risk <= 0
+                    or row["actual_initial_risk_dollars"] != actual_risk
+                    or row["risk_at_recorded_stop_dollars"] != actual_risk
+                    or row["initial_stop_status"] != "ORIGINAL_ENTRY_STOP_FIXED_CONTROL"):
+                raise ValueError("initial risk changed")
+            components = _route_a_exact_base_return_components(row, spec=spec, ordinal=ordinal,
+                swap_model_enabled=facts["exact_swap_model_enabled"])
+            calculated_net = components["canonical_net_r"]
+            if (row["base_return_components"] != components
+                    or row["base_actual_initial_risk_net_r"] != calculated_net
+                    or row["executed_price_swap_capture"]["backend"] != facts["exact_capture_backend"]):
+                raise ValueError("exact BASE price/swap R changed")
+            witness = row["base_fill_witness"]
+            input_fields = {"direction", "entry_bar", "exit_bar", "partition_bar_count", "entry_time_utc",
+                "exit_time_utc", "entry_mid_open", "p75_entry_half_price", "observed_entry_price", "observed_exit_price",
+                "original_stop_price", "original_target_price", "exit_reason", "held_bar_inputs"}
+            if not input_fields <= set(witness):
+                reasons.append("BASE_FILL_WITNESS_INPUT_INVALID")
+                continue
+            inputs = {key: witness[key] for key in input_fields}
+            replay = _route_a_replay_base_fill_inputs(inputs)
+            expected_witness = {**inputs, **replay, "held_bar_inputs_sha256": _sha256(inputs["held_bar_inputs"])}
+            if _canonical_bytes(expected_witness) != _canonical_bytes(witness):
+                raise ValueError("fill verdict or captured path changed")
+            opened, closed = identity["entry_bar"], identity["exit_bar"]
+            if (inputs["direction"] != identity["direction"] or inputs["entry_bar"] != opened or inputs["exit_bar"] != closed
+                    or inputs["partition_bar_count"] != count
+                    or pd.Timestamp(inputs["entry_time_utc"]) != pd.Timestamp(identity["entry_time"])
+                    or pd.Timestamp(inputs["exit_time_utc"]) != pd.Timestamp(identity["exit_time"])
+                    or inputs["observed_entry_price"] != row["entry_price"]
+                    or inputs["original_stop_price"] != row["recorded_stop_price"]
+                    or inputs["exit_reason"] != identity["exit_reason"]
+                    or inputs["p75_entry_half_price"] != arrays["P75"]["entry_half_spread"][opened]
+                    or any(item["p75_intrabar_half_price"] != arrays["P75"]["intrabar_half_spread"][item["bar"]]
+                        for item in inputs["held_bar_inputs"])):
+                raise ValueError("fill inputs cross trade/array membership")
+            for tier in ("P75", "P95"):
+                expected_sides = {"entry_half_spread_at_entry": arrays[tier]["entry_half_spread"][opened],
+                    "intrabar_half_spread_at_entry": arrays[tier]["intrabar_half_spread"][opened],
+                    "entry_half_spread_at_exit": arrays[tier]["entry_half_spread"][closed],
+                    "intrabar_half_spread_at_exit": arrays[tier]["intrabar_half_spread"][closed]}
+                if row["spread_sides"][tier] != expected_sides:
+                    raise ValueError("selected spread sides changed")
+            if replay["status"] != "VERIFIED":
+                reasons.append(replay["reason_code"])
+            else:
+                numerator = float(arrays["P95"]["entry_half_spread"][opened]) + float(arrays["P95"]["intrabar_half_spread"][closed])
+                distance = abs(row["entry_price"] - row["recorded_stop_price"])
+                expected_inputs = {"entry_half_price": arrays["P95"]["entry_half_spread"][opened],
+                    "exit_intrabar_half_price": arrays["P95"]["intrabar_half_spread"][closed],
+                    "numerator_price": numerator, "original_initial_stop_distance_price": distance}
+                cost_r = pm_core.canonical_backtest_winner_r(numerator, distance)
+                if (row["matched_p95_cost_inputs"] != expected_inputs
+                        or row["matched_p95_spread_cost_r_unrounded"] != numerator / distance
+                        or row["matched_p95_spread_cost_r"] != cost_r):
+                    raise ValueError("matched price-ratio cost changed")
+                costs_r.append(cost_r)
+            event = events[ordinal] if ordinal < len(events) else None
+            if (type(event) is not dict or event.get("trade_record_schema_version") != pm_core.BACKTEST_POSITION_EVENT_SCHEMA_VERSION
+                    or type(event.get("position_id")) is not str
+                    or raw_winner._BACKTEST_POSITION_ID.fullmatch(event["position_id"]) is None or event["position_id"] in ids
+                    or pd.Timestamp(event.get("entry_time")) != pd.Timestamp(identity["entry_time"])
+                    or pd.Timestamp(event.get("exit_time")) != pd.Timestamp(identity["exit_time"])
+                    or event.get("entry_event_order") != opened * 4 + 1 or event.get("exit_event_order") != closed * 4 + 3
+                    or event.get("pnl_dollars") != identity["pnl_dollars"] or event.get("risk_amount") != identity["risk_amount"]
+                    or row.get("base_position_event") != event):
+                joined = False
+            else:
+                ids.append(event["position_id"])
+                opens.append(pd.Timestamp(event["entry_time"]).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                closes.append(pd.Timestamp(event["exit_time"]).strftime("%Y-%m-%dT%H:%M:%SZ"))
+                open_orders.append(event["entry_event_order"]); close_orders.append(event["exit_event_order"])
+            net_r.append(calculated_net)
+        if facts["base_fill_witness_sha256"] != _sha256([row["base_fill_witness"] for row in rows]):
+            raise ValueError("fill witness roster changed")
+        if not joined:
+            reasons.append("BASE_POSITION_EVENT_BIJECTION_INVALID")
+        if not rows:
+            return {"floor_status": "UNAVAILABLE_NO_COMPLETED_BASE_TRADES", "floor_reason_codes": sorted(set(reasons)), **empty, "authenticates_origin": False}
+        if reasons:
+            return {**unavailable, "floor_reason_codes": sorted(set(reasons))}
+        return {"floor_status": "AVAILABLE_MATCHED_BASE_VERIFIED", "floor_reason_codes": [],
+            "completed_position_ids": ids, "completed_position_open_utc": opens, "completed_position_close_utc": closes,
+            "completed_position_open_event_order": open_orders, "completed_position_close_event_order": close_orders,
+            "base_actual_initial_risk_net_r": net_r, "matched_p95_spread_cost_r": costs_r, "authenticates_origin": False}
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError, OverflowError):
+        return {**unavailable, "floor_reason_codes": ["SERIALIZED_MATCHED_BASE_FACTS_INVALID"]}
+
+
+
+def _route_a_encode_spread_array(raw, role):
+    """Keep the exact attested little-endian binary64 bytes, including sentinels."""
+    import base64
+    array = np.asarray(raw, dtype=np.float64)
+    if array.ndim != 1:
+        raise ValueError("spread vector must have one axis")
+    exact = np.ascontiguousarray(array.astype("<f8", copy=False))
+    return {"dtype": "<f8", "shape": [int(exact.size)],
+        "values_base64": base64.b64encode(exact.tobytes(order="C")).decode("ascii"),
+        "array_sha256": Backtester._spread_array_sha256(role, exact)}
+
+
+def _route_a_decode_spread_array(encoded, role):
+    """Decode without changing signed zeros, NaNs, sentinels or bar indexes."""
+    import base64
+    if (type(encoded) is not dict or set(encoded) != {"dtype", "shape", "values_base64", "array_sha256"}
+            or encoded["dtype"] != "<f8" or type(encoded["shape"]) is not list or len(encoded["shape"]) != 1
+            or type(encoded["shape"][0]) is not int or encoded["shape"][0] < 0
+            or type(encoded["values_base64"]) is not str):
+        raise ValueError("invalid binary spread vector")
+    raw = base64.b64decode(encoded["values_base64"], validate=True)
+    if len(raw) != encoded["shape"][0] * 8:
+        raise ValueError("binary spread vector shape changed")
+    array = np.frombuffer(raw, dtype="<f8")
+    if Backtester._spread_array_sha256(role, array) != encoded["array_sha256"]:
+        raise ValueError("binary spread vector hash changed")
+    return array
+
+
+
+def _route_a_spread_non_improvement(arrays):
+    """Check every finite bar; retain nonfinite sentinel ordering as unknown."""
+    unknown = {}
+    for role in ("entry_half_spread", "intrabar_half_spread"):
+        base = np.asarray(arrays["P75"][role], dtype=np.float64)
+        stress = np.asarray(arrays["P95"][role], dtype=np.float64)
+        if base.ndim != 1 or stress.shape != base.shape:
+            raise ValueError("tier comparison axes differ")
+        finite = np.isfinite(base) & np.isfinite(stress)
+        inversion = np.flatnonzero(finite & (stress < base))
+        if inversion.size:
+            return {"status": "REFUSED_P95_BELOW_P75", "role": role, "bar": int(inversion[0])}
+        missing = np.flatnonzero(~finite)
+        if missing.size:
+            unknown[role] = [int(index) for index in missing]
+    return ({"status": "NO_FINITE_INVERSION_WITH_SENTINELS", "unknown_indices": unknown}
+        if unknown else {"status": "VERIFIED_ALL_BARS"})
+
+
+def _verify_route_a_prepared_stage_origin(stage, *, capture, frozen, unit, raw_body):
+    """Keep each floor vector attached to its actual selected unit and Raw body."""
+    if (type(stage) is not _PreparedRouteAFullPanelStage
+            or type(capture) is not historical_adapter.DeclaredSlotSearchCapture
+            or not historical_adapter._verify_declared_slot_capture(capture)
+            or capture._winner_generation is not winner.V17_GENERATION
+            or capture._active is None or capture._active.frozen is not frozen):
+        _fail("ROUTE_A_FULL_PANEL_STAGE_ORIGIN_INVALID")
+    handle = capture._active
+    header = _read_declared_unit_header(capture.context, capture.request_body)
+    if header is None or _sha256(header["binding"]) != stage.declared_unit_binding_sha256:
+        _fail("ROUTE_A_FULL_PANEL_STAGE_ORIGINAL_BINDING_CHANGED")
+    original = stage.unit_body(unit)
+    if _canonical_bytes(original) != _canonical_bytes(raw_body):
+        _fail("ROUTE_A_FULL_PANEL_STAGE_RAW_BODY_CHANGED")
+    facts = stage.matched_base_facts(unit["ordinal"])
+    row = stage.rows[unit["ordinal"]]
+    origin = {"schema_version": "fxpm.matched-floor-stage-origin-binding.v1",
+        "producer_request_sha256": capture.request.receipt_sha256,
+        "process_receipt_sha256": capture.process.receipt_sha256,
+        "frozen_receipt_sha256": handle.frozen_receipt_descriptor["sha256"],
+        "precommitment_sha256": _sha256(frozen.precommitment),
+        "declared_unit_binding_sha256": stage.declared_unit_binding_sha256,
+        "preparation_contract_sha256": stage.preparation_contract_sha256,
+        "unit": dict(unit), "stage_content_sha256": row.sha256, "stage_size_bytes": row.size_bytes,
+        "raw_body_sha256": _sha256(original), "matched_base_facts_sha256": _sha256(facts)}
+    return facts, origin
+
+
+
+
+def _reopen_route_a_matched_source_material(context, *, request, process, frozen,
+        frozen_pipeline_config, m5_fitted=None):
+    """Reopen retained source for verification only; no fitting or execution grant."""
+    import pm_production_search_planner as planner
+    body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    planner.verify_frozen_production_search_process(context, process)
+    if (frozen.selection_generation is not winner.V17_GENERATION
+            or frozen.bound_fitted_state_entry is None
+            or planner.frozen_search_execution_edition(context, process) != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION):
+        _fail("MATCHED_FLOOR_FROZEN_SOURCE_EDITION_REQUIRED")
+    frozen_pipeline_config.verify_current(context)
+    config = frozen_pipeline_config.materialize(context)
+    state, delta = current_refit.read_bound_fitted_state_reference(context, frozen.bound_fitted_state_entry,
+        artifact_namespace=body["artifact_namespace"])
+    meta, receipts = state["metadata"], state["metadata"]["receipts"]
+    if (meta["binding"]["producer_request_sha256"] != request.receipt_sha256
+            or meta["binding"]["process_sha256"] != process.receipt_sha256
+            or meta["binding"]["effective_config_sha256"] != frozen_pipeline_config.effective_config_sha256
+            or _canonical_bytes(meta["fold_plan"]) != _canonical_bytes(frozen.precommitment["causal_fold_plan"])
+            or _canonical_bytes(receipts["source_contract_seeds"]) != _canonical_bytes(frozen.source_contract_seeds)
+            or _canonical_bytes(receipts["frozen_tier_pair_contract"]) != _canonical_bytes(frozen.frozen_tier_pair_contract)):
+        _fail("MATCHED_FLOOR_RETAINED_SOURCE_BINDING_CHANGED")
+    if historical.declared_slot_source_kind(body) == "m5_derived":
+        if (m5_fitted is None or _frame_sha256(m5_fitted._frame) != meta["frame_sha256"]
+                or _canonical_bytes(asdict(m5_fitted.instrument_spec)) != _canonical_bytes(receipts["instrument_spec"])
+                or _canonical_bytes(m5_fitted.frozen_tier_pair_contract) != _canonical_bytes(frozen.frozen_tier_pair_contract)):
+            _fail("MATCHED_FLOOR_VERIFIED_M5_SOURCE_REQUIRED")
+        return m5_fitted._frame, m5_fitted.instrument_spec, m5_fitted._spread_tiers, config
+    if m5_fitted is not None:
+        _fail("MATCHED_FLOOR_NATIVE_SOURCE_REJECTS_M5")
+    target = _bound_fit_open_carrier(context, config, meta["target_carrier"])
+    fine = _bound_fit_open_carrier(context, config, meta["fine_carrier"])
+    base = native_prefix.open_verified_prefix_frame(target)
+    if (not base.index.equals(delta.index)
+            or [{"name": name, "dtype": str(dtype)} for name, dtype in base.dtypes.items()] != meta["base_columns"]):
+        _fail("MATCHED_FLOOR_ORIGINAL_FRAME_CHANGED")
+    frame = base.copy(deep=True)
+    for name in _REGIME_COLUMNS:
+        frame[name] = delta[name]
+    if _frame_sha256(frame) != meta["frame_sha256"]:
+        _fail("MATCHED_FLOOR_ORIGINAL_FRAME_CHANGED")
+    spec, spec_receipt = _freeze_bound_execution_spec(product=target, config=config)
+    tiers, observations, verified_fine, _ = _native_spread_inputs(product=target, config=config,
+        frame=base, spec=spec, _reopened_fine_product=fine)
+    if (verified_fine.index_sha256 != meta["fine_carrier"]["index_sha256"]
+            or hashlib.sha256(pd.util.hash_pandas_object(observations, index=True).values.tobytes()).hexdigest()
+                != meta["entry_observations_sha256"]
+            or _canonical_bytes(spec_receipt) != _canonical_bytes(receipts["execution_spec_receipt"])
+            or _canonical_bytes(asdict(spec)) != _canonical_bytes(receipts["instrument_spec"])
+            or any(level["frozen_spread_tier"] != tiers[level["tier"]].descriptor()
+                for level in frozen.frozen_tier_pair_contract["tiers"])):
+        _fail("MATCHED_FLOOR_ORIGINAL_COST_SOURCE_CHANGED")
+    return frame, spec, tiers, config
+
+
+def _verify_route_a_matched_fact_source(facts, geometry, *, source_frame, spec, tiers, config, timeframe,
+        _prepared_source_cache=None):
+    """Compare witness OHLC and complete half arrays to reopened source without a model run."""
+    spec_bytes = _canonical_bytes(vars(spec))
+    if spec_bytes != _canonical_bytes(facts["instrument_spec"]):
+        _fail("MATCHED_FLOOR_PARTITION_SOURCE_CHANGED")
+    pricing = None
+    prepared = None
+    if _prepared_source_cache is not None:
+        key = (id(source_frame), _canonical_bytes(geometry), id(config),
+            pickle.dumps(vars(config), protocol=5), id(spec), spec_bytes, timeframe,
+            tuple((tier, id(tiers[tier]), tiers[tier]._json) for tier in ("P75", "P95")))
+        prepared = _prepared_source_cache.get(key)
+    if prepared is None:
+        frame = source_frame.loc[(source_frame.index >= pd.Timestamp(geometry["frame_start_utc"]))
+            & (source_frame.index < pd.Timestamp(geometry["end_exclusive_utc"]))]
+        if len(frame) != geometry["frame_rows"] or _frame_sha256(frame) != geometry["frame_sha256"]:
+            _fail("MATCHED_FLOOR_PARTITION_SOURCE_CHANGED")
+        pricing = Backtester(config)
+        expected_tiers = []
+        for tier in ("P75", "P95"):
+            entry, intrabar, metadata = pricing._build_half_spread_arrays(frame, spec,
+                spread_tier=tiers[tier], timeframe=timeframe)
+            expected = {"entry_half_spread": _route_a_encode_spread_array(entry, "entry_half_spread"),
+                "intrabar_half_spread": _route_a_encode_spread_array(intrabar, "intrabar_half_spread")}
+            expected_tiers.append((tier, _canonical_bytes(expected), _canonical_bytes(metadata)))
+        prepared = frame, tuple(expected_tiers)
+        if _prepared_source_cache is not None:
+            _prepared_source_cache[key] = prepared
+    frame, expected_tiers = prepared
+    if pricing is None:
+        pricing = Backtester(config)
+    for tier, expected, metadata in expected_tiers:
+        if (expected != _canonical_bytes(facts["half_spread_arrays"][tier])
+                or metadata != _canonical_bytes(facts["spread_model_metadata"][tier])):
+            _fail("MATCHED_FLOOR_SPREAD_ARRAY_SOURCE_CHANGED")
+    for row in facts["trades"]:
+        fill = row["base_fill_witness"]
+        inputs = fill
+        if "held_bar_inputs" not in inputs:
+            if facts["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED":
+                _fail("MATCHED_FLOOR_SOURCE_INPUTS_MISSING")
+            continue
+        entry_bar = inputs["entry_bar"]
+        if (not 0 <= entry_bar < len(frame)
+                or inputs["entry_mid_open"] != float(frame.iloc[entry_bar]["Open"])
+                or pd.Timestamp(inputs["entry_time_utc"]) != frame.index[entry_bar]):
+            _fail("MATCHED_FLOOR_ENTRY_SOURCE_CHANGED")
+        for held in inputs["held_bar_inputs"]:
+            bar = held["bar"]
+            if (not 0 <= bar < len(frame)
+                    or pd.Timestamp(held["open_utc"]) != frame.index[bar]
+                    or held["ohlc"] != {name: float(frame.iloc[bar][name]) for name in ("Open", "High", "Low", "Close")}):
+                _fail("MATCHED_FLOOR_HELD_BAR_SOURCE_CHANGED")
+    _verify_route_a_exact_swap_source(facts, frame, spec=spec, pricing=pricing, timeframe=timeframe)
+    return True
+
+
+def _route_a_intern_matched_codec_strings(facts, pool):
+    """Reuse exact immutable strings only; every owner still verifies arrays and attestations."""
+    if facts is None:
+        return
+    for tier, legs in facts["half_spread_arrays"].items():
+        for role, codec in legs.items():
+            value = codec["values_base64"]
+            key = (role, codec["dtype"], tuple(codec["shape"]), codec["array_sha256"],
+                hashlib.sha256(value.encode("ascii")).hexdigest())
+            previous = pool.get(key)
+            if previous is None:
+                pool[key] = value
+            elif previous == value:
+                codec["values_base64"] = previous
+            else:
+                _fail("ROUTE_A_FULL_PANEL_CODEC_INTERN_IDENTITY_CHANGED")
+
+
+def _route_a_exact_base_return_components(row, *, spec, ordinal, swap_model_enabled):
+    """Pure executed-price/swap arithmetic; this data alone authenticates no source."""
+    exact, identity = row["executed_price_swap_capture"], row["base_trade_identity"]
+    fields = {"schema_version", "ordinal", "backend", "signal_bar", "entry_bar", "exit_bar", "direction",
+        "entry_price", "exit_price", "initial_stop_price", "executed_volume", "exit_reason",
+        "swap_dollars_exact", "swap_rollover_units", "swap_source_kind", "swap_cash_steps"}
+    if (type(exact) is not dict or set(exact) != fields or exact["schema_version"] != "fxpm.backtest-exact-executed-trade.v1"
+            or type(exact["ordinal"]) is not int or exact["ordinal"] != ordinal or exact["backend"] not in {"PYTHON", "NUMBA"}
+            or any(exact[key] != identity[key] for key in ("signal_bar", "entry_bar", "exit_bar", "direction", "exit_reason"))
+            or exact["entry_price"] != row["entry_price"] or exact["initial_stop_price"] != row["recorded_stop_price"]
+            or exact["executed_volume"] != row["executed_volume"]
+            or exact["executed_volume"] != identity["position_size"]
+            or exact["exit_price"] != row["base_fill_witness"].get("observed_exit_price")):
+        raise ValueError("exact trade identity changed")
+    direction = 1 if exact["direction"] == "LONG" else -1
+    values = [exact[key] for key in ("entry_price", "exit_price", "initial_stop_price", "executed_volume", "swap_dollars_exact")]
+    if any(type(value) not in (int, float) or not math.isfinite(value) for value in values):
+        raise ValueError("nonfinite exact trade values")
+    distance = abs(exact["entry_price"] - exact["initial_stop_price"])
+    risk = float(spec.calculate_loss_at_stop(exact["entry_price"], exact["initial_stop_price"], exact["executed_volume"], direction))
+    if distance <= 0 or risk <= 0 or not math.isfinite(risk) or exact["executed_volume"] <= 0:
+        raise ValueError("invalid executed risk")
+    kind, steps = exact["swap_source_kind"], exact["swap_cash_steps"]
+    if type(steps) is not list or type(exact["swap_rollover_units"]) is not int or exact["swap_rollover_units"] < 0:
+        raise ValueError("invalid exact swap steps")
+    if kind not in {"CAUSAL_KERNEL", "LEGACY_MODEL", "DISABLED_OR_PENDING_LEGACY"}:
+        raise ValueError("invalid exact swap source kind")
+    if (kind == "DISABLED_OR_PENDING_LEGACY" and (swap_model_enabled or steps or exact["swap_dollars_exact"] != 0)
+            or not swap_model_enabled and kind != "DISABLED_OR_PENDING_LEGACY"):
+        raise ValueError("unproven enabled swap")
+    cash, units, previous = 0.0, 0, None
+    for step in steps:
+        if type(step) is not dict or set(step) != {"bar", "phase", "rollover_units", "rate_per_lot_dollars", "cash"}:
+            raise ValueError("invalid swap step")
+        phase = {"PRE_OPEN": 0, "CLOSE": 1, "LEGACY_AT_EXIT": 2}.get(step["phase"])
+        key = (step["bar"], phase)
+        if (type(step["bar"]) is not int or phase is None or type(step["rollover_units"]) is not int
+                or step["rollover_units"] <= 0 or not exact["entry_bar"] <= step["bar"] <= exact["exit_bar"]
+                or previous is not None and key <= previous
+                or kind == "CAUSAL_KERNEL" and (phase == 2
+                    or phase == 0 and step["bar"] <= exact["entry_bar"]
+                    or phase == 1 and step["bar"] == exact["exit_bar"] and exact["exit_reason"] != pm_core.TradeStatus.CLOSED_EOD.value)
+                or kind == "LEGACY_MODEL" and (phase != 2 or step["bar"] != exact["exit_bar"])
+                or type(step["rate_per_lot_dollars"]) not in (int, float)
+                or not math.isfinite(step["rate_per_lot_dollars"])):
+            raise ValueError("invalid ordered swap step")
+        expected = step["rate_per_lot_dollars"] * exact["executed_volume"] * step["rollover_units"]
+        if step["cash"] != expected:
+            raise ValueError("swap cash multiplication changed")
+        cash += expected;units += step["rollover_units"];previous = key
+    if cash != exact["swap_dollars_exact"] or units != exact["swap_rollover_units"]:
+        raise ValueError("exact swap accumulation changed")
+    price_r = direction * (exact["exit_price"] - exact["entry_price"]) / distance
+    swap_r = cash / risk
+    return {"price_move_r": price_r, "swap_cash_exact": cash, "swap_r": swap_r,
+        "executed_initial_stop_risk_cash": risk,
+        "canonical_net_r": pm_core.canonical_backtest_winner_r(price_r + swap_r, 1.0)}
+
+
+def _verify_route_a_exact_swap_source(facts, frame, *, spec, pricing, timeframe):
+    """Rebuild captured swap inputs from reopened source; no strategy or execution replay."""
+    enabled = bool(getattr(pricing.config, "swap_model_enabled", True))
+    if facts.get("exact_swap_model_enabled") is not enabled:
+        _fail("MATCHED_FLOOR_SWAP_CONFIG_SOURCE_CHANGED")
+    entries = np.full(len(frame), np.nan, dtype=np.float64)
+    for row in facts["trades"]:
+        exact = row["executed_price_swap_capture"]
+        bar = exact["entry_bar"]
+        if type(bar) is not int or not 0 <= bar < len(frame) or np.isfinite(entries[bar]):
+            _fail("MATCHED_FLOOR_SWAP_ENTRY_SOURCE_CHANGED")
+        entries[bar] = exact["entry_price"]
+    pre_open, close, longs, shorts, causal, contract = pricing._build_causal_swap_inputs(
+        frame, spec, entries, timeframe=timeframe)
+    if _canonical_bytes(contract) != _canonical_bytes(facts.get("exact_swap_accrual_contract")):
+        _fail("MATCHED_FLOOR_SWAP_CONTRACT_SOURCE_CHANGED")
+    for ordinal, row in enumerate(facts["trades"]):
+        exact = row["executed_price_swap_capture"]
+        _route_a_exact_base_return_components(row, spec=spec, ordinal=ordinal, swap_model_enabled=enabled)
+        expected = {"trades": []}
+        pm_core._append_exact_backtest_trade(expected, backend=exact["backend"], signal_bar=exact["signal_bar"],
+            entry_bar=exact["entry_bar"], exit_bar=exact["exit_bar"],
+            direction=1 if exact["direction"] == "LONG" else -1,
+            entry_price=exact["entry_price"], exit_price=exact["exit_price"], initial_stop=exact["initial_stop_price"],
+            volume=exact["executed_volume"], exit_reason=exact["exit_reason"], swap_cash=0.0, swap_units=0,
+            causal_swap_enabled=causal, pre_open_units=pre_open, close_units=close, long_rates=longs, short_rates=shorts)
+        rebuilt = expected["trades"][0]
+        rebuilt["ordinal"] = ordinal
+        if causal:
+            cash, units = 0.0, 0
+            for step in rebuilt["swap_cash_steps"]:
+                cash += step["cash"]; units += step["rollover_units"]
+            rebuilt["swap_dollars_exact"], rebuilt["swap_rollover_units"] = cash, units
+        elif enabled:
+            identity = row["base_trade_identity"]
+            schedule = pricing._calendar_swap_rollover_schedule(identity, spec=spec)
+            units = (sum(int(weight) for _timestamp, weight in schedule) if schedule is not None
+                else pricing._swap_rollover_units(identity, frame, timeframe=timeframe, spec=spec))
+            rate = (pricing._swap_value_per_lot_dollars(spec,
+                spec.swap_long if exact["direction"] == "LONG" else spec.swap_short,
+                entry_price=exact["entry_price"]) if units > 0 else 0.0)
+            cash = rate * exact["executed_volume"] * units if units > 0 else 0.0
+            rebuilt.update(swap_source_kind="LEGACY_MODEL", swap_dollars_exact=cash,
+                swap_rollover_units=int(units), swap_cash_steps=[] if units <= 0 else [{
+                    "bar": exact["exit_bar"], "phase": "LEGACY_AT_EXIT", "rollover_units": int(units),
+                    "rate_per_lot_dollars": rate, "cash": cash}])
+        if _canonical_bytes(rebuilt) != _canonical_bytes(exact):
+            _fail("MATCHED_FLOOR_EXACT_SWAP_SOURCE_CHANGED")
+    return True
