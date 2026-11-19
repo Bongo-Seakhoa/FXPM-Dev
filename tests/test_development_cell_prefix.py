@@ -165,18 +165,24 @@ def test_development_issuers_default_to_the_first_period(prefix_metadata_factory
 
 
 @pytest.mark.parametrize("kind", ["native_v2", "m5_full"])
-def test_full_roster_issuers_require_the_explicit_final_study_request(prefix_metadata_factory, kind):
+def test_ordinary_issuers_default_to_one_period_and_require_explicit_final_study(prefix_metadata_factory, kind):
     env = prefix_metadata_factory(full_panel=False)
     issuer = (orchestration.precommit_declared_slot_owner_run_v2 if kind == "native_v2"
         else orchestration.precommit_declared_m5_slot_owner_run)
     extra = {} if kind == "native_v2" else {"m5_source_pins": _prefix_m5_pins(env)}
-    for request in ({}, {"final_study_13": False}, {"final_study_13": 1}):
-        with pytest.raises(orchestration.HistoricalAnchorOrchestrationError,
-                match="^DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED$"):
-            issuer(env.context, **env.kwargs, **extra, **request)
-    assert not list((env.context.root / "declared-slots").glob("*/precommit.json"))
+    for request in ({}, {"final_study_13": False}):
+        selected = issuer(env.context, **env.kwargs, **extra, **request).to_dict()
+        assert selected["period_selection"] == orchestration.declared_ordinary_period_selection(env.roster,
+            symbols=(env.cell["symbol"],))
+        assert len(orchestration.declared_slot_selected_slots(selected)) == 1
+        assert "development_scope" not in selected
+    before = list((env.context.root / "declared-slots").glob("*/precommit.json"))
+    with pytest.raises(orchestration.HistoricalAnchorOrchestrationError,
+            match="^DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED$"):
+        issuer(env.context, **env.kwargs, **extra, final_study_13=1)
+    assert list((env.context.root / "declared-slots").glob("*/precommit.json")) == before
     parent = issuer(env.context, **env.kwargs, **extra, final_study_13=True).to_dict()
-    assert "development_scope" not in parent and "final_study_13" not in parent
+    assert not {"development_scope", "final_study_13", "period_selection"} & set(parent)
     assert len(orchestration.declared_slot_selected_slots(parent)) == 13
 
 

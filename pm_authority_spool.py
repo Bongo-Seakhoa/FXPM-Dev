@@ -48,6 +48,10 @@ POST_SOURCE_ABORT_FENCE_SCHEMA = "fxpm.declared-m5-post-source-abort-fence.v1"
 POST_SOURCE_ABORT_RESULT_KIND = "POST_SOURCE_ABORT_SOURCE_NOT_COMPLETED"
 NATIVE_COMPLETION_FENCE_SCHEMA = "fxpm.declared-broker-native-completion-fence.v1"
 NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA = "fxpm.declared-broker-native-development-completion-fence.v1"
+NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA = "fxpm.declared-broker-native-selected-period-completion-fence.v1"
+M5_ORDINARY_COMPLETION_FENCE_SCHEMA = "fxpm.declared-m5-ordinary-source-fence.v1"
+_NATIVE_COMPLETION_FENCE_SCHEMAS = (NATIVE_COMPLETION_FENCE_SCHEMA,
+    NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA, NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA)
 POST_SOURCE_ABORT_GRID_SOURCE_FIELDS = ("symbol", "timeframe", "activation_sha256", "bars_sha256",
     "sidecar_sha256", "provenance_sha256", "request_sha256", "spread_unit")
 DEFAULT_STREAM_CHUNK_BYTES = 1024 * 1024
@@ -2301,9 +2305,9 @@ def _retirement_retained_account(fence: dict, *, binding: dict, grid_root: Path,
     if reference is None and "retained_account_result" not in fence:
         if not required:
             return None
-        if fence["schema_version"] in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA):
+        if fence["schema_version"] in _NATIVE_COMPLETION_FENCE_SCHEMAS:
             expected_sha = fence["completion"].get("account_artifact_sha256")
-        elif fence["schema_version"] == "fxpm.declared-m5-development-source-fence.v1":
+        elif fence["schema_version"] in ("fxpm.declared-m5-development-source-fence.v1", M5_ORDINARY_COMPLETION_FENCE_SCHEMA):
             terminal_key = binding.get("terminal_result_key")
             results = fence["source_summary"].get("results")
             terminal = [value[1] for value in results if type(value) in (list, tuple)
@@ -2342,10 +2346,11 @@ def _retirement_retained_account(fence: dict, *, binding: dict, grid_root: Path,
             or any(account.get(key) is not False for key in
                 ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
         _fail(invalid)
-    native = fence["schema_version"] in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA)
-    development = fence["schema_version"] != NATIVE_COMPLETION_FENCE_SCHEMA
+    native = fence["schema_version"] in _NATIVE_COMPLETION_FENCE_SCHEMAS
+    development = fence["schema_version"] in (NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA,
+        "fxpm.declared-m5-development-source-fence.v1")
     expected_schema = ("fxpm.declared-development-native-cell-raw-account.v1" if native and development
-        else "fxpm.declared-cell-raw-account.v4" if native
+        else "fxpm.declared-cell-raw-account.v4" if native or fence["schema_version"] == M5_ORDINARY_COMPLETION_FENCE_SCHEMA
         else "fxpm.declared-development-m5-cell-raw-account.v1")
     if (account.get("schema_version") != expected_schema
             or account.get("progress_status") != ("DEVELOPMENT_COMPLETE" if development else "COMPLETE")):
@@ -2366,6 +2371,20 @@ def _retirement_retained_account(fence: dict, *, binding: dict, grid_root: Path,
             and len(value) == 2 and value[0] == terminal_key] if type(results) is list else []
         if (type(terminal_key) is not str or len(terminal) != 1 or type(terminal[0]) is not dict
                 or terminal[0].get("result_sha256") != reference["sha256"]):
+            _fail(invalid)
+    if fence["schema_version"] in (NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA, M5_ORDINARY_COMPLETION_FENCE_SCHEMA):
+        selected = fence["period_selection"]["selected_slot_ids"]
+        schedule = account.get("slot_schedule")
+        measurement = account.get("measurement")
+        if (account["cell"].get("symbol") != fence["symbol"]
+                or type(schedule) is not list or [row.get("slot_id") for row in schedule] != selected
+                or type(measurement) is not dict or measurement.get("refit_cycles") != len(selected)
+                or measurement.get("calendar_days") != 28 * len(selected)):
+            _fail(invalid)
+        if fence["schema_version"] == M5_ORDINARY_COMPLETION_FENCE_SCHEMA and (
+                account.get("source_kind") != "m5_derived" or account.get("result_kind") != "ORDINARY_SELECTED_PERIODS"
+                or account.get("design_contaminated") is not True or account.get("pristine_validation") is not False
+                or "development_scope" in account or "development_scope_sha256" in account):
             _fail(invalid)
     if development and (account.get("result_kind") != "DEVELOPMENT_PARTIAL"
             or account.get("source_kind") != ("broker_native" if native else "m5_derived")
@@ -2445,14 +2464,17 @@ def _retirement_native_completion_fence(body: dict, *, context_sha256: str, gene
 
     invalid = "RETIREMENT_NATIVE_COMPLETION_FENCE_INVALID"
     development = body.get("schema_version") == NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
+    selected_periods = body.get("schema_version") == NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA
     fields = {"schema_version", "workspace_owner_sha256", "binding", "completion",
         "selected_slots", "end_grid_rows"} | set(end_grid.AUTHORITY_FLAGS)
     if development:
         fields.update(("development_scope", "development_scope_sha256", "accepted_slot_ids"))
+    if selected_periods:
+        fields.update(("period_selection", "accepted_slot_ids", "symbol"))
     if "retained_account_result" in body:
         fields.add("retained_account_result")
     if (set(body) != fields
-            or body["schema_version"] not in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA)
+            or body["schema_version"] not in _NATIVE_COMPLETION_FENCE_SCHEMAS
             or body["workspace_owner_sha256"] != workspace_sha256
             or any(body[key] is not False for key in end_grid.AUTHORITY_FLAGS)):
         _fail(invalid)
@@ -2473,9 +2495,13 @@ def _retirement_native_completion_fence(body: dict, *, context_sha256: str, gene
         _fail(invalid)
     slots, references = body["selected_slots"], body["end_grid_rows"]
     if (type(slots) is not list or type(references) is not dict
-            or (not development and len(slots) != 13)
+            or (not development and not selected_periods and len(slots) != 13)
             or (development and not 1 <= len(slots) <= 3)):
         _fail(invalid)
+    if selected_periods:
+        selection = _retirement_ordinary_period_selection(body)
+        if [slot.get("slot_id") if type(slot) is dict else None for slot in slots] != selection["selected_slot_ids"]:
+            _fail(invalid)
     if development:
         import pm_historical_anchor_orchestration as orchestration
         accepted = body["accepted_slot_ids"]
@@ -2544,6 +2570,7 @@ def _retirement_native_completion_fence(body: dict, *, context_sha256: str, gene
         row = rows_by_start.get(slot["cycle_start_utc"])
         if (row is None or row.row_sha256 != references[slot["slot_id"]]["row_sha256"]
                 or row.schema_version != end_grid.END_GRID_SCHEMA_VERSION or row.source_kind != "broker_native"
+                or selected_periods and row.symbol != body["symbol"]
                 or row.outcome != slot["outcome"] or any(getattr(row, key) != slot[key] for key in time_keys)
                 or row.job_binding_sha256 is not None or row.consumer_binding_sha256 is not None
                 or row.view_contract_sha256 is None
@@ -2583,15 +2610,23 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
         return _retirement_terminal_refusal_fence(body, context_sha256=context_sha256,
             generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
             working_root=working_root)
-    if body.get("schema_version") in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA):
+    if body.get("schema_version") in _NATIVE_COMPLETION_FENCE_SCHEMAS:
         if digest != expected:
             _fail("RETIREMENT_NATIVE_COMPLETION_FENCE_INVALID")
         return _retirement_native_completion_fence(body, context_sha256=context_sha256,
             generation_id=generation_id, cell_id=cell_id, workspace_sha256=workspace_sha256,
             working_root=working_root, owner=owner, require_retained_account=require_retained_account,
             retained_account_result_out=retained_account_result_out)
+    ordinary_m5 = body.get("schema_version") == M5_ORDINARY_COMPLETION_FENCE_SCHEMA
+    if ordinary_m5:
+        selection = _retirement_ordinary_period_selection(body)
+        if (body.get("result_kind") != "ORDINARY_SELECTED_PERIODS"
+                or body.get("design_contaminated") is not True or body.get("pristine_validation") is not False
+                or "development_scope" in body or "development_scope_sha256" in body):
+            _fail("RETIREMENT_FINAL_SOURCE_FENCE_INVALID")
     summary = body.get("source_summary")
-    if (digest != expected or body.get("schema_version") != "fxpm.declared-m5-development-source-fence.v1"
+    if (digest != expected or body.get("schema_version") not in (
+            "fxpm.declared-m5-development-source-fence.v1", M5_ORDINARY_COMPLETION_FENCE_SCHEMA)
             or body.get("workspace_owner_sha256") != workspace_sha256
             or type(summary) is not dict or summary.get("owned_values_released") is not True
             or summary.get("release_eligible") is not True
@@ -2606,6 +2641,9 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
         _fail("RETIREMENT_FINAL_SOURCE_FENCE_INVALID")
     rows = body.get("end_grid_rows")
     if type(rows) is not dict or not rows:
+        _fail("RETIREMENT_GRID_READBACK_REQUIRED")
+    if ordinary_m5 and (set(rows) != set(selection["selected_slot_ids"])
+            or binding.get("terminal_result_key") in selection["selected_slot_ids"]):
         _fail("RETIREMENT_GRID_READBACK_REQUIRED")
     job_sha = hashlib.sha256(_canonical_json_bytes(binding, MAX_CONTEXT_BYTES)).hexdigest()
     retained = None
@@ -2625,7 +2663,8 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
             _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
         matched = [row for row in end_grid.read_end_grid(grid_path.parent, grid_path.stem)
             if row.row_sha256 == reference["row_sha256"]]
-        if len(matched) != 1 or matched[0].cell_id != cell_id or matched[0].job_binding_sha256 != job_sha:
+        if (len(matched) != 1 or matched[0].cell_id != cell_id or matched[0].job_binding_sha256 != job_sha
+                or ordinary_m5 and (matched[0].symbol != body["symbol"] or matched[0].source_kind != "m5_derived")):
             _fail("RETIREMENT_GRID_READBACK_REQUIRED")
         if not retained_checked:
             retained = _retirement_retained_account(body, binding=binding, grid_root=grid_root,
@@ -2647,6 +2686,11 @@ def _retirement_fence(path: Path, expected: str, *, context_sha256: str, generat
             _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
         if matched[0].view_contract_sha256 is not None:
             contract = end_grid.load_view_contract(grid_path.parent, matched[0].view_contract_sha256)
+            if ordinary_m5 and (contract.get("period_selection") != selection
+                    or contract.get("accepted_slot_ids") != body["accepted_slot_ids"]
+                    or contract.get("result_kind") != "ORDINARY_SELECTED_PERIODS"
+                    or "development_scope" in contract or "development_scope_sha256" in contract):
+                _fail("RETIREMENT_RETAINED_ACCOUNT_INVALID")
             if retained is not None:
                 identity = contract.get("actual_result_identity", {})
                 if (identity.get("account_artifact_sha256") != retained_reference["sha256"]
@@ -2747,7 +2791,7 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
             _fail("RETIREMENT_COMPLETION_INVALID")
     elif "result_kind" in receipt or "terminal_refusal" in receipt:
         _fail("RETIREMENT_COMPLETION_INVALID")
-    if fence["schema_version"] in (NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA):
+    if fence["schema_version"] in _NATIVE_COMPLETION_FENCE_SCHEMAS:
         expected_receipt = {"generation_id": marker["generation_id"], "cell_id": marker["cell_id"],
             "cell_contract_sha256": fence["binding"]["cell_contract_sha256"],
             "workspace_owner_sha256": marker["workspace_owner_sha256"], "intent_sha256": marker["intent_sha256"],
@@ -2757,8 +2801,13 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
         if fence["schema_version"] == NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA:
             expected_receipt.update({key: fence[key] for key in
                 ("development_scope", "development_scope_sha256", "accepted_slot_ids")})
+        if fence["schema_version"] == NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA:
+            expected_receipt.update({key: fence[key] for key in ("period_selection", "accepted_slot_ids", "symbol")})
         if any(receipt.get(key) != value for key, value in expected_receipt.items()):
             _fail("RETIREMENT_COMPLETION_INVALID")
+    if fence["schema_version"] == M5_ORDINARY_COMPLETION_FENCE_SCHEMA and any(
+            receipt.get(key) != fence[key] for key in ("period_selection", "accepted_slot_ids", "symbol")):
+        _fail("RETIREMENT_COMPLETION_INVALID")
     return {**receipt, "retirement_receipt_sha256": digest,
         "retirement_receipt_path": marker["retirement_receipt_path"]}
 
@@ -3376,8 +3425,7 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             arguments["retained_account_result"] = dict(retained_reference)
         terminal_refusal = fence.get("schema_version") == TERMINAL_REFUSAL_FENCE_SCHEMA
         post_source_abort = fence.get("schema_version") == POST_SOURCE_ABORT_FENCE_SCHEMA
-        native_completion = fence.get("schema_version") in (
-            NATIVE_COMPLETION_FENCE_SCHEMA, NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA)
+        native_completion = fence.get("schema_version") in _NATIVE_COMPLETION_FENCE_SCHEMAS
         if terminal_refusal and (unit_lock_paths or direct != frozenset({
                 f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
             _fail("RETIREMENT_REFUSAL_SOURCE_STATE_INVALID")
@@ -3466,6 +3514,8 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
         if fence["schema_version"] == NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA:
             receipt.update({key: fence[key] for key in
                 ("development_scope", "development_scope_sha256", "accepted_slot_ids")})
+        if fence["schema_version"] in (NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA, M5_ORDINARY_COMPLETION_FENCE_SCHEMA):
+            receipt.update({key: fence[key] for key in ("period_selection", "accepted_slot_ids", "symbol")})
         if terminal_refusal:
             receipt.update(result_kind=TERMINAL_REFUSAL_RESULT_KIND,
                 terminal_refusal=dict(fence["refusal"]))
@@ -3525,3 +3575,31 @@ __all__ = [
     "plan_segmented_retirement",
     "verify_segmented_retirement_inventory",
 ]
+
+
+def _retirement_ordinary_period_selection(body):
+    """Validate selected geometry metadata; this does not issue an owner or authority."""
+    import pm_historical_anchor_orchestration as orchestration
+
+    invalid = "RETIREMENT_ORDINARY_PERIOD_SELECTION_INVALID"
+    accepted = body.get("accepted_slot_ids")
+    selection = body.get("period_selection")
+    if (type(accepted) is not list or len(accepted) != 13
+            or any(type(value) is not str or not value for value in accepted) or len(set(accepted)) != 13
+            or type(body.get("symbol")) is not str or not body["symbol"]
+            or type(selection) is not dict or set(selection) != {"mode", "selected_slot_ids"}):
+        _fail(invalid)
+    for value in accepted:
+        _identity(value, "RETIREMENT_NATIVE_SLOT_ID")
+    try:
+        expected = orchestration.declared_ordinary_period_selection(
+            {"slots": [{"slot_id": value} for value in accepted]}, mode=selection["mode"],
+            final_study_13=selection["mode"] == "final_study_13", symbols=(body["symbol"],))
+    except orchestration.HistoricalAnchorOrchestrationError:
+        _fail(invalid)
+    if selection != expected:
+        _fail(invalid)
+    return expected
+
+
+__all__ += ["NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA", "M5_ORDINARY_COMPLETION_FENCE_SCHEMA"]

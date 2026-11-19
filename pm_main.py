@@ -12747,12 +12747,47 @@ def _declared_rnd_write_report(path: Path, body: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _declared_rnd_contract_bytes(contract):
+    return json.dumps(contract, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def _declared_rnd_effective_contract(contract, report, prior, *, fresh_contract):
+    """Compile once; a resumed launch consumes its saved effective contract."""
+    import pm_historical_scheduler as scheduler
+
+    source_sha = hashlib.sha256(_declared_rnd_contract_bytes(contract)).hexdigest()
+    effective_path = report.with_name(report.stem + ".effective-contract.json")
+    if prior is not None and "effective_contract" in prior:
+        reference = prior["effective_contract"]
+        if (type(reference) is not dict or set(reference) != {"path", "source_contract_sha256"}
+                or reference["path"] != str(effective_path)
+                or reference["source_contract_sha256"] != source_sha):
+            raise ValueError("DECLARED_RND_EFFECTIVE_CONTRACT_OWNER_CHANGED")
+        effective = _declared_rnd_read_json(effective_path)
+        digest = hashlib.sha256(_declared_rnd_contract_bytes(effective)).hexdigest()
+        if type(effective) is not dict or digest != prior.get("contract_sha256"):
+            raise ValueError("DECLARED_RND_EFFECTIVE_CONTRACT_CHANGED")
+        return effective, digest, reference
+    if not fresh_contract:
+        return contract, source_sha, None
+    if prior is not None:
+        raise ValueError("DECLARED_RND_LEGACY_REPORT_CANNOT_COMPILE_FRESH")
+    effective = scheduler.compile_fresh_declared_contract(contract)
+    effective_path.parent.mkdir(parents=True, exist_ok=True)
+    frozen = scheduler._declared_m5_external_record(effective_path, effective,
+        maximum_bytes=_DECLARED_RND_CONTRACT_MAX_BYTES)
+    return effective, frozen["sha256"], {
+        "path": str(effective_path), "source_contract_sha256": source_sha}
+
+
 def _run_declared_rnd_contract(
     contract_path: Any,
     report_path: Any,
     *,
     requested_workers: int = 0,
     _worker: Any = None,
+    fresh_contract: bool = False,
 ) -> int:
     """Own the report and telemetry for one dispatcher invocation."""
     from pm_storage import _exclusive_file_lock
@@ -12775,7 +12810,8 @@ def _run_declared_rnd_contract(
         # Ownership is checked inside it before either output can be changed.
         with _exclusive_file_lock(lock_path, timeout_seconds=0):
             return _run_declared_rnd_contract_locked(
-                contract_path, report, requested_workers=requested_workers, _worker=_worker)
+                contract_path, report, requested_workers=requested_workers, _worker=_worker,
+                fresh_contract=fresh_contract)
     except TimeoutError:
         print("Declared R&D report is busy: " + str(report))
         return 2
@@ -12790,6 +12826,7 @@ def _run_declared_rnd_contract_locked(
     *,
     requested_workers: int = 0,
     _worker: Any = None,
+    fresh_contract: bool = False,
 ) -> int:
     """Launch the existing historical cell dispatcher, with no trading authority.
 
@@ -12803,6 +12840,8 @@ def _run_declared_rnd_contract_locked(
     try:
         if type(requested_workers) is not int or requested_workers < 0:
             raise ValueError("DECLARED_RND_WORKERS_INVALID")
+        if type(fresh_contract) is not bool:
+            raise ValueError("DECLARED_RND_FRESH_CONTRACT_FLAG_INVALID")
         supplied_report = Path(report_path)
         if supplied_report.is_symlink():
             raise ValueError("DECLARED_RND_REPORT_SYMLINK_REFUSED")
@@ -12811,30 +12850,31 @@ def _run_declared_rnd_contract_locked(
         if report.suffix.lower() != ".json":
             raise ValueError("DECLARED_RND_REPORT_JSON_REQUIRED")
         telemetry = report.with_suffix(".telemetry.jsonl")
-        if source in (report, telemetry):
+        effective_path = report.with_name(report.stem + ".effective-contract.json")
+        if source in (report, telemetry) or (fresh_contract and source == effective_path):
             raise ValueError("DECLARED_RND_OUTPUT_INPUT_COLLISION")
         contract = _declared_rnd_read_json(source)
         if type(contract) is not dict:
             raise ValueError("DECLARED_RND_CONTRACT_NOT_OBJECT")
         active_config = contract.get("active_config_path")
-        if type(active_config) is str and Path(active_config).resolve() in (report, telemetry):
+        if type(active_config) is str and Path(active_config).resolve() in (
+                report, telemetry, *([effective_path] if fresh_contract else [])):
             raise ValueError("DECLARED_RND_OUTPUT_CONFIG_COLLISION")
-        contract_bytes = json.dumps(contract, sort_keys=True, separators=(",", ":"),
-                                    ensure_ascii=True, allow_nan=False).encode("ascii")
-        contract_sha = hashlib.sha256(contract_bytes).hexdigest()
         owned_report = report.exists()
-        if owned_report:
-            prior = _declared_rnd_read_json(report)
-            if (type(prior) is not dict
-                    or prior.get("schema_version") != _DECLARED_RND_REPORT_SCHEMA
-                    or prior.get("contract_sha256") != contract_sha
-                    or any(prior.get(name) is not False for name in authority)):
-                raise ValueError("DECLARED_RND_REPORT_DIFFERENT_OWNER")
+        prior = _declared_rnd_read_json(report) if owned_report else None
+        if owned_report and (type(prior) is not dict
+                or prior.get("schema_version") != _DECLARED_RND_REPORT_SCHEMA
+                or any(prior.get(name) is not False for name in authority)):
+            raise ValueError("DECLARED_RND_REPORT_DIFFERENT_OWNER")
         if telemetry.is_symlink():
             raise ValueError("DECLARED_RND_TELEMETRY_SYMLINK_REFUSED")
         if telemetry.exists() and (not owned_report or not telemetry.is_file()):
             raise ValueError("DECLARED_RND_TELEMETRY_DIFFERENT_OWNER")
-    except (OSError, ValueError, TypeError) as exc:
+        contract, contract_sha, effective_reference = _declared_rnd_effective_contract(
+            contract, report, prior, fresh_contract=fresh_contract)
+        if prior is not None and prior.get("contract_sha256") != contract_sha:
+            raise ValueError("DECLARED_RND_REPORT_DIFFERENT_OWNER")
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
         print("Refusing declared R&D input: " + str(exc))
         return 2
 
@@ -12849,6 +12889,7 @@ def _run_declared_rnd_contract_locked(
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "dispatch_report": None,
         "error_code": None,
+        **({"effective_contract": effective_reference} if effective_reference is not None else {}),
         **authority,
     }
     try:
@@ -12890,9 +12931,12 @@ def _declared_rnd_main(argv: Sequence[str]) -> int:
     parser.add_argument("--report", required=True, help="Latest dispatch report JSON")
     parser.add_argument("--workers", type=int, default=0,
                         help="Requested symbol workers (0 uses the existing resource policy)")
+    parser.add_argument("--fresh-contract", action="store_true",
+                        help="Compile a new ordinary contract; omitted period selection uses one period")
     args = parser.parse_args(list(argv))
+    extra = {"fresh_contract": True} if args.fresh_contract else {}
     return _run_declared_rnd_contract(args.contract, args.report,
-                                      requested_workers=args.workers)
+                                      requested_workers=args.workers, **extra)
 
 
 def main(

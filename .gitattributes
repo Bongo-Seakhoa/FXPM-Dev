@@ -1,6 +1,5 @@
 # Keep code-bound evidence and checkpoint identities stable across checkouts.
 *.py text eol=lf
-/pm_strategy_domain_v1.json -text
 /data/native/terms/spread_profile.json -text
 /pm_causal_evidence_producer.py -text
 /pm_historical_anchor_orchestration.py -text

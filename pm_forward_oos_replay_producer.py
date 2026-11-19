@@ -3562,8 +3562,10 @@ def _declared_account_verified_progress(context, *, precommit, process,
 
 
 def _declared_cell_measurement(parent):
-    slots = parent["slot_roster"]["slots"]
-    if type(slots) is not list or len(slots) != 13:
+    selected = "period_selection" in parent
+    slots = (historical.declared_slot_selected_slots(parent) if selected
+        else parent["slot_roster"]["slots"])
+    if type(slots) not in (list, tuple) or (len(slots) not in (1, 2, 13) if selected else len(slots) != 13):
         _fail("DECLARED_CELL_H364_GEOMETRY_INVALID")
     previous = None
     for ordinal, slot in enumerate(slots, 1):
@@ -3573,21 +3575,23 @@ def _declared_cell_measurement(parent):
                 or (previous is not None and start != previous)):
             _fail("DECLARED_CELL_H364_GEOMETRY_INVALID")
         previous = end
-    return {"calendar_days": 364, "refit_cycles": 13, "cycle_days": 28,
+    return {"calendar_days": 28 * len(slots), "refit_cycles": len(slots), "cycle_days": 28,
         "risk_per_trade_pct": 0.25, "terminal_policy": "MARK_OPEN",
         "start_utc": slots[0]["activation_utc"],
         "end_exclusive_utc": slots[-1]["end_exclusive_utc"]}
 
 
 def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline_config,
-        _verified_chain=None):
+        _verified_chain=None, _source_kind="broker_native"):
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
         _fail("DECLARED_CELL_ORIGINAL_CONFIG_REQUIRED")
     try:
         chain = _declared_account_verified_progress(context, precommit=precommit, process=process,
             frozen_pipeline_config=frozen_pipeline_config, _verified_chain=_verified_chain)
         parent = chain["parent"]
-        if historical.declared_slot_source_kind(parent) != "broker_native" or historical.declared_slot_development_scope(parent) is not None:
+        if (_source_kind not in ("broker_native", "m5_derived")
+                or historical.declared_slot_source_kind(parent) != _source_kind
+                or historical.declared_slot_development_scope(parent) is not None):
             _fail("DECLARED_NATIVE_ACCOUNT_SOURCE_KIND_REQUIRED")
         config = chain["config"]
         _declared_cell_measured_config(config)
@@ -3630,7 +3634,8 @@ def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline
             records.append({"owner": owner, "source_count_receipt": count})
         commits.append(commit)
     by_slot = {commit["slot_id"]: commit["completion"] for commit in commits}
-    for slot in parent["slot_roster"]["slots"]:
+    selected_slots = historical.declared_slot_selected_slots(parent)
+    for slot in selected_slots:
         completion = by_slot.get(slot["slot_id"])
         schedule.append({"slot_id": slot["slot_id"], "ordinal": slot["ordinal"],
             "start_utc": slot["activation_utc"], "end_exclusive_utc": slot["end_exclusive_utc"],
@@ -3638,7 +3643,7 @@ def _reopen_declared_cell_inputs(context, *, precommit, process, frozen_pipeline
             "owner_id": completion["owner"]["owner_id"]
                 if completion is not None and completion["status"] == "OWNER" else None})
     status = "STOP" if progress.terminal_stop else "INCOMPLETE" if (
-        progress.first_uncommitted_slot is not None or len(commits) != 13
+        progress.first_uncommitted_slot is not None or len(commits) != len(selected_slots)
         or any(row["status"] == "MISSING" for row in schedule)) else "COMPLETE"
     if status == "COMPLETE" and any(row["status"] not in ("OWNER", "NO_TRADE") for row in schedule):
         _fail("DECLARED_CELL_COMPLETED_SCHEDULE_INVALID")
@@ -4079,7 +4084,7 @@ def _declared_cell_body(context, *, precommit, process, frozen_pipeline_config, 
 
 
 def _read_declared_account_output_with_inputs(context, descriptor, *, process,
-        frozen_pipeline_config, precommit, inputs, development=False, _manifest_record=None):
+        frozen_pipeline_config, precommit, inputs, development=False, ordinary_m5=False, _manifest_record=None):
     """Retain the existing manifest/source/math checks without reopening this call's inputs."""
     body = causal_producer._read_descriptor_json(context, descriptor, code="DECLARED_CELL_RAW_ACCOUNT")
     schema = DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA if development else DECLARED_CELL_RAW_ACCOUNT_SCHEMA
@@ -4095,8 +4100,10 @@ def _read_declared_account_output_with_inputs(context, descriptor, *, process,
             _manifest_record=_manifest_record,
             _verified_artifact_descriptors={(descriptor["relative_path"], descriptor["sha256"],
                 descriptor["size_bytes"], descriptor["format"])})
-        if development:
-            verified = _verify_declared_m5_development_cell_account_transport_with_inputs(
+        if development or ordinary_m5:
+            verify = (_verify_declared_m5_development_cell_account_transport_with_inputs if development
+                else _verify_declared_m5_cell_account_transport_with_inputs)
+            verified = verify(
                 context, body, process=process, frozen_pipeline_config=frozen_pipeline_config,
                 _precommit=precommit, _inputs=inputs)
             unchanged = (causal_producer._canonical_bytes(verified, causal_producer._MAX_RAW_ARTIFACT_BYTES)
@@ -4320,6 +4327,9 @@ def _produce_declared_cell_account_from_inputs(context, *, precommit, process,
 
 
 def verify_declared_cell_account_transport(context, body, *, process, frozen_pipeline_config, reopen_source):
+    if type(body) is dict and body.get("source_kind") == "m5_derived":
+        return _verify_declared_m5_cell_account_transport_with_inputs(context, body, process=process,
+            frozen_pipeline_config=frozen_pipeline_config)
     return _verify_declared_cell_account_transport_with_inputs(context, body, process=process,
         frozen_pipeline_config=frozen_pipeline_config, reopen_source=reopen_source)
 
@@ -5297,13 +5307,14 @@ def _declared_development_cell_transport_symbol(body):
 
 
 
-def _discover_declared_development_cell_account_output(context, *, expected, process, frozen_pipeline_config,
+def _discover_declared_m5_cell_account_output(context, *, expected, process, frozen_pipeline_config,
         _precommit=None, _inputs=None, _verified_body_out=None):
     """Read only the canonical publication; unsealed content objects are not output."""
+    development = expected["schema_version"] == DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA
     try:
         root = authority_spool._validate_root(context.root, create=False)
         relative = authority_spool._manifest_relative_path(
-            _declared_development_cell_transport_symbol(expected), authority_spool.GENERAL_MANIFEST_DOMAIN)
+            _declared_m5_account_transport_symbol(expected), authority_spool.GENERAL_MANIFEST_DOMAIN)
         path = authority_spool._local_path(root, relative)
         authority_spool._reject_reparse_chain(path)
         try:
@@ -5333,9 +5344,9 @@ def _discover_declared_development_cell_account_output(context, *, expected, pro
         else:
             verified = _read_declared_account_output_with_inputs(context, descriptor,
                 process=process, frozen_pipeline_config=frozen_pipeline_config,
-                precommit=_precommit, inputs=_inputs, development=True,
+                precommit=_precommit, inputs=_inputs, development=development, ordinary_m5=not development,
                 _manifest_record=manifest_record)
-        for name in _DECLARED_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
+        for name in _declared_m5_account_fields(expected) - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
             if verified[name] != expected[name]:
                 _fail("DECLARED_CELL_EXISTING_OUTPUT_INVALID", "CALLER_BINDING", name)
         if _verified_body_out is not None:
@@ -5400,10 +5411,15 @@ def _declared_m5_account_consumers(inputs, *, precommit_sha256):
     """Build ordinary bindings only after the caller reopened the real selected prefix."""
     from pm_m5_job_view import AccountViewBinding, NoTradeAccountViewBinding
     parent = inputs["parent"]
-    measurement = _declared_development_cell_measurement(parent)
+    development = historical.declared_slot_development_scope(parent) is not None
+    complete = "DEVELOPMENT_COMPLETE" if development else "COMPLETE"
+    purpose = "DEVELOPMENT_PARTIAL_ACCOUNT" if development else "ORDINARY_SELECTED_PERIODS_ACCOUNT"
+    run_schema = ("fxpm.declared-development-cell-owner-run.v1" if development
+        else "fxpm.declared-cell-owner-run.v1")
+    measurement = _declared_m5_account_measurement(parent)
     slots = historical.declared_slot_selected_slots(parent)
     schedule = inputs["slot_schedule"]
-    if (inputs["progress_status"] != "DEVELOPMENT_COMPLETE" or type(schedule) is not list
+    if (inputs["progress_status"] != complete or type(schedule) is not list
             or len(schedule) != len(slots)
             or any(row.get("slot_id") != slot["slot_id"] or row.get("ordinal") != slot["ordinal"]
                    or row.get("status") not in ("OWNER", "NO_TRADE")
@@ -5413,7 +5429,7 @@ def _declared_m5_account_consumers(inputs, *, precommit_sha256):
     if type(run) is not dict:
         _fail("DECLARED_DEVELOPMENT_RUN_RECEIPT_REQUIRED")
     cell = parent["cells"][0]
-    if (run.get("schema_version") != "fxpm.declared-development-cell-owner-run.v1"
+    if (run.get("schema_version") != run_schema
             or run.get("precommit_sha256") != precommit_sha256 or run.get("cell_id") != cell["cell_id"]
             or type(run.get("declared_slots")) is not int or run["declared_slots"] != len(slots)
             or type(run.get("completed_slots")) is not int or run["completed_slots"] != len(slots)
@@ -5424,7 +5440,7 @@ def _declared_m5_account_consumers(inputs, *, precommit_sha256):
     if all(row["status"] == "NO_TRADE" for row in schedule):
         if inputs["owner_records"]:
             _fail("DECLARED_M5_ACCOUNT_OWNER_BINDING_INVALID")
-        return (NoTradeAccountViewBinding("DEVELOPMENT_PARTIAL_ACCOUNT",
+        return (NoTradeAccountViewBinding(purpose,
             measurement["end_exclusive_utc"], _sha(run), precommit_sha256),)
     owners = {record["owner"].get("slot_id"): record["owner"] for record in inputs["owner_records"]}
     expected_ids = {row["slot_id"] for row in schedule if row["status"] == "OWNER"}
@@ -5439,7 +5455,7 @@ def _declared_m5_account_consumers(inputs, *, precommit_sha256):
                 or owner.get("cell_id") != cell["cell_id"] or owner.get("owner_id") != row["owner_id"]):
             _fail("DECLARED_M5_ACCOUNT_OWNER_BINDING_INVALID")
         contract = _hex(owner.get("source_contract_sha256"), "DECLARED_M5_ACCOUNT_OWNER_BINDING_INVALID")
-        result.append(AccountViewBinding("DEVELOPMENT_PARTIAL_ACCOUNT", measurement["end_exclusive_utc"],
+        result.append(AccountViewBinding(purpose, measurement["end_exclusive_utc"],
             _sha(owner), contract))
     return tuple(result)
 
@@ -5461,7 +5477,7 @@ def _validate_declared_m5_account_owner(context, *, precommit, process, inputs, 
             or cost_edition.sha256 != parent["spread_profile_identity"]["profile_sha256"]
             or cost_edition.reopen_route()["cost_edition_identity"] != parent["m5_source_pins"]["cost_edition_identity"]):
         _fail("DECLARED_M5_ACCOUNT_SOURCE_BINDING_MISMATCH")
-    measurement = _declared_development_cell_measurement(parent)
+    measurement = _declared_m5_account_measurement(parent)
     product = owner.product_at(measurement["end_exclusive_utc"])
     product = native_prefix.reverify_activated_native_prefix_product(product, context, require_current_activation=True)
     if (product.source_state != native_prefix.AVAILABLE or product.index["timeframe"] != "M5"
@@ -5587,7 +5603,7 @@ def _declared_m5_account_frame_inputs(context, *, precommit, process, inputs, ow
     parent, config = inputs["parent"], inputs["config"]
     _validate_declared_m5_account_owner(context, precommit=precommit, process=process,
         inputs=inputs, owner=owner, cost_edition=cost_edition)
-    measurement = _declared_development_cell_measurement(parent)
+    measurement = _declared_m5_account_measurement(parent)
     consumers = _declared_m5_account_consumers(inputs, precommit_sha256=precommit.receipt_sha256)
     slot_sources = _declared_m5_account_slot_inputs(context, inputs=inputs, owner=owner, cost_edition=cost_edition)
     if type(account_view_id) is not str or not 1 <= len(account_view_id) <= 128:
@@ -5720,9 +5736,9 @@ def produce_declared_m5_development_cell_account_artifact(context, *, precommit,
         m5_owner=m5_owner, account_view_id=account_view_id, cost_edition=cost_edition)
 
 
-def _produce_declared_m5_development_cell_account_from_inputs(context, *, precommit, process,
+def _produce_declared_m5_cell_account_from_inputs(context, *, precommit, process,
         frozen_pipeline_config, inputs, body, m5_owner=None, account_view_id=None, cost_edition=None):
-    if inputs["progress_status"] == "DEVELOPMENT_COMPLETE":
+    if inputs["progress_status"] == _declared_m5_complete_status(inputs["parent"]):
         material = _declared_m5_account_frame_inputs(context, precommit=precommit, process=process,
             inputs=inputs, owner=m5_owner, account_view_id=account_view_id, cost_edition=cost_edition)
         try:
@@ -5745,7 +5761,7 @@ def _produce_declared_m5_development_cell_account_from_inputs(context, *, precom
         finally:
             _release_declared_m5_account_leases(material["leases"])
     _canonical_bytes(body, _DECLARED_CELL_MAX_RAW_BYTES)
-    sink = authority_spool.open_symbol_sink(context, _declared_development_cell_transport_symbol(body),
+    sink = authority_spool.open_symbol_sink(context, _declared_m5_account_transport_symbol(body),
         manifest_domain=authority_spool.GENERAL_MANIFEST_DOMAIN)
     entry = sink.put_json("declared-cell-account", "declared_cell_raw_account", body)
     sink.seal()
@@ -5760,28 +5776,33 @@ def verify_declared_m5_development_cell_account_transport(context, body, *, proc
         m5_owner=m5_owner, cost_edition=cost_edition)
 
 
-def _verify_declared_m5_development_cell_account_transport_with_inputs(context, body, *, process,
+def _verify_declared_m5_cell_account_transport_with_inputs(context, body, *, process,
         frozen_pipeline_config, m5_owner=None, cost_edition=None, _precommit=None, _inputs=None):
-    if (type(body) is not dict or set(body) != _DECLARED_DEVELOPMENT_CELL_FIELDS
-            or body.get("schema_version") != DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA
-            or body.get("source_kind") != "m5_derived" or body.get("result_kind") != "DEVELOPMENT_PARTIAL"
+    development = type(body) is dict and body.get("schema_version") == DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA
+    fields = _DECLARED_DEVELOPMENT_CELL_FIELDS if development else _DECLARED_ORDINARY_M5_CELL_FIELDS
+    schema = DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA if development else DECLARED_CELL_RAW_ACCOUNT_SCHEMA
+    if (type(body) is not dict or set(body) != fields or body.get("schema_version") != schema
+            or body.get("source_kind") != "m5_derived"
+            or body.get("result_kind") != ("DEVELOPMENT_PARTIAL" if development else "ORDINARY_SELECTED_PERIODS")
             or body.get("design_contaminated") is not True or body.get("pristine_validation") is not False
             or any(body.get(key) is not False for key in
                    ("qualification_authority", "capital_authority", "live_authority", "order_authority"))):
-        _fail("DECLARED_DEVELOPMENT_ACCOUNT_FIELDS_INVALID")
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_FIELDS_INVALID" if development else "DECLARED_M5_ACCOUNT_FIELDS_INVALID")
     if _inputs is None:
         precommit = historical.reopen_declared_slot_owner_run_precommit(context,
             receipt_sha256=body["declared_precommit_sha256"], process=process, frozen_pipeline_config=frozen_pipeline_config)
-        inputs = _reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
-            frozen_pipeline_config=frozen_pipeline_config)
+        inputs = (_reopen_declared_development_cell_inputs(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config) if development else
+            _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
+                frozen_pipeline_config=frozen_pipeline_config, _source_kind="m5_derived"))
     else:
         precommit, inputs = _precommit, _inputs
-    expected = _declared_development_cell_body(context, precommit=precommit, process=process,
+    expected = _declared_m5_cell_body(context, precommit=precommit, process=process,
         frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
-    for name in _DECLARED_DEVELOPMENT_CELL_FIELDS - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
+    for name in fields - set(_DECLARED_DEVELOPMENT_MARKET_FIELDS) - {"account"}:
         if _canonical_bytes(body[name]) != _canonical_bytes(expected[name]):
             _fail("DECLARED_CELL_TRANSPORT_BINDING_MISMATCH", name)
-    if inputs["progress_status"] != "DEVELOPMENT_COMPLETE":
+    if inputs["progress_status"] != _declared_m5_complete_status(inputs["parent"]):
         if body["account"] is not None or any(body[name] is not None for name in _DECLARED_DEVELOPMENT_MARKET_FIELDS):
             _fail("DECLARED_CELL_INCOMPLETE_ACCOUNT_FORBIDDEN")
         return body
@@ -6279,3 +6300,116 @@ def _verify_declared_account_output_manifest(context, body, *, symbol, artifact_
     except (authority_spool.AuthoritySpoolError, OSError, KeyError, TypeError, ValueError) as exc:
         raise ForwardOOSReplayProductionError(invalid_code,
             (type(exc).__name__, getattr(exc, "code", ""))) from exc
+
+
+# Ordinary M5 accounts share source and numerical machinery, not development classification.
+_DECLARED_ORDINARY_M5_CELL_FIELDS = _DECLARED_CELL_FIELDS | frozenset({
+    "source_kind", "result_kind", "design_contaminated", "pristine_validation",
+    "saved_cell_run_receipt_sha256", "m5_source_context", "m5_account_consumer_bindings",
+    "m5_account_view_window", "m5_selected_tier_views", "terminal_consumer_binding_sha256",
+})
+
+
+def _declared_m5_complete_status(parent):
+    return "DEVELOPMENT_COMPLETE" if historical.declared_slot_development_scope(parent) is not None else "COMPLETE"
+
+
+def _declared_m5_account_measurement(parent):
+    return (_declared_development_cell_measurement(parent)
+        if historical.declared_slot_development_scope(parent) is not None
+        else _declared_cell_measurement(parent))
+
+
+def _declared_m5_account_fields(body):
+    return (_DECLARED_DEVELOPMENT_CELL_FIELDS
+        if body["schema_version"] == DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA
+        else _DECLARED_ORDINARY_M5_CELL_FIELDS)
+
+
+def _declared_m5_account_transport_symbol(body):
+    return (_declared_development_cell_transport_symbol(body)
+        if body["schema_version"] == DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA
+        else _declared_cell_transport_symbol(body))
+
+
+def _declared_m5_cell_body(context, *, precommit, process, frozen_pipeline_config, inputs):
+    if historical.declared_slot_development_scope(inputs["parent"]) is not None:
+        return _declared_development_cell_body(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    body = _declared_cell_body(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    body.update({name: None for name in _DECLARED_DEVELOPMENT_MARKET_FIELDS})
+    body.update(source_kind="m5_derived", result_kind="ORDINARY_SELECTED_PERIODS",
+        design_contaminated=True, pristine_validation=False,
+        saved_cell_run_receipt_sha256=(None if inputs["progress"].run_receipt is None
+                                      else _sha(inputs["progress"].run_receipt)))
+    return body
+
+
+def _prepare_declared_m5_cell_account_artifact(context, *, precommit, process,
+        frozen_pipeline_config, _verified_chain=None):
+    inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, _verified_chain=_verified_chain,
+        _source_kind="m5_derived")
+    expected = _declared_m5_cell_body(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs)
+    existing = _discover_declared_m5_cell_account_output(context, expected=expected, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, _precommit=precommit, _inputs=inputs,
+        _verified_body_out=expected)
+    return existing, inputs, expected
+
+
+def _declared_m5_cell_account_request_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs):
+    if inputs is None:
+        inputs = _reopen_declared_cell_inputs(context, precommit=precommit, process=process,
+            frozen_pipeline_config=frozen_pipeline_config, _source_kind="m5_derived")
+    parent = inputs["parent"]
+    measurement = _declared_cell_measurement(parent)
+    return {"schema_version": "fxpm.declared-m5-account-request.v1", "source_kind": "m5_derived",
+        "cell": parent["cells"][0], "measurement": measurement,
+        "cutoff_utc": measurement["end_exclusive_utc"],
+        "m5_view_contract_sha256": parent["m5_view_contract_sha256"],
+        "profile_sha256": parent["spread_profile_identity"]["profile_sha256"],
+        "qualification_authority": False, "capital_authority": False,
+        "live_authority": False, "order_authority": False}
+
+
+def _discover_declared_development_cell_account_output(context, *, expected, process,
+        frozen_pipeline_config, _precommit=None, _inputs=None, _verified_body_out=None):
+    if expected["schema_version"] != DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA:
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_SCOPE_REQUIRED")
+    return _discover_declared_m5_cell_account_output(context, expected=expected, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, _precommit=_precommit, _inputs=_inputs,
+        _verified_body_out=_verified_body_out)
+
+
+def _produce_declared_m5_development_cell_account_from_inputs(context, *, precommit, process,
+        frozen_pipeline_config, inputs, body, m5_owner=None, account_view_id=None, cost_edition=None):
+    if historical.declared_slot_development_scope(inputs["parent"]) is None:
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_SCOPE_REQUIRED")
+    return _produce_declared_m5_cell_account_from_inputs(context, precommit=precommit, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, inputs=inputs, body=body,
+        m5_owner=m5_owner, account_view_id=account_view_id, cost_edition=cost_edition)
+
+
+def _verify_declared_m5_development_cell_account_transport_with_inputs(context, body, *, process,
+        frozen_pipeline_config, m5_owner=None, cost_edition=None, _precommit=None, _inputs=None):
+    if type(body) is not dict or body.get("schema_version") != DECLARED_DEVELOPMENT_CELL_RAW_ACCOUNT_SCHEMA:
+        _fail("DECLARED_DEVELOPMENT_ACCOUNT_FIELDS_INVALID")
+    return _verify_declared_m5_cell_account_transport_with_inputs(context, body, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, m5_owner=m5_owner, cost_edition=cost_edition,
+        _precommit=_precommit, _inputs=_inputs)
+
+
+def verify_declared_m5_cell_account_transport(context, body, *, process, frozen_pipeline_config,
+        m5_owner=None, cost_edition=None):
+    """Cold ordinary M5 verification; caller-owned publication reuse stays separate."""
+    if (type(body) is not dict or body.get("schema_version") != DECLARED_CELL_RAW_ACCOUNT_SCHEMA
+            or body.get("source_kind") != "m5_derived"):
+        _fail("DECLARED_M5_ACCOUNT_FIELDS_INVALID")
+    return _verify_declared_m5_cell_account_transport_with_inputs(context, body, process=process,
+        frozen_pipeline_config=frozen_pipeline_config, m5_owner=m5_owner, cost_edition=cost_edition)
+
+
+__all__ += ["verify_declared_m5_cell_account_transport"]

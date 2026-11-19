@@ -255,6 +255,25 @@ def load_effective_pipeline_config(
     return payload, _derive_pipeline_config(payload, path)
 
 
+def _effective_snapshot_bytes(snapshot: Mapping[str, Any]) -> bytes:
+    return _canonical_bytes(
+        {"schema_version": BINDING_SCHEMA, "pipeline_config": snapshot},
+        maximum=MAX_SNAPSHOT_BYTES,
+    )
+
+
+def resolve_effective_pipeline_config_identity(
+    active_config_path: Path,
+) -> tuple[dict[str, Any], PipelineConfig, dict[str, str]]:
+    """Resolve config identities without issuing a generation or source window."""
+    payload, config = load_effective_pipeline_config(active_config_path)
+    snapshot_json = _effective_snapshot_bytes(_snapshot(config))
+    return payload, config, {
+        "config_sha256": cap.canonical_json_sha256(payload),
+        "effective_config_sha256": hashlib.sha256(snapshot_json).hexdigest(),
+    }
+
+
 def _verify_context(
     context: authority_spool.GenerationSpoolContext,
     config_sha256: str,
@@ -380,13 +399,7 @@ def freeze_production_pipeline_config(
         )
         _fail("EFFECTIVE_PIPELINE_CONFIG_MISMATCH", *changed[:16])
     payload_json = _canonical_bytes(observed, maximum=MAX_CONFIG_BYTES)
-    snapshot_json = _canonical_bytes(
-        {
-            "schema_version": BINDING_SCHEMA,
-            "pipeline_config": expected_snapshot,
-        },
-        maximum=MAX_SNAPSHOT_BYTES,
-    )
+    snapshot_json = _effective_snapshot_bytes(expected_snapshot)
     result = FrozenProductionPipelineConfig(
         active_config_path=path,
         config_sha256=config_sha256,
@@ -406,4 +419,5 @@ __all__ = [
     "ProductionConfigBindingError",
     "freeze_production_pipeline_config",
     "load_effective_pipeline_config",
+    "resolve_effective_pipeline_config_identity",
 ]

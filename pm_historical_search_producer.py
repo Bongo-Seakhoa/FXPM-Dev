@@ -2944,6 +2944,15 @@ def _declared_run_body(context, *, precommit, cell_id, summaries, declared_slots
         body["terminal_failure"] = terminal_failure
     parent = precommit.to_dict()
     scope = historical.declared_slot_development_scope(parent)
+    selection = historical.declared_slot_period_selection(parent)
+    if selection is not None:
+        selected = historical.declared_slot_selected_slots(parent)
+        expected_ids = [slot["slot_id"] for slot in selected]
+        if (declared_slots != len(selected) or len(summaries) > len(selected)
+                or [item["slot_id"] for item in summaries] != expected_ids[:len(summaries)]
+                or (not terminal_stop and terminal_failure is None and len(summaries) != len(selected))):
+            _fail("DECLARED_ORDINARY_COMPLETION_PREFIX_INVALID")
+        body["period_selection"] = selection
     if scope is not None:
         selected = historical.declared_slot_selected_slots(parent)
         expected_ids = [slot["slot_id"] for slot in selected]
@@ -3105,8 +3114,9 @@ def _commit_declared_slot_completion(context, *, precommit, process, cell_id, sl
                                       _verified_commits=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     search_planner._require_current_process(process)
-    if historical.declared_slot_development_scope(parent) is not None and slot not in historical.declared_slot_selected_slots(parent):
-        _fail("DECLARED_DEVELOPMENT_PREFIX_INVALID")
+    if slot not in historical.declared_slot_selected_slots(parent):
+        _fail("DECLARED_DEVELOPMENT_PREFIX_INVALID" if historical.declared_slot_development_scope(parent) is not None
+            else "DECLARED_ORDINARY_PREFIX_INVALID")
     # Independently reopen the COMPLETE result before publishing an immutable
     # completion marker. The marker, not process memory, commits the slot.
     try:

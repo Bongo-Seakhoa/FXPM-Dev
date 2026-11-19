@@ -151,6 +151,121 @@ def _declared_digest(value: Any) -> bool:
     return type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
 
 
+def _declared_ordinary_row_selection(row):
+    import pm_historical_anchor_orchestration as orchestration
+
+    if "period_selection" not in row:
+        return None
+    selected = row["period_selection"]
+    counts = orchestration.DECLARED_ORDINARY_PERIOD_SELECTION_COUNTS
+    if (type(selected) is not dict or set(selected) != {"mode", "selected_slot_ids"}
+            or type(selected.get("mode")) is not str or selected["mode"] not in counts
+            or type(selected.get("selected_slot_ids")) is not list
+            or len(selected["selected_slot_ids"]) != counts[selected["mode"]]
+            or any(type(value) is not str or not value for value in selected["selected_slot_ids"])
+            or len(set(selected["selected_slot_ids"])) != len(selected["selected_slot_ids"])
+            or not _declared_digest(row.get("slot_roster_sha256"))
+            or "development" in row or "m5_development" in row
+            or (row.get("final_study_13") is True) != (selected["mode"] == "final_study_13")):
+        _fail("DECLARED_ORDINARY_PERIOD_SELECTION_INVALID")
+    symbol = row.get("cell", {}).get("symbol") if type(row.get("cell")) is dict else None
+    if selected["mode"] != "final_study_13" and symbol not in orchestration.DECLARED_DEVELOPMENT_SYMBOLS:
+        _fail("DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED")
+    return selected
+
+
+def _declared_resolved_ordinary_roster(row, config_identity_refs):
+    import hashlib
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_production_anchor_plan as anchors
+
+    roster = anchors.derive_declared_owner_slot_roster_v2(
+        launch_activation_utc=row["launch_activation_utc"],
+        frozen_refit_clock=row["frozen_refit_clock"],
+        config_identity_refs=config_identity_refs,
+        extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
+        protected_end_exclusive_utc=row["protected_end_exclusive_utc"],
+    )
+    selected = _declared_ordinary_row_selection(row)
+    if selected is not None:
+        actual = orchestration.declared_ordinary_period_selection(roster, mode=selected["mode"],
+            final_study_13=row.get("final_study_13", False), symbols=(row["cell"]["symbol"],))
+        if (selected != actual or row["slot_roster_sha256"]
+                != hashlib.sha256(orchestration._declared_json(roster)).hexdigest()):
+            _fail("DECLARED_ORDINARY_ROSTER_BINDING_CHANGED")
+    return roster
+
+
+def compile_fresh_declared_contract(contract):
+    """Resolve a new ordinary contract without issuing a process or source window."""
+    from pathlib import Path
+    import hashlib
+    import pm_authority_spool as spool
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_production_anchor_plan as anchors
+    import pm_production_config_binding as binding
+
+    owned = _declared_json_copy(contract)
+    if (type(owned) is not dict or owned.get("schema_version") != DECLARED_SCHEDULER_SCHEMA
+            or type(owned.get("active_config_path")) is not str or not owned["active_config_path"]
+            or not all(_declared_digest(owned.get(name)) for name in (
+                "native_universe_sha256", "config_sha256", "profile_sha256"))
+            or type(owned.get("cells")) is not list or not owned["cells"]):
+        _fail("DECLARED_FRESH_ORDINARY_CONTRACT_REQUIRED")
+    owned["active_config_path"] = str(Path(owned["active_config_path"]).resolve())
+    _, _, refs = binding.resolve_effective_pipeline_config_identity(Path(owned["active_config_path"]))
+    if refs["config_sha256"] != owned.get("config_sha256"):
+        _fail("DECLARED_FRESH_CONFIG_IDENTITY_CHANGED")
+    for row in owned["cells"]:
+        if (type(row) is not dict or "development" in row or "m5_development" in row
+                or type(row.get("root")) is not str or not row["root"]
+                or type(row.get("cell")) is not dict
+                or type(row["cell"].get("symbol")) is not str or not row["cell"]["symbol"]
+                or not {"root", "cell", "launch_activation_utc", "frozen_refit_clock",
+                    "extend_frozen_clock_backward", "protected_end_exclusive_utc"} <= set(row)):
+            _fail("DECLARED_FRESH_ORDINARY_CELL_REQUIRED")
+        root = Path(row["root"])
+        if any((root / name).exists() for name in (
+                spool.CONTEXT_RELATIVE_PATH, spool.WORKSPACE_OWNER_RELATIVE_PATH,
+                spool.RETIREMENT_RELATIVE_PATH, "declared-slots")):
+            _fail("DECLARED_FRESH_CONTRACT_SAVED_WORKSPACE_REFUSED")
+        requested = row.get("period_selection")
+        if requested is None:
+            mode = None
+        else:
+            if (type(requested) is not dict or not {"mode"} <= set(requested)
+                    or not set(requested) <= {"mode", "selected_slot_ids"}):
+                _fail("DECLARED_ORDINARY_PERIOD_SELECTION_INVALID")
+            mode = requested["mode"]
+        roster = anchors.derive_declared_owner_slot_roster_v2(
+            launch_activation_utc=row["launch_activation_utc"],
+            frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs=refs,
+            extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
+            protected_end_exclusive_utc=row["protected_end_exclusive_utc"],
+        )
+        selection = orchestration.declared_ordinary_period_selection(roster, mode=mode,
+            final_study_13=row.get("final_study_13", False), symbols=(row["cell"]["symbol"],))
+        digest = hashlib.sha256(orchestration._declared_json(roster)).hexdigest()
+        if (requested is not None and "selected_slot_ids" in requested
+                and requested["selected_slot_ids"] != selection["selected_slot_ids"]):
+            _fail("DECLARED_ORDINARY_ROSTER_BINDING_CHANGED")
+        if "slot_roster_sha256" in row and row["slot_roster_sha256"] != digest:
+            _fail("DECLARED_ORDINARY_ROSTER_BINDING_CHANGED")
+        row["period_selection"] = selection
+        row["slot_roster_sha256"] = digest
+        if selection["mode"] == "final_study_13":
+            row["final_study_13"] = True
+        if "m5_source" in row:
+            metadata = row["m5_source"]
+            if type(metadata) is not dict:
+                _fail("DECLARED_ORDINARY_M5_METADATA_INVALID")
+            if metadata.get("selected_slot_ids", selection["selected_slot_ids"]) != selection["selected_slot_ids"]:
+                _fail("DECLARED_ORDINARY_M5_SELECTION_MISMATCH")
+            metadata["selected_slot_ids"] = list(selection["selected_slot_ids"])
+    checked, _ = _declared_contract(owned)
+    return checked
+
+
 def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     from pathlib import Path
     if type(contract) is not dict:
@@ -178,6 +293,14 @@ def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dic
                 or type(row.get("protected_end_exclusive_utc")) is not str
                 or type(row.get("extend_frozen_clock_backward")) is not bool):
             _fail("DECLARED_SCHEDULER_CELL_DESCRIPTOR_INVALID", index)
+        if owned.get("schema_version") == DECLARED_SCHEDULER_SCHEMA:
+            selection = _declared_ordinary_row_selection(row)
+            if "m5_source" in row:
+                if selection is None or "native_finalization" in row or "slot_parallel_workers" in row:
+                    _fail("DECLARED_ORDINARY_M5_METADATA_INVALID")
+                _declared_ordinary_m5_metadata(owned, row)
+        if "slot_parallel_workers" in row and row.get("period_selection", {}).get("mode", "final_study_13") != "final_study_13":
+            _fail("DECLARED_SLOT_PARALLEL_FULL_ROSTER_REQUIRED")
         policy = row.get("source_access_window_policy")
         if (type(policy) is not dict or set(policy) != {"lead_seconds", "validity_seconds"}
                 or type(policy["lead_seconds"]) is not int or policy["lead_seconds"] < 0
@@ -497,6 +620,24 @@ def _declared_native_cell_contract_sha256(contract, row, limits):
         "cell": {key: value for key, value in row.items() if key != "descriptor_index"}})
 
 
+def _declared_native_fence_schema(row, *, development=False):
+    import pm_authority_spool as spool
+
+    if development:
+        return spool.NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
+    selection = _declared_ordinary_row_selection(row)
+    return (spool.NATIVE_SELECTED_PERIOD_COMPLETION_FENCE_SCHEMA
+        if selection is not None and selection["mode"] != "final_study_13"
+        else spool.NATIVE_COMPLETION_FENCE_SCHEMA)
+
+
+def _declared_m5_result_scope(*, ordinary):
+    scope = dict(_DECLARED_M5_SCOPE)
+    if ordinary:
+        scope["result_kind"] = "ORDINARY_SELECTED_PERIODS"
+    return scope
+
+
 def _declared_native_spool_limits(row):
     import pm_authority_spool as spool
 
@@ -569,7 +710,10 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
     development = scope is not None
     expected_run_schema = (producer.DECLARED_DEVELOPMENT_CELL_RUN_SCHEMA if development else producer.DECLARED_CELL_RUN_SCHEMA)
     cell_id, symbol = row["cell"]["cell_id"], row["cell"]["symbol"]
-    if ((not 1 <= len(slots) <= 3 if development else len(slots) != 13) or type(run_body) is not dict
+    ordinary_selection = orchestration.declared_slot_period_selection(parent)
+    if ((not 1 <= len(slots) <= 3 if development else
+            len(slots) != (13 if ordinary_selection is None else len(ordinary_selection["selected_slot_ids"])))
+            or type(run_body) is not dict
             or run_body.get("schema_version") != expected_run_schema
             or run_body.get("terminal_stop") is not False or "terminal_failure" in run_body
             or run_body.get("completed_slots") != len(slots) or run_body.get("declared_slots") != len(slots)
@@ -589,6 +733,8 @@ def _declared_native_completed_records(context, *, row, precommit, process, arti
         if (len(encoded) != artifact.descriptor["size_bytes"]
                 or hashlib.sha256(encoded).hexdigest() != artifact.descriptor["sha256"]):
             _fail("DECLARED_NATIVE_FINALIZATION_ACCOUNT_BINDING_INVALID")
+    if ordinary_selection is not None and run_body.get("period_selection") != ordinary_selection:
+        _fail("DECLARED_ORDINARY_PERIOD_SELECTION_CHANGED")
     if development:
         import pm_forward_oos_replay_producer as forward
         if _verified_account_body is None:
@@ -957,8 +1103,8 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
             for slot, record in zip(slots, planned, strict=True)}
         import pm_historical_anchor_orchestration as orchestration
         development_scope = orchestration.declared_slot_development_scope(parent)
-        fence_body = {"schema_version": (spool.NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
-                if development_scope is not None else spool.NATIVE_COMPLETION_FENCE_SCHEMA),
+        fence_body = {"schema_version": _declared_native_fence_schema(row,
+                development=development_scope is not None),
             "workspace_owner_sha256": workspace_sha,
             "binding": {"generation_context_sha256": context.context_sha256, "run_id": row["run_id"],
                 "cell_id": row["cell"]["cell_id"], "cell_contract_sha256": cell_contract_sha256,
@@ -971,6 +1117,9 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
         if development_scope is not None:
             fence_body.update(development_scope=development_scope,
                 development_scope_sha256=parent["development_scope_sha256"],
+                accepted_slot_ids=[slot["slot_id"] for slot in parent["slot_roster"]["slots"]])
+        elif (selection := orchestration.declared_slot_period_selection(parent)) is not None and len(slots) < 13:
+            fence_body.update(period_selection=selection, symbol=row["cell"]["symbol"],
                 accepted_slot_ids=[slot["slot_id"] for slot in parent["slot_roster"]["slots"]])
         fence_maximum = 4 * 1024**2
         fence_body = _declared_retained_completion_fence(fence_path, fence_body, maximum_bytes=fence_maximum)
@@ -1070,8 +1219,7 @@ def _declared_run_one_cell(
             limits = _declared_native_spool_limits(row)
             digest = _declared_native_cell_contract_sha256(contract, row, limits)
             archived = spool.read_generation_retirement(context_root,
-                expected_completed_fence_schema=(spool.NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
-                    if development else spool.NATIVE_COMPLETION_FENCE_SCHEMA))
+                expected_completed_fence_schema=_declared_native_fence_schema(row, development=development))
             if archived is not None:
                 if archived["status"] != "ARCHIVED_RECORD_ONLY":
                     result.update(status="NOT_RUN", reason_code="RETIREMENT_INCOMPLETE")
@@ -1126,13 +1274,17 @@ def _declared_run_one_cell(
                 precommit = orchestration.reopen_declared_slot_owner_run_precommit(context,
                     receipt_sha256=records[0].parent.name, process=process, frozen_pipeline_config=frozen)
             else:
-                if not development and row.get("final_study_13") is not True:
+                ordinary_selection = None if development else _declared_ordinary_row_selection(row)
+                if not development and ordinary_selection is None and row.get("final_study_13") is not True:
                     _fail("DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED")
                 process = _declared_initial_process(context, row, development=development)
-                roster = anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
-                    frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs={"config_sha256":context.config_sha256,
-                        "effective_config_sha256":frozen.effective_config_sha256},
-                    extend_frozen_clock_backward=row["extend_frozen_clock_backward"], protected_end_exclusive_utc=row["protected_end_exclusive_utc"])
+                refs = {"config_sha256": context.config_sha256,
+                    "effective_config_sha256": frozen.effective_config_sha256}
+                roster = (anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
+                    frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs=refs,
+                    extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
+                    protected_end_exclusive_utc=row["protected_end_exclusive_utc"]) if development
+                    else _declared_resolved_ordinary_roster(row, refs))
                 if slot_dispatch is not None and len(roster["slots"]) != 13:
                     _fail("DECLARED_SLOT_PARALLEL_FULL_ROSTER_REQUIRED")
                 profile = spread.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
@@ -1145,12 +1297,19 @@ def _declared_run_one_cell(
                 issuer = (orchestration.precommit_declared_development_native_slot_owner_run if development
                     else orchestration.precommit_declared_slot_owner_run_v2)
                 prefix = ({"development_slot_ids": row["development"]["selected_slot_ids"]} if development
-                    else {"final_study_13": True})
+                    else {"final_study_13": ordinary_selection is None or ordinary_selection["mode"] == "final_study_13",
+                        **({"period_selection": ordinary_selection} if ordinary_selection is not None else {})})
                 precommit = issuer(context, run_id=row["run_id"], process=process, slot_roster=roster,
                     cell_roster=[row["cell"]], frozen_pipeline_config=frozen,
                     spread_profile_identity={"profile_sha256":profile.sha256}, source_access_window_utc=window,
                     launch_activation_utc=row["launch_activation_utc"], **prefix)
             parent = precommit.to_dict()
+            if not development:
+                ordinary_selection = _declared_ordinary_row_selection(row)
+                if orchestration.declared_slot_period_selection(parent) != ordinary_selection:
+                    _fail("DECLARED_ORDINARY_PERIOD_SELECTION_CHANGED")
+                if ordinary_selection is not None and parent["slot_roster_sha256"] != row["slot_roster_sha256"]:
+                    _fail("DECLARED_ORDINARY_ROSTER_BINDING_CHANGED")
             expected_schema = (orchestration.DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA if development
                 else orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2)
             if (parent.get("schema_version") != expected_schema
@@ -1214,8 +1373,7 @@ def _declared_run_one_cell(
                     return result
             # Any unfinished work, including account production after all slots,
             # needs the existing effective access window and native snapshot.
-            access_slot = progress.first_uncommitted_slot or (orchestration.declared_slot_selected_slots(parent)[-1]
-                if development else parent["slot_roster"]["slots"][-1])
+            access_slot = progress.first_uncommitted_slot or orchestration.declared_slot_selected_slots(parent)[-1]
             window, _ = orchestration._declared_slot_effective_access(context, precommit, parent, access_slot)
             now = _declared_utc_now()
             if not datetime.fromisoformat(window["start_utc"].replace("Z", "+00:00")) <= now < datetime.fromisoformat(window["end_exclusive_utc"].replace("Z", "+00:00")):
@@ -1299,7 +1457,8 @@ def declared_symbol_worker(contract: Mapping[str, Any], symbol: str) -> dict[str
         try:
             row = (_declared_m5_run_one_cell(contract, cell)
                 if (contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
-                    or contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA and "m5_development" in cell)
+                    or contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA and "m5_development" in cell
+                    or contract.get("schema_version") == DECLARED_SCHEDULER_SCHEMA and "m5_source" in cell)
                 else _declared_run_one_cell(contract, cell))
         except Exception as exc:
             import pm_authority_spool as spool
@@ -1346,7 +1505,7 @@ def _declared_validate_result(value: Any, cells: Sequence[Mapping[str, Any]], sy
             _fail("DECLARED_SCHEDULER_CELL_PRECOMMIT_INVALID")
         if row["status"] == "ARCHIVED":
             archive = row.get("archive_record")
-            source_kind = ("m5_derived" if "m5_development" in expected else
+            source_kind = ("m5_derived" if "m5_development" in expected or "m5_source" in expected else
                 "broker_native" if "native_finalization" in expected else None)
             if (source_kind is None or row.get("source_kind") != source_kind
                     or row.get("descriptor_assurance") != "IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE"
@@ -1373,9 +1532,11 @@ def _declared_validate_result(value: Any, cells: Sequence[Mapping[str, Any]], sy
         if row["status"] in {"COMPLETED","REOPENED"} and (not _declared_digest(precommit) or receipt is None or account is None):
             _fail("DECLARED_SCHEDULER_COMPLETED_BINDINGS_MISSING")
         if "period_facts" in row:
-            selected = expected.get("development", {}).get("selected_slot_ids")
+            selected = expected.get("period_selection", {}).get("selected_slot_ids")
+            if selected is None:
+                selected = expected.get("development", {}).get("selected_slot_ids")
             if selected is None and "m5_development" in expected:
-                selected = expected["m5_development"]["development_slot_ids"]
+                selected = _declared_m5_period_ids(_declared_m5_metadata(expected))
             _declared_checked_period_facts(row["period_facts"], selected)
         if "retained_account_result" in row:
             _declared_checked_account_reference(row["retained_account_result"])
@@ -1398,8 +1559,7 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
             limits = _declared_native_spool_limits(expected)
             record = spool.read_generation_retirement(Path(row["root"]),
                 expected_context_sha256=row["generation_context_sha256"],
-                expected_completed_fence_schema=(spool.NATIVE_DEVELOPMENT_COMPLETION_FENCE_SCHEMA
-                    if development else spool.NATIVE_COMPLETION_FENCE_SCHEMA))
+                expected_completed_fence_schema=_declared_native_fence_schema(expected, development=development))
             _declared_native_archive_binding(record, expected, _declared_native_cell_contract_sha256(contract, expected, limits))
             if (record["retirement_receipt_sha256"] != row["archive_record"]["sha256"]
                     or record["retirement_receipt_path"] != row["archive_record"]["path"]
@@ -1411,7 +1571,9 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
             if type(row) is dict:
                 row["archive_record_confirmed"] = True
             return None
-        if contract.get("schema_version") not in {DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA, DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA}:
+        if contract.get("schema_version") not in {DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA, DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA} and not (
+                contract.get("schema_version") == DECLARED_SCHEDULER_SCHEMA
+                and any("m5_source" in cell for cell in contract["cells"])):
             _fail("DECLARED_M5_ARCHIVED_RESULT_INVALID")
         record = spool.read_generation_retirement(Path(row["root"]),
             expected_context_sha256=row["generation_context_sha256"])
@@ -1419,7 +1581,7 @@ def _declared_confirm_receipt(contract: Mapping[str, Any], row: Mapping[str, Any
         if (type(record) is not dict or record.get("status") != "ARCHIVED_RECORD_ONLY"
                 or record["retirement_receipt_sha256"] != row["archive_record"]["sha256"]
                 or record["retirement_receipt_path"] != row["archive_record"]["path"]
-                or record["retirement_receipt_path"] != expected["m5_development"]["retirement"]["receipt_path"]
+                or record["retirement_receipt_path"] != _declared_m5_metadata(expected)["retirement"]["receipt_path"]
                 or record["cell_contract_sha256"] != _declared_m5_cell_contract_sha256(contract, expected)
                 or record.get("retained_account_result") != row.get("retained_account_result")):
             _fail("DECLARED_M5_ARCHIVE_RECORD_CHANGED")
@@ -1622,7 +1784,7 @@ def run_declared_symbol_scheduler(
 
 
 __all__ += ["DECLARED_SCHEDULER_SCHEMA", "DECLARED_CELL_MIN_FREE_BYTES", "DeclaredSymbolSchedulerError",
-    "declared_symbol_worker", "run_declared_symbol_scheduler"]
+    "declared_symbol_worker", "run_declared_symbol_scheduler", "compile_fresh_declared_contract"]
 
 
 _DECLARED_M5_LIMITS: Final = {
@@ -1729,13 +1891,13 @@ def _declared_m5_contract(contract):
     if (any(type(policy[name]) is not int for name in ("lead_seconds", "validity_seconds"))
             or policy != {"lead_seconds": 0, "validity_seconds": 172800}):
         _fail("DECLARED_M5_WINDOW_POLICY_INVALID")
-    dev = row["m5_development"]
+    dev = _declared_m5_metadata(row)
     fields = {"development_slot_ids", "view_axes", "slot_view_ids", "calibration_view_id",
         "account_view_id", "required_result_keys", "terminal_result_key", "m5_source_pins",
         "cost_group_metadata", "gap_provenance", "end_grid_root", "source_fence_path", "retirement"}
     if type(dev) is not dict or set(dev) != fields:
         _fail("DECLARED_M5_CELL_DESCRIPTOR_INVALID")
-    selected = dev["development_slot_ids"]
+    selected = _declared_m5_period_ids(dev)
     if (type(selected) is not list or not 1 <= len(selected) <= 3
             or any(type(item) is not str or not item for item in selected)
             or len(set(selected)) != len(selected)
@@ -1830,7 +1992,7 @@ def _declared_m5_admission(dev):
             or record.get("decision_event") != "E-00004594"
             or record.get("decision_event_canonical_sha256") != _DECLARED_M5_COUNCIL_EVENT_SHA
             or record.get("cell") != {"symbol": "XAGUSD", "timeframe": "H1", "regime": "TREND"}
-            or record.get("selected_periods") != len(dev["development_slot_ids"])
+            or record.get("selected_periods") != len(_declared_m5_period_ids(dev))
             or gap["lineage"] != record.get("lineage") or gap["gap_pattern_observations"] != record.get("gap_pattern_observations")
             or gap["lineage"].get("sha256") != _DECLARED_M5_LINEAGE_SHA or gap["lineage"].get("bytes") != 4717
             or gap["gap_pattern_observations"].get("sha256") != _DECLARED_M5_PATTERN_SHA
@@ -1876,15 +2038,21 @@ def _declared_m5_cell_contract_sha256(contract, row):
         "native_universe_sha256": contract["native_universe_sha256"], "config_sha256": contract["config_sha256"],
         "profile_sha256": contract["profile_sha256"], "active_config_path": contract["active_config_path"],
         "spool_limits": contract["spool_limits"], "view_budgets": contract["view_budgets"],
-        "cost_edition_route": contract["cost_edition_route"], "scope": contract["scope"],
+        "cost_edition_route": contract["cost_edition_route"],
+        **({"scope": contract["scope"]} if "scope" in contract else {}),
         "cell": {key: value for key, value in row.items() if key != "descriptor_index"}})
 
 
 def _declared_m5_check_roster(row, parent, context, frozen, *, profile_sha256=None):
     import pm_historical_anchor_orchestration as orchestration
     import pm_production_anchor_plan as anchors
-    dev = row["m5_development"]
-    if (parent.get("schema_version") != orchestration.DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA
+    dev = _declared_m5_metadata(row)
+    ordinary = "m5_source" in row
+    expected_schema = (orchestration.DECLARED_M5_SLOT_PRECOMMIT_SCHEMA if ordinary
+        else orchestration.DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA)
+    if (parent.get("schema_version") != expected_schema
+            or (ordinary and (orchestration.declared_slot_period_selection(parent) != row["period_selection"]
+                or parent["slot_roster_sha256"] != row["slot_roster_sha256"]))
             or orchestration.declared_slot_source_kind(parent) != "m5_derived"
             or parent.get("cells") != [row["cell"]] or parent.get("run_id") != row["run_id"]
             or parent.get("m5_source_pins") != dev["m5_source_pins"]
@@ -1897,7 +2065,7 @@ def _declared_m5_check_roster(row, parent, context, frozen, *, profile_sha256=No
         extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
         protected_end_exclusive_utc=row["protected_end_exclusive_utc"])
     slots = orchestration.declared_slot_selected_slots(parent)
-    if [slot["slot_id"] for slot in slots] != dev["development_slot_ids"]:
+    if [slot["slot_id"] for slot in slots] != _declared_m5_period_ids(dev):
         _fail("DECLARED_M5_DEVELOPMENT_PREFIX_INVALID")
     axes = {axis["view_id"]: axis for axis in dev["view_axes"]}
     for slot in slots:
@@ -1914,7 +2082,7 @@ def _declared_m5_new_owner(context, *, precommit, process, frozen, config, contr
     import pm_m5_job_view as views
     import pm_native_prefix_production as native
     from pm_explicit_derived_history import Interval
-    dev = row["m5_development"]
+    dev = _declared_m5_metadata(row)
     group = edition.cell_metadata(row["cell"]["symbol"], row["cell"]["timeframe"])
     identification = edition.identification(row["cell"]["symbol"], row["cell"]["timeframe"])
     if (group != dev["cost_group_metadata"] or edition.sha256 != contract["profile_sha256"]
@@ -2033,21 +2201,25 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
     import pm_forward_oos_replay_producer as forward
     import pm_historical_search_producer as producer
     import pm_m5_job_view as views
-    dev = row["m5_development"]
+    dev = _declared_m5_metadata(row)
     body = _verified_account_body
     if body is None:
         body = causal_producer._read_descriptor_json(context, artifact.descriptor,
             code="DECLARED_CELL_RAW_ACCOUNT")
+        ordinary = "m5_source" in row
         causal_producer._verify_declared_cell_account_manifest(context, body, artifact.descriptor,
-            development=True)
-        forward.verify_declared_m5_development_cell_account_transport(context, body, process=process,
+            development=not ordinary)
+        verifier = (forward.verify_declared_m5_cell_account_transport if ordinary
+            else forward.verify_declared_m5_development_cell_account_transport)
+        verifier(context, body, process=process,
             frozen_pipeline_config=frozen, m5_owner=owner, cost_edition=edition)
     else:
         encoded = spool._canonical_json_bytes(body, context.limits.max_artifact_bytes)
         if (len(encoded) != artifact.descriptor["size_bytes"]
                 or hashlib.sha256(encoded).hexdigest() != artifact.descriptor["sha256"]):
             _fail("DECLARED_M5_ACCOUNT_RESULT_NOT_COMPLETE")
-    if (body.get("progress_status") != "DEVELOPMENT_COMPLETE"
+    ordinary = "m5_source" in row
+    if (body.get("progress_status") != ("COMPLETE" if ordinary else "DEVELOPMENT_COMPLETE")
             or tuple(body.get("terminal_consumer_binding_sha256", ())) != owner.consumer_bindings_for(dev["terminal_result_key"])):
         _fail("DECLARED_M5_ACCOUNT_RESULT_NOT_COMPLETE")
     # Derive every selected result from an existing original commit; no future
@@ -2066,7 +2238,7 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
             _fail("DECLARED_M5_FINAL_COMMIT_MISSING")
         slot_results[slot["slot_id"]] = record[1]
         commits[slot["slot_id"]] = record[0]
-    if set(slot_results) != set(dev["development_slot_ids"]):
+    if set(slot_results) != set(_declared_m5_period_ids(dev)):
         _fail("DECLARED_M5_FINAL_COMMIT_MISSING")
     run_descriptor = _declared_run_descriptor(precommit, row, run_body)
     if body.get("saved_cell_run_receipt_sha256") != run_descriptor["sha256"]:
@@ -2084,7 +2256,7 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
         owner.consumer_bindings_for(key), result_descriptor_sha256=grids[key]["row_sha256"])
         for key, value in slot_results.items()}
     terminal = dev["terminal_result_key"]
-    last = dev["development_slot_ids"][-1]
+    last = _declared_m5_period_ids(dev)[-1]
     results[terminal] = views.CallerValidatedResultBinding(artifact.descriptor["sha256"],
         owner.job_binding_sha256, owner.consumer_bindings_for(terminal),
         result_descriptor_sha256=grids[last]["row_sha256"])
@@ -2103,13 +2275,17 @@ def _declared_m5_finalize(context, *, precommit, process, frozen, contract, row,
             coverage["observed_gap_count"] = None if gaps is None else len(gaps)
             coverage["observed_gaps_sha256"] = None if gaps is None else _declared_m5_hash(gaps)
     fence_body = {
-        "schema_version": "fxpm.declared-m5-development-source-fence.v1",
+        "schema_version": (spool.M5_ORDINARY_COMPLETION_FENCE_SCHEMA if ordinary
+            else "fxpm.declared-m5-development-source-fence.v1"),
         "workspace_owner_sha256": spool.read_owned_generation_workspace(context)[1],
         "terminal_end_grid_reference_semantics": "FINAL_SELECTED_SLOT_ROW_WITH_SEPARATE_ACCOUNT_BINDING",
         "retirement_ownership": direct[2],
         "end_grid_rows": {key: {name: value[name] for name in ("path", "row_sha256")}
             for key, value in grids.items()}, "source_summary": compact,
-        "retained_account_result": retained_account, **_DECLARED_M5_SCOPE}
+        "retained_account_result": retained_account,
+        **({"period_selection": orchestration.declared_slot_period_selection(precommit.to_dict()),
+            "symbol": row["cell"]["symbol"], "accepted_slot_ids": [slot["slot_id"] for slot in precommit.to_dict()["slot_roster"]["slots"]]}
+            if ordinary else {}), **_declared_m5_result_scope(ordinary=ordinary)}
     fence_body = _declared_retained_completion_fence(dev["source_fence_path"], fence_body, maximum_bytes=4 * 1024**2)
     fence = _declared_m5_external_record(dev["source_fence_path"], fence_body, maximum_bytes=4 * 1024**2)
     return grids, fence, direct
@@ -2123,7 +2299,8 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
     import pm_end_grid as grid
     import pm_historical_anchor_orchestration as orchestration
     import pm_m5_job_view as views
-    dev = row["m5_development"]
+    dev = _declared_m5_metadata(row)
+    ordinary = "m5_source" in row
     slots = orchestration.declared_slot_selected_slots(precommit.to_dict())
     statuses = {slot["slot_id"]: commits[slot["slot_id"]]["completion"]["status"] for slot in slots}
     if any(value not in {"OWNER", "NO_TRADE"} for value in statuses.values()):
@@ -2152,7 +2329,8 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
             selected = actual["selected_attempt"]
             tier_contract = actual["selected_tier_contract"]
             source_contract = actual.get("source_contract_sha256")
-            outcome, reason, tier = "WINNER", "DECLARED_DEVELOPMENT_VERIFIED_OWNER", actual["selected_tier"]
+            outcome, reason, tier = "WINNER", ("DECLARED_VERIFIED_OWNER" if ordinary
+                else "DECLARED_DEVELOPMENT_VERIFIED_OWNER"), actual["selected_tier"]
             family, configuration = selected["strategy_id"], selected["trial_definition_sha256"]
             baseline = None
         else:
@@ -2175,7 +2353,8 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
                     if window["view_key"] != live_view.view_key:
                         _fail("DECLARED_M5_GRID_BASELINE_VIEW_CHANGED")
             selected, tier_contract, source_contract = None, None, None
-            outcome, reason, tier = "NO_TRADE", "DECLARED_DEVELOPMENT_VERIFIED_NO_TRADE", "P75"
+            outcome, reason, tier = "NO_TRADE", ("DECLARED_VERIFIED_NO_TRADE" if ordinary
+                else "DECLARED_DEVELOPMENT_VERIFIED_NO_TRADE"), "P75"
             family, configuration = None, None
         consumers = owner.consumer_bindings_for(key)
         if ((actual is not None and (actual.get("schema_version") != "fxpm.declared-m5-slot-owner.v1"
@@ -2196,12 +2375,14 @@ def _declared_m5_append_grid(context, *, precommit, process, row, owner, edition
             "cash_reporting_basis": _cash_snapshot_reporting(),
             "bound_baseline_descriptor_sha256": None if baseline is None else _declared_m5_hash(baseline),
             "bound_baseline_descriptor": baseline,
-            "development_scope": orchestration.declared_slot_development_scope(precommit.to_dict()),
+            **({"period_selection": orchestration.declared_slot_period_selection(precommit.to_dict()),
+                "accepted_slot_ids": [slot["slot_id"] for slot in precommit.to_dict()["slot_roster"]["slots"]]}
+                if ordinary else {"development_scope": orchestration.declared_slot_development_scope(precommit.to_dict())}),
             "selected_slots": len(slots), "accepted_roster_slots": 13,
             "actual_result_identity": {"slot_commit_sha256": _declared_m5_hash(commits[key]),
                 "cell_run_receipt_sha256": run_descriptor["sha256"], "account_artifact_sha256": account_descriptor["sha256"]},
-            **_DECLARED_M5_SCOPE}
-        if key == dev["development_slot_ids"][-1]:
+            **_declared_m5_result_scope(ordinary=ordinary)}
+        if key == _declared_m5_period_ids(dev)[-1]:
             contract_body["terminal_account_reference"] = {
                 "semantics": "FINAL_SELECTED_SLOT_ROW_WITH_SEPARATE_ACCOUNT_BINDING",
                 "account_view_window": account_body["m5_account_view_window"],
@@ -2708,8 +2889,8 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
         if (actual_workspace_sha != workspace_sha or workspace["cell_contract_sha256"] != cell_contract_sha256
                 or workspace["cell_id"] != row["cell"]["cell_id"]):
             _fail("DECLARED_M5_WORKSPACE_OWNER_CHANGED")
-        if _declared_m5_reuse_recorded_rows(result, end_grid_root=row["m5_development"]["end_grid_root"],
-                source_fence_path=row["m5_development"]["source_fence_path"],
+        if _declared_m5_reuse_recorded_rows(result, end_grid_root=_declared_m5_metadata(row)["end_grid_root"],
+                source_fence_path=_declared_m5_metadata(row)["source_fence_path"],
                 cell=row["cell"], slots=slots, process_sha256=process.receipt_sha256,
                 generation_context_sha256=context.context_sha256, precommit_sha256=precommit.receipt_sha256,
                 run_id=row["run_id"], cell_contract_sha256=cell_contract_sha256, workspace_owner_sha256=workspace_sha):
@@ -2767,14 +2948,14 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
             job_binding_sha256=None if abort_report is None else abort_report["job_binding_sha256"],
             consumer_binding_sha256=None, produced_at_utc=produced)
         compact_reference = {"path": str(grid._symbol_file(grid._grid_root(
-            row["m5_development"]["end_grid_root"]), row["cell"]["symbol"])), "row_sha256": stopped.row_sha256}
+            _declared_m5_metadata(row)["end_grid_root"]), row["cell"]["symbol"])), "row_sha256": stopped.row_sha256}
         fact = facts[slot["ordinal"] - 1]
         if fact["commit_sha256"] is None:
             fact.update(status="STOPPED", completion_status="STOP", reason_code=stopped.reason_code)
         fact["end_grid_reference"] = compact_reference
         facts = _declared_checked_period_facts(facts, [item["slot_id"] for item in slots])
-        appended = grid.EndGridWriter(row["m5_development"]["end_grid_root"]).append(stopped)
-        matched = [item for item in grid.read_end_grid(row["m5_development"]["end_grid_root"], row["cell"]["symbol"])
+        appended = grid.EndGridWriter(_declared_m5_metadata(row)["end_grid_root"]).append(stopped)
+        matched = [item for item in grid.read_end_grid(_declared_m5_metadata(row)["end_grid_root"], row["cell"]["symbol"])
             if item.row_sha256 == stopped.row_sha256]
         if len(matched) != 1 or matched[0].to_bytes() != stopped.to_bytes():
             _fail("DECLARED_M5_GRID_READBACK_MISMATCH")
@@ -2785,7 +2966,7 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
         body["end_grid_rows"] = {slot["slot_id"]: compact_reference}
         result["period_facts"] = facts
         body["period_facts"] = result["period_facts"]
-        dev = row["m5_development"]
+        dev = _declared_m5_metadata(row)
         saved = _declared_m5_external_record(dev["source_fence_path"], body, maximum_bytes=4 * 1024**2)
         result.update(terminal_refusal_record=saved, terminal_refusal=dict(refusal),
             terminal_refusal_record_status="DURABLE_STOP", terminal_refusal_workspace_status="RETAINED")
@@ -2811,7 +2992,8 @@ def _declared_m5_run_one_cell(contract, row):
     import os
     import pm_authority_spool as spool
     result = _declared_cell_row(row, "FAILED", pid=os.getpid())
-    result.update(source_kind="m5_derived", result_kind="DEVELOPMENT_PARTIAL",
+    ordinary = contract.get("schema_version") == DECLARED_SCHEDULER_SCHEMA and "m5_source" in row
+    result.update(source_kind="m5_derived", result_kind="ORDINARY_SELECTED_PERIODS" if ordinary else "DEVELOPMENT_PARTIAL",
         design_contaminated=True, pristine_validation=False)
     owner, root = None, None
     context = workspace_sha = precommit = process = frozen = config = digest = None
@@ -2820,12 +3002,13 @@ def _declared_m5_run_one_cell(contract, row):
     phase, run_body = "PRE_SOURCE", None
     try:
         development = contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA
-        checked, _ = (_declared_development_contract(contract) if development else _declared_m5_contract(contract))
-        if ((not development and row != checked["cells"][0]) or (development and not any(
+        checked, _ = (_declared_contract(contract) if ordinary else
+            _declared_development_contract(contract) if development else _declared_m5_contract(contract))
+        if ((not development and not ordinary and row != checked["cells"][0]) or ((development or ordinary) and not any(
                 {key: value for key, value in row.items() if key != "descriptor_index"}
                 == {key: value for key, value in other.items() if key != "descriptor_index"} for other in checked["cells"]))):
             _fail("DECLARED_M5_CELL_DESCRIPTOR_INVALID")
-        dev = row["m5_development"]
+        dev = _declared_m5_metadata(row)
         _declared_m5_dependencies()
         import pm_book_multiplicity as book
         import pm_forward_oos_replay_producer as forward
@@ -2886,25 +3069,32 @@ def _declared_m5_run_one_cell(contract, row):
                     precommit = orchestration.reopen_declared_slot_owner_run_precommit(context,
                         receipt_sha256=records[0].parent.name, process=process, frozen_pipeline_config=frozen)
                 else:
+                    refs = {"config_sha256": context.config_sha256,
+                        "effective_config_sha256": frozen.effective_config_sha256}
+                    roster = (_declared_resolved_ordinary_roster(row, refs) if ordinary else
+                        anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
+                            frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs=refs,
+                            extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
+                            protected_end_exclusive_utc=row["protected_end_exclusive_utc"]))
                     process = _declared_initial_process(context, row, development=development)
-                    roster = anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
-                        frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs={
-                            "config_sha256": context.config_sha256, "effective_config_sha256": frozen.effective_config_sha256},
-                        extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
-                        protected_end_exclusive_utc=row["protected_end_exclusive_utc"])
-                    if [slot["slot_id"] for slot in roster["slots"][:len(dev["development_slot_ids"])]] != dev["development_slot_ids"]:
+                    if [slot["slot_id"] for slot in roster["slots"][:len(_declared_m5_period_ids(dev))]] != _declared_m5_period_ids(dev):
                         _fail("DECLARED_M5_DEVELOPMENT_PREFIX_INVALID")
                     now, policy = _declared_utc_now(), row["source_access_window_policy"]
                     window = {"start_utc": (now - timedelta(seconds=policy["lead_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "end_exclusive_utc": (now + timedelta(seconds=policy["validity_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ")}
-                    precommit = orchestration.precommit_declared_development_m5_slot_owner_run(context,
+                    issuer = (orchestration.precommit_declared_m5_slot_owner_run if ordinary
+                        else orchestration.precommit_declared_development_m5_slot_owner_run)
+                    selection_arguments = ({"period_selection": row["period_selection"],
+                        "final_study_13": row["period_selection"]["mode"] == "final_study_13"} if ordinary
+                        else {"development_slot_ids": _declared_m5_period_ids(dev)})
+                    precommit = issuer(context,
                         run_id=row["run_id"], process=process, slot_roster=roster, cell_roster=[row["cell"]],
                         frozen_pipeline_config=frozen, spread_profile_identity={"profile_sha256": contract["profile_sha256"]},
                         source_access_window_utc=window, launch_activation_utc=row["launch_activation_utc"],
-                        m5_source_pins=dev["m5_source_pins"], development_slot_ids=dev["development_slot_ids"])
+                        m5_source_pins=dev["m5_source_pins"], **selection_arguments)
                 parent = precommit.to_dict()
                 slots = _declared_m5_check_roster(row, parent, context, frozen,
-                    **({"profile_sha256": contract["profile_sha256"]} if development else {}))
+                    **({"profile_sha256": contract["profile_sha256"]} if development or ordinary else {}))
                 result["precommit_sha256"] = precommit.receipt_sha256
                 _declared_capture_period_facts(result, context, precommit, row)
                 _declared_m5_reuse_recorded_rows(result, end_grid_root=dev["end_grid_root"],
@@ -2918,8 +3108,10 @@ def _declared_m5_run_one_cell(contract, row):
                         if result["status"] == "TERMINAL_STOP":
                             result["reason_code"] = "RECORDED_TERMINAL_STOP"
                     return result
-                account_request = forward.declared_m5_development_cell_account_request(context, precommit=precommit,
-                    process=process, frozen_pipeline_config=frozen)
+                account_request = (forward._declared_m5_cell_account_request_from_inputs(context,
+                    precommit=precommit, process=process, frozen_pipeline_config=frozen, inputs={"parent": parent})
+                    if ordinary else forward.declared_m5_development_cell_account_request(context, precommit=precommit,
+                        process=process, frozen_pipeline_config=frozen))
                 account_axis = next(axis for axis in dev["view_axes"] if axis["view_id"] == dev["account_view_id"])
                 if _declared_m5_utc(account_request["cutoff_utc"]) != _declared_m5_utc(account_axis["cutoff_utc"]):
                     _fail("DECLARED_M5_ACCOUNT_AXIS_MISMATCH")
@@ -2982,12 +3174,16 @@ def _declared_m5_run_one_cell(contract, row):
                         if result["recorded_before_dispatch"] else "NEW_TERMINAL_STOP")
                     return result
                 phase = "ACCOUNT"
-                artifact, account_inputs, account_body = forward._prepare_declared_m5_development_cell_account_artifact(
+                prepare_account = (forward._prepare_declared_m5_cell_account_artifact if ordinary
+                    else forward._prepare_declared_m5_development_cell_account_artifact)
+                produce_account = (forward._produce_declared_m5_cell_account_from_inputs if ordinary
+                    else forward._produce_declared_m5_development_cell_account_from_inputs)
+                artifact, account_inputs, account_body = prepare_account(
                     context, precommit=precommit, process=process, frozen_pipeline_config=frozen,
                     _verified_chain=verified_chain)
                 account_produced = False
                 if window_open and artifact is None:
-                    artifact = forward._produce_declared_m5_development_cell_account_from_inputs(context,
+                    artifact = produce_account(context,
                         precommit=precommit, process=process, frozen_pipeline_config=frozen,
                         inputs=account_inputs, body=account_body,
                         m5_owner=owner, account_view_id=dev["account_view_id"], cost_edition=edition)
@@ -3082,7 +3278,7 @@ def _declared_m5_archived_row(result, record):
         if digest != reference["sha256"]:
             _fail("DECLARED_RETAINED_ACCOUNT_CHANGED")
         result.update(retained_account_result=dict(reference), retained_account_bytes=reference["size_bytes"])
-        if body.get("development_scope") is not None:
+        if body.get("development_scope") is not None or body.get("period_selection") is not None or record.get("period_selection") is not None:
             result["period_facts"] = _declared_account_period_facts(body)
     return result
 
@@ -3103,7 +3299,7 @@ def _declared_m5_protected_paths(contract, row, config):
         if type(file) is not str:
             _fail("DECLARED_M5_RETIREMENT_CODE_ORIGIN_UNAVAILABLE", name)
         files.append(Path(file).resolve())
-    dev = row["m5_development"]
+    dev = _declared_m5_metadata(row)
     return tuple(files) + (Path(config.data_dir).resolve(), Path(contract["cost_edition_route"]["root"]).resolve(),
         Path(contract["active_config_path"]).resolve(), Path(dev["end_grid_root"]).resolve(),
         Path(dev["source_fence_path"]).resolve())
@@ -3137,7 +3333,7 @@ def _declared_m5_owned_direct_files(context, precommit, row, *, process, frozen,
 
     cell = row["cell"]["cell_id"]
     return _declared_owned_direct_files(context, precommit, row,
-        max_paths=row["m5_development"]["retirement"]["max_paths"], verified_no_plan=verified_no_plan,
+        max_paths=_declared_m5_metadata(row)["retirement"]["max_paths"], verified_no_plan=verified_no_plan,
         additional_direct=(producer._declared_terminal_path(precommit, cell),
                            producer._declared_m5_cell_source_path(precommit, cell)))
 
@@ -3268,11 +3464,11 @@ def _declared_development_expected(contract):
     """Keep the existing eligible-cell and first-K admission unchanged."""
     checked, _ = _declared_m5_contract(contract)
     cell = checked["cells"][0]
-    dev = cell["m5_development"]
+    dev = _declared_m5_metadata(cell)
     axes = {axis["view_id"]: axis for axis in dev["view_axes"]}
     periods = [{"cell_id": cell["cell"]["cell_id"], "slot_id": slot_id,
         "information_cutoff_utc": _declared_m5_grid_utc(axes[dev["slot_view_ids"][slot_id]]["cutoff_utc"])}
-        for slot_id in dev["development_slot_ids"]]
+        for slot_id in _declared_m5_period_ids(dev)]
     import pm_historical_anchor_orchestration as orchestration
     protected = _declared_m5_utc(cell["protected_end_exclusive_utc"])
     if protected > _declared_m5_utc(orchestration._DECLARED_PROTECTED_END_EXCLUSIVE_UTC):
@@ -3286,9 +3482,9 @@ def _declared_development_expected(contract):
 def _declared_development_grid_rows(cell, references):
     from pathlib import Path
     import pm_end_grid as grid
-    if type(references) is not dict or not set(references).issubset(cell["m5_development"]["development_slot_ids"]):
+    if type(references) is not dict or not set(references).issubset(_declared_m5_period_ids(_declared_m5_metadata(cell))):
         _fail("DEVELOPMENT_COMPLETION_GRID_ROSTER")
-    expected_path = Path(cell["m5_development"]["end_grid_root"]) / (cell["cell"]["symbol"] + ".jsonl")
+    expected_path = Path(_declared_m5_metadata(cell)["end_grid_root"]) / (cell["cell"]["symbol"] + ".jsonl")
     retained = grid.read_end_grid(expected_path.parent, cell["cell"]["symbol"]) if references else []
     selected = {}
     for slot_id, reference in references.items():
@@ -3315,7 +3511,7 @@ def _declared_development_completed_bindings(checked, cell, periods, archive, fe
     if type(summary) is not dict:
         return None, None
     binding = summary.get("binding")
-    dev = cell["m5_development"]
+    dev = _declared_m5_metadata(cell)
     if (type(binding) is not dict or binding.get("config_sha256") != checked["config_sha256"]
             or binding.get("precommit_sha256") != archive["precommit_sha256"]
             or binding.get("required_result_keys") != dev["required_result_keys"]
@@ -3333,14 +3529,14 @@ def _declared_development_completed_bindings(checked, cell, periods, archive, fe
         extend_frozen_clock_backward=cell["extend_frozen_clock_backward"],
         protected_end_exclusive_utc=cell["protected_end_exclusive_utc"])
     slots = roster["slots"][:len(periods)]
-    if [item["slot_id"] for item in slots] != dev["development_slot_ids"]:
+    if [item["slot_id"] for item in slots] != _declared_m5_period_ids(dev):
         _fail("DEVELOPMENT_COMPLETION_ORIGINAL_PREFIX")
     pairs = summary.get("results")
     if (type(pairs) is not list or any(type(pair) is not list or len(pair) != 2 for pair in pairs)
             or len({pair[0] for pair in pairs}) != len(pairs)):
         _fail("DEVELOPMENT_COMPLETION_RESULT_BINDINGS")
     results = dict(pairs)
-    if set(results) != set(dev["required_result_keys"]) or set(rows) != set(dev["development_slot_ids"]):
+    if set(results) != set(dev["required_result_keys"]) or set(rows) != set(_declared_m5_period_ids(dev)):
         _fail("DEVELOPMENT_COMPLETION_RESULT_BINDINGS")
     job_sha = _declared_m5_hash(binding)
     terminal = results[dev["terminal_result_key"]]
@@ -3377,7 +3573,7 @@ def _declared_development_completed_bindings(checked, cell, periods, archive, fe
                 or body.get("actual_slot_consumer", {}).get("slot_id") != slot_id
                 or body.get("target_view_window", {}).get("view_key") != item.view_key
                 or body.get("target_view_window", {}).get("m5_view_contract_sha256") != binding["m5_view_contract_sha256"]
-                or body.get("development_scope") != orchestration._declared_development_scope_body(roster, dev["development_slot_ids"])
+                or body.get("development_scope") != orchestration._declared_development_scope_body(roster, _declared_m5_period_ids(dev))
                 or body.get("selected_slots") != len(slots) or body.get("accepted_roster_slots") != len(roster["slots"])
                 or identity.get("account_artifact_sha256") != account_sha
                 or identity.get("slot_commit_sha256") != result.get("result_sha256")
@@ -3436,7 +3632,7 @@ def build_declared_m5_development_completion(contract, dispatch_report):
     if actual["status"] == "ARCHIVED" or actual.get("archive_record") is not None:
         archive = spool.read_generation_retirement(Path(cell["root"]),
             expected_context_sha256=actual.get("generation_context_sha256"))
-        dev = cell["m5_development"]
+        dev = _declared_m5_metadata(cell)
         if (type(archive) is not dict or archive.get("status") != "ARCHIVED_RECORD_ONLY"
                 or archive.get("cell_contract_sha256") != contract_sha
                 or not _declared_digest(actual.get("generation_context_sha256"))
@@ -3555,7 +3751,26 @@ def _declared_development_contract(contract):
     return checked, groups
 
 
+def _declared_m5_metadata(row):
+    return row["m5_source"] if "m5_source" in row else row["m5_development"]
+
+
+def _declared_m5_period_ids(metadata):
+    return metadata["selected_slot_ids"] if "selected_slot_ids" in metadata else metadata["development_slot_ids"]
+
+
+def _declared_ordinary_m5_metadata(contract, row):
+    selected = _declared_ordinary_row_selection(row)
+    _declared_m5_selection_metadata(contract, row, metadata=row["m5_source"],
+        selected_slot_ids=selected["selected_slot_ids"], selection_field="selected_slot_ids")
+
+
 def _declared_development_m5_metadata(contract, row):
+    _declared_m5_selection_metadata(contract, row, metadata=_declared_m5_metadata(row),
+        selected_slot_ids=row["development"]["selected_slot_ids"], selection_field="development_slot_ids")
+
+
+def _declared_m5_selection_metadata(contract, row, *, metadata, selected_slot_ids, selection_field):
     """Reconcile the original per-cell view, cost-edition and research-admission fields."""
     from pathlib import Path
     import pm_m5_job_view as views
@@ -3575,13 +3790,13 @@ def _declared_development_m5_metadata(contract, row):
         _fail("DECLARED_M5_COST_EDITION_MISMATCH")
     if row["source_access_window_policy"] != {"lead_seconds": 0, "validity_seconds": 172800}:
         _fail("DECLARED_M5_WINDOW_POLICY_INVALID")
-    dev, cell = row["m5_development"], row["cell"]
-    fields = {"development_slot_ids", "view_axes", "slot_view_ids", "calibration_view_id",
+    dev, cell = metadata, row["cell"]
+    fields = {selection_field, "view_axes", "slot_view_ids", "calibration_view_id",
         "account_view_id", "required_result_keys", "terminal_result_key", "m5_source_pins",
         "cost_group_metadata", "gap_provenance", "end_grid_root", "source_fence_path", "retirement"}
-    if type(dev) is not dict or set(dev) != fields or dev["development_slot_ids"] != row["development"]["selected_slot_ids"]:
+    if type(dev) is not dict or set(dev) != fields or dev[selection_field] != selected_slot_ids:
         _fail("DECLARED_M5_CELL_DESCRIPTOR_INVALID")
-    selected = dev["development_slot_ids"]
+    selected = dev[selection_field]
     if type(dev["slot_view_ids"]) is not dict or set(dev["slot_view_ids"]) != set(selected):
         _fail("DECLARED_M5_VIEW_ROSTER_INVALID")
     ids = list(dev["slot_view_ids"].values()) + [dev["calibration_view_id"], dev["account_view_id"]]
@@ -3660,7 +3875,7 @@ def _declared_development_m5_admission(dev, cell):
     if (record.get("schema_version") != "fxpm.available-data-research-admission.v1"
             or record.get("status") != gap["status"] or record.get("gap_status") != "UNCLASSIFIED"
             or record.get("cell") != {name: cell[name] for name in ("symbol", "timeframe", "regime")}
-            or record.get("selected_periods") != len(dev["development_slot_ids"])
+            or record.get("selected_periods") != len(_declared_m5_period_ids(dev))
             or type(record.get("decision_event")) is not str or not record["decision_event"]
             or not _declared_digest(record.get("decision_event_canonical_sha256"))
             or record.get("lineage") != gap["lineage"]
@@ -3841,7 +4056,7 @@ def _declared_account_period_facts(body):
 def _declared_capture_period_facts(result, context, precommit, row):
     """Keep each original commit fact before optional workspace retirement."""
     if (context is None or precommit is None or result.get("status") == "ARCHIVED"
-            or not ("development" in row or "m5_development" in row)):
+            or not ("development" in row or "m5_development" in row or "period_selection" in row)):
         return
     import os
     import pm_authority_spool as spool

@@ -218,11 +218,11 @@ def test_real_held_cell_lease_is_persisted_as_busy_without_issuance(tmp_path):
 
 def test_same_contract_report_resume_reopens_saved_account_without_changing_run_receipt(tmp_path):
     contract, source, report = _inputs(tmp_path)
-    assert main._run_declared_rnd_contract(source, report, requested_workers=1, _worker=_launcher_inert_worker) == 0
+    assert main._run_declared_rnd_contract(source, report, requested_workers=1, _worker=declared_fixture._synthetic_declared_worker) == 0
     first = _report(report, source, "COMPLETED")["dispatch_report"]["cells"][0]
     run = Path(first["root"]) / first["run_receipt"]["relative_path"]
     original = run.read_bytes()
-    assert main._run_declared_rnd_contract(source, report, requested_workers=1, _worker=_launcher_inert_worker) == 0
+    assert main._run_declared_rnd_contract(source, report, requested_workers=1, _worker=declared_fixture._synthetic_declared_worker) == 0
     second = _report(report, source, "COMPLETED")["dispatch_report"]["cells"][0]
     assert second["status"] == "REOPENED"
     assert second["recorded_before_dispatch"] is True
