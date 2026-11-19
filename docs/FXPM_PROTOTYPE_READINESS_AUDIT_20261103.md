@@ -13,6 +13,7 @@
 | One period is the unit | 2026-11-17 | Tests use one period, two only where the hand-over between periods is under test. Live always runs one period. The 13-period study runs once, at the end. |
 | No time limits on runs | 2026-11-17 | Write down the outputs a run should produce before it starts. Stop it only when an expected output does not appear and nothing else is being written. Otherwise it runs to completion. |
 | Remove redundancy everywhere | 2026-11-17 | Verify a thing once, where it enters, then hand the verified value on. Now rule 23 and ruling 30 of the shared OmniMind contract (E6698). |
+| Parallel work and visibility | 2026-11-19 | Third PM relay E6700: a search taking a week is acceptable. Prioritise useful parallel independent streams and visible current work. Cloud workspaces and Colab are options; paid execution still needs a concrete shard, hours and cost plan before spending authority. |
 | Prepare once, then slice | 2026-11-18 | Suggestion: transform a symbol and timeframe's data once, let later steps subdivide it, free it when the timeframe or symbol is done. Bar-by-bar loading belongs to forward and live simulation only. |
 | Stale information is removed | 2026-11-16 | Superseded text is deleted; a change-log line stays. This pass applies it to itself. |
 
@@ -46,13 +47,13 @@ The landed test's 7,021 s includes the result and cold-check stages the earlier 
 
 Where the finished q293 run spent its time (39,167 samples; the rows overlap): time-axis reconversion on every slice 29.6%, partly cut in lane 300; roster rebinding 29.0%, cut in lanes 297 and 298; the three per-request working-copy hashes 22.9%, still open; result records 13.3%, cut from three evaluations to one; the strategy runs themselves 6.9%; whole-state rechecks 0.1%, removed.
 
-Budget arithmetic, not a forecast: 2,400 cells in 28 days allows about 17 minutes per cell on one worker. Native315's search alone took about 126 minutes.
+Historical serial arithmetic: 2,400 cells in 28 days would allow about 17 minutes per cell on one worker; Native315's search took about 126 minutes. This is neither an admission gate nor a completion threshold. The newer operator direction relayed in E6700 accepts a week-long search and prioritises useful parallel independent streams.
 
 ## 4. Findings, ranked
 
 1. **The machinery is proven on invented data, not yet on real data.** Native315 is the first real cell on this edition. Until it exits, nothing after the search is proven with real models.
 2. **Every full-run failure this week was the same class: code that handled V16 but not V17.** The transport guard, the restore map, the decision verifier's policy version and the M5 cross-binding were all fixed. One known member is still open off the current path: `_build_current_cross_binding_bytes` in `pm_authoritative_search_execution.py` (4938 and 4955 at HEAD) has V16-only schema branches. A V17 current-refit is rejected by the historical-schema expectation before the output is emitted; the current-schema selection is also wrong. Both need the existing generation-aware mapping (E6499). This remains open for the live one-period refit path.
-3. **Throughput is about seven times over the grid budget.** See section 3. The largest open cut is the per-request deep copy and triple hash of unchanged prepared data (22.9%). The proposed cut uses read-only prepared arrays with a shallow copy per request to retain refusal of actual input mutation; correctness and the timing benefit remain unmeasured (E6447, parked until Native315 exits). It is also the operator's prepare-once suggestion.
+3. **Parallel independent streams remain to be deployed.** Native315 uses one worker. The next batch should use the existing scheduler's independent work units, with observed worker memory informing concurrency; a portable shard-bundle design is source-only work under E6717. The largest identified redundant-work cut remains the per-request deep copy and triple hash of unchanged prepared data (22.9%). The proposed cut uses read-only prepared arrays with a shallow copy per request to retain refusal of actual input mutation; correctness and the timing benefit remain unmeasured (E6447, parked until Native315 exits). It is also the operator's prepare-once suggestion.
 4. **Method risk is unresolved.** On case002, choosing strategies by their history did not predict their later results (methodology review, 2026-11-16). Native315 is the first new real evidence. A pilot design waits for a retained 300 by 24 panel table that the current edition does not keep.
 5. **Compatibility is broken by design for old records.** Processes and bound fits saved before lane 288 refuse under the landed executor. M5 source pins issued against earlier `pm_forward_oos_replay_producer.py` or `pm_authority_spool.py` bytes need their original code or a new authorised issuance before a real M5-derived run. Both are stated in the `bc5c023e` message.
 6. **Not re-checked in this pass:** the one-time MetaTrader backfill, daily-like segment exclusion and the Spread=min cost extension (landing plan W1.3, W1.4, W2.1). No landing for them was found in the log since 2026-11-03.
@@ -61,7 +62,7 @@ Budget arithmetic, not a forecast: 2,400 cells in 28 days allows about 17 minute
 
 1. Native315 runs to its end, judged against its declared outputs, with no timer. Its source window closes 2026-11-21 08:15 UTC. Root reads the outcome at exit.
 2. Land the reviewed 316 and 317 batch (fresh ordinary-family V17 routing, dead quota accounting removed) after Native315 exits.
-3. If Native315 passes, run the development set at one period on the ten symbols. If it fails, repair the named defect and run that one period again.
+3. After Native315 passes and the next execution scope is recorded, use useful parallel independent streams for the one-period ten-symbol development set. On failure, repair the named defect and obtain the next scoped execution disposition. E6700 is not an automatic retry, source-window renewal or paid-run grant.
 4. Close finding 2 before any live one-period refit.
 5. Strategy 101: US100 M5 cost tier and clock proof, then qualification.
 6. Cut the per-request copy and hashes (finding 3) the next time the search code is touched.

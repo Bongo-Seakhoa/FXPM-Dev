@@ -14,6 +14,9 @@ Notes:
 
 ### One-period prototype path (2026-11-17 to 2026-11-19)
 
+- Reconciled the 19 November operator direction relayed in E6700: prioritise useful independent
+  parallel work and visible progress; retained timings are observations, not admission thresholds.
+
 - Removed repeated whole-state, roster, fit, process and cost re-verification from the search and
   completion path; each is verified once where it enters. A one-period acceptance test that ran
   about 15 hours without finishing now passes (`bc5c023e`).
