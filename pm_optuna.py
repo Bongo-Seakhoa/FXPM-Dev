@@ -31,6 +31,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+from pm_strategies import resolve_strategy_parameters
 from pm_current_refit_parameters import (
     build_parameter_domain, validate_parameter_domain_member, parameter_domain_point,
     decode_parameter_mapping,
@@ -808,7 +809,12 @@ class OptunaTPEOptimizer:
         # Get default params
         try:
             base_strategy = self.strategy_registry.get(strategy_name)
+            defaults, _, _ = resolve_strategy_parameters(base_strategy, timeframe, defaults_only=True)
             default_params = base_strategy.get_params()
+            if set(defaults) - set(default_params):
+                base_strategy = self.strategy_registry.get(
+                    strategy_name, **{**defaults, **default_params})
+                default_params = base_strategy.get_params()
         except Exception as exc:
             if isinstance(exc, SearchInfrastructureError):
                 raise
@@ -1090,7 +1096,12 @@ class OptunaTPEOptimizer:
         start_time = time.time()
         try:
             base_strategy = self.strategy_registry.get(strategy_name)
+            defaults, _, _ = resolve_strategy_parameters(base_strategy, timeframe, defaults_only=True)
             default_params = base_strategy.get_params()
+            if set(defaults) - set(default_params):
+                base_strategy = self.strategy_registry.get(
+                    strategy_name, **{**defaults, **default_params})
+                default_params = base_strategy.get_params()
         except Exception as exc:
             if isinstance(exc, SearchInfrastructureError):
                 raise
@@ -1681,7 +1692,12 @@ class OptunaTPEOptimizer:
         
         try:
             base_strategy = self.strategy_registry.get(strategy_name)
+            defaults, _, _ = resolve_strategy_parameters(base_strategy, timeframe, defaults_only=True)
             default_params = base_strategy.get_params()
+            if set(defaults) - set(default_params):
+                base_strategy = self.strategy_registry.get(
+                    strategy_name, **{**defaults, **default_params})
+                default_params = base_strategy.get_params()
         except Exception as exc:
             if isinstance(exc, SearchInfrastructureError):
                 raise
@@ -1840,7 +1856,12 @@ class OptunaTPEOptimizer:
         
         try:
             base_strategy = self.strategy_registry.get(strategy_name)
+            defaults, _, _ = resolve_strategy_parameters(base_strategy, timeframe, defaults_only=True)
             default_params = base_strategy.get_params()
+            if set(defaults) - set(default_params):
+                base_strategy = self.strategy_registry.get(
+                    strategy_name, **{**defaults, **default_params})
+                default_params = base_strategy.get_params()
         except Exception as exc:
             if isinstance(exc, SearchInfrastructureError):
                 raise

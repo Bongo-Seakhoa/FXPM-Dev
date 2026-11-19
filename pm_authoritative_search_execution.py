@@ -73,7 +73,7 @@ from pm_search_outcomes import (
     SearchStage,
     TrialOutcome,
 )
-from pm_strategies import StrategyRegistry
+from pm_strategies import StrategyRegistry, resolve_strategy_parameters
 
 
 UTC: Final = timezone.utc
@@ -1703,6 +1703,7 @@ def _verify_attempt_roster(
     attempt_artifacts: Sequence[Mapping[str, Any]],
     fitted: FittedNativeSearchTimeframe,
     regime: str,
+    search_process: Any = None,
 ) -> tuple[dict[str, Any], tuple[_VerifiedAttempt, ...]]:
     if type(fitted) is not FittedNativeSearchTimeframe:
         _fail("FITTED_TIMEFRAME_INVALID")
@@ -1726,6 +1727,11 @@ def _verify_attempt_roster(
     elif plan_body.get("source_kind", "broker_native") != "broker_native":
         _fail("HORIZON_PLAN_NATIVE_SOURCE_KIND_MISMATCH")
     normalized_regime = str(regime or "").strip().upper()
+    attempt_limit = MAX_ATTEMPTS
+    if search_process is not None:
+        import pm_production_search_planner as planner
+        process_body = search_process.to_dict()
+        attempt_limit = planner.process_attempt_count(process_body)
     if (
         binding.get("cell")
         != {
@@ -1757,7 +1763,7 @@ def _verify_attempt_roster(
         type(candidates) is not list
         or type(trials) is not list
         or type(planned_attempts) is not list
-        or not 1 <= len(planned_attempts) <= MAX_ATTEMPTS
+        or not 1 <= len(planned_attempts) <= attempt_limit
         or type(attempt_artifacts) not in {list, tuple}
         or len(attempt_artifacts) != len(planned_attempts)
     ):
@@ -2485,13 +2491,16 @@ def _independent_tier_execution_receipt(lanes: Mapping[str, Mapping[str, Any]],
 
 def _runtime_strategy(
     attempt: _VerifiedAttempt,
+    *, timeframe=None,
 ) -> tuple[Any, dict[str, Any]]:
     strategy_id = attempt.artifacts.winner_process["strategy_id"]
     base = StrategyRegistry.get(strategy_id)
     try:
+        defaults, _grid, _coupled = resolve_strategy_parameters(base, timeframe,
+            defaults_only=True, persisted_parameters=attempt.artifacts.trial_definition["parameters"])
         parameters = decode_parameter_mapping(
             attempt.artifacts.trial_definition["parameters"],
-            base.get_default_params(),
+            defaults,
         )
         strategy = StrategyRegistry.get(strategy_id, **parameters)
     except Exception as exc:
@@ -2744,7 +2753,7 @@ def _run_tier_partition(
         facts = _route_a_matched_base_trade_facts(
             result=result, features=features, backtester=backtester, spec=spec,
             base_tier=spread_tier, stress_tier=_matched_stress_tier,
-            timeframe=timeframe, partition_role=partition.role, exact_trade_capture=exact_trade_capture)
+            timeframe=timeframe, partition_role=partition.role, exact_trade_capture=exact_trade_capture, strategy=strategy)
         # This call omits governance/schedules: both fixed-control backends keep
         # the entry stop unchanged through ordinary and terminal trade emission.
         facts["initial_risk_source_binding"] = {
@@ -2988,7 +2997,7 @@ def _build_planned_attempt_evidence(
     if (_full_panel_lane_capture is not None
             and type(_full_panel_lane_capture) is not _FullPanelLaneCapture):
         _fail("ROUTE_A_FULL_PANEL_CAPTURE_INVALID")
-    strategy, _parameters = _runtime_strategy(attempt)
+    strategy, _parameters = _runtime_strategy(attempt, timeframe=plan_body["cell"]["timeframe"])
     frame = fitted._frame
     symbol, timeframe, regime = (plan_body["cell"][key] for key in ("symbol", "timeframe", "regime"))
     geometry = plan_body.get("derived_dependency_geometry")
@@ -3179,10 +3188,7 @@ def _bound_fit_frozen_chain(context, body, header):
     raws = [_bound_fit_entry_bytes(context, entry, expected_format=raw_winner.ASCII_JSON_FORMAT) for entry in frozen_entries]
     schema = json.loads(_bound_fit_entry_bytes(context, receipt_entry,
         expected_format=raw_winner.ASCII_JSON_FORMAT).decode("ascii")).get("schema_version")
-    restorers = {raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v6,
-        raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v7,
-        raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v9}
-    restore = restorers.get(schema)
+    restore = raw_winner.frozen_plan_restorer_for_schema(schema, bound_only=True)
     if restore is None:
         _fail("BOUND_FIT_LEGACY_FROZEN_PLAN_FORBIDDEN")
     frozen = restore(context_identity={"generation_id": context.generation_id,
@@ -5088,6 +5094,8 @@ def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receip
         _fail("SIGNAL_DESIGN_FROZEN_CONFIG_REQUIRED")
     config = frozen_pipeline_config.materialize(sink.context)
     planner.verify_frozen_production_search_process(sink.context, process)
+    process_body = process.to_dict()
+    edition = planner.source_edition_info(process_body)
     metadata = planner._validate_request(planning_request, process=process,
         context=sink.context, causal_precommit_payload=causal_precommit_payload)
     if metadata.get("schema_version") != historical.PRE_EVIDENCE_PLANNING_REQUEST_SCHEMA:
@@ -5139,9 +5147,11 @@ def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receip
     refreshed = _reverify_fitted_timeframe(fitted, config)
     frame = _signal_design_frame(refreshed._frame, cap)
     plan_body, attempts = _verify_attempt_roster(plan=cell_plan.horizon_plan,
-        attempt_artifacts=cell_plan.attempt_artifacts(), fitted=refreshed, regime=cell_plan.regime)
-    if len(attempts) != MAX_ATTEMPTS or MAX_ATTEMPTS != 300:
-        _fail("SIGNAL_DESIGN_COMPLETE_300_ROSTER_REQUIRED")
+        attempt_artifacts=cell_plan.attempt_artifacts(), fitted=refreshed, regime=cell_plan.regime,
+        search_process=process)
+    if len(attempts) != edition.attempt_count:
+        _fail("SIGNAL_DESIGN_COMPLETE_ROSTER_REQUIRED" if edition.edition_id == planner.NOISE101_SOURCE_EDITION_ID
+            else "SIGNAL_DESIGN_COMPLETE_300_ROSTER_REQUIRED")
     anchor = plan_body["anchor"]
     if (anchor.get("anchor_id") != metadata["anchor"]["anchor_id"]
             or anchor.get("selection_cutoff_utc") != metadata["anchor"]["selection_cutoff_utc"]
@@ -5175,7 +5185,7 @@ def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receip
         "current_or_trading_authority": False, "score_or_shortlist_authority": False,
         "generation_context_sha256": sink.context.context_sha256,
         "search_process_receipt_sha256": process.receipt_sha256,
-        "candidate_domain_sha256": process.to_dict()["candidate_domain_sha256"],
+        "candidate_domain_sha256": process_body["candidate_domain_sha256"],
         "planning_metadata_sha256": _sha256(metadata),
         "causal_precommit_sha256": _sha256(precommit),
         "production_anchor_plan_receipt_sha256": anchor_plan_receipt.receipt_sha256,
@@ -5206,6 +5216,9 @@ def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receip
         "labeler_schema_version": signal_opportunities.SCHEMA_VERSION,
         "attempt_count": len(roster), "attempt_roster": roster,
         "attempt_roster_sha256": _sha256(roster)}
+    if edition.edition_id == planner.NOISE101_SOURCE_EDITION_ID:
+        binding["source_edition"] = edition.to_dict()
+        binding["domain_roster_sha256"] = edition.domain_roster_sha256_by_timeframe[cell_plan.timeframe]
     return binding, refreshed, frame, config, plan_body, attempts
 
 
@@ -5273,7 +5286,7 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                 continue
             if attempt.plan_attempt["status"] != "PLANNED":
                 _fail("SIGNAL_DESIGN_ATTEMPT_DISPOSITION_INVALID")
-            strategy, _ = _runtime_strategy(attempt)
+            strategy, _ = _runtime_strategy(attempt, timeframe=cell_plan.timeframe)
             surface = _build_full_prefix_strategy_surface(frame=frame, strategy=strategy,
                 fitted=refreshed, symbol=cell_plan.symbol, timeframe=cell_plan.timeframe)
             _signal_design_frame(surface.features, cap)
@@ -5351,8 +5364,8 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                         del batch
                 del partitions
             del surface
-        if (totals["roster_count"] != 300 or totals["evaluated_attempt_count"]
-                + totals["presearch_rejected_count"] != 300):
+        if (totals["roster_count"] != binding["attempt_count"] or totals["evaluated_attempt_count"]
+                + totals["presearch_rejected_count"] != binding["attempt_count"]):
             _fail("SIGNAL_DESIGN_COMPLETE_ROSTER_MISMATCH")
         frozen_pipeline_config.verify_current(sink.context)
         if (_frame_sha256(refreshed._frame) != binding["native_fitted_frame_sha256"]
@@ -5437,6 +5450,7 @@ def _execute_current_observed_cell(
             attempt_artifacts=cell_plan.attempt_artifacts(),
             fitted=refreshed,
             regime=normalized_regime,
+            search_process=process,
         )
         planned = tuple(
             attempt
@@ -5826,10 +5840,10 @@ def execute_historical_observed_cell(
     frozen_execution_edition = search_process.to_dict().get("execution_edition")
     if _execution_edition != frozen_execution_edition:
         _fail("HISTORICAL_EXECUTION_EDITION_MISMATCH")
-    full_panel_execution = frozen_execution_edition == planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION
+    full_panel_execution = planner.is_route_a_full_panel_process(search_process)
     if full_panel_execution and type(capture) is not historical_adapter.DeclaredSlotSearchCapture:
         _fail("ROUTE_A_FULL_PANEL_DECLARED_CAPTURE_REQUIRED")
-    if full_panel_execution and capture._winner_generation is not winner.V17_GENERATION:
+    if full_panel_execution and capture._winner_generation is not planner.full_panel_generation(search_process):
         _fail("ROUTE_A_FULL_PANEL_MATCHED_FLOOR_GENERATION_REQUIRED")
     attempted_exact = (
         len(attempt_artifacts) if isinstance(attempt_artifacts, Sequence) else 0
@@ -5868,6 +5882,7 @@ def execute_historical_observed_cell(
             attempt_artifacts=attempt_artifacts,
             fitted=refreshed,
             regime=normalized_regime,
+            search_process=search_process,
         )
         attempted_exact = len(attempts)
         planned = tuple(
@@ -6257,7 +6272,7 @@ def execute_route_a_full_panel_historical_observed_cell(**kwargs: Any) -> Histor
             or "_execution_edition" in kwargs):
         _fail("ROUTE_A_FULL_PANEL_DECLARED_CAPTURE_REQUIRED")
     edition = planner.frozen_search_execution_edition(capture.context, kwargs.get("search_process"))
-    if edition != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+    if not planner.is_route_a_full_panel_process(kwargs.get("search_process")):
         _fail("ROUTE_A_FULL_PANEL_PROCESS_EDITION_REQUIRED")
     return execute_historical_observed_cell(_execution_edition=edition, **kwargs)
 
@@ -7195,7 +7210,7 @@ def _route_a_resolve_request_membership(*, specification, frozen_domains, attemp
         _fail("ROUTE_A_MAPPING_DOMAIN_UNAVAILABLE")
     try:
         parameters = _route_a_mapping_validate_member(domain["parameter_domain"], specification["parameters"])
-        defaults = copy.deepcopy(StrategyRegistry.get(specification["strategy_id"]).get_default_params())
+        defaults = copy.deepcopy(domain["parameter_domain"]["defaults"])
         matches = []
         for index, attempt in enumerate(attempt_roster):
             if attempt["status"] != "PLANNED" or attempt["strategy_id"] != specification["strategy_id"]:
@@ -7714,7 +7729,8 @@ def _route_a_rebind_owner_membership(*, specification, snapshot, attempts, owner
                         and _canonical_bytes(current.plan_attempt) == _canonical_bytes(row["source_plan_attempt"])
                         and _canonical_bytes(current.candidate["folds"]) == _canonical_bytes(row["source_folds"])
                         and current.artifacts.winner_process["strategy_id"] == resolved["strategy_id"] == row["strategy_id"])
-                defaults = copy.deepcopy(StrategyRegistry.get(row["strategy_id"]).get_default_params())
+                domain = next(value for value in snapshot["frozen_domains"] if value["strategy_id"] == row["strategy_id"])
+                defaults = copy.deepcopy(domain["parameter_domain"]["defaults"])
                 parameters = decode_parameter_mapping(selected_attempt.artifacts.trial_definition["parameters"], defaults)
                 original_parameters = decode_parameter_mapping(owner_attempt.artifacts.trial_definition["parameters"], defaults)
                 valid = (valid and _canonical_bytes(parameters) == _canonical_bytes(original_parameters) == _canonical_bytes(resolved["parameters"]))
@@ -7774,8 +7790,8 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
         private_config = copy.deepcopy(config)
         private_attempts = copy.deepcopy(attempts)
         private_plan = json.loads(_canonical_bytes(plan_body).decode("ascii"))
-        private_domains = json.loads(_canonical_bytes(
-            search_process.to_dict()["semantics"]["strategy_domains"]).decode("ascii"))
+        private_domains = json.loads(_canonical_bytes(list(planner._domain_by_name(
+            search_process.to_dict(), timeframe=timeframe).values())).decode("ascii"))
         private_precommitments = original_frozen.partition_cost_precommitments
         private_partition_rows = _index_partition_precommitment_rows(private_precommitments)
         window = request_body["source_access_window_utc"]
@@ -8109,7 +8125,7 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
 
                         realized = _route_a_evaluate_prepared_request(prepare_probe=prepare_probe,
                             verify_probe=verify_probe, require_current=require_working_current,
-                            make_strategy=lambda: _runtime_strategy(selected_attempt)[0],
+                            make_strategy=lambda: _runtime_strategy(selected_attempt, timeframe=timeframe)[0],
                             run_strategy=run_strategy, verify_realized=verify_realized)
                         described = prepared["described"]
                         index = len(unique_entries)
@@ -8296,8 +8312,76 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
     return route_a_consumer_outcome
 
 
+def _session_execution_context(metadata, *, bar_count, trades, index=None, owner_specs=None):
+    """Check the one captured session axis; source authentication remains with its caller."""
+    fields = {"schema_version", "clock", "specs", "owner_spec_codes", "exit_half_spreads", "exit_open_prices"}
+    if (type(metadata) is not dict or set(metadata) != fields
+            or metadata["schema_version"] != "fxpm.backtest-session-execution.v1"
+            or metadata["clock"] != "AS_RECORDED"
+            or type(metadata["specs"]) is not list or not metadata["specs"]
+            or type(metadata["owner_spec_codes"]) is not list or not metadata["owner_spec_codes"]):
+        raise ValueError("invalid captured session execution")
+    specs = []
+    for axis in metadata["specs"]:
+        if (type(axis) is not dict or set(axis) != {"anchor_minutes", "length_minutes", "in_session", "session_keys"}
+                or type(axis["anchor_minutes"]) is not int or not 0 <= axis["anchor_minutes"] < 1440
+                or type(axis["length_minutes"]) is not int or not 1 <= axis["length_minutes"] <= 1440
+                or type(axis["in_session"]) is not list or len(axis["in_session"]) != bar_count
+                or any(type(value) is not bool for value in axis["in_session"])
+                or type(axis["session_keys"]) is not list or len(axis["session_keys"]) != bar_count
+                or any(type(value) is not int for value in axis["session_keys"])):
+            raise ValueError("invalid captured session axis")
+        spec = (axis["anchor_minutes"], axis["length_minutes"])
+        if spec in specs:
+            raise ValueError("duplicate captured session specification")
+        specs.append(spec)
+        if index is not None:
+            inside, keys = pm_core._recorded_session_arrays(index, spec)
+            if inside.tolist() != axis["in_session"] or keys.tolist() != axis["session_keys"]:
+                raise ValueError("captured session clock changed")
+    codes = metadata["owner_spec_codes"]
+    if (any(type(code) is not int or not -1 <= code < len(specs) for code in codes)
+            or set(code for code in codes if code >= 0) != set(range(len(specs)))):
+        raise ValueError("captured session owner mapping changed")
+    if owner_specs is not None:
+        expected_specs, expected_codes = [], []
+        for spec in owner_specs:
+            if spec is None:
+                expected_codes.append(-1)
+            else:
+                spec = tuple(spec)
+                if spec not in expected_specs:
+                    expected_specs.append(spec)
+                expected_codes.append(expected_specs.index(spec))
+        if specs != expected_specs or codes != expected_codes:
+            raise ValueError("captured session owner specification changed")
+    for name in ("exit_half_spreads", "exit_open_prices"):
+        if type(metadata[name]) is not list or len(metadata[name]) != len(trades):
+            raise ValueError("captured session exit axis changed")
+    for ordinal, trade in enumerate(trades):
+        half, opened = metadata["exit_half_spreads"][ordinal], metadata["exit_open_prices"][ordinal]
+        if str(trade.get("exit_reason", "")).lower() == "closed_session":
+            if (type(half) not in (int, float) or not math.isfinite(half) or half < 0
+                    or type(opened) not in (int, float) or not math.isfinite(opened)):
+                raise ValueError("captured session OPEN inputs missing")
+        elif half is not None or opened is not None:
+            raise ValueError("session OPEN inputs attached to another exit")
+    return metadata
+
+
+def _session_entry_allowed(axis, signal_bar, entry_bar):
+    return (0 <= signal_bar < entry_bar < len(axis["in_session"])
+        and axis["in_session"][signal_bar] and axis["in_session"][entry_bar]
+        and axis["session_keys"][signal_bar] == axis["session_keys"][entry_bar])
+
+
+def _session_boundary_at(axis, entry_bar, bar):
+    return (bar > entry_bar and (not axis["in_session"][bar]
+        or axis["session_keys"][bar] != axis["session_keys"][entry_bar]))
+
+
 def _route_a_matched_base_trade_facts(*, result, features, backtester, spec,
-                                     base_tier, stress_tier, timeframe, partition_role, exact_trade_capture=None):
+                                     base_tier, stress_tier, timeframe, partition_role, exact_trade_capture=None, strategy=None):
     """Retain matched kernel facts without inventing a charged-cost scalar."""
     if (not isinstance(base_tier, spread_profile.FrozenSpreadTier)
             or not isinstance(stress_tier, spread_profile.FrozenSpreadTier)
@@ -8320,6 +8404,19 @@ def _route_a_matched_base_trade_facts(*, result, features, backtester, spec,
     if non_improvement["status"] == "REFUSED_P95_BELOW_P75":
         _fail("ROUTE_A_FULL_PANEL_P95_SPREAD_NON_IMPROVEMENT_VIOLATION")
     identities = build_backtest_trade_identity_pnl_evidence(result["trades"])
+    session = None
+    session_axis = None
+    session_getter = getattr(strategy, "session_spec", None)
+    session_spec = session_getter(spec.symbol) if callable(session_getter) else None
+    if session_spec is not None and "session_execution" not in result:
+        _fail("ROUTE_A_MATCHED_SESSION_CAPTURE_MISSING")
+    if "session_execution" in result:
+        session = _session_execution_context(result["session_execution"], bar_count=len(features),
+            trades=result["trades"], index=features.index,
+            owner_specs=[session_spec] if strategy is not None else None)
+        if len(session["owner_spec_codes"]) != 1 or session["owner_spec_codes"][0] < 0:
+            _fail("ROUTE_A_MATCHED_SESSION_OWNER_INVALID")
+        session_axis = session["specs"][session["owner_spec_codes"][0]]
     if exact_trade_capture is not None and (type(exact_trade_capture) is not dict
             or exact_trade_capture.get("schema_version") != "fxpm.backtest-exact-executed-trades.v1"
             or exact_trade_capture.get("swap_accrual_contract") != result.get("swap_accrual_contract")
@@ -8335,6 +8432,8 @@ def _route_a_matched_base_trade_facts(*, result, features, backtester, spec,
         if (type(opened) is not int or type(closed) is not int
                 or not 0 <= opened <= closed < len(features)):
             _fail("ROUTE_A_MATCHED_BASE_TRADE_AXIS_INVALID", ordinal)
+        if session_axis is not None and identity["signal_bar"] != opened - 1:
+            _fail("ROUTE_A_MATCHED_SESSION_SIGNAL_BINDING_CHANGED")
         try:
             entry_price, stop_price = float(trade["entry_price"]), float(trade["stop_loss"])
             volume = float(trade["position_size"])
@@ -8355,8 +8454,12 @@ def _route_a_matched_base_trade_facts(*, result, features, backtester, spec,
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise AuthoritativeSearchExecutionError(
                 "ROUTE_A_MATCHED_BASE_RECORDED_RISK_UNAVAILABLE", (str(ordinal),)) from exc
+        if identity["exit_reason"] == "closed_session":
+            if (session is None or session["exit_half_spreads"][ordinal] != float(arrays["P75"][1][closed])
+                    or session["exit_open_prices"][ordinal] != float(features["Open"].iloc[closed])):
+                _fail("ROUTE_A_MATCHED_SESSION_OPEN_ARRAY_CHANGED")
         fill = _route_a_base_fill_witness(trade=trade, identity=identity, features=features,
-            base_entry_half=arrays["P75"][0], base_intrabar_half=arrays["P75"][1])
+            base_entry_half=arrays["P75"][0], base_intrabar_half=arrays["P75"][1], session_axis=session_axis)
         rows.append({"base_trade_identity": identity,
             "entry_price": entry_price, "recorded_stop_price": stop_price,
             "executed_volume": volume, "risk_at_recorded_stop_dollars": recorded_risk,
@@ -8413,6 +8516,7 @@ def _route_a_matched_base_trade_facts(*, result, features, backtester, spec,
         "use_spread": bool(backtester.config.use_spread),
         "spread_model_metadata": spread_metadata,
         "instrument_spec": vars(spec), "trades": rows,
+        **({"session_execution": session} if session is not None else {}),
         "base_position_events": copy.deepcopy(events),
         "position_event_bijection_status": "VERIFIED" if position_join else "MISMATCH",
         "base_fill_witness_status": ("NO_COMPLETED_BASE_TRADES" if not rows else "VERIFIED" if not reasons else "MISMATCH"),
@@ -8618,8 +8722,8 @@ def _route_a_full_panel_specifications(*, snapshot, contract, attempt_ordinal):
     attempt = snapshot["attempt_roster"][attempt_ordinal]
     if attempt["ordinal"] != attempt_ordinal or attempt["status"] != "PLANNED":
         _fail("ROUTE_A_FULL_PANEL_REQUEST_ROSTER_CHANGED")
-    parameters = decode_parameter_mapping(attempt["parameters"],
-        copy.deepcopy(StrategyRegistry.get(attempt["strategy_id"]).get_default_params()))
+    domain = next(value for value in snapshot["frozen_domains"] if value["strategy_id"] == attempt["strategy_id"])
+    parameters = decode_parameter_mapping(attempt["parameters"], copy.deepcopy(domain["parameter_domain"]["defaults"]))
     footprint = [row for row in contract["requests"] if row["attempt_ordinal"] == attempt_ordinal]
     expected = [(fold, role, tier) for fold in range(4)
         for role in ("optimizer_train", "tuning_validation", "final_lockbox") for tier in ("P75", "P95")]
@@ -8709,8 +8813,8 @@ def _route_a_rebind_full_panel_owner_membership(*, specification, snapshot, atte
                 or row["horizon_attempt_id"] != specification["bookkeeping"]["horizon_attempt_id"]
                 or row["strategy_id"] != specification["strategy_id"]):
             raise ValueError("crossed original attempt")
-        defaults = copy.deepcopy(StrategyRegistry.get(row["strategy_id"]).get_default_params())
         domain = next(value for value in snapshot["frozen_domains"] if value["strategy_id"] == row["strategy_id"])
+        defaults = copy.deepcopy(domain["parameter_domain"]["defaults"])
         parameters = _route_a_mapping_validate_member(domain["parameter_domain"], specification["parameters"])
         for current in (selected, original):
             if (type(current.ordinal) is not int or current.ordinal != index
@@ -8828,7 +8932,7 @@ def _route_a_assemble_full_panel_attempt(*, attempt, raw_attempt_id, plan_body,
 
 
 
-def _route_a_base_fill_witness(*, trade, identity, features, base_entry_half, base_intrabar_half):
+def _route_a_base_fill_witness(*, trade, identity, features, base_entry_half, base_intrabar_half, session_axis=None):
     """Capture actual inputs and reproduce the fixed-control fill before projection."""
     try:
         opened, closed = identity["entry_bar"], identity["exit_bar"]
@@ -8846,14 +8950,18 @@ def _route_a_base_fill_witness(*, trade, identity, features, base_entry_half, ba
                  "ohlc": {name: float(features[name].iloc[bar]) for name in ("Open", "High", "Low", "Close")},
                  "p75_intrabar_half_price": float(base_intrabar_half[bar])}
                 for bar in range(opened, closed + 1)]}
+        if session_axis is not None:
+            if opened < 1:
+                raise ValueError("session entry has no prior signal bar")
+            inputs["session_signal_open_utc"] = pd.Timestamp(features.index[opened - 1]).isoformat()
         _canonical_bytes(inputs)
-        return {**inputs, **_route_a_replay_base_fill_inputs(inputs),
+        return {**inputs, **_route_a_replay_base_fill_inputs(inputs, session_axis=session_axis),
             "held_bar_inputs_sha256": _sha256(inputs["held_bar_inputs"])}
     except (KeyError, TypeError, ValueError, IndexError, OverflowError):
         return {"status": "MISMATCH", "reason_code": "BASE_FILL_WITNESS_INPUT_INVALID"}
 
 
-def _route_a_replay_base_fill_inputs(inputs):
+def _route_a_replay_base_fill_inputs(inputs, *, session_axis=None):
     """Pure exact branch reference shared by capture and serialized verification."""
     try:
         opened, closed, count = (inputs[key] for key in ("entry_bar", "exit_bar", "partition_bar_count"))
@@ -8872,17 +8980,34 @@ def _route_a_replay_base_fill_inputs(inputs):
                 or pd.Timestamp(path[-1]["open_utc"]) != pd.Timestamp(inputs["exit_time_utc"])
                 or float(path[0]["ohlc"]["Open"]) != entry_mid):
             raise ValueError("invalid literal input")
+        if session_axis is not None:
+            if not _session_entry_allowed(session_axis, opened - 1, opened):
+                raise ValueError("session signal and fill do not share an active key")
+            recorded = [pd.Timestamp(inputs["session_signal_open_utc"])] + [pd.Timestamp(row["open_utc"]) for row in path]
+            stamps = pd.DatetimeIndex([stamp.tz_localize(None) if stamp.tzinfo is not None else stamp
+                for stamp in recorded])
+            inside, keys = pm_core._recorded_session_arrays(stamps,
+                (session_axis["anchor_minutes"], session_axis["length_minutes"]))
+            bars = [opened - 1] + list(range(opened, closed + 1))
+            if (inside.tolist() != [session_axis["in_session"][bar] for bar in bars]
+                    or keys.tolist() != [session_axis["session_keys"][bar] for bar in bars]):
+                raise ValueError("session witness clock changed")
         expected_entry = entry_mid + entry_half if direction == 1 else entry_mid - entry_half
         if expected_entry != entry:
             return {"status": "MISMATCH", "reason_code": "BASE_ENTRY_FILL_MISMATCH"}
         trigger, scanned = None, 0
         for row in path:
             mid, half = row["ohlc"], float(row["p75_intrabar_half_price"])
+            session_open = session_axis is not None and _session_boundary_at(session_axis, opened, row["bar"])
             if (type(mid) is not dict or set(mid) != {"Open", "High", "Low", "Close"}
-                    or not all(math.isfinite(float(value)) for value in (*mid.values(), half)) or half < 0):
+                    or not math.isfinite(float(mid["Open"])) or not math.isfinite(half) or half < 0
+                    or not session_open and not all(math.isfinite(float(value)) for value in mid.values())):
                 raise ValueError("invalid trigger input")
             scanned += 1
-            if direction == 1:
+            if session_open:
+                quote_open = float(mid["Open"]) - direction * half
+                trigger = (row["bar"], "SESSION_OPEN", quote_open, "closed_session", mid, half)
+            elif direction == 1:
                 quote_open, adverse, favorable = mid["Open"] - half, mid["Low"] - half, mid["High"] - half
                 if quote_open <= stop:
                     trigger = (row["bar"], "GAP_SL", quote_open, pm_core.TradeStatus.CLOSED_SL.value, mid, half)
@@ -8964,6 +9089,14 @@ def _verify_route_a_matched_base_facts(facts):
                     "schema_version": pm_core.BACKTEST_INSTRUMENT_SPEC_SCHEMA_VERSION, "instrument_spec": vars(spec)}))
             if rebuilt != facts["numerical_execution_cost_attestations"][tier]:
                 raise ValueError("spread vector attestation changed")
+        session = None
+        session_axis = None
+        if "session_execution" in facts:
+            session = _session_execution_context(facts["session_execution"], bar_count=count,
+                trades=[row["base_trade_identity"] for row in facts["trades"]])
+            if len(session["owner_spec_codes"]) != 1 or session["owner_spec_codes"][0] < 0:
+                raise ValueError("invalid matched session owner")
+            session_axis = session["specs"][session["owner_spec_codes"][0]]
         non_improvement = _route_a_spread_non_improvement(arrays)
         if non_improvement["status"] == "REFUSED_P95_BELOW_P75":
             return {**unavailable, "floor_status": "REFUSED_P95_BELOW_P75", "floor_reason_codes": ["P95_BELOW_P75"]}
@@ -9004,15 +9137,19 @@ def _verify_route_a_matched_base_facts(facts):
             input_fields = {"direction", "entry_bar", "exit_bar", "partition_bar_count", "entry_time_utc",
                 "exit_time_utc", "entry_mid_open", "p75_entry_half_price", "observed_entry_price", "observed_exit_price",
                 "original_stop_price", "original_target_price", "exit_reason", "held_bar_inputs"}
+            if session_axis is not None:
+                input_fields.add("session_signal_open_utc")
             if not input_fields <= set(witness):
                 reasons.append("BASE_FILL_WITNESS_INPUT_INVALID")
                 continue
             inputs = {key: witness[key] for key in input_fields}
-            replay = _route_a_replay_base_fill_inputs(inputs)
+            replay = _route_a_replay_base_fill_inputs(inputs, session_axis=session_axis)
             expected_witness = {**inputs, **replay, "held_bar_inputs_sha256": _sha256(inputs["held_bar_inputs"])}
             if _canonical_bytes(expected_witness) != _canonical_bytes(witness):
                 raise ValueError("fill verdict or captured path changed")
             opened, closed = identity["entry_bar"], identity["exit_bar"]
+            if session_axis is not None and identity["signal_bar"] != opened - 1:
+                raise ValueError("session signal-bar identity changed")
             if (inputs["direction"] != identity["direction"] or inputs["entry_bar"] != opened or inputs["exit_bar"] != closed
                     or inputs["partition_bar_count"] != count
                     or pd.Timestamp(inputs["entry_time_utc"]) != pd.Timestamp(identity["entry_time"])
@@ -9024,6 +9161,10 @@ def _verify_route_a_matched_base_facts(facts):
                     or any(item["p75_intrabar_half_price"] != arrays["P75"]["intrabar_half_spread"][item["bar"]]
                         for item in inputs["held_bar_inputs"])):
                 raise ValueError("fill inputs cross trade/array membership")
+            if identity["exit_reason"] == "closed_session":
+                if (session is None or session["exit_half_spreads"][ordinal] != arrays["P75"]["intrabar_half_spread"][closed]
+                        or session["exit_open_prices"][ordinal] != inputs["held_bar_inputs"][-1]["ohlc"]["Open"]):
+                    raise ValueError("session OPEN array capture changed")
             for tier in ("P75", "P95"):
                 expected_sides = {"entry_half_spread_at_entry": arrays[tier]["entry_half_spread"][opened],
                     "intrabar_half_spread_at_entry": arrays[tier]["intrabar_half_spread"][opened],
@@ -9132,7 +9273,7 @@ def _verify_route_a_prepared_stage_origin(stage, *, capture, frozen, unit, raw_b
     if (type(stage) is not _PreparedRouteAFullPanelStage
             or type(capture) is not historical_adapter.DeclaredSlotSearchCapture
             or not historical_adapter._verify_declared_slot_capture(capture)
-            or capture._winner_generation is not winner.V17_GENERATION
+            or not capture._winner_generation.matched_floor_enabled
             or capture._active is None or capture._active.frozen is not frozen):
         _fail("ROUTE_A_FULL_PANEL_STAGE_ORIGIN_INVALID")
     handle = capture._active
@@ -9164,9 +9305,8 @@ def _reopen_route_a_matched_source_material(context, *, request, process, frozen
     import pm_production_search_planner as planner
     body = historical.verify_declared_slot_producer_request(context, request, process=process)
     planner.verify_frozen_production_search_process(context, process)
-    if (frozen.selection_generation is not winner.V17_GENERATION
-            or frozen.bound_fitted_state_entry is None
-            or planner.frozen_search_execution_edition(context, process) != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION):
+    if (frozen.selection_generation is not planner.full_panel_generation(process)
+            or frozen.bound_fitted_state_entry is None):
         _fail("MATCHED_FLOOR_FROZEN_SOURCE_EDITION_REQUIRED")
     frozen_pipeline_config.verify_current(context)
     config = frozen_pipeline_config.materialize(context)
@@ -9249,6 +9389,9 @@ def _verify_route_a_matched_fact_source(facts, geometry, *, source_frame, spec, 
         if (expected != _canonical_bytes(facts["half_spread_arrays"][tier])
                 or metadata != _canonical_bytes(facts["spread_model_metadata"][tier])):
             _fail("MATCHED_FLOOR_SPREAD_ARRAY_SOURCE_CHANGED")
+    if "session_execution" in facts:
+        _session_execution_context(facts["session_execution"], bar_count=len(frame), index=frame.index,
+            trades=[row["base_trade_identity"] for row in facts["trades"]])
     for row in facts["trades"]:
         fill = row["base_fill_witness"]
         inputs = fill
@@ -9261,6 +9404,9 @@ def _verify_route_a_matched_fact_source(facts, geometry, *, source_frame, spec, 
                 or inputs["entry_mid_open"] != float(frame.iloc[entry_bar]["Open"])
                 or pd.Timestamp(inputs["entry_time_utc"]) != frame.index[entry_bar]):
             _fail("MATCHED_FLOOR_ENTRY_SOURCE_CHANGED")
+        if "session_execution" in facts and (entry_bar < 1
+                or pd.Timestamp(inputs["session_signal_open_utc"]) != frame.index[entry_bar - 1]):
+            _fail("MATCHED_FLOOR_SESSION_SIGNAL_SOURCE_CHANGED")
         for held in inputs["held_bar_inputs"]:
             bar = held["bar"]
             if (not 0 <= bar < len(frame)

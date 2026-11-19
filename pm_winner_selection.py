@@ -499,6 +499,9 @@ class _ContractGeneration:
     tier_lanes: Mapping[str, tuple[str, ...]]
     archived: bool
     transport: WinnerTransportEnvelope = LEGACY_TRANSPORT_ENVELOPE
+    max_attempts: int = MAX_ATTEMPTS
+    matched_floor_enabled: bool = False
+    statistical_policy_version: str = "fxpm.winner-statistical-policy.v11"
 
     @property
     def pair_field(self) -> str:
@@ -524,6 +527,7 @@ CURRENT_GENERATION: Final = _ContractGeneration(
     MappingProxyType({"P75": "daily_net_mtm_r_p75", "P95": "daily_net_mtm_r_p95"}),
     MappingProxyType({"P75": "completed_trade_net_mtm_r_p75", "P95": "completed_trade_net_mtm_r_p95"}),
     MappingProxyType({"P75_REQUIRED": ("P75",), "P95_PREFERENCE": ("P95",)}), False,
+    statistical_policy_version="fxpm.winner-statistical-policy.v12",
 )
 V16_GENERATION: Final = replace(
     CURRENT_GENERATION, selection_version="fxpm.winner-selection.v16",
@@ -561,7 +565,19 @@ V17_GENERATION: Final = replace(V16_GENERATION,
     selection_version="fxpm.winner-selection.v17", request_version="fxpm.winner-selection-request.v5",
     precommitment_version="fxpm.winner-precommitment.v6", evidence_version="fxpm.winner-evidence-ledger.v9",
     marginal_version="fxpm.winner-book-marginal.v4", shared_partition_version="fxpm.winner-shared-oos-partition.v5",
-    policy=V17_SELECTION_POLICY, policy_sha256=_sha256_json(dict(V17_SELECTION_POLICY)))
+    policy=V17_SELECTION_POLICY, policy_sha256=_sha256_json(dict(V17_SELECTION_POLICY)),
+    matched_floor_enabled=True, statistical_policy_version="fxpm.winner-statistical-policy.v13")
+V18_SELECTION_POLICY: Final = MappingProxyType({
+    **V17_SELECTION_POLICY,
+    "policy_version": "fxpm.winner-statistical-policy.v14",
+    "moving_block_bootstrap_operation_limit": 141484032,
+})
+V18_GENERATION: Final = replace(V17_GENERATION,
+    selection_version="fxpm.winner-selection.v18", request_version="fxpm.winner-selection-request.v6",
+    precommitment_version="fxpm.winner-precommitment.v7", evidence_version="fxpm.winner-evidence-ledger.v10",
+    marginal_version="fxpm.winner-book-marginal.v5", shared_partition_version="fxpm.winner-shared-oos-partition.v6",
+    policy=V18_SELECTION_POLICY, policy_sha256=_sha256_json(dict(V18_SELECTION_POLICY)),
+    max_attempts=303, statistical_policy_version="fxpm.winner-statistical-policy.v14")
 
 
 CURRENT_WINNER_SELECTION_CONTRACT_VERSION: Final = CURRENT_GENERATION.selection_version
@@ -574,6 +590,8 @@ CURRENT_SHARED_OOS_PARTITION_VERSION: Final = CURRENT_GENERATION.shared_partitio
 
 def _generation_for_precommitment(value: Mapping[str, Any]) -> _ContractGeneration:
     version = value.get("contract_version")
+    if version == V18_GENERATION.precommitment_version:
+        return V18_GENERATION
     if version == V17_GENERATION.precommitment_version:
         return V17_GENERATION
     if version == V16_GENERATION.precommitment_version:
@@ -589,9 +607,14 @@ def winner_generation_for_precommitment(value: Mapping[str, Any]) -> _ContractGe
     return _generation_for_precommitment(value)
 
 
+def is_supported_current_generation(generation) -> bool:
+    return any(generation is known for known in (
+        CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION))
+
+
 def winner_request_byte_limit(contract_version: str) -> int:
     """Assembled Winner request bound; metadata artifacts keep their own bounds."""
-    for generation in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION):
+    for generation in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION):
         if contract_version in (generation.selection_version, generation.request_version,
                 generation.precommitment_version, generation.evidence_version, generation.marginal_version):
             return generation.transport.max_request_bytes
@@ -599,13 +622,13 @@ def winner_request_byte_limit(contract_version: str) -> int:
 
 
 def _payload_transport(generation, payload_type):
-    if generation in (V16_GENERATION, V17_GENERATION) and payload_type is not WinnerEvidenceLedgerPayload:
+    if generation in (V16_GENERATION, V17_GENERATION, V18_GENERATION) and payload_type is not WinnerEvidenceLedgerPayload:
         return V16_METADATA_ENVELOPE
     return generation.transport
 
 
 def check_completed_trade_transport_count(total: int, *, generation: _ContractGeneration = CURRENT_GENERATION) -> None:
-    if not any(generation is known for known in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION)):
+    if not any(generation is known for known in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION)):
         raise _ContractError("WINNER_TRANSPORT_GENERATION_INVALID")
     if type(total) is not int or total < 0:
         raise _ContractError("COMPLETED_TRADE_COUNT_INVALID")
@@ -625,7 +648,7 @@ def _generation_keys(
         result |= {"frozen_tier_pair_contract", "partition_cost_precommitments_sha256"}
     elif keys is _ATTEMPT_LEDGER_KEYS or keys is _EVIDENCE_LEDGER_KEYS:
         result |= {"partition_cost_precommitments_sha256"}
-    if generation is V17_GENERATION:
+    if generation.matched_floor_enabled:
         if keys is _PRECOMMITMENT_KEYS:
             result |= {"selection_addendum_contract", "selection_complexity_roster", "selection_complexity_roster_sha256"}
         elif keys is _EVIDENCE_LEDGER_KEYS:
@@ -1110,7 +1133,7 @@ def _create_winner_selection_request(
         )
     )
     request = WinnerSelectionRequest(precommitment, attempt_ledger, evidence_ledger, request_sha256)
-    if _generation in (V16_GENERATION, V17_GENERATION):
+    if _generation in (V16_GENERATION, V17_GENERATION, V18_GENERATION):
         _owned_json(request.to_dict(), _generation.transport.max_request_bytes,
             _envelope=_generation.transport, _copy_owned=False)
     elif len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes:
@@ -1124,6 +1147,8 @@ def create_winner_selection_request(precommitment_payload: Any, attempt_ledger_p
         generation = _generation_for_precommitment(precommitment_payload)
     except Exception:
         return None
+    if generation is V18_GENERATION:
+        return create_winner_selection_request_v18(precommitment_payload, attempt_ledger_payload, evidence_ledger_payload)
     if generation is V17_GENERATION:
         return create_winner_selection_request_v17(precommitment_payload, attempt_ledger_payload, evidence_ledger_payload)
     if generation is V16_GENERATION:
@@ -1151,6 +1176,15 @@ def create_winner_selection_request_v17(precommitment_payload: Any, attempt_ledg
         raise _ContractError("V17_PRECOMMITMENT_VERSION_REQUIRED")
     return _create_winner_selection_request(precommitment_payload, attempt_ledger_payload,
         evidence_ledger_payload, _generation=V17_GENERATION)
+
+
+def create_winner_selection_request_v18(precommitment_payload: Any, attempt_ledger_payload: Any,
+        evidence_ledger_payload: Any) -> WinnerSelectionRequest:
+    """Build the explicit 303-attempt edition using the retained matched-floor rules."""
+    if _generation_for_precommitment(precommitment_payload) is not V18_GENERATION:
+        raise _ContractError("V18_PRECOMMITMENT_VERSION_REQUIRED")
+    return _create_winner_selection_request(precommitment_payload, attempt_ledger_payload,
+        evidence_ledger_payload, _generation=V18_GENERATION)
 
 
 def _payload_from_wrapper(
@@ -1211,13 +1245,13 @@ def _request_payloads(
             policy_sha, attempt_sha, evidence_sha, _generation=_generation
         )
     )
-    if _generation in (V16_GENERATION, V17_GENERATION):
+    if _generation in (V16_GENERATION, V17_GENERATION, V18_GENERATION):
         _owned_json(request.to_dict(), _generation.transport.max_request_bytes,
             _envelope=_generation.transport, _copy_owned=False)
     if (
         type(request.request_sha256) is not str
         or request.request_sha256 != expected_request_sha
-        or (_generation not in (V16_GENERATION, V17_GENERATION)
+        or (_generation not in (V16_GENERATION, V17_GENERATION, V18_GENERATION)
             and len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes)
     ):
         raise _ContractError("REQUEST_BINDING_INVALID")
@@ -1762,7 +1796,7 @@ def _validate_precommitment(
     if value["risk_unit_contract_sha256"] != PINNED_RISK_UNIT_CONTRACT_SHA256:
         raise _ContractError("RISK_UNIT_CONTRACT_MISMATCH")
     attempts = _exact_int(
-        value["planned_attempt_count"], 1, MAX_ATTEMPTS, "PLANNED_ATTEMPT_COUNT_INVALID"
+        value["planned_attempt_count"], 1, _generation.max_attempts, "PLANNED_ATTEMPT_COUNT_INVALID"
     )
     fold_plan, latest_boundary = _validate_causal_fold_plan(
         value["causal_fold_plan"],
@@ -1771,7 +1805,7 @@ def _validate_precommitment(
         declared_latest_boundary=value["latest_evidence_boundary_utc"],
         _generation=_generation,
     )
-    if _generation is V17_GENERATION:
+    if _generation.matched_floor_enabled:
         if value["selection_addendum_contract"] != dict(V17_SELECTION_ADDENDUM_CONTRACT):
             raise _ContractError("SELECTION_ADDENDUM_CONTRACT_MISMATCH")
         roster = validate_selection_complexity_roster(value["selection_complexity_roster"], expected_count=attempts)
@@ -2921,7 +2955,7 @@ def _validate_evidence_ledger(
 
     if technical_failure:
         raise _ContractError("ATTEMPT_EVIDENCE_INCOMPLETE_TECHNICAL_FAILURE")
-    if _generation is V17_GENERATION:
+    if _generation.matched_floor_enabled:
         _validate_v17_selection_addendum(value["selection_addendum"], policy=policy, policy_sha=policy_sha,
             attempt_sha=attempt_payload_sha, attempts=attempts, entries=entries, shared_axis=shared_axis)
     return generated_at, entries, shared_axis
@@ -4059,7 +4093,7 @@ def _validate_primary_policy_contract(
     *, _generation: _ContractGeneration = ARCHIVED_GENERATION
 ) -> None:
     expected = {
-        "policy_version": "fxpm.winner-statistical-policy.v11",
+        "policy_version": _generation.statistical_policy_version,
         "cost_ladder_lane_order": tuple(_generation.lane_fields),
         "required_cost_ladder_tier": "P75_REQUIRED",
         "preference_cost_ladder_tier": "P95_PREFERENCE",
@@ -4095,10 +4129,6 @@ def _validate_primary_policy_contract(
     }
     if not _generation.archived:
         expected.update({
-            "policy_version": (
-                "fxpm.winner-statistical-policy.v13" if _generation is V17_GENERATION
-                else "fxpm.winner-statistical-policy.v12"
-            ),
             "primary_pairwise_inference": "INDEPENDENT_P75_P95_PAIRED_DAILY_DIFFERENCES_SEPARATE_TIER_HOLM",
             "pbo_lane_rule": "INDEPENDENT_FROZEN_TIER_ACCOUNTS",
         })
@@ -4279,7 +4309,7 @@ def _candidate_statistics(
         "refit_recipe_sha256": attempt["refit_recipe_sha256"],
         "evidence_status": entry["evidence_status"],
     }
-    if _generation is V17_GENERATION:
+    if _generation.matched_floor_enabled:
         identity["selection_complexity"] = entry["selection_complexity"]
         identity["matched_floor"] = entry["matched_floor"]
     unavailable_tiers = {
@@ -4535,7 +4565,7 @@ def _candidate_statistics(
             "MOVING_BLOCK_BOOTSTRAP_LOWER_BOUND_FAILED": bootstrap_tier["status"]
             == "FAIL",
         }
-        if _generation is V17_GENERATION:
+        if _generation.matched_floor_enabled:
             floor = entry["matched_floor"]
             gate_results["MATCHED_STRESS_FLOOR_UNAVAILABLE"] = floor["status"] != "AVAILABLE"
             gate_results["BELOW_MATCHED_STRESS_ECONOMIC_FLOOR"] = (floor["status"] == "AVAILABLE"
@@ -4827,7 +4857,7 @@ def _resolve_tier(
             status = "UNRESOLVED_NONDOMINATED_SET"
             reasons = ["STATISTICALLY_DIFFERENT_PRIMARY_UTILITY_ORDER_CONFLICT"]
         else:
-            winner = (_v17_statistical_tie(nondominated) if _generation is V17_GENERATION
+            winner = (_v17_statistical_tie(nondominated) if _generation.matched_floor_enabled
                 else min(nondominated, key=_simplicity_key))
             reporting = winner
             status = "PROCESS_WINNER_PENDING_BOOK_MULTIPLICITY"
@@ -5670,3 +5700,7 @@ def current_policy_snapshot() -> dict[str, Any]:
 
 __all__.extend(["V17_GENERATION", "V17_SELECTION_POLICY", "V17_SELECTION_ADDENDUM_CONTRACT",
     "V17_SELECTION_ADDENDUM_CONTRACT_SHA256", "validate_selection_complexity_roster", "create_winner_selection_request_v17"])
+
+
+__all__.extend(["V18_GENERATION", "V18_SELECTION_POLICY", "create_winner_selection_request_v18",
+    "is_supported_current_generation"])

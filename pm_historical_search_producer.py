@@ -2104,11 +2104,12 @@ def _verify_declared_completion_transport(context, *, completion, expected_editi
         # Every caller authenticates this process against its original request/precommit first.
         search_planner._require_current_process(process)
         process_body = process.to_dict()
-        if process_body.get("schema_version") == search_planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA:
-            if (process_body.get("execution_edition") != search_planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION
-                    or completion["request_body"].get("search_process_receipt_sha256") != process.receipt_sha256):
+        generation = search_planner.full_panel_generation(process_body)
+        if generation is not None:
+            if completion["request_body"].get("search_process_receipt_sha256") != process.receipt_sha256:
                 _fail(code)
-            expected_schemas = {historical_adapter.raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA}
+            expected_schemas = {
+                historical_adapter.raw_winner.bound_frozen_plan_schema_for_generation(generation)}
     if receipt.get("schema_version") not in expected_schemas:
         _fail(code)
 
@@ -2323,8 +2324,8 @@ def _declared_observed_cell_executor(context, *, process, transport_edition):
     if transport_edition not in {historical.DECLARED_WINNER_TRANSPORT_V15,
             historical.DECLARED_WINNER_TRANSPORT_V16}:
         _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
-    edition = search_planner.frozen_search_execution_edition(context, process)
-    if edition == search_planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+    search_planner.frozen_search_execution_edition(context, process)
+    if search_planner.is_route_a_full_panel_process(process):
         return search_execution.execute_route_a_full_panel_historical_observed_cell
     return (search_execution.execute_transport_historical_observed_cell
         if transport_edition == historical.DECLARED_WINNER_TRANSPORT_V16
@@ -4498,8 +4499,8 @@ def _reopen_declared_m5_source_material(context, *, request, process, frozen_pip
 
 
 def _declared_capture_opener(context, *, process, transport_edition):
-    edition = search_planner.frozen_search_execution_edition(context, process)
-    if edition == search_planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+    search_planner.frozen_search_execution_edition(context, process)
+    if search_planner.is_route_a_full_panel_process(process):
         return historical_adapter.open_matched_floor_declared_slot_capture
     return (historical_adapter.open_transport_declared_slot_capture
         if transport_edition == historical.DECLARED_WINNER_TRANSPORT_V16

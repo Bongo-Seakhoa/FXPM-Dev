@@ -7,9 +7,10 @@ import pytest
 import pm_authoritative_search_execution as execution
 
 
+@pytest.mark.parametrize("version", (17, 18), ids=("v17-v9", "v18-v10"))
 @pytest.mark.parametrize("damage", (None, "fitted_binding", "cross_binding"),
-    ids=("v17-public-v9-dispatch", "fitted-binding-still-required", "cross-binding-still-required"))
-def test_bound_fit_v17_dispatch_preserves_chain_guards(monkeypatch, damage):
+    ids=("public-reader-dispatch", "fitted-binding-still-required", "cross-binding-still-required"))
+def test_bound_fit_matched_generation_dispatch_preserves_chain_guards(monkeypatch, damage, version):
     raw = execution.raw_winner
     body = {"artifact_namespace": "INVENTED-READER", "symbol": "INVENTED",
         "timeframe": "H1", "regime": "TREND"}
@@ -29,7 +30,8 @@ def test_bound_fit_v17_dispatch_preserves_chain_guards(monkeypatch, damage):
         native_universe_sha256="c" * 64, config_sha256="d" * 64)
     frozen = SimpleNamespace(bound_fitted_state_entry=fitted)
     expected_frozen = frozen
-    receipt_bytes = json.dumps({"schema_version": raw.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA}).encode("ascii")
+    generation = getattr(execution.winner, f"V{version}_GENERATION")
+    receipt_bytes = json.dumps({"schema_version": raw.bound_frozen_plan_schema_for_generation(generation)}).encode("ascii")
     cross_bytes, cross_value = b'{"fixture":"INVENTED_CROSS"}', {"fixture": "INVENTED_CROSS"}
     restored, verified = [], []
 
@@ -55,13 +57,10 @@ def test_bound_fit_v17_dispatch_preserves_chain_guards(monkeypatch, damage):
         verified.append(frozen)
         return cross_value, None, None
 
-    def legacy(**_kwargs):
-        pytest.fail("V17 frozen.v9 was routed to a legacy reader")
-
     monkeypatch.setattr(execution, "_bound_fit_entry_bytes", read)
-    monkeypatch.setattr(raw, "restore_frozen_winner_search_plan_v9", restore)
-    monkeypatch.setattr(raw, "restore_frozen_winner_search_plan_v6", legacy)
-    monkeypatch.setattr(raw, "restore_frozen_winner_search_plan_v7", legacy)
+    monkeypatch.setattr(raw, "_BOUND_GENERATION_FORMATS", tuple(
+        (known, {**formats, "restorer": restore} if known is generation else formats)
+        for known, formats in raw._BOUND_GENERATION_FORMATS))
     monkeypatch.setattr(raw, "verify_historical_frozen_winner_cross_binding", verify)
     if damage == "fitted_binding":
         header["fitted_state_entry"] = {"fixture": "INVENTED_CROSSED_FITTED_REFERENCE"}

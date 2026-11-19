@@ -1828,7 +1828,7 @@ def test_historical_executor_replays_envelope_before_attempt_roster(
     ]
 
 
-def _attempt_roster_fixture(*, boundary: bool, attempt_count: int):
+def _attempt_roster_fixture(*, boundary: bool, attempt_count: int, process_body=None):
     symbol = "EURUSD"
     timeframe = "D1"
     regime = "TREND"
@@ -1888,7 +1888,8 @@ def _attempt_roster_fixture(*, boundary: bool, attempt_count: int):
             }
         ],
     }
-    process_body = {
+    process_body = process_body or {
+        "schema_version": search_planner.PROCESS_SCHEMA,
         "semantics": search_planner._process_semantics(
             search_planner._strategy_domains()
         )
@@ -8048,3 +8049,155 @@ def test_fresh_matched_source_call_rechecks_changed_original_frame(monkeypatch):
         execution._verify_route_a_matched_fact_source(case.facts, case.geometry,
             **{**case.arguments, "source_frame": changed}, _prepared_source_cache={})
     assert caught.value.code == "MATCHED_FLOOR_PARTITION_SOURCE_CHANGED"
+
+
+@pytest.fixture(scope="module")
+def source303_roster_fixture():
+    """INVENTED software-only metadata and frames; no process/window is issued."""
+    with search_planner._process_verification_scope():
+        body = search_planner.noise101_process_metadata()
+        plan, artifacts, fitted, binding = _attempt_roster_fixture(
+            boundary=True, attempt_count=303, process_body=body)
+    assert len(artifacts) == 303
+    return body, plan, artifacts, fitted, binding
+
+
+@pytest.mark.parametrize("mode", ("bound303", "legacy300"))
+def test_roster_extent_uses_authenticated_edition_count(monkeypatch, source303_roster_fixture, mode):
+    body, original_plan, artifacts, fitted, binding = source303_roster_fixture
+    body_hash = execution._sha256(body)
+    plan_body = original_plan.to_dict()
+    causal_hash = execution._sha256({"fixture": "INVENTED_CAUSAL_PRECOMMIT"})
+    assert causal_hash != body_hash
+    plan_body["anchor"] = {"process_precommit_receipt_sha256": causal_hash}
+    process = SimpleNamespace(to_dict=lambda: copy.deepcopy(body), receipt_sha256=body_hash)
+    monkeypatch.setattr(execution.historical, "historical_horizon_plan_binding", lambda _plan: binding)
+    kwargs = dict(plan=_PlanBody(plan_body), attempt_artifacts=artifacts, fitted=fitted, regime="TREND")
+    if mode != "legacy300":
+        kwargs["search_process"] = process
+    if mode == "bound303":
+        _, verified = execution._verify_attempt_roster(**kwargs)
+        assert len(verified) == 303
+        assert sum(row.artifacts.winner_process["strategy_id"] == "NoiseBandBreakoutStrategy"
+            for row in verified) == 3
+        assert {row.plan_attempt["status"] for row in verified} == {"PROCESS_REJECTED"}
+    else:
+        with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+            execution._verify_attempt_roster(**kwargs)
+        assert caught.value.code == "HORIZON_ATTEMPT_ROSTER_INVALID"
+
+
+@pytest.mark.parametrize("timeframe,bar_minutes", (("H1", 60), ("D1", 1440)), ids=("H1", "D1"))
+def test_frozen_complexity_uses_authenticated_timeframe(source303_roster_fixture, timeframe, bar_minutes):
+    body, _, _, _, _ = source303_roster_fixture
+    domains = search_planner._domain_by_name(body, timeframe=timeframe)
+    source = domains["NoiseBandBreakoutStrategy"]
+    artifact = {"winner_process": {"strategy_id": source["strategy_id"],
+        "process_candidate_id": hashlib.sha1(f"INVENTED-{timeframe}".encode("ascii")).hexdigest()},
+        "trial_definition": {"fixture": "INVENTED_COMPLEXITY_ONLY", "parameters": source["defaults"]},
+        "refit_recipe": {"fixture": "INVENTED_COMPLEXITY_ONLY"}}
+    rows = execution.historical_adapter._frozen_selection_complexity_from_process(
+        body, [artifact], timeframe=timeframe)
+    assert len(rows) == 1 and rows[0]["source_strategy_domain_sha256"] == source["domain_sha256"]
+    assert rows[0]["parameter_domain"]["defaults"]["bar_minutes"] == bar_minutes
+
+
+def test_frozen_complexity_refuses_unbound_timeframe(source303_roster_fixture):
+    body, _, _, _, _ = source303_roster_fixture
+    with pytest.raises(search_planner.ProductionSearchPlannerError, match="NOISE101_AUTHENTICATED_TIMEFRAME_REQUIRED"):
+        execution.historical_adapter._frozen_selection_complexity_from_process(body, [])
+
+
+@pytest.mark.parametrize("version", (17, 18), ids=("legacy-v17", "noise-v18"))
+def test_matched_capture_routes_only_explicit_process_generation(monkeypatch, source303_roster_fixture, version):
+    adapter = execution.historical_adapter
+    body = (source303_roster_fixture[0] if version == 18 else {
+        "schema_version": search_planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA,
+        "execution_edition": search_planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION})
+    sentinel = object()
+    seen = []
+    def open_capture(context, **kwargs):
+        seen.append(kwargs)
+        return sentinel
+    monkeypatch.setattr(adapter, "open_declared_slot_capture", open_capture)
+    assert adapter.open_matched_floor_declared_slot_capture(None, request=None,
+        process=body, plan=None, source_session=None) is sentinel
+    assert seen[0]["_winner_generation"] is getattr(winner, f"V{version}_GENERATION")
+
+
+@pytest.mark.parametrize("scope,count", (("declared", 303), ("declared", 304), ("canary", 303)),
+    ids=("declared303", "declared304-refused", "canary303-refused"))
+def test_failure_diagnostic_preserves_edition_extent(source303_roster_fixture, scope, count):
+    adapter = execution.historical_adapter
+    if scope == "canary":
+        with pytest.raises(adapter.HistoricalProductionAdapterError, match="CANARY_FAILURE_ATTEMPT_COUNT_INVALID"):
+            adapter._bounded_canary_failure_diagnostic(exception_type=None, failure_details=(),
+                attempt_ordinal=None, fold_ordinal=None, attempted_trials_exact=count)
+        return
+    published = []
+    def put_json(*args):
+        published.append(args)
+        return {"fixture": "INVENTED_DESCRIPTOR"}
+    capture = SimpleNamespace(process=source303_roster_fixture[0],
+        request=SimpleNamespace(receipt_sha256="b" * 64), sink=SimpleNamespace(put_json=put_json),
+        request_body={"artifact_namespace": "INVENTED-DIAGNOSTIC", "cell_id": "INVENTED-CELL",
+            "slot_id": "INVENTED-SLOT", "symbol": "EURUSD", "timeframe": "D1", "regime": "TREND"})
+    if count == 304:
+        with pytest.raises(adapter.HistoricalProductionAdapterError, match="CANARY_FAILURE_ATTEMPT_COUNT_INVALID"):
+            adapter._declared_slot_failure_entry(capture, failure_code="INVENTED_SOFTWARE_FAILURE",
+                attempted_trials_exact=count)
+        assert not published
+    else:
+        adapter._declared_slot_failure_entry(capture, failure_code="INVENTED_SOFTWARE_FAILURE",
+            attempted_trials_exact=count)
+        assert published[0][2]["attempted_trials_exact"] == 303
+        assert published[0][2]["downstream_authority"] is False
+
+
+@pytest.mark.parametrize("crossed_schema", (False, True), ids=("raw-v8", "raw-v7-refused"))
+def test_worker_production_receipt_binds_winner_generation(monkeypatch, crossed_schema):
+    """INVENTED receipt transport only; real schema and cross-binding checks."""
+    adapter = execution.historical_adapter
+    raw = adapter.raw_winner
+    cross = b'{"fixture":"INVENTED_CROSS"}'
+    cross_hash = hashlib.sha256(cross).hexdigest()
+    def descriptor(digest="a" * 64):
+        return {"schema_version": adapter.authority_spool.ARTIFACT_DESCRIPTOR_SCHEMA,
+            "relative_path": f"objects/sha256/{digest[:2]}/{digest}", "sha256": digest,
+            "size_bytes": len(cross), "format": raw.ASCII_JSON_FORMAT}
+    request_descriptor = descriptor()
+    decision_descriptor = descriptor("b" * 64)
+    cross_descriptor = descriptor(cross_hash)
+    request = SimpleNamespace(request_sha256="c" * 64,
+        precommitment=SimpleNamespace(to_dict=lambda: {"contract_version": winner.V18_GENERATION.precommitment_version}))
+    decision = SimpleNamespace(receipt_sha256="d" * 64)
+    context = SimpleNamespace(context_sha256="e" * 64, limits=SimpleNamespace(max_json_bytes=4096))
+    body = {"schema_version": raw.V17_PRODUCTION_SCHEMA if crossed_schema else raw.V18_PRODUCTION_SCHEMA,
+        "generation_context_sha256": context.context_sha256, "symbol": "EURUSD", "timeframe": "H1",
+        "regime": "TREND", "request_sha256": request.request_sha256,
+        "decision_receipt_sha256": decision.receipt_sha256, "provenance_cross_binding_sha256": cross_hash,
+        "artifact_roster": {"winner-request": request_descriptor, "winner-decision": decision_descriptor}}
+    encoded = execution._canonical_bytes(body)
+    monkeypatch.setattr(adapter, "_reopen_worker_ascii_json_descriptor", lambda *a, **k: (body, encoded))
+    kwargs = dict(context=context, descriptor=descriptor(), cross_descriptor=cross_descriptor,
+        cross_bytes=cross, request_descriptor=request_descriptor, decision_descriptor=decision_descriptor,
+        request=request, decision=decision, symbol="EURUSD", timeframe="H1", regime="TREND")
+    if crossed_schema:
+        with pytest.raises(adapter.HistoricalProductionAdapterError, match="WORKER_PRODUCTION_RECEIPT_SPLICE"):
+            adapter._verify_worker_production_receipt(**kwargs)
+    else:
+        assert adapter._verify_worker_production_receipt(**kwargs) == encoded
+
+
+def test_retained_matched_source_refuses_crossed_generation_before_reopen(monkeypatch, source303_roster_fixture):
+    body = source303_roster_fixture[0]
+    monkeypatch.setattr(execution.historical, "verify_declared_slot_producer_request", lambda *a, **k: {})
+    monkeypatch.setattr(search_planner, "verify_frozen_production_search_process", lambda *a, **k: True)
+    class NoSourceAccess:
+        def verify_current(self, _context):
+            pytest.fail("crossed generation reached source/config reopening")
+    frozen = SimpleNamespace(selection_generation=winner.V17_GENERATION,
+        bound_fitted_state_entry={"fixture": "INVENTED_BOUND_REFERENCE"})
+    with pytest.raises(execution.AuthoritativeSearchExecutionError, match="MATCHED_FLOOR_FROZEN_SOURCE_EDITION_REQUIRED"):
+        execution._reopen_route_a_matched_source_material(None, request=None, process=body,
+            frozen=frozen, frozen_pipeline_config=NoSourceAccess())

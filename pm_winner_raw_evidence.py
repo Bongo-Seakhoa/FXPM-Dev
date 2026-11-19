@@ -13,6 +13,7 @@ from decimal import Decimal, InvalidOperation
 from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
+from types import MappingProxyType
 
 import pandas as pd
 
@@ -64,6 +65,7 @@ V16_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v5"
 BOUND_FIT_V15_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v6"
 BOUND_FIT_V16_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v7"
 BOUND_FIT_V17_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v9"
+BOUND_FIT_V18_FROZEN_PLAN_SCHEMA = "fxpm.winner-search-plan-frozen.v10"
 FROZEN_COST_LADDER_CONTRACT_SCHEMA = BACKTEST_COST_LADDER_CONTRACT_SCHEMA_VERSION
 ARCHIVED_RAW_LANE_SCHEMA = "fxpm.winner-raw-backtester-lane.v4"
 RAW_LANE_SCHEMA = ARCHIVED_RAW_LANE_SCHEMA
@@ -80,6 +82,7 @@ PRODUCTION_SCHEMA = ARCHIVED_PRODUCTION_SCHEMA
 CURRENT_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v5"
 V16_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v6"
 V17_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v7"
+V18_PRODUCTION_SCHEMA = "fxpm.winner-raw-evidence-production.v8"
 ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v3"
 AUTHORITATIVE_PROVENANCE_SCHEMA = ARCHIVED_AUTHORITATIVE_PROVENANCE_SCHEMA
 CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA = "fxpm.authoritative-search-provenance.v4"
@@ -96,6 +99,8 @@ HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 = "fxpm.historical-horizon-win
 CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 = "fxpm.horizon-winner-cross-binding.v5"
 HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 = "fxpm.historical-horizon-winner-cross-binding.v5"
 CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6 = "fxpm.horizon-winner-cross-binding.v6"
+HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6 = "fxpm.historical-horizon-winner-cross-binding.v6"
+CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V7 = "fxpm.horizon-winner-cross-binding.v7"
 HISTORICAL_CROSS_BINDING_MODE = "HISTORICAL"
 CURRENT_CROSS_BINDING_MODE = "CURRENT"
 PARTITION_GEOMETRY_SCHEMA = "fxpm.winner-partition-geometry.v1"
@@ -335,7 +340,7 @@ class FrozenWinnerSearchPlan:
             self.horizon_execution_contracts_bytes,
             "HORIZON_EXECUTION_CONTRACT_BYTES_INVALID",
         )
-        if not 1 <= len(value) <= winner.MAX_ATTEMPTS:
+        if not 1 <= len(value) <= self.selection_generation.max_attempts:
             _fail("HORIZON_EXECUTION_CONTRACT_BYTES_INVALID")
         return value
 
@@ -1005,11 +1010,12 @@ def _normalized_horizon_execution_contracts(
     raw: Sequence[Mapping[str, Any]],
     *,
     expected_count: int,
+    _generation=winner.CURRENT_GENERATION,
 ) -> list[dict[str, Any]]:
     if (
         not isinstance(raw, (list, tuple))
         or type(expected_count) is not int
-        or not 1 <= expected_count <= winner.MAX_ATTEMPTS
+        or not 1 <= expected_count <= _generation.max_attempts
         or len(raw) != expected_count
     ):
         _fail("HORIZON_EXECUTION_CONTRACT_ROSTER_INVALID")
@@ -1103,9 +1109,10 @@ def _normalize_attempt_artifacts(
     symbol: str,
     timeframe: str,
     regime: str,
+    _generation=winner.CURRENT_GENERATION,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if not isinstance(raw_attempts, (list, tuple)) or not (
-        1 <= len(raw_attempts) <= winner.MAX_ATTEMPTS
+        1 <= len(raw_attempts) <= _generation.max_attempts
     ):
         _fail("ATTEMPT_FAMILY_BOUNDS")
     attempts: list[dict[str, Any]] = []
@@ -1759,13 +1766,63 @@ def _restored_frozen_context_identity(context_identity: Any) -> dict[str, str]:
     return identity
 
 
+def _bound_generation_format(generation):
+    for known, formats in _BOUND_GENERATION_FORMATS:
+        if generation is known:
+            return formats
+    _fail("WINNER_GENERATION_INVALID")
+
+
+def bound_frozen_plan_schema_for_generation(generation):
+    return _bound_generation_format(generation)["frozen_schema"]
+
+
+def raw_production_schema_for_generation(generation):
+    if generation is winner.ARCHIVED_GENERATION:
+        return ARCHIVED_PRODUCTION_SCHEMA
+    return _bound_generation_format(generation)["production_schema"]
+
+
+def bound_frozen_plan_freezer_for_generation(generation):
+    return _bound_generation_format(generation)["freezer"]
+
+
+def bound_frozen_plan_restorer_for_generation(generation):
+    return _bound_generation_format(generation)["restorer"]
+
+
+def raw_evidence_producer_for_generation(generation):
+    return _bound_generation_format(generation)["producer"]
+
+
+def horizon_winner_cross_binding_schemas_for_generation(generation, *, current_pair=True):
+    if generation is winner.ARCHIVED_GENERATION:
+        return (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA,
+            CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
+    formats = _bound_generation_format(generation)
+    if not current_pair:
+        return (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA,
+            CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
+    return formats["cross_binding_schemas"]
+
+
+def frozen_plan_restorer_for_schema(schema, *, bound_only=False):
+    for _, formats in _BOUND_GENERATION_FORMATS:
+        if schema == formats["frozen_schema"]:
+            return formats["restorer"]
+    if not bound_only:
+        if schema == CURRENT_FROZEN_PLAN_SCHEMA:
+            return restore_frozen_winner_search_plan_v4
+        if schema == V16_FROZEN_PLAN_SCHEMA:
+            return restore_frozen_winner_search_plan_v5
+    return None
+
+
 def _bound_frozen_schema(generation, present):
-    if generation is winner.V17_GENERATION:
-        if not present:
-            _fail("MATCHED_FLOOR_BOUND_FIT_REQUIRED")
-        return BOUND_FIT_V17_FROZEN_PLAN_SCHEMA
+    if generation.matched_floor_enabled and not present:
+        _fail("MATCHED_FLOOR_BOUND_FIT_REQUIRED")
     if present:
-        return BOUND_FIT_V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else BOUND_FIT_V15_FROZEN_PLAN_SCHEMA
+        return bound_frozen_plan_schema_for_generation(generation)
     return V16_FROZEN_PLAN_SCHEMA if generation is winner.V16_GENERATION else CURRENT_FROZEN_PLAN_SCHEMA
 
 
@@ -1883,12 +1940,12 @@ def _freeze_winner_search_plan(
     if normalized_regime not in winner.REGIMES:
         _fail("REGIME_INVALID")
     if not isinstance(attempt_artifacts, (list, tuple)) or not (
-        1 <= len(attempt_artifacts) <= winner.MAX_ATTEMPTS
+        1 <= len(attempt_artifacts) <= _generation.max_attempts
     ):
         _fail("ATTEMPT_FAMILY_BOUNDS")
     normalized_horizon_contracts = _normalized_horizon_execution_contracts(
         horizon_execution_contracts,
-        expected_count=len(attempt_artifacts),
+        expected_count=len(attempt_artifacts), _generation=_generation,
     )
     horizon_contracts_sha256 = _sha_json(normalized_horizon_contracts)
     precommitted_at = _utc(precommitted_at_utc, "PRECOMMITTED_AT_INVALID")
@@ -1914,7 +1971,7 @@ def _freeze_winner_search_plan(
         common_hashes=common_hashes,
         symbol=normalized_symbol,
         timeframe=normalized_timeframe,
-        regime=normalized_regime,
+        regime=normalized_regime, _generation=_generation,
     )
     normalized_folds, latest_boundary = _normalize_fold_plan(
         fold_plan,
@@ -1975,7 +2032,7 @@ def _freeze_winner_search_plan(
         "causal_fold_plan": normalized_folds,
         "latest_evidence_boundary_utc": latest_boundary,
     }
-    if _generation is winner.V17_GENERATION:
+    if _generation.matched_floor_enabled:
         complexity = winner.validate_selection_complexity_roster(selection_complexity_roster,
             attempts=attempts, expected_count=len(attempts))
         precommitment.update(selection_addendum_contract=dict(winner.V17_SELECTION_ADDENDUM_CONTRACT),
@@ -3600,7 +3657,6 @@ def _validated_horizon_winner_cross_binding(
     schema = binding.get("schema_version")
     current_pair = bool(frozen.frozen_tier_pair_contract_bytes)
     transport_v16 = frozen.selection_generation is winner.V16_GENERATION
-    matched_v17 = frozen.selection_generation is winner.V17_GENERATION
     m5_window = None
     if current_pair:
         pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
@@ -3608,10 +3664,8 @@ def _validated_horizon_winner_cross_binding(
             [item["frozen_spread_tier"] for item in pair["tiers"]],
             symbol=frozen.symbol, timeframe=frozen.timeframe,
         )
-    historical_schema = (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 if matched_v17 else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if transport_v16
-        else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3 if current_pair else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
-    current_schema = (CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6 if matched_v17 else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5 if transport_v16
-        else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4 if current_pair else CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA)
+    historical_schema, current_schema = horizon_winner_cross_binding_schemas_for_generation(
+        frozen.selection_generation, current_pair=current_pair)
     if schema == historical_schema:
         mode = HISTORICAL_CROSS_BINDING_MODE
         expected_top = common_top | historical_fields
@@ -3743,7 +3797,7 @@ def _validated_horizon_winner_cross_binding(
     mapping = binding.get("mapping")
     frozen_horizon_contracts = _normalized_horizon_execution_contracts(
         frozen.horizon_execution_contracts,
-        expected_count=len(attempt_ledger["attempts"]),
+        expected_count=len(attempt_ledger["attempts"]), _generation=frozen.selection_generation,
     )
     if (
         type(mapping) is not list
@@ -5208,7 +5262,7 @@ def _verified_frozen_attempt_bundle(
     bundle = frozen.attempt_artifacts_bundle
     horizon_contracts = _normalized_horizon_execution_contracts(
         frozen.horizon_execution_contracts,
-        expected_count=len(bundle),
+        expected_count=len(bundle), _generation=frozen.selection_generation,
     )
     attempts = attempt_ledger.get("attempts")
     roster = frozen_receipt.get("artifact_roster")
@@ -5411,7 +5465,7 @@ def _restore_frozen_winner_search_plan(
     if (not isinstance(manifest_entries, (list, tuple))
             or not isinstance(body_bytes, (list, tuple))
             or len(manifest_entries) != len(body_bytes)
-            or not 1 <= len(manifest_entries) <= (11 if _bound_fit else 10) + 4 * winner.MAX_ATTEMPTS):
+            or not 1 <= len(manifest_entries) <= (11 if _bound_fit else 10) + 4 * _generation.max_attempts):
         _fail("FROZEN_PLAN_RESTORE_INPUT_ROSTER_INVALID")
     prefix = _artifact_prefix(namespace, normalized_timeframe, normalized_regime)
     frozen_prefix = f"{prefix}/frozen/"
@@ -5475,7 +5529,7 @@ def _restore_frozen_winner_search_plan(
     power_policy = body_for("trade_power_policy", "winner_trade_power_policy")
     multiplicity = body_for("multiplicity_receipt", "winner_trade_power_multiplicity")
     attempts = attempt_ledger.get("attempts")
-    if type(attempts) is not list or not 1 <= len(attempts) <= winner.MAX_ATTEMPTS:
+    if type(attempts) is not list or not 1 <= len(attempts) <= _generation.max_attempts:
         _fail("FROZEN_PLAN_RESTORE_ATTEMPTS_INVALID")
     logical_entries = {
         name: entries_by_id[frozen_prefix + name]
@@ -5516,7 +5570,7 @@ def _restore_frozen_winner_search_plan(
         _fail("FROZEN_PLAN_RECEIPT_MISMATCH")
     source_seeds, pair_contract, pair_hashes = _current_pair_inputs(source_seeds, pair_contract)
     normalized_horizons = _normalized_horizon_execution_contracts(horizon_contracts,
-        expected_count=len(attempts))
+        expected_count=len(attempts), _generation=_generation)
     stored_folds = precommitment.get("causal_fold_plan")
     if (type(stored_folds) is not list
             or any(type(fold) is not dict or set(fold) != {
@@ -5598,7 +5652,7 @@ def _restore_frozen_winner_search_plan(
         precommitted_evidence_roles=[attempt.get("precommitted_evidence_role") for attempt in attempts],
         horizon_execution_contracts=normalized_horizons,
         common_hashes={**pair_hashes, "risk_unit_contract_sha256": _sha_json(risk_contract)},
-        symbol=normalized_symbol, timeframe=normalized_timeframe, regime=normalized_regime)
+        symbol=normalized_symbol, timeframe=normalized_timeframe, regime=normalized_regime, _generation=_generation)
     if normalized_attempts != attempts:
         _fail("FROZEN_PLAN_RESTORE_BINDING_INVALID")
     return frozen
@@ -5621,14 +5675,14 @@ def verify_historical_frozen_winner_cross_binding(
         CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
         CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5,
         CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6,
+        CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V7,
     }:
         _fail("HISTORICAL_CROSS_BINDING_CURRENT_PLAN_FORBIDDEN")
     receipt = _decode_object(frozen.frozen_receipt_bytes, "FROZEN_RECEIPT_INVALID")
     if (receipt.get("schema_version") != _bound_frozen_schema(generation, bool(frozen.bound_fitted_state_entry_bytes))
             or not frozen.frozen_tier_pair_contract_bytes
-            or binding.get("schema_version") != (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
-                if generation is winner.V17_GENERATION else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
-                if generation is winner.V16_GENERATION else HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3)):
+            or binding.get("schema_version") != horizon_winner_cross_binding_schemas_for_generation(
+                generation)[0]):
         _fail("PROVENANCE_CROSS_BINDING_SCHEMA_INVALID")
     attempts = _verified_frozen_attempt_bundle(frozen=frozen,
         attempt_ledger=frozen.attempt_ledger, frozen_receipt=receipt)
@@ -5687,6 +5741,8 @@ def _verify_produced_winner_decision(decision, request, generation):
     reasons = body.get("reason_codes", ()) if type(body) is dict else ()
     detail = ",".join(reasons) if type(reasons) in (list, tuple) and all(
         type(reason) is str for reason in reasons) else ""
+    if generation is winner.V18_GENERATION:
+        _fail("WINNER_V18_DECISION_VERIFICATION_FAILED", detail)
     if generation is winner.V17_GENERATION:
         _fail("WINNER_V17_DECISION_VERIFICATION_FAILED", detail)
     if generation is winner.V16_GENERATION:
@@ -5738,7 +5794,7 @@ def _produce_winner_raw_evidence(
         _fail("FROZEN_TIER_PAIR_BINDING_INVALID")
     receipt = _decode_object(frozen.frozen_receipt_bytes, "FROZEN_RECEIPT_INVALID")
     horizon_contracts = _normalized_horizon_execution_contracts(frozen.horizon_execution_contracts,
-        expected_count=attempt_ledger.get("attempt_count"))
+        expected_count=attempt_ledger.get("attempt_count"), _generation=_generation)
     partition_precommits = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
         pair=pair_contract, attempts=attempt_ledger.get("attempts"), folds=precommitment.get("causal_fold_plan"))
     partition_sha = _sha_json(partition_precommits)
@@ -5834,7 +5890,7 @@ def _produce_winner_raw_evidence(
                 evidence_entries.append(
                     _evidence_entry(attempt, status=status, folds=[])
                 )
-                if _generation is winner.V17_GENERATION:
+                if _generation.matched_floor_enabled:
                     matched_entries.append({"ordinal": ordinal, "attempt_id": attempt["attempt_id"],
                         "process_candidate_id": attempt["process_candidate_id"], "stage_origin_binding": None, "partition_witnesses_descriptor": None,
                         "full_witnesses_sha256": None, "partition_statuses": [], "final_folds": []})
@@ -5842,7 +5898,7 @@ def _produce_winner_raw_evidence(
             if attempt["precommitted_evidence_role"] != "EVALUATION_REQUIRED":
                 _fail(f"ATTEMPT_{ordinal:04d}_PRESEARCH_REJECTED_CARRIES_RAW_FOLDS")
             if set(raw) != ({"attempt_id", "folds", "selection_addendum"}
-                    if _generation is winner.V17_GENERATION else {"attempt_id", "folds"}):
+                    if _generation.matched_floor_enabled else {"attempt_id", "folds"}):
                 _fail(f"ATTEMPT_{ordinal:04d}_EVIDENCE_SCHEMA_INVALID")
             raw_folds = raw.get("folds")
             planned_folds = precommitment["causal_fold_plan"]
@@ -5926,7 +5982,7 @@ def _produce_winner_raw_evidence(
                     folds=finalized_folds,
                 )
             )
-            if _generation is winner.V17_GENERATION:
+            if _generation.matched_floor_enabled:
                 added, proof_entries = _build_matched_floor_attempt_addendum(sink=sink,
                     frozen=frozen, attempt=attempt, witnesses=raw["selection_addendum"], raw_folds=raw_folds,
                     shared_axis=attempt_shared_axis, partition_cost_index=partition_cost_index,
@@ -5986,21 +6042,22 @@ def _produce_winner_raw_evidence(
         "evidence_scope": "PROCESS_LEVEL_ONLY",
         "parameter_evidence_inherited": False,
     }
-    if _generation is winner.V17_GENERATION:
+    if _generation.matched_floor_enabled:
         evidence_ledger["selection_addendum"] = {"contract_version": "fxpm.matched-floor-selection-evidence.v1",
             "precommitment_payload_sha256": _sha_json(precommitment),
             "attempt_ledger_payload_sha256": _sha_json(attempt_ledger),
             "selection_complexity_roster_sha256": precommitment["selection_complexity_roster_sha256"],
             "entries": matched_entries, "entries_sha256": _sha_json(matched_entries)}
     partition_cost_index.source_inputs.finish(frozen=frozen, sink=sink)
-    request_builder = (winner.create_winner_selection_request_v17 if _generation is winner.V17_GENERATION
+    request_builder = (winner.create_winner_selection_request_v18 if _generation is winner.V18_GENERATION
+        else winner.create_winner_selection_request_v17 if _generation is winner.V17_GENERATION
         else winner.create_winner_selection_request_v16 if _generation is winner.V16_GENERATION
         else winner.create_winner_selection_request)
     try:
         request = request_builder(precommitment, attempt_ledger, evidence_ledger)
     except ValueError as exc:
         raise WinnerRawEvidenceError(str(exc)) from exc
-    if _generation not in (winner.V16_GENERATION, winner.V17_GENERATION):
+    if _generation not in (winner.V16_GENERATION, winner.V17_GENERATION, winner.V18_GENERATION):
         if request is None:
             _fail("WINNER_V15_REQUEST_REJECTED")
         if len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes:
@@ -6012,8 +6069,8 @@ def _produce_winner_raw_evidence(
     )
     final_bodies = {
         "evidence-ledger": ("winner_evidence_ledger", evidence_ledger),
-        "winner-request": ("winner_v17_request" if _generation is winner.V17_GENERATION else "winner_v16_request" if _generation is winner.V16_GENERATION else "winner_v15_request", request.to_dict()),
-        "winner-decision": ("winner_v17_decision" if _generation is winner.V17_GENERATION else "winner_v16_decision" if _generation is winner.V16_GENERATION else "winner_v15_decision", decision.to_dict()),
+        "winner-request": ("winner_v18_request" if _generation is winner.V18_GENERATION else "winner_v17_request" if _generation is winner.V17_GENERATION else "winner_v16_request" if _generation is winner.V16_GENERATION else "winner_v15_request", request.to_dict()),
+        "winner-decision": ("winner_v18_decision" if _generation is winner.V18_GENERATION else "winner_v17_decision" if _generation is winner.V17_GENERATION else "winner_v16_decision" if _generation is winner.V16_GENERATION else "winner_v15_decision", decision.to_dict()),
     }
     if marginal is not None:
         final_bodies["book-marginal-receipt"] = (
@@ -6025,7 +6082,7 @@ def _produce_winner_raw_evidence(
             sink, f"{prefix}/{name}", artifact_type, body
         )
     production = {
-        "schema_version": V17_PRODUCTION_SCHEMA if _generation is winner.V17_GENERATION else V16_PRODUCTION_SCHEMA if _generation is winner.V16_GENERATION else CURRENT_PRODUCTION_SCHEMA,
+        "schema_version": raw_production_schema_for_generation(_generation),
         "generation_context_sha256": sink.context.context_sha256,
         "run_id": precommitment["run_id"],
         "artifact_namespace": frozen.artifact_namespace,
@@ -6320,10 +6377,10 @@ def _matched_floor_attempt_record(*, frozen, attempt, witnesses, origin, raw_fol
 
 def verify_matched_floor_publication_chain(context, *, frozen, request, producer_request,
         manifest_entries, cross_binding, source_material):
-    """Cold-replay v17 witnesses against original published lanes and reopened source."""
+    """Cold-replay matched-floor witnesses against original published lanes and reopened source."""
     import copy
     import pm_authoritative_search_execution as execution
-    if frozen.selection_generation is not winner.V17_GENERATION:
+    if not frozen.selection_generation.matched_floor_enabled:
         _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
     precommitment = request.precommitment.to_dict()
     ledger = request.evidence_ledger.to_dict()
@@ -6523,3 +6580,54 @@ def _expand_matched_floor_witnesses(packed, *, frozen, attempt, raw_folds, sourc
     if _sha_json(result) != packed["full_witnesses_sha256"]:
         _fail("MATCHED_FLOOR_EXPANDED_WITNESS_HASH_CHANGED")
     return result
+
+
+def freeze_winner_search_plan_v10(sink, *, symbol, timeframe, regime, precommitted_at_utc, attempts_frozen_at_utc,
+        fold_plan, attempt_artifacts, precommitted_evidence_roles, horizon_execution_contracts, source_contract_seeds,
+        frozen_tier_pair_contract, risk_unit_contract, partition_cost_precommitments, bound_fitted_state_entry,
+        selection_complexity_roster, artifact_namespace=None):
+    if bound_fitted_state_entry is None:
+        _fail("BOUND_FIT_REFERENCE_REQUIRED")
+    return _freeze_winner_search_plan(**locals(), _generation=winner.V18_GENERATION)
+
+
+def restore_frozen_winner_search_plan_v10(*, context_identity, symbol, timeframe, regime, artifact_namespace, manifest_entries, body_bytes):
+    return _restore_frozen_winner_search_plan(**locals(), _generation=winner.V18_GENERATION, _bound_fit=True)
+
+
+def produce_winner_v18_raw_evidence(sink, *, frozen, attempt_evidence, evidence_access_started_at_utc,
+        evidence_access_completed_at_utc, provenance_cross_binding_bytes=None, production_cell_search_plan=None,
+        production_search_process=None, artifact_namespace=None):
+    return _produce_winner_raw_evidence(**locals(), _generation=winner.V18_GENERATION)
+
+
+_BOUND_GENERATION_FORMATS = (
+    (winner.CURRENT_GENERATION, MappingProxyType({
+        "frozen_schema": BOUND_FIT_V15_FROZEN_PLAN_SCHEMA, "production_schema": CURRENT_PRODUCTION_SCHEMA,
+        "freezer": freeze_winner_search_plan_v6, "restorer": restore_frozen_winner_search_plan_v6,
+        "producer": produce_winner_v15_raw_evidence,
+        "cross_binding_schemas": (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3, CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4)})),
+    (winner.V16_GENERATION, MappingProxyType({
+        "frozen_schema": BOUND_FIT_V16_FROZEN_PLAN_SCHEMA, "production_schema": V16_PRODUCTION_SCHEMA,
+        "freezer": freeze_winner_search_plan_v7, "restorer": restore_frozen_winner_search_plan_v7,
+        "producer": produce_winner_v16_raw_evidence,
+        "cross_binding_schemas": (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4, CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5)})),
+    (winner.V17_GENERATION, MappingProxyType({
+        "frozen_schema": BOUND_FIT_V17_FROZEN_PLAN_SCHEMA, "production_schema": V17_PRODUCTION_SCHEMA,
+        "freezer": freeze_winner_search_plan_v9, "restorer": restore_frozen_winner_search_plan_v9,
+        "producer": produce_winner_v17_raw_evidence,
+        "cross_binding_schemas": (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5, CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6)})),
+    (winner.V18_GENERATION, MappingProxyType({
+        "frozen_schema": BOUND_FIT_V18_FROZEN_PLAN_SCHEMA, "production_schema": V18_PRODUCTION_SCHEMA,
+        "freezer": freeze_winner_search_plan_v10, "restorer": restore_frozen_winner_search_plan_v10,
+        "producer": produce_winner_v18_raw_evidence,
+        "cross_binding_schemas": (HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6, CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V7)})),
+)
+
+__all__.extend(["V18_PRODUCTION_SCHEMA", "BOUND_FIT_V18_FROZEN_PLAN_SCHEMA",
+    "HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6", "CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V7",
+    "freeze_winner_search_plan_v10", "restore_frozen_winner_search_plan_v10", "produce_winner_v18_raw_evidence",
+    "bound_frozen_plan_schema_for_generation", "raw_production_schema_for_generation",
+    "bound_frozen_plan_freezer_for_generation", "bound_frozen_plan_restorer_for_generation",
+    "raw_evidence_producer_for_generation", "horizon_winner_cross_binding_schemas_for_generation",
+    "frozen_plan_restorer_for_schema"])

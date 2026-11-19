@@ -145,6 +145,14 @@ def _checked_continuous_kernel(function):
             spreads = kwargs.get("owner_half_spreads", args[26] if len(args) > 26 else None)
             entries = args[7] if len(args) > 7 else kwargs["entry_prices"]
             _validate_continuous_arrays(len(opens), codes, spreads, entries)
+        session_codes = kwargs.get("session_owner_codes", args[30] if len(args) > 30 else None)
+        session_inside = kwargs.get("session_inside", args[31] if len(args) > 31 else None)
+        session_keys = kwargs.get("session_keys", args[32] if len(args) > 32 else None)
+        if session_codes is not None or session_inside is not None or session_keys is not None:
+            opens = args[0] if args else kwargs["open_arr"]
+            spreads = kwargs.get("owner_half_spreads", args[26] if len(args) > 26 else None)
+            _validate_session_kernel_arrays(len(opens), spreads.shape[0] if mark_open else 1,
+                session_codes, session_inside, session_keys)
         return function(*args, **kwargs)
     return checked
 
@@ -210,6 +218,101 @@ EXIT_NONE = 0
 EXIT_SL = 1
 EXIT_TP = 2
 EXIT_EOD = 3
+EXIT_SESSION = 4
+
+
+def _recorded_session_arrays(index, session_spec):
+    """Use recorded wall-clock labels; removing a timezone label does not shift stamps."""
+    if (not isinstance(index, pd.DatetimeIndex) or index.hasnans
+            or type(session_spec) is not tuple or len(session_spec) != 2
+            or any(type(value) is not int for value in session_spec)):
+        raise ValueError("SESSION_SPEC_OR_AXIS_INVALID")
+    anchor, length = session_spec
+    if not 0 <= anchor < 1440 or not 0 < length <= 1440:
+        raise ValueError("SESSION_SPEC_OR_AXIS_INVALID")
+    recorded = index.tz_localize(None) if index.tz is not None else index
+    minutes = recorded.hour.to_numpy() * 60 + recorded.minute.to_numpy()
+    inside = np.ascontiguousarray((minutes - anchor) % 1440 < length, dtype=np.bool_)
+    dates = (recorded - pd.Timedelta(minutes=anchor)).normalize()
+    keys = np.ascontiguousarray(dates.to_numpy(dtype="datetime64[ns]").view(np.int64))
+    return inside, keys
+
+
+def _prepare_session_execution(index, strategies, symbol, entry_owner_codes=None):
+    specs, owner_codes = [], []
+    spec_codes = {}
+    for strategy in strategies:
+        hook = getattr(strategy, "session_spec", None)
+        spec = hook(symbol) if callable(hook) else None
+        if spec is None:
+            owner_codes.append(-1)
+            continue
+        if (type(spec) is not tuple or len(spec) != 2
+                or any(type(value) is not int for value in spec)):
+            raise ValueError("SESSION_SPEC_OR_AXIS_INVALID")
+        code = spec_codes.get(spec)
+        if code is None:
+            code = len(specs)
+            inside, keys = _recorded_session_arrays(index, spec)
+            spec_codes[spec] = code
+            specs.append((spec, inside, keys))
+        owner_codes.append(code)
+    if not specs:
+        return None
+    inside = np.ascontiguousarray(np.stack([row[1] for row in specs]), dtype=np.bool_)
+    keys = np.ascontiguousarray(np.stack([row[2] for row in specs]), dtype=np.int64)
+    owner_codes = np.ascontiguousarray(owner_codes, dtype=np.int32)
+    bar_codes = np.full(len(index), -2, dtype=np.int32)
+    if entry_owner_codes is None:
+        bar_codes[:] = owner_codes[0]
+    else:
+        owned = entry_owner_codes >= 0
+        bar_codes[owned] = owner_codes[entry_owner_codes[owned]]
+    entry_mask = np.zeros(len(index), dtype=np.bool_)
+    entry_mask[1:] = bar_codes[1:] == -1
+    for code in range(len(specs)):
+        allowed = inside[code, 1:] & inside[code, :-1] & (keys[code, 1:] == keys[code, :-1])
+        entry_mask[1:] |= (bar_codes[1:] == code) & allowed
+    return {"specs": tuple(row[0] for row in specs), "owner_codes": owner_codes,
+        "inside": inside, "keys": keys, "entry_mask": entry_mask}
+
+
+def _validate_session_kernel_arrays(count, owner_count, codes, inside, keys):
+    if codes is None and inside is None and keys is None:
+        return
+    if not (isinstance(codes, np.ndarray) and codes.dtype == np.dtype("int32")
+            and codes.shape == (owner_count,) and codes.flags.c_contiguous
+            and isinstance(inside, np.ndarray) and inside.dtype == np.dtype("bool")
+            and inside.ndim == 2 and inside.shape[0] > 0 and inside.shape[1] == count
+            and inside.flags.c_contiguous and isinstance(keys, np.ndarray)
+            and keys.dtype == np.dtype("int64") and keys.shape == inside.shape
+            and keys.flags.c_contiguous and (codes >= -1).all()
+            and (codes < inside.shape[0]).all()):
+        raise ValueError("SESSION_EXECUTION_ARRAYS_INVALID")
+
+
+def _session_execution_metadata(context, trades, opens, half_spreads, use_spread,
+        entry_owner_codes=None, owner_half_spreads=None):
+    if context is None:
+        return None
+    exit_halves, exit_opens = [], []
+    for trade in trades:
+        if trade["exit_reason"] != TradeStatus.CLOSED_SESSION.value:
+            exit_halves.append(None)
+            exit_opens.append(None)
+            continue
+        bar = int(trade["exit_bar"])
+        owner = int(entry_owner_codes[int(trade["entry_bar"])]) if entry_owner_codes is not None else 0
+        half = (owner_half_spreads[owner, bar] if owner_half_spreads is not None else half_spreads[bar])
+        exit_halves.append(float(half) if use_spread else 0.0)
+        exit_opens.append(float(opens[bar]))
+    return {"schema_version": "fxpm.backtest-session-execution.v1", "clock": "AS_RECORDED",
+        "specs": [{"anchor_minutes": spec[0], "length_minutes": spec[1],
+            "in_session": context["inside"][code].tolist(),
+            "session_keys": context["keys"][code].tolist()}
+            for code, spec in enumerate(context["specs"])],
+        "owner_spec_codes": context["owner_codes"].tolist(),
+        "exit_half_spreads": exit_halves, "exit_open_prices": exit_opens}
 
 # Trade records emitted after this version include per-trade MAE/MFE and
 # underwater timing fields. Older artifacts without this field must not be
@@ -1618,6 +1721,9 @@ def _backtest_loop_numba(
     mark_open: bool = False,
     terminal_float_out=None,
     terminal_int_out=None,
+    session_owner_codes=None,
+    session_inside=None,
+    session_keys=None,
 ) -> Tuple:
     """
     Numba JIT-compiled backtest loop for 3-10x speedup.
@@ -1692,6 +1798,8 @@ def _backtest_loop_numba(
     
     in_position = False
     held_owner_code = -1
+    held_session_code = -1
+    entry_session_key = 0
     position_direction = 0
     entry_price = 0.0
     entry_bar = 0
@@ -1764,9 +1872,19 @@ def _backtest_loop_numba(
                 accrued_swap_dollars_current += swap_cashflow
         
         if in_position:
+            session_exit_now = False
+            if (session_owner_codes is not None and session_inside is not None and session_keys is not None
+                    and held_session_code >= 0 and i > entry_bar):
+                session_exit_now = (not session_inside[held_session_code, i]
+                    or session_keys[held_session_code, i] != entry_session_key)
             bars_held_now = i - entry_bar
             if pip_size > 0.0:
-                if position_direction == 1:
+                if session_exit_now:
+                    open_mark = bid_open if position_direction == 1 else ask_open
+                    adverse_pips = (entry_price - open_mark) * position_direction / pip_size
+                    favorable_pips = (open_mark - entry_price) * position_direction / pip_size
+                    close_mark_pips = 0.0
+                elif position_direction == 1:
                     adverse_pips = (entry_price - bid_low) / pip_size
                     favorable_pips = (bid_high - entry_price) / pip_size
                     close_mark_pips = (bid_close - entry_price) / pip_size
@@ -1786,7 +1904,11 @@ def _backtest_loop_numba(
             exit_price = -1.0
             exit_reason = EXIT_NONE
 
-            if position_direction == 1:
+            if session_exit_now:
+                exit_price = bid_open if position_direction == 1 else ask_open
+                exit_reason = EXIT_SESSION
+                entry_allowed_at_open = True
+            elif position_direction == 1:
                 if bid_open <= stop_loss:
                     exit_price = bid_open
                     exit_reason = EXIT_SL
@@ -1846,7 +1968,19 @@ def _backtest_loop_numba(
 
         if entry_allowed_at_open and (not in_position) and i >= warmup_bars:
             signal = sig_arr[i - 1]
-            if signal != 0:
+            candidate_session_code = -1
+            session_entry_allowed = True
+            if session_owner_codes is not None and session_inside is not None and session_keys is not None:
+                session_owner = entry_owner_codes[i] if mark_open and entry_owner_codes is not None else 0
+                if session_owner < 0:
+                    session_entry_allowed = False
+                else:
+                    candidate_session_code = session_owner_codes[session_owner]
+                    if candidate_session_code >= 0:
+                        session_entry_allowed = (session_inside[candidate_session_code, i]
+                            and session_inside[candidate_session_code, i - 1]
+                            and session_keys[candidate_session_code, i] == session_keys[candidate_session_code, i - 1])
+            if signal != 0 and session_entry_allowed:
                 direction = signal
                 signal_bar_index = i - 1
                 entry_price_candidate = entry_prices[i]
@@ -1929,6 +2063,9 @@ def _backtest_loop_numba(
                 in_position = True
                 position_direction = direction
                 entry_bar = i
+                held_session_code = candidate_session_code
+                if session_keys is not None and held_session_code >= 0:
+                    entry_session_key = session_keys[held_session_code, i]
                 signal_bar = signal_bar_index
                 daily_swap_per_lot_current = (
                     swap_long_per_lot_arr[i]
@@ -3888,6 +4025,7 @@ class TradeStatus(Enum):
     CLOSED_SIGNAL = "closed_signal"
     CLOSED_TIME = "closed_time"
     CLOSED_EOD = "end_of_data"
+    CLOSED_SESSION = "closed_session"
 
 
 # =============================================================================
@@ -8638,6 +8776,8 @@ class Backtester:
         for i in range(1, len(features)):
             code = context["codes"][i]
             opportunities[i] = code >= 0 and context["owners"][code][2].iat[i - 1] != 0
+        if "session_entry_mask" in context:
+            opportunities &= context["session_entry_mask"]
         admission = context["admission"]
         tier_counts = {}
         for code, row in enumerate(context["owners"]):
@@ -8715,6 +8855,7 @@ class Backtester:
                 raise ValueError("FROZEN_SPREAD_REQUIRES_CONSERVATIVE_MAX")
             spread_tier.validate_execution(symbol, timeframe, spec.point)
         continuous = None
+        recorded_session_index = features.index if isinstance(features, pd.DataFrame) else None
         if terminal_policy not in {"LIQUIDATE", "MARK_OPEN"}:
             raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_TERMINAL_POLICY_INVALID")
         if entry_schedule is not None:
@@ -9020,6 +9161,17 @@ class Backtester:
             sl_prices[refused] = np.nan
             tp_prices[refused] = np.nan
 
+        session_context = _prepare_session_execution(recorded_session_index,
+            [strategy] if continuous is None else [row[0].strategy for row in continuous["owners"]],
+            symbol, None if continuous is None else continuous["codes"])
+        if session_context is not None:
+            refused_session = ~session_context["entry_mask"]
+            entry_prices[refused_session] = np.nan
+            sl_prices[refused_session] = np.nan
+            tp_prices[refused_session] = np.nan
+            if continuous is not None:
+                continuous["session_entry_mask"] = session_context["entry_mask"]
+
         # RUN BACKTEST LOOP (Numba JIT or Pure Python)
         # ----------------------------------------------------------------
         discovery_risk_per_trade_pct = self._discovery_risk_per_trade_pct()
@@ -9037,12 +9189,15 @@ class Backtester:
             timeframe=timeframe,
         )
         kernel_extra = {}
+        if session_context is not None:
+            kernel_extra.update(session_owner_codes=session_context["owner_codes"],
+                session_inside=session_context["inside"], session_keys=session_context["keys"])
         if continuous is not None:
             if self.config.swap_model_enabled and not causal_swap_enabled:
                 raise ContinuousAccountExecutionError("CONTINUOUS_ACCOUNT_CAUSAL_SWAP_REQUIRED")
             floats = np.full(CONTINUOUS_TERMINAL_FLOAT_COUNT, np.nan, dtype=np.float64)
             integers = np.full(CONTINUOUS_TERMINAL_INT_COUNT, -1, dtype=np.int64)
-            kernel_extra = dict(entry_owner_codes=continuous["codes"], owner_half_spreads=continuous["half_spreads"],
+            kernel_extra.update(entry_owner_codes=continuous["codes"], owner_half_spreads=continuous["half_spreads"],
                 mark_open=True, terminal_float_out=floats, terminal_int_out=integers)
             finite = np.isfinite(entry_prices)
             side = np.zeros(n_bars, dtype=np.int32)
@@ -9091,7 +9246,8 @@ class Backtester:
                 EXIT_NONE: "none",
                 EXIT_SL: TradeStatus.CLOSED_SL.value,
                 EXIT_TP: TradeStatus.CLOSED_TP.value,
-                EXIT_EOD: TradeStatus.CLOSED_EOD.value
+                EXIT_EOD: TradeStatus.CLOSED_EOD.value,
+                EXIT_SESSION: TradeStatus.CLOSED_SESSION.value
             }
             
             trades = []
@@ -9162,8 +9318,13 @@ class Backtester:
             )
         
         if continuous is not None:
-            return self._continuous_account_result(continuous, features, spec, trades, equity_curve,
+            account_result = self._continuous_account_result(continuous, features, spec, trades, equity_curve,
                 max_drawdown, floats, integers, swap_accrual_contract)
+            if session_context is not None:
+                account_result["session_execution"] = _session_execution_metadata(session_context, trades,
+                    open_arr, half_spread_arr, self.config.use_spread,
+                    continuous["codes"], continuous["half_spreads"])
+            return account_result
         if bool(getattr(self.config, "swap_model_enabled", True)) and not causal_swap_enabled:
             trades, final_equity, max_drawdown, equity_curve = self._apply_swap_model(
                 trades,
@@ -9234,6 +9395,8 @@ class Backtester:
         if admission_states is not None:
             opportunities = np.zeros(n_bars, dtype=bool)
             opportunities[max(1, warmup_bars):] = sig_arr[max(1, warmup_bars) - 1:-1] != 0
+            if session_context is not None:
+                opportunities &= session_context["entry_mask"]
             for trade in trades:
                 trade["entry_spread_admission"] = str(admission_states[int(trade["entry_bar"])])
             metrics["spread_admission"] = {
@@ -9264,6 +9427,9 @@ class Backtester:
                 spec=spec,
             )
         )
+        if session_context is not None:
+            metrics["session_execution"] = _session_execution_metadata(session_context, trades,
+                open_arr, half_spread_arr, self.config.use_spread)
         return metrics
 
     def run_frozen_spread_tiers(
@@ -9818,7 +9984,8 @@ class Backtester:
                          pre_open_rollover_units_arr: Optional[np.ndarray] = None,
                          entry_owner_codes=None, owner_half_spreads=None, mark_open=False,
                          terminal_float_out=None, terminal_int_out=None,
-                         _exact_trade_facts_out=None) -> Tuple[List[Dict], float, float, List[float]]:
+                         _exact_trade_facts_out=None,
+                          session_owner_codes=None, session_inside=None, session_keys=None) -> Tuple[List[Dict], float, float, List[float]]:
         """
         Pure Python backtest loop (fallback when Numba not available).
         
@@ -9829,6 +9996,8 @@ class Backtester:
         _validate_continuous_buffers(mark_open, terminal_float_out, terminal_int_out)
         if mark_open:
             _validate_continuous_arrays(len(open_arr), entry_owner_codes, owner_half_spreads, entry_prices)
+        _validate_session_kernel_arrays(len(open_arr), owner_half_spreads.shape[0] if mark_open else 1,
+            session_owner_codes, session_inside, session_keys)
         equity = self.config.initial_capital
         peak_equity = equity
         max_drawdown = 0.0
@@ -9839,6 +10008,8 @@ class Backtester:
         # Position state
         in_position = False
         held_owner_code = -1
+        held_session_code = -1
+        entry_session_key = 0
         position_direction = 0
         entry_price = 0.0
         entry_bar = 0
@@ -9996,10 +10167,23 @@ class Backtester:
             
             # CHECK EXITS FOR OPEN POSITIONS
             if in_position:
+                session_exit_now = (session_owner_codes is not None and session_inside is not None
+                    and session_keys is not None and held_session_code >= 0 and i > entry_bar
+                    and (not session_inside[held_session_code, i]
+                        or session_keys[held_session_code, i] != entry_session_key))
                 governance_exit_price = None
                 governance_exit_reason = None
                 governance_open_excursion_updated = False
-                if governance_policy:
+                if session_exit_now:
+                    (mae_pips_current, mfe_pips_current,
+                        time_to_mae_bars_current, time_to_mfe_bars_current) = _update_open_excursion(
+                            position_direction, entry_price, max(0, i - entry_bar),
+                            mae_pips_current, mfe_pips_current,
+                            time_to_mae_bars_current, time_to_mfe_bars_current)
+                    governance_exit_price = bid_open if position_direction == 1 else ask_open
+                    governance_exit_reason = TradeStatus.CLOSED_SESSION.value
+                    entry_allowed_at_open = True
+                if governance_policy and not session_exit_now:
                     prev_bar = i - 1
                     if prev_bar >= entry_bar:
                         highest_since_entry = max(highest_since_entry, float(high_arr[prev_bar]))
@@ -10288,8 +10472,19 @@ class Backtester:
             # CHECK ENTRIES
             if entry_allowed_at_open and not in_position and i >= warmup_bars:
                 signal = sig_arr[i - 1]
-                
-                if signal != 0:
+                candidate_session_code = -1
+                session_entry_allowed = True
+                if session_owner_codes is not None and session_inside is not None and session_keys is not None:
+                    session_owner = int(entry_owner_codes[i]) if mark_open and entry_owner_codes is not None else 0
+                    if session_owner < 0:
+                        session_entry_allowed = False
+                    else:
+                        candidate_session_code = int(session_owner_codes[session_owner])
+                        if candidate_session_code >= 0:
+                            session_entry_allowed = (session_inside[candidate_session_code, i]
+                                and session_inside[candidate_session_code, i - 1]
+                                and session_keys[candidate_session_code, i] == session_keys[candidate_session_code, i - 1])
+                if signal != 0 and session_entry_allowed:
                     # Use pre-computed entry/stop prices
                     if not np.isnan(entry_prices[i]) and not np.isnan(sl_prices[i]) and (not mark_open or not np.isnan(tp_prices[i])):
                         direction = int(signal)
@@ -10350,6 +10545,9 @@ class Backtester:
                             in_position = True
                             position_direction = direction
                             entry_bar = i
+                            held_session_code = candidate_session_code
+                            if session_keys is not None and held_session_code >= 0:
+                                entry_session_key = int(session_keys[held_session_code, i])
                             signal_bar = i - 1
                             daily_swap_per_lot_current = (
                                 float(swap_long_per_lot_arr[i])

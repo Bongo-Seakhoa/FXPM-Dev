@@ -1090,14 +1090,15 @@ def _bounded_canary_failure_diagnostic(
     attempt_ordinal: Any,
     fold_ordinal: Any,
     attempted_trials_exact: int,
+    attempt_limit: int = winner_selection.MAX_ATTEMPTS,
 ) -> dict[str, Any]:
-    """Validate the small diagnostic carried by a non-authorizing canary failure."""
+    """Validate the small diagnostic without changing its authority scope."""
 
     if (
         type(attempted_trials_exact) is not int
         or not 0
         <= attempted_trials_exact
-        <= winner_selection.MAX_ATTEMPTS
+        <= attempt_limit
     ):
         _fail("CANARY_FAILURE_ATTEMPT_COUNT_INVALID")
     if exception_type is not None:
@@ -2096,12 +2097,8 @@ def _cross_binding_body_m5(
     for value in winner_roster.values():
         _hex64(value, "WINNER_CROSS_BINDING_ROSTER_INVALID")
     return {
-        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
-                           if generation is winner_selection.V17_GENERATION
-                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
-                           if generation is winner_selection.V16_GENERATION
-                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3
-                           if current_costs else HORIZON_WINNER_CROSS_BINDING_SCHEMA),
+        "schema_version": raw_winner.horizon_winner_cross_binding_schemas_for_generation(
+            generation, current_pair=current_costs)[0],
         "producer_request_sha256": producer_request_sha256,
         "anchor_id": anchor_id,
         "selection_cutoff_utc": plan["anchor"]["selection_cutoff_utc"],
@@ -2910,12 +2907,8 @@ def _cross_binding_body(
     for value in winner_roster.values():
         _hex64(value, "WINNER_CROSS_BINDING_ROSTER_INVALID")
     return {
-        "schema_version": (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
-                           if generation is winner_selection.V17_GENERATION
-                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
-                           if generation is winner_selection.V16_GENERATION
-                           else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3
-                           if current_costs else HORIZON_WINNER_CROSS_BINDING_SCHEMA),
+        "schema_version": raw_winner.horizon_winner_cross_binding_schemas_for_generation(
+            generation, current_pair=current_costs)[0],
         "producer_request_sha256": producer_request_sha256,
         "anchor_id": anchor_id,
         "selection_cutoff_utc": plan["anchor"]["selection_cutoff_utc"],
@@ -3075,7 +3068,7 @@ class HistoricalSymbolSearchCapture:
         symbol: str,
         *, _winner_generation: Any = None,
     ) -> None:
-        if not any(_winner_generation is known for known in (None, winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION, winner_selection.V17_GENERATION)):
+        if _winner_generation is not None and not winner_selection.is_supported_current_generation(_winner_generation):
             _fail("WINNER_CAPTURE_GENERATION_INVALID")
         self._winner_generation = _winner_generation or winner_selection.CURRENT_GENERATION
         if type(context) is not authority_spool.GenerationSpoolContext:
@@ -3226,21 +3219,11 @@ class HistoricalSymbolSearchCapture:
         attempts = frozen.attempt_ledger.get("attempts")
         if type(attempts) is not list:
             _fail("WINNER_FROZEN_ATTEMPT_ROSTER_INVALID")
-        if receipt.get("schema_version") in {
-            raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA,
-            raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA,
-            raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA,
-        }:
+        if raw_winner.frozen_plan_restorer_for_schema(receipt.get("schema_version"), bound_only=True) is not None:
             if type(self) is not DeclaredSlotSearchCapture:
                 _fail("BOUND_FIT_CANARY_OR_LEGACY_CAPTURE_FORBIDDEN")
             _verify_declared_slot_capture(self)
-            expected_schema = (
-                raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA
-                if self._winner_generation is winner_selection.V17_GENERATION
-                else raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA
-                if self._winner_generation is winner_selection.V16_GENERATION
-                else raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA
-            )
+            expected_schema = raw_winner.bound_frozen_plan_schema_for_generation(self._winner_generation)
             if receipt.get("schema_version") != expected_schema:
                 _fail("WINNER_FROZEN_RECEIPT_SCHEMA_INVALID")
             reference = frozen.bound_fitted_state_entry
@@ -3324,7 +3307,7 @@ class HistoricalSymbolSearchCapture:
         if key in self._evidence:
             _fail("CELL_CAPTURE_DUPLICATED")
         state_factory = (book.create_matched_floor_historical_process_state_decision
-                         if getattr(self, "_winner_generation", None) is winner_selection.V17_GENERATION
+                         if self._winner_generation.matched_floor_enabled
                          else book.create_transport_historical_process_state_decision
                          if getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
                          else book.create_historical_process_state_decision)
@@ -3342,6 +3325,8 @@ class HistoricalSymbolSearchCapture:
             process_rejection_decision=process_rejection_decision,
             horizon_winner_cross_binding_bytes=horizon_winner_cross_binding_bytes,
             winner_raw_production_receipt_bytes=winner_raw_production_receipt_bytes,
+            **({"winner_generation": self._winner_generation}
+                if self._winner_generation.matched_floor_enabled else {}),
         )
         if state is None:
             _fail("PROCESS_STATE_DECISION_REJECTED")
@@ -3726,7 +3711,7 @@ class HistoricalSymbolSearchCapture:
             self._horizon_plan_bodies[key], len(normalized_attempts)
         )
         transport = getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
-        matched = getattr(self, "_winner_generation", None) is winner_selection.V17_GENERATION
+        matched = self._winner_generation.matched_floor_enabled
         freeze = raw_winner.freeze_winner_search_plan_v5 if transport else raw_winner.freeze_winner_search_plan_v4
         if type(self) is DeclaredSlotSearchCapture and (
             type(bound_fitted_state_entry) is not dict or not bound_fitted_state_entry
@@ -3735,14 +3720,12 @@ class HistoricalSymbolSearchCapture:
         if bound_fitted_state_entry is not None:
             if type(self) is not DeclaredSlotSearchCapture:
                 _fail("BOUND_FIT_CANARY_OR_LEGACY_CAPTURE_FORBIDDEN")
-            freeze = raw_winner.freeze_winner_search_plan_v7 if transport else raw_winner.freeze_winner_search_plan_v6
+            freeze = raw_winner.bound_frozen_plan_freezer_for_generation(self._winner_generation)
         if matched:
             _verify_declared_slot_capture(self)
             if bound_fitted_state_entry is None:
                 _fail("MATCHED_FLOOR_BOUND_FIT_REQUIRED")
-            freeze = raw_winner.freeze_winner_search_plan_v9
-        produce = (raw_winner.produce_winner_v17_raw_evidence if matched else
-            raw_winner.produce_winner_v16_raw_evidence if transport else raw_winner.produce_winner_v15_raw_evidence)
+        produce = raw_winner.raw_evidence_producer_for_generation(self._winner_generation)
         if not _raw_namespace_supported(freeze) or not _raw_namespace_supported(produce):
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
         try:
@@ -3923,11 +3906,7 @@ class HistoricalSymbolSearchCapture:
             or handle.cross_binding_descriptor["format"] != raw_winner.ASCII_JSON_FORMAT
         ):
             _fail("HORIZON_WINNER_CROSS_BINDING_REPLAY_FAILED")
-        produce = (raw_winner.produce_winner_v17_raw_evidence
-                   if handle.frozen.selection_generation is winner_selection.V17_GENERATION
-                   else raw_winner.produce_winner_v16_raw_evidence
-                   if handle.frozen.selection_generation is winner_selection.V16_GENERATION
-                   else raw_winner.produce_winner_v15_raw_evidence)
+        produce = raw_winner.raw_evidence_producer_for_generation(handle.frozen.selection_generation)
         if not _raw_namespace_supported(produce):
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
         try:
@@ -4884,8 +4863,11 @@ def _rebuild_winner_pair(
         maximum_bytes=winner_selection.MAX_SUPPORTED_WINNER_REQUEST_BYTES,
         code="WORKER_WINNER_REQUEST_REOPEN_FAILED",
     )
-    if (request_body.get("contract_version") not in (winner_selection.V16_GENERATION.request_version, winner_selection.V17_GENERATION.request_version)
-            and len(request_bytes) > winner_selection.MAX_REQUEST_BYTES):
+    try:
+        request_limit = winner_selection.winner_request_byte_limit(request_body.get("contract_version"))
+    except ValueError as exc:
+        raise HistoricalProductionAdapterError("WORKER_WINNER_REQUEST_REOPEN_FAILED") from exc
+    if len(request_bytes) > request_limit:
         _fail("WORKER_WINNER_REQUEST_REOPEN_FAILED")
     if set(request_body) != {
         "contract_version",
@@ -4960,13 +4942,12 @@ def _verify_worker_production_receipt(
         code="WORKER_PRODUCTION_RECEIPT_REOPEN_FAILED",
     )
     roster = body.get("artifact_roster")
+    generation = winner_selection.winner_generation_for_precommitment(request.precommitment.to_dict())
+    production_schemas = ({raw_winner.PRODUCTION_SCHEMA, raw_winner.CURRENT_PRODUCTION_SCHEMA}
+        if generation.archived or generation is winner_selection.CURRENT_GENERATION
+        else {raw_winner.raw_production_schema_for_generation(generation)})
     if (
-        body.get("schema_version") not in (
-            {raw_winner.V17_PRODUCTION_SCHEMA}
-            if request.to_dict()["contract_version"] == winner_selection.V17_GENERATION.request_version
-            else {raw_winner.V16_PRODUCTION_SCHEMA}
-            if request.to_dict()["contract_version"] == winner_selection.V16_GENERATION.request_version
-            else {raw_winner.PRODUCTION_SCHEMA, raw_winner.CURRENT_PRODUCTION_SCHEMA})
+        body.get("schema_version") not in production_schemas
         or body.get("generation_context_sha256") != context.context_sha256
         or body.get("symbol") != symbol
         or body.get("timeframe") != timeframe
@@ -5423,8 +5404,13 @@ def reopen_historical_symbol_worker_bundle(
             ):
                 _fail("WORKER_PROCESS_CELL_SPLICE")
             binding_schema = (process_payload.get("insufficient_evidence_binding") or {}).get("schema_version")
+            binding_generation = (book.book_generation_for_insufficient_schema(binding_schema)
+                if binding_schema is not None else None)
+            matched_generation = (binding_generation.winner_generation
+                if binding_generation is not None and binding_generation.winner_generation.matched_floor_enabled
+                else None)
             state_factory = (book.create_matched_floor_historical_process_state_decision
-                if binding_schema == book.V17_GENERATION.insufficient_schema
+                if matched_generation is not None
                 else book.create_transport_historical_process_state_decision
                 if binding_schema == book.V16_GENERATION.insufficient_schema else book.create_historical_process_state_decision)
             process_decision = state_factory(
@@ -5441,6 +5427,7 @@ def reopen_historical_symbol_worker_bundle(
                 process_rejection_decision=rejection_decision,
                 horizon_winner_cross_binding_bytes=cross_bytes,
                 winner_raw_production_receipt_bytes=production_bytes,
+                **({"winner_generation": matched_generation} if matched_generation is not None else {}),
             )
             if (
                 process_decision is None
@@ -6858,9 +6845,11 @@ def _declared_slot_failure_entry(capture, *, failure_code, attempted_trials_exac
                                  handle=None, search_outcome=None, exception_type=None,
                                  failure_details=(), attempt_ordinal=None, fold_ordinal=None):
     body = capture.request_body
+    import pm_production_search_planner as planner
     diagnostic = _bounded_canary_failure_diagnostic(exception_type=exception_type,
         failure_details=failure_details, attempt_ordinal=attempt_ordinal,
-        fold_ordinal=fold_ordinal, attempted_trials_exact=attempted_trials_exact)
+        fold_ordinal=fold_ordinal, attempted_trials_exact=attempted_trials_exact,
+        attempt_limit=planner.process_attempt_count(capture.process))
     failure = {"schema_version": "fxpm.declared-slot-technical-failure.v1",
         "request_sha256": capture.request.receipt_sha256,
         **{k: body[k] for k in ("cell_id", "slot_id", "symbol", "timeframe", "regime")},
@@ -6901,8 +6890,7 @@ def _make_declared_slot_capture_authority():
         import pm_historical_search_producer as producer
         if type(value) is not DeclaredSlotSearchCapture or any(not hasattr(value, k) for k in ("_capture_tag", "context", "request", "source_session", "cell_plan", "fitted_timeframe", "pipeline_config", "_bindings", "_horizon_plan_bodies", "process", "sink", "_source", "_fit", "_horizon_plans", "raw_artifact_namespace", "anchor", "symbol", "regime", "request_body")):
             _fail("DECLARED_SLOT_CAPTURE_INVALID")
-        if not any(getattr(value, "_winner_generation", None) is known
-                   for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION, winner_selection.V17_GENERATION)):
+        if not winner_selection.is_supported_current_generation(getattr(value, "_winner_generation", None)):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
         if not hmac.compare_digest(value._capture_tag, tag(value)):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
@@ -6933,10 +6921,11 @@ def _make_declared_slot_capture_authority():
         if (plan.mode != "DECLARED_SLOT_UNISSUED" or plan._declared_slot_request is not request
                 or (plan.symbol, plan.timeframe, plan.regime) != (body["symbol"], body["timeframe"], body["regime"])):
             _fail("DECLARED_SLOT_CAPTURE_BINDING_MISMATCH")
-        if not any(_winner_generation is known for known in (winner_selection.CURRENT_GENERATION, winner_selection.V16_GENERATION, winner_selection.V17_GENERATION)):
+        if not winner_selection.is_supported_current_generation(_winner_generation):
             _fail("WINNER_CAPTURE_GENERATION_INVALID")
-        if _winner_generation is winner_selection.V17_GENERATION:
-            if planner.frozen_search_execution_edition(context, process) != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
+        if _winner_generation.matched_floor_enabled:
+            if (not planner.is_route_a_full_panel_process(process)
+                    or _winner_generation is not planner.full_panel_generation(process)):
                 _fail("MATCHED_FLOOR_FROZEN_EXECUTION_EDITION_REQUIRED")
         value = object.__new__(DeclaredSlotSearchCapture)
         value._winner_generation = _winner_generation
@@ -7443,7 +7432,7 @@ def _verify_declared_m5_slot_post_source_chain(context, *, precommit, process, c
                 "winner_request_sha256", "winner_decision_sha256")):
             _fail("DECLARED_SLOT_COMPLETION_INVALID")
         if completion["status"] == "STOP":
-            failure = _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries)
+            failure = _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries, process=process)
             if frozen is not None and failure["attempted_trials_exact"] != frozen.attempt_ledger["attempt_count"]:
                 _fail("DECLARED_SLOT_FAILURE_INVALID")
         elif completion.get("technical_failure_entry") is not None:
@@ -7478,9 +7467,7 @@ def _verify_declared_m5_slot_post_source_chain(context, *, precommit, process, c
         request=wr, decision=wd, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
     production = json.loads(production_bytes)
     if (set(production) != {"schema_version", "generation_context_sha256", "run_id", "artifact_namespace", "symbol", "timeframe", "regime", "precommitment_sha256", "attempt_ledger_sha256", "provenance_cross_binding_sha256", "evidence_ledger_sha256", "request_sha256", "decision_receipt_sha256", "artifact_roster"}
-            or production.get("schema_version") != (raw_winner.V17_PRODUCTION_SCHEMA
-                if frozen.selection_generation is winner_selection.V17_GENERATION else raw_winner.V16_PRODUCTION_SCHEMA
-                if frozen.selection_generation is winner_selection.V16_GENERATION else raw_winner.CURRENT_PRODUCTION_SCHEMA)
+            or production.get("schema_version") != raw_winner.raw_production_schema_for_generation(frozen.selection_generation)
             or production.get("precommitment_sha256") != wr.precommitment.payload_sha256
             or production.get("attempt_ledger_sha256") != wr.attempt_ledger.payload_sha256
             or production.get("evidence_ledger_sha256") != wr.evidence_ledger.payload_sha256
@@ -7542,6 +7529,8 @@ def _read_declared_m5_headerless_plan(context, *, request, process, completion, 
     body = orchestration.verify_declared_slot_producer_request(context, request, process=process)
     planner.verify_frozen_production_search_process(context, process)
     planner._require_current_process(process)
+    process_body = process.to_dict()
+    attempt_count = planner.process_attempt_count(process_body)
     transport, saved_horizon = completion["plan_transport"], completion["horizon_plan"]
     if (set(transport) != {"cell_receipt", "spool_entry", "attempt_artifacts", "state_requirements"}
             or set(saved_horizon) != {"descriptor", "receipt_sha256"}
@@ -7563,7 +7552,7 @@ def _read_declared_m5_headerless_plan(context, *, request, process, completion, 
     expected = {"source_kind": "m5_derived", "mode": "DECLARED_SLOT_UNISSUED",
         "authority_scope": "FROZEN_CELL_SEARCH_PLAN_ONLY",
         "artifact_namespace": body["artifact_namespace"], "generation_id": context.generation_id,
-        "generation_context_sha256": context.context_sha256, "run_id": process.to_dict()["run_id"],
+        "generation_context_sha256": context.context_sha256, "run_id": process_body["run_id"],
         "causal_process_precommit_receipt_sha256": body["precommit_sha256"],
         "search_process_receipt_sha256": process.receipt_sha256,
         "declared_slot_request_sha256": request.receipt_sha256,
@@ -7597,12 +7586,12 @@ def _read_declared_m5_headerless_plan(context, *, request, process, completion, 
         anchor=horizon_body["anchor"], canary_request_body=None)
     attempts, states = transport["attempt_artifacts"], transport["state_requirements"]
     if (type(attempts) is not list or type(states) is not list
-            or len(attempts) != planner.ATTEMPT_COUNT or len(states) != planner.ATTEMPT_COUNT
+            or len(attempts) != attempt_count or len(states) != attempt_count
             or any(type(value) is not dict for value in (*attempts, *states))):
         _fail("DECLARED_M5_HEADERLESS_ROSTER_INVALID")
     attempt_hashes = [_sha256(value) for value in attempts]
     state_hashes = [value.get("requirement_sha256") for value in states]
-    if (receipt["attempt_count"] != planner.ATTEMPT_COUNT
+    if (receipt["attempt_count"] != attempt_count
             or receipt["attempt_artifact_sha256"] != attempt_hashes
             or receipt["attempt_roster_sha256"] != _sha256(attempt_hashes)
             or receipt["state_requirement_sha256"] != state_hashes
@@ -7612,7 +7601,7 @@ def _read_declared_m5_headerless_plan(context, *, request, process, completion, 
             or receipt["state_error_envelope"].get("regime_parameters_sha256") != fit.to_dict()["regime_params_sha256"]):
         _fail("DECLARED_M5_HEADERLESS_PLAN_BINDING_MISMATCH")
     # Original pure state replay and actual PRICE-window attempt/count checks; no detector/refit.
-    planner._verify_state_context_plan_binding(process_body=process.to_dict(), receipt=receipt,
+    planner._verify_state_context_plan_binding(process_body=process_body, receipt=receipt,
         attempts=attempts, states=states, horizon_plan=horizon,
         boundary_limited=receipt["boundary_limited"], timeframe=body["timeframe"], m5_view_window=window)
     _strict_m5_attempt_artifacts(attempts, symbol=body["symbol"], timeframe=body["timeframe"],
@@ -7631,7 +7620,7 @@ def _verify_declared_m5_headerless_completion(context, *, completion, body, requ
         completion=completion, sink=sink, source=source, fit=fit, product=actual, frame=frame,
         window=window, support=support)
     if completion["status"] == "STOP":
-        _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries)
+        _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries, process=process)
     elif any(value.get("status") == "PLANNED" for value in horizon_body["attempts"]):
         _fail("DECLARED_M5_HEADERLESS_COMPLETION_INVALID")
     return json.loads(_canonical_bytes(completion))
@@ -7758,7 +7747,7 @@ def _declared_slot_detector_cutoff(value):
     return parsed
 
 
-def _verify_declared_slot_failure(context, *, completion, body, request, entries):
+def _verify_declared_slot_failure(context, *, completion, body, request, entries, process=None):
     entry = completion.get("technical_failure_entry")
     if entry not in entries.values():
         _fail("DECLARED_SLOT_FAILURE_INVALID")
@@ -7777,9 +7766,11 @@ def _verify_declared_slot_failure(context, *, completion, body, request, entries
             or failure.get("economic_no_trade_or_no_winner") is not False
             or failure.get("downstream_authority") is not False):
         _fail("DECLARED_SLOT_FAILURE_INVALID")
+    import pm_production_search_planner as planner
     _bounded_canary_failure_diagnostic(exception_type=failure["exception_type"],
         failure_details=failure["failure_details"], attempt_ordinal=failure["attempt_ordinal"],
-        fold_ordinal=failure["fold_ordinal"], attempted_trials_exact=failure["attempted_trials_exact"])
+        fold_ordinal=failure["fold_ordinal"], attempted_trials_exact=failure["attempted_trials_exact"],
+        attempt_limit=planner.process_attempt_count(process) if process is not None else winner_selection.MAX_ATTEMPTS)
     outcome = failure["search_outcome"]
     if outcome is None:
         if frozen is None or failure["exception_type"] is None:
@@ -7844,13 +7835,7 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
     frozen_schema = json.loads(_reopen_worker_descriptor_bytes(context, frozen_entry["descriptor"],
         maximum_bytes=winner_selection.MAX_REQUEST_BYTES, expected_format=raw_winner.ASCII_JSON_FORMAT,
         code="DECLARED_SLOT_FROZEN_INVALID")).get("schema_version")
-    restore = {
-        raw_winner.CURRENT_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v4,
-        raw_winner.V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v5,
-        raw_winner.BOUND_FIT_V15_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v6,
-        raw_winner.BOUND_FIT_V16_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v7,
-        raw_winner.BOUND_FIT_V17_FROZEN_PLAN_SCHEMA: raw_winner.restore_frozen_winner_search_plan_v9,
-    }.get(frozen_schema)
+    restore = raw_winner.frozen_plan_restorer_for_schema(frozen_schema)
     if restore is None:
         _fail("DECLARED_SLOT_FROZEN_SCHEMA_INVALID")
     frozen = restore(context_identity={
@@ -8142,7 +8127,7 @@ def _verify_declared_slot_completion_request(context, *, precommit, process, com
                 "winner_request_sha256", "winner_decision_sha256")):
             _fail("DECLARED_SLOT_COMPLETION_INVALID")
         if completion["status"] == "STOP":
-            failure = _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries)
+            failure = _verify_declared_slot_failure(context, completion=completion, body=body, request=request, entries=entries, process=process)
             if frozen is not None and failure["attempted_trials_exact"] != frozen.attempt_ledger["attempt_count"]:
                 _fail("DECLARED_SLOT_FAILURE_INVALID")
         elif completion.get("technical_failure_entry") is not None:
@@ -8177,9 +8162,7 @@ def _verify_declared_slot_completion_request(context, *, precommit, process, com
         request=wr, decision=wd, symbol=body["symbol"], timeframe=body["timeframe"], regime=body["regime"])
     production = json.loads(production_bytes)
     if (set(production) != {"schema_version", "generation_context_sha256", "run_id", "artifact_namespace", "symbol", "timeframe", "regime", "precommitment_sha256", "attempt_ledger_sha256", "provenance_cross_binding_sha256", "evidence_ledger_sha256", "request_sha256", "decision_receipt_sha256", "artifact_roster"}
-            or production.get("schema_version") != (raw_winner.V17_PRODUCTION_SCHEMA
-                if frozen.selection_generation is winner_selection.V17_GENERATION else raw_winner.V16_PRODUCTION_SCHEMA
-                if frozen.selection_generation is winner_selection.V16_GENERATION else raw_winner.CURRENT_PRODUCTION_SCHEMA)
+            or production.get("schema_version") != raw_winner.raw_production_schema_for_generation(frozen.selection_generation)
             or production.get("precommitment_sha256") != wr.precommitment.payload_sha256
             or production.get("attempt_ledger_sha256") != wr.attempt_ledger.payload_sha256
             or production.get("evidence_ledger_sha256") != wr.evidence_ledger.payload_sha256
@@ -8365,23 +8348,29 @@ def _declared_m5_unobserved_current_view(*, support, fit_body, window, train_win
 
 
 def open_matched_floor_declared_slot_capture(context, *, request, process, plan, source_session):
-    """The process verifier binds v17 policy before the capture can be sealed."""
+    """The verified process selects its matched-floor generation."""
+    import pm_production_search_planner as planner
+    generation = planner.full_panel_generation(process)
+    if generation is None or not generation.matched_floor_enabled:
+        _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
     return open_declared_slot_capture(context, request=request, process=process, plan=plan,
-        source_session=source_session, _winner_generation=winner_selection.V17_GENERATION)
+        source_session=source_session, _winner_generation=generation)
 
 
 def _declared_frozen_selection_complexity(capture, normalized_attempts):
     import pm_production_search_planner as planner
     _verify_declared_slot_capture(capture)
-    if capture._winner_generation is not winner_selection.V17_GENERATION:
+    if (not capture._winner_generation.matched_floor_enabled
+            or capture._winner_generation is not planner.full_panel_generation(capture.process)):
         _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
     planner.verify_frozen_production_search_process(capture.context, capture.process)
-    return _frozen_selection_complexity_from_process(capture.process.to_dict(), normalized_attempts)
+    return _frozen_selection_complexity_from_process(capture.process.to_dict(), normalized_attempts,
+        timeframe=capture.request_body["timeframe"])
 
 
-def _frozen_selection_complexity_from_process(process_body, normalized_attempts):
+def _frozen_selection_complexity_from_process(process_body, normalized_attempts, *, timeframe=None):
     import pm_production_search_planner as planner
-    domains = planner._domain_by_name(process_body)
+    domains = planner._domain_by_name(process_body, timeframe=timeframe)
     rows = []
     for ordinal, artifact in enumerate(normalized_attempts):
         process = artifact["winner_process"]
@@ -8403,15 +8392,18 @@ __all__.append("open_matched_floor_declared_slot_capture")
 
 def _verify_declared_matched_floor_chain(context, *, process, producer_request, frozen,
         winner_request, entries, cross, frozen_pipeline_config, m5_fitted=None):
-    if frozen.selection_generation is not winner_selection.V17_GENERATION:
+    if not frozen.selection_generation.matched_floor_enabled:
         return
     import pm_production_search_planner as planner
     import pm_authoritative_search_execution as execution
     planner.verify_frozen_production_search_process(context, process)
+    if frozen.selection_generation is not planner.full_panel_generation(process):
+        _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
     if frozen_pipeline_config is None:
         _fail("MATCHED_FLOOR_FROZEN_CONFIG_REQUIRED")
     artifacts = json.loads(frozen.attempt_artifacts_bundle_bytes)
-    expected = _frozen_selection_complexity_from_process(process.to_dict(), artifacts)
+    expected = _frozen_selection_complexity_from_process(process.to_dict(), artifacts,
+        timeframe=frozen.timeframe)
     if (expected != frozen.precommitment["selection_complexity_roster"]
             or winner_request.precommitment.to_dict() != frozen.precommitment):
         _fail("MATCHED_FLOOR_PRE_EVIDENCE_COMPLEXITY_SPLICE")

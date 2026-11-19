@@ -3032,6 +3032,9 @@ def test_transport_owner_restore_dispatch_keeps_canonical_v5_boundary(monkeypatc
         selection_generation=(book.CURRENT_GENERATION.winner_generation
                               if wrong_restored_generation else generation.winner_generation))
     cross = {"schema_version": generation.cross_binding_schema}
+    entry = {"artifact_id": "synthetic/winner-search/H1/TREND/frozen/receipt",
+        "descriptor": {"fixture": "SYNTHETIC_DISPATCH_ONLY"}}
+    receipt_bytes = json.dumps({"schema_version": raw_winner.V16_FROZEN_PLAN_SCHEMA}).encode("ascii")
     calls = []
 
     def legacy_forbidden(**_kwargs):
@@ -3040,7 +3043,7 @@ def test_transport_owner_restore_dispatch_keeps_canonical_v5_boundary(monkeypatc
     def restore(**kwargs):
         calls.append("v5")
         assert kwargs["context_identity"]["generation_context_sha256"] == context.context_sha256
-        assert kwargs["manifest_entries"] == [] and kwargs["body_bytes"] == []
+        assert kwargs["manifest_entries"] == [entry] and kwargs["body_bytes"] == [receipt_bytes]
         return frozen
 
     def verify(encoded, *, frozen):
@@ -3050,9 +3053,10 @@ def test_transport_owner_restore_dispatch_keeps_canonical_v5_boundary(monkeypatc
         return cross, (), {"synthetic_dispatch_only": True}
 
     monkeypatch.setattr(raw_winner, "restore_frozen_winner_search_plan_v4", legacy_forbidden)
+    monkeypatch.setattr(producer, "_read_descriptor_bytes", lambda *a, **k: receipt_bytes)
     monkeypatch.setattr(raw_winner, "restore_frozen_winner_search_plan_v5", restore)
     monkeypatch.setattr(raw_winner, "verify_historical_frozen_winner_cross_binding", verify)
-    args = dict(context=context, entries={}, symbol="SYNTHETIC", timeframe="H1", regime="TREND",
+    args = dict(context=context, entries={entry["artifact_id"]: entry}, symbol="SYNTHETIC", timeframe="H1", regime="TREND",
                 namespace="synthetic", cross=cross, _generation=generation)
     if wrong_restored_generation:
         with pytest.raises(producer.ForwardOOSReplayProductionError,

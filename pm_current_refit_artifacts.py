@@ -25,7 +25,7 @@ from pm_current_refit_parameters import (
     build_parameter_domain,
     validate_parameter_domain_member,
 )
-from pm_strategies import StrategyRegistry
+from pm_strategies import StrategyRegistry, resolve_strategy_parameters
 
 
 WINNER_PROCESS_SCHEMA = "fxpm.current-refit-winner-process.v1"
@@ -240,7 +240,7 @@ def _utc(value: Any, code: str) -> str:
 
 
 def _normalized_parameters(
-    strategy_id: str, parameters: Mapping[str, Any]
+    strategy_id: str, parameters: Mapping[str, Any], *, timeframe: str | None = None
 ) -> dict[str, Any]:
     try:
         supplied = canonicalize_parameter_mapping(parameters)
@@ -248,14 +248,14 @@ def _normalized_parameters(
         raise CurrentRefitArtifactError("PARAMETERS_INVALID") from exc
     base = StrategyRegistry.get(strategy_id)
     try:
-        defaults = canonicalize_parameter_mapping(base.get_default_params())
+        raw_defaults, grid, groups = resolve_strategy_parameters(base, timeframe)
+        defaults = canonicalize_parameter_mapping(raw_defaults)
     except CurrentRefitParameterCodecError as exc:
         raise CurrentRefitArtifactError("STRATEGY_DEFAULTS_INVALID") from exc
-    grid = base.get_param_grid()
     if not set(supplied) <= (set(defaults) | set(grid)):
         _fail("PARAMETER_NAME_OUTSIDE_PROCESS")
     try:
-        runtime = decode_parameter_mapping(supplied, base.get_default_params())
+        runtime = decode_parameter_mapping(supplied, raw_defaults)
         fitted = StrategyRegistry.get(strategy_id, **runtime)
         normalized = canonicalize_parameter_mapping(fitted.get_params())
     except Exception as exc:
@@ -266,8 +266,7 @@ def _normalized_parameters(
         if name not in grid and not parameter_values_equal(value, defaults[name]):
             _fail("PARAMETER_FIXED_DEFAULT_MISMATCH")
     try:
-        domain = build_parameter_domain(base.get_default_params(), grid,
-            coupled_groups=base.get_param_couplings())
+        domain = build_parameter_domain(raw_defaults, grid, coupled_groups=groups)
         validate_parameter_domain_member(domain, normalized)
     except CurrentRefitParameterCodecError as exc:
         raise CurrentRefitArtifactError("PARAMETER_VALUE_OUTSIDE_PROCESS") from exc
@@ -336,7 +335,7 @@ def build_winner_process_artifact_v2(
 
     symbol, timeframe, regime = _cell_identity(symbol, timeframe, regime)
     name, strategy = _strategy(strategy_id)
-    normalized = _normalized_parameters(name, parameters)
+    normalized = _normalized_parameters(name, parameters, timeframe=timeframe)
     body = {
         "schema_version": WINNER_PROCESS_SCHEMA,
         "process_candidate_id": _candidate_id(
@@ -418,7 +417,6 @@ def build_trial_definition_artifact_v2(
     """Build one exact full-parameter trial bound to process and horizon bytes."""
 
     name, strategy = _strategy(strategy_id)
-    normalized = _normalized_parameters(name, parameters)
     process = dict(winner_process)
     horizon = dict(horizon_process)
     if (
@@ -428,6 +426,7 @@ def build_trial_definition_artifact_v2(
         _fail("WINNER_PROCESS_BINDING_INVALID")
     if horizon.get("schema_version") != HORIZON_PROCESS_SCHEMA:
         _fail("HORIZON_PROCESS_BINDING_INVALID")
+    normalized = _normalized_parameters(name, parameters, timeframe=horizon.get("timeframe"))
     body = {
         "schema_version": TRIAL_DEFINITION_SCHEMA,
         "strategy_id": name,

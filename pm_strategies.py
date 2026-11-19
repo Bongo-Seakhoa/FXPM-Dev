@@ -733,6 +733,15 @@ class BaseStrategy(ABC):
         """Get default parameter values."""
         pass
 
+    def get_default_params_for_timeframe(self, timeframe: str) -> Dict[str, Any]:
+        return self.get_default_params()
+
+    def get_param_grid_for_timeframe(self, timeframe: str) -> Dict[str, List]:
+        return self.get_param_grid()
+
+    def session_spec(self, symbol: str) -> Optional[Tuple[int, int]]:
+        return None
+
     def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize legacy parameters into the current parameter surface."""
         return dict(params)
@@ -7367,6 +7376,134 @@ class AutocorrelationReversalStrategy(BaseStrategy):
                 **self._base_sl_tp_grid()}
 
 
+def resolve_strategy_parameters(strategy: BaseStrategy, timeframe: str, *,
+                                defaults_only=False, persisted_parameters=None):
+    """Bind physical-time parameters; codecs can skip unused domain construction."""
+    defaults = strategy.get_default_params_for_timeframe(timeframe)
+    if persisted_parameters is not None and "bar_minutes" in defaults:
+        if (type(persisted_parameters) is not dict
+                or type(persisted_parameters.get("bar_minutes")) is not int
+                or persisted_parameters["bar_minutes"] != defaults["bar_minutes"]):
+            raise ValueError("NOISE101_TIMEFRAME_BINDING_MISMATCH")
+    if defaults_only:
+        return defaults, None, None
+    return defaults, strategy.get_param_grid_for_timeframe(timeframe), strategy.get_param_couplings()
+
+
+class NoiseBandBreakoutStrategy(BaseStrategy):
+    """Edition B; recorded-clock session templates remain unverified prototypes."""
+
+    _BAR_MINUTES = {"M5": 5, "M15": 15, "M30": 30, "H1": 60,
+                    "H4": 240, "D1": 1440}
+
+    @property
+    def name(self) -> str:
+        return "NoiseBandBreakoutStrategy"
+
+    @property
+    def category(self) -> StrategyCategory:
+        return StrategyCategory.BREAKOUT_MOMENTUM
+
+    def get_default_params(self) -> Dict[str, Any]:
+        return {"lookback": 14, "band_k": 1.0,
+                "sl_atr_mult": 2.0, "tp_atr_mult": 2.0}
+
+    @classmethod
+    def _bar_minutes(cls, timeframe: str) -> int:
+        if type(timeframe) is not str or timeframe.upper() not in cls._BAR_MINUTES:
+            raise ValueError("NOISE101_TIMEFRAME_REQUIRED")
+        return cls._BAR_MINUTES[timeframe.upper()]
+
+    @staticmethod
+    def _check_bars(minutes: int, bar_minutes: int) -> int:
+        return max(1, (minutes + bar_minutes - 1) // bar_minutes)
+
+    def get_default_params_for_timeframe(self, timeframe: str) -> Dict[str, Any]:
+        bar_minutes = self._bar_minutes(timeframe)
+        if self.params.get("bar_minutes", bar_minutes) != bar_minutes:
+            raise ValueError("NOISE101_TIMEFRAME_BINDING_MISMATCH")
+        return {**self.get_default_params(), "bar_minutes": bar_minutes,
+                "check_bars": self._check_bars(30, bar_minutes)}
+
+    def _grid(self, bar_minutes: int) -> Dict[str, List]:
+        checks = list(dict.fromkeys(self._check_bars(minutes, bar_minutes)
+                                   for minutes in (15, 30, 60, 120)))
+        return {"lookback": [7, 10, 14, 20, 30],
+                "band_k": [0.5, 0.75, 1.0, 1.25, 1.5],
+                "check_bars": checks, **self._base_sl_tp_grid()}
+
+    def get_param_grid_for_timeframe(self, timeframe: str) -> Dict[str, List]:
+        return self._grid(self._bar_minutes(timeframe))
+
+    def get_param_grid(self) -> Dict[str, List]:
+        if "bar_minutes" not in self.params:
+            raise ValueError("NOISE101_TIMEFRAME_REQUIRED")
+        return self._grid(self.params["bar_minutes"])
+
+    def normalize_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        params = dict(params)
+        if "bar_minutes" in params or "check_bars" in params:
+            if (type(params.get("bar_minutes")) is not int
+                    or params["bar_minutes"] not in self._BAR_MINUTES.values()
+                    or type(params.get("check_bars")) is not int
+                    or params["check_bars"] <= 0):
+                raise ValueError("NOISE101_TIMEFRAME_BINDING_INVALID")
+        return params
+
+    def session_spec(self, symbol: str) -> Tuple[int, int]:
+        # Source prototype only: clock/DST and US100 cost proof precede adoption.
+        return (990, 390) if symbol.upper() in ("US100", "US500", "US30") else (0, 1440)
+
+    def get_required_features(self) -> Set[str]:
+        return {"ATR_14"}
+
+    def generate_signals(self, features: pd.DataFrame, symbol: str) -> pd.Series:
+        from pm_core import _recorded_session_arrays
+
+        if "bar_minutes" not in self.params or "check_bars" not in self.params:
+            raise ValueError("NOISE101_TIMEFRAME_REQUIRED")
+        bar_minutes, check_bars = self.params["bar_minutes"], self.params["check_bars"]
+        spec = self.session_spec(symbol)
+        signals = pd.Series(0, index=features.index, dtype=int)
+        if features.empty or spec[1] // (bar_minutes * check_bars) < 6:
+            return signals
+        inside, keys = _recorded_session_arrays(features.index, spec)
+        positions = np.flatnonzero(inside)
+        if not len(positions):
+            return signals
+        index = features.index[positions]
+        rel = (index.hour * 60 + index.minute - spec[0]) % 1440
+        rows = pd.DataFrame({"key": keys[positions],
+                             "slot": np.asarray(rel, dtype=np.int64) + bar_minutes,
+                             "open": features["Open"].to_numpy()[positions],
+                             "close": features["Close"].to_numpy()[positions]})
+        grouped = rows.groupby("key", sort=False)
+        session_open = grouped["open"].first()
+        previous_close = grouped["close"].last().shift(1)
+        opens = rows["key"].map(session_open)
+        moves = rows[["key", "slot"]].copy()
+        moves["move"] = (rows["close"] / opens - 1.0).abs()
+        history = moves.pivot(index="key", columns="slot", values="move")
+        lookback = int(self.params["lookback"])
+        minimum = (7 * lookback + 9) // 10
+        # Shift whole observed session keys, including missing same-slot values.
+        noise = history.shift(1).rolling(lookback, min_periods=minimum).mean()
+        row_indices = noise.index.get_indexer(rows["key"])
+        slot_indices = noise.columns.get_indexer(rows["slot"])
+        sigma = noise.to_numpy()[row_indices, slot_indices]
+        prior = rows["key"].map(previous_close).to_numpy()
+        opens = opens.to_numpy()
+        scale = float(self.params["band_k"]) * sigma
+        upper = np.maximum(opens, prior) * (1.0 + scale)
+        lower = np.minimum(opens, prior) * (1.0 - scale)
+        checks = (grouped.cumcount().to_numpy() + 1) % check_bars == 0
+        closes = rows["close"].to_numpy()
+        values = np.where(checks & (closes > upper), 1,
+                          np.where(checks & (closes < lower), -1, 0))
+        signals.iloc[positions] = values
+        return signals
+
+
 # =============================================================================
 # STRATEGY REGISTRY
 # =============================================================================
@@ -7507,6 +7644,9 @@ class StrategyRegistry:
         'HeadAndShouldersNecklineBreakStrategy': HeadAndShouldersNecklineBreakStrategy,
         'VarianceRatioTrendStrategy': VarianceRatioTrendStrategy,
         'AutocorrelationReversalStrategy': AutocorrelationReversalStrategy,
+
+        # Next edition, source preparation only.
+        'NoiseBandBreakoutStrategy': NoiseBandBreakoutStrategy,
     }
     
     @classmethod
@@ -7558,6 +7698,8 @@ class StrategyRegistry:
 __all__ = [
     'BaseStrategy',
     'StrategyRegistry',
+    'resolve_strategy_parameters',
+    'NoiseBandBreakoutStrategy',
     'StrategyCategory',
     # Global grid constants
     '_GLOBAL_SL_GRID',

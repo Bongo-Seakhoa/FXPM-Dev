@@ -34,6 +34,7 @@ import json
 import math
 from pathlib import Path
 from typing import Any, Final, Mapping, Optional, Sequence, Set
+from types import MappingProxyType
 
 import pandas as pd
 
@@ -59,7 +60,7 @@ from pm_current_refit_parameters import (
     parameter_values_equal,
     validate_parameter_domain_member,
 )
-from pm_strategies import StrategyRegistry
+from pm_strategies import StrategyRegistry, resolve_strategy_parameters
 
 
 UTC: Final = timezone.utc
@@ -346,18 +347,19 @@ def _required_feature_union(
     return sorted(requested)
 
 
-def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
+def _strategy_domain(name: str, ordinal: int, timeframe: str = None) -> dict[str, Any]:
     strategy = StrategyRegistry.get(name)
-    defaults = canonicalize_parameter_mapping(strategy.get_default_params())
+    raw_defaults, raw_grid, groups = resolve_strategy_parameters(strategy, timeframe)
+    if set(raw_defaults) - set(strategy.get_params()):
+        strategy = StrategyRegistry.get(name, **raw_defaults)
+    defaults = canonicalize_parameter_mapping(raw_defaults)
     normalized_defaults = canonicalize_parameter_mapping(strategy.get_params())
     if defaults != normalized_defaults:
         _fail("STRATEGY_DEFAULT_NORMALIZATION_DRIFT", name)
-    raw_grid = strategy.get_param_grid()
     if type(raw_grid) is not dict or not raw_grid:
         _fail("STRATEGY_GRID_INVALID", name)
     parameter_domain = build_parameter_domain(
-        strategy.get_default_params(), raw_grid,
-        coupled_groups=strategy.get_param_couplings(),
+        raw_defaults, raw_grid, coupled_groups=groups,
     )
     axes: list[dict[str, Any]] = []
     for axis_name, raw_choices in raw_grid.items():
@@ -381,7 +383,7 @@ def _strategy_domain(name: str, ordinal: int) -> dict[str, Any]:
         axes.append({"name": axis_name, "choices": choices})
     required_feature_union = _required_feature_union(
         name,
-        defaults=strategy.get_default_params(),
+        defaults=raw_defaults,
         parameter_domain=parameter_domain,
     )
     body = {
@@ -427,7 +429,7 @@ def _normalize_candidate_domain_value(value: Any) -> Any:
 
 def _live_candidate_domain_sha256() -> str:
     documents: list[dict[str, Any]] = []
-    for name in sorted(StrategyRegistry.list_all()):
+    for name in sorted(state_contract.ACTUAL_STRATEGY_NAMES):
         strategy = StrategyRegistry.get(name)
         documents.append(
             {
@@ -448,9 +450,11 @@ def _live_candidate_domain_sha256() -> str:
 
 
 def _strategy_domains() -> list[dict[str, Any]]:
-    names = list(StrategyRegistry.list_all())
+    actual_names = tuple(StrategyRegistry.list_all())
+    names = list(state_contract.ACTUAL_STRATEGY_NAMES)
     if (
-        len(names) != BASELINE_ATTEMPTS
+        actual_names not in (tuple(names), (*names, NOISE101_STRATEGY_ID))
+        or len(names) != BASELINE_ATTEMPTS
         or len(names) != len(set(names))
         or tuple(names) != state_contract.ACTUAL_STRATEGY_NAMES
     ):
@@ -655,7 +659,10 @@ def _process_source_generation():
         search_execution.MAX_ATTEMPTS, ATTEMPT_COUNT, BASELINE_ATTEMPTS,
         VARIANT_ATTEMPTS, GROUPED_PARAMETER_DESIGN_SEED,
         tuple((timeframe, tuple(FIT_CALENDAR_DAY_LADDERS[timeframe])) for timeframe in TIMEFRAMES),
-        CAUSAL_FOLD_COUNT, CAUSAL_FOLD_MIN_DAYS)
+        CAUSAL_FOLD_COUNT, CAUSAL_FOLD_MIN_DAYS,
+        NOISE101_PROCESS_SCHEMA, NOISE101_EXECUTION_EDITION, NOISE101_CATALOGUE_SCHEMA,
+        selection.V18_GENERATION.selection_version, selection.V18_GENERATION.request_version,
+        selection.V18_GENERATION.policy_sha256, selection.V18_GENERATION.max_attempts)
 
 
 def _expected_process_body(
@@ -665,7 +672,7 @@ def _expected_process_body(
     schema_version: str = PROCESS_SCHEMA,
 ) -> dict[str, Any]:
     run_id = _identity(run_id, "RUN_ID_INVALID")
-    if schema_version not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA):
+    if schema_version not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA):
         _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
     state = _PROCESS_VERIFICATION_STATE.get()
     if state is None:
@@ -693,10 +700,11 @@ def _derive_expected_process_body(
     )
     if observed.context_sha256 != context.context_sha256:
         _fail("GENERATION_CONTEXT_CHANGED")
-    if schema_version not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA}:
+    if schema_version not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA}:
         _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
-    domains = _strategy_domains()
-    semantics = _process_semantics(domains)
+    noise_metadata = noise101_process_metadata() if schema_version == NOISE101_PROCESS_SCHEMA else None
+    domains = _strategy_domains() if noise_metadata is None else None
+    semantics = _process_semantics(domains) if noise_metadata is None else noise_metadata["semantics"]
     if schema_version == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA:
         import pm_winner_selection as selection
         semantics["attempt_policy"]["winner_contract_version"] = selection.V17_GENERATION.selection_version
@@ -725,13 +733,18 @@ def _derive_expected_process_body(
         "confers_winner_causal_current_capital_publication_or_live_authority": False,
     }
 
-    if schema_version == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA:
-        body["execution_edition"] = ROUTE_A_FULL_PANEL_EXECUTION_EDITION
+    if noise_metadata is not None:
+        body.update(noise_metadata)
+        body["process_semantics_sha256"] = _sha(semantics)
+        body["authority_scope"] = "SOFTWARE_SEARCH_DESCRIPTION_ONLY_UNQUALIFIED"
+    if schema_version in (ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA):
+        body["execution_edition"] = (NOISE101_EXECUTION_EDITION if noise_metadata is not None else ROUTE_A_FULL_PANEL_EXECUTION_EDITION)
         import pm_winner_selection as selection
+        generation = selection.V18_GENERATION if noise_metadata is not None else selection.V17_GENERATION
         body["winner_selection_binding"] = {
-            "selection_version": selection.V17_GENERATION.selection_version,
-            "request_version": selection.V17_GENERATION.request_version,
-            "selection_policy_sha256": selection.V17_GENERATION.policy_sha256,
+            "selection_version": generation.selection_version,
+            "request_version": generation.request_version,
+            "selection_policy_sha256": generation.policy_sha256,
             "selection_addendum_contract_sha256": selection.V17_SELECTION_ADDENDUM_CONTRACT_SHA256,
         }
     return body
@@ -878,8 +891,7 @@ def frozen_search_execution_edition(context: authority_spool.GenerationSpoolCont
     """Authenticate the process before selecting its frozen execution path."""
     verify_frozen_production_search_process(context, process)
     body = process.to_dict()
-    return (body["execution_edition"]
-        if body["schema_version"] == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA else None)
+    return body.get("execution_edition") if is_route_a_full_panel_process(body) else None
 
 
 @_owned_process_verification_call
@@ -1503,6 +1515,7 @@ def _seal_cell_plan(
         )
     ):
         _fail("NONCANARY_CELL_PLAN_CAPABILITY_FORBIDDEN")
+    edition = source_edition_info(process)
     normalized_namespace = _artifact_namespace(namespace)
     native = dict(fitted.product.native_prefix)
     symbol = str(native["symbol"])
@@ -1522,9 +1535,9 @@ def _seal_cell_plan(
     ]
     _verify_state_error_envelope_fitted_binding(state_error_envelope, fitted=fitted, native=native, m5_view_window=m5_view_window)
     if (
-        len(attempt_hashes) != ATTEMPT_COUNT
-        or len(state_hashes) != ATTEMPT_COUNT
-        or len(state_domain_record_hashes) != BASELINE_ATTEMPTS
+        len(attempt_hashes) != edition.attempt_count
+        or len(state_hashes) != edition.attempt_count
+        or len(state_domain_record_hashes) != edition.strategy_count
         or len(set(attempt_hashes)) != len(attempt_hashes)
         or len(state_hashes) != len(set(state_hashes))
         or len(state_domain_record_hashes)
@@ -1809,6 +1822,8 @@ def _verify_state_context_plan_binding(
 ) -> None:
     """Recompute the full state-requirement -> Horizon disposition chain."""
 
+    edition = source_edition_info(process_body)
+    is_noise = edition.edition_id == NOISE101_SOURCE_EDITION_ID
     try:
         plan_body = horizon_plan.to_dict()
     except Exception as exc:
@@ -1930,7 +1945,7 @@ def _verify_state_context_plan_binding(
         )
         if (
             requirement_sha256 != _sha(requirement_body)
-            or state.get("schema_version") != (M5_DERIVED_STATE_REQUIREMENT_SCHEMA if m5_view_window is not None else STATE_REQUIREMENT_SCHEMA)
+            or state.get("schema_version") != (M5_DERIVED_STATE_REQUIREMENT_SCHEMA if m5_view_window is not None else (NOISE101_STATE_REQUIREMENT_SCHEMA if is_noise else STATE_REQUIREMENT_SCHEMA))
             or state.get("execution_rule")
             != "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
             or state.get("initial_error_bound_hex") != initial_error.hex()
@@ -1951,7 +1966,7 @@ def _verify_state_context_plan_binding(
             or any(
                 type(value) is not dict
                 or value.get("schema_version")
-                != ("fxpm.production-m5-derived-full-prefix-state-replay.v1" if m5_view_window is not None else "fxpm.production-full-prefix-state-replay.v1")
+                != ("fxpm.production-m5-derived-full-prefix-state-replay.v1" if m5_view_window is not None else (NOISE101_FULL_PREFIX_STATE_REPLAY_SCHEMA if is_noise else "fxpm.production-full-prefix-state-replay.v1"))
                 or value.get(
                     "requires_executor_full_prefix_replay_before_any_scored_slice"
                 )
@@ -1960,6 +1975,10 @@ def _verify_state_context_plan_binding(
             )
         ):
             _fail("STATE_REQUIREMENT_REPLAY_INVALID")
+        if is_noise:
+            _verify_noise101_state_requirement(edition, timeframe, state,
+                effective_domain=effective_domain, native_prefix=native_prefix,
+                state_error_envelope=envelope)
 
     if m5_view_window is not None:
         for state in states:
@@ -1988,6 +2007,7 @@ def _verify_state_context_plan_binding(
         expected_dispositions,
         selected_common_context_bars=selected,
         boundary_limited=boundary_limited,
+        source_edition=edition,
     )
     if receipt.get("state_context_selection") != expected_selection:
         _fail("STATE_CONTEXT_SELECTION_RECEIPT_INVALID")
@@ -2088,6 +2108,7 @@ def _verify_production_cell_search_plan_source(
         or plan._seal is not _CELL_PLAN_SEAL
     ):
         _fail("CELL_PLAN_OBJECT_INVALID")
+    edition = source_edition_info(process)
     receipt = plan.cell_receipt
     receipt_sha256 = receipt.get("receipt_sha256")
     body = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
@@ -2222,7 +2243,7 @@ def _verify_production_cell_search_plan_source(
         "HISTORICAL_REGIME_UNOBSERVED",
         "CURRENT_REGIME_UNOBSERVED",
     }
-    expected_attempt_count = 0 if terminal or unobserved else ATTEMPT_COUNT
+    expected_attempt_count = 0 if terminal or unobserved else edition.attempt_count
     if (
         len(attempt_hashes) != expected_attempt_count
         or len(state_hashes) != expected_attempt_count
@@ -2392,7 +2413,24 @@ def _cell_hash(
     ).hexdigest()
 
 
-def _domain_by_name(process_body: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+def _domain_by_name(process_body: Mapping[str, Any], *, timeframe: str | None = None) -> dict[str, dict[str, Any]]:
+    if process_body.get("schema_version") == NOISE101_PROCESS_SCHEMA:
+        edition = source_edition_info(process_body)
+        if timeframe not in edition.ordered_timeframes:
+            _fail("NOISE101_AUTHENTICATED_TIMEFRAME_REQUIRED")
+        catalogue = process_body.get("semantics", {}).get("candidate_catalogue")
+        if type(catalogue) is not dict:
+            _fail("NOISE101_CATALOGUE_FIELDS_INVALID")
+        roster = catalogue["rosters_by_timeframe"][timeframe]
+        if roster["domain_roster_sha256"] != dict(edition.domain_roster_sha256_by_timeframe)[timeframe]:
+            _fail("NOISE101_CATALOGUE_ROSTER_HASH_INVALID")
+        refs = roster["domain_sha256_by_strategy_ordinal"]
+        if len(refs) != edition.strategy_count:
+            _fail("PROCESS_DOMAIN_ROSTER_INVALID")
+        rows = [catalogue["domain_pool"][digest] for digest in refs]
+        if tuple(row["strategy_id"] for row in rows) != edition.ordered_strategy_ids:
+            _fail("PROCESS_DOMAIN_IDENTITY_INVALID")
+        return {row["strategy_id"]: dict(row) for row in rows}
     semantics = process_body.get("semantics")
     domains = semantics.get("strategy_domains") if type(semantics) is dict else None
     if type(domains) is not list or len(domains) != BASELINE_ATTEMPTS:
@@ -2413,14 +2451,27 @@ def _state_authority_for_candidate(candidate_domain_sha256: str):
         and candidate_domain_sha256 == state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
     ):
         return state_contract.DEFAULT_AUTHORITY
+    catalogue = build_noise101_candidate_catalogue()
+    if candidate_domain_sha256 == _sha(catalogue):
+        scope = _PROCESS_VERIFICATION_STATE.get()
+        if scope is not None and "noise101_authority" in scope:
+            return scope["noise101_authority"]
+        authority = state_contract.build_noise101_state_authority(candidate_domain_sha256)
+        if scope is not None:
+            scope["noise101_authority"] = authority
+        return authority
     _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
 
 
 def _require_current_process(process: FrozenProductionSearchProcess) -> None:
     if type(process) is not FrozenProductionSearchProcess or process._seal is not _PROCESS_SEAL:
         _fail("PROCESS_OBJECT_INVALID")
-    if process.to_dict().get("schema_version") not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA}:
+    if process.to_dict().get("schema_version") not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA}:
         _fail("RETAINED_PROCESS_IS_READ_ONLY")
+    body = process.to_dict()
+    if (body["schema_version"] == NOISE101_PROCESS_SCHEMA
+            and body.get("authority_scope") == "SOFTWARE_SEARCH_DESCRIPTION_ONLY_UNQUALIFIED"):
+        _fail("NOISE101_SOFTWARE_DESCRIPTION_NOT_EXECUTABLE")
 
 
 def _variant_strategy_names(
@@ -2429,9 +2480,12 @@ def _variant_strategy_names(
     symbol: str,
     timeframe: str,
     regime: str,
+    source_edition: SourceEditionDescriptor | None = None,
 ) -> list[tuple[str, int]]:
     if any(item.get("schema_version") != DOMAIN_SCHEMA for item in domains):
         _fail("RETAINED_PROCESS_IS_READ_ONLY")
+    strategy_count = source_edition.strategy_count if source_edition is not None else BASELINE_ATTEMPTS
+    variant_count = strategy_count * VARIANTS_PER_STRATEGY
     affinity = _REGIME_CATEGORY_AFFINITY[regime]
 
     def order(item: Mapping[str, Any]) -> tuple[int, str]:
@@ -2448,7 +2502,7 @@ def _variant_strategy_names(
 
     ordered = sorted(domains, key=order)
     names = [str(item["strategy_id"]) for item in ordered]
-    if len(names) != BASELINE_ATTEMPTS or len(names) != len(set(names)):
+    if len(names) != strategy_count or len(names) != len(set(names)):
         _fail("VARIANT_STRATEGY_ALLOCATION_INVALID")
     # Every strategy is tuned, VARIANTS_PER_STRATEGY times. Regime-family
     # affinity still drives the ordering, so the sweep remains deterministic and
@@ -2459,7 +2513,7 @@ def _variant_strategy_names(
         for ordinal in range(VARIANTS_PER_STRATEGY)
         for name in names
     ]
-    if len(selected) != VARIANT_ATTEMPTS or len(selected) != len(set(selected)):
+    if len(selected) != variant_count or len(selected) != len(set(selected)):
         _fail("VARIANT_STRATEGY_ALLOCATION_INVALID")
     return selected
 
@@ -2481,7 +2535,7 @@ def _nondefault_parameters(
     The current edition traverses a seeded coprime permutation of legal points.
     """
     if domain is None:
-        domain = _strategy_domain(strategy_name, 0)
+        domain = _strategy_domain(strategy_name, 0, timeframe)
     if domain.get("strategy_id") != strategy_name:
         _fail("VARIANT_STRATEGY_OUTSIDE_DOMAIN", strategy_name)
     if domain.get("schema_version") != DOMAIN_SCHEMA:
@@ -2512,7 +2566,8 @@ def _nondefault_parameters(
                 continue
             wire = parameter_domain_point(structured, ordinal)
             base = StrategyRegistry.get(strategy_name)
-            runtime = decode_parameter_mapping(wire, base.get_default_params())
+            defaults, _, _ = resolve_strategy_parameters(base, timeframe, defaults_only=True)
+            runtime = decode_parameter_mapping(wire, defaults)
             normalized = canonicalize_parameter_mapping(
                 StrategyRegistry.get(strategy_name, **runtime).get_params()
             )
@@ -2531,7 +2586,8 @@ def _attempt_designs(
     timeframe: str,
     regime: str,
 ) -> list[dict[str, Any]]:
-    domains = list(_domain_by_name(process_body).values())
+    edition = source_edition_info(process_body)
+    domains = list(_domain_by_name(process_body, timeframe=timeframe).values())
     domains.sort(key=lambda value: int(value["ordinal"]))
     if any(item.get("schema_version") != DOMAIN_SCHEMA for item in domains):
         _fail("RETAINED_PROCESS_IS_READ_ONLY")
@@ -2549,7 +2605,7 @@ def _attempt_designs(
     by_name = {str(item["strategy_id"]): item for item in domains}
     emitted_by_strategy: dict[str, Set[str]] = {}
     for name, variant_ordinal in _variant_strategy_names(
-        domains, symbol=symbol, timeframe=timeframe, regime=regime
+        domains, symbol=symbol, timeframe=timeframe, regime=regime, source_edition=edition
     ):
         if name not in by_name:
             _fail("VARIANT_STRATEGY_OUTSIDE_DOMAIN", name)
@@ -2568,7 +2624,9 @@ def _attempt_designs(
                 ),
             }
         )
-    if len(designs) != ATTEMPT_COUNT or ATTEMPT_COUNT != search_execution.MAX_ATTEMPTS:
+    generation = full_panel_generation(process_body)
+    maximum = generation.max_attempts if generation is not None else search_execution.MAX_ATTEMPTS
+    if len(designs) != edition.attempt_count or edition.attempt_count != maximum:
         _fail("ATTEMPT_COUNT_NOT_EXACT_WINNER_BOUND")
     identities = [(item["strategy_id"], _sha(item["parameters"])) for item in designs]
     if len(identities) != len(set(identities)):
@@ -3091,7 +3149,9 @@ def _effective_state_domains(
 ) -> list[dict[str, Any]]:
     """Bind the frozen registry domain to one explicit production cell."""
 
-    domains = list(_domain_by_name(process_body).values())
+    edition = source_edition_info(process_body)
+    is_noise = edition.edition_id == NOISE101_SOURCE_EDITION_ID
+    domains = list(_domain_by_name(process_body, timeframe=timeframe).values())
     domains.sort(key=lambda value: int(value.get("ordinal", -1)))
     candidate_domain_sha256 = _hex64(
         process_body.get("candidate_domain_sha256"),
@@ -3145,7 +3205,7 @@ def _effective_state_domains(
         if full_count != domain.get("grid_size"):
             _fail("EFFECTIVE_STATE_DOMAIN_COUNT_INVALID", ordinal)
         body = {
-            "schema_version": EFFECTIVE_STATE_DOMAIN_SCHEMA,
+            "schema_version": NOISE101_EFFECTIVE_STATE_DOMAIN_SCHEMA if is_noise else EFFECTIVE_STATE_DOMAIN_SCHEMA,
             "cell": {
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -3163,12 +3223,14 @@ def _effective_state_domains(
             ],
             "outcome_or_protected_value_dependent": False,
         }
+        if is_noise:
+            body["source_edition_context"] = source_edition_context_for_cell(edition, timeframe)
         body["parameter_domain"] = parameter_domain
         effective.append({**body, "effective_domain_sha256": _sha(body)})
     if (
-        len(effective) != BASELINE_ATTEMPTS
+        len(effective) != edition.strategy_count
         or [value["strategy_id"] for value in effective]
-        != list(state_contract.ACTUAL_STRATEGY_NAMES)
+        != list(edition.ordered_strategy_ids)
     ):
         _fail("EFFECTIVE_STATE_DOMAIN_ROSTER_INVALID")
     return effective
@@ -3235,7 +3297,7 @@ def _domain_state_replay_evidence(
     }
     if len(parameters) != len(parameter_domains):
         _fail("STATE_DOMAIN_EVIDENCE_PARAMETER_INVALID")
-    if effective_domain.get("schema_version") == EFFECTIVE_STATE_DOMAIN_SCHEMA:
+    if effective_domain.get("schema_version") in (EFFECTIVE_STATE_DOMAIN_SCHEMA, NOISE101_EFFECTIVE_STATE_DOMAIN_SCHEMA):
         parameters = dict(effective_domain["parameter_domain"]["defaults"])
     unresolved = authority.resolve_cell(
         str(effective_domain.get("strategy_id") or ""),
@@ -3277,6 +3339,9 @@ def _domain_state_replay_evidence(
             ),
             "requires_executor_full_prefix_replay_before_any_scored_slice": True,
         }
+        if effective_domain.get("schema_version") == NOISE101_EFFECTIVE_STATE_DOMAIN_SCHEMA:
+            identity_body["schema_version"] = NOISE101_DOMAIN_STATE_REPLAY_SCHEMA
+            identity_body["source_edition_context"] = dict(effective_domain["source_edition_context"])
         identity_body = _m5_state_binding(identity_body, m5_view_window, "fxpm.production-m5-derived-domain-full-prefix-state-replay.v1")
         item, receipt = _sealed_state_replay_evidence(
             node=node,
@@ -3315,6 +3380,7 @@ def _state_domain_ceiling_records(
         regime=regime,
     )
     authority = _state_authority_for_candidate(process_body.get("candidate_domain_sha256"))
+    edition = source_edition_info(process_body)
     records: list[dict[str, Any]] = []
     for ordinal, effective_domain in enumerate(effective_domains):
         evidence, evidence_bodies = _domain_state_replay_evidence(native_prefix=native_prefix, effective_domain=effective_domain, initial_error_bound=initial_error, tolerance=tolerance, authority=authority, m5_view_window=m5_view_window)
@@ -3351,7 +3417,7 @@ def _state_domain_ceiling_records(
                 *ceiling.reason_codes,
             )
         body = {
-            "schema_version": STATE_DOMAIN_CEILING_RECORD_SCHEMA,
+            "schema_version": (NOISE101_STATE_DOMAIN_CEILING_RECORD_SCHEMA if edition.edition_id == NOISE101_SOURCE_EDITION_ID else STATE_DOMAIN_CEILING_RECORD_SCHEMA),
             "strategy_ordinal": ordinal,
             "strategy_id": effective_domain["strategy_id"],
             "effective_domain": effective_domain,
@@ -3360,7 +3426,7 @@ def _state_domain_ceiling_records(
         }
         records.append({**body, "record_sha256": _sha(body)})
     if (
-        len(records) != BASELINE_ATTEMPTS
+        len(records) != edition.strategy_count
         or len({value["record_sha256"] for value in records}) != len(records)
     ):
         _fail("STATE_DOMAIN_CEILING_ROSTER_INVALID")
@@ -3377,6 +3443,7 @@ def _state_replay_requirement(
     tolerance: float,
     state_domain_record: Mapping[str, Any],
     m5_view_window: Mapping[str, Any] | None = None,
+    state_error_envelope: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     record_body = {
         key: value
@@ -3387,7 +3454,7 @@ def _state_replay_requirement(
     ceiling = state_domain_record.get("ceiling")
     if (
         state_domain_record.get("schema_version")
-        != STATE_DOMAIN_CEILING_RECORD_SCHEMA
+        not in (STATE_DOMAIN_CEILING_RECORD_SCHEMA, NOISE101_STATE_DOMAIN_CEILING_RECORD_SCHEMA)
         or state_domain_record.get("record_sha256") != _sha(record_body)
         or state_domain_record.get("strategy_id") != strategy_name
         or type(effective_domain) is not dict
@@ -3413,7 +3480,7 @@ def _state_replay_requirement(
     ):
         _fail("STATE_ATTEMPT_OUTSIDE_EFFECTIVE_DOMAIN", strategy_name)
     authority = _state_authority_for_candidate(effective_domain.get("candidate_domain_sha256"))
-    if effective_domain.get("schema_version") == EFFECTIVE_STATE_DOMAIN_SCHEMA:
+    if effective_domain.get("schema_version") in (EFFECTIVE_STATE_DOMAIN_SCHEMA, NOISE101_EFFECTIVE_STATE_DOMAIN_SCHEMA):
         try:
             validate_parameter_domain_member(effective_domain["parameter_domain"], wire_parameters)
         except Exception as exc:
@@ -3422,9 +3489,9 @@ def _state_replay_requirement(
             ) from exc
     base = StrategyRegistry.get(strategy_name)
     try:
-        parameters = decode_parameter_mapping(
-            dict(wire_parameters), base.get_default_params()
-        )
+        timeframe = str(_planning_source_value(native, m5_view_window, "timeframe"))
+        defaults, _, _ = resolve_strategy_parameters(base, timeframe, persisted_parameters=wire_parameters, defaults_only=True)
+        parameters = decode_parameter_mapping(dict(wire_parameters), defaults)
         strategy = StrategyRegistry.get(strategy_name, **parameters)
     except Exception as exc:
         raise ProductionSearchPlannerError(
@@ -3448,6 +3515,14 @@ def _state_replay_requirement(
         initial_error_bound=initial_error_bound,
         tolerance=tolerance,
     )
+    source_context = effective_domain.get("source_edition_context")
+    noise_bundle = None
+    if source_context is not None and strategy_name == NOISE101_STRATEGY_ID:
+        if state_error_envelope is None:
+            _fail("NOISE101_STATE_BOUNDARY_REQUIRED")
+        noise_bundle = _noise101_preprotected_state_bundle(fitted=fitted, native=native,
+            parameters=parameters, source_context=source_context, state_error_envelope=state_error_envelope)
+        source_context = noise_bundle["source_edition_context"]
     evidence: dict[str, state_contract.StateEvidence] = {}
     evidence_bodies: list[dict[str, Any]] = []
     for node in unresolved.required_path_state_nodes:
@@ -3471,6 +3546,9 @@ def _state_replay_requirement(
             ),
             "requires_executor_full_prefix_replay_before_any_scored_slice": True,
         }
+        if source_context is not None:
+            identity_body["schema_version"] = NOISE101_FULL_PREFIX_STATE_REPLAY_SCHEMA
+            identity_body["source_edition_context"] = dict(source_context)
         identity_body = _m5_state_binding(identity_body, m5_view_window, "fxpm.production-m5-derived-full-prefix-state-replay.v1")
         item, receipt = _sealed_state_replay_evidence(
             node=node,
@@ -3505,7 +3583,7 @@ def _state_replay_requirement(
     if type(ceiling_bars) is not int or resolved.bounded_context_bars > ceiling_bars:
         _fail("STATE_DOMAIN_CEILING_BREACH", strategy_name)
     body = {
-        "schema_version": STATE_REQUIREMENT_SCHEMA,
+        "schema_version": NOISE101_STATE_REQUIREMENT_SCHEMA if source_context is not None else STATE_REQUIREMENT_SCHEMA,
         "strategy_id": strategy_name,
         "parameters_sha256": _sha(dict(wire_parameters)),
         "effective_domain_sha256": effective_domain[
@@ -3527,6 +3605,10 @@ def _state_replay_requirement(
             "COMPUTE_FEATURES_AND_RAW_SIGNALS_ONCE_OVER_FULL_PREFIX_THEN_SLICE"
         ),
     }
+    if source_context is not None:
+        body["source_edition_context"] = dict(source_context)
+        if noise_bundle is not None:
+            body["recorded_session_state"] = noise_bundle
     if m5_view_window is not None:
         body = _m5_state_binding(body, m5_view_window, M5_DERIVED_STATE_REQUIREMENT_SCHEMA)
         body["regime_surface_source"] = "FITTED_FULL_M5_DERIVED_PREFIX_REGIME_LIVE"
@@ -3541,6 +3623,7 @@ def _state_requirements(
     state_error_envelope: Mapping[str, Any],
     state_domain_records: Sequence[Mapping[str, Any]],
     m5_view_window: Mapping[str, Any] | None = None,
+    source_edition: SourceEditionDescriptor | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     initial_error, tolerance, regime_warmup_bars = (
         _verify_state_error_envelope_fitted_binding(state_error_envelope, fitted=fitted, native=native, m5_view_window=m5_view_window)
@@ -3551,8 +3634,8 @@ def _state_requirements(
         if type(record) is dict
     }
     if (
-        len(state_domain_records) != BASELINE_ATTEMPTS
-        or len(by_strategy) != BASELINE_ATTEMPTS
+        len(state_domain_records) != (source_edition.strategy_count if source_edition is not None else BASELINE_ATTEMPTS)
+        or len(by_strategy) != (source_edition.strategy_count if source_edition is not None else BASELINE_ATTEMPTS)
     ):
         _fail("STATE_DOMAIN_CEILING_ROSTER_INVALID")
     requirements = []
@@ -3562,7 +3645,7 @@ def _state_requirements(
         if record is None:
             _fail("STATE_DOMAIN_CEILING_MISSING", strategy_name)
         requirements.append(
-            _state_replay_requirement(fitted=fitted, native=native, strategy_name=strategy_name, wire_parameters=dict(design['parameters']), initial_error_bound=initial_error, tolerance=tolerance, state_domain_record=record, m5_view_window=m5_view_window)
+            _state_replay_requirement(fitted=fitted, native=native, strategy_name=strategy_name, wire_parameters=dict(design['parameters']), initial_error_bound=initial_error, tolerance=tolerance, state_domain_record=record, m5_view_window=m5_view_window, state_error_envelope=state_error_envelope)
         )
     return requirements, regime_warmup_bars
 
@@ -4012,6 +4095,7 @@ def _select_feasible_common_state_context(
     state_domain_records: Sequence[Mapping[str, Any]],
     regime_warmup_bars: int,
     m5_view_window: Mapping[str, Any] | None = None,
+    source_edition: SourceEditionDescriptor | None = None,
 ) -> dict[str, Any]:
     """Select geometry from exhaustive domain ceilings, never sampled attempts.
 
@@ -4023,7 +4107,7 @@ def _select_feasible_common_state_context(
     """
 
     if (
-        len(state_domain_records) != BASELINE_ATTEMPTS
+        len(state_domain_records) != (source_edition.strategy_count if source_edition is not None else BASELINE_ATTEMPTS)
         or type(regime_warmup_bars) is not int
         or regime_warmup_bars < 1
     ):
@@ -4111,9 +4195,10 @@ def _state_context_selection_receipt(
     *,
     selected_common_context_bars: int,
     boundary_limited: bool,
+    source_edition: SourceEditionDescriptor | None = None,
 ) -> dict[str, Any]:
     if (
-        len(state_domain_records) != BASELINE_ATTEMPTS
+        len(state_domain_records) != (source_edition.strategy_count if source_edition is not None else BASELINE_ATTEMPTS)
         or not dispositions
         or type(boundary_limited) is not bool
     ):
@@ -4152,7 +4237,7 @@ def _state_context_selection_receipt(
     if within_count + exceeds_count != len(dispositions):
         _fail("STATE_CONTEXT_SELECTION_RELATION_INVALID")
     body = {
-        "schema_version": STATE_CONTEXT_SELECTION_SCHEMA,
+        "schema_version": (NOISE101_STATE_CONTEXT_SELECTION_SCHEMA if source_edition is not None and source_edition.edition_id == NOISE101_SOURCE_EDITION_ID else STATE_CONTEXT_SELECTION_SCHEMA),
         "selection_rule": (
             "LARGEST_SOURCE_GEOMETRY_FEASIBLE_EXHAUSTIVE_DOMAIN_CEILING_"
             "DESCENDING"
@@ -5121,6 +5206,7 @@ def _build_observed_cell_plan_source(
         _fail("REGIME_NOT_EMPIRICALLY_OBSERVED_USE_TERMINAL_PATH")
 
     process_body = process.to_dict()
+    edition = source_edition_info(process_body)
     state_error_envelope = _freeze_state_error_envelope(frame=frame, fitted=fitted, native=native, opens=opens, closes=closes, m5_view_window=m5_view_window)
     cell_identity = {
         "symbol": symbol,
@@ -5136,7 +5222,7 @@ def _build_observed_cell_plan_source(
         "rows": native["prefix_rows"],
     }
     state_domain_records, regime_warmup_bars = _state_domain_ceiling_records(process_body, native_prefix=native_binding, cell=cell_identity, state_error_envelope=state_error_envelope, m5_view_window=m5_view_window)
-    state_selection = _select_feasible_common_state_context(native=native, opens=opens, closes=closes, timeframe=timeframe, state_domain_records=state_domain_records, regime_warmup_bars=regime_warmup_bars, m5_view_window=m5_view_window)
+    state_selection = _select_feasible_common_state_context(native=native, opens=opens, closes=closes, timeframe=timeframe, state_domain_records=state_domain_records, regime_warmup_bars=regime_warmup_bars, m5_view_window=m5_view_window, source_edition=edition)
     state_context_bars = state_selection["selected_common_context_bars"]
     payload = state_selection["dependency_payload"]
     dependency_geometry = state_selection["dependency_geometry"]
@@ -5158,7 +5244,7 @@ def _build_observed_cell_plan_source(
         timeframe=timeframe,
         regime=normalized_regime,
     )
-    state_requirements, exact_regime_warmup_bars = _state_requirements(fitted=fitted, native=native, designs=designs, state_error_envelope=state_error_envelope, state_domain_records=state_domain_records, m5_view_window=m5_view_window)
+    state_requirements, exact_regime_warmup_bars = _state_requirements(fitted=fitted, native=native, designs=designs, state_error_envelope=state_error_envelope, state_domain_records=state_domain_records, m5_view_window=m5_view_window, source_edition=edition)
     if exact_regime_warmup_bars != regime_warmup_bars:
         _fail("STATE_DOMAIN_REGIME_WARMUP_MISMATCH")
     state_dispositions = _state_context_dispositions(
@@ -5171,6 +5257,7 @@ def _build_observed_cell_plan_source(
         state_dispositions,
         selected_common_context_bars=state_context_bars,
         boundary_limited=boundary_limited,
+        source_edition=edition,
     )
     fit_end = pd.Timestamp(
         _utc(_planning_source_value(native, m5_view_window, "prefix_end_exclusive_utc"), "PREFIX_END_INVALID")
@@ -5332,7 +5419,7 @@ def _build_observed_cell_plan_source(
     )
     if (
         plan_body.get("plan_status") != expected_status
-        or len(plan_body.get("attempts", [])) != ATTEMPT_COUNT
+        or len(plan_body.get("attempts", [])) != edition.attempt_count
         or plan_body.get("anchor", {}).get("process_precommit_receipt_sha256")
         != causal_precommit_receipt_sha256
     ):
@@ -5367,7 +5454,7 @@ def _build_observed_cell_plan_source(
         _bounded_canary_plan_permit=bounded_canary_plan_permit,
         _declared_slot_request=declared_slot_request,
     )
-    if result.attempt_count != ATTEMPT_COUNT:
+    if result.attempt_count != edition.attempt_count:
         _fail("CELL_PLAN_ATTEMPT_ROSTER_INCOMPLETE")
     (verify_m5_derived_production_cell_search_plan if m5_view_window is not None else verify_production_cell_search_plan)(
         context,
@@ -5857,3 +5944,485 @@ def _route_a_full_panel_preparation_contract(*, owner_snapshot,
 
 __all__.extend(["ROUTE_A_FULL_PANEL_PROCESS_SCHEMA", "ROUTE_A_FULL_PANEL_EXECUTION_EDITION",
     "freeze_route_a_full_panel_production_search_process", "frozen_search_execution_edition"])
+
+
+NOISE101_SOURCE_EDITION_ID: Final = "fxpm.noise101-per-timeframe-source-edition.v1"
+NOISE101_PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v4"
+NOISE101_EXECUTION_EDITION: Final = "fxpm.route-a-noise101-per-timeframe-owner-execution.v1"
+NOISE101_PROCESS_SEMANTICS_SCHEMA: Final = "fxpm.production-search-process-semantics.v3"
+NOISE101_CATALOGUE_SCHEMA: Final = "fxpm.strategy-candidate-catalogue-by-timeframe.v1"
+NOISE101_SOURCE_RELEASE_SCHEMA: Final = "fxpm.source-release-roster.v1"
+NOISE101_STRATEGY_ID: Final = "NoiseBandBreakoutStrategy"
+NOISE101_STRATEGY_COUNT: Final = 101
+NOISE101_ATTEMPT_COUNT: Final = 303
+NOISE101_SOFTWARE_QUALIFICATION: Final = "SOFTWARE_DRAFT_UNQUALIFIED"
+
+
+@dataclass(frozen=True)
+class SourceEditionDescriptor:
+    edition_id: str
+    process_schema: str
+    execution_edition: str | None
+    catalogue_schema: str | None
+    winner_generation_id: str
+    ordered_strategy_ids: tuple[str, ...]
+    ordered_timeframes: tuple[str, ...]
+    strategy_count: int
+    nondefault_variants_per_strategy: int
+    attempt_count: int
+    candidate_catalogue_sha256: str
+    domain_roster_sha256_by_timeframe: Mapping[str, str]
+    state_registry_sha256: str
+    source_release_sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"edition_id": self.edition_id, "process_schema": self.process_schema,
+            "execution_edition": self.execution_edition, "catalogue_schema": self.catalogue_schema,
+            "winner_generation_id": self.winner_generation_id,
+            "ordered_strategy_ids": list(self.ordered_strategy_ids),
+            "ordered_timeframes": list(self.ordered_timeframes),
+            "strategy_count": self.strategy_count,
+            "nondefault_variants_per_strategy": self.nondefault_variants_per_strategy,
+            "attempt_count": self.attempt_count,
+            "candidate_catalogue_sha256": self.candidate_catalogue_sha256,
+            "domain_roster_sha256_by_timeframe": dict(self.domain_roster_sha256_by_timeframe),
+            "state_registry_sha256": self.state_registry_sha256,
+            "source_release_sha256": self.source_release_sha256}
+
+
+def _edition_process_body(process_or_body):
+    if type(process_or_body) is FrozenProductionSearchProcess:
+        return process_or_body.to_dict()
+    if isinstance(process_or_body, Mapping):
+        return process_or_body
+    _fail("PROCESS_OBJECT_INVALID")
+
+
+def is_route_a_full_panel_process(process_or_body) -> bool:
+    """Select a verified caller's route without repeating source/context checks."""
+    body = _edition_process_body(process_or_body)
+    return ((body.get("schema_version") == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA
+             and body.get("execution_edition") == ROUTE_A_FULL_PANEL_EXECUTION_EDITION)
+        or (body.get("schema_version") == NOISE101_PROCESS_SCHEMA
+             and body.get("execution_edition") == NOISE101_EXECUTION_EDITION))
+
+
+def full_panel_generation(process_or_body):
+    body = _edition_process_body(process_or_body)
+    if not is_route_a_full_panel_process(body):
+        return None
+    return (search_execution.winner.V18_GENERATION if body["schema_version"] == NOISE101_PROCESS_SCHEMA
+        else search_execution.winner.V17_GENERATION)
+
+
+def source_edition_info(process_or_body) -> SourceEditionDescriptor:
+    """Read immutable identities from already-authenticated process metadata."""
+    if type(process_or_body) is SourceEditionDescriptor:
+        return process_or_body
+    body = _edition_process_body(process_or_body)
+    schema = body.get("schema_version")
+    if schema == NOISE101_PROCESS_SCHEMA:
+        value = body.get("source_edition")
+        keys = set(SourceEditionDescriptor.__dataclass_fields__)
+        if type(value) is not dict or set(value) != keys:
+            _fail("SOURCE_EDITION_FIELDS_INVALID")
+        if (value["edition_id"] != NOISE101_SOURCE_EDITION_ID
+                or value["process_schema"] != NOISE101_PROCESS_SCHEMA
+                or value["execution_edition"] != NOISE101_EXECUTION_EDITION
+                or value["catalogue_schema"] != NOISE101_CATALOGUE_SCHEMA
+                or value["winner_generation_id"] != search_execution.winner.V18_GENERATION.selection_version
+                or value["ordered_strategy_ids"] != [*state_contract.ACTUAL_STRATEGY_NAMES, NOISE101_STRATEGY_ID]
+                or value["ordered_timeframes"] != list(TIMEFRAMES)
+                or value["strategy_count"] != NOISE101_STRATEGY_COUNT
+                or value["nondefault_variants_per_strategy"] != VARIANTS_PER_STRATEGY
+                or value["attempt_count"] != NOISE101_ATTEMPT_COUNT
+                or body.get("execution_edition") != value["execution_edition"]
+                or body.get("candidate_domain_sha256") != value["candidate_catalogue_sha256"]
+                or body.get("state_contract_registry_sha256") != value["state_registry_sha256"]):
+            _fail("SOURCE_EDITION_BINDING_INVALID")
+        for name in ("candidate_catalogue_sha256", "state_registry_sha256", "source_release_sha256"):
+            _hex64(value[name], "SOURCE_EDITION_HASH_INVALID")
+        rosters = value["domain_roster_sha256_by_timeframe"]
+        if type(rosters) is not dict or set(rosters) != set(TIMEFRAMES):
+            _fail("SOURCE_EDITION_TIMEFRAME_ROSTER_INVALID")
+        for digest in rosters.values():
+            _hex64(digest, "SOURCE_EDITION_HASH_INVALID")
+        return SourceEditionDescriptor(**{**value,
+            "ordered_strategy_ids": tuple(value["ordered_strategy_ids"]),
+            "ordered_timeframes": tuple(value["ordered_timeframes"]),
+            "domain_roster_sha256_by_timeframe": MappingProxyType({tf: rosters[tf] for tf in TIMEFRAMES})})
+    if schema not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA):
+        _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
+    sem = body.get("semantics", {})
+    names = tuple(sem.get("registry_order", state_contract.ACTUAL_STRATEGY_NAMES))
+    if names != state_contract.ACTUAL_STRATEGY_NAMES:
+        _fail("PROCESS_DOMAIN_ROSTER_INVALID")
+    generation = full_panel_generation(body) or search_execution.winner.CURRENT_GENERATION
+    roster = sem.get("strategy_domain_roster_sha256", body.get("candidate_domain_sha256", ""))
+    return SourceEditionDescriptor(schema, schema, body.get("execution_edition"), None,
+        generation.selection_version, names, TIMEFRAMES, BASELINE_ATTEMPTS,
+        VARIANTS_PER_STRATEGY, ATTEMPT_COUNT, body.get("candidate_domain_sha256", ""),
+        MappingProxyType({tf: roster for tf in TIMEFRAMES}), body.get("state_contract_registry_sha256", ""),
+        _sha({name: body.get(name) for name in ("planner_release_sha256",
+            "authoritative_executor_release_sha256", "historical_adapter_release_sha256")}))
+
+
+def process_attempt_count(process_or_body) -> int:
+    return source_edition_info(process_or_body).attempt_count
+
+
+def process_strategy_count(process_or_body) -> int:
+    return source_edition_info(process_or_body).strategy_count
+
+
+def _noise101_source_release_roster() -> dict[str, Any]:
+    from pm_causal_evidence_producer import _COMPONENT_SOURCE_FILES
+    # Reuse the authoritative component closure, adding the actual search callers.
+    files = {name for group in _COMPONENT_SOURCE_FILES.values() for name in group}
+    files.update({"pm_production_search_planner.py", "pm_state_contract.py", "pm_pipeline.py",
+        "pm_authoritative_search_execution.py", "pm_historical_production_adapter.py",
+        "pm_historical_anchor_orchestration.py", "pm_historical_search_producer.py",
+        "pm_strategies.py", "pm_current_refit_parameters.py", "pm_current_refit_artifacts.py",
+        "pm_current_refit_execution.py", "pm_current_refit_production.py", "pm_optuna.py",
+        "pm_main.py", "pm_authority_spool.py", "pm_authority_spool_quota.py"})
+    base = Path(__file__).resolve().parent
+    return {"schema_version": NOISE101_SOURCE_RELEASE_SCHEMA,
+        "modules": {Path(name).stem: hashlib.sha256((base / name).read_bytes()).hexdigest()
+            for name in sorted(files)}}
+
+
+def _noise101_legacy_domains() -> list[dict[str, Any]]:
+    scope = _PROCESS_VERIFICATION_STATE.get()
+    if scope is not None and "noise101_legacy_domains" in scope:
+        return json.loads(scope["noise101_legacy_domains"].decode("ascii"))
+    names = state_contract.ACTUAL_STRATEGY_NAMES
+    documents = []
+    for name in sorted(names):
+        strategy = StrategyRegistry.get(name)
+        documents.append({"name": name,
+            "defaults": _normalize_candidate_domain_value(strategy.get_default_params()),
+            "grid": _normalize_candidate_domain_value(strategy.get_param_grid()),
+            "coupled_groups": _normalize_candidate_domain_value(strategy.get_param_couplings())})
+    if state_contract.strategy_candidate_domain_sha256(documents) != state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256:
+        _fail("LEGACY100_CANDIDATE_DOMAIN_DRIFT")
+    domains = [_strategy_domain(name, ordinal) for ordinal, name in enumerate(names)]
+    if scope is not None:
+        scope["noise101_legacy_domains"] = _canonical_bytes(domains)
+    return domains
+
+
+def build_noise101_candidate_catalogue() -> dict[str, Any]:
+    """Resolve complete metadata once; no market inputs or process issuance."""
+    scope = _PROCESS_VERIFICATION_STATE.get()
+    if scope is not None and "noise101_catalogue" in scope:
+        return json.loads(scope["noise101_catalogue"].decode("ascii"))
+    names = [*state_contract.ACTUAL_STRATEGY_NAMES, NOISE101_STRATEGY_ID]
+    if set(StrategyRegistry.list_all()) != set(names) or len(names) != NOISE101_STRATEGY_COUNT:
+        _fail("NOISE101_REGISTRY_ROSTER_INVALID")
+    legacy = _noise101_legacy_domains()
+    pool = {row["domain_sha256"]: row for row in legacy}
+    rosters = {}
+    for timeframe in TIMEFRAMES:
+        references = []
+        for old in legacy:
+            strategy = StrategyRegistry.get(old["strategy_id"])
+            defaults, grid, groups = resolve_strategy_parameters(strategy, timeframe)
+            actual_axes = [{"name": name, "choices": [canonicalize_parameter_value(value) for value in choices]}
+                for name, choices in grid.items()]
+            if (_canonical_bytes(canonicalize_parameter_mapping(defaults)) != _canonical_bytes(old["defaults"])
+                    or _canonical_bytes(actual_axes) != _canonical_bytes(old["grid_axes"])
+                    or _canonical_bytes(_normalize_candidate_domain_value(groups))
+                        != _canonical_bytes(_normalize_candidate_domain_value(strategy.get_param_couplings()))):
+                _fail("LEGACY100_TIMEFRAME_PARAMETER_DRIFT", old["strategy_id"], timeframe)
+            references.append(old["domain_sha256"])
+        noise = _strategy_domain(NOISE101_STRATEGY_ID, BASELINE_ATTEMPTS, timeframe)
+        pool[noise["domain_sha256"]] = noise
+        references.append(noise["domain_sha256"])
+        identity = {"timeframe": timeframe, "ordered_strategy_ids": names,
+            "domain_sha256_by_strategy_ordinal": references}
+        rosters[timeframe] = {"domain_sha256_by_strategy_ordinal": references,
+            "domain_roster_sha256": _sha(identity)}
+    body = {"schema_version": NOISE101_CATALOGUE_SCHEMA,
+        "source_edition_id": NOISE101_SOURCE_EDITION_ID,
+        "ordered_strategy_ids": names, "ordered_timeframes": list(TIMEFRAMES),
+        "source_release_sha256": _sha(_noise101_source_release_roster()),
+        "domain_pool": {key: pool[key] for key in sorted(pool)},
+        "rosters_by_timeframe": rosters}
+    validate_noise101_candidate_catalogue(body)
+    if scope is not None:
+        scope["noise101_catalogue"] = _canonical_bytes(body)
+    return body
+
+
+def validate_noise101_candidate_catalogue(body: Mapping[str, Any]) -> dict[str, Any]:
+    if (type(body) is not dict or set(body) != {"schema_version", "source_edition_id",
+            "ordered_strategy_ids", "ordered_timeframes", "source_release_sha256", "domain_pool", "rosters_by_timeframe"}
+            or body["schema_version"] != NOISE101_CATALOGUE_SCHEMA
+            or body["source_edition_id"] != NOISE101_SOURCE_EDITION_ID
+            or body["ordered_strategy_ids"] != [*state_contract.ACTUAL_STRATEGY_NAMES, NOISE101_STRATEGY_ID]
+            or body["ordered_timeframes"] != list(TIMEFRAMES)
+            or type(body["domain_pool"]) is not dict
+            or type(body["rosters_by_timeframe"]) is not dict
+            or set(body["rosters_by_timeframe"]) != set(TIMEFRAMES)):
+        _fail("NOISE101_CATALOGUE_FIELDS_INVALID")
+    _hex64(body["source_release_sha256"], "NOISE101_SOURCE_RELEASE_INVALID")
+    for digest, concrete in body["domain_pool"].items():
+        if type(concrete) is not dict or concrete.get("domain_sha256") != digest or _sha(
+                {k: v for k, v in concrete.items() if k != "domain_sha256"}) != digest:
+            _fail("NOISE101_CONCRETE_DOMAIN_HASH_INVALID")
+    used = set()
+    for timeframe in TIMEFRAMES:
+        roster = body["rosters_by_timeframe"][timeframe]
+        if type(roster) is not dict or set(roster) != {"domain_sha256_by_strategy_ordinal", "domain_roster_sha256"}:
+            _fail("NOISE101_CATALOGUE_ROSTER_INVALID")
+        refs = roster["domain_sha256_by_strategy_ordinal"]
+        if type(refs) is not list or len(refs) != NOISE101_STRATEGY_COUNT:
+            _fail("NOISE101_CATALOGUE_ROSTER_INVALID")
+        for ordinal, (name, digest) in enumerate(zip(body["ordered_strategy_ids"], refs, strict=True)):
+            concrete = body["domain_pool"].get(digest)
+            if concrete is None or concrete.get("strategy_id") != name or concrete.get("ordinal") != ordinal:
+                _fail("NOISE101_CATALOGUE_MEMBER_CROSSED")
+            used.add(digest)
+        identity = {"timeframe": timeframe, "ordered_strategy_ids": body["ordered_strategy_ids"],
+            "domain_sha256_by_strategy_ordinal": refs}
+        if _sha(identity) != roster["domain_roster_sha256"]:
+            _fail("NOISE101_CATALOGUE_ROSTER_HASH_INVALID")
+        defaults = body["domain_pool"][refs[-1]]["defaults"]
+        expected, _, _ = resolve_strategy_parameters(StrategyRegistry.get(NOISE101_STRATEGY_ID),
+            timeframe, defaults_only=True, persisted_parameters=defaults)
+        if defaults != canonicalize_parameter_mapping(expected):
+            _fail("NOISE101_CATALOGUE_TIMEFRAME_CROSSED")
+    if used != set(body["domain_pool"]):
+        _fail("NOISE101_CATALOGUE_UNUSED_DOMAIN")
+    return dict(body)
+
+
+def noise101_process_metadata() -> dict[str, Any]:
+    catalogue = build_noise101_candidate_catalogue()
+    digest = _sha(catalogue)
+    authority = state_contract.build_noise101_state_authority(digest)
+    descriptor = SourceEditionDescriptor(NOISE101_SOURCE_EDITION_ID, NOISE101_PROCESS_SCHEMA,
+        NOISE101_EXECUTION_EDITION, NOISE101_CATALOGUE_SCHEMA,
+        search_execution.winner.V18_GENERATION.selection_version,
+        tuple(catalogue["ordered_strategy_ids"]), TIMEFRAMES, NOISE101_STRATEGY_COUNT,
+        VARIANTS_PER_STRATEGY, NOISE101_ATTEMPT_COUNT, digest,
+        MappingProxyType({tf: catalogue["rosters_by_timeframe"][tf]["domain_roster_sha256"] for tf in TIMEFRAMES}),
+        authority.registry_hash, catalogue["source_release_sha256"])
+    semantics = _process_semantics(_noise101_legacy_domains())
+    semantics.pop("strategy_domains")
+    semantics.pop("strategy_domain_roster_sha256")
+    semantics.pop("all_100_strategies_represented")
+    semantics.update(schema_version=NOISE101_PROCESS_SEMANTICS_SCHEMA,
+        registry_order=list(descriptor.ordered_strategy_ids),
+        registry_order_sha256=_sha(list(descriptor.ordered_strategy_ids)),
+        strategy_domain_count=NOISE101_STRATEGY_COUNT, candidate_catalogue=catalogue,
+        accepted_candidate_domain_sha256=digest, state_contract_registry_sha256=authority.registry_hash,
+        all_declared_strategies_represented=True)
+    semantics["attempt_policy"].update(winner_contract_version=descriptor.winner_generation_id,
+        winner_max_attempts=search_execution.winner.V18_GENERATION.max_attempts,
+        attempt_count_per_observed_cell=NOISE101_ATTEMPT_COUNT,
+        default_attempt_count=NOISE101_STRATEGY_COUNT,
+        additional_nondefault_attempt_count=NOISE101_STRATEGY_COUNT * VARIANTS_PER_STRATEGY)
+    return {"schema_version": NOISE101_PROCESS_SCHEMA, "execution_edition": NOISE101_EXECUTION_EDITION,
+        "candidate_domain_sha256": digest, "state_contract_registry_sha256": authority.registry_hash,
+        "source_edition": descriptor.to_dict(), "semantics": semantics}
+
+
+def freeze_noise101_full_panel_production_search_process(context: authority_spool.GenerationSpoolContext,
+        *, run_id: str) -> FrozenProductionSearchProcess:
+    """Production requires actual recorded-clock/DST and cost qualification authority."""
+    _fail("NOISE101_PRODUCTION_QUALIFICATION_NOT_ESTABLISHED")
+
+
+def freeze_noise101_software_search_description(context: authority_spool.GenerationSpoolContext,
+        *, run_id: str) -> FrozenProductionSearchProcess:
+    """Freeze/reopen honest software metadata; real execution refuses this scope."""
+    return _freeze_production_search_process(context, run_id=run_id, schema_version=NOISE101_PROCESS_SCHEMA)
+
+
+def write_noise101_candidate_catalogue(path: Path, catalogue: Mapping[str, Any] | None = None):
+    body = build_noise101_candidate_catalogue() if catalogue is None else validate_noise101_candidate_catalogue(dict(catalogue))
+    encoded = _canonical_bytes(body)
+    with Path(path).open("xb") as handle:
+        handle.write(encoded)
+    return {"path": str(path), "sha256": hashlib.sha256(encoded).hexdigest(),
+        "bytes": len(encoded), "qualification_status": NOISE101_SOFTWARE_QUALIFICATION}
+
+
+def noise101_structural_disposition(timeframe: str, symbol: str, parameters: Mapping[str, Any]):
+    strategy = StrategyRegistry.get(NOISE101_STRATEGY_ID, **dict(parameters))
+    resolve_strategy_parameters(strategy, timeframe, defaults_only=True, persisted_parameters=dict(parameters))
+    length = strategy.session_spec(symbol)[1]
+    checks = length // (parameters["bar_minutes"] * parameters["check_bars"])
+    return {"nominal_session_checks": checks, "existing_minimum_session_checks": 6,
+        "structurally_zero_signal": checks < 6, "removed_from_declared_roster": False}
+
+
+__all__.extend(["NOISE101_SOURCE_EDITION_ID", "NOISE101_PROCESS_SCHEMA", "NOISE101_EXECUTION_EDITION",
+    "NOISE101_CATALOGUE_SCHEMA", "SourceEditionDescriptor", "source_edition_info", "process_attempt_count",
+    "process_strategy_count", "is_route_a_full_panel_process", "full_panel_generation",
+    "build_noise101_candidate_catalogue", "validate_noise101_candidate_catalogue",
+    "noise101_process_metadata", "freeze_noise101_full_panel_production_search_process",
+    "write_noise101_candidate_catalogue", "noise101_structural_disposition"])
+
+
+NOISE101_EFFECTIVE_STATE_DOMAIN_SCHEMA = "fxpm.production-effective-state-domain.v3"
+NOISE101_STATE_REQUIREMENT_SCHEMA = "fxpm.production-attempt-state-requirement.v3"
+NOISE101_STATE_DOMAIN_CEILING_RECORD_SCHEMA = "fxpm.production-state-domain-ceiling-record.v2"
+NOISE101_STATE_CONTEXT_SELECTION_SCHEMA = "fxpm.production-cell-state-context-selection.v3"
+NOISE101_DOMAIN_STATE_REPLAY_SCHEMA = "fxpm.production-domain-state-replay.v2"
+NOISE101_FULL_PREFIX_STATE_REPLAY_SCHEMA = "fxpm.production-full-prefix-state-replay.v2"
+
+
+def source_edition_context_for_cell(process_or_edition, timeframe: str, *,
+        noise_state_sha256=None, noise_transition_sha256=None,
+        state_boundary_source_sha256=None) -> dict[str, Any]:
+    edition = source_edition_info(process_or_edition)
+    if edition.edition_id != NOISE101_SOURCE_EDITION_ID or timeframe not in edition.ordered_timeframes:
+        _fail("NOISE101_SOURCE_CONTEXT_EDITION_INVALID")
+    return state_contract.validate_noise101_source_context({
+        "source_edition_id": edition.edition_id,
+        "candidate_catalogue_sha256": edition.candidate_catalogue_sha256,
+        "timeframe": timeframe,
+        "domain_roster_sha256": edition.domain_roster_sha256_by_timeframe[timeframe],
+        "state_registry_sha256": edition.state_registry_sha256,
+        "noise_state_sha256": noise_state_sha256,
+        "noise_transition_sha256": noise_transition_sha256,
+        "state_boundary_source_sha256": state_boundary_source_sha256}, allow_unproved=True)
+
+
+def verify_source_edition_context(process_or_edition, timeframe: str, context, *,
+        strategy_id: str | None = None, allow_unproved: bool = False):
+    """Bind an already-verified requirement; no source reads or replay."""
+    edition = source_edition_info(process_or_edition)
+    if edition.edition_id != NOISE101_SOURCE_EDITION_ID:
+        if context is not None:
+            _fail("LEGACY_SOURCE_CONTEXT_REJECTED")
+        return None
+    if timeframe not in edition.ordered_timeframes:
+        _fail("NOISE101_AUTHENTICATED_TIMEFRAME_REQUIRED")
+    complete_noise = strategy_id == NOISE101_STRATEGY_ID and not allow_unproved
+    actual = state_contract.validate_noise101_source_context(context,
+        allow_unproved=not complete_noise)
+    expected = source_edition_context_for_cell(edition, timeframe)
+    for field in ("source_edition_id", "candidate_catalogue_sha256", "timeframe",
+            "domain_roster_sha256", "state_registry_sha256"):
+        if actual[field] != expected[field]:
+            _fail("NOISE101_SOURCE_CONTEXT_CROSSED", field)
+    if strategy_id is not None and strategy_id not in edition.ordered_strategy_ids:
+        _fail("NOISE101_SOURCE_CONTEXT_STRATEGY_INVALID")
+    return actual
+
+
+def _noise101_preprotected_state_bundle(*, fitted, native, parameters,
+        source_context, state_error_envelope):
+    frame = fitted._frame
+    cutoff = pd.Timestamp(_utc(state_error_envelope["preprotected_cutoff_utc"],
+        "NOISE101_STATE_CUTOFF_INVALID"))
+    opens = pd.DatetimeIndex(pd.to_datetime(frame.index, utc=True))
+    closes = pd.DatetimeIndex(pd.to_datetime(frame["_BAR_CLOSE_TS"], utc=True))
+    source = frame.loc[(opens < cutoff) & (closes <= cutoff)]
+    if len(source) != state_error_envelope["source_rows"]:
+        _fail("NOISE101_STATE_BOUNDARY_SOURCE_CHANGED")
+    # The existing envelope proves this prefix precedes every protected observation.
+    boundary = _noise101_boundary_identity({"index_sha256": fitted.product.index_sha256,
+        "content_sha256": native["prefix_content_sha256"],
+        "start_utc": native["prefix_start_utc"]}, state_error_envelope)
+    context = {**source_context, "state_boundary_source_sha256": _sha(boundary)}
+    strategy = StrategyRegistry.get(NOISE101_STRATEGY_ID, **dict(parameters))
+    symbol = str(native["symbol"])
+    spec = strategy.session_spec(symbol)
+    inside, keys = search_execution.pm_core._recorded_session_arrays(source.index, spec)
+    relative = (source.index.hour * 60 + source.index.minute - spec[0]) % 1440
+    bundle = state_contract.encode_noise101_replay_state(source_context=context,
+        implementation_sha256=_callable_sha256(type(strategy).generate_signals),
+        symbol=symbol, parameters=parameters, session_spec=spec,
+        session_keys=[int(value) for value in keys],
+        in_session=[bool(value) for value in inside],
+        slot_minutes=[int(value) + parameters["bar_minutes"] for value in relative],
+        open_prices=source["Open"].tolist(), close_prices=source["Close"].tolist(),
+        recorded_opens=[value.isoformat() for value in source.index],
+        recorded_timezone=str(source.index.tz) if source.index.tz is not None else None)
+    state_contract.decode_noise101_replay_state(bundle)
+    return bundle
+
+
+__all__.extend(["source_edition_context_for_cell", "verify_source_edition_context"])
+
+
+__all__.append("freeze_noise101_software_search_description")
+
+
+def _noise101_boundary_identity(native_prefix, state_error_envelope):
+    return {"native_prefix_index_sha256": native_prefix["index_sha256"],
+        "native_prefix_content_sha256": native_prefix["content_sha256"],
+        "prefix_start_utc": native_prefix["start_utc"],
+        "preprotected_cutoff_utc": state_error_envelope["preprotected_cutoff_utc"],
+        "source_price_surface_sha256": state_error_envelope["source_price_surface_sha256"],
+        "source_rows": state_error_envelope["source_rows"],
+        "replay_from_authenticated_prefix_start": True}
+
+
+def _verify_noise101_state_requirement(edition, timeframe, state, *,
+        effective_domain, native_prefix, state_error_envelope):
+    strategy_id = state.get("strategy_id")
+    context = verify_source_edition_context(edition, timeframe,
+        state.get("source_edition_context"), strategy_id=strategy_id)
+    expected = dict(effective_domain["source_edition_context"])
+    if any(context[key] != expected[key] for key in ("source_edition_id", "candidate_catalogue_sha256", "timeframe", "domain_roster_sha256", "state_registry_sha256")):
+        _fail("NOISE101_STATE_DOMAIN_CONTEXT_CROSSED")
+    for replay in state["state_evidence"]:
+        if replay.get("source_edition_context") != context:
+            _fail("NOISE101_STATE_REPLAY_CONTEXT_CROSSED")
+    if strategy_id == NOISE101_STRATEGY_ID:
+        bundle = state.get("recorded_session_state")
+        try:
+            decoded = state_contract.decode_noise101_replay_state(bundle)
+        except (TypeError, KeyError, ValueError) as exc:
+            raise ProductionSearchPlannerError("NOISE101_STATE_BUNDLE_INVALID", (str(exc),)) from exc
+        if (bundle["source_edition_context"] != context
+                or context["state_boundary_source_sha256"] != _sha(_noise101_boundary_identity(native_prefix, state_error_envelope))
+                or bundle["transition"]["implementation_sha256"] != _callable_sha256(type(StrategyRegistry.get(NOISE101_STRATEGY_ID)).generate_signals)
+                or decoded["timeframe"] != timeframe
+                or decoded["parameters_sha256"] != state["parameters_sha256"]
+                or decoded["symbol"] != effective_domain["cell"]["symbol"]):
+            _fail("NOISE101_STATE_BOUNDARY_BINDING_INVALID")
+    elif "recorded_session_state" in state or context != expected:
+        _fail("NOISE101_STATE_BUNDLE_STRATEGY_CROSSED")
+
+
+def resume_noise101_recorded_session_signals(bundle, suffix_frame, *, strategy, symbol):
+    """Replay the bounded recorded history through the same strategy implementation."""
+    state = state_contract.decode_noise101_replay_state(bundle)
+    if (_sha(dict(strategy.params)) != state["parameters_sha256"]
+            or type(strategy).__name__ != NOISE101_STRATEGY_ID or symbol != state["symbol"]
+            or _callable_sha256(type(strategy).generate_signals) != bundle["transition"]["implementation_sha256"]
+            or strategy.session_spec(symbol) != (state["session_spec"]["anchor_minutes"], state["session_spec"]["length_minutes"])
+            or any(strategy.params[key] != state[key] for key in ("bar_minutes", "check_bars", "lookback"))):
+        _fail("NOISE101_RESUME_STRATEGY_CROSSED")
+    timezone = state["recorded_timezone"]
+    labels = [row["recorded_open"] for row in state["replay_observations"]]
+    if timezone is None:
+        index = pd.DatetimeIndex(labels)
+    else:
+        index = pd.DatetimeIndex(pd.to_datetime(labels, utc=True)).tz_convert(timezone)
+    suffix_index = pd.DatetimeIndex(suffix_frame.index)
+    if (str(suffix_index.tz) if suffix_index.tz is not None else None) != timezone:
+        _fail("NOISE101_RESUME_RECORDED_TIMEZONE_CROSSED")
+    if len(suffix_index) and state["last_recorded_open"] is not None and suffix_index[0] <= pd.Timestamp(state["last_recorded_open"]):
+        _fail("NOISE101_RESUME_SOURCE_OVERLAP")
+    history = pd.DataFrame({"Open": [row["open"] for row in state["replay_observations"]],
+        "Close": [row["close"] for row in state["replay_observations"]]}, index=index)
+    combined = pd.concat([history, suffix_frame])
+    signals = strategy.generate_signals(combined, symbol)
+    return signals.iloc[len(history):].copy() if hasattr(signals, "iloc") else signals[len(history):].copy()
+
+
+__all__.extend(["SourceEditionDescriptor", "NOISE101_SOURCE_EDITION_ID", "NOISE101_PROCESS_SCHEMA",
+    "NOISE101_EXECUTION_EDITION", "source_edition_info", "is_route_a_full_panel_process",
+    "full_panel_generation", "process_attempt_count", "process_strategy_count",
+    "build_noise101_candidate_catalogue", "validate_noise101_candidate_catalogue",
+    "write_noise101_candidate_catalogue", "noise101_process_metadata",
+    "freeze_noise101_software_search_description", "freeze_noise101_full_panel_production_search_process",
+    "source_edition_context_for_cell", "verify_source_edition_context",
+    "noise101_structural_disposition", "resume_noise101_recorded_session_signals"])

@@ -17,7 +17,7 @@ from pm_current_refit_parameters import (
     canonicalize_parameter_mapping,
     decode_parameter_mapping,
 )
-from pm_strategies import StrategyRegistry
+from pm_strategies import StrategyRegistry, resolve_strategy_parameters
 from pm_authority_spool import (
     CANONICAL_JSON_FORMAT,
     CURRENT_REFIT_MANIFEST_DOMAIN,
@@ -621,8 +621,9 @@ def _build_physical_current_refit_ledger_payload(
         wire_parameters = canonicalize_parameter_mapping(trial.get("parameters"))
         try:
             template = StrategyRegistry.get(str(cell["strategy_id"]))
+            defaults, _, _ = resolve_strategy_parameters(template, timeframe, defaults_only=True)
             runtime_parameters = decode_parameter_mapping(
-                wire_parameters, template.get_default_params()
+                wire_parameters, defaults
             )
             fitted = StrategyRegistry.get(
                 str(cell["strategy_id"]), **runtime_parameters

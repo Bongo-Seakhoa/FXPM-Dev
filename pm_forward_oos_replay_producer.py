@@ -52,7 +52,7 @@ from pm_core import (
     build_backtest_position_events,
 )
 from pm_current_refit_parameters import decode_parameter_mapping
-from pm_strategies import StrategyRegistry
+from pm_strategies import StrategyRegistry, resolve_strategy_parameters
 
 
 UTC: Final = timezone.utc
@@ -1798,14 +1798,17 @@ def _selected_owner_generation(
         book_body.get("contract_version"), request_body.get("contract_version"),
         *payload_versions, decision_body.get("contract_version"),
     )
-    for generation in (book.ARCHIVED_GENERATION, book.CURRENT_GENERATION, book.V16_GENERATION):
-        expected = generation.winner_generation
-        if observed == (
-            generation.version, expected.request_version,
-            expected.precommitment_version, expected.evidence_version,
-            expected.selection_version,
-        ):
-            return generation
+    try:
+        generation = book.book_generation_for_version(book_body.get("contract_version"))
+    except ValueError:
+        _fail("SELECTED_OWNER_GENERATION_TUPLE_INVALID")
+    expected = generation.winner_generation
+    if observed == (
+        generation.version, expected.request_version,
+        expected.precommitment_version, expected.evidence_version,
+        expected.selection_version,
+    ):
+        return generation
     _fail("SELECTED_OWNER_GENERATION_TUPLE_INVALID")
 
 
@@ -1821,15 +1824,21 @@ def _restore_current_owner_frozen_binding(
     _generation: Any = book.CURRENT_GENERATION,
 ) -> tuple[Any, dict[str, Any], tuple[dict[str, Any], ...], dict[str, Any]]:
     """Restore only the sealed current historical owner, without an issuer or sink."""
+    try:
+        generation = book.book_generation_for_winner(getattr(_generation, "winner_generation", None))
+    except ValueError:
+        _fail("CURRENT_OWNER_CROSS_BINDING_SCHEMA_INVALID")
+    if generation is not _generation or generation.winner_generation.archived:
+        _fail("CURRENT_OWNER_CROSS_BINDING_SCHEMA_INVALID")
+    expected = generation.winner_generation
     schema = cross.get("schema_version")
     if schema in (
         raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA,
         raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
-    ) or (_generation is book.V16_GENERATION
-          and schema == raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5):
+        raw_winner.horizon_winner_cross_binding_schemas_for_generation(expected)[1],
+    ):
         _fail("CURRENT_OWNER_CROSS_BINDING_MODE_FORBIDDEN")
-    if (_generation is not book.CURRENT_GENERATION and _generation is not book.V16_GENERATION
-            or schema != _generation.cross_binding_schema):
+    if schema != generation.cross_binding_schema:
         _fail("CURRENT_OWNER_CROSS_BINDING_SCHEMA_INVALID")
     prefix = f"{namespace}/winner-search/{timeframe}/{regime}/frozen/"
     selected_entries = [
@@ -1842,9 +1851,19 @@ def _restore_current_owner_frozen_binding(
         for entry in selected_entries
     ]
     try:
-        restore = (raw_winner.restore_frozen_winner_search_plan_v5
-                   if _generation is book.V16_GENERATION
-                   else raw_winner.restore_frozen_winner_search_plan_v4)
+        receipt_bytes = next((encoded for entry, encoded in zip(selected_entries, bodies, strict=True)
+            if entry["artifact_id"] == prefix + "receipt"), None)
+        if receipt_bytes is None:
+            _fail("CURRENT_OWNER_FROZEN_RESTORE_FAILED")
+        receipt = json.loads(receipt_bytes.decode("ascii"))
+        if type(receipt) is not dict:
+            _fail("CURRENT_OWNER_FROZEN_RESTORE_FAILED")
+        frozen_schema = receipt.get("schema_version")
+        restore = raw_winner.frozen_plan_restorer_for_schema(frozen_schema)
+        if restore is None:
+            _fail("CURRENT_OWNER_FROZEN_RESTORE_FAILED")
+        if expected.matched_floor_enabled and frozen_schema != raw_winner.bound_frozen_plan_schema_for_generation(expected):
+            _fail("CURRENT_OWNER_FROZEN_PAIR_GENERATION_MISMATCH")
         frozen = restore(
             context_identity={
                 "generation_id": context.generation_id,
@@ -1856,14 +1875,14 @@ def _restore_current_owner_frozen_binding(
             artifact_namespace=namespace,
             manifest_entries=selected_entries, body_bytes=bodies,
         )
-    except raw_winner.WinnerRawEvidenceError as exc:
+    except (raw_winner.WinnerRawEvidenceError, UnicodeError, json.JSONDecodeError) as exc:
         raise ForwardOOSReplayProductionError(
-            "CURRENT_OWNER_FROZEN_RESTORE_FAILED", (exc.code,)
+            "CURRENT_OWNER_FROZEN_RESTORE_FAILED", (getattr(exc, "code", type(exc).__name__),)
         ) from exc
     if not frozen.frozen_tier_pair_contract_bytes:
         _fail("CURRENT_OWNER_FROZEN_PAIR_GENERATION_MISMATCH")
-    if (_generation is book.V16_GENERATION
-            and frozen.selection_generation is not winner.V16_GENERATION):
+    if (frozen.selection_generation is not expected
+            or (expected.matched_floor_enabled and frozen.bound_fitted_state_entry is None)):
         _fail("CURRENT_OWNER_FROZEN_PAIR_GENERATION_MISMATCH")
     try:
         binding, attempts, binding_context = raw_winner.verify_historical_frozen_winner_cross_binding(
@@ -1874,6 +1893,41 @@ def _restore_current_owner_frozen_binding(
             "CURRENT_OWNER_CROSS_BINDING_REVERIFY_FAILED", (exc.code,)
         ) from exc
     return frozen, binding, attempts, binding_context
+
+
+def _verify_bound_owner_source_reference(*, context, entries, frozen, cross, index,
+        binding, source, fit, native_index, cell_id):
+    """Join the original content-addressed fitted state to its selected capture."""
+    reference = getattr(frozen, "bound_fitted_state_entry", None)
+    if reference is not None:
+        try:
+            state, _ = current_refit.read_bound_fitted_state_reference(context, reference,
+                artifact_namespace=frozen.artifact_namespace)
+        except current_refit.CurrentRefitArtifactError as exc:
+            raise ForwardOOSReplayProductionError(
+                "CURRENT_OWNER_BOUND_SOURCE_REOPEN_FAILED", (str(exc),)) from exc
+        metadata = state.get("metadata")
+        fitted_binding = metadata.get("binding") if type(metadata) is dict else None
+        receipts = metadata.get("receipts") if type(metadata) is dict else None
+        state_entry = reference.get("state_entry")
+        session_entry = metadata.get("source_session_entry") if type(metadata) is dict else None
+        target_carrier = metadata.get("target_carrier") if type(metadata) is dict else None
+        if (type(fitted_binding) is not dict or type(receipts) is not dict
+                or type(state_entry) is not dict or type(session_entry) is not dict or type(target_carrier) is not dict
+                or entries.get(state_entry.get("artifact_id")) != state_entry
+                or entries.get(session_entry.get("artifact_id")) != session_entry
+                or fitted_binding.get("generation_context_sha256") != context.context_sha256
+                or fitted_binding.get("artifact_namespace") != frozen.artifact_namespace
+                or fitted_binding.get("producer_request_sha256") != index.get("producer_request_sha256")
+                or fitted_binding.get("precommit_sha256") != cross.get("process_precommit_receipt_sha256")
+                or fitted_binding.get("horizon_plan_receipt_sha256") != binding["plan_receipt_sha256"]
+                or _canonical_bytes(metadata.get("fold_plan")) != _canonical_bytes(frozen.precommitment["causal_fold_plan"])
+                or _canonical_bytes(receipts.get("source_group_decision")) != _canonical_bytes(source)
+                or _canonical_bytes(receipts.get("regime_fit_decision")) != _canonical_bytes(fit)
+                or _canonical_bytes(receipts.get("source_contract_seeds")) != _canonical_bytes(frozen.source_contract_seeds)
+                or _canonical_bytes(receipts.get("frozen_tier_pair_contract")) != _canonical_bytes(frozen.frozen_tier_pair_contract)
+                or target_carrier.get("index_sha256") != native_index):
+            _fail("CURRENT_OWNER_BOUND_SOURCE_REFERENCE_SPLICE", cell_id)
 
 
 def _verify_current_owner_capture_binding(
@@ -1958,6 +2012,9 @@ def _verify_current_owner_capture_binding(
         if (count["native_prefix_index_sha256"] != native_index
                 or count["horizon_plan_receipt_sha256"] != binding["plan_receipt_sha256"]):
             _fail("CURRENT_OWNER_SOURCE_COUNT_SPLICE", cell_id)
+    _verify_bound_owner_source_reference(context=context, entries=entries, frozen=frozen,
+        cross=cross, index=index, binding=binding, source=source, fit=fit,
+        native_index=native_index, cell_id=cell_id)
     frozen_entry = entries.get(f"{prefix}/frozen/receipt")
     if (type(frozen_entry) is not dict
             or _descriptor(record.get("frozen_plan_receipt"), "CURRENT_OWNER_FROZEN_RECEIPT_INVALID")
@@ -2024,12 +2081,17 @@ def _winner_request(
             _fail("WINNER_REQUEST_PAYLOAD_HASH_INVALID", name)
         wrappers.append(wrapper)
     try:
+        generation = winner.winner_generation_for_precommitment(wrappers[0]["payload"])
+    except ValueError:
+        _fail("WINNER_REQUEST_RAW_REPLAY_FAILED")
+    try:
         request = winner.create_winner_selection_request(
             wrappers[0]["payload"], wrappers[1]["payload"], wrappers[2]["payload"]
         )
     except ValueError as exc:
-        if body["contract_version"] == winner.V16_GENERATION.request_version:
-            code = str(exc) if str(exc).startswith("V16_") else "WINNER_REQUEST_RAW_REPLAY_FAILED"
+        prefix = generation.transport.error_prefix
+        if prefix:
+            code = str(exc) if str(exc).startswith(prefix) else "WINNER_REQUEST_RAW_REPLAY_FAILED"
             raise ForwardOOSReplayProductionError(code, (str(exc),)) from exc
         raise
     if (
@@ -2184,14 +2246,16 @@ def _selected_artifacts(
     ):
         _fail("ADAPTER_BOOK_WINNER_SPLICE", cell_id)
     cell_namespace = f"{namespace}/winner-search/{timeframe}/{regime}"
+    try:
+        book_generation = book.book_generation_for_version(book_body.get("contract_version"))
+    except ValueError:
+        _fail("SELECTED_OWNER_GENERATION_TUPLE_INVALID")
     request_body = _manifest_body(
         context,
         entries,
         f"{cell_namespace}/authority/winner-request",
         code="WINNER_REQUEST",
-        maximum=(winner.MAX_SUPPORTED_WINNER_REQUEST_BYTES
-                 if book_body.get("contract_version") == book.V16_GENERATION.version
-                 else winner.MAX_REQUEST_BYTES),
+        maximum=winner.winner_request_byte_limit(book_generation.winner_generation.request_version),
     )
     request = _winner_request(request_body, book_cell["winner_request_sha256"])
     decision_body = _manifest_body(
@@ -2248,7 +2312,7 @@ def _selected_artifacts(
         code="HORIZON_WINNER_CROSS_BINDING",
         expected_descriptor=record.get("horizon_winner_cross_binding"),
     )
-    if generation is book.CURRENT_GENERATION or generation is book.V16_GENERATION:
+    if not generation.winner_generation.archived:
         frozen, cross, _verified_attempts, _binding_context = _restore_current_owner_frozen_binding(
             context=context, entries=entries, symbol=symbol, timeframe=timeframe,
             regime=regime, namespace=namespace, cross=cross, _generation=generation,
@@ -2627,7 +2691,8 @@ def _selection_prefix_match(
 def _strategy(specialist: _VerifiedSpecialist) -> Any:
     try:
         template = StrategyRegistry.get(specialist.strategy_id)
-        defaults = template.get_default_params()
+        defaults, _grid, _coupled = resolve_strategy_parameters(template, specialist.timeframe,
+            defaults_only=True, persisted_parameters=specialist.parameters)
         decoded = decode_parameter_mapping(specialist.parameters, defaults)
         materialized = StrategyRegistry.get(specialist.strategy_id, **decoded)
     except Exception as exc:
@@ -2864,7 +2929,11 @@ def _reopen_owner_capture(*, context, anchor, book_body, cell_id, symbol_receipt
     index = _manifest_body(context, entries, f"{anchor['anchor_id']}/adapter/production-index",
         code="FROZEN_TIER_ORIGINAL_ADAPTER_INDEX", expected_descriptor=adapter_index_descriptor,
         maximum=32 * 1024 * 1024)
-    if book_body.get("contract_version") in (book.CURRENT_GENERATION.version, book.V16_GENERATION.version):
+    try:
+        generation = book.book_generation_for_version(book_body.get("contract_version"))
+    except ValueError:
+        _fail("SELECTED_OWNER_GENERATION_TUPLE_INVALID")
+    if not generation.winner_generation.archived:
         stored_anchor = index.get("anchor")
         if (type(anchor) is dict and type(stored_anchor) is dict
                 and anchor.keys() == stored_anchor.keys()
@@ -2968,7 +3037,39 @@ def _reopen_retained_deployment(*, context, descriptors, original_receipt, confi
     return config, deployment, source_bytes
 
 
-def _reconcile_tier_account(account: Mapping[str, Any]) -> dict[str, Any]:
+def _session_capture(metadata, *, index, trades, owner_specs=None):
+    try:
+        return search_execution._session_execution_context(metadata, bar_count=len(index),
+            index=index, trades=trades, owner_specs=owner_specs)
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError) as exc:
+        raise ForwardOOSReplayProductionError("SESSION_EXECUTION_WITNESS_INVALID", (type(exc).__name__,)) from exc
+
+
+def _session_recorded_index(rows, reporting_opens):
+    try:
+        recorded = [pd.Timestamp(row["session_recorded_open"]) for row in rows]
+        if any(_timestamp(stamp, "FROZEN_TIER_SESSION_CLOCK_AXIS_INVALID") != reporting_opens[i]
+                for i, stamp in enumerate(recorded)):
+            _fail("FROZEN_TIER_SESSION_CLOCK_AXIS_INVALID")
+        return pd.DatetimeIndex([stamp.tz_localize(None) if stamp.tzinfo is not None else stamp
+            for stamp in recorded])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ForwardOOSReplayProductionError("FROZEN_TIER_SESSION_CLOCK_AXIS_INVALID") from exc
+
+
+def _owner_session_spec(strategy, symbol):
+    getter = getattr(strategy, "session_spec", None)
+    return getter(symbol) if callable(getter) else None
+
+
+def _owner_session_axis(session, ordinal):
+    if session is None:
+        return None
+    code = session["owner_spec_codes"][ordinal]
+    return None if code < 0 else session["specs"][code]
+
+
+def _reconcile_tier_account(account: Mapping[str, Any], *, _session_owner_specs=None) -> dict[str, Any]:
     """Rebuild derived state from actual fills, model events and close quotes.
 
     Cash is a derivation, not an engine observation. Matching float operations
@@ -3044,9 +3145,15 @@ def _reconcile_tier_account(account: Mapping[str, Any]) -> dict[str, Any]:
         spread_meta=spread_meta, spec=spec)
     if attestation != account["numerical_execution_cost_attestation"]:
         _fail("FROZEN_TIER_ENGINE_COST_ATTESTATION_CHANGED")
+    session = (_session_capture(account["session_execution"],
+        index=_session_recorded_index(rows, opens), trades=trades, owner_specs=_session_owner_specs)
+        if "session_execution" in account else None)
+    if session is not None and len(session["owner_spec_codes"]) != 1:
+        _fail("FROZEN_TIER_SESSION_OWNER_INVALID")
+    session_axis = _owner_session_axis(session, 0)
     positions, transactions = [], []
     multiplier = spec.tick_value / spec.tick_size
-    for pid, trade in zip(position_ids, trades, strict=True):
+    for ordinal, (pid, trade) in enumerate(zip(position_ids, trades, strict=True)):
         entry, exit_bar = trade["entry_bar"], trade["exit_bar"]
         if (type(entry) is not int or type(exit_bar) is not int
                 or not account["warmup_bars"] <= entry <= exit_bar < len(rows)):
@@ -3065,7 +3172,28 @@ def _reconcile_tier_account(account: Mapping[str, Any]) -> dict[str, Any]:
         eod = str(trade["exit_reason"]).lower() in _EOD_EXIT_REASONS
         open_exit = rows[exit_bar]["open"] - sign * rows[exit_bar]["intrabar_half_spread"]
         reason = str(trade["exit_reason"]).lower()
-        if eod:
+        if session_axis is not None:
+            fill_inputs = {"direction": side, "entry_bar": entry, "exit_bar": exit_bar,
+                "partition_bar_count": len(rows), "entry_time_utc": rows[entry]["session_recorded_open"],
+                "exit_time_utc": rows[exit_bar]["session_recorded_open"], "entry_mid_open": rows[entry]["open"],
+                "p75_entry_half_price": rows[entry]["entry_half_spread"],
+                "observed_entry_price": entry_price, "observed_exit_price": exit_price,
+                "original_stop_price": stop, "original_target_price": float(trade["take_profit"]),
+                "exit_reason": trade["exit_reason"],
+                "session_signal_open_utc": rows[entry - 1]["session_recorded_open"],
+                "held_bar_inputs": [{"bar": bar, "open_utc": rows[bar]["session_recorded_open"],
+                    "ohlc": {name.title(): rows[bar][name] for name in ("open", "high", "low", "close")},
+                    "p75_intrabar_half_price": rows[bar]["intrabar_half_spread"]}
+                    for bar in range(entry, exit_bar + 1)]}
+            if search_execution._route_a_replay_base_fill_inputs(fill_inputs, session_axis=session_axis)["status"] != "VERIFIED":
+                _fail("FROZEN_TIER_SESSION_FILL_RECONSTRUCTION_FAILED", pid)
+        if reason == "closed_session":
+            if (session is None or session_axis is None or exit_price != open_exit
+                    or session["exit_half_spreads"][ordinal] != rows[exit_bar]["intrabar_half_spread"]
+                    or session["exit_open_prices"][ordinal] != rows[exit_bar]["open"]):
+                _fail("FROZEN_TIER_SESSION_OPEN_ARRAY_CHANGED", pid)
+            exit_phase = "BAR_OPEN"
+        elif eod:
             if exit_bar != len(rows) - 1 or exit_price != rows[exit_bar]["close"] - sign * rows[exit_bar]["intrabar_half_spread"]:
                 _fail("BACKTEST_TERMINAL_FILL_RECONSTRUCTION_FAILED", pid)
             exit_phase = "TERMINAL_AFTER_CLOSE_ROLLOVER"
@@ -3165,7 +3293,7 @@ def _spread_source_observations(observations: pd.Series, matched_closes: pd.Seri
             for index, (stamp, value) in enumerate(observations.items())]
 
 
-def _tier_source_rows(features, entry_half, intrabar_half, spread_meta, curve):
+def _tier_source_rows(features, entry_half, intrabar_half, spread_meta, curve, *, session_clock=False):
     opens, closes = _frame_interval(features)
     source_rows = []
     for index in range(len(features)):
@@ -3178,7 +3306,9 @@ def _tier_source_rows(features, entry_half, intrabar_half, spread_meta, curve):
                             "recorded_entry_points": recorded(spread_meta["entry_column"]),
                             "recorded_intrabar_points": recorded(spread_meta["bar_column"]),
                             "entry_half_spread": float(entry_half[index]), "intrabar_half_spread": float(intrabar_half[index]),
-                            "engine_equity": None if not np.isfinite(curve[index]) else float(curve[index])})
+                            "engine_equity": None if not np.isfinite(curve[index]) else float(curve[index]),
+                            **({"session_recorded_open": pd.Timestamp(features.index[index]).isoformat()}
+                                if session_clock else {})})
     return source_rows
 
 
@@ -3217,7 +3347,9 @@ def _position_evidence(*, specialist: _VerifiedSpecialist, strategy: Any,
               "exported_curve_rows", None if curve is None else len(curve),
               "exported_trade_count", len(trades),
               "reduced_raw_mark_count", result.get("equity_growth", {}).get("raw_mark_count"))
-    source_rows = _tier_source_rows(features, entry_half, intrabar_half, spread_meta, curve)
+    session_spec = _owner_session_spec(strategy, specialist.symbol)
+    source_rows = _tier_source_rows(features, entry_half, intrabar_half, spread_meta, curve,
+        session_clock="session_execution" in result)
     account = {"symbol": specialist.symbol, "timeframe": specialist.timeframe, "cell_id": specialist.cell_id,
                "tier": tier.descriptor(), "initial_cash": float(config.initial_capital), "warmup_bars": warmup_bars,
                "instrument_spec": asdict(spec), "position_namespace": "|".join((specialist.symbol, specialist.timeframe,
@@ -3231,7 +3363,11 @@ def _position_evidence(*, specialist: _VerifiedSpecialist, strategy: Any,
                "financing_model": {"pre_open_units": _raw_json(pre), "close_units": _raw_json(close),
                    "long_per_lot": _raw_json(long_rates), "short_per_lot": _raw_json(short_rates),
                    "enabled": bool(enabled), "contract": _raw_json(swap_contract)}}
-    account["derived"] = _reconcile_tier_account(account)
+    if session_spec is not None and "session_execution" not in result:
+        _fail("FROZEN_TIER_SESSION_CAPTURE_MISSING")
+    if "session_execution" in result:
+        account["session_execution"] = _raw_json(result["session_execution"])
+    account["derived"] = _reconcile_tier_account(account, _session_owner_specs=[session_spec])
     entry_column = valuation_tape.spread_meta["spread_model"]["entry_column"]
     account["valuation_rows"] = [
         {"open_utc": stamp.isoformat(), "open": float(valuation_tape.frame["Open"].iloc[index]),
@@ -3811,8 +3947,11 @@ def _declared_cell_stop_prices(owner, *, entry_bar, entry_price, direction, symb
         entry_price + direction * spec.pips_to_price(target_pips))
 
 
-def _declared_cell_exit_at(frame, bar, *, direction, half_spread, stop, target):
+def _declared_cell_exit_at(frame, bar, *, direction, half_spread, stop, target,
+                           session_axis=None, entry_bar=None):
     open_quote = float(frame["Open"].iloc[bar]) - direction * half_spread
+    if session_axis is not None and search_execution._session_boundary_at(session_axis, entry_bar, bar):
+        return open_quote, "closed_session", True
     adverse = float(frame["Low" if direction == 1 else "High"].iloc[bar]) - direction * half_spread
     favourable = float(frame["High" if direction == 1 else "Low"].iloc[bar]) - direction * half_spread
     if direction * (open_quote - stop) <= 0:
@@ -3835,6 +3974,8 @@ def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, conf
         "equity_curve", "max_drawdown_pct", "total_trades", "trades", "closed_trade_statistics_basis",
         "closed_trade_gross_profit", "terminal", "first_depletion_bar", "swap_accrual_contract",
         "qualification_authority", "tier_entry_counts", "spread_admission"}
+    if type(result) is dict and "session_execution" in result:
+        result_fields.add("session_execution")
     if (type(result) is not dict or set(result) != result_fields
             or result.get("schema_version") != "fxpm.continuous-account-result.v1"
             or result.get("terminal_policy") != "MARK_OPEN" or result.get("qualification_authority") is not False
@@ -3863,6 +4004,13 @@ def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, conf
     if account["financing_model"] != financing:
         _fail("DECLARED_CELL_FINANCING_BINDING_MISMATCH")
     owners = {owner.owner_id: owner for owner in owner_inputs}
+    owner_specs = [_owner_session_spec(owner.strategy, spec.symbol) for owner in owner_inputs]
+    if any(value is not None for value in owner_specs) and "session_execution" not in result:
+        _fail("DECLARED_CELL_SESSION_CAPTURE_MISSING")
+    session = (_session_capture(result["session_execution"], index=frame.index, trades=trades,
+        owner_specs=owner_specs) if "session_execution" in result else None)
+    session_axes = {owner.owner_id: _owner_session_axis(session, ordinal)
+        for ordinal, owner in enumerate(owner_inputs)}
     slots = {slot.slot_id: slot for slot in schedule.slots}
     bt = Backtester(config)
     spreads = {}
@@ -3887,6 +4035,9 @@ def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, conf
             entry_owners[i] = owner
             if owner.signals.iloc[i - 1] == 0:
                 continue
+            axis = session_axes[owner.owner_id]
+            if axis is not None and not search_execution._session_entry_allowed(axis, i - 1, i):
+                continue
             state = spreads[owner.owner_id][2][i]
             key, counter = {"ADMIT": ("admitted", "known_cap_pass_opportunities"),
                 "REFUSE": ("refused", "known_cap_refused_opportunities"),
@@ -3908,7 +4059,7 @@ def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, conf
         positions.append((position, True))
     previous_exit, previous_gap = -1, False
     risk_joins = []
-    for leg, is_open in positions:
+    for ordinal, (leg, is_open) in enumerate(positions):
         owner = owners.get(leg.get("owner_id"))
         slot = slots.get(leg.get("slot_id"))
         entry_bar, signal_bar = leg.get("entry_bar"), leg.get("signal_bar")
@@ -3924,6 +4075,9 @@ def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, conf
                 or (leg.get("tier") if is_open else leg.get("frozen_spread_tier")) != owner.spread_tier.descriptor()
                 or spreads[owner.owner_id][2][entry_bar] != "ADMIT"):
             _fail("DECLARED_CELL_POSITION_OWNER_OR_SLOT_INVALID")
+        session_axis = session_axes[owner.owner_id]
+        if session_axis is not None and not search_execution._session_entry_allowed(session_axis, signal_bar, entry_bar):
+            _fail("DECLARED_CELL_SESSION_ENTRY_INVALID")
         previous_exit = exit_bar
         entry_counts[entry_bar] += 1
         entry_price = float(leg["entry_price"])
@@ -3961,7 +4115,8 @@ def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, conf
             _fail("DECLARED_CELL_POSITION_FINANCING_INVALID")
         for i in range(entry_bar, exit_bar + 1):
             exit_at = _declared_cell_exit_at(frame, i, direction=direction,
-                half_spread=spreads[owner.owner_id][1][i], stop=stop, target=target)
+                half_spread=spreads[owner.owner_id][1][i], stop=stop, target=target,
+                session_axis=session_axis, entry_bar=entry_bar)
             if (i < exit_bar or is_open) and exit_at is not None:
                 _fail("DECLARED_CELL_POSITION_EXIT_TIMING_INVALID")
         if is_open:
@@ -3971,6 +4126,11 @@ def _reconcile_declared_cell_account(account, *, frame, owner_inputs, spec, conf
             if leg.get("exit_reason") in _EOD_EXIT_REASONS or str(leg.get("exit_reason", "")).lower() in _EOD_EXIT_REASONS:
                 _fail("DECLARED_CELL_FORCED_TERMINAL_EXIT_INVALID")
             gross = spec.calculate_tick_profit(entry_price, float(leg["exit_price"]), lots, direction)
+            if str(leg.get("exit_reason", "")).lower() == "closed_session" and (
+                    session is None or session_axis is None
+                    or session["exit_half_spreads"][ordinal] != float(spreads[owner.owner_id][1][exit_bar])
+                    or session["exit_open_prices"][ordinal] != float(frame["Open"].iloc[exit_bar])):
+                _fail("DECLARED_CELL_SESSION_OPEN_ARRAY_CHANGED")
             if exit_at is None or str(leg.get("exit_reason", "")).lower() != exit_at[1]:
                 _fail("DECLARED_CELL_EXIT_COST_INVALID")
             _declared_cell_close(leg.get("exit_price"), exit_at[0], "DECLARED_CELL_EXIT_COST_INVALID")

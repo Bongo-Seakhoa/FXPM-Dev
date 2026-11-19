@@ -1396,3 +1396,205 @@ __all__ = [
     "WindowTerm",
     "strategy_candidate_domain_sha256",
 ]
+
+
+NOISE101_STATE_SCHEMA = "fxpm.noise101-recorded-session-state.v1"
+NOISE101_TRANSITION_SCHEMA = "fxpm.noise101-recorded-session-transition.v1"
+NOISE101_MISSING_VALUE_SEMANTICS = "NULL_IS_MISSING_OBSERVATION_NOT_ZERO"
+NOISE101_CONTEXT_FIELDS = (
+    "source_edition_id", "candidate_catalogue_sha256", "timeframe",
+    "domain_roster_sha256", "state_registry_sha256", "noise_state_sha256",
+    "noise_transition_sha256", "state_boundary_source_sha256",
+)
+
+
+def build_noise101_state_authority(candidate_catalogue_sha256: str) -> StateContractAuthority:
+    """Separate recorded-session authority; the captured100 authority stays exact."""
+    if not _SHA256_RE.fullmatch(str(candidate_catalogue_sha256 or "")):
+        raise ValueError("NOISE101_CATALOGUE_HASH_INVALID")
+    noise = StateContract(
+        "strategy:NoiseBandBreakoutStrategy", StateKind.PATH_STATE,
+        dependencies=("feature:ATR_14", "feature:SESSION_RESET"),
+        finite_rule=FiniteWindowRule(fixed_bars=1),
+        checkpoint_schema=NOISE101_STATE_SCHEMA,
+        transition_schema=NOISE101_TRANSITION_SCHEMA,
+        description="Exact observed-session history requires authenticated full-prefix replay or a matching checkpoint.",
+    )
+    return StateContractAuthority(
+        (*_feature_contracts(), *_strategy_contracts(), noise),
+        candidate_domain_hash=candidate_catalogue_sha256,
+    )
+
+
+def noise101_transition_payload(*, source_edition_id: str, implementation_sha256: str,
+        session_spec: Sequence[int], bar_minutes: int, check_bars: int,
+        lookback: int) -> dict[str, Any]:
+    if (type(source_edition_id) is not str or not source_edition_id
+            or not _SHA256_RE.fullmatch(str(implementation_sha256 or ""))
+            or len(session_spec) != 2
+            or any(type(v) is not int for v in session_spec)
+            or not 0 <= session_spec[0] < 1440 or not 1 <= session_spec[1] <= 1440
+            or any(type(v) is not int or v < 1 for v in (bar_minutes, check_bars, lookback))):
+        raise ValueError("NOISE101_TRANSITION_INPUT_INVALID")
+    return {
+        "schema_version": NOISE101_TRANSITION_SCHEMA,
+        "source_edition_id": source_edition_id,
+        "strategy_id": "NoiseBandBreakoutStrategy",
+        "implementation_sha256": implementation_sha256,
+        "session_spec": {"anchor_minutes": session_spec[0],
+            "length_minutes": session_spec[1], "clock": "AS_RECORDED"},
+        "bar_minutes": bar_minutes, "check_bars": check_bars, "lookback": lookback,
+        "minimum_expression": "(7*lookback+9)//10",
+        "history_rule": "SHIFT_WHOLE_OBSERVED_SESSION_KEYS_THEN_ROLL_LOOKBACK_SAME_SLOT_MOVES",
+        "slot_rule": "RECORDED_RELATIVE_OPEN_MINUTE_PLUS_BAR_MINUTES",
+        "check_rule": "ONE_BASED_IN_SESSION_OBSERVED_BAR_ORDINAL_MOD_CHECK_BARS_EQ_ZERO",
+        "missing_value_semantics": NOISE101_MISSING_VALUE_SEMANTICS,
+    }
+
+
+def validate_noise101_source_context(context: Mapping[str, Any], *,
+        allow_unproved: bool = False) -> dict[str, Any]:
+    if type(context) is not dict or set(context) != set(NOISE101_CONTEXT_FIELDS):
+        raise ValueError("NOISE101_SOURCE_CONTEXT_FIELDS_INVALID")
+    if (type(context["source_edition_id"]) is not str or not context["source_edition_id"]
+            or context["timeframe"] not in _BARS_PER_UTC_DAY):
+        raise ValueError("NOISE101_SOURCE_CONTEXT_IDENTITY_INVALID")
+    proof_fields = {"noise_state_sha256", "noise_transition_sha256", "state_boundary_source_sha256"}
+    for name in set(NOISE101_CONTEXT_FIELDS) - {"source_edition_id", "timeframe"}:
+        value = context[name]
+        if allow_unproved and name in proof_fields and value is None:
+            continue
+        if not _SHA256_RE.fullmatch(str(value or "")):
+            raise ValueError("NOISE101_SOURCE_CONTEXT_HASH_INVALID:" + name)
+    return dict(context)
+
+
+def encode_noise101_replay_state(*, source_context: Mapping[str, Any],
+        implementation_sha256: str, symbol: str, parameters: Mapping[str, Any],
+        session_spec: Sequence[int], session_keys: Sequence[int],
+        in_session: Sequence[bool], slot_minutes: Sequence[int],
+        open_prices: Sequence[Any], close_prices: Sequence[Any],
+        recorded_opens: Sequence[str], recorded_timezone: Optional[str]) -> dict[str, Any]:
+    """Encode actual replay arrays only; this function never reads source data."""
+    context = validate_noise101_source_context(dict(source_context), allow_unproved=True)
+    boundary = context["state_boundary_source_sha256"]
+    if not _SHA256_RE.fullmatch(str(boundary or "")):
+        raise ValueError("NOISE101_AUTHENTICATED_BOUNDARY_REQUIRED")
+    bar_minutes, check_bars, lookback = (parameters[k] for k in ("bar_minutes", "check_bars", "lookback"))
+    transition = noise101_transition_payload(source_edition_id=context["source_edition_id"],
+        implementation_sha256=implementation_sha256, session_spec=session_spec,
+        bar_minutes=bar_minutes, check_bars=check_bars, lookback=lookback)
+    count = len(session_keys)
+    if any(len(v) != count for v in (in_session, slot_minutes, open_prices, close_prices, recorded_opens)):
+        raise ValueError("NOISE101_REPLAY_AXIS_INVALID")
+    if recorded_timezone is not None and (type(recorded_timezone) is not str or not recorded_timezone):
+        raise ValueError("NOISE101_RECORDED_TIMEZONE_INVALID")
+    observations: list[dict[str, Any]] = []
+    sessions: dict[int, dict[str, Any]] = {}
+    order: list[int] = []
+    for key, inside, slot, opened, closed, recorded_open in zip(session_keys, in_session,
+            slot_minutes, open_prices, close_prices, recorded_opens, strict=True):
+        if (type(key) is not int or type(inside) is not bool or type(slot) is not int
+                or type(recorded_open) is not str or not recorded_open):
+            raise ValueError("NOISE101_REPLAY_AXIS_INVALID")
+        if not inside:
+            continue
+        observations.append({"session_key": key, "recorded_open": recorded_open,
+            "open": float(opened) if math.isfinite(float(opened)) else None,
+            "close": float(closed) if math.isfinite(float(closed)) else None})
+        if key not in sessions:
+            if order and key <= order[-1]:
+                raise ValueError("NOISE101_REPLAY_SESSION_ORDER_INVALID")
+            order.append(key)
+            sessions[key] = {"first_open": float(opened), "last_close": float(closed), "moves": {}}
+        item = sessions[key]
+        if slot in item["moves"]:
+            raise ValueError("NOISE101_REPLAY_DUPLICATE_SLOT")
+        first_open = item["first_open"]
+        value = abs(float(closed) / first_open - 1.0) if first_open else float("nan")
+        item["moves"][slot] = value if math.isfinite(value) else None
+        item["last_close"] = float(closed)
+    current = order[-1] if order else None
+    previous = order[-2] if len(order) > 1 else None
+    history_keys = order[max(0, len(order) - 1 - lookback):-1] if order else []
+    slots = sorted({slot for key in order for slot in sessions[key]["moves"]})
+    def finite_or_missing(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        number = float(value)
+        return number if math.isfinite(number) else None
+    state = {
+        "schema_version": NOISE101_STATE_SCHEMA,
+        **{key: context[key] for key in ("source_edition_id", "candidate_catalogue_sha256",
+            "timeframe", "domain_roster_sha256", "state_registry_sha256")},
+        "strategy_id": "NoiseBandBreakoutStrategy", "symbol": str(symbol),
+        "parameters_sha256": _canonical_sha256(dict(parameters)),
+        "bar_minutes": bar_minutes, "check_bars": check_bars, "lookback": lookback,
+        "session_spec": dict(transition["session_spec"]),
+        "current_session_key": current,
+        "current_session_first_open": finite_or_missing(sessions[current]["first_open"]) if current is not None else None,
+        "previous_session_key": previous,
+        "previous_session_last_close": finite_or_missing(sessions[previous]["last_close"]) if previous is not None else None,
+        "history_session_keys": history_keys, "history_slot_minutes": slots,
+        "history_absolute_moves": [[sessions[key]["moves"].get(slot) for slot in slots] for key in history_keys],
+        "missing_value_semantics": NOISE101_MISSING_VALUE_SEMANTICS,
+        "state_boundary_source_sha256": boundary,
+        "recorded_timezone": recorded_timezone,
+        "last_recorded_open": recorded_opens[-1] if count else None,
+        "replay_observations": [item for item in observations
+            if item["session_key"] in {*history_keys, current}],
+    }
+    context.update(noise_state_sha256=_canonical_sha256(state),
+        noise_transition_sha256=_canonical_sha256(transition))
+    validate_noise101_source_context(context)
+    return {"state": state, "transition": transition, "source_edition_context": context}
+
+
+def decode_noise101_replay_state(bundle: Mapping[str, Any]) -> dict[str, Any]:
+    if type(bundle) is not dict or set(bundle) != {"state", "transition", "source_edition_context"}:
+        raise ValueError("NOISE101_STATE_BUNDLE_INVALID")
+    context = validate_noise101_source_context(bundle["source_edition_context"])
+    state, transition = bundle["state"], bundle["transition"]
+    if (type(state) is not dict or type(transition) is not dict
+            or state.get("schema_version") != NOISE101_STATE_SCHEMA
+            or transition.get("schema_version") != NOISE101_TRANSITION_SCHEMA
+            or state.get("missing_value_semantics") != NOISE101_MISSING_VALUE_SEMANTICS
+            or transition.get("missing_value_semantics") != NOISE101_MISSING_VALUE_SEMANTICS
+            or _canonical_sha256(state) != context["noise_state_sha256"]
+            or _canonical_sha256(transition) != context["noise_transition_sha256"]):
+        raise ValueError("NOISE101_STATE_BINDING_INVALID")
+    for key in ("source_edition_id", "candidate_catalogue_sha256", "timeframe",
+            "domain_roster_sha256", "state_registry_sha256", "state_boundary_source_sha256"):
+        if state.get(key) != context[key]:
+            raise ValueError("NOISE101_STATE_CONTEXT_CROSSED")
+    if (any(state.get(key) != transition.get(key) for key in ("source_edition_id", "strategy_id", "bar_minutes", "check_bars", "lookback", "session_spec"))
+            or not _SHA256_RE.fullmatch(str(state.get("parameters_sha256") or ""))):
+        raise ValueError("NOISE101_STATE_TRANSITION_CROSSED")
+    keys, slots, matrix = (state[name] for name in ("history_session_keys",
+        "history_slot_minutes", "history_absolute_moves"))
+    if (type(keys) is not list or type(slots) is not list or type(matrix) is not list
+            or len(keys) != len(matrix) or keys != sorted(set(keys))
+            or slots != sorted(set(slots)) or len(keys) > state["lookback"]):
+        raise ValueError("NOISE101_STATE_HISTORY_INVALID")
+    decoded = []
+    for values in matrix:
+        if type(values) is not list or len(values) != len(slots):
+            raise ValueError("NOISE101_STATE_HISTORY_INVALID")
+        decoded.append([float("nan") if value is None else float(value) for value in values])
+    observations = state.get("replay_observations")
+    allowed_keys = {*keys, state.get("current_session_key")}
+    if (type(observations) is not list
+            or any(type(row) is not dict or set(row) != {"session_key", "recorded_open", "open", "close"}
+                or row["session_key"] not in allowed_keys
+                or type(row["recorded_open"]) is not str or not row["recorded_open"]
+                or any(value is not None and (type(value) not in (int, float) or not math.isfinite(value))
+                    for value in (row["open"], row["close"])) for row in observations)):
+        raise ValueError("NOISE101_STATE_OBSERVATIONS_INVALID")
+    result = dict(state)
+    result["history_absolute_moves"] = decoded
+    return result
+
+
+__all__.extend(["NOISE101_STATE_SCHEMA", "NOISE101_TRANSITION_SCHEMA", "NOISE101_CONTEXT_FIELDS",
+    "build_noise101_state_authority", "noise101_transition_payload", "validate_noise101_source_context",
+    "encode_noise101_replay_state", "decode_noise101_replay_state"])

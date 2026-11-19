@@ -61,6 +61,7 @@ from pm_enhancement_seams import EnhancementSeams, create_default_enhancement_se
 from pm_strategies import (
     StrategyRegistry,
     BaseStrategy,
+    resolve_strategy_parameters,
     _STRATEGY_MIGRATION,
 )
 from pm_position import PositionConfig, PositionManager
@@ -791,6 +792,7 @@ def _current_refit_validate_trial(
     strategy_id: str,
     process_sha256: str,
     horizon_sha256: str,
+    timeframe: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     trial = _current_refit_exact(
         value, _CURRENT_REFIT_TRIAL_FIELDS, "CURRENT_REFIT_TRIAL_FIELDS_INVALID"
@@ -809,12 +811,13 @@ def _current_refit_validate_trial(
         or trial["parameter_count"] != len(parameters)
     ):
         raise ValueError("CURRENT_REFIT_TRIAL_INVALID")
-    allowed_keys = set(base.get_default_params()) | set(base.get_param_grid())
+    defaults, grid, groups = resolve_strategy_parameters(base, timeframe)
+    allowed_keys = set(defaults) | set(grid)
     if not set(parameters) <= allowed_keys:
         raise ValueError("CURRENT_REFIT_TRIAL_PARAMETER_UNKNOWN")
     try:
         runtime_parameters = decode_parameter_mapping(
-            parameters, base.get_default_params()
+            parameters, defaults
         )
         fitted = StrategyRegistry.get(strategy_id, **runtime_parameters)
     except Exception as exc:
@@ -822,7 +825,6 @@ def _current_refit_validate_trial(
     normalized = _current_refit_json_parameters(fitted.get_params())
     if canonical_parameter_bytes(normalized) != canonical_parameter_bytes(parameters):
         raise ValueError("CURRENT_REFIT_TRIAL_PARAMETERS_NONCANONICAL")
-    defaults, grid, groups = base.get_default_params(), base.get_param_grid(), base.get_param_couplings()
     try:
         validate_parameter_domain_member(build_parameter_domain(defaults, grid, coupled_groups=groups), parameters)
     except CurrentRefitParameterCodecError as exc:
@@ -1196,6 +1198,7 @@ def replay_current_refit_execution_from_raw_manifest(
             strategy_id=request["strategy_id"],
             process_sha256=process_sha256,
             horizon_sha256=horizon_sha256,
+            timeframe=request["timeframe"],
         )
         expected_process_candidate_id = _current_refit_process_candidate_id(
             symbol=request["symbol"],
@@ -1935,7 +1938,8 @@ def _scheduled_valid_until(config: PipelineConfig, from_dt: Optional[datetime] =
 _DEFAULT_STRATEGY_SURFACE_HASH: Optional[str] = None
 
 
-def _strategy_surface_fingerprint(strategies: Optional[List[BaseStrategy]] = None) -> str:
+def _strategy_surface_fingerprint(strategies: Optional[List[BaseStrategy]] = None, *,
+        source_edition=None, timeframe: str | None = None) -> str:
     """Hash the discoverable strategy surface once per process.
 
     Enumerating every strategy, parameter grid, and class source is intentionally
@@ -1944,6 +1948,21 @@ def _strategy_surface_fingerprint(strategies: Optional[List[BaseStrategy]] = Non
     ledger/readiness check adds latency without detecting any additional drift.
     Explicit strategy lists remain uncached for tests and bounded research runs.
     """
+    if source_edition is not None:
+        import pm_production_search_planner as planner
+        edition = (source_edition if isinstance(source_edition, planner.SourceEditionDescriptor)
+            else planner.source_edition_info(source_edition))
+        if edition.edition_id == planner.NOISE101_SOURCE_EDITION_ID:
+            if timeframe not in edition.ordered_timeframes:
+                raise ValueError("NOISE101_AUTHENTICATED_TIMEFRAME_REQUIRED")
+            payload = {"source_edition_id": edition.edition_id,
+                "candidate_catalogue_sha256": edition.candidate_catalogue_sha256,
+                "timeframe": timeframe,
+                "domain_roster_sha256": edition.domain_roster_sha256_by_timeframe[timeframe],
+                "state_registry_sha256": edition.state_registry_sha256,
+                "source_release_sha256": edition.source_release_sha256}
+            return hashlib.sha256(json.dumps(payload, sort_keys=True,
+                separators=(",", ":"), allow_nan=False).encode("ascii")).hexdigest()
     global _DEFAULT_STRATEGY_SURFACE_HASH
     if strategies is None and _DEFAULT_STRATEGY_SURFACE_HASH is not None:
         return _DEFAULT_STRATEGY_SURFACE_HASH
@@ -2194,7 +2213,7 @@ def build_artifact_meta(config: PipelineConfig,
         "regime_provenance": _regime_provenance_fingerprint(
             getattr(config, "regime_params_file", "regime_params.json")
         ),
-        "strategy_surface_hash": _strategy_surface_fingerprint(strategies),
+        "strategy_surface_hash": _strategy_surface_fingerprint(strategies, source_edition=source_edition, timeframe=timeframe),
         "metric_contract": "net_dollar_mtm_equity_v1",
     }
 
@@ -3809,6 +3828,11 @@ class StrategySelector:
 
                 for strategy in strategies:
                     try:
+                        defaults, _, _ = resolve_strategy_parameters(strategy, timeframe, defaults_only=True)
+                        current_params = strategy.get_params()
+                        bound_params = {**defaults, **current_params}
+                        if bound_params != current_params:
+                            strategy = StrategyRegistry.get(strategy.name, **bound_params)
                         signals = strategy.generate_signals(train_features, symbol)
                         metrics = self.backtester.run(
                             features=train_features,
@@ -3856,6 +3880,9 @@ class StrategySelector:
 
                     try:
                         strat = StrategyRegistry.get(cand["strategy_name"])
+                        defaults, _, _ = resolve_strategy_parameters(strat, tf, defaults_only=True)
+                        if set(defaults) - set(strat.get_params()):
+                            strat = StrategyRegistry.get(cand["strategy_name"], **defaults)
                         signals = strat.generate_signals(val_features, symbol)
                         val_metrics = self.backtester.run(val_features, signals, symbol, strat)
 
@@ -3945,7 +3972,9 @@ class HyperparameterOptimizer:
         """
         # Get strategy and param grid
         strategy = StrategyRegistry.get(strategy_name)
-        param_grid = strategy.get_param_grid()
+        defaults, param_grid, _ = resolve_strategy_parameters(strategy, timeframe)
+        if set(defaults) - set(strategy.get_params()):
+            strategy = StrategyRegistry.get(strategy_name, **defaults)
         
         if not param_grid:
             # No params to optimize, use defaults
@@ -4033,7 +4062,11 @@ class HyperparameterOptimizer:
                               timeframe: str = "") -> Tuple[Dict[str, Any], Dict, Dict]:
         """Fallback grid search optimization."""
         strategy = StrategyRegistry.get(strategy_name)
+        defaults, _, _ = resolve_strategy_parameters(strategy, timeframe, defaults_only=True)
         default_params = strategy.get_params()
+        if set(defaults) - set(default_params):
+            strategy = StrategyRegistry.get(strategy_name, **{**defaults, **default_params})
+            default_params = strategy.get_params()
         
         # Decode at most the configured cap; never allocate the full grid.
         domain = build_parameter_domain(default_params, param_grid, coupled_groups=strategy.get_param_couplings())
@@ -7038,6 +7071,11 @@ class RegimeOptimizer:
         the cartesian grid by a deterministic coprime mixed-radix cycle, which
         gives bounded uniform coverage without materializing a large grid.
         """
+        defaults, param_grid, groups = resolve_strategy_parameters(strategy, timeframe)
+        current_params = dict(strategy.get_params() or {})
+        base_params = {**defaults, **current_params}
+        if base_params != current_params:
+            strategy = StrategyRegistry.get(strategy.name, **base_params)
         specs: List[Tuple[Dict[str, Any], Optional[float]]] = []
         seen: set = set()
 
@@ -7051,13 +7089,12 @@ class RegimeOptimizer:
 
         for seeded_strategy, anchor in self._screening_variants_for_strategy(strategy):
             add(dict(seeded_strategy.get_params() or {}), anchor)
-        base_params = dict(strategy.get_params() or {})
         add(base_params, None)
         target_budget = max(int(self.family_probe_trials), len(specs), 1)
-        param_grid = dict(strategy.get_param_grid() or {})
+        param_grid = dict(param_grid or {})
         if not param_grid:
             return specs
-        domain = build_parameter_domain(base_params, param_grid, coupled_groups=strategy.get_param_couplings())
+        domain = build_parameter_domain(base_params, param_grid, coupled_groups=groups)
         total_space = domain["point_count"]
         if total_space <= 0:
             return specs
@@ -7691,7 +7728,7 @@ class RegimeOptimizer:
                 continue
 
             # Get param grid
-            param_grid = original_cand['strategy'].get_param_grid()
+            _, param_grid, _ = resolve_strategy_parameters(original_cand['strategy'], timeframe)
             if not param_grid:
                 # No params to tune, keep original
                 continue
@@ -8049,7 +8086,11 @@ class RegimeOptimizer:
         """
         try:
             base_strategy = StrategyRegistry.get(strategy_name)
+            defaults, _, _ = resolve_strategy_parameters(base_strategy, timeframe, defaults_only=True)
             default_params = base_strategy.get_params()
+            if set(defaults) - set(default_params):
+                base_strategy = StrategyRegistry.get(strategy_name, **{**defaults, **default_params})
+                default_params = base_strategy.get_params()
         except Exception as exc:
             if isinstance(exc, SearchInfrastructureError):
                 raise
@@ -11314,7 +11355,7 @@ class OptimizationPipeline:
                     if regime in eligible_champions
                 )
                 strategy = StrategyRegistry.get(family, **dict(reference.parameters or {}))
-                param_grid = strategy.get_param_grid()
+                _, param_grid, _ = resolve_strategy_parameters(strategy, timeframe)
                 if param_grid:
                     tuned = self.regime_optimizer._tune_strategy_params(
                         symbol,

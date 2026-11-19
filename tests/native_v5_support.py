@@ -878,8 +878,9 @@ def write_receipt_backed_v5_authority(
     run_id: str = "receipt-fixture-run",
     activation_id: str = "receipt-fixture-activation",
     current_schedule_surface: bool = False,
+    target_frame_overrides: Optional[dict[tuple[str, str], pd.DataFrame]] = None,
 ) -> dict[str, Any]:
-    """Write a tiny exact 100x6 receipt authority without running raw replay."""
+    """Write a tiny invented 100x6 receipt authority, with optional exact target bars."""
 
     native_root = Path(native_root).resolve()
     entries: dict[str, dict[str, Any]] = {}
@@ -917,6 +918,10 @@ def write_receipt_backed_v5_authority(
                     "Close": 1.0 + symbol_index * 1e-6,
                 }
             )
+            if target_frame_overrides is not None:
+                override = target_frame_overrides.get((symbol, timeframe))
+                if override is not None:
+                    frame = override.copy(deep=True)
             frame.to_csv(bars_path, index=False, lineterminator="\n")
             bars_sha = sha256_file(bars_path)
             audit_leaf = native_root / "audits" / activation_id / symbol / timeframe
