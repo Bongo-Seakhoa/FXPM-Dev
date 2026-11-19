@@ -15,6 +15,7 @@ import pandas as pd
 
 import pm_authority_spool as authority_spool
 import pm_book_multiplicity as book
+import pm_broker_terms as broker_terms
 import pm_current_refit_artifacts as current_refit
 import pm_historical_anchor_orchestration as orchestration
 import pm_native_prefix_production as native_prefix
@@ -7922,6 +7923,8 @@ def _verify_declared_slot_frozen_chain(context, *, completion, parent, body, req
 _DECLARED_ROSTER_VERIFY_WORKERS = 8
 
 
+@native_prefix._owned_native_resolution_call
+@broker_terms._owned_swap_source_call
 def verify_declared_slot_completion(context, *, precommit, process, completion, artifact_roster, frozen_pipeline_config, m5_source_context=None, m5_owner=None, m5_cost_edition=None):
     """Revalidate committed bytes at the established current-owner assurance level."""
     _declared_m5_completion_reuse_arguments(m5_source_context=m5_source_context,
