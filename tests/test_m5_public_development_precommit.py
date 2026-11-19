@@ -1,7 +1,8 @@
-"""Real metadata issuers on invented owned inputs: no native, fit, Raw or financial proof.
+"""Public saved DEV metadata on invented owned inputs; no native or financial proof.
 
-Root must supply a coherent flat source image. This test neither assembles code
-nor substitutes verifier results; original public APIs create every capability.
+Root supplies the coherent source image. A labelled test-only recipe writes the
+saved legacy body, and the original public reopen/request APIs create every
+capability. No verifier, source clock or private seal is substituted.
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -110,7 +111,12 @@ def public_development_environment(tmp_path_factory):
     cell = {"cell_id": modules.book.compute_cell_id("XAGUSD", "H1", "TREND"),
             "symbol": "XAGUSD", "timeframe": "H1", "regime": "TREND"}
     # These are invented documentary pins, not a RecordedDerivedCosts object or verified profile.
-    profile_sha = _sha({"classification": _NOTICE, "identity_role": "unverified-profile"})
+    from test_development_cell_prefix import _install_documentary_profile, _saved_development_precommit
+    environment = SimpleNamespace(modules=modules, root=root, context=context, frozen=frozen,
+        process=process, roster=roster, cell=cell,
+        kwargs={"run_id": run_id, "launch_activation_utc": launch})
+    _install_documentary_profile(environment)
+    profile_sha = environment.profile_sha
     cost_identity = {"receipt_sha256": _sha({"classification": _NOTICE, "identity_role": "unverified-cost-receipt"}),
         "generation_id": "synthetic-unverified-cost-metadata", "native_universe_sha256": context.native_universe_sha256,
         "plan_sha256": _sha({"classification": _NOTICE, "identity_role": "unverified-cost-plan"}),
@@ -126,16 +132,13 @@ def public_development_environment(tmp_path_factory):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     window = {"start_utc": (now-timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "end_exclusive_utc": (now+timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")}
-    precommit = modules.o.precommit_declared_development_m5_slot_owner_run(context,
-        run_id=run_id, process=process, slot_roster=roster, cell_roster=[cell],
-        frozen_pipeline_config=frozen, spread_profile_identity={"profile_sha256": profile_sha},
-        source_access_window_utc=window, launch_activation_utc=launch, m5_source_pins=pins,
-        development_slot_ids=[roster["slots"][0]["slot_id"]])
-    return SimpleNamespace(modules=modules, root=root, context=context, frozen=frozen,
-        process=process, roster=roster, cell=cell, pins=pins, precommit=precommit, window=window)
+    environment.pins, environment.window = pins, window
+    environment.precommit = _saved_development_precommit(environment,
+        [roster["slots"][0]["slot_id"]], m5_source_pins=pins)
+    return environment
 
 
-def test_genuine_public_development_precommit_request_and_reopen_scope(public_development_environment):
+def test_public_saved_development_precommit_request_and_reopen_scope(public_development_environment):
     e = public_development_environment
     o, context = e.modules.o, e.context
     parent = o.verify_declared_slot_owner_run_precommit(context, e.precommit, process=e.process)

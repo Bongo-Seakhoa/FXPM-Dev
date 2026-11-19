@@ -208,14 +208,10 @@ class DeclaredDevelopmentScopeTests(unittest.TestCase):
             body = deepcopy(parent); body["schema_version"] = schema
             self.assertEqual(o.declared_slot_source_kind(body), "m5_derived")
             self.assertEqual(o.declared_slot_transport_edition(body), o.DECLARED_WINNER_TRANSPORT_V16)
-        self.assertEqual(o._declared_precommit_schema(o.DECLARED_WINNER_TRANSPORT_V16, "m5_derived", development=True),
-                         o.DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA)
         self.assertEqual(o._declared_request_schema(o.DECLARED_WINNER_TRANSPORT_V16, "m5_derived", development=True),
                          o.DECLARED_M5_DEVELOPMENT_SLOT_REQUEST_SCHEMA)
         self.assertEqual(o._declared_request_schema(o.DECLARED_WINNER_TRANSPORT_V16, "broker_native", development=True),
                          o.DECLARED_NATIVE_DEVELOPMENT_SLOT_REQUEST_SCHEMA)
-        self.assertEqual(o._declared_precommit_schema(o.DECLARED_WINNER_TRANSPORT_V16, "broker_native", development=True),
-                         o.DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA)
         for schema in (o.DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA, o.DECLARED_NATIVE_DEVELOPMENT_SLOT_REQUEST_SCHEMA):
             body = deepcopy(parent); body["schema_version"] = schema
             for key in ("source_kind", "m5_source_pins", "m5_view_contract_sha256"):

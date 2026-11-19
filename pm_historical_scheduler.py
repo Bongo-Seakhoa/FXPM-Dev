@@ -1274,17 +1274,15 @@ def _declared_run_one_cell(
                 precommit = orchestration.reopen_declared_slot_owner_run_precommit(context,
                     receipt_sha256=records[0].parent.name, process=process, frozen_pipeline_config=frozen)
             else:
-                ordinary_selection = None if development else _declared_ordinary_row_selection(row)
-                if not development and ordinary_selection is None and row.get("final_study_13") is not True:
+                if development:
+                    _fail("DECLARED_FRESH_ORDINARY_CONTRACT_REQUIRED")
+                ordinary_selection = _declared_ordinary_row_selection(row)
+                if ordinary_selection is None and row.get("final_study_13") is not True:
                     _fail("DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED")
                 process = _declared_initial_process(context, row, development=development)
                 refs = {"config_sha256": context.config_sha256,
                     "effective_config_sha256": frozen.effective_config_sha256}
-                roster = (anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
-                    frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs=refs,
-                    extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
-                    protected_end_exclusive_utc=row["protected_end_exclusive_utc"]) if development
-                    else _declared_resolved_ordinary_roster(row, refs))
+                roster = _declared_resolved_ordinary_roster(row, refs)
                 if slot_dispatch is not None and len(roster["slots"]) != 13:
                     _fail("DECLARED_SLOT_PARALLEL_FULL_ROSTER_REQUIRED")
                 profile = spread.load_spread_profile(Path(config.data_dir) / "native" / "terms" / "spread_profile.json")
@@ -1294,12 +1292,9 @@ def _declared_run_one_cell(
                 policy = row["source_access_window_policy"]
                 window = {"start_utc":(now-timedelta(seconds=policy["lead_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "end_exclusive_utc":(now+timedelta(seconds=policy["validity_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ")}
-                issuer = (orchestration.precommit_declared_development_native_slot_owner_run if development
-                    else orchestration.precommit_declared_slot_owner_run_v2)
-                prefix = ({"development_slot_ids": row["development"]["selected_slot_ids"]} if development
-                    else {"final_study_13": ordinary_selection is None or ordinary_selection["mode"] == "final_study_13",
-                        **({"period_selection": ordinary_selection} if ordinary_selection is not None else {})})
-                precommit = issuer(context, run_id=row["run_id"], process=process, slot_roster=roster,
+                prefix = {"final_study_13": ordinary_selection is None or ordinary_selection["mode"] == "final_study_13",
+                    **({"period_selection": ordinary_selection} if ordinary_selection is not None else {})}
+                precommit = orchestration.precommit_declared_slot_owner_run_v2(context, run_id=row["run_id"], process=process, slot_roster=roster,
                     cell_roster=[row["cell"]], frozen_pipeline_config=frozen,
                     spread_profile_identity={"profile_sha256":profile.sha256}, source_access_window_utc=window,
                     launch_activation_utc=row["launch_activation_utc"], **prefix)
@@ -3069,25 +3064,20 @@ def _declared_m5_run_one_cell(contract, row):
                     precommit = orchestration.reopen_declared_slot_owner_run_precommit(context,
                         receipt_sha256=records[0].parent.name, process=process, frozen_pipeline_config=frozen)
                 else:
+                    if not ordinary:
+                        _fail("DECLARED_FRESH_ORDINARY_CONTRACT_REQUIRED")
                     refs = {"config_sha256": context.config_sha256,
                         "effective_config_sha256": frozen.effective_config_sha256}
-                    roster = (_declared_resolved_ordinary_roster(row, refs) if ordinary else
-                        anchors.derive_declared_owner_slot_roster_v2(launch_activation_utc=row["launch_activation_utc"],
-                            frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs=refs,
-                            extend_frozen_clock_backward=row["extend_frozen_clock_backward"],
-                            protected_end_exclusive_utc=row["protected_end_exclusive_utc"]))
+                    roster = _declared_resolved_ordinary_roster(row, refs)
                     process = _declared_initial_process(context, row, development=development)
                     if [slot["slot_id"] for slot in roster["slots"][:len(_declared_m5_period_ids(dev))]] != _declared_m5_period_ids(dev):
                         _fail("DECLARED_M5_DEVELOPMENT_PREFIX_INVALID")
                     now, policy = _declared_utc_now(), row["source_access_window_policy"]
                     window = {"start_utc": (now - timedelta(seconds=policy["lead_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         "end_exclusive_utc": (now + timedelta(seconds=policy["validity_seconds"])).strftime("%Y-%m-%dT%H:%M:%SZ")}
-                    issuer = (orchestration.precommit_declared_m5_slot_owner_run if ordinary
-                        else orchestration.precommit_declared_development_m5_slot_owner_run)
-                    selection_arguments = ({"period_selection": row["period_selection"],
-                        "final_study_13": row["period_selection"]["mode"] == "final_study_13"} if ordinary
-                        else {"development_slot_ids": _declared_m5_period_ids(dev)})
-                    precommit = issuer(context,
+                    selection_arguments = {"period_selection": row["period_selection"],
+                        "final_study_13": row["period_selection"]["mode"] == "final_study_13"}
+                    precommit = orchestration.precommit_declared_m5_slot_owner_run(context,
                         run_id=row["run_id"], process=process, slot_roster=roster, cell_roster=[row["cell"]],
                         frozen_pipeline_config=frozen, spread_profile_identity={"profile_sha256": contract["profile_sha256"]},
                         source_access_window_utc=window, launch_activation_utc=row["launch_activation_utc"],

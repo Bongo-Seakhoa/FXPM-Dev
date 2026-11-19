@@ -1,14 +1,12 @@
 """INVENTED metadata: real issuers and custody, no native/model/financial evidence."""
 import copy
 import hashlib
-from pathlib import Path
 
 import pytest
 
 import pm_authority_spool as spool
 import pm_historical_anchor_orchestration as orchestration
 import pm_production_anchor_plan as anchors
-import pm_spread_profile as spread
 from prototype_support import _roster_arguments
 from test_development_cell_prefix import prefix_metadata_factory, _prefix_m5_pins
 
@@ -122,30 +120,11 @@ def test_ordinary_issued_selection_binds_requests_without_development_scope(
                 attempt_id="invented-unselected-ordinary", sink=sink)
 
 
-def _install_documentary_profile(env):
-    # The unavailable group is invented metadata, not observations or empirical calibration.
-    body = {"schema_version": spread.PROFILE_SCHEMA,
-        "status": "COMPLETE_CALIBRATION_WITH_EXPLICIT_UNAVAILABLE_GROUPS",
-        "calculation_policy": "ONE_TIME_OFFLINE_NO_RUNTIME_RECALCULATION",
-        "source_convention": "FINEST_ACTIVATED_CANDIDATE_FIXED_PER_SYMBOL_EXACT_PRIOR_CLOSE_AT_TARGET_OPEN",
-        "production_authority": False,
-        "fixture_provenance": "INVENTED_METADATA_ONLY_NO_OBSERVATIONS_OR_CALIBRATION",
-        "activation": {"id": "invented-ordinary-period-cold", "manifest_sha256": "1" * 64},
-        "protected_cutoff_utc": "2024-07-14T08:05:00Z",
-        "cells": [{"symbol": env.cell["symbol"], "timeframe": "H1",
-            "status": "NO_VALID_SPREAD_OBSERVATIONS", "tiers": {}}]}
-    path = Path(env.frozen.materialize(env.context).data_dir) / "native/terms/spread_profile.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(orchestration._declared_json(body))
-    profile = spread.load_spread_profile(path)
-    env.profile_sha = profile.sha256
-    env.kwargs["spread_profile_identity"] = {"profile_sha256": profile.sha256}
 
 
 @pytest.mark.parametrize("kind", ["native", "m5"])
 def test_ordinary_default_is_bound_one_period_through_public_cold_reopen(prefix_metadata_factory, kind):
     env = prefix_metadata_factory(full_panel=False)
-    _install_documentary_profile(env)
     value = _issue(env, kind)
     body = value.to_dict()
     expected = orchestration.declared_ordinary_period_selection(env.roster, symbols=(env.cell["symbol"],))

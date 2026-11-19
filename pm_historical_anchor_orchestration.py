@@ -3519,12 +3519,7 @@ def _validate_declared_m5_profile_binding(pins, profile):
         _fail("DECLARED_SLOT_M5_PROFILE_BINDING_MISMATCH")
 
 
-def _declared_precommit_schema(edition, source_kind, *, development=False):
-    if type(development) is not bool or (development and (source_kind not in ("broker_native", "m5_derived") or edition != DECLARED_WINNER_TRANSPORT_V16)):
-        _fail("DECLARED_DEVELOPMENT_SCOPE_INVALID")
-    if development:
-        return (DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA if source_kind == "broker_native"
-                else DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA)
+def _declared_precommit_schema(edition, source_kind):
     if edition not in (DECLARED_WINNER_TRANSPORT_V15, DECLARED_WINNER_TRANSPORT_V16):
         _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
     if source_kind not in ("broker_native", "m5_derived"):
@@ -3651,7 +3646,7 @@ def declared_ordinary_period_selection(roster, *, mode=None, final_study_13=Fals
     elif (type(symbols) not in (list, tuple) or not symbols
             or any(type(symbol) is not str or symbol not in DECLARED_DEVELOPMENT_SYMBOLS for symbol in symbols)):
         _fail("DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED")
-    return {"mode": mode, "selected_slot_ids": _declared_first_period(roster, None, ordinary_mode=mode)}
+    return {"mode": mode, "selected_slot_ids": _declared_ordinary_slot_ids(roster, mode=mode)}
 
 
 def declared_slot_period_selection(body):
@@ -3703,24 +3698,16 @@ def _require_declared_final_study_request(final_study_13):
         _fail("DECLARED_FULL_ROSTER_FINAL_STUDY_REQUEST_REQUIRED")
 
 
-def _declared_first_period(slot_roster, development_slot_ids, *, ordinary_mode=None):
-    """Resolve roster IDs while preserving the existing development default."""
-    if development_slot_ids is not None:
-        return development_slot_ids
+def _declared_ordinary_slot_ids(slot_roster, *, mode):
     slots = slot_roster.get("slots") if type(slot_roster) is dict else None
-    if ordinary_mode is not None:
-        if type(ordinary_mode) is not str or ordinary_mode not in DECLARED_ORDINARY_PERIOD_SELECTION_COUNTS:
-            _fail("DECLARED_ORDINARY_PERIOD_SELECTION_INVALID")
-        if (type(slots) is not list or len(slots) != 13
-                or any(type(slot) is not dict or type(slot.get("slot_id")) is not str
-                    or not slot["slot_id"] for slot in slots)
-                or len({slot["slot_id"] for slot in slots}) != 13):
-            _fail("DECLARED_SLOT_ROSTER_INVALID")
-        return [slot["slot_id"] for slot in slots[:DECLARED_ORDINARY_PERIOD_SELECTION_COUNTS[ordinary_mode]]]
-    if (type(slots) is not list or not slots or type(slots[0]) is not dict
-            or type(slots[0].get("slot_id")) is not str):
-        _fail("DECLARED_DEVELOPMENT_PREFIX_INVALID")
-    return [slots[0]["slot_id"]]
+    if type(mode) is not str or mode not in DECLARED_ORDINARY_PERIOD_SELECTION_COUNTS:
+        _fail("DECLARED_ORDINARY_PERIOD_SELECTION_INVALID")
+    if (type(slots) is not list or len(slots) != 13
+            or any(type(slot) is not dict or type(slot.get("slot_id")) is not str
+                or not slot["slot_id"] for slot in slots)
+            or len({slot["slot_id"] for slot in slots}) != 13):
+        _fail("DECLARED_SLOT_ROSTER_INVALID")
+    return [slot["slot_id"] for slot in slots[:DECLARED_ORDINARY_PERIOD_SELECTION_COUNTS[mode]]]
 
 
 def _declared_ordinary_issuer_selection(roster, period_selection, final_study_13, cell_roster):
@@ -3767,14 +3754,6 @@ def precommit_declared_slot_owner_run_v2(context, *, run_id, process, slot_roste
         **({"period_selection": ordinary} if ordinary is not None else {}))
 
 
-def precommit_declared_development_native_slot_owner_run(context, *, run_id, process, slot_roster,
-        cell_roster, frozen_pipeline_config, spread_profile_identity,
-        source_access_window_utc, launch_activation_utc, development_slot_ids=None):
-    return _precommit_declared_slot_owner_run(context, run_id=run_id, process=process,
-        slot_roster=slot_roster, cell_roster=cell_roster, frozen_pipeline_config=frozen_pipeline_config,
-        spread_profile_identity=spread_profile_identity, source_access_window_utc=source_access_window_utc,
-        launch_activation_utc=launch_activation_utc, transport_edition=DECLARED_WINNER_TRANSPORT_V16,
-        development_slot_ids=_declared_first_period(slot_roster, development_slot_ids))
 
 
 def precommit_declared_m5_slot_owner_run(context, *, run_id, process, slot_roster,
@@ -3792,21 +3771,12 @@ def precommit_declared_m5_slot_owner_run(context, *, run_id, process, slot_roste
         **({"period_selection": ordinary} if ordinary is not None else {}))
 
 
-def precommit_declared_development_m5_slot_owner_run(context, *, run_id, process, slot_roster,
-        cell_roster, frozen_pipeline_config, spread_profile_identity,
-        source_access_window_utc, launch_activation_utc, m5_source_pins, development_slot_ids=None):
-    return _precommit_declared_slot_owner_run(context, run_id=run_id, process=process,
-        slot_roster=slot_roster, cell_roster=cell_roster, frozen_pipeline_config=frozen_pipeline_config,
-        spread_profile_identity=spread_profile_identity, source_access_window_utc=source_access_window_utc,
-        launch_activation_utc=launch_activation_utc, transport_edition=DECLARED_WINNER_TRANSPORT_V16,
-        m5_source_pins=m5_source_pins,
-        development_slot_ids=_declared_first_period(slot_roster, development_slot_ids))
 
 
 def _precommit_declared_slot_owner_run(context, *, run_id, process, slot_roster,
         cell_roster, frozen_pipeline_config, spread_profile_identity,
         source_access_window_utc, launch_activation_utc, transport_edition, m5_source_pins=None,
-        development_slot_ids=None, period_selection=None):
+        period_selection=None):
     if transport_edition not in (DECLARED_WINNER_TRANSPORT_V15, DECLARED_WINNER_TRANSPORT_V16):
         _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
     import pm_production_search_planner as planner
@@ -3853,14 +3823,7 @@ def _precommit_declared_slot_owner_run(context, *, run_id, process, slot_roster,
     m5_digest = None if m5_source_pins is None else _validate_declared_m5_source_pins(m5_source_pins, cell)
     if m5_source_pins is not None:
         _validate_declared_m5_profile_binding(m5_source_pins, spread_profile_identity)
-    development_scope = None
-    if development_slot_ids is not None:
-        if cell["symbol"] not in DECLARED_DEVELOPMENT_SYMBOLS:
-            _fail("DECLARED_DEVELOPMENT_SYMBOL_NOT_ADOPTED")
-        if source_kind == "broker_native" and planner.frozen_search_execution_edition(context, process) != planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION:
-            _fail("DECLARED_DEVELOPMENT_NATIVE_PROCESS_INVALID")
-        development_scope = _declared_development_scope_body(roster, development_slot_ids)
-    body = {"schema_version": _declared_precommit_schema(transport_edition, source_kind, development=development_scope is not None),
+    body = {"schema_version": _declared_precommit_schema(transport_edition, source_kind),
         "run_id": _safe_id(run_id, "DECLARED_SLOT_PRECOMMIT_INVALID"),
         "generation_id": context.generation_id, "generation_context_sha256": context.context_sha256,
         "native_universe_sha256": context.native_universe_sha256, "config_sha256": context.config_sha256,
@@ -3878,12 +3841,8 @@ def _precommit_declared_slot_owner_run(context, *, run_id, process, slot_roster,
     if m5_source_pins is not None:
         body.update(source_kind="m5_derived", m5_source_pins=m5_source_pins,
                     m5_view_contract_sha256=m5_digest)
-    if development_scope is not None:
-        body.update(development_scope=development_scope,
-            development_scope_sha256=hashlib.sha256(_declared_json(development_scope)).hexdigest())
-        declared_slot_selected_slots(body)
     if period_selection is not None:
-        if development_scope is not None or transport_edition != DECLARED_WINNER_TRANSPORT_V16:
+        if transport_edition != DECLARED_WINNER_TRANSPORT_V16:
             _fail("DECLARED_ORDINARY_PERIOD_SELECTION_INVALID")
         body["period_selection"] = period_selection
         body["period_selection"] = declared_slot_period_selection(body)
@@ -4216,13 +4175,12 @@ def reopen_declared_slot_owner_run_precommit(context, *, receipt_sha256, process
 __all__ += ["reopen_declared_slot_owner_run_precommit"]
 
 
-__all__ += ["DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA", "DECLARED_NATIVE_DEVELOPMENT_SLOT_REQUEST_SCHEMA",
-    "precommit_declared_development_native_slot_owner_run"]
+__all__ += ["DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA", "DECLARED_NATIVE_DEVELOPMENT_SLOT_REQUEST_SCHEMA"]
 
 
 __all__ += ["DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA", "DECLARED_M5_DEVELOPMENT_SLOT_REQUEST_SCHEMA",
     "DECLARED_DEVELOPMENT_SCOPE_SCHEMA", "DECLARED_DEVELOPMENT_SYMBOLS",
-    "precommit_declared_development_m5_slot_owner_run", "declared_slot_development_scope",
+    "declared_slot_development_scope",
     "declared_slot_selected_slots"]
 
 

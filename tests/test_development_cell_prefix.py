@@ -1,8 +1,8 @@
-"""INVENTED metadata fixtures: real issuers, no native/model/financial evidence.
+"""INVENTED software fixtures: ordinary issuers and saved DEV readers.
 
-The QA image must provide the coherent product source closure used by the real
-issuers. No verifier, source clock or issuer result is substituted here. The
-profile and M5 view/cost pins below are documentary invented identities only.
+Legacy DEV bodies use the documentary test-only recipe below and the normal
+public saved-contract reopen. The profile and M5 identities describe invented
+metadata only; no native/model/financial evidence or trading grant is claimed.
 """
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import pm_spread_profile as spread
 import pm_authority_spool as spool
 import pm_book_multiplicity as book
 import pm_cap_calibration as cap
@@ -75,15 +76,16 @@ def prefix_metadata_factory(tmp_path):
         kwargs = dict(run_id=run_id, process=process, slot_roster=roster, cell_roster=[cell],
             frozen_pipeline_config=frozen, spread_profile_identity={"profile_sha256": profile_sha},
             source_access_window_utc=window, launch_activation_utc=launch)
-        return SimpleNamespace(root=root, context=context, frozen=frozen, process=process,
+        env = SimpleNamespace(root=root, context=context, frozen=frozen, process=process,
             roster=roster, cell=cell, window=window, profile_sha=profile_sha, kwargs=kwargs)
+        _install_documentary_profile(env)
+        return env
 
     return create
 
 
 def _prefix_native_issue(env, ids):
-    return orchestration.precommit_declared_development_native_slot_owner_run(
-        env.context, **env.kwargs, development_slot_ids=ids)
+    return _saved_development_precommit(env, ids)
 
 
 def _prefix_m5_pins(env):
@@ -103,7 +105,7 @@ def _prefix_m5_pins(env):
 
 
 @pytest.mark.parametrize("k", [1, 2, 3])
-def test_native_development_issuer_keeps_full13_and_issues_only_selected_prefix(prefix_metadata_factory, k):
+def test_saved_native_development_keeps_full13_and_selected_prefix(prefix_metadata_factory, k):
     env = prefix_metadata_factory()
     slots = env.roster["slots"]
     selected = [slot["slot_id"] for slot in slots[:k]]
@@ -149,19 +151,11 @@ def test_native_development_refuses_nonprefix_selection(prefix_metadata_factory,
         _prefix_native_issue(env, values[bad])
 
 
-@pytest.mark.parametrize("source_kind", ["native", "m5"])
-def test_development_issuers_default_to_the_first_period(prefix_metadata_factory, source_kind):
-    env = prefix_metadata_factory(full_panel=source_kind == "native")
-    if source_kind == "native":
-        value = orchestration.precommit_declared_development_native_slot_owner_run(env.context, **env.kwargs)
-    else:
-        value = orchestration.precommit_declared_development_m5_slot_owner_run(env.context, **env.kwargs,
-            m5_source_pins=_prefix_m5_pins(env))
-    parent = value.to_dict()
-    first = [env.roster["slots"][0]["slot_id"]]
-    assert parent["development_scope"]["selected_slot_ids"] == first
-    assert [slot["slot_id"] for slot in orchestration.declared_slot_selected_slots(parent)] == first
-    assert len(parent["slot_roster"]["slots"]) == 13
+@pytest.mark.parametrize("name", ["precommit_declared_development_native_slot_owner_run",
+    "precommit_declared_development_m5_slot_owner_run"])
+def test_obsolete_fresh_development_issuers_are_removed(name):
+    assert not hasattr(orchestration, name)
+    assert name not in orchestration.__all__
 
 
 @pytest.mark.parametrize("kind", ["native_v2", "m5_full"])
@@ -209,7 +203,7 @@ def test_native_development_requires_actual_full_panel_process(prefix_metadata_f
 
 
 @pytest.mark.parametrize("kind", ["native_v1", "native_v2", "m5_full", "m5_development"])
-def test_legacy_native_and_m5_issuers_preserve_old_schema_and_roster(prefix_metadata_factory, kind):
+def test_legacy_native_and_m5_schemas_preserve_old_roster(prefix_metadata_factory, kind):
     env = prefix_metadata_factory(full_panel=False)
     if kind == "native_v1":
         value = orchestration.precommit_declared_slot_owner_run(env.context, **env.kwargs)
@@ -222,9 +216,8 @@ def test_legacy_native_and_m5_issuers_preserve_old_schema_and_roster(prefix_meta
             m5_source_pins=_prefix_m5_pins(env), final_study_13=True)
         expected = orchestration.DECLARED_M5_SLOT_PRECOMMIT_SCHEMA
     else:
-        value = orchestration.precommit_declared_development_m5_slot_owner_run(env.context, **env.kwargs,
-            m5_source_pins=_prefix_m5_pins(env),
-            development_slot_ids=[slot["slot_id"] for slot in env.roster["slots"][:2]])
+        value = _saved_development_precommit(env,
+            [slot["slot_id"] for slot in env.roster["slots"][:2]], m5_source_pins=_prefix_m5_pins(env))
         expected = orchestration.DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA
     body = orchestration.verify_declared_slot_owner_run_precommit(env.context, value, process=env.process)
     assert body["schema_version"] == expected and body["slot_roster"] == env.roster
@@ -258,8 +251,7 @@ def test_native_development_does_not_replace_full_roster_with_prefix(prefix_meta
     shortened["slot_count"] = 1
     kwargs = {**env.kwargs, "slot_roster": shortened}
     with pytest.raises(orchestration.HistoricalAnchorOrchestrationError):
-        orchestration.precommit_declared_development_native_slot_owner_run(env.context, **kwargs,
-            development_slot_ids=[shortened["slots"][0]["slot_id"]])
+        _saved_development_precommit(env, [shortened["slots"][0]["slot_id"]], slot_roster=shortened)
 
 
 
@@ -1269,3 +1261,52 @@ def test_full_native_refinalization_preserves_legacy_grid_view_and_fence_bytes(t
     reopened = spool.read_generation_retirement(context.root)
     assert reopened["retained_account_result"] == kept
     assert reopened["source_fence"]["sha256"] == saved["sha256"]
+
+
+def _install_documentary_profile(env):
+    # The unavailable group is invented metadata, not observations or empirical calibration.
+    body = {"schema_version": spread.PROFILE_SCHEMA,
+        "status": "COMPLETE_CALIBRATION_WITH_EXPLICIT_UNAVAILABLE_GROUPS",
+        "calculation_policy": "ONE_TIME_OFFLINE_NO_RUNTIME_RECALCULATION",
+        "source_convention": "FINEST_ACTIVATED_CANDIDATE_FIXED_PER_SYMBOL_EXACT_PRIOR_CLOSE_AT_TARGET_OPEN",
+        "production_authority": False,
+        "fixture_provenance": "INVENTED_METADATA_ONLY_NO_OBSERVATIONS_OR_CALIBRATION",
+        "activation": {"id": "invented-ordinary-period-cold", "manifest_sha256": "1" * 64},
+        "protected_cutoff_utc": "2024-07-14T08:05:00Z",
+        "cells": [{"symbol": env.cell["symbol"], "timeframe": "H1",
+            "status": "NO_VALID_SPREAD_OBSERVATIONS", "tiers": {}}]}
+    path = Path(env.frozen.materialize(env.context).data_dir) / "native/terms/spread_profile.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(orchestration._declared_json(body))
+    profile = spread.load_spread_profile(path)
+    env.profile_sha = profile.sha256
+    env.kwargs["spread_profile_identity"] = {"profile_sha256": profile.sha256}
+
+
+def _saved_development_precommit(env, selected, *, m5_source_pins=None, slot_roster=None):
+    """Publish labelled invented legacy bytes, then use the real saved-contract reader."""
+    roster = env.roster if slot_roster is None else slot_roster
+    scope = orchestration._declared_development_scope_body(roster, selected)
+    body = {"schema_version": (orchestration.DECLARED_NATIVE_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA
+            if m5_source_pins is None else orchestration.DECLARED_M5_DEVELOPMENT_SLOT_PRECOMMIT_SCHEMA),
+        "run_id": env.kwargs["run_id"], "generation_id": env.context.generation_id,
+        "generation_context_sha256": env.context.context_sha256,
+        "native_universe_sha256": env.context.native_universe_sha256, "config_sha256": env.context.config_sha256,
+        "effective_config_sha256": env.frozen.effective_config_sha256,
+        "search_process_receipt_sha256": env.process.receipt_sha256,
+        "source_identity": orchestration._declared_source_identity(), "slot_roster": roster,
+        "slot_roster_sha256": _prefix_sha(roster), "launch_activation_utc": env.kwargs["launch_activation_utc"],
+        "protected_end_exclusive_utc": orchestration._DECLARED_PROTECTED_END_EXCLUSIVE_UTC,
+        "cells": [env.cell], "spread_profile_identity": {"profile_sha256": env.profile_sha},
+        "source_access_window_utc": dict(env.window), "precommitted_at_utc": env.window["start_utc"],
+        "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False,
+        "development_scope": scope, "development_scope_sha256": _prefix_sha(scope),
+        "winner_transport_edition": orchestration.DECLARED_WINNER_TRANSPORT_V16}
+    if m5_source_pins is not None:
+        body.update(source_kind="m5_derived", m5_source_pins=m5_source_pins,
+            m5_view_contract_sha256=orchestration._validate_declared_m5_source_pins(m5_source_pins, env.cell))
+    digest = _prefix_sha(body)
+    spool._publish_exact_json(env.context, f"declared-slots/{digest}/precommit.json", body,
+        orchestration._MAX_PRECOMMIT_BYTES)
+    return orchestration.reopen_declared_slot_owner_run_precommit(env.context, receipt_sha256=digest,
+        process=env.process, frozen_pipeline_config=env.frozen)
