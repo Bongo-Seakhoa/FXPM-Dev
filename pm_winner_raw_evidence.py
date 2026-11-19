@@ -3656,7 +3656,8 @@ def _validated_horizon_winner_cross_binding(
     }
     schema = binding.get("schema_version")
     current_pair = bool(frozen.frozen_tier_pair_contract_bytes)
-    transport_v16 = frozen.selection_generation is winner.V16_GENERATION
+    m5_generation = (frozen.selection_generation is winner.V16_GENERATION
+                     or frozen.selection_generation.matched_floor_enabled)
     m5_window = None
     if current_pair:
         pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
@@ -3682,7 +3683,7 @@ def _validated_horizon_winner_cross_binding(
             _fail("PROVENANCE_CROSS_BINDING_MODE_INVALID")
     else:
         _fail("PROVENANCE_CROSS_BINDING_SCHEMA_INVALID")
-    if m5_window is not None and (mode != HISTORICAL_CROSS_BINDING_MODE or not transport_v16):
+    if m5_window is not None and (mode != HISTORICAL_CROSS_BINDING_MODE or not m5_generation):
         _fail("PROVENANCE_M5_CROSS_BINDING_MODE_INVALID")
     if set(binding) != expected_top or (
         binding.get("symbol") != frozen.symbol
