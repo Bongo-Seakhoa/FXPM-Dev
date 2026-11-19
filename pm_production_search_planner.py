@@ -767,7 +767,7 @@ def _derive_expected_process_body(
             "selection_version": generation.selection_version,
             "request_version": generation.request_version,
             "selection_policy_sha256": generation.policy_sha256,
-            "selection_addendum_contract_sha256": _sha(generation.selection_addendum_contract),
+            "selection_addendum_contract_sha256": generation.policy["selection_addendum_contract_sha256"],
         }
     return body
 

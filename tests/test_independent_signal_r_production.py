@@ -57,18 +57,39 @@ def test_v19_historical_dispatch_authenticates_before_generation_lookup(monkeypa
     assert found is execution.execute_independent_r_historical_observed_cell
 
 
-def test_v19_scheduler_freezes_explicit_edition_on_fresh_owner(monkeypatch, tmp_path):
+@pytest.mark.parametrize(("freezer", "schema", "generation", "addendum_sha256", "strategy_count"), [
+    pytest.param(planner.freeze_route_a_full_panel_production_search_process,
+        planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, winner.V17_GENERATION,
+        winner.V17_SELECTION_ADDENDUM_CONTRACT_SHA256, 100, id="v17"),
+    pytest.param(planner.freeze_noise101_software_search_description,
+        planner.NOISE101_PROCESS_SCHEMA, winner.V18_GENERATION,
+        winner.V17_SELECTION_ADDENDUM_CONTRACT_SHA256, 101, id="v18"),
+    pytest.param(None, planner.INDEPENDENT_R_PROCESS_SCHEMA, winner.V19_GENERATION,
+        winner.V19_SELECTION_ADDENDUM_CONTRACT_SHA256, 100, id="v19"),
+])
+def test_fresh_process_binds_canonical_winner_addendum(tmp_path, freezer, schema, generation,
+                                                       addendum_sha256, strategy_count):
     import pm_authority_spool as spool
-    monkeypatch.setattr(producer, "_read_declared_record", lambda *a, **kw: None)
-    monkeypatch.setattr(spool, "_reject_reparse_chain", lambda *a: None)
-    calls = []
-    monkeypatch.setattr(planner, "freeze_independent_signal_r_production_search_process",
-        lambda context, **kw: calls.append(kw) or "v19")
-    context = SimpleNamespace(root=tmp_path, limits=SimpleNamespace(max_manifest_bytes=1024))
-    assert scheduler._declared_initial_process(context,
-        {"run_id": "invented-software", "execution_edition": planner.INDEPENDENT_R_EXECUTION_EDITION},
-        development=False) == "v19"
-    assert calls == [{"run_id": "invented-software"}]
+
+    run_id = "invented-addon-binding"
+    context = spool.freeze_generation_context(tmp_path / run_id, generation_id=run_id,
+        native_universe_sha256="a" * 64, config_sha256="b" * 64)
+    if freezer is None:
+        process = scheduler._declared_initial_process(context,
+            {"run_id": run_id, "execution_edition": planner.INDEPENDENT_R_EXECUTION_EDITION},
+            development=False)
+    else:
+        process = freezer(context, run_id=run_id)
+
+    body = process.to_dict()
+    assert body["schema_version"] == schema
+    assert planner.source_edition_info(process).winner_generation_id == generation.selection_version
+    assert body["winner_selection_binding"]["selection_addendum_contract_sha256"] == addendum_sha256
+    assert winner._sha256_json(dict(generation.selection_addendum_contract)) == addendum_sha256
+    assert body["semantics"]["strategy_domain_count"] == strategy_count
+    assert body["semantics"]["attempt_policy"]["attempt_count_per_observed_cell"] == generation.max_attempts
+    assert (context.root / process.spool_receipt["symbol_manifest"]["relative_path"]).is_file()
+    assert not (context.root / "declared-slots").exists()
 
 
 class _Strategy:
