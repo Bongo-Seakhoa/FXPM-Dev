@@ -89,7 +89,8 @@ a result. Collisions advance a deterministic salt within a bounded budget and
 fail closed rather than emitting a duplicate or collapsing to the default.
 
 Grounds for the sizing, measured: the smallest strategy grid admits **165**
-distinct combinations, the median **4,455**, the largest **1,267,200**, and every
+distinct combinations, the median **4,455**, the largest **27,500** (after the
+2026-10-25 trim; the pre-trim table was retired on 2026-11-19), and every
 strategy can supply at least 8 distinct non-default points. Sampling 0.28 tuned
 points against a median space of 4,455 was not a search.
 

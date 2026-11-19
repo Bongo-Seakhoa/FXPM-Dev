@@ -12,6 +12,23 @@ Notes:
 
 ## [1.4.10] - Unreleased
 
+### One-period prototype path (2026-11-17 to 2026-11-19)
+
+- Removed repeated whole-state, roster, fit, process and cost re-verification from the search and
+  completion path; each is verified once where it enters. A one-period acceptance test that ran
+  about 15 hours without finishing now passes (`bc5c023e`).
+- Repaired V17 completion: the decision verifier's policy version, one winner evaluation instead
+  of three, and the V17 frozen-plan restore (`bc5c023e`).
+- One period is the default run: `pm_main.py declared-rnd --fresh-contract` compiles the first
+  period; two periods is an explicit hand-over. Both are limited to the ten development symbols;
+  all thirteen need `final_study_13: true` and are the final study only. Duplicate fresh
+  development issuers were retired (`5e4f4fee`, `e1c44ffe`, `c85da1c5`). See
+  `docs/ORDINARY_PERIOD_CONTRACT.md`.
+- Deleted the pre-trim strategy table `pm_strategy_domain_v1.json` and its readers (`bc5c023e`,
+  `5e4f4fee`).
+- Added Strategy 101, the noise-band breakout, as a source edition; not production-qualified until
+  a US100 M5 cost tier and a recorded-clock proof exist (`3c64600d`).
+
 ### Discovery context hygiene
 
 - Added `docs/ACTIVE_DISCOVERY_STATE.md` as the compact current source of truth for active
