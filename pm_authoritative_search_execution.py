@@ -90,6 +90,9 @@ STATE_CONTEXT_BOUNDARY_REASON: Final = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
 SIGNAL_DESIGN_REQUEST_SCHEMA: Final = "fxpm.signal-opportunity-design-request.v1"
 SIGNAL_DESIGN_TAPE_SCHEMA: Final = "fxpm.signal-opportunity-train-design-tape.v1"
 SIGNAL_DESIGN_TAPE_FORMAT: Final = "fxpm-signal-opportunity-design-jsonl-v1"
+INDEPENDENT_R_REQUEST_SCHEMA: Final = "fxpm.signal-opportunity-design-request.v2"
+INDEPENDENT_R_TAPE_SCHEMA: Final = "fxpm.signal-opportunity-train-design-tape.v2"
+INDEPENDENT_R_TAPE_FORMAT: Final = "fxpm-signal-opportunity-design-jsonl-v2"
 _SIGNAL_DESIGN_REQUEST_SEAL = object()
 MAX_PREFIX_ROWS: Final = 10_000_000
 MAX_ATTEMPTS: Final = winner.MAX_ATTEMPTS
@@ -178,6 +181,9 @@ class FittedNativeSearchTimeframe:
     _spread_source_frame: pd.DataFrame | None = None
     _bound_fit_owner: Any = field(default=None, repr=False, compare=False)
     _derived_binding: Any = field(default=None, repr=False, compare=False)
+    _numeric_preparation: Any = field(default=None, repr=False, compare=False)
+    _numeric_key: Any = field(default=None, repr=False, compare=False)
+    _numeric_source_columns: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
     def frame_copy(self) -> pd.DataFrame:
         """Return an isolated copy; callers cannot mutate the bound surface."""
@@ -1048,6 +1054,7 @@ def fit_native_timeframe_for_search(
     config: PipelineConfig,
     instrument_spec: InstrumentSpec | None = None,
     acquisition_attempts_exact: int = 1,
+    _numeric_preparation=None, _numeric_config_sha256=None,
 ) -> FittedNativeSearchTimeframe:
     """Open one native prefix and derive its genuine source/regime authority."""
 
@@ -1099,13 +1106,35 @@ def fit_native_timeframe_for_search(
         acquisition_attempts_exact=acquisition_attempts_exact,
         source_reason_code="AUTHENTICATED_NATIVE_PREFIX_AVAILABLE",
         fit_cutoff_utc=native["prefix_end_exclusive_utc"],
+        _numeric_preparation=_numeric_preparation, _numeric_config_sha256=_numeric_config_sha256,
     )
+
+
+def _unit_numeric_identity(*, product, timeframe, config_sha256, tiers, derived_binding=None):
+    """Use facts already authenticated by this cell; missing facts simply do not reuse."""
+    native = product.native_prefix
+    fields = ("activation_id", "activation_manifest_sha256", "activation_entry_sha256",
+        "artifact_sha256", "prefix_content_sha256", "prefix_rows")
+    facts = tuple(native.get(name) for name in fields)
+    cutoff = product.index.get("cutoff_utc")
+    profiles = tuple((name, tier.descriptor().get("profile_sha256")) for name, tier in sorted(tiers.items()))
+    if (not config_sha256 or not cutoff or any(value is None for value in facts)
+            or any(not value for _, value in profiles)):
+        return None
+    view = None
+    if derived_binding is not None:
+        evidence = derived_binding.view_evidence
+        view = tuple(evidence.get(name) for name in ("view_timeframe", "view_payload_sha256", "view_membership_sha256"))
+        if any(value is None for value in view):
+            return None
+    return ("m5_derived" if view is not None else "broker_native", native.get("symbol"),
+        timeframe, cutoff, facts, config_sha256, profiles, view)
 
 
 def _fit_verified_search_frame(*, product, config, frame, native, symbol, timeframe,
         instrument_spec, execution_spec_receipt, tiers, observations, fine_product,
         fine_frame, acquisition_attempts_exact, source_reason_code, fit_cutoff_utc,
-        derived_binding=None):
+        derived_binding=None, _numeric_preparation=None, _numeric_config_sha256=None):
     """Shared original probe/regime calculations after each source branch verifies inputs."""
     probe_backtester = Backtester(config)
     try:
@@ -1146,11 +1175,17 @@ def _fit_verified_search_frame(*, product, config, frame, native, symbol, timefr
     detector_code_sha256 = pm_regime.detector_code_sha256()
     if detector_code_sha256 is None:
         _fail("REGIME_DETECTOR_CODE_UNAVAILABLE")
+    numeric_identity = (_unit_numeric_identity(product=product, timeframe=timeframe,
+        config_sha256=_numeric_config_sha256, tiers=tiers, derived_binding=derived_binding)
+        if _numeric_preparation is not None else None)
+    numeric_key = (None if numeric_identity is None else (numeric_identity, parameters_sha256, detector_code_sha256))
     try:
-        detector = pm_regime.MarketRegimeDetector(
-            pm_regime.RegimeParams.from_dict(parameters)
-        )
-        surface = detector.compute_regime_scores(frame)
+        def compute_surface():
+            detector = pm_regime.MarketRegimeDetector(pm_regime.RegimeParams.from_dict(parameters))
+            return detector.compute_regime_scores(frame)
+        surface = (compute_surface() if _numeric_preparation is None else
+            _numeric_preparation.prepare(("regime", numeric_key) if numeric_key is not None else None,
+                frame, compute_surface, source_columns=tuple(frame.columns)))
     except Exception as exc:
         raise AuthoritativeSearchExecutionError(
             "REGIME_DETECTOR_EXECUTION_FAILED",
@@ -1236,6 +1271,8 @@ def _fit_verified_search_frame(*, product, config, frame, native, symbol, timefr
         _spread_source_product=fine_product,
         _spread_source_frame=fine_frame,
         _derived_binding=derived_binding,
+        _numeric_preparation=_numeric_preparation, _numeric_key=numeric_key,
+        _numeric_source_columns=tuple(frame.columns),
     )
 
 
@@ -1251,7 +1288,7 @@ class _DerivedSearchBinding:
 
 
 def fit_m5_derived_timeframe_for_search(*, context, owner, request_lease, calibration_lease,
-        cost_edition, declared_m5_source_pins, config, acquisition_attempts_exact=1):
+        cost_edition, declared_m5_source_pins, config, acquisition_attempts_exact=1, _numeric_preparation=None, _numeric_config_sha256=None):
     """Use a registered M5 view and recorded costs; the product remains genuine base M5."""
     from pm_m5_job_view import M5JobViews
     from pm_m5_derived_costs import RecordedDerivedCosts
@@ -1324,6 +1361,7 @@ def fit_m5_derived_timeframe_for_search(*, context, owner, request_lease, calibr
         source_reason_code="AUTHENTICATED_BASE_M5_DERIVED_PREFIX_AVAILABLE",
         fit_cutoff_utc=pd.Timestamp(frame["_BAR_CLOSE_TS"].iloc[-1]).isoformat(),
         derived_binding=binding,
+        _numeric_preparation=_numeric_preparation, _numeric_config_sha256=_numeric_config_sha256,
     )
 
 
@@ -2573,10 +2611,19 @@ def _decision_relevant_result(result: Mapping[str, Any], role: str) -> dict[str,
 
 def _compute_fitted_strategy_features(*, frame, strategy, fitted, symbol, timeframe):
     """Use the held authenticated fit recipe when full features are requested."""
+    def prepare(recipe, compute):
+        owner, identity = getattr(fitted, "_numeric_preparation", None), getattr(fitted, "_numeric_key", None)
+        if owner is None or identity is None:
+            return compute()
+        return owner.prepare(("features", identity, tuple(frame.columns), recipe), frame, compute,
+            source_columns=fitted._numeric_source_columns)
+
     def full_features():
-        return FeatureComputer.compute_all(frame, symbol=symbol, timeframe=timeframe,
-            regime_params_override=dict(fitted.regime_parameters),
-            regime_params_sha256=fitted.regime_fit_decision.to_dict()["regime_params_sha256"])
+        parameters = dict(fitted.regime_parameters)
+        parameters_sha256 = fitted.regime_fit_decision.to_dict()["regime_params_sha256"]
+        return prepare(("all", _canonical_bytes(parameters), parameters_sha256),
+            lambda: FeatureComputer.compute_all(frame, symbol=symbol, timeframe=timeframe,
+                regime_params_override=parameters, regime_params_sha256=parameters_sha256))
 
     if strategy is None:
         return full_features()
@@ -2591,7 +2638,8 @@ def _compute_fitted_strategy_features(*, frame, strategy, fitted, symbol, timefr
         return frame.copy()
     if request & FeatureComputer._REGIME_FEATURE_COLUMNS:
         return full_features()
-    return FeatureComputer.compute_required(frame, request, symbol=symbol, timeframe=timeframe)
+    return prepare(("required", tuple(sorted(request))),
+        lambda: FeatureComputer.compute_required(frame, request, symbol=symbol, timeframe=timeframe))
 
 
 def _build_full_prefix_strategy_surface(
@@ -4132,9 +4180,11 @@ def _make_declared_unit_header(capture: Any, fitted: Any, cell_plan: Any,
 
 
 def _continue_declared_attempt_units(context: Any, body: Mapping[str, Any],
-        binding_sha256: str, units: Sequence[Mapping[str, Any]], produce: Any) -> tuple[list[dict[str, Any]], str]:
+        binding_sha256: str, units: Sequence[Mapping[str, Any]], produce: Any, *, progress=None) -> tuple[list[dict[str, Any]], str]:
     """Resume whole attempts; no partially executed fold or ledger is inferred."""
     records = _declared_completed_prefix(context, body, binding_sha256, units)
+    from pm_historical_scheduler import _declared_observe_progress
+    _declared_observe_progress(progress, 'search_attempts', len(records), len(units))
     end_path = _declared_unit_relative(body, "evidence-completed.json")
     end = _read_declared_unit_json(context, end_path)
     if end is not None and len(records) != len(units):
@@ -4148,6 +4198,7 @@ def _continue_declared_attempt_units(context: Any, body: Mapping[str, Any],
         value = produce(unit)
         row = _publish_declared_completed_unit(context, body, binding_sha256, unit, value)
         records.append(row)
+        _declared_observe_progress(progress, 'search_attempts', len(records), len(units))
         del value
     completed = {"binding_sha256": binding_sha256, "unit_count": len(units),
         "unit_receipt_sha256": [_sha256(row) for row in records]}
@@ -4914,7 +4965,7 @@ def _build_current_cross_binding_bytes(
     horizon_execution_contracts: Sequence[Mapping[str, Any]],
     source_count_receipts: Sequence[Mapping[str, Any]],
 ) -> bytes:
-    """Derive CURRENT v4 from the released Horizon<->Winner bijection."""
+    """Derive the CURRENT binding from the released Horizon<->Winner bijection."""
 
     anchor = plan_body.get("anchor")
     if not isinstance(anchor, Mapping):
@@ -4932,12 +4983,12 @@ def _build_current_cross_binding_bytes(
         horizon_execution_contracts=horizon_execution_contracts,
         source_count_receipts=source_count_receipts,
     )
-    if (
-        historical_body.get("schema_version")
-        != (raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4
-            if frozen.selection_generation is winner.V16_GENERATION
-            else raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3)
-    ):
+    historical_schema, current_schema = (
+        raw_winner.horizon_winner_cross_binding_schemas_for_generation(
+            frozen.selection_generation, current_pair=True
+        )
+    )
+    if historical_body.get("schema_version") != historical_schema:
         _fail("CURRENT_CROSS_BINDING_BASE_INVALID")
     current = dict(historical_body)
     for name in (
@@ -4951,9 +5002,7 @@ def _build_current_cross_binding_bytes(
         current.pop(name)
     current.update(
         {
-            "schema_version": (raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
-                if frozen.selection_generation is winner.V16_GENERATION
-                else raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4),
+            "schema_version": current_schema,
             "mode": raw_winner.CURRENT_CROSS_BINDING_MODE,
             "cell_plan_receipt_sha256": cell_plan.receipt_sha256,
             "causal_precommit_receipt_sha256": (
@@ -5080,10 +5129,13 @@ def _signal_design_groups(records) -> list[dict[str, Any]]:
 
 def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receipt,
         causal_precommit_payload, cell_plan, fitted, frozen_pipeline_config,
-        declared_slot_roster=None):
+        declared_slot_roster=None, method_edition=None):
     import pm_production_config_binding as config_binding
     import pm_production_anchor_plan as anchor_authority
     import pm_production_search_planner as planner
+
+    if method_edition not in (None, signal_opportunities.INDEPENDENT_R_METHOD):
+        _fail("SIGNAL_DESIGN_METHOD_EDITION_INVALID")
 
     if declared_slot_roster is not None or getattr(cell_plan, "mode", None) == "DECLARED_SLOT_UNISSUED":
         _fail("SIGNAL_DESIGN_DECLARED_SLOTS_UNSUPPORTED")
@@ -5219,12 +5271,15 @@ def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receip
     if edition.edition_id == planner.NOISE101_SOURCE_EDITION_ID:
         binding["source_edition"] = edition.to_dict()
         binding["domain_roster_sha256"] = edition.domain_roster_sha256_by_timeframe[cell_plan.timeframe]
+    if method_edition is not None:
+        binding.update(schema_version=INDEPENDENT_R_REQUEST_SCHEMA, method_edition=method_edition,
+            labeler_schema_version=signal_opportunities.INDEPENDENT_R_SCHEMA)
     return binding, refreshed, frame, config, plan_body, attempts
 
 
 def issue_signal_opportunity_design_request(*, process, sink, planning_request,
         anchor_plan_receipt, causal_precommit_payload, cell_plan, fitted, frozen_pipeline_config,
-        declared_slot_roster=None
+        declared_slot_roster=None, method_edition=None
 ) -> SignalOpportunityDesignRequest:
     """Issue a distinct descriptive TRAIN grant from verified planning metadata.
 
@@ -5235,7 +5290,7 @@ def issue_signal_opportunity_design_request(*, process, sink, planning_request,
         planning_request=planning_request, anchor_plan_receipt=anchor_plan_receipt,
         causal_precommit_payload=causal_precommit_payload,
         cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config,
-        declared_slot_roster=declared_slot_roster)
+        declared_slot_roster=declared_slot_roster, method_edition=method_edition)
     encoded = _canonical_bytes(binding)
     identifier = hashlib.sha256(encoded).hexdigest()
     entry = sink.put_json("signal-design-request/" + identifier,
@@ -5250,11 +5305,16 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
     if (type(request) is not SignalOpportunityDesignRequest
             or request._seal is not _SIGNAL_DESIGN_REQUEST_SEAL):
         _fail("SIGNAL_DESIGN_REQUEST_REQUIRED")
+    method = json.loads(request._body_json.decode("ascii")).get("method_edition")
     binding, refreshed, frame, config, plan_body, attempts = _signal_design_inputs(
         process=process, sink=sink, planning_request=request._planning_request,
         anchor_plan_receipt=request._anchor_plan_receipt,
         causal_precommit_payload=json.loads(request._causal_precommit_json.decode("ascii")),
-        cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config)
+        cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config,
+        method_edition=method)
+    independent = method == signal_opportunities.INDEPENDENT_R_METHOD
+    tape_schema = INDEPENDENT_R_TAPE_SCHEMA if independent else SIGNAL_DESIGN_TAPE_SCHEMA
+    tape_format = INDEPENDENT_R_TAPE_FORMAT if independent else SIGNAL_DESIGN_TAPE_FORMAT
     if _canonical_bytes(binding) != request._body_json:
         _fail("SIGNAL_DESIGN_REQUEST_BINDING_CHANGED")
     request_entry = json.loads(request._entry_json.decode("ascii"))
@@ -5266,6 +5326,8 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
         "batch_count", "opportunity_count", "closed_count", "right_censored_count",
         "no_next_observation_count", "unavailable_regime_count", "source_observation_receipt_count",
         "source_observation_row_count")}
+    if independent:
+        totals["not_eligible_count"] = 0
     observation_receipts_seen: set[str] = set()
     cap = _signal_design_utc(binding["training_label_cap_utc"], "SIGNAL_DESIGN_CAP_INVALID")
 
@@ -5273,11 +5335,11 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
         return _canonical_bytes(value) + b"\n"
 
     def chunks():
-        yield line({"record_type": "HEADER", "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA,
+        yield line({"record_type": "HEADER", "schema_version": tape_schema,
             "request_sha256": request.receipt_sha256, "request": binding,
             "complete_cost_net_profit_available": False,
             "source_observation_reference_semantics": "EXACT_RECEIPT_EMITTED_ONCE_BEFORE_FIRST_SHA256_REFERENCE",
-            "swap_status": "UNAVAILABLE_PRICE_UNIT_CONVERSION"})
+            "swap_status": "PER_TRADE_MODELED" if independent else "UNAVAILABLE_PRICE_UNIT_CONVERSION"})
         for attempt in attempts:
             totals["roster_count"] += 1
             yield line({"record_type": "ATTEMPT", **binding["attempt_roster"][attempt.ordinal]})
@@ -5290,6 +5352,9 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
             surface = _build_full_prefix_strategy_surface(frame=frame, strategy=strategy,
                 fitted=refreshed, symbol=cell_plan.symbol, timeframe=cell_plan.timeframe)
             _signal_design_frame(surface.features, cap)
+            episodes = (signal_opportunities.independent_entry_episodes(surface.features,
+                symbol=cell_plan.symbol, timeframe=cell_plan.timeframe, cutoff_utc=cap)
+                if independent else None)
             totals["evaluated_attempt_count"] += 1
             config_sha = _sha256({"effective_config_sha256": binding["effective_config_sha256"],
                 "trial_definition_sha256": attempt.artifacts.trial_definition_sha256,
@@ -5333,11 +5398,15 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                             "source_observation_receipt_sha256": observation_sha}
                         provenance = signal_opportunities.OpportunityProvenance(strategy.name,
                             config_sha, surface_sha, tier, _sha256(numerical), _sha256(admission_binding))
-                        batch = signal_opportunities.label_signal_opportunities(features, signals,
+                        evaluate = (signal_opportunities.evaluate_independent_signal_r
+                            if independent else signal_opportunities.label_signal_opportunities)
+                        batch = evaluate(features, signals,
                             strategy=strategy, spec=refreshed.instrument_spec, symbol=cell_plan.symbol,
                             timeframe=cell_plan.timeframe, cutoff_utc=cutoff, signal_start_utc=start,
                             entry_half_spreads=entry, exit_half_spreads=exits,
-                            entry_admission=states, provenance=provenance)
+                            entry_admission=states, provenance=provenance,
+                            **({"pricing": pricing, "episode_ids": episodes.loc[features.index]}
+                               if independent else {}))
                         summary = {"record_type": "BATCH", "attempt_ordinal": attempt.ordinal,
                             "fold_ordinal": fold_ordinal, "partition": partition.role, "tier": tier,
                             "partition_geometry": dict(partition.geometry_receipt),
@@ -5351,13 +5420,17 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                             "unavailable_regime_count": batch.unavailable_regime_count,
                             "descriptive_groups": _signal_design_groups(batch.records),
                             "qualification_authority": False}
+                        if independent:
+                            summary.update(method_edition=batch.method_edition, cost_model=batch.cost_model,
+                                episode_diagnostics=batch.episode_diagnostics)
                         totals["batch_count"] += 1
                         totals["opportunity_count"] += len(batch.records)
                         totals["unavailable_regime_count"] += batch.unavailable_regime_count
                         yield line(summary)
                         for record in batch.records:
                             totals[{"CLOSED": "closed_count", "RIGHT_CENSORED": "right_censored_count",
-                                "NO_NEXT_OBSERVATION": "no_next_observation_count"}[record.status]] += 1
+                                "NO_NEXT_OBSERVATION": "no_next_observation_count",
+                                "NOT_ELIGIBLE": "not_eligible_count"}[record.status]] += 1
                             yield line({"record_type": "OPPORTUNITY", "attempt_ordinal": attempt.ordinal,
                                 "fold_ordinal": fold_ordinal, "partition": partition.role, "tier": tier,
                                 "label": asdict(record)})
@@ -5374,7 +5447,7 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
             _fail("SIGNAL_DESIGN_SOURCE_CHANGED")
         native_prefix.reverify_activated_native_prefix_product(refreshed.product,
             sink.context, require_current_activation=True)
-        yield line({"record_type": "COMPLETE", "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA,
+        yield line({"record_type": "COMPLETE", "schema_version": tape_schema,
             "request_sha256": request.receipt_sha256, **totals,
             "validation_evidence": False, "qualification_authority": False,
             "current_or_trading_authority": False})
@@ -5386,9 +5459,9 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                 yield encoded[offset:offset + width]
 
     entry = sink.put_opaque("signal-design-tape/" + request.receipt_sha256,
-        "signal_opportunity_train_design_tape", bounded_chunks(), format=SIGNAL_DESIGN_TAPE_FORMAT)
+        "signal_opportunity_train_design_tape", bounded_chunks(), format=tape_format)
     return SignalOpportunityDesignExecution(_canonical_bytes({
-        "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA, "status": "DESCRIPTIVE_COMPLETE",
+        "schema_version": tape_schema, "status": "DESCRIPTIVE_COMPLETE",
         "authority_scope": "TRAIN_DESIGN_LABELS_ONLY", "request_sha256": request.receipt_sha256,
         "artifact_entry": entry, **totals, "validation_evidence": False,
         "qualification_authority": False, "current_or_trading_authority": False,
@@ -6010,12 +6083,14 @@ def execute_historical_observed_cell(
                     _entry_admission_preparation=entry_admission_preparation)
             if prepared_full_panel is not None:
                 declared_records, evidence_completed = _continue_declared_attempt_units(
-                    capture.context, request_body, declared_binding_sha256, declared_units, produce_unit)
+                    capture.context, request_body, declared_binding_sha256, declared_units, produce_unit,
+                    progress=getattr(capture, '_progress_observer', None))
             else:
                 with pm_core._EntryAdmissionPreparation(
                         refreshed._entry_spread_observations) as entry_admission_preparation:
                     declared_records, evidence_completed = _continue_declared_attempt_units(
-                        capture.context, request_body, declared_binding_sha256, declared_units, produce_unit)
+                        capture.context, request_body, declared_binding_sha256, declared_units, produce_unit,
+                    progress=getattr(capture, '_progress_observer', None))
         else:
             reservation_scope = authority_spool.reserve_transient_publication(
                 capture.context
@@ -7175,6 +7250,41 @@ def _route_a_evaluate_prepared_request(*, prepare_probe, verify_probe, require_c
     return realized
 
 
+def _route_a_plain_strategy_state(strategy):
+    """Copy replayable library state; other strategies keep their original compute path."""
+    cls = type(strategy)
+    hooks = ("__copy__", "__deepcopy__", "__getstate__", "__setstate__",
+        "__reduce__", "__reduce_ex__", "__getattribute__", "__setattr__")
+    if cls.__module__ != StrategyRegistry.__module__ or any(
+            base.__dict__.get("__slots__") or any(name in base.__dict__ for name in hooks)
+            for base in cls.__mro__ if base is not object):
+        return None
+
+    def plain(value):
+        if type(value) in (str, int, bool, type(None)):
+            return True
+        if type(value) is float:
+            return math.isfinite(value)
+        if type(value) in (list, tuple):
+            return all(plain(item) for item in value)
+        if type(value) is dict:
+            return all(type(key) is str and plain(item) for key, item in value.items())
+        return False
+
+    try:
+        state = vars(strategy)
+        return copy.deepcopy(state) if type(state) is dict and plain(state) else None
+    except (TypeError, RecursionError):
+        return None
+
+
+def _route_a_strategy_surface_key(strategy, *, strategy_id, parameters, recipe):
+    if (StrategyRegistry._strategies.get(strategy_id) is not type(strategy)
+            or type(recipe) is not str):
+        return None
+    return type(strategy), strategy_id, _canonical_bytes(parameters), recipe
+
+
 def _route_a_pair_check(*, signals_by_tier, results_by_tier, spec, use_spread, frozen_pair):
     missing = sorted({"P75", "P95"} - set(results_by_tier))
     if missing:
@@ -7822,10 +7932,12 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
         owner_snapshot_bytes = owner_snapshot = None
         owner_partition_templates = {}
         owner_current_attempt_ordinal = None
+        owner_strategy_surface = None
 
         def close_route_a_scope():
-            nonlocal owner_snapshot_bytes, owner_snapshot, owner_current_attempt_ordinal
+            nonlocal owner_snapshot_bytes, owner_snapshot, owner_current_attempt_ordinal, owner_strategy_surface
             owner_snapshot_bytes = owner_snapshot = owner_current_attempt_ordinal = None
+            owner_strategy_surface = None
             owner_partition_templates.clear()
             if private_partition_rows is not None:
                 private_partition_rows.clear()
@@ -7986,6 +8098,7 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
             return described
 
         def evaluate_route_a_batch(*, specifications, metadata_recipe=_ROUTE_A_UNIT_BATCH_RECIPE):
+            nonlocal owner_strategy_surface
             try:
                 lifecycle.enter()
                 request_guard()
@@ -8034,6 +8147,7 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
                         stable_source = _source_identity(working_fitted.source_contract_seeds[tier])
                         prepared = {}
                         working_content = None
+                        replay_candidate = None
 
                         def require_working_current():
                             nonlocal working_content
@@ -8090,8 +8204,26 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
                             prepared["described"] = describe_request(specification, parameters, evaluation_binding)
 
                         def run_strategy(strategy, probe):
-                            surface = _build_full_prefix_strategy_surface(frame=working_fitted._frame,
-                                strategy=strategy, fitted=working_fitted, symbol=symbol, timeframe=timeframe)
+                            nonlocal replay_candidate
+                            strategy_id = selected_attempt.artifacts.winner_process["strategy_id"]
+                            recipe = getattr(selected_attempt.artifacts, "refit_recipe_sha256", None)
+                            key = (_route_a_strategy_surface_key(strategy, strategy_id=strategy_id,
+                                parameters=parameters, recipe=recipe)
+                                if type(route_a_consumer) is _FullPanelOwnerPreparation else None)
+                            state = _route_a_plain_strategy_state(strategy) if key is not None else None
+                            cached = owner_strategy_surface
+                            if (state is not None and cached is not None
+                                    and cached["key"] == key and cached["before"] == state):
+                                strategy.__dict__.clear()
+                                strategy.__dict__.update(copy.deepcopy(cached["after"]))
+                                surface = cached["surface"]
+                            else:
+                                surface = _build_full_prefix_strategy_surface(frame=working_fitted._frame,
+                                    strategy=strategy, fitted=working_fitted, symbol=symbol, timeframe=timeframe)
+                                after = _route_a_plain_strategy_state(strategy) if state is not None else None
+                                if after is not None:
+                                    replay_candidate = {"key": key, "before": state,
+                                        "after": after, "surface": surface}
                             decision = {}
                             matched_facts = {} if type(route_a_consumer) is _FullPanelOwnerPreparation and tier == "P75" else None
                             backtester = Backtester(working_config)
@@ -8127,6 +8259,8 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
                             verify_probe=verify_probe, require_current=require_working_current,
                             make_strategy=lambda: _runtime_strategy(selected_attempt, timeframe=timeframe)[0],
                             run_strategy=run_strategy, verify_realized=verify_realized)
+                        if replay_candidate is not None:
+                            owner_strategy_surface = replay_candidate
                         described = prepared["described"]
                         index = len(unique_entries)
                         diagnostic = {"schema_version": "fxpm.route-a-unit-request-diagnostic.v1",
@@ -8243,7 +8377,7 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
                 partition_cost_precommitments=private_precommitments)
 
         def prepare_full_panel_attempt(ordinal):
-            nonlocal owner_current_attempt_ordinal
+            nonlocal owner_current_attempt_ordinal, owner_strategy_surface
             request_guard()
             rows = _route_a_full_panel_specifications(snapshot=owner_snapshot,
                 contract=full_panel_contract, attempt_ordinal=ordinal)
@@ -8254,6 +8388,7 @@ def _run_route_a_owned_unit_continuation(*, config, handle, search_process, cell
                 private_pair_groups.clear()
                 private_pair_checks.clear()
                 private_codec_strings.clear()
+                owner_strategy_surface = None
                 owner_current_attempt_ordinal = ordinal
             mapping, pair_checks = evaluate_route_a_batch(specifications=rows)
             if len(mapping) != 24 or len(rows) != 24:
@@ -9353,6 +9488,16 @@ def _reopen_route_a_matched_source_material(context, *, request, process, frozen
     return frame, spec, tiers, config
 
 
+def _route_a_source_column_number(frame, columns, name, bar):
+    if not isinstance(bar, (int, np.integer)) or isinstance(bar, (bool, np.bool_)):
+        return float(frame.iloc[bar][name])
+    if name not in columns:
+        column = frame[name].to_numpy(copy=False).view()
+        column.setflags(write=False)
+        columns[name] = column
+    return float(columns[name][bar])
+
+
 def _verify_route_a_matched_fact_source(facts, geometry, *, source_frame, spec, tiers, config, timeframe,
         _prepared_source_cache=None):
     """Compare witness OHLC and complete half arrays to reopened source without a model run."""
@@ -9379,12 +9524,10 @@ def _verify_route_a_matched_fact_source(facts, geometry, *, source_frame, spec, 
             expected = {"entry_half_spread": _route_a_encode_spread_array(entry, "entry_half_spread"),
                 "intrabar_half_spread": _route_a_encode_spread_array(intrabar, "intrabar_half_spread")}
             expected_tiers.append((tier, _canonical_bytes(expected), _canonical_bytes(metadata)))
-        prepared = frame, tuple(expected_tiers)
+        prepared = frame, tuple(expected_tiers), {}, pricing, ({} if _prepared_source_cache is not None else None)
         if _prepared_source_cache is not None:
             _prepared_source_cache[key] = prepared
-    frame, expected_tiers = prepared
-    if pricing is None:
-        pricing = Backtester(config)
+    frame, expected_tiers, columns, pricing, swap_preparation = prepared
     for tier, expected, metadata in expected_tiers:
         if (expected != _canonical_bytes(facts["half_spread_arrays"][tier])
                 or metadata != _canonical_bytes(facts["spread_model_metadata"][tier])):
@@ -9401,7 +9544,7 @@ def _verify_route_a_matched_fact_source(facts, geometry, *, source_frame, spec, 
             continue
         entry_bar = inputs["entry_bar"]
         if (not 0 <= entry_bar < len(frame)
-                or inputs["entry_mid_open"] != float(frame.iloc[entry_bar]["Open"])
+                or inputs["entry_mid_open"] != _route_a_source_column_number(frame, columns, "Open", entry_bar)
                 or pd.Timestamp(inputs["entry_time_utc"]) != frame.index[entry_bar]):
             _fail("MATCHED_FLOOR_ENTRY_SOURCE_CHANGED")
         if "session_execution" in facts and (entry_bar < 1
@@ -9411,9 +9554,10 @@ def _verify_route_a_matched_fact_source(facts, geometry, *, source_frame, spec, 
             bar = held["bar"]
             if (not 0 <= bar < len(frame)
                     or pd.Timestamp(held["open_utc"]) != frame.index[bar]
-                    or held["ohlc"] != {name: float(frame.iloc[bar][name]) for name in ("Open", "High", "Low", "Close")}):
+                    or held["ohlc"] != {name: _route_a_source_column_number(frame, columns, name, bar) for name in ("Open", "High", "Low", "Close")}):
                 _fail("MATCHED_FLOOR_HELD_BAR_SOURCE_CHANGED")
-    _verify_route_a_exact_swap_source(facts, frame, spec=spec, pricing=pricing, timeframe=timeframe)
+    _verify_route_a_exact_swap_source(facts, frame, spec=spec, pricing=pricing, timeframe=timeframe,
+        _static_preparation=swap_preparation)
     return True
 
 
@@ -9494,7 +9638,7 @@ def _route_a_exact_base_return_components(row, *, spec, ordinal, swap_model_enab
         "canonical_net_r": pm_core.canonical_backtest_winner_r(price_r + swap_r, 1.0)}
 
 
-def _verify_route_a_exact_swap_source(facts, frame, *, spec, pricing, timeframe):
+def _verify_route_a_exact_swap_source(facts, frame, *, spec, pricing, timeframe, _static_preparation=None):
     """Rebuild captured swap inputs from reopened source; no strategy or execution replay."""
     enabled = bool(getattr(pricing.config, "swap_model_enabled", True))
     if facts.get("exact_swap_model_enabled") is not enabled:
@@ -9507,7 +9651,8 @@ def _verify_route_a_exact_swap_source(facts, frame, *, spec, pricing, timeframe)
             _fail("MATCHED_FLOOR_SWAP_ENTRY_SOURCE_CHANGED")
         entries[bar] = exact["entry_price"]
     pre_open, close, longs, shorts, causal, contract = pricing._build_causal_swap_inputs(
-        frame, spec, entries, timeframe=timeframe)
+        frame, spec, entries, timeframe=timeframe,
+        **({"_static_preparation": _static_preparation} if _static_preparation is not None else {}))
     if _canonical_bytes(contract) != _canonical_bytes(facts.get("exact_swap_accrual_contract")):
         _fail("MATCHED_FLOOR_SWAP_CONTRACT_SOURCE_CHANGED")
     for ordinal, row in enumerate(facts["trades"]):

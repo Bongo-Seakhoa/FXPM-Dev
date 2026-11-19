@@ -925,11 +925,17 @@ def test_current_raw_cross_binding_rejects_before_evidence(current_native_case, 
     ("matched_close", "SOURCE_OBSERVATION_VALUES_CHANGED"),
     ("carrier", "SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID"),
 ])
-def test_current_source_receipt_is_rebuilt_from_original_native_rows(current_native_case, tmp_path, mutation, expected):
-    case = clone_current_native_case(current_native_case, tmp_path)
-    fold = _first_fold(case)
-    replay = fold["provenance"]["attempt_replay_receipt"]
-    observation = replay["source_observation_receipts"]["optimizer_train"]
+def test_current_source_receipt_is_rebuilt_from_original_native_rows(monkeypatch, mutation, expected):
+    """Invented verified-native boundary; actual row reconstruction, no universe audit."""
+    from tests.test_raw_source_observation_inputs import _receipt_validation_case
+
+    case = _receipt_validation_case()
+    acquired = []
+    def original_native_rows(*_args, **_kwargs):
+        acquired.append(True)
+        return case["product"], case["fine"]
+    monkeypatch.setattr(raw, "_open_source_observation_native", original_native_rows)
+    observation = copy.deepcopy(case["receipt"])
     if mutation == "points":
         point = observation["observations"][0]["points"]
         observation["observations"][0]["points"] = 1 if point is None else point + 1
@@ -939,11 +945,12 @@ def test_current_source_receipt_is_rebuilt_from_original_native_rows(current_nat
     else:
         observation["source_product"]["timeframe"] = "INVALID"
     observation = _reseal(observation)
-    # Even a self-consistent receipt hash cannot replace original native rows.
+    # A self-consistent receipt still has to match the original verified frame.
     with pytest.raises(raw.WinnerRawEvidenceError, match=expected):
         raw._validated_source_observation_receipt(observation, sink=case["sink"], frozen=case["frozen"],
             expected_sha256=observation["receipt_sha256"], partition="optimizer_train",
-            signals=replay["signal_vector_receipts"]["optimizer_train"], lanes=fold["lanes"])
+            signals=case["signals"], lanes=case["lanes"])
+    assert len(acquired) == (0 if mutation == "carrier" else 1)
 
 
 @pytest.mark.parametrize("mutation,expected", [
@@ -1391,7 +1398,8 @@ def _tiny_matched_cold_read_case(tmp_path, monkeypatch):
     context, sink = carrier["context"], carrier["sink"]
     attempt = {"ordinal": 0, "attempt_id": "INVENTED-RAW", "process_candidate_id": "INVENTED-CANDIDATE",
                "precommitted_evidence_role": "INVENTED_SOFTWARE_TRANSPORT"}
-    precommitment = {"causal_fold_plan": [{"fixture_provenance": "INVENTED_ONE_PERIOD"}]}
+    precommitment = {"contract_version": winner.V17_GENERATION.precommitment_version,
+        "causal_fold_plan": [{"fixture_provenance": "INVENTED_ONE_PERIOD"}]}
     frozen = SimpleNamespace(selection_generation=winner.V17_GENERATION,
         artifact_namespace="invented-cold-transport", timeframe="H1", regime="TREND",
         precommitment=precommitment, attempt_ledger={"attempts": [attempt]},
@@ -1471,7 +1479,7 @@ def _tiny_matched_cold_read_case(tmp_path, monkeypatch):
     monkeypatch.setattr(execution, "_read_declared_completed_unit", lambda *args: ({}, copy.deepcopy(raw_body)))
     monkeypatch.setattr(execution, "_verify_route_a_matched_fact_source", lambda *args, **kwargs: True)
     monkeypatch.setattr(raw, "_validated_partition_cost_precommitments", lambda *args, **kwargs: {})
-    monkeypatch.setattr(raw, "_index_partition_cost_precommitments", lambda *args: None)
+    monkeypatch.setattr(raw, "_index_partition_cost_precommitments", lambda *args, **kwargs: None)
     monkeypatch.setattr(raw, "_matched_floor_attempt_record", semantic_record)
 
     def run():

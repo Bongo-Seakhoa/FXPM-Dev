@@ -11,6 +11,7 @@ prepared, immutable surface; typed digests alone do not authenticate its data.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import copy
 import hashlib
 import json
 import math
@@ -19,8 +20,12 @@ from typing import Any, Literal, Sequence
 import numpy as np
 import pandas as pd
 
+from pm_core import _protective_session_exit, _prepare_session_execution, EXIT_NONE, EXIT_SL, EXIT_TP, EXIT_SESSION
+
 
 SCHEMA_VERSION = "fxpm.signal-opportunity-labels.v1"
+INDEPENDENT_R_SCHEMA = "fxpm.signal-opportunity-labels.v2"
+INDEPENDENT_R_METHOD = "fxpm.independent-signal-modeled-r.v1"
 CORE_PRICING_REFERENCE_SHA256 = "e52c24e09d8b9de6da041a3bda817e0a5b1abddeb03ae9a20019a7cf0801331a"
 _REGIMES = frozenset({"TREND", "RANGE", "CHOP", "BREAKOUT"})
 _ADMISSION = frozenset({"ADMIT", "REFUSE", "MISSING", "UNAVAILABLE"})
@@ -88,6 +93,54 @@ class OpportunityBatch:
     swap_status: str = field(default="UNAVAILABLE_PRICE_UNIT_CONVERSION", init=False)
     complete_cost_net_profit_available: bool = field(default=False, init=False)
     qualification_authority: bool = field(default=False, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class IndependentSignalTrade(SignalOpportunity):
+    stop_loss_pips: float | None
+    take_profit_pips: float | None
+    eligible: bool = False
+    eligibility_reason: str | None = None
+    signal_regime: str | None = None
+    episode_id: str | None = None
+    initial_risk_per_unit: float | None = None
+    price_pnl_per_unit: float | None = None
+    spread_cost_per_unit: float | None = None
+    swap_per_unit: float | None = None
+    price_r: float | None = None
+    spread_r: float | None = None
+    swap_r: float | None = None
+    modeled_net_r: float | None = None
+    cost_status: str = "NOT_ENTERED"
+
+
+@dataclass(frozen=True, slots=True)
+class IndependentOpportunityBatch(OpportunityBatch):
+    schema_version: str = field(default=INDEPENDENT_R_SCHEMA, init=False)
+    swap_status: str = field(default="PER_TRADE_MODELED", init=False)
+    method_edition: str = field(default=INDEPENDENT_R_METHOD, init=False)
+    cost_model: dict = field(default_factory=dict)
+    episode_diagnostics: dict = field(default_factory=dict)
+
+
+def independent_episode_diagnostics(records):
+    episodes = {}
+    for record in records:
+        value = record if isinstance(record, dict) else {
+            name: getattr(record, name) for name in ("eligible", "episode_id", "entry_regime", "status", "modeled_net_r")}
+        if value["eligible"] and value["episode_id"] is not None:
+            episodes.setdefault((value["entry_regime"], value["episode_id"]), []).append(value)
+    result = {}
+    for regime in sorted(_REGIMES):
+        selected = [rows for (label, _), rows in episodes.items() if label == regime]
+        resolved = [rows for rows in selected if all(row["status"] == "CLOSED"
+            and row["modeled_net_r"] is not None for row in rows)]
+        profitable = sum(math.fsum(row["modeled_net_r"] for row in rows) > 0 for rows in resolved)
+        result[regime] = {"traded_episode_count": len(selected), "resolved_episode_count": len(resolved),
+            "profitable_episode_count": profitable,
+            "profitable_episode_share": profitable / len(resolved) if resolved else None,
+            "unresolved_episode_count": len(selected) - len(resolved)}
+    return result
 
 
 def _utc(value: Any, name: str) -> pd.Timestamp:
@@ -166,6 +219,109 @@ def _stops(strategy: Any, features: pd.DataFrame, bar: int, direction: int,
     return stop, target
 
 
+def independent_entry_episodes(features, *, symbol, timeframe, cutoff_utc):
+    """Name known live-label runs on the full causal prefix before partition slicing."""
+    if "REGIME" not in features:
+        raise OpportunityLabelError("CONFIRMED_REGIME_REQUIRED")
+    opens = _axis(features.index, "OPEN_AXIS_INVALID")
+    closes = _axis(features["_BAR_CLOSE_TS"], "CLOSE_AXIS_INVALID")
+    cap = _utc(cutoff_utc, "CUTOFF_UTC_INVALID")
+    visible = int(closes.searchsorted(cap, side="right"))
+    observed = int(opens.searchsorted(cap, side="left"))
+    values = [None] * len(features)
+    previous, identifier = None, None
+    for entry in range(1, min(observed, visible + 1)):
+        label = features["REGIME"].iat[entry - 1]
+        label = label if isinstance(label, str) and label in _REGIMES else None
+        if label is None:
+            previous, identifier = None, None
+        elif label != previous:
+            identifier = "/".join((symbol, timeframe, label, _text(opens[entry])))
+            previous = label
+        values[entry] = identifier
+    return pd.Series(values, index=features.index, dtype=object, name="entry_episode_id")
+
+
+def _independent_inputs(features, *, strategy, spec, symbol, timeframe, opens, closes,
+        visible, observed, selected, signals, open_values, entry_spreads, admission,
+        cutoff, pricing, episode_ids):
+    if "REGIME" not in features:
+        raise OpportunityLabelError("CONFIRMED_REGIME_REQUIRED")
+    if episode_ids is None:
+        episode_ids = independent_entry_episodes(features, symbol=symbol,
+            timeframe=timeframe, cutoff_utc=cutoff)
+    if not isinstance(episode_ids, pd.Series) or not episode_ids.index.equals(features.index):
+        raise OpportunityLabelError("EPISODE_AXIS_INVALID")
+    session = _prepare_session_execution(opens[:observed], [strategy], symbol)
+    allowed = np.ones(observed, dtype=bool) if session is None else session["entry_mask"]
+    session_exit = np.full(observed, -1, dtype=np.int64)
+    if session is not None:
+        code = int(session["owner_codes"][0])
+        if code >= 0:
+            inside, keys = session["inside"][code], session["keys"][code]
+            following = observed
+            for bar in range(observed - 1, -1, -1):
+                if bar + 1 < observed and (not inside[bar + 1] or keys[bar + 1] != keys[bar]):
+                    following = bar + 1
+                session_exit[bar] = following if following < observed else -1
+    entry_prices = np.full(observed, np.nan, dtype=np.float64)
+    for bar in selected:
+        entry = bar + 1
+        state = admission.iloc[entry] if isinstance(admission, pd.Series) and entry < observed else (
+            admission[entry] if entry < observed else None)
+        if entry < observed and state == "ADMIT" and allowed[entry]:
+            entry_prices[entry] = open_values[entry] + int(signals[bar]) * entry_spreads[entry]
+    # Carry preparation uses recorded time axes, not unfinished OHLC observations.
+    carry_frame = features.iloc[:observed].loc[:, ["_BAR_CLOSE_TS"]].copy(deep=False)
+    carry_frame.attrs = copy.deepcopy(features.attrs)
+    if np.isfinite(entry_prices).any():
+        pre, close, long_rate, short_rate, enabled, contract = pricing._build_causal_swap_inputs(
+            carry_frame, spec, entry_prices, timeframe=timeframe)
+    else:
+        pre = close = np.zeros(observed, dtype=np.int32)
+        long_rate = short_rate = np.zeros(observed, dtype=np.float64)
+        enabled, contract = False, {"status": "NOT_REQUIRED_NO_ELIGIBLE_ENTRY"}
+    modeled = bool(enabled) or contract.get("status") == "DISABLED"
+    return {"allowed": allowed, "session_exit": session_exit, "episodes": episode_ids,
+        "pre": np.concatenate(([0], np.cumsum(pre, dtype=np.int64))),
+        "close": np.concatenate(([0], np.cumsum(close, dtype=np.int64))),
+        "long": long_rate, "short": short_rate, "swap_modeled": modeled,
+        "cost_model": {"declared_model": "SPREAD_PLUS_SWAP", "commission": "NOT_MODELED", "account_compounding": False,
+            "swap_contract": copy.deepcopy(contract)}}
+
+
+def _independent_trade(common, *, spec, direction, context, opened=None, exited=None,
+        mid_entry=None, mid_exit=None):
+    values = dict(common)
+    if opened is None:
+        return IndependentSignalTrade(**values)
+    risk = abs(float(spec.calculate_tick_profit(opened, values["stop_loss_price"], 1.0, direction)))
+    if not math.isfinite(risk) or risk <= 0:
+        raise OpportunityLabelError("INITIAL_RISK_INVALID")
+    values["initial_risk_per_unit"] = risk
+    values["cost_status"] = "UNRESOLVED"
+    if exited is not None:
+        price = float(spec.calculate_tick_profit(opened, exited, 1.0, direction))
+        mid = float(spec.calculate_tick_profit(mid_entry, mid_exit, 1.0, direction))
+        values.update(price_pnl_per_unit=price, spread_cost_per_unit=mid - price,
+            price_r=price / risk, spread_r=-(mid - price) / risk, cost_status="UNAVAILABLE_SWAP")
+        if context["swap_modeled"]:
+            entry, end = values["entry_bar"], values["exit_bar"]
+            units = ((context["pre"][end + 1] - context["pre"][entry + 1])
+                + (context["close"][end] - context["close"][entry]))
+            rate = context["long"][entry] if direction == 1 else context["short"][entry]
+            swap = float(rate) * int(units)
+            values.update(swap_per_unit=swap, swap_r=swap / risk,
+                modeled_net_r=(price + swap) / risk, cost_status="MODELED_AVAILABLE")
+    return IndependentSignalTrade(**values)
+
+
+def evaluate_independent_signal_r(features, raw_signals, *, pricing, episode_ids=None, **kwargs):
+    """Evaluate each eligible signal under the declared spread+swap model, without an account."""
+    return label_signal_opportunities(features, raw_signals,
+        _independent={"pricing": pricing, "episode_ids": episode_ids}, **kwargs)
+
+
 class _FirstTouchIndex:
     """Linear storage/build; earliest suffix touch in O(log n) per label."""
 
@@ -200,12 +356,11 @@ class _FirstTouchIndex:
 
 def _fixed_exit(direction: int, opened: float, low: float, high: float,
                 stop: float, target: float) -> tuple[float, str, str]:
-    if (direction == 1 and opened <= stop) or (direction == -1 and opened >= stop):
-        return opened, "SL", "GAP_OPEN"
-    if (direction == 1 and low <= stop) or (direction == -1 and high >= stop):
-        return stop, "SL", "STOP_LEVEL"
-    if (direction == 1 and high >= target) or (direction == -1 and low <= target):
-        return target, "TP", "TARGET_LEVEL"
+    price, reason, at_open = _protective_session_exit(direction, opened, low, high, stop, target)
+    if reason == EXIT_SL:
+        return float(price), "SL", "GAP_OPEN" if at_open else "STOP_LEVEL"
+    if reason == EXIT_TP:
+        return float(price), "TP", "TARGET_LEVEL"
     raise OpportunityLabelError("TOUCH_INDEX_INCONSISTENT")
 
 
@@ -216,6 +371,7 @@ def label_signal_opportunities(
     exit_half_spreads: Sequence[float] | pd.Series,
     entry_admission: Sequence[str] | pd.Series,
     provenance: OpportunityProvenance, signal_start_utc: Any | None = None,
+    _independent=None,
 ) -> OpportunityBatch:
     """Label each nonzero closed-bar emission without an account or occupancy.
 
@@ -279,22 +435,34 @@ def label_signal_opportunities(
         raise OpportunityLabelError("ADMISSION_STATE_INVALID")
     emissions = np.flatnonzero(signals != 0)
     selected = [int(bar) for bar in emissions if start is None or closes[int(bar)] >= start]
+    independent = None if _independent is None else _independent_inputs(features,
+        strategy=strategy, spec=spec, symbol=symbol, timeframe=timeframe, opens=opens, closes=closes,
+        visible=visible, observed=observed_opens, selected=selected, signals=signals,
+        open_values=open_values, entry_spreads=entry_spreads, admission=admission, cutoff=cutoff,
+        pricing=_independent["pricing"], episode_ids=_independent["episode_ids"])
     prepared = features.iloc[:visible]
     # A caller's copied frame may carry a length-keyed scratch cache from a
     # different surface. Give the public API one fresh local scratch namespace;
     # share the same view for all indices without copying a frame per label.
-    prepared.attrs = {}
+    prepared.attrs = {} if independent is None else {key: copy.deepcopy(value)
+        for key, value in features.attrs.items() if key != "_fxpm_structural_sl_cache"}
     indexes: dict[int, _FirstTouchIndex] = {}
     rows = []
     unknown_regimes = 0
     for bar in selected:
         direction = int(signals[bar])
-        raw_regime = features["REGIME_LIVE"].iat[bar]
+        entry = bar + 1
+        signal_regime = features["REGIME_LIVE"].iat[bar]
+        raw_regime = signal_regime if independent is None else features["REGIME"].iat[bar]
         raw_regime = raw_regime if isinstance(raw_regime, str) else None
         regime = raw_regime if raw_regime in _REGIMES else None
         unknown_regimes += int(regime is None)
-        stop_pips, target_pips = _stops(strategy, prepared, bar, direction, symbol, timeframe, regime, spec)
-        identity = (SCHEMA_VERSION, provenance.strategy_id, provenance.configuration_sha256,
+        state = (admission.iloc[entry] if isinstance(admission, pd.Series) else admission[entry]) if entry < observed_opens else None
+        eligible = entry < observed_opens and state == "ADMIT" and (independent is None or independent["allowed"][entry])
+        stop_pips, target_pips = (_stops(strategy, prepared, bar, direction, symbol, timeframe, regime, spec)
+            if independent is None or eligible else (None, None))
+        identity = (SCHEMA_VERSION if independent is None else INDEPENDENT_R_SCHEMA,
+                    provenance.strategy_id, provenance.configuration_sha256,
                     provenance.source_surface_sha256, provenance.spread_tier,
                     provenance.spread_model_sha256, provenance.admission_policy_sha256,
                     symbol, timeframe, "pip_size_binary64", pip_size.hex(),
@@ -305,9 +473,18 @@ def label_signal_opportunities(
             run_start=bool(bar == 0 or signals[bar - 1] != direction),
             entry_regime=regime, regime_status="AVAILABLE" if regime else "UNAVAILABLE",
             raw_regime=raw_regime, stop_loss_pips=stop_pips, take_profit_pips=target_pips)
-        entry = bar + 1
+        if independent is not None:
+            common.update(eligible=bool(eligible), signal_regime=signal_regime if isinstance(signal_regime, str) else None,
+                episode_id=independent["episodes"].iat[entry] if eligible else None,
+                eligibility_reason=None if eligible else ("NO_NEXT_OBSERVATION" if entry >= observed_opens
+                    else "ENTRY_ADMISSION_" + state if state != "ADMIT" else "STRATEGY_SESSION_REFUSED"))
         if entry >= observed_opens:
-            rows.append(SignalOpportunity(**common, status="NO_NEXT_OBSERVATION"))
+            rows.append((SignalOpportunity if independent is None else IndependentSignalTrade)(
+                **common, status="NO_NEXT_OBSERVATION"))
+            continue
+        if independent is not None and not eligible:
+            rows.append(IndependentSignalTrade(**common, status="NOT_ELIGIBLE",
+                entry_bar=entry, entry_open_utc=_text(opens[entry]), entry_admission=state))
             continue
         entry_price = float(open_values[entry] + direction * entry_spreads[entry])
         stop = entry_price - direction * stop_pips * pip_size
@@ -321,19 +498,44 @@ def label_signal_opportunities(
             indexes[direction] = _FirstTouchIndex(low - direction * exit_spreads, high - direction * exit_spreads)
         touched = indexes[direction].first(entry, stop if direction == 1 else target,
                                           target if direction == 1 else stop)
+        session_exit = int(independent["session_exit"][entry]) if independent is not None else -1
+        session_first = 0 <= session_exit < visible and (touched is None or session_exit <= touched)
+        if session_first:
+            touched = session_exit
         if touched is None:
-            rows.append(SignalOpportunity(**common, status="RIGHT_CENSORED"))
+            if independent is None:
+                rows.append(SignalOpportunity(**common, status="RIGHT_CENSORED"))
+            else:
+                rows.append(_independent_trade({**common, "status": "RIGHT_CENSORED"}, spec=spec,
+                    direction=direction, context=independent, opened=entry_price))
             continue
         quote_spread = direction * exit_spreads[touched]
-        exit_price, reason, fill = _fixed_exit(direction, float(open_values[touched] - quote_spread),
-            float(low[touched] - quote_spread), float(high[touched] - quote_spread), stop, target)
+        if session_first:
+            # An observed session exit open needs no unfinished bar range.
+            quoted_open = float(open_values[touched] - quote_spread)
+            exit_price, code, _ = _protective_session_exit(direction, quoted_open, 0.0, 0.0,
+                stop, target, True)
+            assert code == EXIT_SESSION
+            reason, fill = "SESSION", "SESSION_OPEN"
+        else:
+            exit_price, reason, fill = _fixed_exit(direction, float(open_values[touched] - quote_spread),
+                float(low[touched] - quote_spread), float(high[touched] - quote_spread), stop, target)
         delta = direction * (exit_price - entry_price)
-        rows.append(SignalOpportunity(**common, status="CLOSED", exit_bar=touched,
-            exit_bar_open_utc=_text(opens[touched]), exit_observed_at_utc=_text(closes[touched]),
+        closed = dict(**common, status="CLOSED", exit_bar=touched,
+            exit_bar_open_utc=_text(opens[touched]), exit_observed_at_utc=_text(opens[touched] if session_first else closes[touched]),
             exit_price=float(exit_price), exit_reason=reason, exit_fill=fill,
-            signed_price_delta=float(delta), signed_pips=float(delta / pip_size)))
-    return OpportunityBatch(provenance=provenance, symbol=symbol, timeframe=timeframe,
+            signed_price_delta=float(delta), signed_pips=float(delta / pip_size))
+        if independent is None:
+            rows.append(SignalOpportunity(**closed))
+        else:
+            mid_exit = float(open_values[touched]) if session_first or fill == "GAP_OPEN" else exit_price + quote_spread
+            rows.append(_independent_trade(closed, spec=spec, direction=direction, context=independent,
+                opened=entry_price, exited=exit_price, mid_entry=float(open_values[entry]), mid_exit=mid_exit))
+    batch = OpportunityBatch if independent is None else IndependentOpportunityBatch
+    extra = {} if independent is None else {"cost_model": independent["cost_model"],
+        "episode_diagnostics": independent_episode_diagnostics(rows)}
+    return batch(provenance=provenance, symbol=symbol, timeframe=timeframe,
         pip_size=pip_size, cutoff_utc=_text(cutoff),
         signal_start_utc=None if start is None else _text(start),
         raw_nonzero_count=len(emissions), excluded_before_start_count=len(emissions) - len(selected),
-        window_nonzero_count=len(selected), unavailable_regime_count=unknown_regimes, records=tuple(rows))
+        window_nonzero_count=len(selected), unavailable_regime_count=unknown_regimes, records=tuple(rows), **extra)

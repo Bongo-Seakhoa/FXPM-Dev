@@ -138,6 +138,10 @@ def test_structural_index_refuses_wrong_frozen_binding(change):
     with pytest.raises(raw.WinnerRawEvidenceError, match="PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID"):
         raw._selected_partition_cost_precommitments(frozen=supplied,
             attempt=case["attempts"][0], planned_fold=case["folds"][0], partition_cost_index=index)
+    for getter in (raw._owned_precommitment, raw._owned_pair_contract, raw._owned_generation,
+            raw._owned_precommitment_sha, raw._owned_partition_cost_receipt_sha):
+        with pytest.raises(raw.WinnerRawEvidenceError, match="PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID"):
+            getter(supplied, index)
 
 
 def test_structural_index_retains_duplicate_rows_and_missing_key_semantics():
@@ -226,7 +230,7 @@ def test_native_public_producer_one_validation_and_byte_identical_old_path(curre
     indexed = _produce_native(case)
     assert len(calls) == 1
     calls.clear()
-    monkeypatch.setattr(raw, "_index_partition_cost_precommitments", lambda *_args: None)
+    monkeypatch.setattr(raw, "_index_partition_cost_precommitments", lambda *_args, **_kwargs: None)
     old = _produce_native(other)
     folds = sum(len(attempt.get("folds", [])) for attempt in other["evidence"])
     assert len(calls) == 1 + folds
@@ -267,8 +271,8 @@ def test_native_producer_retains_partition_roster_refusal(current_native_case, t
     case = _native_case_copy(current_native_case, tmp_path / "duplicate")
     factory = raw._index_partition_cost_precommitments
 
-    def duplicate(frozen, validated):
-        index = factory(frozen, validated)
+    def duplicate(frozen, validated, **kwargs):
+        index = factory(frozen, validated, **kwargs)
         key = next(iter(index.rows_by_fold))
         index.rows_by_fold[key].append(copy.deepcopy(index.rows_by_fold[key][0]))
         return index
@@ -276,3 +280,77 @@ def test_native_producer_retains_partition_roster_refusal(current_native_case, t
     monkeypatch.setattr(raw, "_index_partition_cost_precommitments", duplicate)
     with pytest.raises(raw.WinnerRawEvidenceIncomplete, match="PARTITION_COST_PRECOMMITMENTS_ROSTER_INVALID"):
         _produce_native(case)
+
+
+def _owned_projection_case():
+    case, table, frozen = _structural_case()
+    precommitment = {"contract_version": raw.winner.V17_GENERATION.precommitment_version,
+        "causal_fold_plan": case["folds"], "cell_id": "SYNTHETIC-OWNED-VIEWS",
+        "source_contract_sha256": "1" * 64, "cost_contract_sha256": "2" * 64,
+        "risk_unit_contract_sha256": "3" * 64, "frozen_tier_pair_contract_sha256": "4" * 64}
+    return case, table, replace(frozen, precommitment_bytes=_canonical(precommitment))
+
+
+def _shared_source_fixture():
+    return {"execution_spec_receipt": {"receipt_sha256": "5" * 64},
+        **{name: "6" * 64 for name in ("native_prefix_index_sha256", "native_prefix_content_sha256",
+            "source_contract_sha256", "native_source_sha256", "activation_manifest_sha256",
+            "source_group_decision_sha256", "regime_fit_decision_sha256")}}
+
+
+def test_owned_projections_decode_once_across_repeated_fold_and_witness_reads(monkeypatch):
+    """Invented two-attempt owner; actual decoding/index expansion, no native or model run."""
+    from collections import Counter
+    case, table, frozen = _owned_projection_case()
+    source = _shared_source_fixture()
+    expected = {fold["fold_ordinal"]: raw._shared_oos_partition_receipt(
+        frozen=frozen, planned_fold=fold, source_receipt=source) for fold in case["folds"]}
+    original, decodes = raw._decode_object, Counter()
+    def decode(encoded, code):
+        decodes[code] += 1
+        return original(encoded, code)
+    monkeypatch.setattr(raw, "_decode_object", decode)
+    precommitment, pair = frozen.precommitment, frozen.frozen_tier_pair_contract
+    ledger, costs = frozen.attempt_ledger, frozen.partition_cost_precommitments
+    index = raw._index_partition_cost_precommitments(frozen, _validate(case, costs),
+        attempt_ledger=ledger, precommitment=precommitment, pair_contract=pair,
+        generation=raw.winner.V17_GENERATION, precommitment_sha256=raw._sha_json(precommitment))
+    for _ in range(3):
+        for attempt in case["attempts"]:
+            for fold in case["folds"]:
+                assert raw._owned_precommitment(frozen, index) is precommitment
+                assert raw._owned_pair_contract(frozen, index) is pair
+                assert raw._owned_generation(frozen, index) is raw.winner.V17_GENERATION
+                assert raw._owned_precommitment_sha(frozen, index) == raw._sha_json(precommitment)
+                assert raw._owned_partition_cost_receipt_sha(frozen, index) == table["receipt_sha256"]
+                assert table["receipt_sha256"] != raw._sha_json(table)
+                assert raw._selected_partition_cost_precommitments(frozen=frozen, attempt=attempt,
+                    planned_fold=fold, partition_cost_index=index) == _old_filter(table, pair, attempt, fold)
+                assert raw._shared_oos_partition_receipt(frozen=frozen, planned_fold=fold,
+                    source_receipt=source, partition_cost_index=index) == expected[fold["fold_ordinal"]]
+    assert {name: decodes[name] for name in ("PRECOMMITMENT_BYTES_INVALID",
+        "FROZEN_TIER_PAIR_CONTRACT_BYTES_INVALID", "ATTEMPT_LEDGER_BYTES_INVALID",
+        "PARTITION_COST_PRECOMMITMENTS_BYTES_INVALID")} == {
+            "PRECOMMITMENT_BYTES_INVALID": 1, "FROZEN_TIER_PAIR_CONTRACT_BYTES_INVALID": 1,
+            "ATTEMPT_LEDGER_BYTES_INVALID": 1, "PARTITION_COST_PRECOMMITMENTS_BYTES_INVALID": 1}
+
+
+def test_public_nested_projections_and_replace_stay_independent_of_owned_views():
+    case, table, frozen = _owned_projection_case()
+    precommitment, pair = frozen.precommitment, frozen.frozen_tier_pair_contract
+    index = raw._index_partition_cost_precommitments(frozen, _validate(case, table),
+        precommitment=precommitment, pair_contract=pair)
+    projection, costs, pair_projection = frozen.precommitment, frozen.partition_cost_precommitments, frozen.frozen_tier_pair_contract
+    assert type(projection) is dict and type(projection["causal_fold_plan"]) is list
+    assert type(costs) is dict and type(costs["rows"]) is list
+    projection["causal_fold_plan"][0]["fold_ordinal"] = 99
+    costs["rows"].clear()
+    pair_projection["tiers"][0]["tier"] = "SYNTHETIC_SPLICE"
+    assert raw._owned_precommitment(frozen, index)["causal_fold_plan"][0]["fold_ordinal"] == 0
+    assert index.precommitments["rows"] and frozen.partition_cost_precommitments["rows"]
+    assert raw._owned_pair_contract(frozen, index)["tiers"][0]["tier"] == "P75"
+    assert frozen.precommitment["causal_fold_plan"][0]["fold_ordinal"] == 0
+    changed = replace(frozen, precommitment_bytes=_canonical(projection))
+    assert raw._owned_precommitment(changed, None) == projection
+    with pytest.raises(raw.WinnerRawEvidenceError, match="PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID"):
+        raw._owned_precommitment(changed, index)

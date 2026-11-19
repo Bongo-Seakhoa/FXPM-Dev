@@ -3909,6 +3909,9 @@ class HistoricalSymbolSearchCapture:
         produce = raw_winner.raw_evidence_producer_for_generation(handle.frozen.selection_generation)
         if not _raw_namespace_supported(produce):
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
+        progress = getattr(self, '_progress_observer', None)
+        progress_args = ({'progress': progress}
+            if progress is not None and handle.frozen.selection_generation is winner_selection.V17_GENERATION else {})
         try:
             production = produce(
                 self.sink,
@@ -3918,6 +3921,7 @@ class HistoricalSymbolSearchCapture:
                 evidence_access_completed_at_utc=evidence_access_completed_at_utc,
                 provenance_cross_binding_bytes=handle._cross_binding_bytes,
                 artifact_namespace=self.raw_artifact_namespace,
+                **progress_args,
             )
         except TypeError as exc:
             raise HistoricalProductionAdapterError(

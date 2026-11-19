@@ -1,6 +1,5 @@
 """Invented filesystem fixtures; no trading or host-resource admission authority."""
 
-from collections import namedtuple
 import errno
 from pathlib import Path
 
@@ -9,7 +8,6 @@ import pytest
 import pm_authority_spool_quota as quota
 
 
-_USAGE = namedtuple("Usage", "total used free")
 _PAYLOAD = b"published despite retired capacity metadata"
 
 
@@ -34,32 +32,31 @@ def _publish(root, *, batched, name, maximum=1, minimum=2**40):
 
 
 @pytest.mark.parametrize("batched", [False, True], ids=["ordinary", "batch"])
-def test_zero_reported_free_space_and_over_old_cap_reach_actual_write(tmp_path, monkeypatch, batched):
+def test_retired_capacity_metadata_reaches_actual_write(tmp_path, batched):
     root = tmp_path / "quota"
     root.mkdir()
     previous = b"existing committed bytes already exceed the old one-byte cap"
     (root / "previous.bin").write_bytes(previous)
-    monkeypatch.setattr(quota.shutil, "disk_usage", lambda path: _USAGE(0, 0, 0))
     path = _publish(root, batched=batched, name="first.bin")
     assert path.read_bytes() == _PAYLOAD
     state = quota._read_state(root)
-    assert state["committed_bytes"] == len(previous)+len(_PAYLOAD)
+    assert state["committed_bytes"] == 0  # Legacy recorded metadata, not a filesystem recount.
     assert state["reservations"] == []
     assert state["max_generation_bytes"] == 1
     assert state["min_free_bytes"] == 2**40
-    # Old metadata can change without blocking a later publication or its accounting.
+    # New caller limits do not reinterpret the saved numeric compatibility metadata.
     second = _publish(root, batched=batched, name="second.bin", maximum=2, minimum=0)
     assert second.read_bytes() == _PAYLOAD
-    assert quota._read_state(root)["committed_bytes"] == len(previous)+2*len(_PAYLOAD)
+    assert quota._read_state(root)["committed_bytes"] == 0
+    assert quota._read_state(root)["reservations"] == []
 
 
 @pytest.mark.parametrize("batched", [False, True], ids=["ordinary", "batch"])
-def test_actual_write_error_remains_visible_and_uncertain_bytes_are_reconciled(tmp_path, monkeypatch, batched):
+def test_actual_write_error_remains_visible_and_uncertain_membership_is_reconciled(tmp_path, batched):
     root = tmp_path / "quota"
     root.mkdir()
     previous = b"old"
     (root / "previous.bin").write_bytes(previous)
-    monkeypatch.setattr(quota.shutil, "disk_usage", lambda path: _USAGE(0, 0, 0))
     fault = OSError(errno.ENOSPC, "injected OS error after an actual partial publication")
     with pytest.raises(OSError) as caught:
         if batched:
@@ -81,10 +78,9 @@ def test_actual_write_error_remains_visible_and_uncertain_bytes_are_reconciled(t
     assert (root / "uncertain.bin").read_bytes() == _PAYLOAD
     state = quota._read_state(root)
     assert state["reservations"]
-    assert sum(row["reserved_bytes"] for row in state["reservations"]) >= len(_PAYLOAD)
     _publish(root, batched=False, name="recovery.bin")
     recovered = quota._read_state(root)
-    assert recovered["committed_bytes"] == len(previous)+2*len(_PAYLOAD)
+    assert recovered["committed_bytes"] == 0
     assert recovered["reservations"] == []
 
 
@@ -132,10 +128,9 @@ def test_legacy_true_ram_hold_option_reaches_dispatch_without_high_rss_hold(tmp_
             soft_ram_hold=True, telemetry_path=tmp_path / "resource.jsonl")
 
 
-def test_spool_publication_and_cold_receipt_keep_over_legacy_byte_totals(tmp_path, monkeypatch):
+def test_spool_publication_and_cold_receipt_ignore_retired_capacity_metadata(tmp_path):
     import pm_authority_spool as spool
 
-    monkeypatch.setattr(quota.shutil, "disk_usage", lambda path: _USAGE(0, 0, 0))
     limits = spool.SpoolLimits(max_artifact_bytes=4096, max_symbol_bytes=1,
         max_artifacts_per_symbol=3, max_manifest_bytes=4096, max_json_bytes=4096,
         stream_chunk_bytes=64, max_generation_bytes=1, min_free_bytes=2**40)
@@ -151,7 +146,8 @@ def test_spool_publication_and_cold_receipt_keep_over_legacy_byte_totals(tmp_pat
         expected_native_universe_sha256="a" * 64, expected_config_sha256="b" * 64)
     assert manifest["artifact_total_bytes"] == len(b"first payloadsecond payload")
     assert manifest["artifacts"] == [first, second]
-    assert quota._read_state(context.root)["committed_bytes"] > limits.max_generation_bytes
+    assert quota._read_state(context.root)["committed_bytes"] == 0
+    assert quota._read_state(context.root)["reservations"] == []
     # Cold verification above still authenticates content instead of trusting the total.
     artifact = context.root.joinpath(*Path(first["descriptor"]["relative_path"]).parts)
     artifact.write_bytes(b"tampered data")

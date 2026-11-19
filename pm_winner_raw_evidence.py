@@ -1706,11 +1706,19 @@ class _PartitionCostIndex:
     rows_by_fold: Mapping[tuple[int, int], list[Mapping[str, Any]]]
     attempt_ledger: Optional[Mapping[str, Any]] = None
     source_inputs: Any = None
+    precommitment: Optional[Mapping[str, Any]] = None
+    pair_contract: Optional[Mapping[str, Any]] = None
+    generation: Any = None
+    precommitment_sha256: Optional[str] = None
 
 
 def _index_partition_cost_precommitments(
     frozen: FrozenWinnerSearchPlan, validated: Mapping[str, Any],
     *, attempt_ledger: Optional[Mapping[str, Any]] = None,
+    precommitment: Optional[Mapping[str, Any]] = None,
+    pair_contract: Optional[Mapping[str, Any]] = None,
+    generation: Any = None,
+    precommitment_sha256: Optional[str] = None,
 ) -> _PartitionCostIndex:
     rows_by_fold: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
     for row in validated["rows"]:
@@ -1718,19 +1726,59 @@ def _index_partition_cost_precommitments(
     return _PartitionCostIndex(
         frozen, frozen.partition_cost_precommitments_bytes, validated, rows_by_fold,
         frozen.attempt_ledger if attempt_ledger is None else attempt_ledger,
-        _SourceObservationInputs(frozen))
+        _SourceObservationInputs(frozen), precommitment, pair_contract, generation,
+        precommitment_sha256)
 
+
+
+def _require_partition_cost_index(frozen, index):
+    if (type(index) is not _PartitionCostIndex or index.frozen is not frozen
+            or index.partition_bytes != frozen.partition_cost_precommitments_bytes):
+        _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
+    return index
 
 
 def _owned_attempt_ledger(frozen, partition_cost_index):
     if partition_cost_index is None:
         return frozen.attempt_ledger
-    if (type(partition_cost_index) is not _PartitionCostIndex
-            or partition_cost_index.frozen is not frozen
-            or partition_cost_index.partition_bytes != frozen.partition_cost_precommitments_bytes):
-        _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
-    return (frozen.attempt_ledger if partition_cost_index.attempt_ledger is None
-            else partition_cost_index.attempt_ledger)
+    index = _require_partition_cost_index(frozen, partition_cost_index)
+    return frozen.attempt_ledger if index.attempt_ledger is None else index.attempt_ledger
+
+
+def _owned_precommitment(frozen, partition_cost_index):
+    if partition_cost_index is None:
+        return frozen.precommitment
+    index = _require_partition_cost_index(frozen, partition_cost_index)
+    return frozen.precommitment if index.precommitment is None else index.precommitment
+
+
+def _owned_pair_contract(frozen, partition_cost_index):
+    if partition_cost_index is None:
+        return frozen.frozen_tier_pair_contract
+    index = _require_partition_cost_index(frozen, partition_cost_index)
+    return frozen.frozen_tier_pair_contract if index.pair_contract is None else index.pair_contract
+
+
+def _owned_generation(frozen, partition_cost_index):
+    if partition_cost_index is None:
+        return frozen.selection_generation
+    index = _require_partition_cost_index(frozen, partition_cost_index)
+    return frozen.selection_generation if index.generation is None else index.generation
+
+
+def _owned_precommitment_sha(frozen, partition_cost_index):
+    if partition_cost_index is not None:
+        index = _require_partition_cost_index(frozen, partition_cost_index)
+        if index.precommitment_sha256 is not None:
+            return index.precommitment_sha256
+    return _sha_json(_owned_precommitment(frozen, partition_cost_index))
+
+
+def _owned_partition_cost_receipt_sha(frozen, partition_cost_index):
+    if partition_cost_index is None:
+        return frozen.partition_cost_precommitments["receipt_sha256"]
+    return _require_partition_cost_index(frozen, partition_cost_index).precommitments["receipt_sha256"]
+
 
 
 def _selected_partition_cost_precommitments(
@@ -1738,19 +1786,18 @@ def _selected_partition_cost_precommitments(
     partition_cost_index: Optional[_PartitionCostIndex] = None,
 ) -> list[dict[str, Any]]:
     if partition_cost_index is None:
+        pair = frozen.frozen_tier_pair_contract
         precommitments = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
-            pair=frozen.frozen_tier_pair_contract, attempts=frozen.attempt_ledger["attempts"],
+            pair=pair, attempts=frozen.attempt_ledger["attempts"],
             folds=frozen.precommitment["causal_fold_plan"])
         rows = [row for row in precommitments["rows"] if row["attempt_ordinal"] == attempt["ordinal"]
             and row["fold_ordinal"] == planned_fold["fold_ordinal"]]
     else:
-        if (type(partition_cost_index) is not _PartitionCostIndex
-                or partition_cost_index.frozen is not frozen
-                or partition_cost_index.partition_bytes != frozen.partition_cost_precommitments_bytes):
-            _fail("PARTITION_COST_PRECOMMITMENTS_BINDING_INVALID")
-        precommitments = partition_cost_index.precommitments
-        rows = partition_cost_index.rows_by_fold.get((attempt["ordinal"], planned_fold["fold_ordinal"]), [])
-    return [expand_partition_cost_precommitment(precommitments, row, pair=frozen.frozen_tier_pair_contract)
+        index = _require_partition_cost_index(frozen, partition_cost_index)
+        precommitments = index.precommitments
+        rows = index.rows_by_fold.get((attempt["ordinal"], planned_fold["fold_ordinal"]), [])
+        pair = _owned_pair_contract(frozen, partition_cost_index)
+    return [expand_partition_cost_precommitment(precommitments, row, pair=pair)
             for row in rows]
 
 
@@ -4358,6 +4405,7 @@ class _SourceObservationInputs:
         self._frozen = frozen
         self._entry = None
         self._axes = {}
+        self._receipts = {}
 
     def _require(self, frozen, sink):
         if frozen is not self._frozen or sink.context.context_sha256 != frozen.generation_context_sha256:
@@ -4392,34 +4440,16 @@ class _SourceObservationInputs:
         # Release retained bulk input before the independent publication reopen.
         self._entry = None
         self._axes.clear()
+        self._receipts.clear()
         if carrier is not None:
             _open_source_observation_native(carrier, sink=sink, symbol=frozen.symbol)
 
 
-def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySink,
-        frozen: FrozenWinnerSearchPlan, expected_sha256: str, partition: str,
-        signals: Mapping[str, Any], lanes: Mapping[str, Any],
-    source_inputs: Optional[_SourceObservationInputs] = None) -> dict[str, Any]:
+def _prepare_source_observation_receipt(body, *, sink, frozen, source_inputs):
+    """Prepare source-only facts once; strategy signals and trades remain per call."""
     import numpy as np
-    import pm_native_prefix_production as native
 
-    keys = {"schema_version", "symbol", "timeframe", "source_timeframe", "source_product", "observations",
-        "entry_observations_sha256", "receipt_sha256"}
-    if not isinstance(value, Mapping) or set(value) != keys:
-        _fail("SOURCE_OBSERVATION_RECEIPT_SCHEMA_INVALID")
-    body = dict(value)
-    receipt_sha = body.pop("receipt_sha256")
-    if (body["schema_version"] != SOURCE_OBSERVATIONS_SCHEMA or body["symbol"] != frozen.symbol
-            or body["timeframe"] != frozen.timeframe or receipt_sha != _sha_json(body)
-            or receipt_sha != expected_sha256):
-        _fail("SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
     carrier = body["source_product"]
-    carrier_keys = {"data_dir", "index_descriptor", "index_sha256", "symbol", "timeframe", "cutoff_utc",
-        "activation_manifest_sha256", "production_contract_required"}
-    if (not isinstance(carrier, Mapping) or set(carrier) != carrier_keys
-            or type(carrier["production_contract_required"]) is not bool
-            or carrier["symbol"] != frozen.symbol or carrier["timeframe"] != body["source_timeframe"]):
-        _fail("SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID")
     if source_inputs is None:
         product, fine = _open_source_observation_native(carrier, sink=sink, symbol=frozen.symbol)
     else:
@@ -4450,6 +4480,7 @@ def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySi
     if rows != rebuilt_rows or body["entry_observations_sha256"] != observations_sha:
         _fail("SOURCE_OBSERVATION_VALUES_CHANGED")
     source, activation = product.index["source"], product.index["activation"]
+    prepared_tiers = []
     pair = frozen.frozen_tier_pair_contract
     for level in pair["tiers"]:
         name = level["tier"]
@@ -4464,16 +4495,61 @@ def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySi
                 or activation["activation_id"] != descriptor["activation"]["id"]):
             _fail("SOURCE_OBSERVATION_PROFILE_NATIVE_SPLICE")
         tier = FrozenSpreadTier(json.dumps(descriptor, sort_keys=True, separators=(",", ":"), allow_nan=False))
+        states = np.array([spread_admission(tier, point) for point in observations])
+        if (states == "INVALID").any():
+            _fail("SOURCE_OBSERVATION_VALUE_INVALID")
+        mask = states == "ADMIT"
+        states.setflags(write=False)
+        mask.setflags(write=False)
+        mask_sha = hashlib.sha256(mask.astype(np.uint8).tobytes()).hexdigest()
+        prepared_tiers.append((name, states, mask, mask_sha))
+    return target, observations_sha, tuple(prepared_tiers)
+
+
+def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySink,
+        frozen: FrozenWinnerSearchPlan, expected_sha256: str, partition: str,
+        signals: Mapping[str, Any], lanes: Mapping[str, Any],
+    source_inputs: Optional[_SourceObservationInputs] = None) -> dict[str, Any]:
+    import numpy as np
+
+    keys = {"schema_version", "symbol", "timeframe", "source_timeframe", "source_product", "observations",
+        "entry_observations_sha256", "receipt_sha256"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        _fail("SOURCE_OBSERVATION_RECEIPT_SCHEMA_INVALID")
+    body = dict(value)
+    receipt_sha = body.pop("receipt_sha256")
+    if (body["schema_version"] != SOURCE_OBSERVATIONS_SCHEMA or body["symbol"] != frozen.symbol
+            or body["timeframe"] != frozen.timeframe or receipt_sha != _sha_json(body)
+            or receipt_sha != expected_sha256):
+        _fail("SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID")
+    carrier = body["source_product"]
+    carrier_keys = {"data_dir", "index_descriptor", "index_sha256", "symbol", "timeframe", "cutoff_utc",
+        "activation_manifest_sha256", "production_contract_required"}
+    if (not isinstance(carrier, Mapping) or set(carrier) != carrier_keys
+            or type(carrier["production_contract_required"]) is not bool
+            or carrier["symbol"] != frozen.symbol or carrier["timeframe"] != body["source_timeframe"]):
+        _fail("SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID")
+    prepared = None
+    key = None
+    if source_inputs is not None:
+        if type(source_inputs) is not _SourceObservationInputs:
+            _fail("SOURCE_OBSERVATION_INPUT_OWNER_MISMATCH")
+        source_inputs._require(frozen, sink)
+        key = (receipt_sha, _canonical_bytes(dict(carrier)))
+        prepared = source_inputs._receipts.get(key)
+    if prepared is None:
+        prepared = _prepare_source_observation_receipt(body, sink=sink, frozen=frozen,
+            source_inputs=source_inputs)
+        if source_inputs is not None:
+            source_inputs._receipts[key] = prepared
+    target, observations_sha, prepared_tiers = prepared
+    for name, states, mask, mask_sha in prepared_tiers:
         result = lanes[partition + "_" + name.lower()]
         axis = _partition_axis(result, partition)
         if len(target) != axis["warmup_bars"] + axis["scored_bars"] or len(signals["values"]) != len(target):
             _fail("SOURCE_OBSERVATION_PARTITION_AXIS_SPLICE")
         if target[axis["warmup_bars"]] != pd.Timestamp(axis["start_utc"]) or target[-1] >= pd.Timestamp(axis["end_utc"]):
             _fail("SOURCE_OBSERVATION_PARTITION_AXIS_SPLICE")
-        states = np.array([spread_admission(tier, point) for point in observations])
-        if (states == "INVALID").any():
-            _fail("SOURCE_OBSERVATION_VALUE_INVALID")
-        mask = states == "ADMIT"
         opportunities = np.zeros(len(target), dtype=bool)
         start = max(1, axis["warmup_bars"])
         opportunities[start:] = np.array(signals["values"], dtype=np.int32)[start - 1:-1] != 0
@@ -4487,7 +4563,7 @@ def _validated_source_observation_receipt(value: Any, *, sink: SymbolAuthoritySi
             "missing_refused_opportunities": int((opportunities & (states == "MISSING")).sum()), "missing_executed_legs": 0}
         if (admission.get("schema_version") != ADMISSION_SCHEMA or admission.get("entry_admission_policy") != ADMISSION_POLICY
                 or admission.get("entry_observations_sha256") != observations_sha
-                or admission.get("entry_admission_mask_sha256") != hashlib.sha256(mask.astype(np.uint8).tobytes()).hexdigest()
+                or admission.get("entry_admission_mask_sha256") != mask_sha
                 or admission.get("input_provenance_authenticated") is not False or admission.get("qualification_authority") is not False
                 or model.get("entry_admission_schema") != ADMISSION_SCHEMA or model.get("entry_admission_policy") != ADMISSION_POLICY
                 or model.get("entry_observations_sha256") != observations_sha
@@ -4773,7 +4849,7 @@ def _validated_provenance(
     if current:
         if type(sink) is not SymbolAuthoritySink:
             _fail("CURRENT_PROVENANCE_SINK_REQUIRED")
-        expected_receipt = _independent_tier_execution_receipt(lanes, frozen.precommitment["frozen_tier_pair_contract_sha256"])
+        expected_receipt = _independent_tier_execution_receipt(lanes, _owned_precommitment(frozen, partition_cost_index)["frozen_tier_pair_contract_sha256"])
         signals = replay.get("signal_vector_receipts")
         observation_receipts = replay.get("source_observation_references" if referenced else "source_observation_receipts")
         if (replay.get("lane_sha256") != {name: _sha_json(dict(lanes[name])) for name in _LANE_KEYS}
@@ -4863,14 +4939,14 @@ def _validated_provenance(
         _fail("OOS_SOURCE_FROZEN_INPUT_INVALID")
     m5_window = None
     if current:
-        pair = validate_backtest_frozen_tier_pair_contract(frozen.frozen_tier_pair_contract)
+        pair = validate_backtest_frozen_tier_pair_contract(_owned_pair_contract(frozen, partition_cost_index))
         m5_window = _m5_execution_window_from_descriptors(
             [item["frozen_spread_tier"] for item in pair["tiers"]],
             symbol=frozen.symbol, timeframe=frozen.timeframe)
     _validate_oos_source_content_binding(source, horizon_process, m5_window)
     if (
         source.get("source_contract_sha256")
-        != frozen.precommitment.get("source_contract_sha256")
+        != _owned_precommitment(frozen, partition_cost_index).get("source_contract_sha256")
         or source.get("native_source_sha256")
         != source_binding.get("target_bars_sha256")
         or source.get("activation_manifest_sha256")
@@ -4957,13 +5033,14 @@ def _shared_oos_partition_receipt(
     frozen: FrozenWinnerSearchPlan,
     planned_fold: Mapping[str, Any],
     source_receipt: Mapping[str, Any],
+    partition_cost_index: Optional[_PartitionCostIndex] = None,
 ) -> dict[str, Any]:
     execution_spec = source_receipt.get("execution_spec_receipt")
     if not isinstance(execution_spec, Mapping):
         _fail("SHARED_OOS_PARTITION_EXECUTION_SPEC_INVALID")
     body = {
-        "schema_version": frozen.selection_generation.shared_partition_version,
-        "cell_id": frozen.precommitment["cell_id"],
+        "schema_version": _owned_generation(frozen, partition_cost_index).shared_partition_version,
+        "cell_id": _owned_precommitment(frozen, partition_cost_index)["cell_id"],
         "symbol": frozen.symbol,
         "timeframe": frozen.timeframe,
         "regime": frozen.regime,
@@ -4976,10 +5053,10 @@ def _shared_oos_partition_receipt(
         "source_group_decision_sha256": source_receipt["source_group_decision_sha256"],
         "regime_fit_decision_sha256": source_receipt["regime_fit_decision_sha256"],
         "execution_spec_receipt_sha256": execution_spec["receipt_sha256"],
-        "cost_contract_sha256": frozen.precommitment["cost_contract_sha256"],
+        "cost_contract_sha256": _owned_precommitment(frozen, partition_cost_index)["cost_contract_sha256"],
         ("frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256"):
-            frozen.precommitment["frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256"],
-        "risk_unit_contract_sha256": frozen.precommitment["risk_unit_contract_sha256"],
+            _owned_precommitment(frozen, partition_cost_index)["frozen_tier_pair_contract_sha256" if frozen.frozen_tier_pair_contract_bytes else "cost_ladder_contract_sha256"],
+        "risk_unit_contract_sha256": _owned_precommitment(frozen, partition_cost_index)["risk_unit_contract_sha256"],
     }
     return {**body, "receipt_sha256": _sha_json(body)}
 
@@ -5116,7 +5193,7 @@ def _build_evaluated_fold(
     if pd.Timestamp(final_axis["start_utc"]).to_pydatetime() != start or pd.Timestamp(final_axis["end_utc"]).to_pydatetime() != end:
         _fail(f"FOLD_{ordinal:03d}_FINAL_AXIS_PLAN_MISMATCH")
     shared_partition = _shared_oos_partition_receipt(frozen=frozen, planned_fold=planned_fold,
-        source_receipt=provenance["oos_source_receipt"])
+        source_receipt=provenance["oos_source_receipt"], partition_cost_index=partition_cost_index)
     entries["shared-oos-partition"] = _put_ascii_json(sink, prefix + "/shared-oos-partition", "winner_shared_oos_partition", shared_partition)
     tier_evidence = {}
     dates = None
@@ -5151,7 +5228,7 @@ def _build_evaluated_fold(
         entries[tier.lower() + "-daily-surface"] = _put_ascii_json(sink, prefix + "/" + tier.lower() + "/daily-r-surface", "winner_daily_r_surface", surface)
         binding = _fold_power_binding(attempt_ledger=_owned_attempt_ledger(frozen, partition_cost_index), train=decisions[0], final=decisions[2]) if all(decision is not None and decision.passed for decision in decisions) else None
         order_anchor, open_offsets, close_offsets = winner._encode_event_order_offsets(open_orders, close_orders, "TIER_TRADE_EVENT_ORDER_INVALID")
-        level = next(item for item in frozen.frozen_tier_pair_contract["tiers"] if item["tier"] == tier)
+        level = next(item for item in _owned_pair_contract(frozen, partition_cost_index)["tiers"] if item["tier"] == tier)
         row = {"spread_tier": tier, "source_contract_sha256": _validated_source_identity(frozen.source_contract_seeds[tier]),
             "cost_contract_sha256": _sha_json(level["numerical_execution_cost_policy"]),
             "entry_spread_admission_policy_sha256": _sha_json({"schema_version": ADMISSION_SCHEMA, "entry_admission_policy": ADMISSION_POLICY}),
@@ -5170,7 +5247,7 @@ def _build_evaluated_fold(
     for tier, row in pending.items():
         row["daily_surface_sha256"] = _sha_json({"shared_fold_axis_row_sha256": axis_sha,
             **{key: row[key] for key in ("spread_tier", "source_contract_sha256", "cost_contract_sha256", "entry_spread_admission_policy_sha256", "daily_net_mtm_r_e12_i64be_base64")}})
-        row["trade_vector_sha256"] = _sha_json(_current_tier_trade_vector_body(row, axis_sha256=axis_sha, risk_sha256=frozen.precommitment["risk_unit_contract_sha256"]))
+        row["trade_vector_sha256"] = _sha_json(_current_tier_trade_vector_body(row, axis_sha256=axis_sha, risk_sha256=_owned_precommitment(frozen, partition_cost_index)["risk_unit_contract_sha256"]))
         tier_evidence[tier] = row
     common_hash_fields = {"anchor_selection_receipt_sha256": "anchor_selection_receipt", "anchor_horizon_decision_sha256": "anchor_horizon_decision",
         "anchor_trial_ledger_sha256": "anchor_trial_ledger", "anchor_selected_trial_sha256": "anchor_selected_trial", "anchor_refit_receipt_sha256": "anchor_refit_receipt",
@@ -5769,6 +5846,7 @@ def _produce_winner_raw_evidence(
     production_cell_search_plan: Any = None,
     production_search_process: Any = None,
     artifact_namespace: Optional[str] = None,
+    progress=None,
     _generation=winner.CURRENT_GENERATION,
 ) -> WinnerRawEvidenceProduction:
     """Produce current independent P75/P95 candidate evidence; no live authority."""
@@ -5806,7 +5884,9 @@ def _produce_winner_raw_evidence(
             or receipt.get("attempt_ledger_sha256") != _sha_json(attempt_ledger)):
         _fail("FROZEN_PARTITION_COST_BINDING_INVALID")
     partition_cost_index = _index_partition_cost_precommitments(
-        frozen, partition_precommits, attempt_ledger=attempt_ledger)
+        frozen, partition_precommits, attempt_ledger=attempt_ledger,
+        precommitment=precommitment, pair_contract=pair_contract, generation=_generation,
+        precommitment_sha256=receipt["precommitment_sha256"])
     attempt_bundles = _verified_frozen_attempt_bundle(frozen=frozen, attempt_ledger=attempt_ledger, frozen_receipt=receipt)
     receipt = _reopen_current_frozen_plan_artifacts(sink, frozen=frozen, precommitment=precommitment,
         attempt_ledger=attempt_ledger, source_seeds=source_seeds, pair_contract=pair_contract,
@@ -5847,6 +5927,8 @@ def _produce_winner_raw_evidence(
     provenance_schemas: set[str] = set()
     shared_fold_axis: Optional[list[dict[str, Any]]] = None
     total_completed_trades = 0
+    from pm_historical_scheduler import _declared_observe_progress
+    _declared_observe_progress(progress, 'result_attempts', 0, len(attempt_ledger['attempts']))
     for attempt, attempt_artifacts, cross_binding_attempt in zip(
         attempt_ledger["attempts"],
         attempt_bundles,
@@ -5895,6 +5977,7 @@ def _produce_winner_raw_evidence(
                     matched_entries.append({"ordinal": ordinal, "attempt_id": attempt["attempt_id"],
                         "process_candidate_id": attempt["process_candidate_id"], "stage_origin_binding": None, "partition_witnesses_descriptor": None,
                         "full_witnesses_sha256": None, "partition_statuses": [], "final_folds": []})
+                _declared_observe_progress(progress, 'result_attempts', len(evidence_entries), len(attempt_ledger['attempts']))
                 continue
             if attempt["precommitted_evidence_role"] != "EVALUATION_REQUIRED":
                 _fail(f"ATTEMPT_{ordinal:04d}_PRESEARCH_REJECTED_CARRIES_RAW_FOLDS")
@@ -5990,6 +6073,8 @@ def _produce_winner_raw_evidence(
                     cross_binding_attempt=cross_binding_attempt, array_entries=matched_array_entries)
                 matched_entries.append(added)
                 spool_entries.update(proof_entries)
+        _declared_observe_progress(progress, 'result_attempts', len(evidence_entries), len(attempt_ledger['attempts']))
+    _declared_observe_progress(progress, 'result_finalize')
     try:
         next(raw_iterator)
     except StopIteration:
@@ -6256,7 +6341,7 @@ def restore_frozen_winner_search_plan_v9(*, context_identity, symbol, timeframe,
 
 def produce_winner_v17_raw_evidence(sink, *, frozen, attempt_evidence, evidence_access_started_at_utc,
         evidence_access_completed_at_utc, provenance_cross_binding_bytes=None, production_cell_search_plan=None,
-        production_search_process=None, artifact_namespace=None):
+        production_search_process=None, artifact_namespace=None, progress=None):
     return _produce_winner_raw_evidence(**locals(), _generation=winner.V17_GENERATION)
 
 
@@ -6293,7 +6378,7 @@ def _matched_floor_attempt_record(*, frozen, attempt, witnesses, origin, raw_fol
     import pm_authoritative_search_execution as execution
     if type(witnesses) is not list or len(witnesses) != len(raw_folds) * 3:
         _fail("MATCHED_FLOOR_COMPLETE_PARTITION_ROSTER_REQUIRED")
-    if (origin.get("precommitment_sha256") != _sha_json(frozen.precommitment)
+    if (origin.get("precommitment_sha256") != _owned_precommitment_sha(frozen, partition_cost_index)
             or origin.get("matched_base_facts_sha256") != _sha_json(witnesses)
             or origin.get("raw_body_sha256") != _sha_json({"attempt_id": attempt["attempt_id"], "folds": raw_folds})
             or origin.get("unit", {}).get("ordinal") != attempt["ordinal"]
@@ -6311,7 +6396,7 @@ def _matched_floor_attempt_record(*, frozen, attempt, witnesses, origin, raw_fol
         geometries = _validated_partition_geometry(raw_fold["provenance"]["anchor_horizon_decision"]["partition_geometry"], lanes=lanes)
         geometry = geometries[role_index]
         cost_row = _selected_partition_cost_precommitments(frozen=frozen, attempt=attempt,
-            planned_fold=frozen.precommitment["causal_fold_plan"][fold_ordinal],
+            planned_fold=_owned_precommitment(frozen, partition_cost_index)["causal_fold_plan"][fold_ordinal],
             partition_cost_index=partition_cost_index)[role_index]
         base = lanes[role + "_p75"]
         facts = item.get("facts") if type(item) is dict else None
@@ -6322,7 +6407,7 @@ def _matched_floor_attempt_record(*, frozen, attempt, witnesses, origin, raw_fol
                 or item["partition_geometry_receipt_sha256"] != geometry["receipt_sha256"]
                 or item["partition_frame_sha256"] != geometry["frame_sha256"]
                 or item["partition_axis_sha256"] != _sha_json(base["trade_power_partition_axis"])
-                or item["cost_precommitment_receipt_sha256"] != frozen.partition_cost_precommitments["receipt_sha256"]
+                or item["cost_precommitment_receipt_sha256"] != _owned_partition_cost_receipt_sha(frozen, partition_cost_index)
                 or cost_row["partition_geometry_receipt_sha256"] != geometry["receipt_sha256"]
                 or cost_row["partition_frame_sha256"] != geometry["frame_sha256"]
                 or facts.get("partition_role") != role
@@ -6385,7 +6470,8 @@ def verify_matched_floor_publication_chain(context, *, frozen, request, producer
         _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
     precommitment = request.precommitment.to_dict()
     ledger = request.evidence_ledger.to_dict()
-    if precommitment != frozen.precommitment or request.attempt_ledger.to_dict() != frozen.attempt_ledger:
+    attempt_ledger = request.attempt_ledger.to_dict()
+    if precommitment != frozen.precommitment or attempt_ledger != frozen.attempt_ledger:
         _fail("MATCHED_FLOOR_COLD_FROZEN_SPLICE")
     entries = {entry["artifact_id"]: entry for entry in manifest_entries}
     payload_cache, decoded_array_cache, prepared_source_cache = {}, {}, {}
@@ -6415,12 +6501,16 @@ def verify_matched_floor_publication_chain(context, *, frozen, request, producer
     if header is None:
         _fail("MATCHED_FLOOR_ORIGINAL_HEADER_MISSING")
     source_frame, spec, tiers, config = source_material
+    pair_contract = frozen.frozen_tier_pair_contract
     precommits = _validated_partition_cost_precommitments(frozen.partition_cost_precommitments,
-        pair=frozen.frozen_tier_pair_contract, attempts=frozen.attempt_ledger["attempts"],
+        pair=pair_contract, attempts=attempt_ledger["attempts"],
         folds=precommitment["causal_fold_plan"])
-    index = _index_partition_cost_precommitments(frozen, precommits)
+    index = _index_partition_cost_precommitments(frozen, precommits, attempt_ledger=attempt_ledger,
+        precommitment=precommitment, pair_contract=pair_contract,
+        generation=winner.winner_generation_for_precommitment(precommitment),
+        precommitment_sha256=_sha_json(precommitment))
     root = _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
-    for attempt, added, mapping in zip(frozen.attempt_ledger["attempts"],
+    for attempt, added, mapping in zip(attempt_ledger["attempts"],
             ledger["selection_addendum"]["entries"], cross_binding["mapping"], strict=True):
         if attempt["precommitted_evidence_role"] == "PRESEARCH_PROCESS_REJECTED":
             continue

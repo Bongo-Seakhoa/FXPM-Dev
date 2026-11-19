@@ -343,6 +343,87 @@ def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dic
     return owned, groups
 
 
+def _declared_observe_progress(observer, stage, done=None, total=None):
+    """Display is observational; ordinary sink failures cannot stop work."""
+    if observer is None:
+        return
+    if stage in {'search_attempts', 'result_attempts'} and done is not None and total is not None and 0 < done < total and done != 1 and done % 25:
+        return
+    try:
+        observer(stage, done, total)
+    except Exception:
+        pass
+
+
+def _declared_progress_observer(cell):
+    import os
+    prefix = f"FXPM unit={cell['symbol']}/{cell['timeframe']}"
+    if cell.get('regime'):
+        prefix += f" cell={cell['regime']}"
+    prefix += f" pid={os.getpid()}"
+    def emit(stage, done=None, total=None):
+        count = "" if done is None else f" count={done}/{total}"
+        print(f"{prefix} stage={stage}{count}", flush=True)
+    return emit
+
+
+def _declared_verified_one_period(process, parent):
+    import pm_production_search_planner as planner
+    import pm_historical_anchor_orchestration as orchestration
+    return (type(process) is planner.FrozenProductionSearchProcess
+        and process.to_dict().get('schema_version') == planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA
+        and parent.get('schema_version') in {orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2,
+            orchestration.DECLARED_M5_SLOT_PRECOMMIT_SCHEMA}
+        and parent.get('period_selection', {}).get('mode') == 'one_period'
+        and not any(key in parent for key in ('development_scope', 'development_scope_sha256')))
+
+
+def _declared_request_progress(process, request, body):
+    parent = getattr(request, '_precommit', None)
+    if parent is not None and _declared_verified_one_period(process, parent.to_dict()):
+        return _declared_progress_observer({key: body[key] for key in ('symbol', 'timeframe', 'regime')})
+    return None
+
+
+def _declared_fatal_cell_error(exc):
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_authority_spool as spool
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, (OSError, MemoryError, orchestration.HistoricalAnchorOrchestrationError, spool.AuthoritySpoolError)):
+            return True
+        code = str(getattr(exc, 'code', ''))
+        if code and any(part in code for part in (
+            'CONTEXT', 'OWNER', 'BINDING', 'MISMATCH', 'LOCK', 'LEASE', 'PERMISSION',
+            'ROSTER', 'COMPLETION', 'ORDER', 'CORRUPT', 'RETIREMENT', 'WORKSPACE',
+            'EVIDENCE_END', 'SCHEMA', 'PROTOCOL', 'CONFIG', 'PROFILE', 'ACTIVATION',
+            'SOURCE_WINDOW', 'IDENTITY')):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+def _declared_dispatch_units(owned, groups):
+    from pathlib import Path
+    import json
+    import pm_authority_spool as spool
+    units = {}
+    for symbol, cells in groups.items():
+        for cell in cells:
+            selection = (cell.get('period_selection')
+                if owned['schema_version'] == DECLARED_SCHEDULER_SCHEMA else None)
+            fresh = (selection is not None and selection['mode'] == 'one_period'
+                and 'slot_parallel_workers' not in cell
+                and not (Path(cell['root']) / spool.CONTEXT_RELATIVE_PATH).exists()
+                and not (Path(cell['root']) / spool.RETIREMENT_RELATIVE_PATH).exists())
+            key = json.dumps([symbol, cell['cell']['timeframe']], separators=(',', ':')) if fresh else symbol
+            if key not in units:
+                units[key] = {'symbol': symbol, 'cells': [], 'one_period': fresh}
+            units[key]['cells'].append(cell)
+    return units
+
+
 def _declared_cell_row(row: Mapping[str, Any], status: str, reason: str = "", *, pid: int | None = None) -> dict[str, Any]:
     return {"descriptor_index": row["descriptor_index"], "root": row["root"],
         "run_id": row["run_id"], "cell_id": row["cell"]["cell_id"], "symbol": row["cell"]["symbol"],
@@ -578,11 +659,7 @@ def _declared_initial_process(context, row, *, development):
         if process.to_dict().get("run_id") != row["run_id"]:
             _fail("DECLARED_SCHEDULER_PROCESS_RECORD_INVALID")
         return process
-    route_a = development or (
-        "native_finalization" in row
-        and (selection := _declared_ordinary_row_selection(row)) is not None
-        and selection["mode"] == "one_period"
-    )
+    route_a = development or _declared_ordinary_row_selection(row) is not None
     return (planner.freeze_route_a_full_panel_production_search_process if route_a
         else planner.freeze_production_search_process)(context, run_id=row["run_id"])
 
@@ -1189,7 +1266,7 @@ def _declared_native_finalize_account(result, *, context, contract, row, config,
 
 def _declared_run_one_cell(
     contract: Mapping[str, Any], row: Mapping[str, Any], *,
-    slot_dispatch=None, slot_worker_limit: int = 1,
+    slot_dispatch=None, slot_worker_limit: int = 1, _numeric_preparation=None,
 ) -> dict[str, Any]:
     from datetime import datetime, timedelta
     from pathlib import Path
@@ -1336,6 +1413,13 @@ def _declared_run_one_cell(
                     != row["development"]["selected_slot_ids"]):
                 _fail("DECLARED_DEVELOPMENT_PREFIX_INVALID")
             result["precommit_sha256"] = precommit.receipt_sha256
+            independent = _declared_verified_one_period(process, parent)
+            if independent:
+                result['independent_one_period'] = True
+                observer = _declared_progress_observer(row['cell'])
+                _declared_observe_progress(observer, 'verified')
+            else:
+                observer = None
             verified_chain = {}
             progress, busy = _declared_progress_or_busy(context, precommit, process, frozen, row["cell"]["cell_id"],
                 _verified_progress_out=verified_chain)
@@ -1388,9 +1472,11 @@ def _declared_run_one_cell(
                     "slot_dispatch": slot_dispatch, "slot_worker_limit": slot_worker_limit,
                     "slot_commit_overlap": True,
                 }
+                _declared_observe_progress(observer, 'search')
                 run = producer.execute_declared_cell_owner_slots(context=context, precommit=precommit, process=process,
                     frozen_pipeline_config=frozen, cell_id=row["cell"]["cell_id"],
-                    _verified_progress_out=verified_chain, **parallel)
+                    _verified_progress_out=verified_chain, **parallel,
+                    **({"_numeric_preparation": _numeric_preparation} if _numeric_preparation is not None else {}))
                 run_body = run.to_dict()
                 prepared_account = None
                 result["run_receipt"] = _declared_run_descriptor(precommit, row, run_body)
@@ -1401,6 +1487,7 @@ def _declared_run_one_cell(
                     parallel_files = producer.verify_declared_parallel_slot_files(context, precommit=precommit,
                         process=process, cell_id=row["cell"]["cell_id"], frozen_pipeline_config=frozen)
             verified_account = {}
+            _declared_observe_progress(observer, 'account')
             artifact, reopened = _declared_account(context, precommit, process, frozen, config,
                 _verified_chain=verified_chain, _prepared_account=prepared_account, _verified_account_out=verified_account)
             result.update(status="REOPENED" if reopened else "COMPLETED", account_descriptor=dict(artifact.descriptor))
@@ -1411,6 +1498,11 @@ def _declared_run_one_cell(
                     _verified_account_body=verified_account, _verified_chain=verified_chain)
             return result
     except Exception as exc:
+        failure_code = str(getattr(exc, 'code', type(exc).__name__))[:256]
+        if result.get('independent_one_period') is True:
+            result['closes_admission'] = _declared_fatal_cell_error(exc)
+            if isinstance(exc, (orchestration.HistoricalAnchorOrchestrationError, spool.AuthoritySpoolError)) and exc.args:
+                failure_code = str(exc.args[0]).split(':', 1)[0][:256]
         if isinstance(exc, producer.DeclaredParallelSlotCapacityError):
             reason = exc.capacity_reason
             if type(reason) is str and reason in {"DISK_LOW", "MEMORY_ERROR"}:
@@ -1422,7 +1514,7 @@ def _declared_run_one_cell(
         elif _declared_m5_exception_reason(exc)[0] in {"DECLARED_SLOT_RUN_ACTIVE", "DECLARED_PARALLEL_SLOT_CLAIM_ACTIVE", "GENERATION_BOOTSTRAP_BUSY"}:
             result.update(status="NOT_RUN", reason_code="BUSY")
         else:
-            result.update(status="FAILED", reason_code=str(getattr(exc,"code",type(exc).__name__))[:256])
+            result.update(status="FAILED", reason_code=failure_code)
         return result
     finally:
         _declared_capture_period_facts(result, context, precommit, row)
@@ -1441,44 +1533,65 @@ def _declared_cell_deferral(contract, cell, result):
 
 
 def declared_symbol_worker(contract: Mapping[str, Any], symbol: str) -> dict[str, Any]:
-    """One spawned symbol job; every capability is reconstructed in this child."""
+    if contract.get('_one_period_unit') is not True:
+        return _declared_symbol_worker_cells(contract, symbol)
+    from pm_historical_search_producer import _UnitNumericPreparation
+    with _UnitNumericPreparation() as preparation:
+        return _declared_symbol_worker_cells(contract, symbol, _numeric_preparation=preparation)
+
+
+def _declared_symbol_worker_cells(contract: Mapping[str, Any], symbol: str, *, _numeric_preparation=None) -> dict[str, Any]:
+    """One spawned unit; capabilities remain reconstructed for each cell."""
     import gc
     import os
     from pm_core import FeatureComputer
-    rows: list[dict[str, Any]] = []
+    rows = []
     stopped = False
-    stop_reason = "PRIOR_CELL_FAILURE"
-    for cell in contract["cells"]:
+    stop_reason = 'PRIOR_CELL_FAILURE'
+    cells = contract['cells']
+    unit_observer = (_declared_progress_observer({k: cells[0]['cell'][k] for k in ('symbol', 'timeframe')})
+        if contract.get('_one_period_unit') is True else None)
+    _declared_observe_progress(unit_observer, 'child_start', 0, len(cells))
+    for cell in cells:
         if stopped:
-            rows.append(_declared_cell_row(cell, "NOT_RUN", stop_reason))
+            rows.append(_declared_cell_row(cell, 'NOT_RUN', stop_reason))
             continue
-        if cell["cell"]["symbol"] != symbol:
-            _fail("DECLARED_SCHEDULER_SYMBOL_BINDING_MISMATCH")
+        if cell['cell']['symbol'] != symbol:
+            _fail('DECLARED_SCHEDULER_SYMBOL_BINDING_MISMATCH')
         try:
-            row = (_declared_m5_run_one_cell(contract, cell)
-                if (contract.get("schema_version") == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
-                    or contract.get("schema_version") == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA and "m5_development" in cell
-                    or contract.get("schema_version") == DECLARED_SCHEDULER_SCHEMA and "m5_source" in cell)
-                else _declared_run_one_cell(contract, cell))
+            row = (_declared_m5_run_one_cell(contract, cell,
+                    **({"_numeric_preparation": _numeric_preparation} if _numeric_preparation is not None else {}))
+                if (contract.get('schema_version') == DECLARED_M5_DEVELOPMENT_SCHEDULER_SCHEMA
+                    or contract.get('schema_version') == DECLARED_DEVELOPMENT_CELL_SCHEDULER_SCHEMA and 'm5_development' in cell
+                    or contract.get('schema_version') == DECLARED_SCHEDULER_SCHEMA and 'm5_source' in cell)
+                else _declared_run_one_cell(contract, cell,
+                    **({"_numeric_preparation": _numeric_preparation} if _numeric_preparation is not None else {})))
         except Exception as exc:
             import pm_authority_spool as spool
             capacity = spool.resource_capacity_reason(exc)
-            row = _declared_cell_row(cell, "NOT_RUN" if capacity else "FAILED",
-                capacity or str(getattr(exc, "code", type(exc).__name__)), pid=os.getpid())
+            row = _declared_cell_row(cell, 'NOT_RUN' if capacity else 'FAILED',
+                capacity or str(getattr(exc, 'code', type(exc).__name__)), pid=os.getpid())
             stopped = True
         rows.append(row)
+        independent = row.get('independent_one_period') is True
+        if (row.get('source_abort_error') or row.get('native_finalization_status') in {'INCOMPLETE_RETAINED', 'REFUSED_RETAINED'}):
+            row['closes_admission'] = True
         if deferred := _declared_cell_deferral(contract, cell, row):
             stop_reason = deferred
             stopped = True
-        stopped = stopped or row["status"] in {"FAILED", "UNRESOLVED_CRASH"} or (row["status"] == "TERMINAL_STOP" and not row["recorded_before_dispatch"])
+        terminal_failure = row['status'] in {'FAILED', 'UNRESOLVED_CRASH'} or (
+            row['status'] == 'TERMINAL_STOP' and not row['recorded_before_dispatch'])
+        stopped = stopped or row.get('closes_admission') is True or (terminal_failure and not independent)
+        _declared_observe_progress(unit_observer, 'cell_done', len(rows), len(cells))
         if not stopped:
             try:
                 FeatureComputer.clear_cache()
                 gc.collect()
             except Exception as exc:
-                row["cleanup_failure"] = type(exc).__name__
+                row['cleanup_failure'] = type(exc).__name__
                 stopped = True
-    return {"schema_version":DECLARED_SCHEDULER_SCHEMA, "symbol":symbol, "cells":rows, "closes_admission":stopped}
+    _declared_observe_progress(unit_observer, 'child_done', len(rows), len(cells))
+    return {'schema_version': DECLARED_SCHEDULER_SCHEMA, 'symbol': symbol, 'cells': rows, 'closes_admission': stopped}
 
 
 def _declared_validate_result(value: Any, cells: Sequence[Mapping[str, Any]], symbol: str, *, worker_pid: int) -> dict[str, Any]:
@@ -1497,6 +1610,13 @@ def _declared_validate_result(value: Any, cells: Sequence[Mapping[str, Any]], sy
                 or type(row.get("reason_code")) is not str or len(row["reason_code"]) > 256
                 or any(row.get(k) is not False for k in ("qualification_authority","capital_authority","live_authority","order_authority"))):
             _fail("DECLARED_SCHEDULER_CELL_RESULT_INVALID")
+        for name in ('independent_one_period', 'closes_admission'):
+            if name in row and type(row[name]) is not bool:
+                _fail('DECLARED_SCHEDULER_CELL_DISPOSITION_INVALID')
+        if row.get('independent_one_period') is True and (
+                expected.get('period_selection', {}).get('mode') != 'one_period'
+                or 'development' in expected or 'm5_development' in expected or 'slot_parallel_workers' in expected):
+            _fail('DECLARED_SCHEDULER_CELL_DISPOSITION_INVALID')
         pid = row.get("worker_pid")
         if not (type(pid) is int and pid == worker_pid) and not (row["status"] == "NOT_RUN" and pid is None):
             _fail("DECLARED_SCHEDULER_CELL_PID_INVALID")
@@ -1641,7 +1761,8 @@ def run_declared_symbol_scheduler(
     destination = Path(telemetry_path)
     if destination.suffix != ".jsonl":
         _fail("DECLARED_SCHEDULER_TELEMETRY_PATH_INVALID")
-    worker_limit = memory_governor.recommended_worker_count(requested_workers, 13 if slot_workers else len(groups))
+    units = _declared_dispatch_units(owned, groups) if slot_workers is None else {}
+    worker_limit = memory_governor.recommended_worker_count(requested_workers, 13 if slot_workers else len(units))
     governor = memory_governor.MemoryGovernor(requested_workers=worker_limit, termination_grace_seconds=TERMINATION_GRACE_SECONDS)
     if type(soft_ram_hold) is not bool:
         raise ValueError("soft_ram_hold must be bool")
@@ -1652,8 +1773,9 @@ def run_declared_symbol_scheduler(
     errors: list[str] = []
     rows: dict[int,dict[str,Any]] = {}
     seen: set[str] = set()
-    def retain_error(message):
-        gate["open"] = False
+    def retain_error(message, *, close_admission=True):
+        if close_admission:
+            gate["open"] = False
         if len(errors) < 16:
             errors.append(str(message)[:512])
     def telemetry(sample):
@@ -1668,11 +1790,18 @@ def run_declared_symbol_scheduler(
                 stream.write(line)
         except Exception as exc:
             retain_error("TELEMETRY:"+type(exc).__name__)
+    completed_units = set()
     def tasks():
-        for symbol, cells in groups.items():
-            pending_group["cells"] = cells
-            yield memory_governor.MemoryTask(key=symbol, args=({**owned,"cells":cells},symbol))
-        pending_group["cells"] = None
+        for key, unit in units.items():
+            symbol, cells = unit['symbol'], unit['cells']
+            pending_group['cells'] = cells
+            if unit['one_period']:
+                _declared_observe_progress(_declared_progress_observer(
+                    {k: cells[0]['cell'][k] for k in ('symbol', 'timeframe')}),
+                    'dispatch', len(completed_units), len(units))
+            yield memory_governor.MemoryTask(key=key,
+                args=({**owned, 'cells': cells, '_one_period_unit': unit['one_period']}, symbol))
+        pending_group['cells'] = None
     def admission_open():
         return gate["open"]
 
@@ -1682,10 +1811,14 @@ def run_declared_symbol_scheduler(
         capacity_deferred = next((row["reason_code"] for row in result_rows
             if row["status"] == "NOT_RUN" and row["reason_code"] in {"DISK_LOW", "MEMORY_ERROR"}), None)
         failed = any(row["status"] in {"FAILED","UNRESOLVED_CRASH"}
-            or row.get("cleanup_failure") or (row["status"]=="TERMINAL_STOP" and not row["recorded_before_dispatch"])
+            or row.get('closes_admission') is True or row.get("cleanup_failure") or (row["status"]=="TERMINAL_STOP" and not row["recorded_before_dispatch"])
             for row in result_rows)
         if failed or (value["closes_admission"] and capacity_deferred is None):
-            retain_error("CELL_FAILURE:"+symbol)
+            fatal = value['closes_admission'] or any(row.get('cleanup_failure')
+                or row.get('closes_admission') is True
+                or (row['status'] in {'FAILED', 'UNRESOLVED_CRASH', 'TERMINAL_STOP'}
+                    and row.get('independent_one_period') is not True) for row in result_rows)
+            retain_error("CELL_FAILURE:"+symbol, close_admission=bool(fatal))
         elif capacity_deferred is not None:
             gate.update(open=False, reason=capacity_deferred)
         return result_rows
@@ -1729,24 +1862,32 @@ def run_declared_symbol_scheduler(
 
     try:
         for outcome in () if outcomes is None else outcomes:
-            symbol = outcome.task_key
+            key = outcome.task_key
+            unit = units.get(key)
+            symbol = unit['symbol'] if unit is not None else str(key)
+            cells = unit['cells'] if unit is not None else ()
             try:
-                if symbol not in groups or symbol in seen:
+                if unit is None or key in seen:
                     _fail("DECLARED_SCHEDULER_OUTCOME_IDENTITY_INVALID")
-                seen.add(symbol)
+                seen.add(key)
                 if outcome.status == "NOT_RUN":
-                    result_rows = [_declared_cell_row(cell,"NOT_RUN",gate["reason"]) for cell in groups[symbol]]
+                    result_rows = [_declared_cell_row(cell,"NOT_RUN",gate["reason"]) for cell in cells]
                 elif outcome.status != "COMPLETED" or outcome.technical_failure:
                     retain_error("WORKER:"+symbol+":"+outcome.status)
-                    result_rows = [_declared_cell_row(cell,"UNRESOLVED_CRASH",outcome.error_type or outcome.status,pid=outcome.worker_pid or None) for cell in groups[symbol]]
+                    result_rows = [_declared_cell_row(cell,"UNRESOLVED_CRASH",outcome.error_type or outcome.status,pid=outcome.worker_pid or None) for cell in cells]
                 else:
-                    result_rows = retain_result(outcome.value, groups[symbol], symbol, outcome.worker_pid)
+                    result_rows = retain_result(outcome.value, cells, symbol, outcome.worker_pid)
                 for row in result_rows:
                     rows[row["descriptor_index"]] = row
+                completed_units.add(key)
+                if unit['one_period']:
+                    _declared_observe_progress(_declared_progress_observer(
+                        {k: cells[0]['cell'][k] for k in ('symbol', 'timeframe')}),
+                        'unit_done', len(completed_units), len(units))
             except Exception as exc:
                 retain_error("RESULT:"+symbol+":"+type(exc).__name__)
-                if symbol in groups:
-                    for cell in groups[symbol]:
+                if unit is not None:
+                    for cell in cells:
                         rows.setdefault(cell["descriptor_index"],_declared_cell_row(cell,"UNRESOLVED_CRASH","INVALID_WORKER_RESULT",pid=outcome.worker_pid or None))
     except Exception as exc:
         retain_error("GOVERNOR:"+type(exc).__name__)
@@ -2984,7 +3125,7 @@ def _declared_m5_record_terminal_refusal(result, *, context, workspace_sha, prec
         _declared_m5_refusal_archived_row(result, archived)
 
 
-def _declared_m5_run_one_cell(contract, row):
+def _declared_m5_run_one_cell(contract, row, *, _numeric_preparation=None):
     """Existing worker, explicit development source; no implicit run allocation."""
     from dataclasses import asdict
     from datetime import timedelta
@@ -3091,6 +3232,9 @@ def _declared_m5_run_one_cell(contract, row):
                 slots = _declared_m5_check_roster(row, parent, context, frozen,
                     **({"profile_sha256": contract["profile_sha256"]} if development or ordinary else {}))
                 result["precommit_sha256"] = precommit.receipt_sha256
+                if _declared_verified_one_period(process, parent):
+                    result['independent_one_period'] = True
+                    _declared_observe_progress(_declared_progress_observer(row['cell']), 'verified')
                 _declared_capture_period_facts(result, context, precommit, row)
                 _declared_m5_reuse_recorded_rows(result, end_grid_root=dev["end_grid_root"],
                     source_fence_path=dev["source_fence_path"], cell=row["cell"], slots=slots,
@@ -3154,7 +3298,8 @@ def _declared_m5_run_one_cell(contract, row):
                 verified_chain = {}
                 if window_open:
                     run = producer.execute_declared_cell_owner_slots(context=context,
-                        _verified_progress_out=verified_chain, **controller_args)
+                        _verified_progress_out=verified_chain, **controller_args,
+                        **({"_numeric_preparation": _numeric_preparation} if _numeric_preparation is not None else {}))
                     run_body = run.to_dict()
                 else:
                     progress = producer.reopen_declared_cell_owner_progress(context,
@@ -3219,6 +3364,8 @@ def _declared_m5_run_one_cell(contract, row):
                     result["source_abort_error"] = str(getattr(abort_error, "code", str(abort_error)))[:256]
                 raise
     except Exception as exc:
+        if result.get('independent_one_period') is True:
+            result['closes_admission'] = _declared_fatal_cell_error(exc)
         code, diagnostics = _declared_m5_exception_reason(exc)
         result["exception_diagnostics"] = diagnostics
         capacity = spool.resource_capacity_reason(exc)

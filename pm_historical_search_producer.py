@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 import gc
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -2332,6 +2333,45 @@ def _declared_observed_cell_executor(context, *, process, transport_edition):
         else search_execution.execute_historical_observed_cell)
 
 
+class _UnitNumericPreparation:
+    """Detached calculations for one symbol/timeframe worker, never a source grant."""
+    def __init__(self):
+        self._frames = {}
+        self._closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def close(self):
+        self._frames.clear()
+        self._closed = True
+
+    def prepare(self, key, frame, compute, *, source_columns=()):
+        if key is None or self._closed:
+            return compute()
+        cached = self._frames.get(key)
+        if cached is None:
+            result = compute()
+            columns = [name for name in result.columns if name not in source_columns]
+            values = result.loc[:, columns].copy(deep=True)
+            values.attrs = {}
+            attr = pm_core.FeatureComputer._PRECOMPUTED_ATTR
+            tags = copy.deepcopy(result.attrs.get(attr))
+            self._frames[key] = (values, tags)
+            return result
+        values, tags = cached
+        result = frame.copy(deep=True)
+        result.attrs = copy.deepcopy(frame.attrs)
+        for name in values.columns:
+            result[name] = values[name].copy(deep=True)
+        if tags is not None:
+            result.attrs[pm_core.FeatureComputer._PRECOMPUTED_ATTR] = copy.deepcopy(tags)
+        return result
+
+
 def _make_declared_slot_source_authority():
     sessions = {}
 
@@ -2367,7 +2407,7 @@ def _make_declared_slot_source_authority():
 
     def execute_m5(context, *, request, process, frozen_pipeline_config, config,
                    body, edition, execute_cell, m5_owner, m5_request_view_id,
-                   m5_calibration_view_id, m5_cost_edition):
+                   m5_calibration_view_id, m5_cost_edition, progress_observer=None, _numeric_preparation=None):
         from dataclasses import asdict
         import pm_m5_job_view as job_view
         import pm_m5_derived_costs as derived_costs
@@ -2398,6 +2438,9 @@ def _make_declared_slot_source_authority():
                 _fail("DECLARED_M5_TRANSPORT_EDITION_INVALID")
             capture = _declared_capture_opener(context, process=process, transport_edition=edition)(
                 context, request=request, process=process, plan=plan, source_session=session)
+            capture._progress_observer = progress_observer
+            from pm_historical_scheduler import _declared_observe_progress
+            _declared_observe_progress(progress_observer, 'search')
             execute_cell(capture=capture, fitted=fitted,
                 regime=body["regime"], search_process=process, cell_plan=plan, config=config)
             return finish(capture.completion)
@@ -2529,10 +2572,14 @@ def _make_declared_slot_source_authority():
             source_body["m5_request_view_observation"] = _declared_m5_view_observation(view)
             source_body["m5_calibration_view_observation"] = _declared_m5_view_observation(calibration)
             phase = "FIT"
+            from pm_historical_scheduler import _declared_observe_progress
+            _declared_observe_progress(progress_observer, 'fit')
             fitted = search_execution.fit_m5_derived_timeframe_for_search(
                 context=context, owner=m5_owner, request_lease=request_lease, calibration_lease=calibration_lease,
                 cost_edition=m5_cost_edition, declared_m5_source_pins=body["m5_source_pins"],
-                config=config, acquisition_attempts_exact=1)
+                config=config, acquisition_attempts_exact=1,
+                **({"_numeric_preparation": _numeric_preparation,
+                    "_numeric_config_sha256": body["effective_config_sha256"]} if _numeric_preparation is not None else {}))
             derived = fitted._derived_binding
             if (type(derived) is not search_execution._DerivedSearchBinding
                     or derived.context is not context
@@ -2579,12 +2626,15 @@ def _make_declared_slot_source_authority():
     @search_planner._owned_process_verification_call
     def execute(context, *, request, process, frozen_pipeline_config,
                 m5_owner=None, m5_request_view_id=None, m5_calibration_view_id=None,
-                m5_cost_edition=None):
+                m5_cost_edition=None, _numeric_preparation=None):
         search_planner._require_current_process(process)
         body = historical.verify_declared_slot_producer_request(context, request, process=process)
         _declared_completion_schema(body)
         edition = historical.declared_slot_transport_edition(body)
         historical._verify_declared_request_identity(request, context, require_live=True)
+        from pm_historical_scheduler import _declared_request_progress, _declared_observe_progress
+        progress_observer = _declared_request_progress(process, request, body)
+        _declared_observe_progress(progress_observer, 'source')
         execute_cell = _declared_observed_cell_executor(context, process=process, transport_edition=edition)
         if execute_cell is search_execution.execute_route_a_full_panel_historical_observed_cell:
             search_execution._require_fresh_route_a_full_panel_request(context, request)
@@ -2615,7 +2665,8 @@ def _make_declared_slot_source_authority():
             return execute_m5(context, request=request, process=process,
                 frozen_pipeline_config=frozen_pipeline_config, config=config, body=body, edition=edition, execute_cell=execute_cell,
                 m5_owner=m5_owner, m5_request_view_id=m5_request_view_id,
-                m5_calibration_view_id=m5_calibration_view_id, m5_cost_edition=m5_cost_edition)
+                m5_calibration_view_id=m5_calibration_view_id, m5_cost_edition=m5_cost_edition,
+                progress_observer=progress_observer, _numeric_preparation=_numeric_preparation)
         if source_kind != "broker_native" or any(value is not None for value in m5_arguments):
             _fail("DECLARED_NATIVE_REQUEST_REJECTS_M5_ARGUMENTS")
         saved = _declared_saved_raw_completion(context, request=request, process=process,
@@ -2681,6 +2732,8 @@ def _make_declared_slot_source_authority():
                 context, process=process, request=request, fitted=fitted)
             open_capture = _declared_capture_opener(context, process=process, transport_edition=edition)
             capture = open_capture(context, request=request, process=process, plan=plan, source_session=session)
+            capture._progress_observer = progress_observer
+            _declared_observe_progress(progress_observer, 'search')
             execute_cell(capture=capture, fitted=fitted, regime=body["regime"],
                 search_process=process, cell_plan=plan, config=config)
             return finish(capture.completion)
@@ -2748,7 +2801,10 @@ def _make_declared_slot_source_authority():
                     status="MISSING" if product.source_state in {native_prefix.SOURCE_UNAVAILABLE, native_prefix.TECHNICAL_TERMINAL} else "STOP",
                     reason_code="TERMINAL_TECHNICAL" if product.source_state == native_prefix.TECHNICAL_TERMINAL else product.source_state,
                     source_entry=entry))
-            fitted = search_execution.fit_native_timeframe_for_search(product=product, config=config, acquisition_attempts_exact=1)
+            _declared_observe_progress(progress_observer, 'fit')
+            fitted = search_execution.fit_native_timeframe_for_search(product=product, config=config, acquisition_attempts_exact=1,
+                **({"_numeric_preparation": _numeric_preparation,
+                    "_numeric_config_sha256": body["effective_config_sha256"]} if _numeric_preparation is not None else {}))
             if any(t.descriptor()["profile_sha256"] != body["spread_profile_identity"]["profile_sha256"] for t in fitted._spread_tiers.values()):
                 _fail("DECLARED_SLOT_PROFILE_BINDING_MISMATCH")
             source_body.update(source_group_decision_sha256=fitted.source_group_decision.receipt_sha256,
@@ -3390,7 +3446,11 @@ def _declared_slot_attempt(context, *, precommit, process, frozen_pipeline_confi
             completion, post_failure = exc.completion, exc.failure
         namespace = request.to_dict()["artifact_namespace"] + "/"
         roster = [dict(sink._artifacts[key]) for key in sorted(sink._artifacts) if key.startswith(namespace)]
+        from pm_historical_scheduler import _declared_request_progress, _declared_observe_progress
+        observer = _declared_request_progress(process, request, request.to_dict())
+        _declared_observe_progress(observer, 'commit_start')
         yield completion, roster, post_failure
+        _declared_observe_progress(observer, 'commit_end')
     finally:
         historical._release_declared_slot_producer_request(request, context)
 
@@ -4000,7 +4060,7 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
                                                m5_owner=None, slot_view_ids=None, calibration_view_id=None,
                                                 cost_edition=None, cell_contract_sha256=None,
                                                 slot_dispatch=None, slot_worker_limit=1, slot_commit_overlap=False,
-                                                _verified_progress_out=None):
+                                                _verified_progress_out=None, _numeric_preparation=None):
     parent = historical.verify_declared_slot_owner_run_precommit(context, precommit, process=process)
     search_planner._require_current_process(process)
     if type(frozen_pipeline_config) is not config_binding.FrozenProductionPipelineConfig:
@@ -4059,6 +4119,8 @@ def _execute_declared_cell_owner_slots_unlocked(*, context, precommit, process, 
             attempt_id = original_attempt or ("attempt-" + secrets.token_hex(16))
             slot_arguments = ({"m5_owner": m5_owner, "m5_request_view_id": slot_view_ids[slot["slot_id"]],
                 "m5_calibration_view_id": calibration_view_id, "m5_cost_edition": cost_edition} if is_m5 else {})
+            if _numeric_preparation is not None:
+                slot_arguments["_numeric_preparation"] = _numeric_preparation
             with _declared_slot_attempt(context, precommit=precommit, process=process,
                     frozen_pipeline_config=frozen_pipeline_config, cell_id=cell_id, slot=slot, symbol=symbol,
                     attempt_id=attempt_id, resumed=original_attempt is not None,
@@ -4117,7 +4179,7 @@ def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pip
                                     m5_owner=None, slot_view_ids=None, calibration_view_id=None,
                                      cost_edition=None, cell_contract_sha256=None,
                                      slot_dispatch=None, slot_worker_limit=1, slot_commit_overlap=False,
-                                     _verified_progress_out=None):
+                                     _verified_progress_out=None, _numeric_preparation=None):
     """Hold the existing nonblocking OS primitive through restore and commit."""
     import os
     import pm_native_storage as storage
@@ -4158,7 +4220,7 @@ def execute_declared_cell_owner_slots(*, context, precommit, process, frozen_pip
                 m5_owner=m5_owner, slot_view_ids=slot_view_ids, calibration_view_id=calibration_view_id,
                 cost_edition=cost_edition, cell_contract_sha256=cell_contract_sha256,
                 slot_dispatch=slot_dispatch, slot_worker_limit=slot_worker_limit, slot_commit_overlap=slot_commit_overlap,
-                _verified_progress_out=_verified_progress_out)
+                _verified_progress_out=_verified_progress_out, _numeric_preparation=_numeric_preparation)
         finally:
             storage._release_kernel_lock(handle)
 

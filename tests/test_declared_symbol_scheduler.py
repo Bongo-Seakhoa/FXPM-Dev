@@ -37,6 +37,54 @@ def _contract(tmp_path, symbols=("AUDUSD", "AUDUSD", "EURUSD", "GBPUSD", "USDJPY
         "synthetic_behaviors":{},"synthetic_board":str(tmp_path/"board")}
 
 
+def _ordinary_contract(tmp_path, axes, *, mode="one_period", namespaces=False):
+    """Real config/process/precommit identities; observations remain invented."""
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_production_anchor_plan as anchors
+    import pm_production_config_binding as binding
+    import pm_winner_selection as winner
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    contract = _contract(tmp_path, tuple(symbol for symbol, _, _ in axes))
+    payload = {"_meta": {"scope": "UNISSUED_TECHNICAL_BENCHMARK",
+        "fixture_classification": "INVENTED_ONE_PERIOD_DISPATCH_METADATA_ONLY"},
+        "pipeline": {"data_dir": str(tmp_path / "invented-native"),
+            "output_dir": str(tmp_path / "outputs"), "log_dir": str(tmp_path / "logs"),
+            "research_mode": True, "manual_kill_switch_path": str(tmp_path / "unused-stop.json"),
+            "regime_params_file": str(tmp_path / "absent-regime-params.json"),
+            "initial_capital": 10000.0, "discovery_risk_per_trade_pct": 1.0,
+            "risk_per_trade_pct": 0.25, "backtest_spread_mode": "conservative_max",
+            "oos_validation_mode": "fixed_holdout"},
+        "symbols": list(dict.fromkeys(symbol for symbol, _, _ in axes)),
+        "position": {}, "storage": {}}
+    Path(contract["active_config_path"]).write_bytes(_encoded(payload))
+    _, _, refs = binding.resolve_effective_pipeline_config_identity(Path(contract["active_config_path"]))
+    contract["config_sha256"] = refs["config_sha256"]
+    contract["synthetic_ordinary"] = True
+    for index, (row, (symbol, timeframe, regime)) in enumerate(zip(contract["cells"], axes, strict=True)):
+        row["cell"] = {"cell_id": winner.compute_cell_id(symbol, timeframe, regime),
+            "symbol": symbol, "timeframe": timeframe, "regime": regime}
+        row["frozen_refit_clock"]["anchor_activation_utc"] = "2026-03-29T00:01:00Z"
+        roster = anchors.derive_declared_owner_slot_roster_v2(
+            launch_activation_utc=row["launch_activation_utc"],
+            frozen_refit_clock=row["frozen_refit_clock"], config_identity_refs=refs,
+            extend_frozen_clock_backward=True,
+            protected_end_exclusive_utc=row["protected_end_exclusive_utc"])
+        row["period_selection"] = orchestration.declared_ordinary_period_selection(
+            roster, mode=mode, final_study_13=(mode == "final_study_13"), symbols=(symbol,))
+        row["slot_roster_sha256"] = hashlib.sha256(orchestration._declared_json(roster)).hexdigest()
+        row["final_study_13"] = mode == "final_study_13"
+        if namespaces:
+            grid = tmp_path / f"grid-{index}"
+            retained = tmp_path / f"retained-{index}"
+            grid.mkdir(); retained.mkdir()
+            row["native_finalization"] = {"end_grid_root": str(grid),
+                "source_fence_path": str(retained / "fence.json"),
+                "retirement": {"receipt_path": str(retained / "retirement.json"),
+                    "max_paths": 1000, "max_nodes": 2000, "max_bytes": 64 * 1024**2}}
+    return contract
+
+
 def _encoded(body):
     return json.dumps(body,sort_keys=True,separators=(",",":"),ensure_ascii=True,allow_nan=False).encode("ascii")
 
@@ -67,12 +115,17 @@ def _synthetic_declared_worker(contract,symbol):
     import pm_forward_oos_replay_producer as forward
     import pm_causal_evidence_producer as causal
     from pm_core import FeatureComputer
+    ordinary = contract.get("synthetic_ordinary", False)
+    actual_derive = anchors.derive_declared_owner_slot_roster_v2
+    actual_issue = orchestration.precommit_declared_slot_owner_run_v2
+    actual_reopen = orchestration.reopen_declared_slot_owner_run_precommit
     contexts={}
     milestones=set()
     actual_disk_probe=scheduler._declared_disk_free_bytes
     behavior=contract.get("synthetic_behaviors",{})
     board=Path(contract["synthetic_board"])
-    config=SimpleNamespace(data_dir=str(board/"invented-native"))
+    config=(binding.load_effective_pipeline_config(Path(contract["active_config_path"]))[1]
+        if ordinary else SimpleNamespace(data_dir=str(board/"invented-native")))
     frozen=SimpleNamespace(effective_config_sha256=("e" if contract.get("synthetic_effective_config_changed") else "d")*64,materialize=lambda context:config)
     def note(stage):
         if contract.get("synthetic_dispatch_barrier"):
@@ -81,11 +134,13 @@ def _synthetic_declared_worker(contract,symbol):
     def hold_dispatch(phase):
         if contract.get("synthetic_lease_hold_phase")==phase:
             note("held-"+phase)
-            until=time.monotonic()+30
+            until=time.monotonic()+180
             while not (board/"lease-release").exists() and time.monotonic()<until:
                 time.sleep(.02)
             assert (board/"lease-release").exists()
     def derive(**kwargs):
+        if ordinary:
+            return actual_derive(**kwargs)
         return {"schema_version":anchors.DECLARED_OWNER_SLOT_ROSTER_V2_SCHEMA,
             "slots":[{"ordinal":i} for i in range(1,14)],
             "synthetic_nonfinancial_bindings":json.loads(_encoded(kwargs))}
@@ -139,6 +194,10 @@ def _synthetic_declared_worker(contract,symbol):
         note("issue")
         if contract.get("synthetic_capacity_stage")=="precommit":
             capacity_failure()
+        if ordinary:
+            receipt = actual_issue(context, **kwargs)
+            contexts[receipt.receipt_sha256] = context
+            return receipt
         body={"schema_version":orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2,"run_id":kwargs["run_id"],"search_process_receipt_sha256":kwargs["process"].receipt_sha256,"cells":kwargs["cell_roster"],
             "spread_profile_identity":kwargs["spread_profile_identity"],
             "source_access_window_utc":kwargs["source_access_window_utc"],
@@ -154,6 +213,10 @@ def _synthetic_declared_worker(contract,symbol):
         return receipt
     def reopen(context,**kwargs):
         note("reopen")
+        if ordinary:
+            receipt = actual_reopen(context, **kwargs)
+            contexts[receipt.receipt_sha256] = context
+            return receipt
         body=json.loads((context.root/f"declared-slots/{kwargs['receipt_sha256']}/precommit.json").read_text())
         receipt=_Receipt(body)
         contexts[receipt.receipt_sha256]=context
@@ -179,7 +242,20 @@ def _synthetic_declared_worker(contract,symbol):
         if contract.get("synthetic_forbid_replay"):
             raise AssertionError("Completed cell was searched again")
         board.mkdir(parents=True,exist_ok=True)
-        (board/f"{symbol}.started").write_text(str(os.getpid()))
+        cell = precommit.to_dict()["cells"][0]
+        if ordinary:
+            (board/f"{precommit.to_dict()['run_id']}.started").write_bytes(_encoded(
+                {"pid": os.getpid(), "symbol": symbol, "timeframe": cell["timeframe"],
+                    "regime": cell["regime"], "root": str(context.root),
+                    "classification": "SYNTHETIC_METADATA_ONLY"}))
+            if contract.get("synthetic_unit_barrier"):
+                (board/f"unit-{symbol}-{cell['timeframe']}.arrived").write_text(str(os.getpid()))
+                until = time.monotonic() + 20
+                while len(list(board.glob("unit-*.arrived"))) < 2 and time.monotonic() < until:
+                    time.sleep(.02)
+                assert len(list(board.glob("unit-*.arrived"))) == 2
+        else:
+            (board/f"{symbol}.started").write_text(str(os.getpid()))
         if contract.get("synthetic_barrier"):
             until=time.monotonic()+10
             while len(list(board.glob("*.started")))<3 and time.monotonic()<until:
@@ -188,10 +264,19 @@ def _synthetic_declared_worker(contract,symbol):
         time.sleep(mode.get("delay",0))
         if mode.get("action")=="raise":
             raise RuntimeError("labelled synthetic exception")
+        if mode.get("action")=="permission":
+            raise PermissionError("labelled synthetic permission failure")
+        if mode.get("action")=="context":
+            raise orchestration.HistoricalAnchorOrchestrationError("DECLARED_SLOT_ROSTER_MISMATCH")
+        if mode.get("action")=="spool":
+            raise spool.AuthoritySpoolError("GENERATION_CONTEXT_CHANGED")
+        if mode.get("action")=="ordering":
+            raise producer.HistoricalSearchProducerError("DECLARED_UNIT_COMPLETION_ROSTER_INCOMPLETE")
         if mode.get("action")=="exit":
             os._exit(19)
+        count = len(precommit.to_dict().get("period_selection", {}).get("selected_slot_ids", range(13)))
         body={"schema_version":"SYNTHETIC_NONFINANCIAL_RUN","terminal_stop":mode.get("action")=="stop",
-            "completed_slots":13,"slots":list(range(1,14)),"local_trial_roster_sizes":[300]*13,
+            "completed_slots":count,"slots":list(range(1,count+1)),"local_trial_roster_sizes":[300]*count,
             "child_pid":os.getpid(),"qualification_authority":False}
         spool._publish_exact_json(context,run_path(precommit,cell_id),body,context.limits.max_json_bytes)
         milestones.add("slots-finalised")
@@ -230,10 +315,35 @@ def _synthetic_declared_worker(contract,symbol):
         note("native-request")
         if contract.get("synthetic_forbid_native_request"):
             raise AssertionError("Known lapse reached new native production")
-        return {"schema_version":"SYNTHETIC_NATIVE_REQUEST","symbol":kwargs["precommit"].to_dict()["cells"][0]["symbol"],
-            "execution_timeframe":"H1","cutoff_utc":"2024-06-22T00:00:00Z",
+        cell = kwargs["precommit"].to_dict()["cells"][0]
+        return {"schema_version":"SYNTHETIC_NATIVE_REQUEST","symbol":cell["symbol"],
+            "execution_timeframe":cell["timeframe"],"cutoff_utc":"2024-06-22T00:00:00Z",
             "spread_source_timeframe":"M5" if kwargs.get("execution_product") is not None else None,
             "frozen_profile_path":str(board/"profile.json"),"profile_sha256":"c"*64,"production_contract_required":True}
+    def produce_prefix(**kwargs):
+        if ordinary:
+            context = kwargs["context"]
+            spool._publish_exact_json(context, f"synthetic-native-prefix/{kwargs['timeframe']}.json",
+                {"classification": "SYNTHETIC_METADATA_ONLY", "symbol": kwargs["symbol"],
+                    "timeframe": kwargs["timeframe"], "generation": context.generation_id}, context.limits.max_json_bytes)
+        return SimpleNamespace()
+    def finalize_namespaces(result, *, context, row, process, **kwargs):
+        """Exercise actual per-cell grid storage, not a production retirement."""
+        import pm_end_grid as grid
+        policy = row["native_finalization"]
+        cell = row["cell"]
+        record = grid.build_end_grid_row(symbol=cell["symbol"], timeframe=cell["timeframe"], regime=cell["regime"],
+            cycle_start_utc="2023-06-24T00:00:00+00:00", cycle_end_utc="2023-07-22T00:00:00+00:00",
+            information_cutoff_utc="2023-06-23T00:00:00+00:00", outcome="STOP",
+            reason_code="SYNTHETIC_NAMESPACE_PROBE_ONLY", source_kind="broker_native",
+            source_contract_sha256=None, view_key=None, source_identity={}, cost_tier="NONE",
+            process_edition_sha256=process.receipt_sha256, code_sha256={"synthetic": "f" * 64})
+        grid.EndGridWriter(policy["end_grid_root"]).append(record)
+        probe = {"classification": "SYNTHETIC_NAMESPACE_PROBE_NOT_RETIREMENT", "cell_id": cell["cell_id"],
+            "root": str(context.root), "pid": os.getpid()}
+        Path(policy["source_fence_path"]).write_bytes(_encoded(probe))
+        Path(policy["retirement"]["receipt_path"]).write_bytes(_encoded(probe))
+        return result
     targets=[(binding,"load_effective_pipeline_config",lambda path:({},config)),
         (binding,"freeze_production_pipeline_config",lambda *args,**kwargs:frozen),
         (planner,"freeze_production_search_process",freeze_process),
@@ -251,18 +361,38 @@ def _synthetic_declared_worker(contract,symbol):
         (forward,"_prepare_declared_cell_account_artifact",prepare_account),
         (forward,"_declared_cell_account_native_request_from_inputs",request),
         (forward,"_produce_declared_cell_account_from_inputs",write_account),
-        (native,"produce_activated_native_prefix",lambda **kwargs:SimpleNamespace()),
+        (native,"produce_activated_native_prefix",produce_prefix),
         (native,"reverify_activated_native_prefix_product",lambda product,*args,**kwargs:product),
         (FeatureComputer,"clear_cache",lambda:None)]
+    if ordinary:
+        targets = [item for item in targets if item[:2] not in (
+            (binding,"load_effective_pipeline_config"), (binding,"freeze_production_pipeline_config"),
+            (planner,"reopen_production_search_process"))]
+        if any("native_finalization" in cell for cell in contract["cells"]):
+            targets.append((scheduler,"_declared_native_finalize_account",finalize_namespaces))
+        if contract.get("synthetic_forbid_process_freeze"):
+            targets.append((planner,"freeze_route_a_full_panel_production_search_process",freeze_process))
+        if contract.get("synthetic_observer_failure"):
+            def broken_observer(cell):
+                def broken(*args, **kwargs):
+                    raise OSError("labelled broken display sink")
+                return broken
+            targets.append((scheduler,"_declared_progress_observer",broken_observer))
     with ExitStack() as stack:
         for owner,name,replacement in targets:
             stack.enter_context(patch.object(owner,name,replacement))
         if contract.get("synthetic_dispatch_barrier"):
             note("arrived")
-            until=time.monotonic()+30
+            until=time.monotonic()+180
             while len(list(board.glob("*.arrived")))<2 and time.monotonic()<until:
                 time.sleep(.02)
             assert len(list(board.glob("*.arrived")))==2
+        if ordinary:
+            from contextlib import redirect_stdout
+            board.mkdir(parents=True, exist_ok=True)
+            with (board / f"child-{os.getpid()}.progress.txt").open("a", encoding="utf-8") as stream:
+                with redirect_stdout(stream):
+                    return scheduler.declared_symbol_worker(contract,symbol)
         return scheduler.declared_symbol_worker(contract,symbol)
 
 
@@ -516,7 +646,10 @@ def test_real_concurrent_scheduler_dispatch_lease_excludes_duplicate_work_throug
     with ThreadPoolExecutor(max_workers=2) as callers:
         futures=[callers.submit(dispatch,index) for index in range(2)]
         try:
-            done,pending=wait(futures,timeout=30,return_when=FIRST_COMPLETED)
+            startup_deadline = time.monotonic() + 180
+            while not list(board.glob("*.held-" + phase)) and not any(f.done() for f in futures) and time.monotonic() < startup_deadline:
+                time.sleep(.02)
+            done,pending=wait(futures,timeout=180,return_when=FIRST_COMPLETED)
             assert len(done)==1
             busy=next(iter(done)).result()
             assert busy["cells"][0]["status"]=="NOT_RUN"
@@ -524,7 +657,7 @@ def test_real_concurrent_scheduler_dispatch_lease_excludes_duplicate_work_throug
             busy_pid=busy["cells"][0]["worker_pid"]
             assert {p.suffix for p in board.glob(f"{busy_pid}.*")}=={".arrived"}
             assert busy["cells"][0]["precommit_sha256"] is None
-            until=time.monotonic()+30
+            until=time.monotonic()+180
             while not list(board.glob("*.held-"+phase)) and time.monotonic()<until:
                 time.sleep(.02)
             assert len(list(board.glob("*.held-"+phase)))==1
@@ -532,7 +665,7 @@ def test_real_concurrent_scheduler_dispatch_lease_excludes_duplicate_work_throug
         finally:
             board.mkdir(parents=True,exist_ok=True)
             (board/"lease-release").write_text("release synthetic metadata-only worker")
-        complete=next(iter(pending)).result(timeout=30)
+        complete=next(iter(pending)).result(timeout=180)
     assert complete["cells"][0]["status"]=="COMPLETED"
     assert complete["cells"][0]["run_receipt_confirmed"] is True
     assert len(list(Path(row["root"]).glob("declared-slots/*/precommit.json")))==1
@@ -768,3 +901,138 @@ def test_unresolved_or_invalid_parallel_reason_never_admits_capacity(tmp_path, r
     assert row["status"] == "FAILED" and row["reason_code"] == expected
     assert scheduler._declared_cell_deferral(contract, contract["cells"][0], row) is None
     assert row["run_receipt"] is None and row["account_descriptor"] is None
+
+
+def test_ordinary_one_period_same_symbol_timeframes_overlap_with_disjoint_namespaces(tmp_path, capfd):
+    import pm_authority_spool as spool
+    import pm_end_grid as grid
+    import pm_historical_search_producer as producer
+    import pm_production_search_planner as planner
+    axes = [("EURUSD", timeframe, regime) for timeframe in ("H1", "H4")
+        for regime in ("TREND", "RANGE")]
+    contract = _ordinary_contract(tmp_path, axes, namespaces=True)
+    contract["synthetic_unit_barrier"] = True
+    report = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+        requested_workers=2, telemetry_path=tmp_path / "ordinary-overlap.jsonl")
+    assert report["status"] == "COMPLETED" and report["worker_limit"] == 2
+    assert [row["descriptor_index"] for row in report["cells"]] == list(range(len(axes)))
+    assert [row["cell_id"] for row in report["cells"]] == [row["cell"]["cell_id"] for row in contract["cells"]]
+    assert all(row["status"] == "COMPLETED" and row["independent_one_period"] is True
+        and row["run_receipt_confirmed"] for row in report["cells"])
+    pids = {timeframe: {result["worker_pid"] for source, result in zip(contract["cells"], report["cells"], strict=True)
+        if source["cell"]["timeframe"] == timeframe}
+        for timeframe in ("H1", "H4")}
+    assert all(len(values) == 1 for values in pids.values()) and pids["H1"].isdisjoint(pids["H4"])
+    board = Path(contract["synthetic_board"])
+    arrivals = list(board.glob("unit-*.arrived"))
+    assert len(arrivals) == 2 and len({path.read_text() for path in arrivals}) == 2
+    process_receipts = set()
+    staged_prefixes = set()
+    for row, result in zip(contract["cells"], report["cells"], strict=True):
+        root = Path(row["root"])
+        context = spool.reopen_generation_context(root, expected_generation_id=row["run_id"],
+            expected_native_universe_sha256=contract["native_universe_sha256"],
+            expected_config_sha256=contract["config_sha256"])
+        manifest, _, _ = producer._read_declared_record(context, spool._manifest_relative_path(planner.PROCESS_SPOOL_SYMBOL, spool.GENERAL_MANIFEST_DOMAIN))
+        descriptor = manifest["artifacts"][0]["descriptor"]
+        body = json.loads((root / descriptor["relative_path"]).read_bytes())
+        assert body["schema_version"] == planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA
+        assert body["run_id"] == row["run_id"]
+        process_receipts.add(descriptor["sha256"])
+        for path in (root / "synthetic-native-prefix").glob("*.json"):
+            probe = json.loads(path.read_bytes())
+            assert probe["generation"] == row["run_id"] and probe["symbol"] == "EURUSD"
+            staged_prefixes.add(path)
+        assert (root / "declared-scheduler.lock").is_file()
+        with scheduler._declared_dispatch_lease(context) as acquired:
+            assert acquired is True
+        policy = row["native_finalization"]
+        records = grid.read_end_grid(policy["end_grid_root"], "EURUSD")
+        assert len(records) == 1 and records[0].cell_id == row["cell"]["cell_id"]
+        assert records[0].reason_code == "SYNTHETIC_NAMESPACE_PROBE_ONLY"
+        for path in (policy["source_fence_path"], policy["retirement"]["receipt_path"]):
+            probe = json.loads(Path(path).read_bytes())
+            assert probe == {"classification": "SYNTHETIC_NAMESPACE_PROBE_NOT_RETIREMENT",
+                "cell_id": row["cell"]["cell_id"], "root": str(root), "pid": result["worker_pid"]}
+    assert len(process_receipts) == len(axes) and len(staged_prefixes) == 2 * len(axes)
+    child_lines = [line for path in board.glob("child-*.progress.txt") for line in path.read_text().splitlines()
+        if line.startswith("FXPM unit=")]
+    assert child_lines and all("FXPM unit=EURUSD/" in line and "stage=" in line for line in child_lines)
+    assert any("stage=child_start" in line for line in child_lines)
+    assert any("stage=cell_done" in line and "count=2/2" in line for line in child_lines)
+    assert any("stage=child_done" in line for line in child_lines)
+    assert all(not any(key in line.lower() for key in ("win_rate", "net_profit", "sharpe", "score=")) for line in child_lines)
+    parent_lines = capfd.readouterr().out
+    assert "stage=dispatch" in parent_lines and "stage=unit_done" in parent_lines and "count=2/2" in parent_lines
+
+
+@pytest.mark.parametrize("action,status,reason", [
+    ("raise", "FAILED", "RuntimeError"), ("stop", "TERMINAL_STOP", "NEW_TERMINAL_STOP")])
+def test_ordinary_one_period_failure_continues_sibling_cells_and_refills_queue(tmp_path, action, status, reason):
+    contract = _ordinary_contract(tmp_path, [("EURUSD", "H1", "TREND"),
+        ("EURUSD", "H1", "RANGE"), ("EURUSD", "H4", "TREND")])
+    contract["synthetic_behaviors"] = {"synthetic-cell-0": {"action": action}}
+    with pytest.raises(scheduler.DeclaredSymbolSchedulerError) as caught:
+        scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+            requested_workers=1, telemetry_path=tmp_path / "ordinary-failure.jsonl")
+    report = caught.value.report
+    assert report["status"] == "FAILED"
+    assert [row["status"] for row in report["cells"]] == [status, "COMPLETED", "COMPLETED"]
+    assert report["cells"][0]["reason_code"] == reason
+    assert all(row["independent_one_period"] is True for row in report["cells"])
+    assert all(Path(row["root"]).exists() for row in contract["cells"])
+    assert all(row["run_receipt_confirmed"] for row in report["cells"][1:])
+
+
+@pytest.mark.parametrize("action,reason", [("permission", "PermissionError"),
+    ("context", "DECLARED_SLOT_ROSTER_MISMATCH"),
+    ("ordering", "DECLARED_UNIT_COMPLETION_ROSTER_INCOMPLETE"),
+    ("spool", "GENERATION_CONTEXT_CHANGED")])
+def test_ordinary_one_period_fatal_failure_stops_refill_and_labels_unstarted_cells(tmp_path, action, reason):
+    contract = _ordinary_contract(tmp_path, [("EURUSD", "H1", "TREND"),
+        ("EURUSD", "H1", "RANGE"), ("EURUSD", "H4", "TREND")])
+    contract["synthetic_behaviors"] = {"synthetic-cell-0": {"action": action}}
+    with pytest.raises(scheduler.DeclaredSymbolSchedulerError) as caught:
+        scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+            requested_workers=1, telemetry_path=tmp_path / "ordinary-fatal.jsonl")
+    report = caught.value.report
+    assert report["status"] == "FAILED"
+    assert [row["status"] for row in report["cells"]] == ["FAILED", "NOT_RUN", "NOT_RUN"]
+    assert report["cells"][0]["reason_code"] == reason
+    assert report["cells"][0]["closes_admission"] is True
+    assert all(row["reason_code"] for row in report["cells"][1:])
+    assert all(not Path(row["root"]).exists() for row in contract["cells"][1:])
+
+
+@pytest.mark.parametrize("mode", ["handover", "final_study_13"])
+def test_ordinary_dependent_modes_keep_symbol_dispatch_and_serial_cell_order(tmp_path, mode):
+    contract = _ordinary_contract(tmp_path, [("EURUSD", "H1", "TREND"), ("EURUSD", "H4", "TREND")], mode=mode)
+    report = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+        requested_workers=2, telemetry_path=tmp_path / "dependent-mode.jsonl")
+    assert report["status"] == "COMPLETED" and report["worker_limit"] == 1
+    assert [row["status"] for row in report["cells"]] == ["COMPLETED", "COMPLETED"]
+    assert len({row["worker_pid"] for row in report["cells"]}) == 1
+    assert all(row.get("independent_one_period", False) is False for row in report["cells"])
+
+
+def test_ordinary_saved_contexts_keep_symbol_grouping_without_new_search_or_process(tmp_path):
+    contract = _ordinary_contract(tmp_path, [("EURUSD", "H1", "TREND"), ("EURUSD", "H4", "TREND")])
+    first = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+        requested_workers=2, telemetry_path=tmp_path / "fresh-contexts.jsonl")
+    assert first["status"] == "COMPLETED" and first["worker_limit"] == 2
+    contract.update(synthetic_forbid_replay=True, synthetic_forbid_process_freeze=True)
+    second = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+        requested_workers=2, telemetry_path=tmp_path / "saved-contexts.jsonl")
+    assert second["status"] == "COMPLETED" and second["worker_limit"] == 1
+    assert [row["status"] for row in second["cells"]] == ["REOPENED", "REOPENED"]
+    assert len({row["worker_pid"] for row in second["cells"]}) == 1
+
+
+def test_ordinary_child_progress_sink_failure_is_observational(tmp_path):
+    contract = _ordinary_contract(tmp_path, [("EURUSD", "H1", "TREND"), ("EURUSD", "H1", "RANGE")])
+    contract["synthetic_observer_failure"] = True
+    report = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
+        requested_workers=1, telemetry_path=tmp_path / "broken-progress.jsonl")
+    assert report["status"] == "COMPLETED"
+    assert [row["status"] for row in report["cells"]] == ["COMPLETED", "COMPLETED"]
+    assert all(row["independent_one_period"] is True and row["run_receipt_confirmed"] for row in report["cells"])

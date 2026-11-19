@@ -2341,9 +2341,8 @@ def test_transport_historical_entrypoint_requires_explicit_capture_generation(mo
     assert observed == [{"capture": capture}]
 
 
-def test_transport_current_cross_binding_uses_v5_and_preserves_cost_bijection(monkeypatch):
-    """SYNTHETIC outer-binding witness over the unchanged inner mapping schema."""
-    historical = {"schema_version": execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
+def _current_cross_binding_invented_inputs(monkeypatch, generation, historical_schema):
+    historical = {"schema_version": historical_schema,
         "producer_request_sha256": "1" * 64, "anchor_id": "synthetic-anchor",
         "selection_cutoff_utc": "2025-01-01T00:00:00Z", "process_precommit_receipt_sha256": "2" * 64,
         "mapping": [{"fixture_provenance": "SYNTHETIC_BINDING_ONLY"}], "mapping_sha256": "3" * 64}
@@ -2351,18 +2350,58 @@ def test_transport_current_cross_binding_uses_v5_and_preserves_cost_bijection(mo
     plan = SimpleNamespace(receipt_sha256="4" * 64, causal_precommit_receipt_sha256="5" * 64)
     fitted = SimpleNamespace(source_group_decision=SimpleNamespace(receipt_sha256="6" * 64),
         regime_fit_decision=SimpleNamespace(receipt_sha256="7" * 64))
-    value = execution._build_current_cross_binding_bytes(cell_plan=plan,
+    kwargs = dict(cell_plan=plan,
         process=SimpleNamespace(receipt_sha256="8" * 64), plan_body={"anchor": {"anchor_id": "synthetic-anchor"}},
         plan_binding={"plan_receipt_sha256": "9" * 64},
-        frozen=SimpleNamespace(artifact_namespace="synthetic-v16", selection_generation=winner.V16_GENERATION),
+        frozen=SimpleNamespace(artifact_namespace="synthetic-current-binding", selection_generation=generation),
         attempt_artifacts=(), fitted=fitted, horizon_execution_contracts=(), source_count_receipts=())
-    body = execution.json.loads(value)
-    assert body["schema_version"] == execution.raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5
+    return kwargs, historical
+
+
+@pytest.mark.parametrize("generation,historical_schema,current_schema", [
+    pytest.param(winner.V16_GENERATION,
+        execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4,
+        execution.raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5, id="v16"),
+    pytest.param(winner.V17_GENERATION,
+        execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5,
+        execution.raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6, id="v17"),
+    pytest.param(winner.V18_GENERATION,
+        execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V6,
+        execution.raw_winner.CURRENT_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V7, id="v18"),
+])
+def test_current_cross_binding_uses_generation_schema_and_preserves_cost_bijection(
+    monkeypatch, generation, historical_schema, current_schema
+):
+    """SYNTHETIC outer binding only; no current-refit route or grant is issued."""
+    kwargs, historical = _current_cross_binding_invented_inputs(monkeypatch, generation, historical_schema)
+    body = execution.json.loads(execution._build_current_cross_binding_bytes(**kwargs))
+    assert body["schema_version"] == current_schema
     assert body["mapping"] == historical["mapping"]
     assert body["mapping_sha256"] == historical["mapping_sha256"]
     assert body["mode"] == execution.raw_winner.CURRENT_CROSS_BINDING_MODE
-    assert body["cell_plan_receipt_sha256"] == plan.receipt_sha256
-    assert "anchor_id" not in body
+    assert body["cell_plan_receipt_sha256"] == kwargs["cell_plan"].receipt_sha256
+    assert body["causal_precommit_receipt_sha256"] == kwargs["cell_plan"].causal_precommit_receipt_sha256
+    assert body["search_process_receipt_sha256"] == kwargs["process"].receipt_sha256
+    assert not {"producer_request_sha256", "anchor_id", "selection_cutoff_utc",
+        "process_precommit_receipt_sha256"}.intersection(body)
+
+
+@pytest.mark.parametrize("generation,crossed_schema", [
+    pytest.param(winner.CURRENT_GENERATION,
+        execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4, id="v15"),
+    pytest.param(winner.V16_GENERATION,
+        execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V3, id="v16"),
+    pytest.param(winner.V17_GENERATION,
+        execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V4, id="v17"),
+    pytest.param(winner.V18_GENERATION,
+        execution.raw_winner.HISTORICAL_HORIZON_WINNER_CROSS_BINDING_SCHEMA_V5, id="v18"),
+])
+def test_current_cross_binding_refuses_crossed_historical_generation(monkeypatch, generation, crossed_schema):
+    """SYNTHETIC schema mismatch; the outer conversion must not relabel it."""
+    kwargs, _ = _current_cross_binding_invented_inputs(monkeypatch, generation, crossed_schema)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._build_current_cross_binding_bytes(**kwargs)
+    assert caught.value.code == "CURRENT_CROSS_BINDING_BASE_INVALID"
 
 
 @pytest.mark.parametrize("kind", ["plain", "declared", "canary"])
@@ -7826,6 +7865,9 @@ def _attempt_boundary_invented_continuation(tmp_path, monkeypatch, *, full_panel
     monkeypatch.setattr(execution, "_declared_unit_binding", lambda *args: copy.deepcopy(binding))
     monkeypatch.setattr(execution, "_route_a_working_fitted", copy.deepcopy)
     monkeypatch.setattr(execution, "_route_a_owner_membership_snapshot", lambda **kwargs: copy.deepcopy(snapshot))
+    # This one-strategy fixture does not claim a complete production domain roster.
+    monkeypatch.setattr(search_planner, "_domain_by_name", lambda body, **kwargs:
+        {row["strategy_id"]: copy.deepcopy(row) for row in body["semantics"]["strategy_domains"]})
     monkeypatch.setattr(search_planner, "_route_a_full_panel_preparation_contract", lambda **kwargs: {"fixture": "INVENTED"})
     monkeypatch.setattr(execution, "_route_a_full_panel_specifications", lambda **kwargs:
                         specifications(kwargs["attempt_ordinal"]))
@@ -7844,7 +7886,7 @@ def _attempt_boundary_invented_continuation(tmp_path, monkeypatch, *, full_panel
                         SimpleNamespace(source_contract=source_identity))
     monkeypatch.setattr(execution.pm_core, "build_backtest_spread_mode", lambda value: "INVENTED")
     monkeypatch.setattr(execution, "_verify_partition_precommitment", lambda **kwargs: events.append(("provenance",)))
-    monkeypatch.setattr(execution, "_runtime_strategy", lambda attempt: (object(), None))
+    monkeypatch.setattr(execution, "_runtime_strategy", lambda *args, **kwargs: (object(), None))
     monkeypatch.setattr(execution, "_build_full_prefix_strategy_surface", lambda **kwargs: object())
     monkeypatch.setattr(execution, "_run_tier_partition", run_partition)
     monkeypatch.setattr(execution, "_route_a_pair_check", lambda **kwargs: {"status": "VERIFIED", "missing_tiers": []})
@@ -7888,7 +7930,7 @@ def _attempt_boundary_invented_continuation(tmp_path, monkeypatch, *, full_panel
 
     return SimpleNamespace(run=run, events=events, reads=reads, staged=staged,
         original_frame=frame.copy(deep=True), fitted=fitted, config=config,
-        legacy_observation=legacy_observation)
+        legacy_observation=legacy_observation, attempts=attempts)
 
 
 def test_route_a_full_panel_checks_whole_state_at_owned_unit_boundaries_not_nested_requests(tmp_path, monkeypatch):
@@ -8201,3 +8243,328 @@ def test_retained_matched_source_refuses_crossed_generation_before_reopen(monkey
     with pytest.raises(execution.AuthoritativeSearchExecutionError, match="MATCHED_FLOOR_FROZEN_SOURCE_EDITION_REQUIRED"):
         execution._reopen_route_a_matched_source_material(None, request=None, process=body,
             frozen=frozen, frozen_pipeline_config=NoSourceAccess())
+
+
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_one_period_search_progress_uses_actual_resumed_units_and_is_observational(tmp_path, sink_fails):
+    """INVENTED three-unit storage; no data, model, Winner or account work."""
+    context, body, binding, units = _completed_unit_store_fixture(tmp_path)
+    produced, progress = [], []
+    def observe(stage, done, total):
+        progress.append((stage, done, total))
+        if sink_fails:
+            raise OSError('INVENTED broken display')
+    def produce(unit):
+        produced.append(unit['ordinal'])
+        if unit['ordinal'] == 1 and produced.count(0) == 1 and produced.count(1) == 1:
+            raise RuntimeError('INVENTED interrupted second unit')
+        return _synthetic_completed_unit_value(unit)
+    with pytest.raises(RuntimeError, match='interrupted second unit'):
+        execution._continue_declared_attempt_units(context, body, binding, units, produce, progress=observe)
+    assert [p for p in progress if p[0] == 'search_attempts'] == [('search_attempts', 0, 3), ('search_attempts', 1, 3)]
+    progress.clear()
+    records, ended = execution._continue_declared_attempt_units(context, body, binding, units,
+        lambda unit: produced.append(unit['ordinal']) or _synthetic_completed_unit_value(unit), progress=observe)
+    assert len(records) == 3 and ended
+    assert progress == [('search_attempts', 1, 3), ('search_attempts', 3, 3)]
+    assert produced == [0, 1, 1, 2]
+    assert all(isinstance(stage, str) and isinstance(done, int) and isinstance(total, int)
+        for stage, done, total in progress)
+
+
+@pytest.mark.parametrize("sink_fails", [False, True])
+def test_one_period_raw_result_progress_is_inside_actual_rejected_row_loop(tmp_path, monkeypatch, sink_fails):
+    """INVENTED two-row loop projection; authority/fold/final-decision boundaries are stubs."""
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    import json
+    import pm_winner_raw_evidence as raw
+    import pm_authority_spool as spool
+    context, _, _, _ = _completed_unit_store_fixture(tmp_path)
+    sink = spool.open_symbol_sink(context, 'EURUSD')
+    generation = raw.winner.V17_GENERATION
+    attempts = [{'ordinal': i, 'attempt_id': f'INVENTED-{i}', 'process_candidate_id': f'INVENTED-p{i}',
+        'precommitted_evidence_role': 'PRESEARCH_PROCESS_REJECTED'} for i in range(2)]
+    costs = {}
+    precommit = {'contract_version': generation.precommitment_version,
+        'selection_policy_sha256': generation.policy_sha256, 'frozen_tier_pair_contract': {},
+        'partition_cost_precommitments_sha256': raw._sha_json(costs),
+        'latest_evidence_boundary_utc': '2024-01-01T00:00:00Z', 'causal_fold_plan': []}
+    ledger = {'attempt_count': 2, 'attempts': attempts, 'frozen_at_utc': '2024-01-01T00:00:00Z',
+        'partition_cost_precommitments_sha256': raw._sha_json(costs)}
+    receipt = {'partition_cost_precommitments_sha256': raw._sha_json(costs),
+        'precommitment_sha256': raw._sha_json(precommit), 'attempt_ledger_sha256': raw._sha_json(ledger)}
+    frozen = object.__new__(raw.FrozenWinnerSearchPlan)
+    for name, value in {'symbol': 'EURUSD', 'timeframe': 'H1', 'regime': 'TREND',
+        'generation_context_sha256': context.context_sha256, 'artifact_namespace': 'INVENTED-progress-loop',
+        'frozen_receipt_bytes': raw._canonical_bytes(receipt)}.items():
+        object.__setattr__(frozen, name, value)
+    for name, value in {'precommitment': precommit, 'attempt_ledger': ledger,
+        'risk_unit_contract': raw.build_precommitted_risk_unit_contract(), 'source_contract_seeds': {},
+        'frozen_tier_pair_contract': {}, 'partition_cost_precommitments': costs, 'horizon_execution_contracts': []}.items():
+        monkeypatch.setattr(raw.FrozenWinnerSearchPlan, name, property(lambda self, value=value: value))
+    monkeypatch.setattr(raw, '_current_pair_inputs', lambda *a, **k: ({}, {}, {}))
+    monkeypatch.setattr(raw, '_normalized_horizon_execution_contracts', lambda *a, **k: [])
+    monkeypatch.setattr(raw, '_validated_partition_cost_precommitments', lambda *a, **k: costs)
+    monkeypatch.setattr(raw, '_index_partition_cost_precommitments', lambda *a, **k: {})
+    monkeypatch.setattr(raw, '_verified_frozen_attempt_bundle', lambda *a, **k: [{}, {}])
+    monkeypatch.setattr(raw, '_reopen_current_frozen_plan_artifacts', lambda *a, **k: receipt)
+    monkeypatch.setattr(raw, '_validated_horizon_winner_cross_binding', lambda *a, **k: ({}, [{}, {}], {}))
+    monkeypatch.setattr(raw.authority_spool, 'publication_batch', lambda *a, **k: nullcontext())
+    actual_rows = []
+    monkeypatch.setattr(raw, '_outcome_status', lambda *a, **k: 'PROCESS_REJECTED')
+    monkeypatch.setattr(raw, '_put_ascii_json', lambda *a, **k: {'classification': 'INVENTED-publication'})
+    def row(attempt, *, status, folds):
+        actual_rows.append(attempt['ordinal'])
+        return {'ordinal': attempt['ordinal'], 'status': status, 'folds': folds}
+    monkeypatch.setattr(raw, '_evidence_entry', row)
+    progress = []
+    def observe(stage, done, total):
+        progress.append((stage, done, total))
+        if sink_fails:
+            raise OSError('INVENTED display failure')
+    outcome = SimpleNamespace(to_dict=lambda: {'status': 'PROCESS_REJECTED', 'classification': 'INVENTED-loop-only'})
+    with pytest.raises(raw.WinnerRawEvidenceError, match='SHARED_FOLD_AXIS_UNAVAILABLE'):
+        raw.produce_winner_v17_raw_evidence(sink, frozen=frozen,
+            attempt_evidence=[{'attempt_id': a['attempt_id'], 'outcome': outcome} for a in attempts],
+            evidence_access_started_at_utc='2024-01-02T00:00:00Z', evidence_access_completed_at_utc='2024-01-02T00:00:01Z',
+            artifact_namespace='INVENTED-progress-loop', progress=observe)
+    assert actual_rows == [0, 1]
+    assert progress == [('result_attempts', 0, 2), ('result_attempts', 1, 2),
+        ('result_attempts', 2, 2), ('result_finalize', None, None)]
+
+@pytest.mark.parametrize("kind", ("float64", "float32", "int64", "mixed", "nan"))
+def test_matched_source_column_views_preserve_original_scalar_values(kind):
+    """Source-price scalar compatibility only; no model or financial evidence."""
+    frame = pd.DataFrame({"Open": [100.0, 101.0, 102.0], "High": [102.25, 103.375, 104.5],
+        "Low": [-0.0, 100.123456789, 101.75], "Close": [101.125, 102.00000007, 103.3]},
+        index=pd.date_range("2024-01-01", periods=3, freq="h", tz="UTC"))
+    if kind in ("float32", "int64"): frame = frame.astype(kind)
+    elif kind == "mixed":
+        frame["Open"] = frame["Open"].astype("int64")
+        frame["High"] = frame["High"].astype("float32")
+    elif kind == "nan": frame.loc[frame.index[1], "Low"] = float("nan")
+    columns = {}
+    for bar in (0, 1, execution.np.int64(2)):
+        for name in ("Open", "High", "Low", "Close"):
+            expected = float(frame.iloc[bar][name])
+            actual = execution._route_a_source_column_number(frame, columns, name, bar)
+            if execution.np.isnan(expected): assert execution.np.isnan(actual)
+            else: assert execution.np.float64(actual).tobytes() == execution.np.float64(expected).tobytes()
+    assert set(columns) == {"Open", "High", "Low", "Close"}
+    assert all(not value.flags.writeable for value in columns.values())
+    assert all(execution.np.shares_memory(columns[name], frame[name].to_numpy(copy=False)) for name in columns)
+
+
+@pytest.mark.parametrize("bar", (0.0, True, execution.np.float64(1.0), execution.np.bool_(False)))
+def test_matched_source_column_views_keep_pandas_invalid_index_errors(bar):
+    frame = pd.DataFrame({"Open": [1.0, 2.0]})
+    with pytest.raises(Exception) as original:
+        float(frame.iloc[bar]["Open"])
+    columns = {}
+    with pytest.raises(type(original.value)) as actual:
+        execution._route_a_source_column_number(frame, columns, "Open", bar)
+    assert str(actual.value) == str(original.value) and columns == {}
+
+
+def test_matched_source_ohlc_views_are_reused_and_lazy_when_no_path_needs_them(monkeypatch):
+    case = _tiny_prepared_matched_source_case(monkeypatch)
+    cache = {}
+    assert execution._verify_route_a_matched_fact_source(case.facts, case.geometry,
+        **case.arguments, _prepared_source_cache=cache)
+    columns = next(iter(cache.values()))[2]
+    assert set(columns) == {"Open", "High", "Low", "Close"}
+    originals = dict(columns)
+    assert execution._verify_route_a_matched_fact_source(copy.deepcopy(case.facts), case.geometry,
+        **case.arguments, _prepared_source_cache=cache)
+    assert all(columns[name] is originals[name] for name in columns)
+    columns.clear()
+    no_trades = copy.deepcopy(case.facts)
+    no_trades["trades"] = []
+    monkeypatch.setattr(execution, "_verify_route_a_exact_swap_source", lambda *args, **kwargs: None)
+    assert execution._verify_route_a_matched_fact_source(no_trades, case.geometry,
+        **case.arguments, _prepared_source_cache=cache)
+    assert columns == {}
+    unavailable = copy.deepcopy(case.facts)
+    unavailable["floor_status"] = "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH"
+    for trade in unavailable["trades"]: trade["base_fill_witness"].pop("held_bar_inputs", None)
+    assert execution._verify_route_a_matched_fact_source(unavailable, case.geometry,
+        **case.arguments, _prepared_source_cache=cache)
+    assert columns == {}
+
+
+@pytest.mark.parametrize("location", ("entry", "held"))
+@pytest.mark.parametrize("which", ("negative", "past_end"))
+def test_matched_source_range_refuses_before_column_access(monkeypatch, location, which):
+    case = _tiny_prepared_matched_source_case(monkeypatch)
+    changed = copy.deepcopy(case.facts)
+    fill = changed["trades"][0]["base_fill_witness"]
+    bar = -1 if which == "negative" else len(case.arguments["source_frame"])
+    if location == "entry": fill["entry_bar"] = bar
+    else: fill["held_bar_inputs"][0]["bar"] = bar
+    original = execution._route_a_source_column_number
+    def checked(frame, columns, name, position):
+        assert 0 <= position < len(frame), "invalid source position reached a column array"
+        return original(frame, columns, name, position)
+    monkeypatch.setattr(execution, "_route_a_source_column_number", checked)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        execution._verify_route_a_matched_fact_source(changed, case.geometry, **case.arguments)
+    assert caught.value.code == ("MATCHED_FLOOR_ENTRY_SOURCE_CHANGED" if location == "entry"
+        else "MATCHED_FLOOR_HELD_BAR_SOURCE_CHANGED")
+
+
+def _invented_attempt_surface_reuse(tmp_path, monkeypatch, *, attempts=1, mode="plain", damage=None, expiry=None):
+    """INVENTED state/dispatch proof; probes, authority and numerical execution are stubs."""
+    actual_surface = execution._build_full_prefix_strategy_surface
+    case = _attempt_boundary_invented_continuation(tmp_path, monkeypatch,
+        attempt_count=attempts, damage=damage, expiry=expiry)
+    for attempt in case.attempts:
+        attempt.artifacts.refit_recipe_sha256 = "a" * 64
+    counts = {"features": 0, "signals": 0, "runs": 0, "copies": 0}
+    consumers, surfaces, states = [], [], []
+
+    class InventedStrategy:
+        __module__ = execution.StrategyRegistry.__module__
+        def __init__(self):
+            self.params = {"period": 2}
+            self.state = {"generated": 0, "consumed": []}
+            if mode == "opaque": self.opaque = object()
+            if mode == "changing_initial": self.state["initial"] = len(consumers)
+        def generate_signals(self, features, symbol):
+            counts["signals"] += 1
+            self.state["generated"] += 1
+            features["INVENTED_HELPER"] = [7.0, 8.0]
+            features.attrs["_fxpm_precomputed_params"] = {"INVENTED_HELPER": (2,)}
+            return pd.Series([1, -1], index=features.index, dtype="int32")
+
+    strategy_class = InventedStrategy
+    if mode == "slotted":
+        class Slotted(InventedStrategy):
+            __module__ = execution.StrategyRegistry.__module__
+            __slots__ = ("slot_state",)
+        strategy_class = Slotted
+    elif mode == "custom_copy":
+        class CustomCopy(InventedStrategy):
+            __module__ = execution.StrategyRegistry.__module__
+            def __deepcopy__(self, memo):
+                counts["copies"] += 1
+                raise RuntimeError("INVENTED non-copyable state")
+        strategy_class = CustomCopy
+    elif mode == "external":
+        class External(InventedStrategy):
+            __module__ = "invented_external_strategy"
+        strategy_class = External
+    monkeypatch.setitem(execution.StrategyRegistry._strategies, "INVENTED_STRATEGY", strategy_class)
+
+    def materialize(*args, **kwargs):
+        strategy = strategy_class()
+        consumers.append(strategy)
+        return strategy, {"period": 2}
+
+    def features(*, frame, **kwargs):
+        counts["features"] += 1
+        return frame.copy(deep=True)
+
+    def surface(**kwargs):
+        value = actual_surface(**kwargs)
+        surfaces.append(value)
+        return value
+
+    run_partition = execution._run_tier_partition
+    def consume(**kwargs):
+        counts["runs"] += 1
+        strategy = kwargs["strategy"]
+        assert strategy is consumers[-1]
+        assert strategy.state["generated"] == 1 and strategy.state["consumed"] == []
+        states.append(strategy.state)
+        strategy.state["consumed"].append("INVENTED independent stop state")
+        partition_features, signals = execution._slice_full_prefix_strategy_surface(
+            partition=kwargs["partition"], full_prefix_surface=kwargs["full_prefix_surface"])
+        assert signals.tolist() == [1, -1]
+        assert partition_features["INVENTED_HELPER"].tolist() == [7.0, 8.0]
+        assert partition_features.attrs["_fxpm_precomputed_params"] == {"INVENTED_HELPER": (2,)}
+        partition_features.loc[:, "INVENTED_HELPER"] = 999.0
+        partition_features.attrs["_fxpm_precomputed_params"]["INVENTED_HELPER"] = (999,)
+        return run_partition(**kwargs)
+
+    monkeypatch.setattr(execution, "_runtime_strategy", materialize)
+    monkeypatch.setattr(execution, "_compute_fitted_strategy_features", features)
+    monkeypatch.setattr(execution, "_build_full_prefix_strategy_surface", surface)
+    monkeypatch.setattr(execution, "_run_tier_partition", consume)
+    return SimpleNamespace(case=case, counts=counts, consumers=consumers,
+        surfaces=surfaces, states=states, strategy_class=strategy_class)
+
+
+@pytest.mark.parametrize("attempts", (1, 2))
+def test_full_prefix_attempt_reuse_keeps_state_tags_and_same_ordinal_replay(tmp_path, monkeypatch, attempts):
+    observed = _invented_attempt_surface_reuse(tmp_path, monkeypatch, attempts=attempts)
+    original = execution._FullPanelOwnerPreparation.prepare_owned
+    replay_counts = []
+    def prepare(self, **kwargs):
+        first = kwargs["prepare_attempt"](0)
+        before = dict(observed.counts)
+        second = kwargs["prepare_attempt"](0)
+        assert observed.counts == before
+        assert first == second
+        replay_counts.append(before)
+        return original(self, **kwargs)
+    monkeypatch.setattr(execution._FullPanelOwnerPreparation, "prepare_owned", prepare)
+    observed.case.run()
+    assert observed.counts == {"features": attempts, "signals": attempts, "runs": 24 * attempts, "copies": 0}
+    assert replay_counts[0]["runs"] == 24
+    assert len({id(value) for value in observed.consumers}) == 24 * attempts
+    assert len({id(value) for value in observed.states}) == 24 * attempts
+    assert len(observed.surfaces) == attempts
+    for surface in observed.surfaces:
+        assert surface.features["INVENTED_HELPER"].tolist() == [7.0, 8.0]
+        assert surface.features.attrs["_fxpm_precomputed_params"] == {"INVENTED_HELPER": (2,)}
+    assert observed.case.reads == {"config": 2, "stream": 4}
+
+
+@pytest.mark.parametrize("mode", ("opaque", "slotted", "custom_copy", "external", "changing_initial"))
+def test_full_prefix_attempt_unsupported_or_changed_initial_state_computes_normally(tmp_path, monkeypatch, mode):
+    observed = _invented_attempt_surface_reuse(tmp_path, monkeypatch, mode=mode)
+    observed.case.run()
+    assert observed.counts == {"features": 24, "signals": 24, "runs": 24, "copies": 0}
+
+
+@pytest.mark.parametrize("changed", ("class", "parameters", "recipe"))
+def test_full_prefix_attempt_surface_key_separates_actual_inputs(tmp_path, monkeypatch, changed):
+    observed = _invented_attempt_surface_reuse(tmp_path, monkeypatch)
+    strategy = observed.strategy_class()
+    kwargs = {"strategy_id": "INVENTED_STRATEGY", "parameters": {"period": 2}, "recipe": "a" * 64}
+    original = execution._route_a_strategy_surface_key(strategy, **kwargs)
+    assert original is not None
+    if changed == "parameters": kwargs["parameters"] = {"period": 3}
+    elif changed == "recipe": kwargs["recipe"] = "b" * 64
+    else:
+        class Other(observed.strategy_class):
+            __module__ = execution.StrategyRegistry.__module__
+        strategy = Other()
+        monkeypatch.setitem(execution.StrategyRegistry._strategies, "INVENTED_STRATEGY", Other)
+    assert execution._route_a_strategy_surface_key(strategy, **kwargs) != original
+
+
+def test_full_prefix_attempt_reuse_is_separate_for_another_cell(tmp_path, monkeypatch):
+    for name in ("first", "second"):
+        root = tmp_path / name
+        root.mkdir()
+        with monkeypatch.context() as local:
+            observed = _invented_attempt_surface_reuse(root, local)
+            observed.case.run()
+            assert observed.counts["signals"] == 1 and observed.counts["runs"] == 24
+
+
+@pytest.mark.parametrize("damage,expiry,expected", (
+    ("frame_run", None, "ROUTE_A_UNIT_BATCH_SHARED_CONTENT_CHANGED"),
+    ("config_run", None, "ROUTE_A_UNIT_BATCH_SHARED_CONTENT_CHANGED"),
+    (None, "after_run", "ROUTE_A_UNIT_BATCH_SOURCE_WINDOW_CLOSED"),
+))
+def test_full_prefix_attempt_supported_state_keeps_realized_refusals(tmp_path, monkeypatch, damage, expiry, expected):
+    observed = _invented_attempt_surface_reuse(tmp_path, monkeypatch, damage=damage, expiry=expiry)
+    with pytest.raises(execution.AuthoritativeSearchExecutionError) as caught:
+        observed.case.run()
+    assert caught.value.code == expected
+    assert observed.counts["signals"] == observed.counts["runs"] == 1
+    pd.testing.assert_frame_equal(observed.case.fitted._frame, observed.case.original_frame)
+    assert observed.case.config.fixture_value == 1 and observed.case.staged == []

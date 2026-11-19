@@ -6,6 +6,9 @@ The ninth check inspects actual producer wiring without executing its AST.
 
 from copy import deepcopy
 import ast
+import json
+import hashlib
+import numpy as np
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -261,6 +264,221 @@ class SourceObservationInputChecks(unittest.TestCase):
         requests = calls("request_builder")
         self.assertEqual(len(requests), 1)
         self.assertLess(finish_index, top_index(requests[0]))
+
+
+
+def _receipt_validation_case(offset=0, *, frozen=None, sink=None):
+    """Invented native-boundary inputs; actual alignment, hashing and admission run."""
+    fine = pd.DataFrame({"Spread": [0.0, 2.0, float("nan"), 4.0] * 9},
+        index=pd.date_range("2024-01-01T00:00:00Z", periods=36, freq="5min"))
+    target = fine.index[offset + 1:offset + 5]
+    points = [fine["Spread"].iloc[offset + n] for n in range(4)]
+    observations = pd.Series(points, index=target, name="EntrySpreadPoints", dtype=float)
+    observations_sha = hashlib.sha256(pd.util.hash_pandas_object(
+        observations, index=True).values.tobytes()).hexdigest()
+    carrier = _carrier()
+    carrier["cutoff_utc"] = "2024-01-01T03:00:00Z"
+    source = {"bars_sha256": "1" * 64, "audit_sidecar_sha256": "2" * 64,
+        "provenance_sha256": "3" * 64, "source_identity_sha256": "b" * 64}
+    activation = {"manifest_sha256": carrier["activation_manifest_sha256"],
+        "activation_id": "SYNTHETIC_ACTIVATION"}
+    product = SimpleNamespace(index={"source": source, "activation": activation})
+    pair = {"tiers": [{"tier": tier, "frozen_spread_tier": {
+        "symbol": "SYNTHETIC", "timeframe": "M5", "source_timeframe": "M5",
+        "source_binding": {"bars_sha256": source["bars_sha256"],
+            "sidecar_sha256": source["audit_sidecar_sha256"],
+            "provenance_sha256": source["provenance_sha256"]},
+        "source_identity_sha256": source["source_identity_sha256"],
+        "activation": {"manifest_sha256": activation["manifest_sha256"],
+            "id": activation["activation_id"]}, "spread_points": cap}}
+        for tier, cap in (("P75", 3), ("P95", 5))]}
+    if frozen is None:
+        frozen = SimpleNamespace(symbol="SYNTHETIC", timeframe="M5",
+            generation_context_sha256=SYNTHETIC_CONTEXT_SHA, frozen_tier_pair_contract=pair)
+    if sink is None:
+        sink = SimpleNamespace(context=SimpleNamespace(context_sha256=SYNTHETIC_CONTEXT_SHA))
+    def utc(stamp):
+        return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = [{"target_open_utc": utc(stamp), "expected_prior_fine_close_utc": utc(stamp),
+        "prior_fine_close_utc": utc(stamp), "points": None if pd.isna(point) else float(point)}
+        for stamp, point in zip(target, points, strict=True)]
+    body = {"schema_version": raw.SOURCE_OBSERVATIONS_SCHEMA, "symbol": frozen.symbol,
+        "timeframe": frozen.timeframe, "source_timeframe": "M5", "source_product": carrier,
+        "observations": rows, "entry_observations_sha256": observations_sha}
+    receipt = {**body, "receipt_sha256": raw._sha_json(body)}
+    signals = {"values": [0, 0, 0, 0]}
+    axis = {"schema_version": "fxpm.backtest-partition-axis.v1", "timeframe": "M5",
+        "start_utc": utc(target[1]), "end_utc": utc(target[-1] + pd.Timedelta(minutes=5)),
+        "scored_bars": 3, "warmup_bars": 1, "event_axis_sha256": "e" * 64}
+    axis["horizon_receipt_sha256"] = raw._sha_json(axis)
+    lanes = {}
+    for tier, cap in (("P75", 3), ("P95", 5)):
+        mask = np.array([False if pd.isna(point) else point <= cap for point in points], dtype=np.uint8)
+        lanes["optimizer_train_" + tier.lower()] = {
+            "trade_power_partition_axis": deepcopy(axis), "trade_identity_pnl": [],
+            "spread_admission": {"schema_version": raw.ADMISSION_SCHEMA,
+                "entry_admission_policy": raw.ADMISSION_POLICY,
+                "entry_observations_sha256": observations_sha,
+                "entry_admission_mask_sha256": hashlib.sha256(mask.tobytes()).hexdigest(),
+                "input_provenance_authenticated": False, "qualification_authority": False,
+                "signal_opportunities": 0, "known_cap_pass_opportunities": 0,
+                "known_cap_refused_opportunities": 0, "missing_refused_opportunities": 0,
+                "missing_executed_legs": 0},
+            "spread_model": {"entry_admission_schema": raw.ADMISSION_SCHEMA,
+                "entry_admission_policy": raw.ADMISSION_POLICY,
+                "entry_observations_sha256": observations_sha}}
+    return dict(frozen=frozen, sink=sink, product=product, fine=fine, receipt=receipt,
+        signals=signals, lanes=lanes, target=target)
+
+
+def _validate_receipt_case(case, owner, *, receipt=None, expected_sha256=None, frozen=None, sink=None,
+        signals=None, lanes=None):
+    return raw._validated_source_observation_receipt(
+        case["receipt"] if receipt is None else receipt,
+        sink=case["sink"] if sink is None else sink,
+        frozen=case["frozen"] if frozen is None else frozen,
+        expected_sha256=case["receipt"]["receipt_sha256"] if expected_sha256 is None else expected_sha256,
+        partition="optimizer_train", signals=case["signals"] if signals is None else signals,
+        lanes=case["lanes"] if lanes is None else lanes, source_inputs=owner)
+
+
+class SourceObservationReceiptReuseChecks(unittest.TestCase):
+    def test_more_than_twelve_distinct_receipts_prepare_once_per_invocation(self):
+        first = _receipt_validation_case()
+        owner = raw._SourceObservationInputs(first["frozen"])
+        cases = [_receipt_validation_case(n, frozen=first["frozen"], sink=first["sink"])
+            for n in range(14)]
+        calls = 0
+        with mock.patch.object(raw, "_open_source_observation_native",
+                return_value=(first["product"], first["fine"])) as opened:
+            with mock.patch.object(raw, "_prepare_source_observation_receipt",
+                    wraps=raw._prepare_source_observation_receipt) as prepared:
+                for _ in range(3):
+                    for case in cases:
+                        self.assertEqual(_validate_receipt_case(case, owner), case["receipt"])
+                        calls += 1
+                self.assertEqual(prepared.call_count, 14)
+                self.assertEqual(calls, 42)
+                self.assertEqual(len(owner._receipts), 14)
+                opened.assert_called_once()
+                print(json.dumps({"fixture_provenance": "INVENTED_RAW_RECEIPT_REUSE",
+                    "validation_calls": calls, "distinct_receipts": 14,
+                    "preparations": prepared.call_count, "native_acquisitions": opened.call_count}))
+
+    def test_cached_arrays_are_readonly_and_finish_clears_before_cold_reopen(self):
+        case = _receipt_validation_case()
+        owner = raw._SourceObservationInputs(case["frozen"])
+        calls = []
+        def acquire(carrier, **kwargs):
+            calls.append(carrier)
+            if len(calls) == 2:
+                self.assertEqual(owner._receipts, {})
+                self.assertIsNone(owner._entry)
+                self.assertEqual(owner._axes, {})
+                raise raw.WinnerRawEvidenceError("SOURCE_OBSERVATION_NATIVE_REOPEN_FAILED")
+            return case["product"], case["fine"]
+        with mock.patch.object(raw, "_open_source_observation_native", side_effect=acquire):
+            with mock.patch.object(raw, "_prepare_source_observation_receipt",
+                    wraps=raw._prepare_source_observation_receipt) as prepared:
+                _validate_receipt_case(case, owner)
+                for _, states, mask, _ in next(iter(owner._receipts.values()))[2]:
+                    self.assertFalse(states.flags.writeable)
+                    self.assertFalse(mask.flags.writeable)
+                    with self.assertRaises(ValueError): mask[0] = False
+                    with self.assertRaises(ValueError): states[0] = "INVALID"
+                with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_NATIVE_REOPEN_FAILED"):
+                    owner.finish(frozen=case["frozen"], sink=case["sink"])
+                self.assertEqual(owner._receipts, {})
+                other_owner = raw._SourceObservationInputs(case["frozen"])
+                _validate_receipt_case(case, other_owner)
+                self.assertEqual(prepared.call_count, 2)
+        self.assertEqual(len(calls), 3)
+
+    def test_cached_receipt_still_authenticates_actual_body_before_lookup(self):
+        case = _receipt_validation_case()
+        owner = raw._SourceObservationInputs(case["frozen"])
+        with mock.patch.object(raw, "_open_source_observation_native",
+                return_value=(case["product"], case["fine"])):
+            _validate_receipt_case(case, owner)
+            changed = deepcopy(case["receipt"])
+            changed["observations"][0]["points"] += 1
+            with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"):
+                _validate_receipt_case(case, owner, receipt=changed)
+            changed.pop("receipt_sha256")
+            changed["receipt_sha256"] = raw._sha_json(changed)
+            with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"):
+                _validate_receipt_case(case, owner, receipt=changed)
+            with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_VALUES_CHANGED"):
+                _validate_receipt_case(case, owner, receipt=changed, expected_sha256=changed["receipt_sha256"])
+            malformed = deepcopy(case["receipt"])
+            malformed["extra"] = "SYNTHETIC_UNEXPECTED_FIELD"
+            with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_RECEIPT_SCHEMA_INVALID"):
+                _validate_receipt_case(case, owner, receipt=malformed)
+            malformed = deepcopy(case["receipt"])
+            malformed["source_product"]["timeframe"] = "INVALID"
+            malformed.pop("receipt_sha256")
+            malformed["receipt_sha256"] = raw._sha_json(malformed)
+            with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_NATIVE_CARRIER_INVALID"):
+                _validate_receipt_case(case, owner, receipt=malformed,
+                    expected_sha256=malformed["receipt_sha256"])
+        self.assertEqual(len(owner._receipts), 1)
+
+    def test_cached_receipt_refuses_foreign_frozen_or_context_before_lookup(self):
+        case = _receipt_validation_case()
+        owner = raw._SourceObservationInputs(case["frozen"])
+        with mock.patch.object(raw, "_open_source_observation_native",
+                return_value=(case["product"], case["fine"])) as opened:
+            _validate_receipt_case(case, owner)
+            with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_INPUT_OWNER_MISMATCH"):
+                _validate_receipt_case(case, owner, frozen=SimpleNamespace(**vars(case["frozen"])))
+            with self.assertRaisesRegex(raw.WinnerRawEvidenceError, "SOURCE_OBSERVATION_INPUT_OWNER_MISMATCH"):
+                _validate_receipt_case(case, owner,
+                    sink=SimpleNamespace(context=SimpleNamespace(context_sha256="f" * 64)))
+            opened.assert_called_once()
+        self.assertEqual(len(owner._receipts), 1)
+
+    def test_cache_hits_keep_axes_signals_lane_models_counts_and_trade_checks(self):
+        case = _receipt_validation_case()
+        owner = raw._SourceObservationInputs(case["frozen"])
+        with mock.patch.object(raw, "_open_source_observation_native",
+                return_value=(case["product"], case["fine"])):
+            with mock.patch.object(raw, "_prepare_source_observation_receipt",
+                    wraps=raw._prepare_source_observation_receipt) as prepared:
+                _validate_receipt_case(case, owner)
+                for mutation in ("axis_length", "axis_time", "signal_length", "signals",
+                        "lane_mask", "model", "counts", "trade"):
+                    with self.subTest(mutation=mutation):
+                        signals, lanes = deepcopy(case["signals"]), deepcopy(case["lanes"])
+                        lane = lanes["optimizer_train_p75"]
+                        if mutation.startswith("axis_"):
+                            axis = lane["trade_power_partition_axis"]
+                            if mutation == "axis_length": axis["scored_bars"] += 1
+                            else: axis["start_utc"] = "2024-01-01T00:11:00Z"
+                            axis.pop("horizon_receipt_sha256")
+                            axis["horizon_receipt_sha256"] = raw._sha_json(axis)
+                        elif mutation == "signal_length": signals["values"].pop()
+                        elif mutation == "signals": signals["values"][0] = 1
+                        elif mutation == "lane_mask": lane["spread_admission"]["entry_admission_mask_sha256"] = "0" * 64
+                        elif mutation == "model": lane["spread_model"]["entry_observations_sha256"] = "0" * 64
+                        elif mutation == "counts": lane["spread_admission"]["signal_opportunities"] += 1
+                        else:
+                            lane["trade_identity_pnl"] = [{"entry_bar": 1, "exit_bar": 1,
+                                "signal_bar": 0, "direction": "LONG", "exit_reason": "SYNTHETIC",
+                                "entry_time": "2024-01-01T00:10:00Z", "exit_time": "2024-01-01T00:10:00Z",
+                                "position_size": 1.0, "risk_amount": 1.0, "pnl_dollars": 0.0}]
+                        expected = ("SOURCE_OBSERVATION_PARTITION_AXIS_SPLICE" if mutation in {
+                            "axis_length", "axis_time", "signal_length"} else
+                            "TIER_TRADE_ENTRY_ADMISSION_FAILED" if mutation == "trade" else
+                            "TIER_ADMISSION_RECONSTRUCTION_FAILED")
+                        with self.assertRaisesRegex(raw.WinnerRawEvidenceError, expected):
+                            _validate_receipt_case(case, owner, signals=signals, lanes=lanes)
+                signals, lanes = deepcopy(case["signals"]), deepcopy(case["lanes"])
+                signals["values"][0] = 1
+                for lane in lanes.values():
+                    lane["spread_admission"]["signal_opportunities"] = 1
+                    lane["spread_admission"]["known_cap_pass_opportunities"] = 1
+                self.assertEqual(_validate_receipt_case(case, owner, signals=signals, lanes=lanes), case["receipt"])
+                self.assertEqual(prepared.call_count, 1)
 
 
 if __name__ == "__main__":

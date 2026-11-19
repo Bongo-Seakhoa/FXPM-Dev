@@ -1,3 +1,4 @@
+"""Invented filesystem contracts; no source, model, financial or host admission authority."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -5,6 +6,9 @@ from contextlib import ExitStack
 import json
 import multiprocessing
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 import threading
 from types import SimpleNamespace
@@ -194,7 +198,7 @@ def test_quota_state_replace_exhaustion_preserves_prior_state_and_cleans_temp(
     assert not list(root.glob(f"{quota.QUOTA_TEMP_PREFIX}*.tmp"))
 
 
-def test_accounting_spans_publications_and_manifest_domains_above_legacy_cap(tmp_path: Path) -> None:
+def test_publications_span_domains_above_legacy_capacity_metadata(tmp_path: Path) -> None:
     root = tmp_path / "spool"
     root.mkdir()
     _publish(root, "historical/EURUSD/a.bin", b"123456", maximum=10)
@@ -203,27 +207,21 @@ def test_accounting_spans_publications_and_manifest_domains_above_legacy_cap(tmp
     assert (root / "historical/EURUSD/a.bin").read_bytes() == b"123456"
     assert (root / "current/EURUSD/over-cap.bin").read_bytes() == b"12345"
     assert (root / "current/EURUSD/b.bin").read_bytes() == b"7890"
-    assert _state(root)["committed_bytes"] == 15
+
     assert _state(root)["reservations"] == []
 
 
-def test_legacy_free_space_reserve_does_not_block_actual_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    for name, free in (("below-old-boundary", 99), ("old-boundary", 100)):
-        root = tmp_path / name
-        root.mkdir()
-        monkeypatch.setattr(quota.shutil, "disk_usage",
-            lambda _path, free=free: SimpleNamespace(total=200, used=200-free, free=free))
-        _publish(root, "object.bin", b"x" * 20, maximum=100, reserve=80)
-        assert (root / "object.bin").read_bytes() == b"x" * 20
-        assert _state(root)["committed_bytes"] == 20
-        assert _state(root)["reservations"] == []
-
-
-def test_simultaneous_reservations_remain_accounted_above_legacy_free_space_rule(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_free_space_metadata_does_not_block_actual_publication(tmp_path: Path) -> None:
     root = tmp_path / "spool"
     root.mkdir()
-    monkeypatch.setattr(quota.shutil, "disk_usage",
-        lambda _path: SimpleNamespace(total=200, used=100, free=100))
+    _publish(root, "object.bin", b"x" * 20, maximum=1, reserve=2**40)
+    assert (root / "object.bin").read_bytes() == b"x" * 20
+    assert _state(root)["reservations"] == []
+
+
+def test_simultaneous_memberships_overlap_above_legacy_capacity_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "spool"
+    root.mkdir()
     with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=80) as first:
         first.consume(15)
         with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=80) as second:
@@ -231,68 +229,61 @@ def test_simultaneous_reservations_remain_accounted_above_legacy_free_space_rule
             second.consume(1)
             records = _state(root)["reservations"]
             assert len(records) == 2
-            assert sum(row["reserved_bytes"] for row in records) == 21
             second.cancel_after_cleanup()
-        assert sum(row["reserved_bytes"] for row in _state(root)["reservations"]) == 15
+        assert len(_state(root)["reservations"]) == 1
         first.cancel_after_cleanup()
     assert _state(root)["reservations"] == []
-    assert _state(root)["committed_bytes"] == 0
 
 
-def test_dirty_recovery_rescans_exact_unique_inodes(
-    tmp_path: Path,
-) -> None:
+
+def test_known_abandoned_membership_recovers_without_payload_recount(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = tmp_path / "spool"
     root.mkdir()
-    first = root / "historical/EURUSD/object.bin"
-    alias = root / "current/EURUSD/object.bin"
-
+    target = root / "payload" / "object.bin"
+    target.parent.mkdir()
     with pytest.raises(RuntimeError, match="injected-death"):
-        with quota.publication_lease(
-            root,
-            max_generation_bytes=100,
-            min_free_bytes=0,
-        ) as lease:
+        with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=0) as lease:
             lease.consume(7)
-            first.parent.mkdir(parents=True)
-            first.write_bytes(b"1234567")
-            alias.parent.mkdir(parents=True)
-            try:
-                os.link(first, alias)
-            except OSError as exc:
-                pytest.skip(f"hard links unavailable: {type(exc).__name__}")
+            target.write_bytes(b"1234567")
+            lease.materialize(7)
             raise RuntimeError("injected-death")
-
-    assert _state(root)["status"] == "DIRTY"
-    assert _state(root)["committed_bytes"] == 0
-    with quota.publication_lease(
-        root,
-        max_generation_bytes=100,
-        min_free_bytes=0,
-    ) as recovered:
-        assert recovered.committed_bytes == 7
-        recovered.consume(3)
-        extra = root / "current/EURUSD/extra.bin"
-        extra.write_bytes(b"890")
-        recovered.commit(3)
-
+    assert len(_state(root)["reservations"]) == 1
+    real_scandir = quota.os.scandir
+    def no_payload_scan(path):
+        assert Path(path) != target.parent, "quota admission descended into payload bytes"
+        return real_scandir(path)
+    monkeypatch.setattr(quota.os, "scandir", no_payload_scan)
+    with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=0) as recovered:
+        assert recovered.committed_bytes == 0
+        assert len(_state(root)["reservations"]) == 1
+        recovered.cancel_after_cleanup()
+    assert target.read_bytes() == b"1234567"
     assert _state(root)["status"] == "CLEAN"
-    assert _state(root)["committed_bytes"] == 10
+    assert _state(root)["reservations"] == []
 
 
-def test_legacy_limit_metadata_can_change_without_losing_over_cap_accounting(tmp_path: Path) -> None:
+
+def test_legacy_numeric_state_is_preserved_as_recorded_metadata(tmp_path: Path) -> None:
     root = tmp_path / "spool"
     root.mkdir()
-    _publish(root, "object.bin", b"x" * 120, maximum=100, reserve=10)
-    for maximum, reserve in ((101, 10), (100, 11)):
+    quota._write_state(root, quota._state(max_generation_bytes=100, min_free_bytes=10,
+        committed_bytes=120))
+    target = root / "object.bin"
+    target.write_bytes(b"old payload")
+    for count, (maximum, reserve) in enumerate(((101, 10), (100, 11)), start=1):
         with quota.publication_lease(root, max_generation_bytes=maximum, min_free_bytes=reserve) as lease:
-            lease.commit(0)
+            assert lease.committed_bytes == 120
+            lease.consume(1)
+            with target.open("ab") as output:
+                written = output.write(b"x")
+            lease.materialize(written)
+            lease.commit(written)
         current = _state(root)
-        assert current["max_generation_bytes"] == maximum
-        assert current["min_free_bytes"] == reserve
+        assert current["max_generation_bytes"] == 100
+        assert current["min_free_bytes"] == 10
         assert current["committed_bytes"] == 120
         assert current["reservations"] == []
-        assert (root / "object.bin").read_bytes() == b"x" * 120
+        assert target.read_bytes() == b"old payload" + b"x" * count
 
 
 def test_oversized_integer_state_fails_with_typed_read_error(
@@ -326,7 +317,7 @@ def test_oversized_integer_state_fails_with_typed_read_error(
             pytest.fail("malformed state was admitted")
 
 
-def test_concurrent_threads_account_all_publications_above_legacy_generation_cap(
+def test_concurrent_threads_publish_all_objects_above_legacy_capacity_metadata(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "spool"
@@ -348,7 +339,7 @@ def test_concurrent_threads_account_all_publications_above_legacy_generation_cap
     objects = list(root.glob("*/object.bin"))
     assert len(objects) == 2
     assert sum(path.stat().st_size for path in objects) == 12
-    assert _state(root)["committed_bytes"] == 12
+
     assert _state(root)["reservations"] == []
 
 
@@ -356,7 +347,7 @@ def test_concurrent_threads_account_all_publications_above_legacy_generation_cap
     os.environ.get("FXPM_SKIP_MULTIPROCESS_TESTS") == "1",
     reason="multiprocessing explicitly disabled by environment",
 )
-def test_concurrent_processes_account_all_publications_above_legacy_generation_cap(
+def test_concurrent_processes_publish_all_objects_above_legacy_capacity_metadata(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "spool"
@@ -404,7 +395,7 @@ def test_concurrent_processes_account_all_publications_above_legacy_generation_c
     objects = list(root.glob("*/object.bin"))
     assert len(objects) == 2
     assert sum(path.stat().st_size for path in objects) == 12
-    assert _state(root)["committed_bytes"] == 12
+
     assert _state(root)["reservations"] == []
 
 
@@ -469,7 +460,7 @@ def test_six_process_reservations_overlap_without_holding_root_lock(
         result_queue.join_thread()
 
     assert _state(root)["status"] == "CLEAN"
-    assert _state(root)["committed_bytes"] == 24
+
 
 
 @pytest.mark.skipif(
@@ -478,32 +469,80 @@ def test_six_process_reservations_overlap_without_holding_root_lock(
 )
 def test_killed_writer_temp_is_reconciled_before_new_admission(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "spool"
     root.mkdir()
-    context = multiprocessing.get_context("spawn")
-    ready_event = context.Event()
-    worker = context.Process(
-        target=_process_crash_with_materialized_temp,
-        args=(str(root), ready_event),
-    )
-    worker.start()
+    ready_path = tmp_path / "writer-ready"
+    product_root = Path(quota.__file__).resolve().parent
+    workspace_root = Path.cwd().resolve()
+    child_code = r"""
+from pathlib import Path
+import os
+import sys
+import time
+product_root, workspace_root, root, ready = map(Path, sys.argv[1:])
+sys.path[:0] = [str(product_root), str(workspace_root)]
+import pm_authority_spool_quota as quota
+if Path(quota.__file__).resolve().parent != product_root.resolve():
+    raise RuntimeError("KILLED_WRITER_QUOTA_ORIGIN_MISMATCH")
+with quota.publication_lease(root, max_generation_bytes=10, min_free_bytes=0) as lease:
+    lease.consume(7)
+    target = root / "tmp" / "crashed.part"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("xb") as stream:
+        stream.write(b"1234567")
+        stream.flush()
+        os.fsync(stream.fileno())
+    lease.materialize(7)
+    with ready.open("xb") as marker:
+        marker.write(b"READY")
+        marker.flush()
+        os.fsync(marker.fileno())
+    while True:
+        time.sleep(0.1)
+"""
+    worker = subprocess.Popen([sys.executable, "-E", "-B", "-c", child_code,
+        str(product_root), str(workspace_root), str(root), str(ready_path)],
+        cwd=workspace_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    ready = False
+    alive_at_ready = False
     try:
-        assert ready_event.wait(10)
-        worker.join(10)
-        assert worker.exitcode == 37
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if ready_path.exists():
+                ready = ready_path.read_bytes() == b"READY"
+                if ready:
+                    break
+            if worker.poll() is not None:
+                break
+            time.sleep(0.01)
+        alive_at_ready = ready and worker.poll() is None
+        if worker.poll() is None:
+            worker.kill()
+        _stdout, stderr = worker.communicate(timeout=10)
     finally:
-        if worker.is_alive():
-            worker.terminate()
-            worker.join(5)
+        if worker.poll() is None:
+            worker.kill()
+            worker.communicate(timeout=5)
+    diagnostics = stderr.decode("utf-8", errors="replace")
+    assert ready, f"real killed-writer child was not ready: {diagnostics}"
+    assert alive_at_ready, f"real writer exited before the parent kill: {diagnostics}"
+    assert worker.returncode is not None and worker.returncode != 0
 
     assert _state(root)["status"] == "DIRTY"
+    real_scandir = quota.os.scandir
+    def no_temp_scan(path):
+        assert Path(path) != root / "tmp", "quota recovery descended into crashed payload bytes"
+        return real_scandir(path)
+    monkeypatch.setattr(quota.os, "scandir", no_temp_scan)
     with quota.publication_lease(
         root,
         max_generation_bytes=10,
         min_free_bytes=0,
     ) as recovered:
-        assert recovered.committed_bytes == 7
+        assert recovered.committed_bytes == 0  # Fresh recorded metadata, not a payload recount.
         recovered.consume(3)
         extra = root / "recovered.bin"
         extra.write_bytes(b"890")
@@ -512,7 +551,7 @@ def test_killed_writer_temp_is_reconciled_before_new_admission(
 
     assert (root / "tmp" / "crashed.part").read_bytes() == b"1234567"
     assert _state(root)["status"] == "CLEAN"
-    assert _state(root)["committed_bytes"] == 10
+
 
 
 def test_reservation_roster_allows_scheduler_concurrency_without_count_ceiling(
@@ -537,72 +576,93 @@ def test_reservation_roster_allows_scheduler_concurrency_without_count_ceiling(
         dirty = _state(root)
         assert dirty["status"] == "DIRTY"
         assert len(dirty["reservations"]) == reservation_count
-        assert sum(
-            int(record["reserved_bytes"]) for record in dirty["reservations"]
-        ) == reservation_count
         for lease in reversed(leases):
             lease.cancel_after_cleanup()
     assert _state(root)["status"] == "CLEAN"
 
 
-def test_rescan_entry_bound_is_applied_during_iteration(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = tmp_path / "spool"
+
+
+
+
+def test_consume_materialize_are_local_while_membership_and_guard_stay_live(tmp_path, monkeypatch):
+    root = tmp_path / "hot-loop"
     root.mkdir()
-    for index in range(6):
-        (root / f"{index}.bin").write_bytes(bytes([index]))
-    original_scandir = quota.os.scandir
-    pulls = 0
+    with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=0) as first:
+        with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=0) as second:
+            before = (root / quota.QUOTA_STATE_NAME).read_bytes()
+            members = _state(root)["reservations"]
+            assert len(members) == 2
+            guards = {record["token"]: quota._guard_path(root, record["token"]) for record in members}
+            identities = {token: (path.stat().st_dev, path.stat().st_ino) for token, path in guards.items()}
+            def forbidden(*args, **kwargs):
+                pytest.fail("consume/materialize performed quota state, lock or scan I/O")
+            published = root / "local-published.bin"
+            with published.open("xb") as output, monkeypatch.context() as hot:
+                hot.setattr(quota, "_read_state", forbidden)
+                hot.setattr(quota, "_write_state", forbidden)
+                hot.setattr(quota, "_exclusive_file_lock", forbidden)
+                hot.setattr(quota.os, "scandir", forbidden)
+                for _ in range(64):
+                    first.consume(3)
+                    first.materialize(output.write(b"ab"))
+                    first.materialize(output.write(b"c"))
+                assert first.in_progress_bytes == 192
+                with pytest.raises(quota.AuthoritySpoolQuotaError, match="SPOOL_QUOTA_MATERIALIZED_EXCEEDS_RESERVED"):
+                    first.materialize(1)
+            assert (root / quota.QUOTA_STATE_NAME).read_bytes() == before
+            assert all(quota._guard_is_live(root, token) for token in guards)
+            assert {token: (path.stat().st_dev, path.stat().st_ino) for token, path in guards.items()} == identities
+            second.cancel_after_cleanup()
+        assert len(_state(root)["reservations"]) == 1
+        assert quota._guard_is_live(root, first.token)
+        assert published.read_bytes() == b"abc" * 64
+        published.unlink()
+        first.cancel_after_cleanup()
+    assert _state(root)["reservations"] == []
 
-    class CountingScandir:
-        def __init__(self, path: Path) -> None:
-            self._entries = original_scandir(path)
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args) -> None:
-            self._entries.close()
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            nonlocal pulls
-            entry = next(self._entries)
-            pulls += 1
-            return entry
-
-    monkeypatch.setattr(quota, "MAX_RESCAN_ENTRIES", 3)
-    monkeypatch.setattr(quota.os, "scandir", CountingScandir)
-    with pytest.raises(
-        quota.AuthoritySpoolQuotaError,
-        match="SPOOL_QUOTA_RESCAN_ENTRY_BOUND_EXCEEDED",
-    ):
-        quota._scan_committed_bytes(root)
-    assert pulls == 4
-
-
-def test_rescan_fails_closed_on_reparse_entry(tmp_path: Path) -> None:
-    root = tmp_path / "spool"
-    outside = tmp_path / "outside"
+def test_local_stream_refusals_keep_the_membership_and_exact_progress(tmp_path):
+    root = tmp_path / "local-errors"
     root.mkdir()
-    outside.mkdir()
-    link = root / "redirected-domain"
-    try:
-        link.symlink_to(outside, target_is_directory=True)
-    except OSError as exc:
-        pytest.skip(f"directory symlinks unavailable: {type(exc).__name__}")
+    with quota.publication_lease(root, max_generation_bytes=100, min_free_bytes=0) as lease:
+        before = (root / quota.QUOTA_STATE_NAME).read_bytes()
+        for method, code in ((lease.consume, "SPOOL_QUOTA_CONSUME_BYTES_INVALID"),
+                (lease.materialize, "SPOOL_QUOTA_MATERIALIZE_BYTES_INVALID")):
+            for invalid in (-1, True):
+                with pytest.raises(quota.AuthoritySpoolQuotaError, match=code):
+                    method(invalid)
+        lease.consume(3)
+        output_path = root / "local-written.bin"
+        with output_path.open("xb") as output:
+            lease.materialize(output.write(b"a"))
+            lease.materialize(output.write(b"bc"))
+        assert lease.in_progress_bytes == 3
+        with pytest.raises(quota.AuthoritySpoolQuotaError, match="SPOOL_QUOTA_MATERIALIZED_EXCEEDS_RESERVED"):
+            lease.materialize(1)
+        with pytest.raises(quota.AuthoritySpoolQuotaError, match="SPOOL_QUOTA_COMMIT_EXCEEDS_CONSUMED"):
+            lease.commit(4)
+        assert (root / quota.QUOTA_STATE_NAME).read_bytes() == before
+        assert output_path.read_bytes() == b"abc"
+        output_path.unlink()
+        lease.cancel_after_cleanup()
+    with pytest.raises(quota.AuthoritySpoolQuotaError, match="SPOOL_QUOTA_LEASE_ALREADY_FINISHED"):
+        lease.consume(1)
 
-    with pytest.raises(
-        quota.AuthoritySpoolQuotaError,
-        match="SPOOL_QUOTA_REPARSE_ENTRY_FORBIDDEN",
-    ):
-        with quota.publication_lease(
-            root,
-            max_generation_bytes=100,
-            min_free_bytes=0,
-        ):
-            pytest.fail("reparse-containing root was admitted")
+
+def test_fresh_admission_keeps_membership_without_payload_directory_scan(tmp_path, monkeypatch):
+    root = tmp_path / "fresh"
+    payload = root / "payload" / "old.bin"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"existing invented payload bytes")
+    real_scandir = quota.os.scandir
+    def no_payload_scan(path):
+        assert Path(path) != payload.parent, "fresh admission descended into payload bytes"
+        return real_scandir(path)
+    monkeypatch.setattr(quota.os, "scandir", no_payload_scan)
+    with quota.publication_lease(root, max_generation_bytes=1, min_free_bytes=2**40) as lease:
+        assert lease.committed_bytes == 0
+        assert len(_state(root)["reservations"]) == 1
+        lease.cancel_after_cleanup()
+    assert payload.read_bytes() == b"existing invented payload bytes"
+    assert _state(root)["reservations"] == []

@@ -19,6 +19,7 @@ Version: 3.1 (Portfolio Manager - Numba backtester optimization)
 
 import io
 import json
+from copy import deepcopy
 import os
 import shutil
 import time
@@ -219,6 +220,28 @@ EXIT_SL = 1
 EXIT_TP = 2
 EXIT_EOD = 3
 EXIT_SESSION = 4
+
+
+@jit(nopython=True, cache=True)
+def _protective_session_exit(direction, opened, low, high, stop, target, session_exit=False):
+    """Resolve executable-side quotes; only session and gap-stop exits own the open."""
+    if session_exit:
+        return opened, EXIT_SESSION, True
+    if direction == 1:
+        if opened <= stop:
+            return opened, EXIT_SL, True
+        if low <= stop:
+            return stop, EXIT_SL, False
+        if high >= target:
+            return target, EXIT_TP, False
+    else:
+        if opened >= stop:
+            return opened, EXIT_SL, True
+        if high >= stop:
+            return stop, EXIT_SL, False
+        if low <= target:
+            return target, EXIT_TP, False
+    return 0.0, EXIT_NONE, False
 
 
 def _recorded_session_arrays(index, session_spec):
@@ -1901,35 +1924,15 @@ def _backtest_loop_numba(
                 if close_mark_pips < 0.0:
                     time_underwater_bars_current += 1
 
-            exit_price = -1.0
-            exit_reason = EXIT_NONE
-
-            if session_exit_now:
-                exit_price = bid_open if position_direction == 1 else ask_open
-                exit_reason = EXIT_SESSION
+            exit_price, exit_reason, exit_at_open = _protective_session_exit(
+                position_direction,
+                bid_open if position_direction == 1 else ask_open,
+                bid_low if position_direction == 1 else ask_low,
+                bid_high if position_direction == 1 else ask_high,
+                stop_loss, take_profit, session_exit_now,
+            )
+            if exit_at_open:
                 entry_allowed_at_open = True
-            elif position_direction == 1:
-                if bid_open <= stop_loss:
-                    exit_price = bid_open
-                    exit_reason = EXIT_SL
-                    entry_allowed_at_open = True
-                elif bid_low <= stop_loss:
-                    exit_price = stop_loss
-                    exit_reason = EXIT_SL
-                elif bid_high >= take_profit:
-                    exit_price = take_profit
-                    exit_reason = EXIT_TP
-            else:
-                if ask_open >= stop_loss:
-                    exit_price = ask_open
-                    exit_reason = EXIT_SL
-                    entry_allowed_at_open = True
-                elif ask_high >= stop_loss:
-                    exit_price = stop_loss
-                    exit_reason = EXIT_SL
-                elif ask_low <= take_profit:
-                    exit_price = take_profit
-                    exit_reason = EXIT_TP
             
             if exit_reason != EXIT_NONE:
                 gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
@@ -2093,28 +2096,13 @@ def _backtest_loop_numba(
                         time_underwater_bars_current += 1
 
                 # Same-bar exit: check gap-through at open FIRST, then intra-bar
-                exit_price = -1.0
-                exit_reason = EXIT_NONE
-                if position_direction == 1:
-                    if bid_open <= stop_loss:
-                        exit_price = bid_open
-                        exit_reason = EXIT_SL
-                    elif bid_low <= stop_loss:
-                        exit_price = stop_loss
-                        exit_reason = EXIT_SL
-                    elif bid_high >= take_profit:
-                        exit_price = take_profit
-                        exit_reason = EXIT_TP
-                else:
-                    if ask_open >= stop_loss:
-                        exit_price = ask_open
-                        exit_reason = EXIT_SL
-                    elif ask_high >= stop_loss:
-                        exit_price = stop_loss
-                        exit_reason = EXIT_SL
-                    elif ask_low <= take_profit:
-                        exit_price = take_profit
-                        exit_reason = EXIT_TP
+                exit_price, exit_reason, _ = _protective_session_exit(
+                    position_direction,
+                    bid_open if position_direction == 1 else ask_open,
+                    bid_low if position_direction == 1 else ask_low,
+                    bid_high if position_direction == 1 else ask_high,
+                    stop_loss, take_profit,
+                )
 
                 if exit_reason != EXIT_NONE:
                     gross_pnl_dollars, pnl_pips = _calc_trade_pnl_numba(
@@ -8164,6 +8152,7 @@ class Backtester:
         features: pd.DataFrame,
         spec: InstrumentSpec,
         timeframe: str,
+        *, _contract_only: bool = False,
     ) -> Optional[Tuple[Any, Dict[str, Any]]]:
         """Resolve one activation-bound schedule, or ``None`` for research.
 
@@ -8246,12 +8235,16 @@ class Backtester:
             }
             if m5_observed_binding != m5_expected_binding:
                 raise BrokerTermsError("M5_DERIVED_SWAP_BASE_BINDING_MISMATCH")
-            return project_session_events(list(m5_resolved.get("events") or []), features), m5_resolved
+            projection = (None if _contract_only else
+                project_session_events(list(m5_resolved.get("events") or []), features))
+            return projection, m5_resolved
         if self._research_swap_context is not None:
             if not bool(getattr(self.config, "research_mode", False)):
                 raise BrokerTermsError("RESEARCH_SWAP_CONTEXT_REQUIRES_RESEARCH_MODE")
             if binding:
                 raise BrokerTermsError("RESEARCH_SWAP_CONTEXT_NATIVE_AUTHORITY_CONFLICT")
+            if _contract_only:
+                return None, {"research_context": True}
             projection = self._research_swap_context.project(
                 features, symbol=str(spec.symbol or "").upper()
             )
@@ -8321,20 +8314,67 @@ class Backtester:
                 f"{canonical} {tf}: feature source binding does not match "
                 "the active broker-terms overlay"
             )
-        projection = project_session_events(
+        projection = (None if _contract_only else project_session_events(
             list(resolved.get("events") or []),
             features,
-        )
+        ))
         return projection, resolved
 
+    def _static_swap_identity(self, overlay):
+        if overlay is None:
+            return None
+        resolved = overlay[1]
+        if resolved.get("research_context"):
+            context = self._research_swap_context
+            return (id(context), context.schedule_sha256, context.terms_snapshot_sha256,
+                context.stress_policy_sha256, context.cutoff_utc)
+        # The schedule is already authenticated by its digest; do not rescan events here.
+        return json.dumps({key: value for key, value in resolved.items() if key != "events"},
+            sort_keys=True, separators=(",", ":"), default=str)
+
     def _build_causal_swap_inputs(
+        self, features: pd.DataFrame, spec: InstrumentSpec, entry_prices: np.ndarray,
+        timeframe: str = "", *, _static_preparation=None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, Dict[str, Any]]:
+        """Price each entry afresh; reuse only caller-owned static partition facts."""
+        prepared = None if _static_preparation is None else _static_preparation.get("static")
+        if prepared is not None:
+            # Keep actual source-binding and terms-pointer checks on every use.
+            overlay = (self._resolve_broker_swap_projection(features, spec, timeframe, _contract_only=True)
+                if prepared[2] or self._research_swap_context is not None else None)
+            if self._static_swap_identity(overlay) != prepared[7]:
+                prepared = None
+        if prepared is None:
+            prepared = self._prepare_causal_swap_inputs(features, spec, timeframe,
+                _capture_identity=_static_preparation is not None)
+            if _static_preparation is not None:
+                pre = np.array(prepared[0], dtype=np.int32, copy=True)
+                close = np.array(prepared[1], dtype=np.int32, copy=True)
+                pre.setflags(write=False)
+                close.setflags(write=False)
+                prepared = (pre, close, *prepared[2:])
+                _static_preparation["static"] = prepared
+        pre, close, enabled, contract, raw_long, raw_short, mode, _identity = prepared
+        long_per_lot = np.zeros(len(features), dtype=np.float64)
+        short_per_lot = np.zeros(len(features), dtype=np.float64)
+        if enabled:
+            for index in np.flatnonzero(np.isfinite(entry_prices)):
+                entry_price = float(entry_prices[int(index)])
+                long_per_lot[int(index)] = self._swap_value_per_lot_dollars(
+                    spec, raw_long, entry_price=entry_price, swap_mode=mode)
+                short_per_lot[int(index)] = self._swap_value_per_lot_dollars(
+                    spec, raw_short, entry_price=entry_price, swap_mode=mode)
+        return pre, close, long_per_lot, short_per_lot, enabled, (
+            contract if _static_preparation is None else deepcopy(contract))
+
+    def _prepare_causal_swap_inputs(
         self,
         features: pd.DataFrame,
         spec: InstrumentSpec,
-        entry_prices: np.ndarray,
         timeframe: str = "",
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, Dict[str, Any]]:
-        """Build observable per-close rollover and per-entry swap arrays."""
+        *, _capture_identity: bool = False,
+    ) -> Tuple[Any, ...]:
+        """Prepare unchanged axis, terms and rollover facts without entry pricing."""
         count = int(len(features))
         research_overlay = (
             self._resolve_broker_swap_projection(features, spec, timeframe)
@@ -8342,8 +8382,6 @@ class Backtester:
         )
         pre_open_rollover_units = np.zeros(count, dtype=np.int32)
         rollover_units = np.zeros(count, dtype=np.int32)
-        long_per_lot = np.zeros(count, dtype=np.float64)
-        short_per_lot = np.zeros(count, dtype=np.float64)
         contract: Dict[str, Any] = {
             "contract_version": BACKTEST_SWAP_ACCRUAL_CONTRACT_VERSION,
             "status": "UNAVAILABLE",
@@ -8364,16 +8402,16 @@ class Backtester:
                 "execution_state_compounding": True,
                 "reason": "swap model disabled",
             })
-            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+            return pre_open_rollover_units, rollover_units, False, contract, 0.0, 0.0, None, None
         if count <= 0 or "_BAR_CLOSE_TS" not in features.columns:
-            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+            return pre_open_rollover_units, rollover_units, False, contract, 0.0, 0.0, None, None
         try:
             closes = pd.DatetimeIndex(
                 pd.to_datetime(features["_BAR_CLOSE_TS"], utc=True, errors="coerce")
             )
         except Exception as exc:
             contract["reason"] = f"bar-close conversion failed: {type(exc).__name__}"
-            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+            return pre_open_rollover_units, rollover_units, False, contract, 0.0, 0.0, None, None
         if (
             len(closes) != count
             or closes.isna().any()
@@ -8381,17 +8419,17 @@ class Backtester:
             or not closes.is_monotonic_increasing
         ):
             contract["reason"] = "bar-close axis is incomplete, duplicated, or non-monotonic"
-            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+            return pre_open_rollover_units, rollover_units, False, contract, 0.0, 0.0, None, None
         try:
             opens = pd.DatetimeIndex(
                 pd.to_datetime(features.index, utc=True, errors="coerce")
             )
             if len(opens) != count or opens.isna().any() or not bool((closes > opens).all()):
                 contract["reason"] = "bar-close timestamps are not after bar opens"
-                return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+                return pre_open_rollover_units, rollover_units, False, contract, 0.0, 0.0, None, None
         except Exception as exc:
             contract["reason"] = f"bar-open validation failed: {type(exc).__name__}"
-            return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, False, contract
+            return pre_open_rollover_units, rollover_units, False, contract, 0.0, 0.0, None, None
 
         overlay = research_overlay or self._resolve_broker_swap_projection(
             features,
@@ -8410,20 +8448,6 @@ class Backtester:
             raw_long = float(terms.get("swap_long", 0.0) or 0.0)
             raw_short = float(terms.get("swap_short", 0.0) or 0.0)
             terms_swap_mode = int(terms.get("swap_mode", -1))
-            for index in np.flatnonzero(np.isfinite(entry_prices)):
-                entry_price = float(entry_prices[int(index)])
-                long_per_lot[int(index)] = self._swap_value_per_lot_dollars(
-                    spec,
-                    raw_long,
-                    entry_price=entry_price,
-                    swap_mode=terms_swap_mode,
-                )
-                short_per_lot[int(index)] = self._swap_value_per_lot_dollars(
-                    spec,
-                    raw_short,
-                    entry_price=entry_price,
-                    swap_mode=terms_swap_mode,
-                )
             provenance_status = str(
                 resolved.get("schedule_provenance_status") or ""
             ).upper()
@@ -8498,10 +8522,9 @@ class Backtester:
             return (
                 pre_open_rollover_units,
                 rollover_units,
-                long_per_lot,
-                short_per_lot,
                 True,
-                contract,
+                contract, raw_long, raw_short, terms_swap_mode,
+                self._static_swap_identity((projection, resolved)) if _capture_identity else None,
             )
 
         triple_day = self._resolved_triple_rollover_weekday(spec, self.config)
@@ -8534,18 +8557,6 @@ class Backtester:
 
         raw_long = float(getattr(spec, "swap_long", 0.0) or 0.0)
         raw_short = float(getattr(spec, "swap_short", 0.0) or 0.0)
-        for index in np.flatnonzero(np.isfinite(entry_prices)):
-            entry_price = float(entry_prices[int(index)])
-            long_per_lot[int(index)] = self._swap_value_per_lot_dollars(
-                spec,
-                raw_long,
-                entry_price=entry_price,
-            )
-            short_per_lot[int(index)] = self._swap_value_per_lot_dollars(
-                spec,
-                raw_short,
-                entry_price=entry_price,
-            )
         contract.update({
             "status": "UNAVAILABLE",
             "mode": "legacy_calendar_diagnostic_only",
@@ -8570,7 +8581,7 @@ class Backtester:
                 pre_open_rollover_units.sum() + rollover_units.sum()
             ),
         })
-        return pre_open_rollover_units, rollover_units, long_per_lot, short_per_lot, True, contract
+        return pre_open_rollover_units, rollover_units, True, contract, raw_long, raw_short, None, None
      
     def _validate_research_cost_level(self, level_id: Optional[str]) -> None:
         if level_id is None:
@@ -10180,9 +10191,15 @@ class Backtester:
                             position_direction, entry_price, max(0, i - entry_bar),
                             mae_pips_current, mfe_pips_current,
                             time_to_mae_bars_current, time_to_mfe_bars_current)
-                    governance_exit_price = bid_open if position_direction == 1 else ask_open
+                    governance_exit_price, _, exit_at_open = _protective_session_exit(
+                        position_direction,
+                        bid_open if position_direction == 1 else ask_open,
+                        bid_low if position_direction == 1 else ask_low,
+                        bid_high if position_direction == 1 else ask_high,
+                        stop_loss, take_profit, True,
+                    )
                     governance_exit_reason = TradeStatus.CLOSED_SESSION.value
-                    entry_allowed_at_open = True
+                    entry_allowed_at_open = exit_at_open
                 if governance_policy and not session_exit_now:
                     prev_bar = i - 1
                     if prev_bar >= entry_bar:
@@ -10389,29 +10406,20 @@ class Backtester:
                         time_underwater_bars_current,
                     )
                 
-                if exit_price is None and position_direction == 1:  # Long position
-                    if bid_open <= stop_loss:
-                        exit_price = bid_open
-                        exit_reason = TradeStatus.CLOSED_SL.value
-                        entry_allowed_at_open = True
-                    elif bid_low <= stop_loss:
-                        exit_price = stop_loss
-                        exit_reason = TradeStatus.CLOSED_SL.value
-                    elif bid_high >= take_profit:
-                        exit_price = take_profit
-                        exit_reason = TradeStatus.CLOSED_TP.value
-                        
-                elif exit_price is None:  # Short position
-                    if ask_open >= stop_loss:
-                        exit_price = ask_open
-                        exit_reason = TradeStatus.CLOSED_SL.value
-                        entry_allowed_at_open = True
-                    elif ask_high >= stop_loss:
-                        exit_price = stop_loss
-                        exit_reason = TradeStatus.CLOSED_SL.value
-                    elif ask_low <= take_profit:
-                        exit_price = take_profit
-                        exit_reason = TradeStatus.CLOSED_TP.value
+                if exit_price is None:
+                    protective_price, protective_reason, exit_at_open = _protective_session_exit(
+                        position_direction,
+                        bid_open if position_direction == 1 else ask_open,
+                        bid_low if position_direction == 1 else ask_low,
+                        bid_high if position_direction == 1 else ask_high,
+                        stop_loss, take_profit,
+                    )
+                    if protective_reason != EXIT_NONE:
+                        exit_price = protective_price
+                        exit_reason = (TradeStatus.CLOSED_SL.value if protective_reason == EXIT_SL
+                                       else TradeStatus.CLOSED_TP.value)
+                        if exit_at_open:
+                            entry_allowed_at_open = True
                 
                 if exit_price is not None:
                     # Calculate P&L using tick-based math
@@ -10595,30 +10603,16 @@ class Backtester:
                             )
 
                             # Same-bar exit: check gap-through at open FIRST, then intra-bar
-                            exit_price = None
-                            exit_reason = None
-                            if position_direction == 1:
-                                if bid_open <= stop_loss:
-                                    exit_price = bid_open
-                                    exit_reason = TradeStatus.CLOSED_SL.value
-                                elif bid_low <= stop_loss:
-                                    exit_price = stop_loss
-                                    exit_reason = TradeStatus.CLOSED_SL.value
-                                elif bid_high >= take_profit:
-                                    exit_price = take_profit
-                                    exit_reason = TradeStatus.CLOSED_TP.value
-                            else:
-                                if ask_open >= stop_loss:
-                                    exit_price = ask_open
-                                    exit_reason = TradeStatus.CLOSED_SL.value
-                                elif ask_high >= stop_loss:
-                                    exit_price = stop_loss
-                                    exit_reason = TradeStatus.CLOSED_SL.value
-                                elif ask_low <= take_profit:
-                                    exit_price = take_profit
-                                    exit_reason = TradeStatus.CLOSED_TP.value
-
-                            if exit_price is not None:
+                            exit_price, protective_reason, _ = _protective_session_exit(
+                                position_direction,
+                                bid_open if position_direction == 1 else ask_open,
+                                bid_low if position_direction == 1 else ask_low,
+                                bid_high if position_direction == 1 else ask_high,
+                                stop_loss, take_profit,
+                            )
+                            if protective_reason != EXIT_NONE:
+                                exit_reason = (TradeStatus.CLOSED_SL.value if protective_reason == EXIT_SL
+                                               else TradeStatus.CLOSED_TP.value)
                                 gross_pnl_dollars = spec.calculate_tick_profit(
                                     entry_price, exit_price, position_size, position_direction
                                 )

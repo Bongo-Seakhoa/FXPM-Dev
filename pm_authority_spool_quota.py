@@ -1,12 +1,8 @@
-"""Cross-process publication byte accounting for one authority spool root.
+"""Publication lease ownership with local stream ordering.
 
-The quota is operational routing state, not evidence.  Writers durably reserve
-bytes under a short root lock, then compute and stage outside that lock.  A
-kernel-held per-reservation guard distinguishes live writers from crashed
-writers without trusting reusable process identifiers.  Once no writer is
-live, abandoned reservations are reconciled by one exact inode-deduplicated
-rescan before another publication. Legacy generation-byte and free-space
-fields remain decodable metadata and do not admit or reject writes.
+Legacy quota state remains structurally validated. Its numerical fields are
+compatibility metadata; durable entry/finish records track membership, not
+capacity or byte totals. OS guards preserve live/abandoned ownership.
 """
 
 from __future__ import annotations
@@ -17,7 +13,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import threading
 import time
@@ -34,7 +29,6 @@ QUOTA_TEMP_PREFIX: Final = ".generation-quota."
 QUOTA_RESERVATION_PREFIX: Final = ".generation-quota.reservation."
 GENERATION_TERMINAL_NAME: Final = "generation-retirement.json"
 MAX_STATE_BYTES: Final = 32 * 1024
-MAX_RESCAN_ENTRIES: Final = 1_000_000
 STATE_REPLACE_ATTEMPTS: Final = 6
 STATE_REPLACE_INITIAL_DELAY_SECONDS: Final = 0.05
 
@@ -378,88 +372,8 @@ def _reject_constant(value: str) -> None:
     _fail("SPOOL_QUOTA_STATE_NONFINITE", value)
 
 
-def _excluded_root_metadata(path: Path, root: Path) -> bool:
-    return path.parent == root and (
-        path.name in {QUOTA_STATE_NAME, QUOTA_LOCK_NAME}
-        or path.name.startswith(QUOTA_TEMP_PREFIX)
-    )
 
 
-def _scan_committed_bytes(root: Path) -> int:
-    """Count exact unique regular-file inodes below one non-reparse root."""
-
-    total = 0
-    entry_count = 0
-    inodes: set[tuple[int, int]] = set()
-    stack = [root]
-    while stack:
-        directory = stack.pop()
-        try:
-            entries = os.scandir(directory)
-        except OSError as exc:
-            raise _io_error(
-                "SPOOL_QUOTA_RESCAN_FAILED",
-                exc,
-                step="rescan_open",
-            ) from exc
-        step = "rescan_iteration"
-        try:
-            with entries:
-                for entry in entries:
-                    entry_count += 1
-                    if entry_count > MAX_RESCAN_ENTRIES:
-                        _fail("SPOOL_QUOTA_RESCAN_ENTRY_BOUND_EXCEEDED")
-                    path = Path(entry.path)
-                    if _excluded_root_metadata(path, root):
-                        continue
-                    try:
-                        info = entry.stat(follow_symlinks=False)
-                    except OSError as exc:
-                        raise _io_error(
-                            "SPOOL_QUOTA_RESCAN_FAILED",
-                            exc,
-                            step="rescan_entry_stat",
-                        ) from exc
-                    if entry.is_symlink() or _is_reparse(path):
-                        _fail("SPOOL_QUOTA_REPARSE_ENTRY_FORBIDDEN", path)
-                    if stat.S_ISDIR(info.st_mode):
-                        stack.append(path)
-                        continue
-                    if not stat.S_ISREG(info.st_mode):
-                        _fail("SPOOL_QUOTA_NONREGULAR_ENTRY_FORBIDDEN", path)
-                    try:
-                        file_info = os.stat(path, follow_symlinks=False)
-                    except OSError as exc:
-                        raise _io_error(
-                            "SPOOL_QUOTA_RESCAN_FAILED",
-                            exc,
-                            step="rescan_file_stat",
-                        ) from exc
-                    reparse_marker = int(
-                        getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0) or 0
-                    )
-                    file_attributes = int(
-                        getattr(file_info, "st_file_attributes", 0) or 0
-                    )
-                    if not stat.S_ISREG(file_info.st_mode) or (
-                        reparse_marker and file_attributes & reparse_marker
-                    ):
-                        _fail("SPOOL_QUOTA_RESCAN_FAILED", "FILE_TYPE_CHANGED", path)
-                    inode = (int(file_info.st_dev), int(file_info.st_ino))
-                    if inode == (0, 0):
-                        _fail("SPOOL_QUOTA_RESCAN_FAILED", "FILE_IDENTITY_UNAVAILABLE", path)
-                    if inode not in inodes:
-                        inodes.add(inode)
-                        total += int(file_info.st_size)
-        except AuthoritySpoolQuotaError:
-            raise
-        except OSError as exc:
-            raise _io_error(
-                "SPOOL_QUOTA_RESCAN_FAILED",
-                exc,
-                step=step,
-            ) from exc
-    return total
 
 
 def _guard_path(root: Path, token: str) -> Path:
@@ -608,15 +522,6 @@ def _guard_is_live(root: Path, token: str) -> bool:
         ) from exc
 
 
-def _disk_free(root: Path) -> int:
-    try:
-        return int(shutil.disk_usage(root).free)
-    except OSError as exc:
-        raise _io_error(
-            "SPOOL_QUOTA_FREE_SPACE_UNAVAILABLE",
-            exc,
-            step="disk_usage",
-        ) from exc
 
 
 def _load_state_locked(
@@ -627,21 +532,19 @@ def _load_state_locked(
 ) -> dict[str, Any]:
     current = _read_state(root)
     if current is None:
-        committed = _scan_committed_bytes(root)
         current = _state(
             max_generation_bytes=maximum,
             min_free_bytes=reserve,
-            committed_bytes=committed,
+            committed_bytes=0,
         )
     records = list(current["reservations"])
     if records and not any(
         _guard_is_live(root, str(record["token"])) for record in records
     ):
-        committed = _scan_committed_bytes(root)
         current = _state(
-            max_generation_bytes=maximum,
-            min_free_bytes=reserve,
-            committed_bytes=committed,
+            max_generation_bytes=current["max_generation_bytes"],
+            min_free_bytes=current["min_free_bytes"],
+            committed_bytes=current["committed_bytes"],
         )
         _write_state(root, current)
         for record in records:
@@ -665,16 +568,11 @@ def _record_for(
     raise AssertionError("unreachable")
 
 
-def _unmaterialized(records: list[dict[str, Any]]) -> int:
-    return sum(
-        int(record["reserved_bytes"]) - int(record["materialized_bytes"])
-        for record in records
-    )
 
 
 @dataclass
 class PublicationLease:
-    """One durable publication reservation; no root lock is held by callers."""
+    """Durable publication membership with local byte sequencing."""
 
     _root: Path
     _max_generation_bytes: int
@@ -688,6 +586,7 @@ class PublicationLease:
 
     @property
     def committed_bytes(self) -> int:
+        """Legacy recorded metadata admitted at entry; not a live byte total."""
         return self._committed_bytes
 
     @property
@@ -703,74 +602,23 @@ class PublicationLease:
             _fail("SPOOL_QUOTA_LEASE_ALREADY_FINISHED")
 
     def consume(self, byte_count: int) -> None:
-        """Durably reserve bytes before writing them to any transient file."""
+        """Sequence bytes locally; durable state records membership only."""
 
         self._assert_open()
-        count = _bound(
-            byte_count,
-            "SPOOL_QUOTA_CONSUME_BYTES_INVALID",
-            allow_zero=True,
+        count = _bound(byte_count, "SPOOL_QUOTA_CONSUME_BYTES_INVALID", allow_zero=True)
+        self._in_progress_bytes = _bound(
+            self._in_progress_bytes + count, "SPOOL_QUOTA_RESERVED_BYTES_INVALID", allow_zero=True
         )
-        with _exclusive_file_lock(self._root / QUOTA_LOCK_NAME):
-            current = _load_state_locked(
-                self._root,
-                maximum=self._max_generation_bytes,
-                reserve=self._min_free_bytes,
-            )
-            index, record = _record_for(current, self._token)
-            records = [dict(value) for value in current["reservations"]]
-            if count:
-                record["reserved_bytes"] = int(record["reserved_bytes"]) + count
-                records[index] = record
-                _write_state(
-                    self._root,
-                    _state(
-                        max_generation_bytes=self._max_generation_bytes,
-                        min_free_bytes=self._min_free_bytes,
-                        committed_bytes=int(current["committed_bytes"]),
-                        reservations=records,
-                    ),
-                )
-            self._committed_bytes = int(current["committed_bytes"])
-            self._in_progress_bytes = int(record["reserved_bytes"])
-            self._materialized_bytes = int(record["materialized_bytes"])
 
     def materialize(self, byte_count: int) -> None:
-        """Record bytes written after a successful physical write."""
+        """Record the successful physical write within this lease."""
 
         self._assert_open()
-        count = _bound(
-            byte_count,
-            "SPOOL_QUOTA_MATERIALIZE_BYTES_INVALID",
-            allow_zero=True,
-        )
-        if count == 0:
-            return
-        with _exclusive_file_lock(self._root / QUOTA_LOCK_NAME):
-            current = _load_state_locked(
-                self._root,
-                maximum=self._max_generation_bytes,
-                reserve=self._min_free_bytes,
-            )
-            index, record = _record_for(current, self._token)
-            materialized = int(record["materialized_bytes"]) + count
-            if materialized > int(record["reserved_bytes"]):
-                _fail("SPOOL_QUOTA_MATERIALIZED_EXCEEDS_RESERVED")
-            records = [dict(value) for value in current["reservations"]]
-            record["materialized_bytes"] = materialized
-            records[index] = record
-            _write_state(
-                self._root,
-                _state(
-                    max_generation_bytes=self._max_generation_bytes,
-                    min_free_bytes=self._min_free_bytes,
-                    committed_bytes=int(current["committed_bytes"]),
-                    reservations=records,
-                ),
-            )
-            self._committed_bytes = int(current["committed_bytes"])
-            self._in_progress_bytes = int(record["reserved_bytes"])
-            self._materialized_bytes = materialized
+        count = _bound(byte_count, "SPOOL_QUOTA_MATERIALIZE_BYTES_INVALID", allow_zero=True)
+        materialized = self._materialized_bytes + count
+        if materialized > self._in_progress_bytes:
+            _fail("SPOOL_QUOTA_MATERIALIZED_EXCEEDS_RESERVED")
+        self._materialized_bytes = materialized
 
     def cancel_after_cleanup(self) -> None:
         """Release a reservation only after all of its physical bytes are gone."""
@@ -788,13 +636,12 @@ class PublicationLease:
             _write_state(
                 self._root,
                 _state(
-                    max_generation_bytes=self._max_generation_bytes,
-                    min_free_bytes=self._min_free_bytes,
+                    max_generation_bytes=current["max_generation_bytes"],
+                    min_free_bytes=current["min_free_bytes"],
                     committed_bytes=int(current["committed_bytes"]),
                     reservations=records,
                 ),
             )
-            self._committed_bytes = int(current["committed_bytes"])
             self._in_progress_bytes = 0
             self._materialized_bytes = 0
             self._finished = True
@@ -813,21 +660,19 @@ class PublicationLease:
                 reserve=self._min_free_bytes,
             )
             index, record = _record_for(current, self._token)
-            if unique > int(record["reserved_bytes"]):
+            if unique > self._in_progress_bytes:
                 _fail("SPOOL_QUOTA_COMMIT_EXCEEDS_CONSUMED")
             records = [dict(value) for value in current["reservations"]]
             del records[index]
-            committed = int(current["committed_bytes"]) + unique
             _write_state(
                 self._root,
                 _state(
-                    max_generation_bytes=self._max_generation_bytes,
-                    min_free_bytes=self._min_free_bytes,
-                    committed_bytes=committed,
+                    max_generation_bytes=current["max_generation_bytes"],
+                    min_free_bytes=current["min_free_bytes"],
+                    committed_bytes=current["committed_bytes"],
                     reservations=records,
                 ),
             )
-            self._committed_bytes = committed
             self._in_progress_bytes = 0
             self._materialized_bytes = 0
             self._finished = True
@@ -840,7 +685,7 @@ def publication_lease(
     max_generation_bytes: int,
     min_free_bytes: int,
 ) -> Iterator[PublicationLease]:
-    """Create one durable reservation while holding only short state locks."""
+    """Create durable lease membership while holding only short state locks."""
 
     safe_root = _root(Path(root))
     maximum = _bound(
@@ -878,8 +723,8 @@ def publication_lease(
             _write_state(
                 safe_root,
                 _state(
-                    max_generation_bytes=maximum,
-                    min_free_bytes=reserve,
+                    max_generation_bytes=current["max_generation_bytes"],
+                    min_free_bytes=current["min_free_bytes"],
                     committed_bytes=int(current["committed_bytes"]),
                     reservations=records,
                 ),
@@ -905,11 +750,7 @@ def publication_lease(
 
 @dataclass
 class PublicationBatch:
-    """One durable reservation shared by many small publications.
-
-    The durable reservation always covers every byte the batch has published and
-    not yet committed. Closing commits the same sum the per-object commits add.
-    """
+    """One durable membership shared by locally sequenced publications."""
 
     _lease: PublicationLease
     _window_bytes: int
@@ -938,7 +779,7 @@ class PublicationBatch:
             self._reported_bytes = self._published_bytes
 
     def reserve(self, byte_count: int) -> None:
-        """Durably cover the next object before any of its bytes are written."""
+        """Sequence the next object within the local publication window."""
 
         if self._poisoned:
             _fail("SPOOL_QUOTA_BATCH_POISONED")
@@ -982,11 +823,7 @@ class PublicationBatch:
             self._report()
 
     def poison(self) -> None:
-        """Keep the record for the rescan and refuse any further use.
-
-        The reservation then still covers every byte this batch put on disk,
-        whether or not it was counted as published, until the rescan.
-        """
+        """Retain unfinished membership and refuse any further batch use."""
 
         self._poisoned = True
 
@@ -1019,8 +856,7 @@ def publication_batch(
         try:
             yield batch
         except BaseException:
-            # Linked objects are durable. Account for them, and keep the root
-            # cause if accounting fails: the record then stays for the rescan.
+            # Preserve the original failure; unfinished membership remains durable.
             try:
                 if not lease._finished:
                     batch.close()

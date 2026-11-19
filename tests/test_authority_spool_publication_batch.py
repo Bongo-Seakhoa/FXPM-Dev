@@ -1,4 +1,4 @@
-"""O1 cut 1: batch publication keeps published bytes, names and the final quota state identical to per-object publication."""
+"""Publication byte parity, durable membership and failure invariants; numerical quota totals are retired."""
 import hashlib
 import json
 import os
@@ -42,7 +42,7 @@ class PublicationBatchTests(unittest.TestCase):
         self.bases = {}
 
     def context(self, name, **limits):
-        """A context with internally consistent limits; records the committed bytes the context file itself accounts for."""
+        """A context with consistent limits and its legacy recorded metadata snapshot."""
         default = spool.SpoolLimits()
         generation = limits.get("max_generation_bytes", default.max_generation_bytes)
         artifact = limits.setdefault("max_artifact_bytes", min(default.max_artifact_bytes, generation))
@@ -55,21 +55,15 @@ class PublicationBatchTests(unittest.TestCase):
         return ctx
 
     def capped(self, name, objects, slack=0):
-        """A context whose generation cap leaves room for exactly `objects` payloads plus `slack` bytes."""
-        probe = self.context(name + "_probe", max_generation_bytes=50_000)
-        cap = self.bases[probe.root] + objects * SIZE + slack
-        ctx = self.context(name, max_generation_bytes=cap)
-        self.assertEqual(self.bases[ctx.root] + objects * SIZE + slack, cap)
-        return ctx
+        """Set legacy capacity metadata below the complete tested publication."""
+        return self.context(name, max_generation_bytes=objects * SIZE + slack)
 
-    def assertQuota(self, ctx, published_bytes):
+    def assertMembershipClosed(self, ctx):
         s = state(ctx.root)
-        self.assertEqual((s["committed_bytes"], s["reservations"]), (self.bases[ctx.root] + published_bytes, []))
+        self.assertEqual(s["reservations"], [])
+        self.assertEqual(s["status"], "CLEAN")
+        self.assertEqual(s["committed_bytes"], self.bases[ctx.root])  # Recorded compatibility metadata.
 
-    def fixed_disk_free(self, value):
-        original = quota._disk_free
-        quota._disk_free = lambda root: value
-        self.addCleanup(setattr, quota, "_disk_free", original)
 
     def test_batch_matches_per_object_publication(self):
         payloads = [payload(i) for i in range(40)]
@@ -81,8 +75,8 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         self.assertEqual(tree(batch.root), tree(plain.root))
         self.assertEqual(len(tree(batch.root)), 40)
-        self.assertQuota(plain, 40 * SIZE); self.assertQuota(batch, 40 * SIZE)
-        self.assertEqual(state(batch.root), state(plain.root))    # whole final quota state, limits included
+        self.assertMembershipClosed(plain); self.assertMembershipClosed(batch)
+        self.assertEqual(state(batch.root), state(plain.root))    # whole final membership state, compatibility metadata included
         self.assertEqual(state(batch.root)["min_free_bytes"], 0)  # a disabled free-space reserve stays disabled
         self.assertEqual(list((batch.root / "tmp").iterdir()), [])
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
@@ -95,7 +89,7 @@ class PublicationBatchTests(unittest.TestCase):
             actual = [b.put_opaque(f"ns/{i}", "kind", (payload(i),), format=FORMAT) for i in range(12)]
         self.assertEqual(actual, expected)
         self.assertEqual(b.artifact_roster(), a.artifact_roster())
-        self.assertQuota(batch, 12 * SIZE)
+        self.assertMembershipClosed(batch)
 
     def _assert_reused_mutable_chunk_parity(self, *, memory_view, overflow):
         limit = 64
@@ -123,8 +117,8 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual((plain.root / ordinary["relative_path"]).read_bytes(), expected)
         self.assertEqual((batch.root / buffered["relative_path"]).read_bytes(), expected)
         self.assertEqual(tree(batch.root), tree(plain.root))
-        self.assertQuota(plain, len(expected))
-        self.assertQuota(batch, len(expected))
+        self.assertMembershipClosed(plain)
+        self.assertMembershipClosed(batch)
         self.assertEqual(list((batch.root / "tmp").iterdir()), [])
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
 
@@ -178,8 +172,8 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(ordinary["size_bytes"], len(expected))
         self.assertEqual((plain.root / ordinary["relative_path"]).read_bytes(), expected)
         self.assertEqual((batch.root / buffered["relative_path"]).read_bytes(), expected)
-        self.assertQuota(plain, len(expected))
-        self.assertQuota(batch, len(expected))
+        self.assertMembershipClosed(plain)
+        self.assertMembershipClosed(batch)
         self.assertLessEqual(batch_peak - ordinary_peak, 4 * limit)
 
     def test_oversized_bytearray_streams_with_bounded_extra_publication_peak(self):
@@ -196,7 +190,7 @@ class PublicationBatchTests(unittest.TestCase):
             new = spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
             repeat = spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
         self.assertEqual((again, repeat), (first, new))
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 2)
 
     def test_large_object_inside_a_batch_uses_the_ordinary_path(self):
@@ -207,7 +201,7 @@ class PublicationBatchTests(unittest.TestCase):
             spool.write_opaque_artifact(batch, [payload(7)], format=FORMAT)
             actual = spool.write_opaque_artifact(batch, big, format=FORMAT)
         self.assertEqual(actual, expected)
-        self.assertQuota(batch, 1_400_000 + SIZE)
+        self.assertMembershipClosed(batch)
 
     def test_exception_inside_a_batch_commits_what_was_published(self):
         ctx = self.context("boom")
@@ -216,7 +210,7 @@ class PublicationBatchTests(unittest.TestCase):
                 spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
                 spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
                 raise RuntimeError("boom")
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 2)
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
 
@@ -225,39 +219,21 @@ class PublicationBatchTests(unittest.TestCase):
         with spool.publication_batch(ctx):
             for i in range(6):
                 spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
-        self.assertQuota(ctx, 6 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 6)
-        self.assertGreater(state(ctx.root)["committed_bytes"], ctx.limits.max_generation_bytes)
+        self.assertGreater(6 * SIZE, ctx.limits.max_generation_bytes)
 
-    def test_small_remaining_quota_is_used_exactly(self):
-        ctx = self.capped("exact", 3)
-        with spool.publication_batch(ctx):
-            for i in range(3):
-                spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
-        self.assertQuota(ctx, 3 * SIZE)
-        self.assertEqual(state(ctx.root)["committed_bytes"], ctx.limits.max_generation_bytes)
 
     def test_legacy_free_space_reserve_does_not_block_a_batch(self):
         free = 10**9
-        self.fixed_disk_free(free)
         ctx = self.context("floor", min_free_bytes=free - 2_000)
         with spool.publication_batch(ctx):
             spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
         self.assertEqual(len(tree(ctx.root)), 1)
-        self.assertQuota(ctx, SIZE)
+        self.assertMembershipClosed(ctx)
 
-    def test_free_space_headroom_smaller_than_the_window_is_still_usable(self):
-        free = 10**9
-        self.fixed_disk_free(free)
-        headroom = 100_000
-        self.assertLess(headroom, spool._BATCH_RESERVATION_WINDOW_BYTES)
-        ctx = self.context("headroom", min_free_bytes=free - headroom)
-        with spool.publication_batch(ctx):
-            for i in range(5):
-                spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
-        self.assertQuota(ctx, 5 * SIZE)
 
-    def test_abandoned_batch_is_recovered_by_the_existing_rescan(self):
+    def test_abandoned_batch_is_recovered_from_its_known_membership(self):
         ctx = self.context("dead")
         stack = ExitStack(); stack.enter_context(spool.publication_batch(ctx))
         for i in range(5):
@@ -267,10 +243,10 @@ class PublicationBatchTests(unittest.TestCase):
         scope.account._lease._guard.close(remove=False)          # the process is gone: record stays, guard is dead
         self.assertEqual(len(state(ctx.root)["reservations"]), 1)
         spool.write_opaque_artifact(ctx, [payload(99)], format=FORMAT)   # an ordinary publication recovers the root
-        self.assertQuota(ctx, 6 * SIZE)
+        self.assertMembershipClosed(ctx)
         with self.assertRaises(spool.AuthoritySpoolError):       # the dead batch cannot commit a second time
             stack.close()
-        self.assertQuota(ctx, 6 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
 
     def test_nested_scope_joins_the_outer_batch(self):
@@ -280,7 +256,7 @@ class PublicationBatchTests(unittest.TestCase):
                 spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
             self.assertEqual(len(state(ctx.root)["reservations"]), 1)
             spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
 
     def test_input_refusals_are_unchanged(self):
         ctx = self.context("bad")
@@ -289,12 +265,12 @@ class PublicationBatchTests(unittest.TestCase):
                 spool.write_opaque_artifact(ctx, [], format=FORMAT)
             with self.assertRaisesRegex(spool.AuthoritySpoolError, "ARTIFACT_CHUNK_TYPE_INVALID"):
                 spool.write_opaque_artifact(ctx, ["text"], format=FORMAT)
-        self.assertQuota(ctx, 0)
+        self.assertMembershipClosed(ctx)
         small = self.context("small", max_artifact_bytes=100)
         with spool.publication_batch(small):
             with self.assertRaisesRegex(spool.AuthoritySpoolError, "ARTIFACT_SIZE_BOUND_EXCEEDED"):
                 spool.write_opaque_artifact(small, [payload(1)], format=FORMAT)
-        self.assertQuota(small, 0)
+        self.assertMembershipClosed(small)
 
     def test_content_address_conflict_is_refused(self):
         ctx = self.context("conflict")
@@ -319,18 +295,9 @@ class PublicationBatchTests(unittest.TestCase):
         for t in threads: t.start()
         for t in threads: t.join()
         self.assertEqual(errors, [])
-        self.assertQuota(ctx, 50 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 50)
 
-    def test_unused_reservation_never_exceeds_the_batch_window(self):
-        ctx = self.context("window")
-        self.assertLess(spool._BATCH_RESERVATION_WINDOW_BYTES, spool._RESERVATION_WINDOW_BYTES)
-        with spool.publication_batch(ctx):
-            for i in range(3):
-                spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
-            record = state(ctx.root)["reservations"][0]
-            self.assertEqual(record["reserved_bytes"], spool._BATCH_RESERVATION_WINDOW_BYTES)
-        self.assertQuota(ctx, 3 * SIZE)
 
     def test_ordinary_publication_from_another_thread_while_a_batch_is_open(self):
         ctx = self.context("mixed"); out = []
@@ -340,7 +307,7 @@ class PublicationBatchTests(unittest.TestCase):
             other.start(); other.join()
             self.assertEqual(len(state(ctx.root)["reservations"]), 1)
         self.assertEqual(len(out), 1)
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
 
     # Regressions for Root E5725.
 
@@ -352,15 +319,16 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(original.count(b'"cut1"'), 1)
         with spool.publication_batch(ctx):
             spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
+            before_membership = state(ctx.root)
             changed = replace(ctx, generation_id="cut2")
             with self.assertRaises(spool.AuthoritySpoolError) as caught:
                 spool.write_opaque_artifact(changed, [payload(2)], format=FORMAT)
             self.assertNotIn("SPOOL_QUOTA", str(caught.exception))
             self.assertEqual(len(tree(ctx.root)), 1)
             self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
-            self.assertEqual(state(ctx.root)["reservations"][0]["materialized_bytes"], 0)   # nothing reported for object 2
+            self.assertEqual(state(ctx.root), before_membership)
             spool.write_opaque_artifact(ctx, [payload(3)], format=FORMAT)
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 2)
 
     def test_directory_replaced_by_a_link_is_refused_before_any_write(self):
@@ -396,29 +364,11 @@ class PublicationBatchTests(unittest.TestCase):
             self.assertEqual(list(tmp_dir.iterdir()), [])
             unlink(parent); os.rename(moved, parent)
             spool.write_opaque_artifact(ctx, [payload(3)], format=FORMAT)
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 2)
 
-    def test_declining_reported_free_space_does_not_truncate_or_double_count(self):
-        ctx = self.context("declining")
-        free_at_start = 100_000
 
-        def declining(root):
-            objects = Path(root) / "objects"
-            return free_at_start - sum(p.stat().st_size for p in objects.rglob("*") if p.is_file())
-
-        original = quota._disk_free
-        quota._disk_free = declining
-        self.addCleanup(setattr, quota, "_disk_free", original)
-        formerly_fits = free_at_start // SIZE
-        self.assertEqual(formerly_fits, 21)
-        with spool.publication_batch(ctx):
-            for i in range(formerly_fits + 1):
-                spool.write_opaque_artifact(ctx, [payload(i)], format=FORMAT)
-        self.assertEqual(len(tree(ctx.root)), formerly_fits + 1)
-        self.assertQuota(ctx, (formerly_fits + 1) * SIZE)
-
-    def test_failure_after_the_link_leaves_the_record_for_the_rescan(self):
+    def test_failure_after_the_link_retains_membership_for_recovery(self):
         ctx = self.context("afterlink")
         real = spool._publish_temp_exclusive
 
@@ -435,8 +385,8 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(len(tree(ctx.root)), 1)                             # the object is linked
         self.assertEqual(len(state(ctx.root)["reservations"]), 1)            # and its record was not committed away
         self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
-        spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)        # the next publication recovers by rescan
-        self.assertQuota(ctx, 2 * SIZE)
+        spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)        # the next publication reconciles known membership
+        self.assertMembershipClosed(ctx)
 
     # Regression for Root E5737.
 
@@ -468,12 +418,12 @@ class PublicationBatchTests(unittest.TestCase):
             self.assertEqual(len(tree(ctx.root)), 2)                             # nothing new reached the disk
             self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
             record = state(ctx.root)["reservations"][0]
-            self.assertGreaterEqual(record["reserved_bytes"], 2 * SIZE)          # both linked objects stay covered
+            self.assertEqual(len(state(ctx.root)["reservations"]), 1)          # Linked objects retain their lease membership.
             big = spool.write_opaque_artifact(ctx, [b"a" * 700_000, b"b" * 700_000], format=FORMAT)   # the ordinary path still works
             self.assertEqual(big["size_bytes"], 1_400_000)
         self.assertEqual(len(state(ctx.root)["reservations"]), 1)                # the poisoned record was not committed
-        spool.write_opaque_artifact(ctx, [payload(3)], format=FORMAT)            # the next publication recovers by rescan
-        self.assertQuota(ctx, 3 * SIZE + 1_400_000)
+        spool.write_opaque_artifact(ctx, [payload(3)], format=FORMAT)            # the next publication reconciles known membership
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 4)
 
     def test_outside_a_batch_nothing_changes(self):
@@ -481,7 +431,7 @@ class PublicationBatchTests(unittest.TestCase):
         d = spool.write_opaque_artifact(ctx, [payload(1)], format=FORMAT)
         self.assertEqual(d["sha256"], hashlib.sha256(payload(1)).hexdigest())
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
-        self.assertQuota(ctx, SIZE)
+        self.assertMembershipClosed(ctx)
 
     def _assert_double_fault_keeps_in_flight_reservation(self, *, nested):
         """INVENTED software faults only; no financial or performance evidence."""
@@ -528,13 +478,12 @@ class PublicationBatchTests(unittest.TestCase):
         before = state(ctx.root)
         self.assertEqual(before["committed_bytes"], self.bases[ctx.root])
         self.assertEqual(len(before["reservations"]), 1)
-        self.assertGreaterEqual(before["reservations"][0]["reserved_bytes"], linked_count * SIZE)
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
         spool.write_opaque_artifact(ctx, [payload(3)], format=FORMAT)
-        self.assertQuota(ctx, (linked_count + 1) * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), linked_count + 1)
 
-    def test_double_fault_after_link_retains_reservation_until_ordinary_rescan(self):
+    def test_double_fault_after_link_retains_membership_until_recovery(self):
         self._assert_double_fault_keeps_in_flight_reservation(nested=False)
 
     def test_nested_publication_does_not_clear_outer_double_fault_marker(self):
@@ -557,11 +506,11 @@ class PublicationBatchTests(unittest.TestCase):
             spool._publish_temp_exclusive = real
             self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
             spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 2)
 
 
-    def test_full_window_reports_published_bytes_before_second_window(self):
+    def test_publishing_beyond_local_window_keeps_durable_membership_unchanged(self):
         """INVENTED payloads exercise the unchanged 1 MiB window, not performance."""
         ctx = self.context("two_windows")
         object_bytes = 16 * 1024
@@ -582,15 +531,15 @@ class PublicationBatchTests(unittest.TestCase):
                     self.assertEqual(snapshot["committed_bytes"], self.bases[ctx.root])
                     self.assertEqual(len(snapshot["reservations"]), 1)
                     record = snapshot["reservations"][0]
-                    self.assertEqual(record["reserved_bytes"], window)
-                    self.assertEqual(record["materialized_bytes"], window)
+                    first_membership = dict(record)
+                    self.assertEqual(record["reserved_bytes"], 0)
+                    self.assertEqual(record["materialized_bytes"], 0)
             second = state(ctx.root)["reservations"][0]
-            self.assertEqual(second["reserved_bytes"], 2 * window)
-            self.assertEqual(second["materialized_bytes"], window)
+            self.assertEqual(second, first_membership)
             self.assertEqual(tree(ctx.root), expected)
         total = (first_window_objects + 1) * object_bytes
         self.assertGreater(total, 1024 * 1024)
-        self.assertQuota(ctx, total)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(tree(ctx.root), expected)
         self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
 
@@ -608,7 +557,7 @@ class PublicationBatchTests(unittest.TestCase):
         self.assertEqual(tree(ctx.root), before_tree)
         self.assertEqual(state(ctx.root), before_state)
         self.assertEqual((ctx.root / descriptor["relative_path"]).read_bytes(), payload(0))
-        self.assertQuota(ctx, SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(terminal.read_bytes(), b"INVENTED terminal refusal fixture")
         self.assertEqual(list((ctx.root / "tmp").iterdir()), [])
 
@@ -646,7 +595,6 @@ class PublicationBatchTests(unittest.TestCase):
             before_tree = tree(ctx.root)
             self.assertEqual(before["committed_bytes"], self.bases[ctx.root])
             self.assertEqual(len(before["reservations"]), 1)
-            self.assertGreaterEqual(before["reservations"][0]["reserved_bytes"], SIZE)
             relative = spool._content_relative_path(hashlib.sha256(payload(1)).hexdigest(), FORMAT)
             if after_link:
                 self.assertEqual((ctx.root / relative).read_bytes(), payload(1))
@@ -663,7 +611,7 @@ class PublicationBatchTests(unittest.TestCase):
         Path.unlink = real_unlink
         self.assertEqual(state(ctx.root), before)
         spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 2 if after_link else 1)
         if not after_link:
             self.assertEqual(temps[0].read_bytes(), payload(1))
@@ -672,10 +620,10 @@ class PublicationBatchTests(unittest.TestCase):
     def test_linked_object_unlink_failure_poison_survives_successful_cleanup(self):
         self._assert_unlink_failure_retains_reservation(after_link=True)
 
-    def test_uncleaned_prelink_temp_poisons_batch_until_ordinary_rescan(self):
+    def test_uncleaned_prelink_temp_poisons_batch_until_recovery(self):
         self._assert_unlink_failure_retains_reservation(after_link=False)
 
-    def test_close_commit_failure_retains_published_objects_for_ordinary_rescan(self):
+    def test_close_commit_failure_retains_published_objects_for_recovery(self):
         """INVENTED durable state failure occurs only when close removes the record."""
         ctx = self.context("close_commit_failure")
         real_write_state = quota._write_state
@@ -694,12 +642,12 @@ class PublicationBatchTests(unittest.TestCase):
                 before = state(ctx.root)
                 quota._write_state = fail_close_state
         quota._write_state = real_write_state
-        self.assertEqual(commit_values, [self.bases[ctx.root] + SIZE])
+        self.assertEqual(commit_values, [self.bases[ctx.root]])
         self.assertEqual(state(ctx.root), before)
         self.assertEqual(before["committed_bytes"], self.bases[ctx.root])
         self.assertEqual(len(before["reservations"]), 1)
         self.assertEqual((ctx.root / descriptor["relative_path"]).read_bytes(), payload(1))
         self.assertEqual(spool._PUBLICATION_BATCHES, {})
         spool.write_opaque_artifact(ctx, [payload(2)], format=FORMAT)
-        self.assertQuota(ctx, 2 * SIZE)
+        self.assertMembershipClosed(ctx)
         self.assertEqual(len(tree(ctx.root)), 2)

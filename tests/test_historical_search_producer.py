@@ -1331,6 +1331,108 @@ def test_declared_verified_parent_selects_transport_capture_and_executor(tmp_pat
     assert completion["status"] == "NO_TRADE" and request._body_json == request_before
 
 
+@pytest.mark.parametrize("broken_display", [False, True], ids=["visible", "broken-display"])
+def test_ordinary_one_period_source_fit_search_progress_is_observational(tmp_path, monkeypatch, capfd, broken_display):
+    """Real ordinary issuance/capabilities; source, fit and completion are invented."""
+    from datetime import datetime, timedelta, timezone
+    import pm_historical_production_adapter as adapter
+    import pm_historical_scheduler as scheduler
+    import pm_production_config_binding as binding
+    from test_declared_symbol_scheduler import _ordinary_contract
+    from tests.test_declared_slot_owner_surface import _structural_native_snapshot, _structural_snapshot_backend
+
+    contract = _ordinary_contract(tmp_path, [("EURUSD", "H1", "TREND")])
+    row = contract["cells"][0]
+    snapshot = _structural_native_snapshot()
+    context = spool.freeze_generation_context(Path(row["root"]), generation_id=row["run_id"],
+        native_universe_sha256=_sha(snapshot), config_sha256=contract["config_sha256"])
+    payload, config = binding.load_effective_pipeline_config(Path(contract["active_config_path"]))
+    frozen = binding.freeze_production_pipeline_config(context,
+        active_config_path=Path(contract["active_config_path"]), config_payload=payload, supplied_config=config)
+    process = scheduler._declared_initial_process(context, row, development=False)
+    roster = scheduler._declared_resolved_ordinary_roster(row,
+        {"config_sha256": context.config_sha256, "effective_config_sha256": frozen.effective_config_sha256})
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    precommit = historical.precommit_declared_slot_owner_run_v2(context, run_id=row["run_id"], process=process,
+        slot_roster=roster, cell_roster=[row["cell"]], frozen_pipeline_config=frozen,
+        spread_profile_identity={"profile_sha256": "e" * 64},
+        source_access_window_utc={"start_utc": (now-timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end_exclusive_utc": (now+timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")},
+        launch_activation_utc=row["launch_activation_utc"], period_selection=row["period_selection"], final_study_13=False)
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    request = historical.declared_slot_producer_request(context, precommit=precommit, process=process,
+        cell_id=row["cell"]["cell_id"], slot_id=roster["slots"][0]["slot_id"],
+        attempt_id="INVENTED-ONE-PERIOD-PROGRESS-ONLY", sink=sink)
+    request_before = request._body_json
+    env = SimpleNamespace(context=context, process=process, frozen=frozen, precommit=precommit,
+        roster=roster, sink=sink)
+    source_calls = _structural_snapshot_backend(env, monkeypatch, observed=snapshot, state=native_prefix.AVAILABLE)
+    fitted = SimpleNamespace(
+        source_group_decision=SimpleNamespace(receipt_sha256="3" * 64,
+            to_dict=lambda: {"availability": producer.book.AVAILABLE}),
+        regime_fit_decision=SimpleNamespace(receipt_sha256="4" * 64,
+            to_dict=lambda: {"fit_state": producer.book.REGIME_FITTED}),
+        train_regime_support={"counts": {regime: 1 for regime in producer.book.REGIME_ORDER}},
+        _spread_tiers={tier: SimpleNamespace(descriptor=lambda: {"profile_sha256": "e" * 64})
+            for tier in ("P75", "P95")})
+    plan = SimpleNamespace(classification="INVENTED_PROGRESS_PLAN_NOT_OWNER_EVIDENCE")
+    observed = []
+    if broken_display:
+        def broken_observer(cell):
+            def broken(*args, **kwargs):
+                raise OSError("labelled broken status display")
+            return broken
+        monkeypatch.setattr(scheduler, "_declared_progress_observer", broken_observer)
+    def fit(**kwargs):
+        observed.append("fit")
+        return fitted
+    def open_capture(actual_context, *, request, process, plan, source_session):
+        assert actual_context is context and process is env.process
+        assert producer._verified_declared_slot_source_session(context, request=request,
+            process=process, source_session=source_session) is source_session
+        observed.append("capture")
+        return SimpleNamespace(request=request, plan=plan, _completion=None, completion=None)
+    def execute_cell(**kwargs):
+        assert kwargs["fitted"] is fitted and kwargs["cell_plan"] is plan
+        capture = kwargs["capture"]
+        assert callable(capture._progress_observer)
+        body = capture.request.to_dict()
+        completion = {"classification": "SYNTHETIC_PROGRESS_COMPLETION_NOT_OWNER_EVIDENCE",
+            "schema_version": adapter.DECLARED_SLOT_COMPLETION_SCHEMA,
+            "cell_id": body["cell_id"], "slot_id": body["slot_id"], "status": "NO_TRADE",
+            "reason_code": "SYNTHETIC_PROGRESS_ONLY", "request": body, "request_body": body,
+            "request_sha256": capture.request.receipt_sha256,
+            "completed_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "invented_private_fields": {"net_profit": 123, "win_rate": 0.5}}
+        capture._completion = capture.completion = completion
+        observed.append("search")
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Progress test reached a financial backtest")
+    monkeypatch.setattr(search_execution, "fit_native_timeframe_for_search", fit)
+    monkeypatch.setattr(planner, "build_declared_slot_observed_cell_plan", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(adapter, "open_matched_floor_declared_slot_capture", open_capture)
+    monkeypatch.setattr(search_execution, "execute_route_a_full_panel_historical_observed_cell", execute_cell)
+    monkeypatch.setattr(search_execution.Backtester, "run", forbidden)
+    try:
+        completion = producer.execute_declared_slot_owner_search(context,
+            request=request, process=process, frozen_pipeline_config=frozen)
+        assert completion["classification"] == "SYNTHETIC_PROGRESS_COMPLETION_NOT_OWNER_EVIDENCE"
+        assert completion["status"] == "NO_TRADE" and request._body_json == request_before
+        assert observed == ["fit", "capture", "search"]
+        assert source_calls == ["observe", "produce", "reverify"]
+        assert type(process) is planner.FrozenProductionSearchProcess
+        assert scheduler._declared_verified_one_period(process, precommit.to_dict()) is True
+        lines = [line for line in capfd.readouterr().out.splitlines() if line.startswith("FXPM unit=")]
+        if broken_display:
+            assert lines == []
+        else:
+            assert [line.split("stage=", 1)[1] for line in lines] == ["source", "fit", "search"]
+            assert all(f"FXPM unit=EURUSD/H1 cell=TREND pid=" in line for line in lines)
+            assert all(not any(field in line for field in ("net_profit", "win_rate", "invented_private_fields")) for line in lines)
+    finally:
+        historical._release_declared_slot_producer_request(request, context)
+
+
 @pytest.fixture
 def parallel_capacity_store(tmp_path, monkeypatch):
     """INVENTED metadata-only parallel custody; no source, fit or market model."""
