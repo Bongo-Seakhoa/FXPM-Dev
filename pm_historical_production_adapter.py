@@ -7076,10 +7076,6 @@ def _restore_declared_slot_plan(context, *, request, process, completion, sink, 
     original = transport["spool_entry"]
     if sink._artifacts.get(original["artifact_id"]) != original:
         _fail("DECLARED_SLOT_PLAN_ORIGINAL_MISSING")
-    actual_receipt = _reopen_worker_json_descriptor(context, original["descriptor"],
-        maximum_bytes=context.limits.max_json_bytes, code="DECLARED_SLOT_PLAN_ORIGINAL_MISSING")
-    if actual_receipt != transport["cell_receipt"]:
-        _fail("DECLARED_SLOT_PLAN_BINDING_MISMATCH")
     horizon = _rebuild_horizon_plan(context, completion["horizon_plan"])
     receipt = transport["cell_receipt"]
     result = planner.ProductionCellSearchPlan(mode="DECLARED_SLOT_UNISSUED",
@@ -7090,7 +7086,8 @@ def _restore_declared_slot_plan(context, *, request, process, completion, sink, 
         _state_requirements_json=tuple(_canonical_bytes(x) for x in transport["state_requirements"]),
         _cell_receipt_json=_canonical_bytes(receipt), _spool_entry_json=_canonical_bytes(transport["spool_entry"]),
         boundary_limited=receipt["boundary_limited"], _seal=planner._CELL_PLAN_SEAL, _declared_slot_request=request)
-    planner.verify_production_cell_search_plan(context, process=process, sink=sink, plan=result)
+    planner._verify_production_cell_search_plan_source(context, process=process, sink=sink,
+        plan=result, m5_derived=False, read_only=True)
     return result
 
 

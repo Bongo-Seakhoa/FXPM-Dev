@@ -578,7 +578,12 @@ def _declared_initial_process(context, row, *, development):
         if process.to_dict().get("run_id") != row["run_id"]:
             _fail("DECLARED_SCHEDULER_PROCESS_RECORD_INVALID")
         return process
-    return (planner.freeze_route_a_full_panel_production_search_process if development
+    route_a = development or (
+        "native_finalization" in row
+        and (selection := _declared_ordinary_row_selection(row)) is not None
+        and selection["mode"] == "one_period"
+    )
+    return (planner.freeze_route_a_full_panel_production_search_process if route_a
         else planner.freeze_production_search_process)(context, run_id=row["run_id"])
 
 
