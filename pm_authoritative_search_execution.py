@@ -90,9 +90,6 @@ STATE_CONTEXT_BOUNDARY_REASON: Final = "STATE_CONTEXT_SOURCE_BOUNDARY_SHORTFALL"
 SIGNAL_DESIGN_REQUEST_SCHEMA: Final = "fxpm.signal-opportunity-design-request.v1"
 SIGNAL_DESIGN_TAPE_SCHEMA: Final = "fxpm.signal-opportunity-train-design-tape.v1"
 SIGNAL_DESIGN_TAPE_FORMAT: Final = "fxpm-signal-opportunity-design-jsonl-v1"
-INDEPENDENT_R_REQUEST_SCHEMA: Final = "fxpm.signal-opportunity-design-request.v2"
-INDEPENDENT_R_TAPE_SCHEMA: Final = "fxpm.signal-opportunity-train-design-tape.v2"
-INDEPENDENT_R_TAPE_FORMAT: Final = "fxpm-signal-opportunity-design-jsonl-v2"
 _SIGNAL_DESIGN_REQUEST_SEAL = object()
 MAX_PREFIX_ROWS: Final = 10_000_000
 MAX_ATTEMPTS: Final = winner.MAX_ATTEMPTS
@@ -396,6 +393,7 @@ class _FullPrefixStrategySurface:
 
     features: pd.DataFrame
     raw_signals: pd.Series
+    _content_sha256: str | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2331,6 +2329,7 @@ def _partition_cost_precommitments(
     plan_body: Mapping[str, Any], fitted: FittedNativeSearchTimeframe,
     config: PipelineConfig,
     source_observation_cache: dict[str, tuple[str, bytes]] | None = None,
+    _prepared_inputs: dict | None = None,
 ) -> dict[str, Any]:
     """Freeze each real partition's two costs/admissions before any signal outcome."""
     geometry = plan_body.get("derived_dependency_geometry")
@@ -2377,11 +2376,16 @@ def _partition_cost_precommitments(
                 tiers = cache.get(identity)
                 if tiers is None:
                     observations = fitted._entry_spread_observations.loc[partition.frame.index]
+                    prepared = ({tier: {} for tier in fitted._spread_tiers}
+                        if _prepared_inputs is not None else None)
                     probes = {tier: backtester.build_evidence_source_seed_result(
                         partition.frame, plan_body["cell"]["symbol"],
                         spec=fitted.instrument_spec, timeframe=plan_body["cell"]["timeframe"],
                         spread_tier=bound_tier, entry_spread_observations=observations,
+                        **({"_prepared_inputs_out": prepared[tier]} if _prepared_inputs is not None else {}),
                     ) for tier, bound_tier in fitted._spread_tiers.items()}
+                    if _prepared_inputs is not None:
+                        _prepared_inputs[identity] = prepared
                     pair = pm_core.build_backtest_frozen_tier_pair_contract(
                         probes, spec=fitted.instrument_spec, use_spread=bool(config.use_spread))
                     if pair != dict(fitted.frozen_tier_pair_contract):
@@ -2513,6 +2517,8 @@ def _verify_partition_precommitment(
 
 def _independent_tier_execution_receipt(lanes: Mapping[str, Mapping[str, Any]],
         pair_contract: Mapping[str, Any]) -> dict[str, Any]:
+    if lanes and all(value.get("schema_version") == "fxpm.independent-signal-partition.v1" for value in lanes.values()):
+        return raw_winner.build_independent_tier_execution_receipt(lanes, _sha256(pair_contract))
     rows = {}
     for name, lane in lanes.items():
         admission = lane["spread_admission"]
@@ -2884,6 +2890,7 @@ def _fold_provenance(
     source_observation_receipts: Mapping[str, Mapping[str, Any]] | None,
     source_observation_references: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    independent_r = bool(lanes) and all(value.get("schema_version") == "fxpm.independent-signal-partition.v1" for value in lanes.values())
     if source_observation_references is None:
         if source_observation_receipts is None:
             _fail("SOURCE_OBSERVATION_PROVENANCE_MISSING")
@@ -2895,6 +2902,8 @@ def _fold_provenance(
             _fail("SOURCE_OBSERVATION_PROVENANCE_MIXED")
         provenance_version = raw_winner.REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA
         observation_transport = {"source_observation_references": dict(source_observation_references)}
+    if independent_r:
+        provenance_version = "fxpm.authoritative-search-provenance.v6"
     artifacts = attempt.artifacts
     lane_hashes = {name: _sha256(dict(value)) for name, value in lanes.items()}
     common = {
@@ -2997,7 +3006,8 @@ def _fold_provenance(
         "independent_tier_execution_receipt": json.loads(_canonical_bytes(dict(independent_tier_execution_receipt)).decode("ascii")),
         "signal_vector_receipts": signal_vector_receipts,
         **observation_transport,
-        "position_events_are_genuine_backtester_v2": True,
+        **({"genuine_independent_signal_r_capture": True} if independent_r
+            else {"position_events_are_genuine_backtester_v2": True}),
     })
     source_decision = fitted.source_group_decision.to_dict()
     oos_source = _receipt(
@@ -3041,7 +3051,17 @@ def _build_planned_attempt_evidence(
     source_observation_references: Mapping[str, Mapping[str, Any]] | None,
     _entry_admission_preparation: Any = None,
     _full_panel_lane_capture: Any = None,
+    _generation: Any = None,
+    _independent_inputs: dict | None = None,
+    _source_sink=None, _frozen=None, _independent_array_entries=None,
 ) -> dict[str, Any]:
+    if _generation is not None and _generation.independent_signal_r_enabled:
+        return _build_independent_r_attempt_evidence(attempt=attempt, raw_attempt_id=raw_attempt_id,
+            plan_body=plan_body, plan_receipt_sha256=plan_receipt_sha256, fitted=fitted,
+            config=config, partition_cost_precommitments=partition_cost_precommitments,
+            source_observation_references=source_observation_references,
+            prepared_inputs=_independent_inputs, source_sink=_source_sink,
+            frozen=_frozen, array_entries=_independent_array_entries)
     if (_full_panel_lane_capture is not None
             and type(_full_panel_lane_capture) is not _FullPanelLaneCapture):
         _fail("ROUTE_A_FULL_PANEL_CAPTURE_INVALID")
@@ -3119,6 +3139,196 @@ def _build_planned_attempt_evidence(
     return {"attempt_id": raw_attempt_id, "folds": folds}
 
 
+def _independent_r_session_state(strategy, symbol):
+    session = getattr(strategy, "session_spec", None)
+    if callable(session):
+        session = session(symbol)
+    if session is None or isinstance(session, (Mapping, list, tuple)):
+        return session
+    if hasattr(session, "__dataclass_fields__"):
+        return asdict(session)
+    return vars(session)
+
+
+def _independent_r_configuration_sha256(config, owner=None):
+    import pm_production_config_binding as config_binding
+    key = ("independent-configuration", id(config))
+    value = None if owner is None else owner.get(key)
+    if value is None:
+        value = hashlib.sha256(config_binding._effective_snapshot_bytes(
+            config_binding._snapshot(config))).hexdigest()
+        if owner is not None:
+            owner[key] = value
+    return value
+
+
+def _independent_r_surface_sha(surface):
+    cached = getattr(surface, "_content_sha256", None)
+    return cached if cached is not None else _sha256({
+        "frame_sha256": _frame_sha256(surface.features),
+        "raw_signals_sha256": hashlib.sha256(surface.raw_signals.to_numpy(dtype="<i4").tobytes()).hexdigest()})
+
+
+def _independent_r_cell_signals(features, raw_signals, regime):
+    if regime not in book.REGIME_ORDER or "REGIME" not in features:
+        _fail("INDEPENDENT_R_CELL_REGIME_INVALID")
+    return raw_signals.where(features["REGIME"].eq(regime), 0).astype(np.int32)
+
+
+def _independent_r_geometry_inputs(prepared, features, *, timeframe, warmup_bars):
+    axis = prepared.get("_partition_axis")
+    if axis is None:
+        axis = pm_core.build_backtest_partition_axis(features, timeframe=timeframe, warmup_bars=warmup_bars)
+        prepared["_partition_axis"] = axis
+    arrays = {}
+    for tier in ("P75", "P95"):
+        values = prepared[tier]
+        encoded = values.get("encoded_half_spread_arrays")
+        if encoded is None:
+            encoded = {name: _route_a_encode_spread_array(values[name], name)
+                for name in ("entry_half_spread", "intrabar_half_spread")}
+            values["encoded_half_spread_arrays"] = encoded
+        arrays[tier] = encoded
+    return axis, arrays
+
+
+def _independent_r_strategy_surface(*, attempt, parameters, strategy, fitted,
+        config_sha, symbol, timeframe):
+    before = _route_a_plain_strategy_state(strategy)
+    owner, identity = fitted._numeric_preparation, fitted._numeric_key
+    key = None
+    if owner is not None and identity is not None and before is not None:
+        try:
+            # The fitted numeric identity includes every consumed detector parameter/seed.
+            key = (identity, type(strategy), _canonical_bytes(parameters), config_sha,
+                fitted.frame_sha256, pickle.dumps(fitted._frame.attrs, protocol=5))
+        except (TypeError, pickle.PickleError):
+            key = None
+
+    def compute():
+        original = _frame_sha256(fitted._frame)
+        surface = _build_full_prefix_strategy_surface(frame=fitted._frame, strategy=strategy,
+            fitted=fitted, symbol=symbol, timeframe=timeframe)
+        if (_frame_sha256(fitted._frame) != original
+                or not surface.features.loc[:, list(fitted._frame.columns)].equals(fitted._frame)):
+            _fail("FULL_PREFIX_STRATEGY_INPUT_MUTATED")
+        return _FullPrefixStrategySurface(surface.features, surface.raw_signals,
+            _independent_r_surface_sha(surface))
+
+    return (compute() if owner is None else
+        owner.prepare_strategy_surface(key, strategy, before, fitted._frame, compute))
+
+
+def _build_independent_r_attempt_evidence(*, attempt, raw_attempt_id, plan_body,
+        plan_receipt_sha256, fitted, config, partition_cost_precommitments,
+        source_observation_references, prepared_inputs, source_sink=None, frozen=None, array_entries=None):
+    """Capture real independent outcomes; account replay remains a separate consumer."""
+    import pm_production_config_binding as config_binding
+    prepared_inputs = {} if prepared_inputs is None else prepared_inputs
+    strategy, parameters = _runtime_strategy(attempt, timeframe=plan_body["cell"]["timeframe"])
+    symbol, timeframe, regime = (plan_body["cell"][key] for key in ("symbol", "timeframe", "regime"))
+    config_sha = _independent_r_configuration_sha256(config, prepared_inputs)
+    surface = _independent_r_strategy_surface(attempt=attempt, parameters=parameters,
+        strategy=strategy, fitted=fitted, config_sha=config_sha, symbol=symbol, timeframe=timeframe)
+    cutoff = plan_body["anchor"]["selection_cutoff_utc"]
+    episode_key = ("independent-episodes", fitted.frame_sha256, symbol, timeframe, cutoff)
+    episodes = prepared_inputs.get(episode_key)
+    if episodes is None:
+        episodes = signal_opportunities.independent_entry_episodes(fitted._frame,
+            symbol=symbol, timeframe=timeframe, cutoff_utc=cutoff)
+        prepared_inputs[episode_key] = episodes
+    surface_sha = _independent_r_surface_sha(surface)
+    pricing, folds = Backtester(config), []
+    for ordinal, fold in enumerate(_causal_folds(attempt)):
+        partitions = _fold_partitions(frame=fitted._frame, fold=fold, attempt=attempt,
+            dependency_warmup_bars=plan_body["derived_dependency_geometry"]["warmup_bars"])
+        lanes, partition_signals, indexes = {}, {}, {}
+        for partition in partitions:
+            features, signals = _slice_full_prefix_strategy_surface(
+                partition=partition, full_prefix_surface=surface)
+            signals = _independent_r_cell_signals(features, signals, regime)
+            partition_signals[partition.role] = signals
+            geometry_sha = partition.geometry_receipt["receipt_sha256"]
+            prepared = prepared_inputs.get(geometry_sha)
+            if prepared is None:
+                observations = fitted._entry_spread_observations.loc[features.index]
+                prepared = {}
+                for tier, tier_contract in fitted._spread_tiers.items():
+                    values = {}
+                    pricing.build_evidence_source_seed_result(features, symbol,
+                        spec=fitted.instrument_spec, timeframe=timeframe, spread_tier=tier_contract,
+                        entry_spread_observations=observations, _prepared_inputs_out=values)
+                    prepared[tier] = values
+                prepared_inputs[geometry_sha] = prepared
+            reference = (_source_observation_receipt(fitted, features.index)
+                if source_observation_references is None else _partition_source_observation_reference(
+                    references=source_observation_references, precommitments=partition_cost_precommitments,
+                    pair=fitted.frozen_tier_pair_contract, attempt=attempt,
+                    fold_ordinal=ordinal, partition=partition))
+            axis, half_spread_arrays = _independent_r_geometry_inputs(prepared, features,
+                timeframe=timeframe, warmup_bars=partition.warmup_bars)
+            start = pd.Timestamp(features["_BAR_CLOSE_TS"].iloc[max(1, partition.warmup_bars) - 1])
+            for tier in ("P75", "P95"):
+                values = prepared[tier]
+                probe = values["source_probe"]
+                source_contract = raw_winner.build_trade_source_contract_from_backtester_result(probe)
+                provenance = signal_opportunities.OpportunityProvenance(strategy.name, config_sha,
+                    surface_sha, tier, _sha256(probe["numerical_execution_cost_attestation"]),
+                    _sha256(probe["spread_admission"]))
+                batch = signal_opportunities.evaluate_independent_signal_r(features, signals,
+                    pricing=pricing, episode_ids=episodes.loc[features.index], strategy=strategy,
+                    spec=fitted.instrument_spec, symbol=symbol, timeframe=timeframe,
+                    cutoff_utc=partition.end_exclusive_utc, signal_start_utc=start,
+                    entry_half_spreads=values["entry_half_spread"],
+                    exit_half_spreads=values["intrabar_half_spread"],
+                    entry_admission=values["admission_states"], provenance=provenance)
+                lane = {"schema_version": "fxpm.independent-signal-partition.v1",
+                    "partition_axis": dict(axis), "trade_power_partition_axis": dict(axis),
+                    "source_reference": dict(reference), "batch": asdict(batch),
+                    "source_contract": source_contract,
+                    **{key: copy.deepcopy(probe[key]) for key in (
+                        "numerical_execution_cost_attestation", "spread_model", "spread_admission",
+                        "swap_accrual_contract")}}
+                _verify_partition_precommitment(precommitments=partition_cost_precommitments,
+                    attempt=attempt, fold_ordinal=ordinal, partition=partition, tier=tier,
+                    result=lane, pair=fitted.frozen_tier_pair_contract)
+                lanes[f"{partition.role}_{tier.lower()}"] = lane
+            indexes[partition.role] = {
+                "schema_version": "fxpm.independent-signal-source-index.v1",
+                "partition_geometry": dict(partition.geometry_receipt),
+                "half_spread_arrays": half_spread_arrays,
+                "instrument_spec": asdict(fitted.instrument_spec),
+                "numerical_execution_cost_attestations": {tier: prepared[tier]["source_probe"]["numerical_execution_cost_attestation"]
+                    for tier in ("P75", "P95")},
+                "spread_model_metadata": {tier: prepared[tier]["source_probe"]["spread_model"] for tier in ("P75", "P95")},
+                "strategy_id": strategy.name, "parameters": parameters,
+                "source_reference": dict(reference), "configuration_sha256": config_sha,
+                "regime_parameters": dict(fitted.regime_parameters),
+                "regime_parameters_sha256": fitted.regime_fit_decision.to_dict()["regime_params_sha256"],
+                "source_prefix_frame_sha256": fitted.frame_sha256,
+                "surface_sha256": surface_sha,
+                "session_spec": config_binding._json_value(_independent_r_session_state(strategy, symbol))}
+        receipt = _independent_tier_execution_receipt(lanes, fitted.frozen_tier_pair_contract)
+        provenance = _fold_provenance(plan_body=plan_body, plan_receipt_sha256=plan_receipt_sha256,
+            attempt=attempt, fold=fold, fold_ordinal=ordinal, partitions=partitions,
+            lanes=lanes, fitted=fitted, independent_tier_execution_receipt=receipt,
+            partition_signals=partition_signals,
+            source_observation_receipts=({p.role: _source_observation_receipt(fitted, p.frame.index)
+                for p in partitions} if source_observation_references is None else None),
+            source_observation_references=({p.role: _partition_source_observation_reference(
+                references=source_observation_references, precommitments=partition_cost_precommitments,
+                pair=fitted.frozen_tier_pair_contract, attempt=attempt, fold_ordinal=ordinal, partition=p)
+                for p in partitions} if source_observation_references is not None else None))
+        if source_sink is not None:
+            if frozen is None or array_entries is None:
+                _fail("INDEPENDENT_R_ARRAY_PUBLICATION_OWNER_REQUIRED")
+            indexes, _ = raw_winner._pack_independent_index_arrays(
+                sink=source_sink, frozen=frozen, indexes=indexes, array_entries=array_entries)
+        folds.append({"fold_ordinal": ordinal, "provenance": provenance, "lanes": lanes,
+            "independent_signal_r_indexes": indexes})
+    return {"attempt_id": raw_attempt_id, "folds": folds}
+
+
 def _reverify_fitted_timeframe(
     fitted: FittedNativeSearchTimeframe,
     config: PipelineConfig,
@@ -3134,9 +3344,13 @@ def _reverify_fitted_timeframe(
     if type(attempts) is not int or attempts <= 0:
         _fail("SOURCE_ACQUISITION_ATTEMPT_COUNT_INVALID")
     derived = fitted._derived_binding
+    numeric_owner = getattr(fitted, "_numeric_preparation", None)
+    numeric_kwargs = ({"_numeric_preparation": numeric_owner,
+        "_numeric_config_sha256": _independent_r_configuration_sha256(config)}
+        if numeric_owner is not None else {})
     if derived is None:
         refreshed = fit_native_timeframe_for_search(
-            product=fitted.product, config=config, acquisition_attempts_exact=attempts)
+            product=fitted.product, config=config, acquisition_attempts_exact=attempts, **numeric_kwargs)
     else:
         if type(derived) is not _DerivedSearchBinding:
             _fail("M5_DERIVED_FITTED_BINDING_INVALID")
@@ -3144,7 +3358,7 @@ def _reverify_fitted_timeframe(
             context=derived.context, owner=derived.owner, request_lease=derived.request_lease,
             calibration_lease=derived.calibration_lease, cost_edition=derived.cost_edition,
             declared_m5_source_pins=derived.declared_m5_source_pins,
-            config=config, acquisition_attempts_exact=attempts)
+            config=config, acquisition_attempts_exact=attempts, **numeric_kwargs)
         if _canonical_bytes(derived.view_evidence) != _canonical_bytes(refreshed._derived_binding.view_evidence):
             _fail("M5_DERIVED_FITTED_VIEW_CHANGED")
     comparisons = (
@@ -3182,6 +3396,14 @@ class _FreshFitOwner:
     __slots__ = ("seal", "fitted", "context_id", "request_sha256", "original_fitted", "config")
     def __new__(cls, *args, **kwargs):
         _fail("BOUND_FIT_ISSUER_PRIVATE")
+
+
+def _issue_fresh_fit_owner(*, context, request_sha256, fitted, config):
+    issued = object.__new__(_FreshFitOwner)
+    issued.seal, issued.fitted = _BOUND_FIT_OWNER_SEAL, fitted
+    issued.context_id, issued.request_sha256 = id(context), request_sha256
+    issued.original_fitted, issued.config = fitted, config
+    return issued
 
 
 class _BoundFitOwner:
@@ -3854,10 +4076,8 @@ def _declared_fitted_for_execution(capture, fitted, config):
     if owner is None:
         # The declared capture already owns this exact producer-fitted object/config.
         refreshed = fitted
-        issued = object.__new__(_FreshFitOwner)
-        issued.seal, issued.fitted = _BOUND_FIT_OWNER_SEAL, refreshed
-        issued.context_id, issued.request_sha256 = id(capture.context), capture.request.receipt_sha256
-        issued.original_fitted, issued.config = fitted, config
+        issued = _issue_fresh_fit_owner(context=capture.context,
+            request_sha256=capture.request.receipt_sha256, fitted=fitted, config=config)
         return refreshed, issued
     bound_fitted_state_reference(fitted, context=capture.context, request=capture.request)
     return fitted, owner
@@ -4877,6 +5097,7 @@ def _verified_current_observed_inputs(
     cell_plan: Any,
     fitted: FittedNativeSearchTimeframe,
     config: PipelineConfig,
+    _fresh_fit_owner=None,
 ) -> tuple[FittedNativeSearchTimeframe, dict[str, Any], dict[str, Any]]:
     """Reopen the sealed current plan and bind it to one reverified frame."""
 
@@ -4911,7 +5132,15 @@ def _verified_current_observed_inputs(
     ):
         _fail("CURRENT_OBSERVED_CELL_PLAN_MODE_INVALID")
 
-    refreshed = _reverify_fitted_timeframe(fitted, config)
+    if _fresh_fit_owner is None:
+        refreshed = _reverify_fitted_timeframe(fitted, config)
+    else:
+        owner = _fresh_fit_owner
+        if (type(owner) is not _FreshFitOwner or owner.seal is not _BOUND_FIT_OWNER_SEAL
+                or owner.context_id != id(sink.context) or owner.request_sha256 != process.receipt_sha256
+                or owner.fitted is not fitted or owner.original_fitted is not fitted or owner.config is not config):
+            _fail("CURRENT_FRESH_FIT_OWNER_INVALID")
+        refreshed = fitted
     try:
         receipt = cell_plan.cell_receipt
         plan_body = cell_plan.horizon_plan.to_dict()
@@ -5129,13 +5358,10 @@ def _signal_design_groups(records) -> list[dict[str, Any]]:
 
 def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receipt,
         causal_precommit_payload, cell_plan, fitted, frozen_pipeline_config,
-        declared_slot_roster=None, method_edition=None):
+        declared_slot_roster=None):
     import pm_production_config_binding as config_binding
     import pm_production_anchor_plan as anchor_authority
     import pm_production_search_planner as planner
-
-    if method_edition not in (None, signal_opportunities.INDEPENDENT_R_METHOD):
-        _fail("SIGNAL_DESIGN_METHOD_EDITION_INVALID")
 
     if declared_slot_roster is not None or getattr(cell_plan, "mode", None) == "DECLARED_SLOT_UNISSUED":
         _fail("SIGNAL_DESIGN_DECLARED_SLOTS_UNSUPPORTED")
@@ -5271,15 +5497,12 @@ def _signal_design_inputs(*, process, sink, planning_request, anchor_plan_receip
     if edition.edition_id == planner.NOISE101_SOURCE_EDITION_ID:
         binding["source_edition"] = edition.to_dict()
         binding["domain_roster_sha256"] = edition.domain_roster_sha256_by_timeframe[cell_plan.timeframe]
-    if method_edition is not None:
-        binding.update(schema_version=INDEPENDENT_R_REQUEST_SCHEMA, method_edition=method_edition,
-            labeler_schema_version=signal_opportunities.INDEPENDENT_R_SCHEMA)
     return binding, refreshed, frame, config, plan_body, attempts
 
 
 def issue_signal_opportunity_design_request(*, process, sink, planning_request,
         anchor_plan_receipt, causal_precommit_payload, cell_plan, fitted, frozen_pipeline_config,
-        declared_slot_roster=None, method_edition=None
+        declared_slot_roster=None
 ) -> SignalOpportunityDesignRequest:
     """Issue a distinct descriptive TRAIN grant from verified planning metadata.
 
@@ -5290,7 +5513,7 @@ def issue_signal_opportunity_design_request(*, process, sink, planning_request,
         planning_request=planning_request, anchor_plan_receipt=anchor_plan_receipt,
         causal_precommit_payload=causal_precommit_payload,
         cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config,
-        declared_slot_roster=declared_slot_roster, method_edition=method_edition)
+        declared_slot_roster=declared_slot_roster)
     encoded = _canonical_bytes(binding)
     identifier = hashlib.sha256(encoded).hexdigest()
     entry = sink.put_json("signal-design-request/" + identifier,
@@ -5305,16 +5528,11 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
     if (type(request) is not SignalOpportunityDesignRequest
             or request._seal is not _SIGNAL_DESIGN_REQUEST_SEAL):
         _fail("SIGNAL_DESIGN_REQUEST_REQUIRED")
-    method = json.loads(request._body_json.decode("ascii")).get("method_edition")
     binding, refreshed, frame, config, plan_body, attempts = _signal_design_inputs(
         process=process, sink=sink, planning_request=request._planning_request,
         anchor_plan_receipt=request._anchor_plan_receipt,
         causal_precommit_payload=json.loads(request._causal_precommit_json.decode("ascii")),
-        cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config,
-        method_edition=method)
-    independent = method == signal_opportunities.INDEPENDENT_R_METHOD
-    tape_schema = INDEPENDENT_R_TAPE_SCHEMA if independent else SIGNAL_DESIGN_TAPE_SCHEMA
-    tape_format = INDEPENDENT_R_TAPE_FORMAT if independent else SIGNAL_DESIGN_TAPE_FORMAT
+        cell_plan=cell_plan, fitted=fitted, frozen_pipeline_config=frozen_pipeline_config)
     if _canonical_bytes(binding) != request._body_json:
         _fail("SIGNAL_DESIGN_REQUEST_BINDING_CHANGED")
     request_entry = json.loads(request._entry_json.decode("ascii"))
@@ -5326,8 +5544,6 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
         "batch_count", "opportunity_count", "closed_count", "right_censored_count",
         "no_next_observation_count", "unavailable_regime_count", "source_observation_receipt_count",
         "source_observation_row_count")}
-    if independent:
-        totals["not_eligible_count"] = 0
     observation_receipts_seen: set[str] = set()
     cap = _signal_design_utc(binding["training_label_cap_utc"], "SIGNAL_DESIGN_CAP_INVALID")
 
@@ -5335,11 +5551,11 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
         return _canonical_bytes(value) + b"\n"
 
     def chunks():
-        yield line({"record_type": "HEADER", "schema_version": tape_schema,
+        yield line({"record_type": "HEADER", "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA,
             "request_sha256": request.receipt_sha256, "request": binding,
             "complete_cost_net_profit_available": False,
             "source_observation_reference_semantics": "EXACT_RECEIPT_EMITTED_ONCE_BEFORE_FIRST_SHA256_REFERENCE",
-            "swap_status": "PER_TRADE_MODELED" if independent else "UNAVAILABLE_PRICE_UNIT_CONVERSION"})
+            "swap_status": "UNAVAILABLE_PRICE_UNIT_CONVERSION"})
         for attempt in attempts:
             totals["roster_count"] += 1
             yield line({"record_type": "ATTEMPT", **binding["attempt_roster"][attempt.ordinal]})
@@ -5352,9 +5568,6 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
             surface = _build_full_prefix_strategy_surface(frame=frame, strategy=strategy,
                 fitted=refreshed, symbol=cell_plan.symbol, timeframe=cell_plan.timeframe)
             _signal_design_frame(surface.features, cap)
-            episodes = (signal_opportunities.independent_entry_episodes(surface.features,
-                symbol=cell_plan.symbol, timeframe=cell_plan.timeframe, cutoff_utc=cap)
-                if independent else None)
             totals["evaluated_attempt_count"] += 1
             config_sha = _sha256({"effective_config_sha256": binding["effective_config_sha256"],
                 "trial_definition_sha256": attempt.artifacts.trial_definition_sha256,
@@ -5398,15 +5611,11 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                             "source_observation_receipt_sha256": observation_sha}
                         provenance = signal_opportunities.OpportunityProvenance(strategy.name,
                             config_sha, surface_sha, tier, _sha256(numerical), _sha256(admission_binding))
-                        evaluate = (signal_opportunities.evaluate_independent_signal_r
-                            if independent else signal_opportunities.label_signal_opportunities)
-                        batch = evaluate(features, signals,
+                        batch = signal_opportunities.label_signal_opportunities(features, signals,
                             strategy=strategy, spec=refreshed.instrument_spec, symbol=cell_plan.symbol,
                             timeframe=cell_plan.timeframe, cutoff_utc=cutoff, signal_start_utc=start,
                             entry_half_spreads=entry, exit_half_spreads=exits,
-                            entry_admission=states, provenance=provenance,
-                            **({"pricing": pricing, "episode_ids": episodes.loc[features.index]}
-                               if independent else {}))
+                            entry_admission=states, provenance=provenance)
                         summary = {"record_type": "BATCH", "attempt_ordinal": attempt.ordinal,
                             "fold_ordinal": fold_ordinal, "partition": partition.role, "tier": tier,
                             "partition_geometry": dict(partition.geometry_receipt),
@@ -5420,17 +5629,13 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                             "unavailable_regime_count": batch.unavailable_regime_count,
                             "descriptive_groups": _signal_design_groups(batch.records),
                             "qualification_authority": False}
-                        if independent:
-                            summary.update(method_edition=batch.method_edition, cost_model=batch.cost_model,
-                                episode_diagnostics=batch.episode_diagnostics)
                         totals["batch_count"] += 1
                         totals["opportunity_count"] += len(batch.records)
                         totals["unavailable_regime_count"] += batch.unavailable_regime_count
                         yield line(summary)
                         for record in batch.records:
                             totals[{"CLOSED": "closed_count", "RIGHT_CENSORED": "right_censored_count",
-                                "NO_NEXT_OBSERVATION": "no_next_observation_count",
-                                "NOT_ELIGIBLE": "not_eligible_count"}[record.status]] += 1
+                                "NO_NEXT_OBSERVATION": "no_next_observation_count"}[record.status]] += 1
                             yield line({"record_type": "OPPORTUNITY", "attempt_ordinal": attempt.ordinal,
                                 "fold_ordinal": fold_ordinal, "partition": partition.role, "tier": tier,
                                 "label": asdict(record)})
@@ -5447,7 +5652,7 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
             _fail("SIGNAL_DESIGN_SOURCE_CHANGED")
         native_prefix.reverify_activated_native_prefix_product(refreshed.product,
             sink.context, require_current_activation=True)
-        yield line({"record_type": "COMPLETE", "schema_version": tape_schema,
+        yield line({"record_type": "COMPLETE", "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA,
             "request_sha256": request.receipt_sha256, **totals,
             "validation_evidence": False, "qualification_authority": False,
             "current_or_trading_authority": False})
@@ -5459,9 +5664,9 @@ def describe_signal_opportunity_design(*, request, process, sink, cell_plan,
                 yield encoded[offset:offset + width]
 
     entry = sink.put_opaque("signal-design-tape/" + request.receipt_sha256,
-        "signal_opportunity_train_design_tape", bounded_chunks(), format=tape_format)
+        "signal_opportunity_train_design_tape", bounded_chunks(), format=SIGNAL_DESIGN_TAPE_FORMAT)
     return SignalOpportunityDesignExecution(_canonical_bytes({
-        "schema_version": tape_schema, "status": "DESCRIPTIVE_COMPLETE",
+        "schema_version": SIGNAL_DESIGN_TAPE_SCHEMA, "status": "DESCRIPTIVE_COMPLETE",
         "authority_scope": "TRAIN_DESIGN_LABELS_ONLY", "request_sha256": request.receipt_sha256,
         "artifact_entry": entry, **totals, "validation_evidence": False,
         "qualification_authority": False, "current_or_trading_authority": False,
@@ -5490,9 +5695,57 @@ def execute_transport_current_observed_cell(
         fitted=fitted, config=config, _generation=winner.V16_GENERATION)
 
 
+def execute_independent_r_current_observed_cell(
+    *, process: Any, sink: authority_spool.SymbolAuthoritySink, cell_plan: Any,
+    fitted: FittedNativeSearchTimeframe, config: PipelineConfig,
+    _fresh_fit_owner=None,
+) -> CurrentObservedCellExecution:
+    """Execute the explicitly frozen V19 current-refit edition."""
+    import pm_production_search_planner as planner
+    if not planner.source_edition_info(process).independent_signal_r_enabled:
+        _fail("INDEPENDENT_R_PROCESS_REQUIRED")
+    return _execute_current_observed_cell(process=process, sink=sink, cell_plan=cell_plan,
+        fitted=fitted, config=config, _generation=winner.V19_GENERATION,
+        _fresh_fit_owner=_fresh_fit_owner)
+
+
+def _publish_current_independent_r_bound_fit(*, sink, process, cell_plan, fitted,
+        config, receipt, fold_plan):
+    import pm_production_config_binding as config_binding
+    metadata = {"binding_mode": "CURRENT_OBSERVED_INDEPENDENT_R",
+        "binding": {"generation_context_sha256": sink.context.context_sha256,
+            "producer_request_sha256": cell_plan.receipt_sha256,
+            "process_sha256": process.receipt_sha256,
+            "artifact_namespace": receipt["artifact_namespace"],
+            "effective_config_sha256": _independent_r_configuration_sha256(config),
+            "horizon_plan_receipt_sha256": cell_plan.horizon_plan.receipt_sha256,
+            "cell_plan_receipt_sha256": cell_plan.receipt_sha256},
+        "snapshot_issued_at_utc": _now_utc_seconds(),
+        "frame_sha256": fitted.frame_sha256, "fold_plan": fold_plan,
+        "entry_observations_sha256": hashlib.sha256(pd.util.hash_pandas_object(
+            fitted._entry_spread_observations, index=True).values.tobytes()).hexdigest(),
+        "runtime": _bound_fit_runtime(fitted.regime_parameters),
+        "target_carrier": _bound_fit_carrier(fitted.product),
+        "fine_carrier": _bound_fit_carrier(fitted._spread_source_product),
+        "base_columns": [{"name": name, "dtype": str(dtype)}
+            for name, dtype in fitted._frame.dtypes.items() if name not in _REGIME_COLUMNS],
+        "receipts": {"source_group_decision": fitted.source_group_decision.to_dict(),
+            "regime_fit_decision": fitted.regime_fit_decision.to_dict(),
+            "source_contract_seed": dict(fitted.source_contract_seed),
+            "cost_ladder_contract": dict(fitted.cost_ladder_contract),
+            "source_contract_seeds": fitted.source_contract_seeds,
+            "frozen_tier_pair_contract": fitted.frozen_tier_pair_contract,
+            "regime_parameters": dict(fitted.regime_parameters),
+            "train_regime_support": dict(fitted.train_regime_support),
+            "instrument_spec": asdict(fitted.instrument_spec),
+            "execution_spec_receipt": dict(fitted.execution_spec_receipt)}}
+    return current_refit.spool_bound_fitted_state(sink, frame=fitted._frame, metadata=metadata)
+
+
 def _execute_current_observed_cell(
     *, process: Any, sink: authority_spool.SymbolAuthoritySink, cell_plan: Any,
     fitted: FittedNativeSearchTimeframe, config: PipelineConfig, _generation: Any,
+    _fresh_fit_owner=None,
 ) -> CurrentObservedCellExecution:
     """Execute one sealed latest-cutoff observed cell through raw Winner.
 
@@ -5516,6 +5769,7 @@ def _execute_current_observed_cell(
             cell_plan=cell_plan,
             fitted=fitted,
             config=config,
+            _fresh_fit_owner=_fresh_fit_owner,
         )
         normalized_regime = str(cell_plan.regime).upper()
         plan_body, attempts = _verify_attempt_roster(
@@ -5555,6 +5809,8 @@ def _execute_current_observed_cell(
             )
         )
         source_observation_cache: dict[str, tuple[str, bytes]] = {}
+        independent_inputs = {} if _generation.independent_signal_r_enabled else None
+        independent_array_entries = {} if _generation.independent_signal_r_enabled else None
         partition_cost_precommitments = _partition_cost_precommitments(
             attempts=attempts,
             fold_plan=fold_plan,
@@ -5562,11 +5818,15 @@ def _execute_current_observed_cell(
             fitted=refreshed,
             config=config,
             source_observation_cache=source_observation_cache,
+            _prepared_inputs=independent_inputs,
         )
         precommitted_at = _now_utc_seconds()
         attempts_frozen_at = _next_observed_utc_second(precommitted_at)
-        freeze = (raw_winner.freeze_winner_search_plan_v5 if _generation is winner.V16_GENERATION
-                  else raw_winner.freeze_winner_search_plan_v4)
+        freeze = (raw_winner.bound_frozen_plan_freezer_for_generation(_generation)
+            if _generation.independent_signal_r_enabled else {
+                winner.CURRENT_GENERATION.selection_version: raw_winner.freeze_winner_search_plan_v4,
+                winner.V16_GENERATION.selection_version: raw_winner.freeze_winner_search_plan_v5
+            }[_generation.selection_version])
         frozen = freeze(
             sink,
             symbol=cell_plan.symbol,
@@ -5580,9 +5840,15 @@ def _execute_current_observed_cell(
             horizon_execution_contracts=execution_contracts,
             source_contract_seeds=refreshed.source_contract_seeds,
             frozen_tier_pair_contract=refreshed.frozen_tier_pair_contract,
-            risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
+            risk_unit_contract=_generation.risk_unit_contract,
             partition_cost_precommitments=partition_cost_precommitments,
             artifact_namespace=receipt["artifact_namespace"],
+            **({"bound_fitted_state_entry": _publish_current_independent_r_bound_fit(
+                sink=sink, process=process, cell_plan=cell_plan, fitted=refreshed,
+                config=config, receipt=receipt, fold_plan=fold_plan),
+                "selection_complexity_roster": historical_adapter._frozen_selection_complexity_from_process(
+                    process.to_dict(), normalized_attempts, timeframe=cell_plan.timeframe)}
+                if _generation.independent_signal_r_enabled else {}),
         )
         raw_ids = _raw_attempt_ids(frozen, attempts)
         cross_binding_bytes = _build_current_cross_binding_bytes(
@@ -5654,6 +5920,10 @@ def _execute_current_observed_cell(
                 config=config,
                 partition_cost_precommitments=frozen.partition_cost_precommitments,
                 source_observation_references=source_observation_references,
+                _generation=_generation, _independent_inputs=independent_inputs,
+                **({"_source_sink": sink, "_frozen": frozen,
+                    "_independent_array_entries": independent_array_entries}
+                    if _generation.independent_signal_r_enabled else {}),
             )
             row = _write_staged_attempt(
                 stage=stage,
@@ -5715,8 +5985,7 @@ def _execute_current_observed_cell(
                     _fail("STAGED_ATTEMPT_IDENTITY_CHANGED", attempt.ordinal)
                 yield body
 
-        produce = (raw_winner.produce_winner_v16_raw_evidence if _generation is winner.V16_GENERATION
-                   else raw_winner.produce_winner_v15_raw_evidence)
+        produce = raw_winner.raw_evidence_producer_for_generation(_generation)
         production = produce(
             sink,
             frozen=frozen,
@@ -5727,6 +5996,8 @@ def _execute_current_observed_cell(
             production_cell_search_plan=cell_plan,
             production_search_process=process,
             artifact_namespace=receipt["artifact_namespace"],
+            **({"_independent_array_entries": independent_array_entries}
+                if _generation.independent_signal_r_enabled else {}),
         )
         return CurrentObservedCellExecution(
             status="WINNER_RAW_EVIDENCE_COMPLETE",
@@ -5913,10 +6184,12 @@ def execute_historical_observed_cell(
     frozen_execution_edition = search_process.to_dict().get("execution_edition")
     if _execution_edition != frozen_execution_edition:
         _fail("HISTORICAL_EXECUTION_EDITION_MISMATCH")
-    full_panel_execution = planner.is_route_a_full_panel_process(search_process)
+    edition = planner.source_edition_info(search_process)
+    independent_r_execution = edition.independent_signal_r_enabled
+    full_panel_execution = planner.is_route_a_full_panel_process(search_process) and not independent_r_execution
     if full_panel_execution and type(capture) is not historical_adapter.DeclaredSlotSearchCapture:
         _fail("ROUTE_A_FULL_PANEL_DECLARED_CAPTURE_REQUIRED")
-    if full_panel_execution and capture._winner_generation is not planner.full_panel_generation(search_process):
+    if planner.is_route_a_full_panel_process(search_process) and capture._winner_generation.selection_version != edition.winner_generation_id:
         _fail("ROUTE_A_FULL_PANEL_MATCHED_FLOOR_GENERATION_REQUIRED")
     attempted_exact = (
         len(attempt_artifacts) if isinstance(attempt_artifacts, Sequence) else 0
@@ -5980,6 +6253,8 @@ def execute_historical_observed_cell(
         if len(fold_plan) < minimum_folds:
             _fail("WINNER_FOLD_PLAN_BELOW_EVIDENCE_FLOOR")
         source_observation_cache: dict[str, tuple[str, bytes]] = {}
+        independent_inputs = {} if independent_r_execution else None
+        independent_array_entries = {} if independent_r_execution else None
         if declared_mode:
             bound_fitted_state_entry = _publish_declared_bound_fit(capture, refreshed, fold_plan, bound_fit_issue_owner)
         declared_header = (_read_declared_unit_header(capture.context, capture.request.to_dict())
@@ -5995,6 +6270,7 @@ def execute_historical_observed_cell(
                 fitted=refreshed,
                 config=config,
                 source_observation_cache=source_observation_cache,
+                _prepared_inputs=independent_inputs,
             )
             precommitted_at = _now_utc_seconds()
             attempts_frozen_at = _next_observed_utc_second(precommitted_at)
@@ -6008,7 +6284,7 @@ def execute_historical_observed_cell(
                 attempt_artifacts=attempt_artifacts,
                 source_contract_seeds=refreshed.source_contract_seeds,
                 frozen_tier_pair_contract=refreshed.frozen_tier_pair_contract,
-                risk_unit_contract=raw_winner.build_precommitted_risk_unit_contract(),
+                risk_unit_contract=capture._winner_generation.risk_unit_contract,
                 partition_cost_precommitments=partition_cost_precommitments,
                 **({"bound_fitted_state_entry": bound_fitted_state_entry} if declared_mode else {}),
             )
@@ -6080,7 +6356,10 @@ def execute_historical_observed_cell(
                     plan_receipt_sha256=plan_receipt_sha256, fitted=refreshed, config=config,
                     partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
                     source_observation_references=source_observation_references,
-                    _entry_admission_preparation=entry_admission_preparation)
+                    _entry_admission_preparation=entry_admission_preparation,
+                    _generation=capture._winner_generation, _independent_inputs=independent_inputs,
+                    **({"_source_sink": capture.sink, "_frozen": handle.frozen,
+                        "_independent_array_entries": independent_array_entries} if independent_r_execution else {}))
             if prepared_full_panel is not None:
                 declared_records, evidence_completed = _continue_declared_attempt_units(
                     capture.context, request_body, declared_binding_sha256, declared_units, produce_unit,
@@ -6142,6 +6421,9 @@ def execute_historical_observed_cell(
                     config=config,
                     partition_cost_precommitments=handle.frozen.partition_cost_precommitments,
                     source_observation_references=source_observation_references,
+                    _generation=capture._winner_generation, _independent_inputs=independent_inputs,
+                    **({"_source_sink": capture.sink, "_frozen": handle.frozen,
+                        "_independent_array_entries": independent_array_entries} if independent_r_execution else {}),
                 )
                 row = _write_staged_attempt(
                     stage=stage,
@@ -6201,7 +6483,7 @@ def execute_historical_observed_cell(
                     _fail("STAGED_ATTEMPT_IDENTITY_CHANGED", attempt.ordinal)
                 yield body
 
-        if declared_mode and not full_panel_execution:
+        if declared_mode and not full_panel_execution and not independent_r_execution:
             route_a_consumer = _consume_route_a_unit
             if route_a_consumer is not _route_a_noop_consumer:
                 route_a_consumer_outcome = _run_route_a_owned_unit_continuation(
@@ -6229,6 +6511,7 @@ def execute_historical_observed_cell(
             attempt_evidence=evidence_stream(),
             evidence_access_started_at_utc=evidence_started,
             evidence_access_completed_at_utc=evidence_completed,
+            **({"_independent_array_entries": independent_array_entries} if independent_r_execution else {}),
         )
         handle = None
         result = HistoricalObservedCellExecution(
@@ -6350,6 +6633,15 @@ def execute_route_a_full_panel_historical_observed_cell(**kwargs: Any) -> Histor
     if not planner.is_route_a_full_panel_process(kwargs.get("search_process")):
         _fail("ROUTE_A_FULL_PANEL_PROCESS_EDITION_REQUIRED")
     return execute_historical_observed_cell(_execution_edition=edition, **kwargs)
+
+
+def execute_independent_r_historical_observed_cell(**kwargs: Any) -> HistoricalObservedCellExecution:
+    import pm_production_search_planner as planner
+    process = kwargs.get("search_process")
+    if not planner.source_edition_info(process).independent_signal_r_enabled:
+        _fail("INDEPENDENT_R_PROCESS_REQUIRED")
+    return execute_historical_observed_cell(
+        _execution_edition=planner.INDEPENDENT_R_EXECUTION_EDITION, **kwargs)
 
 
 def _make_bounded_raw_winner_canary_executor():
@@ -8844,7 +9136,8 @@ def _prepare_route_a_full_panel_owner_evidence(*, config, handle, search_process
         _fail("ROUTE_A_FULL_PANEL_PREPARATION_INCOMPLETE")
     return result
 
-__all__.append("execute_route_a_full_panel_historical_observed_cell")
+__all__.extend(["execute_route_a_full_panel_historical_observed_cell",
+    "execute_independent_r_historical_observed_cell", "execute_independent_r_current_observed_cell"])
 
 
 
@@ -9435,32 +9728,43 @@ def _verify_route_a_prepared_stage_origin(stage, *, capture, frozen, unit, raw_b
 
 
 def _reopen_route_a_matched_source_material(context, *, request, process, frozen,
-        frozen_pipeline_config, m5_fitted=None):
+        frozen_pipeline_config, m5_fitted=None, _bound_fit_metadata_out=None):
     """Reopen retained source for verification only; no fitting or execution grant."""
     import pm_production_search_planner as planner
-    body = historical.verify_declared_slot_producer_request(context, request, process=process)
     planner.verify_frozen_production_search_process(context, process)
-    if (frozen.selection_generation is not planner.full_panel_generation(process)
+    if (frozen.selection_generation.selection_version != planner.source_edition_info(process).winner_generation_id
             or frozen.bound_fitted_state_entry is None):
         _fail("MATCHED_FLOOR_FROZEN_SOURCE_EDITION_REQUIRED")
     frozen_pipeline_config.verify_current(context)
     config = frozen_pipeline_config.materialize(context)
     state, delta = current_refit.read_bound_fitted_state_reference(context, frozen.bound_fitted_state_entry,
-        artifact_namespace=body["artifact_namespace"])
+        artifact_namespace=frozen.artifact_namespace)
     meta, receipts = state["metadata"], state["metadata"]["receipts"]
-    if (meta["binding"]["producer_request_sha256"] != request.receipt_sha256
+    independent = frozen.selection_generation.independent_signal_r_enabled
+    current = independent and meta.get("binding_mode") == "CURRENT_OBSERVED_INDEPENDENT_R"
+    if current:
+        if (meta["binding"]["producer_request_sha256"] != meta["binding"]["cell_plan_receipt_sha256"]
+                or frozen.bound_fitted_state_entry["producer_request_sha256"] != meta["binding"]["producer_request_sha256"]):
+            _fail("INDEPENDENT_R_CURRENT_SOURCE_BINDING_CHANGED")
+        body = None
+    else:
+        body = historical.verify_declared_slot_producer_request(context, request, process=process)
+    if ((not current and meta["binding"]["producer_request_sha256"] != request.receipt_sha256)
             or meta["binding"]["process_sha256"] != process.receipt_sha256
             or meta["binding"]["effective_config_sha256"] != frozen_pipeline_config.effective_config_sha256
             or _canonical_bytes(meta["fold_plan"]) != _canonical_bytes(frozen.precommitment["causal_fold_plan"])
             or _canonical_bytes(receipts["source_contract_seeds"]) != _canonical_bytes(frozen.source_contract_seeds)
             or _canonical_bytes(receipts["frozen_tier_pair_contract"]) != _canonical_bytes(frozen.frozen_tier_pair_contract)):
         _fail("MATCHED_FLOOR_RETAINED_SOURCE_BINDING_CHANGED")
-    if historical.declared_slot_source_kind(body) == "m5_derived":
+    if body is not None and historical.declared_slot_source_kind(body) == "m5_derived":
         if (m5_fitted is None or _frame_sha256(m5_fitted._frame) != meta["frame_sha256"]
                 or _canonical_bytes(asdict(m5_fitted.instrument_spec)) != _canonical_bytes(receipts["instrument_spec"])
                 or _canonical_bytes(m5_fitted.frozen_tier_pair_contract) != _canonical_bytes(frozen.frozen_tier_pair_contract)):
             _fail("MATCHED_FLOOR_VERIFIED_M5_SOURCE_REQUIRED")
-        return m5_fitted._frame, m5_fitted.instrument_spec, m5_fitted._spread_tiers, config
+        result = (m5_fitted._frame, m5_fitted.instrument_spec, m5_fitted._spread_tiers, config)
+        if _bound_fit_metadata_out is not None:
+            _bound_fit_metadata_out.update(meta)
+        return (*result, m5_fitted._entry_spread_observations) if independent else result
     if m5_fitted is not None:
         _fail("MATCHED_FLOOR_NATIVE_SOURCE_REJECTS_M5")
     target = _bound_fit_open_carrier(context, config, meta["target_carrier"])
@@ -9485,7 +9789,113 @@ def _reopen_route_a_matched_source_material(context, *, request, process, frozen
             or any(level["frozen_spread_tier"] != tiers[level["tier"]].descriptor()
                 for level in frozen.frozen_tier_pair_contract["tiers"])):
         _fail("MATCHED_FLOOR_ORIGINAL_COST_SOURCE_CHANGED")
-    return frame, spec, tiers, config
+    result = frame, spec, tiers, config
+    if _bound_fit_metadata_out is not None:
+        _bound_fit_metadata_out.update(meta)
+    return (*result, observations) if independent else result
+
+
+def _verify_independent_r_fact_source(facts, geometry, *, source_frame, spec, tiers,
+        config, timeframe, _prepared_source_cache=None, entry_observations=None, target_regime=None):
+    """Replay the pure method over one authenticated prefix, bounded to this window."""
+    from types import SimpleNamespace
+    import pm_production_config_binding as config_binding
+    index, batches = facts["index"], facts["batches"]
+    cache = {} if _prepared_source_cache is None else _prepared_source_cache
+    source_key = ("independent-source", id(source_frame))
+    source_sha = cache.get(source_key)
+    if source_sha is None:
+        source_sha = _frame_sha256(source_frame)
+        cache[source_key] = source_sha
+    config_sha = _independent_r_configuration_sha256(config, cache)
+    if (source_sha != index["source_prefix_frame_sha256"]
+            or config_sha != index["configuration_sha256"]
+            or _canonical_bytes(asdict(spec)) != _canonical_bytes(index["instrument_spec"])
+            or _canonical_bytes(geometry) != _canonical_bytes(index["partition_geometry"])):
+        _fail("INDEPENDENT_R_SOURCE_BINDING_CHANGED")
+    strategy = StrategyRegistry.get(index["strategy_id"], **index["parameters"])
+    if config_binding._json_value(_independent_r_session_state(strategy, spec.symbol)) != index["session_spec"]:
+        _fail("INDEPENDENT_R_SESSION_SOURCE_CHANGED")
+    recipe = (index["strategy_id"], _canonical_bytes(index["parameters"]),
+        _canonical_bytes(index["regime_parameters"]), index["regime_parameters_sha256"])
+    surface_key = ("independent-surface", id(source_frame), config_sha, recipe)
+    active_key = ("independent-surface-current", id(source_frame))
+    previous = cache.get(active_key)
+    if previous != surface_key:
+        if previous is not None:
+            cache.pop(previous, None)
+        cache[active_key] = surface_key
+    before = _route_a_plain_strategy_state(strategy)
+    cached = cache.get(surface_key) if before is not None else None
+    if cached is None or cached[0] != before:
+        fitted = SimpleNamespace(regime_parameters=index["regime_parameters"],
+            regime_fit_decision=SimpleNamespace(to_dict=lambda: {
+                "regime_params_sha256": index["regime_parameters_sha256"]}))
+        surface = _build_full_prefix_strategy_surface(frame=source_frame, strategy=strategy,
+            fitted=fitted, symbol=spec.symbol, timeframe=timeframe)
+        if not surface.features.loc[:, list(source_frame.columns)].equals(source_frame):
+            _fail("FULL_PREFIX_STRATEGY_INPUT_MUTATED")
+        after = _route_a_plain_strategy_state(strategy)
+        surface = replace(surface, _content_sha256=_independent_r_surface_sha(surface))
+        if before is not None and after is not None:
+            cache[surface_key] = (before, after, surface)
+    else:
+        strategy.__dict__.clear()
+        strategy.__dict__.update(copy.deepcopy(cached[1]))
+        surface = cached[2]
+    surface_sha = _independent_r_surface_sha(surface)
+    if surface_sha != index["surface_sha256"]:
+        _fail("INDEPENDENT_R_SIGNAL_SURFACE_CHANGED")
+    mask = ((source_frame.index >= pd.Timestamp(geometry["frame_start_utc"]))
+        & (source_frame.index < pd.Timestamp(geometry["end_exclusive_utc"])))
+    base = source_frame.loc[mask]
+    if len(base) != geometry["frame_rows"] or _frame_sha256(base) != geometry["frame_sha256"]:
+        _fail("INDEPENDENT_R_PARTITION_SOURCE_CHANGED")
+    features, signals = surface.features.loc[base.index].copy(deep=True), surface.raw_signals.loc[base.index].copy(deep=True)
+    if target_regime is not None:
+        signals = _independent_r_cell_signals(features, signals, target_regime)
+    if entry_observations is None or not isinstance(entry_observations, pd.Series):
+        _fail("INDEPENDENT_R_VERIFIED_ADMISSIONS_REQUIRED")
+    observations = entry_observations.loc[base.index]
+    episodes_key = ("independent-episodes", id(source_frame), index["source_prefix_frame_sha256"])
+    episodes = cache.get(episodes_key)
+    if episodes is None:
+        episodes = signal_opportunities.independent_entry_episodes(source_frame,
+            symbol=spec.symbol, timeframe=timeframe, cutoff_utc=source_frame["_BAR_CLOSE_TS"].iloc[-1])
+        cache[episodes_key] = episodes
+    for tier in ("P75", "P95"):
+        cost_key = ("independent-pricing", id(source_frame), config_sha,
+            geometry["receipt_sha256"], tier, tiers[tier]._json)
+        prepared = cache.get(cost_key)
+        if prepared is None:
+            pricing, values = Backtester(config), {}
+            pricing.build_evidence_source_seed_result(base, spec.symbol, spec=spec,
+                timeframe=timeframe, spread_tier=tiers[tier], entry_spread_observations=observations,
+                _prepared_inputs_out=values)
+            prepared = pricing, values
+            cache[cost_key] = prepared
+        pricing, values = prepared
+        probe = values["source_probe"]
+        arrays = {name: _route_a_encode_spread_array(values[name], name)
+            for name in ("entry_half_spread", "intrabar_half_spread")}
+        if (arrays != index["half_spread_arrays"][tier]
+                or probe["numerical_execution_cost_attestation"] != index["numerical_execution_cost_attestations"][tier]
+                or probe["spread_model"] != index["spread_model_metadata"][tier]):
+            _fail("INDEPENDENT_R_COST_SOURCE_CHANGED")
+        provenance = signal_opportunities.OpportunityProvenance(strategy.name, config_sha,
+            surface_sha, tier, _sha256(probe["numerical_execution_cost_attestation"]),
+            _sha256(probe["spread_admission"]))
+        expected = signal_opportunities.evaluate_independent_signal_r(features, signals,
+            pricing=pricing, episode_ids=episodes.loc[base.index], strategy=strategy,
+            spec=spec, symbol=spec.symbol, timeframe=timeframe,
+            cutoff_utc=geometry["end_exclusive_utc"],
+            signal_start_utc=features["_BAR_CLOSE_TS"].iloc[max(1, geometry["warmup_bars"]) - 1],
+            entry_half_spreads=values["entry_half_spread"],
+            exit_half_spreads=values["intrabar_half_spread"],
+            entry_admission=values["admission_states"], provenance=provenance)
+        if _canonical_bytes(asdict(expected)) != _canonical_bytes(batches[tier]):
+            _fail("INDEPENDENT_R_OUTCOME_SOURCE_CHANGED")
+    return True
 
 
 def _route_a_source_column_number(frame, columns, name, bar):

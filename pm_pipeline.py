@@ -120,6 +120,7 @@ from pm_current_refit_parameters import (
     parameter_domain_point,
 )
 from pm_book_multiplicity import BOOK_MULTIPLICITY_CONTRACT_VERSION
+import pm_book_multiplicity as book_multiplicity
 from pm_two_phase_lockbox import FROZEN_PRELOCKBOX_STATUS
 from pm_native_activation import (
     NATIVE_EVIDENCE_CANDIDATE,
@@ -224,6 +225,7 @@ CURRENT_REFIT_HORIZON_BUNDLE_VERSION = "fxpm.current-refit-horizon-bundle.v1"
 CURRENT_REFIT_TRIAL_VERSION = "fxpm.current-refit-trial-definition.v1"
 CURRENT_REFIT_RECIPE_VERSION = "fxpm.current-refit-recipe.v1"
 CURRENT_REFIT_BOOK_ENTRY_VERSION = "fxpm.book-multiplicity-cell.v9"
+INDEPENDENT_SIGNAL_REFIT_BOOK_ENTRY_VERSION = book_multiplicity.V19_GENERATION.cell_entry_version
 CURRENT_REFIT_PARAMETER_VERSION = "fxpm.current-refit-parameters.v1"
 CURRENT_REFIT_SPECIALIST_VERSION = "fxpm.current-refit-specialist.v1"
 CURRENT_REFIT_CELL_TRACE_VERSION = "fxpm.current-refit-cell-trace.v1"
@@ -946,10 +948,19 @@ def _current_refit_validate_recipe(
     return dict(recipe), _current_refit_sha256(recipe)
 
 
+def _current_refit_book_entry_contract_version(format_version: str) -> str:
+    if format_version == INDEPENDENT_SIGNAL_REFIT_BOOK_ENTRY_VERSION:
+        return book_multiplicity.V19_GENERATION.version
+    if format_version == CURRENT_REFIT_BOOK_ENTRY_VERSION:
+        return BOOK_MULTIPLICITY_CONTRACT_VERSION
+    raise ValueError("CURRENT_REFIT_BOOK_ENTRY_VERSION_INVALID")
+
+
 def _current_refit_validate_book_entry(
     value: Any,
     *,
     request: Mapping[str, Any],
+    book_contract_version: str = BOOK_MULTIPLICITY_CONTRACT_VERSION,
 ) -> Tuple[Dict[str, Any], str]:
     entry = _current_refit_exact(
         value,
@@ -968,7 +979,7 @@ def _current_refit_validate_book_entry(
         }
     }
     derived_sha = _current_refit_sha256(
-        {"book_contract_version": BOOK_MULTIPLICITY_CONTRACT_VERSION, **identity}
+        {"book_contract_version": book_contract_version, **identity}
     )
     if (
         any(entry[name] != request[name] for name in ("symbol", "timeframe", "regime"))
@@ -1223,13 +1234,16 @@ def replay_current_refit_execution_from_raw_manifest(
             trial_sha256=trial_sha256,
             source_bar_count=source["bar_count"],
         )
+        book_entry_format = descriptors[artifact_ids["winner_book_entry"]]["format_version"]
+        book_contract_version = _current_refit_book_entry_contract_version(book_entry_format)
         book_entry, book_entry_sha256 = _current_refit_validate_book_entry(
             _current_refit_read_json(
                 root,
                 descriptors[artifact_ids["winner_book_entry"]],
-                format_version=CURRENT_REFIT_BOOK_ENTRY_VERSION,
+                format_version=book_entry_format,
             ),
             request=request,
+            book_contract_version=book_contract_version,
         )
         if (
             book_entry["local_process_sha256"] != process_sha256

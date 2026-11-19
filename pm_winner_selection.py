@@ -446,6 +446,27 @@ def risk_unit_quantum(risk_unit_contract: Mapping[str, Any]) -> Decimal:
     return Decimal(1).scaleb(-decimal_places)
 
 
+def build_independent_signal_risk_unit_contract() -> dict[str, Any]:
+    """Declare additive resolved-opportunity R, separate from portfolio wealth."""
+    return {
+        "schema_version": "fxpm.independent-signal-risk-unit.v1",
+        "unit": "INDEPENDENT_INITIAL_STOP_RISK_UNIT",
+        "position_denominator": "INITIAL_STOP_PRICE_LOSS_PER_UNIT",
+        "daily_surface": "RESOLVED_INDEPENDENT_SIGNAL_MODELED_R",
+        "daily_bucket": "RECORDED_EXIT_BAR_OPEN_UTC_DAY",
+        "cost_model": "SPREAD_PLUS_SWAP",
+        "commission": "NOT_MODELED",
+        "inventory_boundary": "WINDOW_BOUNDED_RESOLVED_OR_RIGHT_CENSORED",
+        "accounting_identity": "EXACT_E12_SUM_DAILY_RESOLVED_R_EQUALS_RESOLVED_TRADE_R",
+        "r_decimal_places": 12,
+        "r_rounding": "ROUND_HALF_EVEN",
+    }
+
+
+INDEPENDENT_SIGNAL_RISK_UNIT_CONTRACT: Final = MappingProxyType(build_independent_signal_risk_unit_contract())
+INDEPENDENT_SIGNAL_RISK_UNIT_CONTRACT_SHA256: Final = _sha256_json(dict(INDEPENDENT_SIGNAL_RISK_UNIT_CONTRACT))
+
+
 PINNED_RISK_UNIT_CONTRACT: Final = MappingProxyType(
     build_backtest_winner_risk_unit_contract()
 )
@@ -503,6 +524,114 @@ class _ContractGeneration:
     matched_floor_enabled: bool = False
     statistical_policy_version: str = "fxpm.winner-statistical-policy.v11"
 
+    independent_signal_r_enabled: bool = False
+    explicit_transport_enabled: bool = False
+
+    @property
+    def risk_unit_contract(self) -> Mapping[str, Any]:
+        return INDEPENDENT_SIGNAL_RISK_UNIT_CONTRACT if self.independent_signal_r_enabled else PINNED_RISK_UNIT_CONTRACT
+
+    @property
+    def risk_unit_contract_sha256(self) -> str:
+        return INDEPENDENT_SIGNAL_RISK_UNIT_CONTRACT_SHA256 if self.independent_signal_r_enabled else PINNED_RISK_UNIT_CONTRACT_SHA256
+
+    @property
+    def book_p_value_contract_sha256(self) -> str:
+        if self.independent_signal_r_enabled:
+            return V19_BOOK_P_VALUE_CONTRACT_SHA256
+        return PINNED_BOOK_P_VALUE_CONTRACT_SHA256 if self.archived else CURRENT_BOOK_P_VALUE_CONTRACT_SHA256
+
+    @property
+    def selection_addendum_contract(self) -> Mapping[str, Any]:
+        return V19_SELECTION_ADDENDUM_CONTRACT if self.independent_signal_r_enabled else V17_SELECTION_ADDENDUM_CONTRACT
+
+    @property
+    def selection_addendum_evidence_version(self) -> str:
+        return "fxpm.matched-floor-selection-evidence.v2" if self.independent_signal_r_enabled else "fxpm.matched-floor-selection-evidence.v1"
+
+    @property
+    def stage_origin_version(self) -> str:
+        return "fxpm.independent-signal-stage-origin-binding.v1" if self.independent_signal_r_enabled else "fxpm.matched-floor-stage-origin-binding.v1"
+
+    @property
+    def stage_origin_fields(self) -> frozenset[str]:
+        if self.independent_signal_r_enabled:
+            return frozenset({"schema_version", "precommitment_sha256", "frozen_receipt_sha256",
+                "bound_fitted_state_sha256", "provenance_cross_binding_sha256", "raw_body_sha256",
+                "matched_base_facts_sha256", "attempt_ordinal", "attempt_id"})
+        return frozenset({"schema_version", "producer_request_sha256", "process_receipt_sha256",
+            "frozen_receipt_sha256", "precommitment_sha256", "declared_unit_binding_sha256",
+            "preparation_contract_sha256", "unit", "stage_content_sha256", "stage_size_bytes",
+            "raw_body_sha256", "matched_base_facts_sha256"})
+
+    @property
+    def primary_utility_field(self) -> str:
+        return self.utility_metric_name("conservative_primary_utility_lcb_daily_log_growth")
+
+    def utility_metric_name(self, name: str) -> str:
+        return name.replace("log_growth", "resolved_trade_r") if self.independent_signal_r_enabled else name
+
+    @property
+    def tier_daily_field(self) -> str:
+        return "daily_resolved_trade_r" if self.independent_signal_r_enabled else "daily_net_mtm_r"
+
+    @property
+    def tier_trade_field(self) -> str:
+        return "resolved_trade_net_r" if self.independent_signal_r_enabled else "completed_trade_net_mtm_r"
+
+    @property
+    def identity_field(self) -> str:
+        return "resolved_trade_opportunity_ids" if self.independent_signal_r_enabled else "completed_trade_position_ids"
+
+    @property
+    def entry_time_field(self) -> str:
+        return "resolved_trade_entry_utc" if self.independent_signal_r_enabled else "completed_trade_open_utc"
+
+    @property
+    def exit_observed_time_field(self) -> str:
+        return "resolved_trade_exit_observed_at_utc" if self.independent_signal_r_enabled else "completed_trade_close_utc"
+
+    @property
+    def entry_order_field(self) -> str:
+        return "resolved_trade_entry_event_order" if self.independent_signal_r_enabled else "completed_trade_open_event_order"
+
+    @property
+    def exit_order_field(self) -> str:
+        return "resolved_trade_exit_event_order" if self.independent_signal_r_enabled else "completed_trade_close_event_order"
+
+    @property
+    def trade_identity_fields(self) -> tuple[str, ...]:
+        fields = (self.identity_field, self.entry_time_field, self.exit_observed_time_field, self.entry_order_field, self.exit_order_field)
+        return (*fields, "resolved_trade_exit_bar_open_utc") if self.independent_signal_r_enabled else fields
+
+    @property
+    def serialized_identity_fields(self) -> tuple[str, ...]:
+        if self.independent_signal_r_enabled:
+            return ("resolved_trade_entry_offset_seconds", "resolved_trade_exit_bar_open_offset_seconds",
+                "resolved_trade_opportunity_id_digests_base64", "resolved_trade_event_order_anchor",
+                "resolved_trade_entry_event_order_offsets", "resolved_trade_exit_event_order_offsets",
+                "resolved_trade_exit_observed_at_offset_seconds")
+        return _TIER_IDENTITY_FIELDS
+
+    @property
+    def witness_field(self) -> str:
+        return "independent_signal_r_witness_sha256" if self.independent_signal_r_enabled else "position_activity_ledger_sha256"
+
+    @property
+    def tier_fold_keys(self) -> frozenset[str]:
+        return frozenset({*self.serialized_identity_fields, *_TIER_LINEAGE_FIELDS, self.witness_field,
+            self.tier_daily_field + "_e12_i64be_base64", "daily_surface_sha256",
+            self.tier_trade_field + "_e12_i64be_base64", "trade_power_binding", "trade_vector_sha256"})
+
+    @property
+    def floor_identity_field(self) -> str:
+        return "base_opportunity_identity" if self.independent_signal_r_enabled else "base_position_identity"
+
+    @property
+    def max_abs_daily_r(self) -> float:
+        # An additive day can contain every transported resolved opportunity.
+        return MAX_TRADES_PER_FOLD * MAX_ABS_TRADE_R if self.independent_signal_r_enabled else MAX_ABS_DAILY_R
+
     @property
     def pair_field(self) -> str:
         return (
@@ -534,6 +663,7 @@ V16_GENERATION: Final = replace(
     request_version="fxpm.winner-selection-request.v4", precommitment_version="fxpm.winner-precommitment.v5",
     evidence_version="fxpm.winner-evidence-ledger.v8", marginal_version="fxpm.winner-book-marginal.v3",
     shared_partition_version="fxpm.winner-shared-oos-partition.v4", transport=V16_TRANSPORT_ENVELOPE,
+    explicit_transport_enabled=True,
 )
 V17_SELECTION_ADDENDUM_CONTRACT: Final = MappingProxyType({
     "schema_version": "fxpm.matched-floor-selection-contract.v1",
@@ -580,6 +710,60 @@ V18_GENERATION: Final = replace(V17_GENERATION,
     max_attempts=303, statistical_policy_version="fxpm.winner-statistical-policy.v14")
 
 
+V19_SELECTION_ADDENDUM_CONTRACT: Final = MappingProxyType({
+    **V17_SELECTION_ADDENDUM_CONTRACT,
+    "schema_version": "fxpm.matched-floor-selection-contract.v2",
+    "base_trade_set": "UNCHANGED_FINAL_LOCKBOX_P75_RESOLVED_OPPORTUNITIES",
+    "fill_witness": "EXACT_P75_FIRST_FILL_AND_OPPORTUNITY_PARITY_REQUIRED",
+})
+V19_SELECTION_ADDENDUM_CONTRACT_SHA256: Final = _sha256_json(dict(V19_SELECTION_ADDENDUM_CONTRACT))
+V19_SELECTION_POLICY: Final = MappingProxyType({
+    **{key.replace("log_growth", "resolved_trade_r"): value for key, value in V17_SELECTION_POLICY.items()
+       if key != "primary_cell_risk_fraction"},
+    "policy_version": "fxpm.winner-statistical-policy.v15",
+    "daily_evidence": "RESOLVED_INDEPENDENT_SIGNAL_MODELED_R",
+    "daily_unit": "INDEPENDENT_INITIAL_STOP_RISK_UNIT",
+    "daily_bucket": "RECORDED_EXIT_BAR_OPEN_UTC_DAY",
+    "inventory_boundary": "WINDOW_BOUNDED_RESOLVED_OR_RIGHT_CENSORED",
+    "accounting_identity": "EXACT_E12_SUM_DAILY_RESOLVED_R_EQUALS_RESOLVED_TRADE_R",
+    "primary_utility": "MEAN_DAILY_RESOLVED_TRADE_R",
+    "primary_transform": "IDENTITY_ADDITIVE_R",
+    "primary_candidate_score": "MIN_DEPENDENCE_ROBUST_LCB_MEAN_DAILY_RESOLVED_TRADE_R_ACROSS_TIER_LANES",
+    "selection_dominance_fields": ("conservative_primary_utility_lcb_daily_resolved_trade_r",),
+    "attempt_aware_dsr_rule": "MAX_PRIMARY_AND_SENSITIVITY_HAC_DSR_ON_ONE_DAILY_RESOLVED_TRADE_R_MOMENT_VECTOR_PER_LANE",
+    "pbo_daily_unit": "INDEPENDENT_INITIAL_STOP_RISK_UNIT",
+    "pbo_performance_measure": "DAILY_RESOLVED_TRADE_R_SHARPE",
+    "moving_block_bootstrap_daily_unit": "INDEPENDENT_INITIAL_STOP_RISK_UNIT",
+    "selection_addendum_contract_sha256": V19_SELECTION_ADDENDUM_CONTRACT_SHA256,
+    "commission": "NOT_MODELED",
+    "power_calibration_distribution": "PYTHON_MT19937_GAUSSIAN_STANDARDIZED_DAILY_ADDITIVE_R",
+    "max_abs_daily_r_transport": MAX_TRADES_PER_FOLD * MAX_ABS_TRADE_R,
+})
+V19_SELECTION_POLICY_SHA256: Final = _sha256_json(dict(V19_SELECTION_POLICY))
+V19_BOOK_P_VALUE_CONTRACT_SHA256: Final = _sha256_json({
+    **_BOOK_P_VALUE_CONTRACT,
+    "method": "INDEPENDENT_SIGNAL_ADDITIVE_R_SELECTED_FROZEN_TIER_HAC_DSR_MBB_CSCV_PBO",
+})
+V19_GENERATION: Final = replace(V17_GENERATION,
+    selection_version="fxpm.winner-selection.v19", request_version="fxpm.winner-selection-request.v7",
+    precommitment_version="fxpm.winner-precommitment.v8", evidence_version="fxpm.winner-evidence-ledger.v11",
+    marginal_version="fxpm.winner-book-marginal.v6", shared_partition_version="fxpm.winner-shared-oos-partition.v7",
+    policy=V19_SELECTION_POLICY, policy_sha256=V19_SELECTION_POLICY_SHA256,
+    lane_fields=MappingProxyType({"P75": "daily_resolved_trade_r_p75", "P95": "daily_resolved_trade_r_p95"}),
+    trade_lane_fields=MappingProxyType({"P75": "resolved_trade_net_r_p75", "P95": "resolved_trade_net_r_p95"}),
+    max_attempts=300, statistical_policy_version="fxpm.winner-statistical-policy.v15", independent_signal_r_enabled=True)
+
+
+_GENERATIONS: Final = (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION, V19_GENERATION)
+
+
+def winner_generation_for_selection_version(version: str) -> _ContractGeneration:
+    for generation in _GENERATIONS:
+        if version == generation.selection_version:
+            return generation
+    raise _ContractError("WINNER_SELECTION_VERSION_INVALID")
+
+
 CURRENT_WINNER_SELECTION_CONTRACT_VERSION: Final = CURRENT_GENERATION.selection_version
 CURRENT_WINNER_SELECTION_REQUEST_VERSION: Final = CURRENT_GENERATION.request_version
 CURRENT_WINNER_BOOK_MARGINAL_CONTRACT_VERSION: Final = CURRENT_GENERATION.marginal_version
@@ -590,6 +774,8 @@ CURRENT_SHARED_OOS_PARTITION_VERSION: Final = CURRENT_GENERATION.shared_partitio
 
 def _generation_for_precommitment(value: Mapping[str, Any]) -> _ContractGeneration:
     version = value.get("contract_version")
+    if version == V19_GENERATION.precommitment_version:
+        return V19_GENERATION
     if version == V18_GENERATION.precommitment_version:
         return V18_GENERATION
     if version == V17_GENERATION.precommitment_version:
@@ -609,12 +795,12 @@ def winner_generation_for_precommitment(value: Mapping[str, Any]) -> _ContractGe
 
 def is_supported_current_generation(generation) -> bool:
     return any(generation is known for known in (
-        CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION))
+        CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION, V19_GENERATION))
 
 
 def winner_request_byte_limit(contract_version: str) -> int:
     """Assembled Winner request bound; metadata artifacts keep their own bounds."""
-    for generation in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION):
+    for generation in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION, V19_GENERATION):
         if contract_version in (generation.selection_version, generation.request_version,
                 generation.precommitment_version, generation.evidence_version, generation.marginal_version):
             return generation.transport.max_request_bytes
@@ -622,13 +808,13 @@ def winner_request_byte_limit(contract_version: str) -> int:
 
 
 def _payload_transport(generation, payload_type):
-    if generation in (V16_GENERATION, V17_GENERATION, V18_GENERATION) and payload_type is not WinnerEvidenceLedgerPayload:
+    if generation.explicit_transport_enabled and payload_type is not WinnerEvidenceLedgerPayload:
         return V16_METADATA_ENVELOPE
     return generation.transport
 
 
 def check_completed_trade_transport_count(total: int, *, generation: _ContractGeneration = CURRENT_GENERATION) -> None:
-    if not any(generation is known for known in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION)):
+    if not any(generation is known for known in (ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION, V19_GENERATION)):
         raise _ContractError("WINNER_TRANSPORT_GENERATION_INVALID")
     if type(total) is not int or total < 0:
         raise _ContractError("COMPLETED_TRADE_COUNT_INVALID")
@@ -904,13 +1090,14 @@ def _encode_utc_second_offsets(
     fold_start_utc: datetime,
     fold_end_exclusive_utc: datetime,
     code: str,
+    allow_end: bool = False,
 ) -> list[int]:
     if type(values) is not list:
         raise _ContractError(code)
     encoded: list[int] = []
     for value in values:
         parsed = _timestamp(value, code)
-        if not fold_start_utc <= parsed < fold_end_exclusive_utc:
+        if not (fold_start_utc <= parsed < fold_end_exclusive_utc or allow_end and parsed == fold_end_exclusive_utc):
             raise _ContractError(code)
         delta = parsed - fold_start_utc
         if delta.microseconds != 0:
@@ -925,10 +1112,11 @@ def _decode_utc_second_offsets(
     fold_start_utc: datetime,
     fold_end_exclusive_utc: datetime,
     code: str,
+    allow_end: bool = False,
 ) -> list[str]:
     if type(values) is not list:
         raise _ContractError(code)
-    maximum = int((fold_end_exclusive_utc - fold_start_utc).total_seconds()) - 1
+    maximum = int((fold_end_exclusive_utc - fold_start_utc).total_seconds()) - (0 if allow_end else 1)
     decoded: list[str] = []
     for value in values:
         offset = _exact_int(value, 0, maximum, code)
@@ -992,21 +1180,21 @@ def _decode_event_order_offsets(
     )
 
 
-def _encode_position_id_digests(position_ids: Any, code: str) -> str:
+def _encode_position_id_digests(position_ids: Any, code: str, *, prefix: str = "btp:") -> str:
     if type(position_ids) is not list:
         raise _ContractError(code)
     if any(
-        type(value) is not str or _BACKTEST_POSITION_ID.fullmatch(value) is None
+        type(value) is not str or not value.startswith(prefix) or _HEX64.fullmatch(value[len(prefix):]) is None
         for value in position_ids
     ):
         raise _ContractError(code)
     if len(set(position_ids)) != len(position_ids):
         raise _ContractError(code)
-    raw = b"".join(bytes.fromhex(value[4:]) for value in position_ids)
+    raw = b"".join(bytes.fromhex(value[len(prefix):]) for value in position_ids)
     return base64.b64encode(raw).decode("ascii")
 
 
-def _decode_position_id_digests(value: Any, trade_count: int, code: str) -> list[str]:
+def _decode_position_id_digests(value: Any, trade_count: int, code: str, *, prefix: str = "btp:") -> list[str]:
     if type(value) is not str:
         raise _ContractError(code)
     expected_bytes = _POSITION_ID_DIGEST_BYTES * trade_count
@@ -1023,7 +1211,7 @@ def _decode_position_id_digests(value: Any, trade_count: int, code: str) -> list
     ):
         raise _ContractError(code)
     position_ids = [
-        "btp:" + decoded[offset : offset + _POSITION_ID_DIGEST_BYTES].hex()
+        prefix + decoded[offset : offset + _POSITION_ID_DIGEST_BYTES].hex()
         for offset in range(0, expected_bytes, _POSITION_ID_DIGEST_BYTES)
     ]
     return position_ids
@@ -1133,7 +1321,7 @@ def _create_winner_selection_request(
         )
     )
     request = WinnerSelectionRequest(precommitment, attempt_ledger, evidence_ledger, request_sha256)
-    if _generation in (V16_GENERATION, V17_GENERATION, V18_GENERATION):
+    if _generation.explicit_transport_enabled:
         _owned_json(request.to_dict(), _generation.transport.max_request_bytes,
             _envelope=_generation.transport, _copy_owned=False)
     elif len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes:
@@ -1147,6 +1335,8 @@ def create_winner_selection_request(precommitment_payload: Any, attempt_ledger_p
         generation = _generation_for_precommitment(precommitment_payload)
     except Exception:
         return None
+    if generation.independent_signal_r_enabled:
+        return create_winner_selection_request_v19(precommitment_payload, attempt_ledger_payload, evidence_ledger_payload)
     if generation is V18_GENERATION:
         return create_winner_selection_request_v18(precommitment_payload, attempt_ledger_payload, evidence_ledger_payload)
     if generation is V17_GENERATION:
@@ -1185,6 +1375,15 @@ def create_winner_selection_request_v18(precommitment_payload: Any, attempt_ledg
         raise _ContractError("V18_PRECOMMITMENT_VERSION_REQUIRED")
     return _create_winner_selection_request(precommitment_payload, attempt_ledger_payload,
         evidence_ledger_payload, _generation=V18_GENERATION)
+
+
+def create_winner_selection_request_v19(precommitment_payload: Any, attempt_ledger_payload: Any,
+        evidence_ledger_payload: Any) -> WinnerSelectionRequest:
+    """Build the explicit independent-opportunity edition on the ordinary roster."""
+    if not _generation_for_precommitment(precommitment_payload).independent_signal_r_enabled:
+        raise _ContractError("V19_PRECOMMITMENT_VERSION_REQUIRED")
+    return _create_winner_selection_request(precommitment_payload, attempt_ledger_payload,
+        evidence_ledger_payload, _generation=V19_GENERATION)
 
 
 def _payload_from_wrapper(
@@ -1245,13 +1444,13 @@ def _request_payloads(
             policy_sha, attempt_sha, evidence_sha, _generation=_generation
         )
     )
-    if _generation in (V16_GENERATION, V17_GENERATION, V18_GENERATION):
+    if _generation.explicit_transport_enabled:
         _owned_json(request.to_dict(), _generation.transport.max_request_bytes,
             _envelope=_generation.transport, _copy_owned=False)
     if (
         type(request.request_sha256) is not str
         or request.request_sha256 != expected_request_sha
-        or (_generation not in (V16_GENERATION, V17_GENERATION, V18_GENERATION)
+        or (not _generation.explicit_transport_enabled
             and len(_canonical_bytes(request.to_dict())) > _generation.transport.max_request_bytes)
     ):
         raise _ContractError("REQUEST_BINDING_INVALID")
@@ -1621,13 +1820,40 @@ def _v17_below_matched_stress_economic_floor(base_net_r, matched_p95_cost_r):
         for value in matched_p95_cost_r)
 
 
+def _validate_selection_stage_origin(raw, *, policy_sha, attempt, ordinal, witness_sha,
+        _generation: _ContractGeneration):
+    """Validate semantic lineage; declared cold replay retains source authority."""
+    fields = _generation.stage_origin_fields
+    origin = _exact_dict(raw, fields, "MATCHED_FLOOR_STAGE_ORIGIN_SCHEMA_INVALID")
+    if (origin["schema_version"] != _generation.stage_origin_version
+            or origin["precommitment_sha256"] != policy_sha
+            or origin["matched_base_facts_sha256"] != witness_sha):
+        raise _ContractError("MATCHED_FLOOR_STAGE_ORIGIN_BINDING_INVALID")
+    if _generation.independent_signal_r_enabled:
+        if (type(origin["attempt_ordinal"]) is not int or origin["attempt_ordinal"] != ordinal
+                or origin["attempt_id"] != attempt["attempt_id"]):
+            raise _ContractError("MATCHED_FLOOR_STAGE_ORIGIN_BINDING_INVALID")
+        non_hash_fields = {"schema_version", "attempt_ordinal", "attempt_id"}
+    else:
+        if (type(origin["unit"]) is not dict or origin["unit"].get("ordinal") != ordinal
+                or origin["unit"].get("raw_attempt_id") != attempt["attempt_id"]):
+            raise _ContractError("MATCHED_FLOOR_STAGE_ORIGIN_BINDING_INVALID")
+        _exact_int(origin["stage_size_bytes"], 1, 2**63 - 1, "MATCHED_FLOOR_STAGE_SIZE_INVALID")
+        non_hash_fields = {"schema_version", "unit", "stage_size_bytes"}
+    for key in fields - non_hash_fields:
+        _hex(origin[key], _HEX64, "MATCHED_FLOOR_STAGE_ORIGIN_HASH_INVALID")
+    return origin
+
+
 def _validate_v17_selection_addendum(value, *, policy, policy_sha, attempt_sha, attempts, entries, shared_axis):
     """Validate compact semantics; original source authority requires declared cold replay."""
     import pm_authority_spool as spool
+    _generation = _generation_for_precommitment(policy)
+    identity_field = _generation.floor_identity_field
     fields = frozenset({"contract_version", "precommitment_payload_sha256", "attempt_ledger_payload_sha256",
         "selection_complexity_roster_sha256", "entries", "entries_sha256"})
     body = _exact_dict(value, fields, "MATCHED_FLOOR_ADDENDUM_SCHEMA_INVALID")
-    if (body["contract_version"] != "fxpm.matched-floor-selection-evidence.v1"
+    if (body["contract_version"] != _generation.selection_addendum_evidence_version
             or body["precommitment_payload_sha256"] != policy_sha
             or body["attempt_ledger_payload_sha256"] != attempt_sha
             or body["selection_complexity_roster_sha256"] != policy["selection_complexity_roster_sha256"]
@@ -1653,20 +1879,8 @@ def _validate_v17_selection_addendum(value, *, policy, policy_sha, attempt_sha, 
                     or row["full_witnesses_sha256"] is not None or row["partition_statuses"] != [] or row["final_folds"] != []):
                 raise _ContractError("MATCHED_FLOOR_REJECTED_ATTEMPT_CARRIES_EVIDENCE")
             continue
-        origin_fields = frozenset({"schema_version", "producer_request_sha256", "process_receipt_sha256",
-            "frozen_receipt_sha256", "precommitment_sha256", "declared_unit_binding_sha256",
-            "preparation_contract_sha256", "unit", "stage_content_sha256", "stage_size_bytes",
-            "raw_body_sha256", "matched_base_facts_sha256"})
-        origin = _exact_dict(row["stage_origin_binding"], origin_fields, "MATCHED_FLOOR_STAGE_ORIGIN_SCHEMA_INVALID")
-        if (origin["schema_version"] != "fxpm.matched-floor-stage-origin-binding.v1"
-                or origin["precommitment_sha256"] != policy_sha
-                or type(origin["unit"]) is not dict or origin["unit"].get("ordinal") != ordinal
-                or origin["unit"].get("raw_attempt_id") != attempt["attempt_id"]
-                or origin["matched_base_facts_sha256"] != row["full_witnesses_sha256"]):
-            raise _ContractError("MATCHED_FLOOR_STAGE_ORIGIN_BINDING_INVALID")
-        for key in origin_fields - {"schema_version", "unit", "stage_size_bytes"}:
-            _hex(origin[key], _HEX64, "MATCHED_FLOOR_STAGE_ORIGIN_HASH_INVALID")
-        _exact_int(origin["stage_size_bytes"], 1, 2**63 - 1, "MATCHED_FLOOR_STAGE_SIZE_INVALID")
+        _validate_selection_stage_origin(row["stage_origin_binding"], policy_sha=policy_sha,
+            attempt=attempt, ordinal=ordinal, witness_sha=row["full_witnesses_sha256"], _generation=_generation)
         reference = _exact_dict(row["partition_witnesses_descriptor"], frozenset({"artifact_id", "artifact_type", "descriptor"}),
             "MATCHED_FLOOR_WITNESS_REFERENCE_INVALID")
         if reference["artifact_type"] != "winner_matched_base_witnesses" or type(reference["artifact_id"]) is not str:
@@ -1694,7 +1908,7 @@ def _validate_v17_selection_addendum(value, *, policy, policy_sha, attempt_sha, 
         net, costs = [], []
         for fold_ordinal, raw_final in enumerate(row["final_folds"]):
             final = _exact_dict(raw_final, frozenset({"fold_ordinal", "shared_fold_axis_row_sha256",
-                "raw_shared_oos_partition_sha256", "base_position_identity_sha256", "base_position_identity",
+                "raw_shared_oos_partition_sha256", identity_field + "_sha256", identity_field,
                 "floor_status", "floor_reason_codes", "base_actual_initial_risk_net_r", "matched_p95_spread_cost_r"}),
                 "MATCHED_FLOOR_FINAL_SCHEMA_INVALID")
             axis = shared_axis[fold_ordinal]
@@ -1702,15 +1916,14 @@ def _validate_v17_selection_addendum(value, *, policy, policy_sha, attempt_sha, 
                     or final["raw_shared_oos_partition_sha256"] != _sha256_json(axis["shared_oos_partition"])):
                 raise _ContractError("MATCHED_FLOOR_FINAL_AXIS_SPLICE")
             account = entry["folds"][fold_ordinal]["tier_evidence"]["P75"]
-            identity = {key: account[key] for key in ("completed_trade_position_ids", "completed_trade_open_utc",
-                "completed_trade_close_utc", "completed_trade_open_event_order", "completed_trade_close_event_order")}
+            identity = {key: account[key] for key in _generation.trade_identity_fields}
             status = row["partition_statuses"][fold_ordinal * 3 + 2]
-            if (final["base_position_identity"] != identity or final["base_position_identity_sha256"] != _sha256_json(identity)
+            if (final[identity_field] != identity or final[identity_field + "_sha256"] != _sha256_json(identity)
                     or any(final[key] != status[key] for key in ("floor_status", "floor_reason_codes"))):
                 raise _ContractError("MATCHED_FLOOR_POSITION_IDENTITY_SPLICE")
             values, spread = final["base_actual_initial_risk_net_r"], final["matched_p95_spread_cost_r"]
             if final["floor_status"] == "AVAILABLE_MATCHED_BASE_VERIFIED":
-                count = len(identity["completed_trade_position_ids"])
+                count = len(identity[_generation.identity_field])
                 if (type(values) is not list or type(spread) is not list or not count
                         or len(values) != count or len(spread) != count):
                     raise _ContractError("MATCHED_FLOOR_COMPLETE_VECTOR_REQUIRED")
@@ -1793,7 +2006,7 @@ def _validate_precommitment(
         "trial_registry_sha256",
     ):
         _hex(value[field], _HEX64, field.upper() + "_INVALID")
-    if value["risk_unit_contract_sha256"] != PINNED_RISK_UNIT_CONTRACT_SHA256:
+    if value["risk_unit_contract_sha256"] != _generation.risk_unit_contract_sha256:
         raise _ContractError("RISK_UNIT_CONTRACT_MISMATCH")
     attempts = _exact_int(
         value["planned_attempt_count"], 1, _generation.max_attempts, "PLANNED_ATTEMPT_COUNT_INVALID"
@@ -1806,7 +2019,7 @@ def _validate_precommitment(
         _generation=_generation,
     )
     if _generation.matched_floor_enabled:
-        if value["selection_addendum_contract"] != dict(V17_SELECTION_ADDENDUM_CONTRACT):
+        if value["selection_addendum_contract"] != dict(_generation.selection_addendum_contract):
             raise _ContractError("SELECTION_ADDENDUM_CONTRACT_MISMATCH")
         roster = validate_selection_complexity_roster(value["selection_complexity_roster"], expected_count=attempts)
         if value["selection_complexity_roster_sha256"] != _sha256_json(roster):
@@ -2469,12 +2682,12 @@ def _validate_current_fold(
     result["tier_evidence"] = {}
     for tier in ("P75", "P95"):
         code = prefix + tier + "_"
-        row = _exact_dict(tiers[tier], _CURRENT_TIER_FOLD_KEYS, code + "SCHEMA_INVALID")
+        row = _exact_dict(tiers[tier], _generation.tier_fold_keys, code + "SCHEMA_INVALID")
         if row["spread_tier"] != tier:
             raise _ContractError(code + "TIER_MISMATCH")
         for field in (
             *_TIER_LINEAGE_FIELDS[1:],
-            "position_activity_ledger_sha256",
+            _generation.witness_field,
             "daily_surface_sha256",
             "trade_vector_sha256",
         ):
@@ -2494,25 +2707,27 @@ def _validate_current_fold(
         if row["entry_spread_admission_policy_sha256"] != expected_admission_sha:
             raise _ContractError(code + "ADMISSION_POLICY_MISMATCH")
         daily = _decode_r_e12_i64be_base64(
-            row["daily_net_mtm_r_e12_i64be_base64"],
+            row[_generation.tier_daily_field + "_e12_i64be_base64"],
             expected_count=len(shared_axis["daily_dates_utc"]),
-            maximum_abs_r=MAX_ABS_DAILY_R,
+            maximum_abs_r=_generation.max_abs_daily_r,
             code=code + "DAILY_R_INVALID",
         )
         daily_body = {
             "shared_fold_axis_row_sha256": axis_sha,
             **{field: row[field] for field in _TIER_LINEAGE_FIELDS},
-            "daily_net_mtm_r_e12_i64be_base64": row["daily_net_mtm_r_e12_i64be_base64"],
+            _generation.tier_daily_field + "_e12_i64be_base64": row[_generation.tier_daily_field + "_e12_i64be_base64"],
         }
+        if _generation.independent_signal_r_enabled:
+            daily_body["risk_unit_contract_sha256"] = policy["risk_unit_contract_sha256"]
         if row["daily_surface_sha256"] != _sha256_json(daily_body):
             raise _ContractError(code + "DAILY_SURFACE_HASH_MISMATCH")
         vectors = [
             row[field]
             for field in (
-                _TIER_IDENTITY_FIELDS[0],
-                _TIER_IDENTITY_FIELDS[1],
-                _TIER_IDENTITY_FIELDS[4],
-                _TIER_IDENTITY_FIELDS[5],
+                _generation.serialized_identity_fields[0],
+                _generation.serialized_identity_fields[1],
+                _generation.serialized_identity_fields[4],
+                _generation.serialized_identity_fields[5],
             )
         ]
         if any(type(vector) is not list for vector in vectors):
@@ -2535,35 +2750,43 @@ def _validate_current_fold(
             code=code + "TRADE_CLOSE_OFFSET_INVALID",
         )
         positions = _decode_position_id_digests(
-            row["completed_trade_position_id_digests_base64"],
+            row[_generation.serialized_identity_fields[2]],
             count,
             code + "POSITION_IDS_INVALID",
+            prefix="iso:" if _generation.independent_signal_r_enabled else "btp:",
         )
         if len(set(positions)) != count:
             raise _ContractError(code + "POSITION_ID_DUPLICATED")
         open_orders, close_orders = _decode_event_order_offsets(
-            row["completed_trade_event_order_anchor"],
+            row[_generation.serialized_identity_fields[3]],
             vectors[2],
             vectors[3],
             code + "EVENT_ORDER_INVALID",
         )
+        observed = (_decode_utc_second_offsets(
+            row[_generation.serialized_identity_fields[6]], fold_start_utc=start,
+            fold_end_exclusive_utc=end, code=code + "OBSERVED_AT_OFFSET_INVALID", allow_end=True)
+            if _generation.independent_signal_r_enabled else closes)
         previous = None
-        for opened, closed, open_order, close_order, position in zip(
-            opens, closes, open_orders, close_orders, positions, strict=True
+        for opened, closed, observed_at, open_order, close_order, position in zip(
+            opens, closes, observed, open_orders, close_orders, positions, strict=True
         ):
             opening = _timestamp(opened, code + "TRADE_OPEN_INVALID")
             closing = _timestamp(closed, code + "TRADE_CLOSE_INVALID")
-            key = (closing, close_order, opening, open_order, position)
+            observed_time = _timestamp(observed_at, code + "OBSERVED_AT_INVALID")
+            key = ((opening, open_order, position) if _generation.independent_signal_r_enabled
+                else (closing, close_order, opening, open_order, position))
             if (
                 opening < start
-                or (opening, open_order) >= (closing, close_order)
+                or (opening, open_order) >= (observed_time, close_order)
+                or closing < opening or observed_time < closing or observed_time > end
                 or closing >= end
                 or (previous is not None and key <= previous)
             ):
                 raise _ContractError(code + "TRADE_TIME_ORDER_INVALID")
             previous = key
         trades = _decode_r_e12_i64be_base64(
-            row["completed_trade_net_mtm_r_e12_i64be_base64"],
+            row[_generation.tier_trade_field + "_e12_i64be_base64"],
             expected_count=count,
             maximum_abs_r=MAX_ABS_TRADE_R,
             code=code + "TRADE_R_INVALID",
@@ -2585,12 +2808,10 @@ def _validate_current_fold(
             "inventory_boundary_kind": _generation.policy["inventory_boundary"],
             **{
                 field: row[field]
-                for field in (*_TIER_LINEAGE_FIELDS, *_TIER_IDENTITY_FIELDS)
+                for field in (*_TIER_LINEAGE_FIELDS, *_generation.serialized_identity_fields)
             },
-            "completed_trade_net_mtm_r_e12_i64be_base64": row[
-                "completed_trade_net_mtm_r_e12_i64be_base64"
-            ],
-            "position_activity_ledger_sha256": row["position_activity_ledger_sha256"],
+            _generation.tier_trade_field + "_e12_i64be_base64": row[_generation.tier_trade_field + "_e12_i64be_base64"],
+            _generation.witness_field: row[_generation.witness_field],
             "risk_unit_contract_sha256": policy["risk_unit_contract_sha256"],
             "trade_power_binding": binding,
         }
@@ -2598,18 +2819,27 @@ def _validate_current_fold(
             raise _ContractError(code + "TRADE_VECTOR_HASH_MISMATCH")
         if sum(daily) != sum(trades):
             raise _ContractError(code + "FLAT_TO_FLAT_ACCOUNTING_MISMATCH")
+        if _generation.independent_signal_r_enabled:
+            buckets = [0] * len(daily)
+            for recorded_exit, amount in zip(closes, trades, strict=True):
+                day_index = (_timestamp(recorded_exit, code + "EXIT_BAR_INVALID").date() - start.date()).days
+                buckets[day_index] += amount
+            if buckets != daily:
+                raise _ContractError(code + "RECORDED_EXIT_DAY_ATTRIBUTION_MISMATCH")
         result["tier_evidence"][tier] = {
             **row,
-            "daily_net_mtm_r": [value / 10**12 for value in daily],
-            "completed_trade_net_mtm_r": [value / 10**12 for value in trades],
-            "completed_trade_open_utc": opens,
-            "completed_trade_close_utc": closes,
-            "completed_trade_position_ids": positions,
-            "completed_trade_open_event_order": open_orders,
-            "completed_trade_close_event_order": close_orders,
+            _generation.tier_daily_field: [value / 10**12 for value in daily],
+            _generation.tier_trade_field: [value / 10**12 for value in trades],
+            _generation.entry_time_field: opens,
+            _generation.exit_observed_time_field: observed,
+            _generation.identity_field: positions,
+            _generation.entry_order_field: open_orders,
+            _generation.exit_order_field: close_orders,
         }
-        result[CURRENT_GENERATION.lane_fields[tier]] = result["tier_evidence"][tier][
-            "daily_net_mtm_r"
+        if _generation.independent_signal_r_enabled:
+            result["tier_evidence"][tier]["resolved_trade_exit_bar_open_utc"] = closes
+        result[_generation.lane_fields[tier]] = result["tier_evidence"][tier][
+            _generation.tier_daily_field
         ]
     for field in ("source_contract_sha256", "cost_contract_sha256"):
         aggregate = _sha256_json({tier: tiers[tier][field] for tier in ("P75", "P95")})
@@ -2622,7 +2852,7 @@ def _validate_fold(raw: Any, **kwargs: Any) -> dict[str, Any]:
     generation = _generation_for_precommitment(kwargs["policy"])
     if generation.archived:
         return _validate_archived_fold(raw, _generation=generation, **kwargs)
-    return _validate_current_fold(raw, **kwargs)
+    return _validate_current_fold(raw, _generation=generation, **kwargs)
 
 
 def _folds_for_lane(
@@ -2891,10 +3121,10 @@ def _validate_evidence_ledger(
                 attempted_trials=len(attempts),
                 authenticated=status == "AUTHENTICATED",
             )
-            positions = set(fold["completed_trade_position_ids"]) if _generation.archived else {
+            positions = set(fold[_generation.identity_field]) if _generation.archived else {
                 tier + ":" + position
                 for tier, account in fold["tier_evidence"].items()
-                for position in account["completed_trade_position_ids"]
+                for position in account[_generation.identity_field]
             }
             if seen_positions.intersection(positions):
                 raise _ContractError(prefix + "POSITION_ID_REUSED_ACROSS_FOLDS")
@@ -2933,7 +3163,7 @@ def _validate_evidence_ledger(
                 seen_replay_axes.add(replay_axis)
             validated.append(fold)
             total_days += len(shared_axis[fold_ordinal]["daily_dates_utc"])
-            total_trades += sum(len(account["completed_trade_close_utc"]) for account in accounts.values())
+            total_trades += sum(len(account[_generation.exit_observed_time_field]) for account in accounts.values())
             if total_days > MAX_TOTAL_DAILY_POINTS:
                 raise _ContractError("GLOBAL_DAILY_POINT_LIMIT_EXCEEDED")
             check_completed_trade_transport_count(total_trades, generation=_generation)
@@ -2943,8 +3173,8 @@ def _validate_evidence_ledger(
         ]
         for lane in _generation.lane_fields:
             lane_folds = _folds_for_lane(validated, lane, _generation)
-            trade_lengths = [len(fold["completed_trade_close_utc"]) for fold in lane_folds]
-            daily_holding_days = [_derived_holding_days(fold) for fold in lane_folds]
+            trade_lengths = [len(fold[_generation.exit_observed_time_field]) for fold in lane_folds]
+            daily_holding_days = [_derived_holding_days(fold, _generation=_generation) for fold in lane_folds]
             dependence_operations += _dependence_operation_count(daily_lengths, daily_holding_days)
             # Archived trade geometry was shared and charged once.
             if (not _generation.archived or lane == "BASE") and trade_lengths and all(length > 0 for length in trade_lengths):
@@ -3207,11 +3437,11 @@ def _student_t_mean_lcb(
     return moments.mean - critical * standard_error
 
 
-def _derived_holding_days(fold: dict[str, Any]) -> int:
+def _derived_holding_days(fold: dict[str, Any], *, _generation: _ContractGeneration = ARCHIVED_GENERATION) -> int:
     maximum = 1
     for raw_open, raw_close in zip(
-        fold["completed_trade_open_utc"],
-        fold["completed_trade_close_utc"],
+        fold[_generation.entry_time_field],
+        fold[_generation.exit_observed_time_field],
         strict=True,
     ):
         opened = _timestamp(raw_open, "TRADE_OPEN_TIME_INVALID")
@@ -3335,7 +3565,7 @@ def _dependence_robust_inference(
         holding_days = holding_days_override
     else:
         holding_days = (
-            [_derived_holding_days(fold) for fold in folds]
+            [_derived_holding_days(fold, _generation=_generation) for fold in folds]
             if folds is not None
             else [1 for _ in fold_values]
         )
@@ -3485,6 +3715,15 @@ def _max_drawdown(values: list[float]) -> float:
     return drawdown
 
 
+def _daily_primary_utility_from_r(value: float, *, _generation: _ContractGeneration = ARCHIVED_GENERATION) -> float:
+    """Apply the generation's declared statistical unit exactly once."""
+    if type(value) is not float or not math.isfinite(value):
+        raise _ContractError("PRIMARY_UTILITY_INPUT_INVALID")
+    if _generation.independent_signal_r_enabled:
+        return value
+    return _daily_log_growth_from_r(value, _generation=_generation)
+
+
 def _daily_log_growth_from_r(
     value: float, *, _generation: _ContractGeneration = ARCHIVED_GENERATION
 ) -> float:
@@ -3593,9 +3832,9 @@ def _moving_block_bootstrap_scale(
             "observation_count": sum(len(values) for values in fold_values),
             "moving_block_start_count": 0,
             "resampled_block_draw_count": 0,
-            "observed_mean_daily_log_growth": None,
-            "lower_confidence_bound_daily_log_growth": None,
-            "bootstrap_median_daily_log_growth": None,
+            _generation.utility_metric_name("observed_mean_daily_log_growth"): None,
+            _generation.utility_metric_name("lower_confidence_bound_daily_log_growth"): None,
+            _generation.utility_metric_name("bootstrap_median_daily_log_growth"): None,
             "positive_bootstrap_fraction": None,
             "seed_sha256": None,
         }
@@ -3632,9 +3871,9 @@ def _moving_block_bootstrap_scale(
             "observation_count": total_observations,
             "moving_block_start_count": moving_starts,
             "resampled_block_draw_count": operation_count,
-            "observed_mean_daily_log_growth": None,
-            "lower_confidence_bound_daily_log_growth": None,
-            "bootstrap_median_daily_log_growth": None,
+            _generation.utility_metric_name("observed_mean_daily_log_growth"): None,
+            _generation.utility_metric_name("lower_confidence_bound_daily_log_growth"): None,
+            _generation.utility_metric_name("bootstrap_median_daily_log_growth"): None,
             "positive_bootstrap_fraction": None,
             "seed_sha256": None,
         }
@@ -3679,9 +3918,9 @@ def _moving_block_bootstrap_scale(
         "observation_count": total_observations,
         "moving_block_start_count": moving_starts,
         "resampled_block_draw_count": operation_count,
-        "observed_mean_daily_log_growth": observed_mean,
-        "lower_confidence_bound_daily_log_growth": lower_bound,
-        "bootstrap_median_daily_log_growth": median,
+        _generation.utility_metric_name("observed_mean_daily_log_growth"): observed_mean,
+        _generation.utility_metric_name("lower_confidence_bound_daily_log_growth"): lower_bound,
+        _generation.utility_metric_name("bootstrap_median_daily_log_growth"): median,
         "positive_bootstrap_fraction": positive_fraction,
         "seed_sha256": seed_sha256,
     }
@@ -3745,9 +3984,9 @@ def _moving_block_bootstrap_evidence(
         else:
             status = "FAIL"
         bounds = [
-            value["lower_confidence_bound_daily_log_growth"]
+            value[_generation.utility_metric_name("lower_confidence_bound_daily_log_growth")]
             for value in (primary, sensitivity)
-            if type(value["lower_confidence_bound_daily_log_growth"]) is float
+            if type(value[_generation.utility_metric_name("lower_confidence_bound_daily_log_growth")]) is float
         ]
         body = {
             "lane": lane,
@@ -3755,7 +3994,7 @@ def _moving_block_bootstrap_evidence(
             "passed": status == "PASS",
             "primary": primary,
             "sensitivity": sensitivity,
-            "conservative_lower_confidence_bound_daily_log_growth": (
+            _generation.utility_metric_name("conservative_lower_confidence_bound_daily_log_growth"): (
                 min(bounds) if len(bounds) == 2 else None
             ),
             "resampled_block_draw_count": int(
@@ -3797,7 +4036,7 @@ def _moving_block_bootstrap_evidence(
             status = "FAIL"
             reason_code = "TIER_LANE_LOWER_BOUND_NONPOSITIVE"
         bounds = [
-            member["conservative_lower_confidence_bound_daily_log_growth"]
+            member[_generation.utility_metric_name("conservative_lower_confidence_bound_daily_log_growth")]
             for member in members
         ]
         tier_body = {
@@ -3806,7 +4045,7 @@ def _moving_block_bootstrap_evidence(
             "status": status,
             "passed": status == "PASS",
             "reason_code": reason_code,
-            "conservative_lower_confidence_bound_daily_log_growth": (
+            _generation.utility_metric_name("conservative_lower_confidence_bound_daily_log_growth"): (
                 min(float(value) for value in bounds)
                 if all(type(value) is float for value in bounds)
                 else None
@@ -3822,7 +4061,7 @@ def _moving_block_bootstrap_evidence(
             "moving_block_bootstrap_contract_version"
         ],
         "daily_unit": _generation.policy["moving_block_bootstrap_daily_unit"],
-        "primary_cell_risk_fraction": PRIMARY_CELL_RISK_FRACTION,
+        **({} if _generation.independent_signal_r_enabled else {"primary_cell_risk_fraction": PRIMARY_CELL_RISK_FRACTION}),
         "process_candidate_id": process_candidate_id,
         "attempted_trials_exact": attempted_trials,
         "block_rule": _generation.policy["moving_block_bootstrap_block_rule"],
@@ -3936,7 +4175,7 @@ def _pbo_lane_evidence(
         "matrix_sha256": _sha256_json(
             {
                 "candidate_ids": candidate_ids,
-                "daily_log_growth_by_candidate": candidate_values,
+                _generation.utility_metric_name("daily_log_growth_by_candidate"): candidate_values,
             }
         ),
     }
@@ -4031,7 +4270,7 @@ def _cell_pbo_evidence(
         for lane, field in _generation.lane_fields.items():
             lane_values[lane].append(
                 [
-                    _daily_log_growth_from_r(float(value), _generation=_generation)
+                    _daily_primary_utility_from_r(float(value), _generation=_generation)
                     for fold in entry["folds"]
                     for value in fold[field]
                 ]
@@ -4100,7 +4339,7 @@ def _validate_primary_policy_contract(
         "p75_required_lanes": _generation.tier_lanes["P75_REQUIRED"],
         "p95_preference_lanes": _generation.tier_lanes["P95_PREFERENCE"],
         "primary_utility": "MEAN_DAILY_LOG_GROWTH_AT_FIXED_CELL_RISK",
-        "primary_cell_risk_fraction": PRIMARY_CELL_RISK_FRACTION,
+        **({} if _generation.independent_signal_r_enabled else {"primary_cell_risk_fraction": PRIMARY_CELL_RISK_FRACTION}),
         "primary_transform": "LOG1P(0.0025_TIMES_DAILY_NET_MTM_R)",
         "primary_lcb_confidence": PRIMARY_LCB_CONFIDENCE,
         "primary_lcb_dependence_rule": (
@@ -4117,7 +4356,7 @@ def _validate_primary_policy_contract(
             "PAIRED_DAILY_LOG_GROWTH_DIFFERENCES_LEAST_FAVORABLE_"
             "RAW_BASE_P75_P95_PAIR_DEPENDENCE_ONCE_THEN_SEPARATE_TIER_HOLM"
         ),
-        "selection_dominance_fields": (_PRIMARY_UTILITY_FIELD,),
+        "selection_dominance_fields": (_generation.primary_utility_field,),
         "pbo_lane_rule": (
             "COMPUTE_BASE_P75_P95_ONCE_THEN_CONJOIN_LANES_BY_COST_LADDER_TIER"
         ),
@@ -4132,11 +4371,17 @@ def _validate_primary_policy_contract(
             "primary_pairwise_inference": "INDEPENDENT_P75_P95_PAIRED_DAILY_DIFFERENCES_SEPARATE_TIER_HOLM",
             "pbo_lane_rule": "INDEPENDENT_FROZEN_TIER_ACCOUNTS",
         })
+    if _generation.independent_signal_r_enabled:
+        expected.update({
+            "primary_utility": "MEAN_DAILY_RESOLVED_TRADE_R",
+            "primary_transform": "IDENTITY_ADDITIVE_R",
+            "primary_candidate_score": "MIN_DEPENDENCE_ROBUST_LCB_MEAN_DAILY_RESOLVED_TRADE_R_ACROSS_TIER_LANES",
+        })
     if any(
         _generation.policy.get(name) != value for name, value in expected.items()
     ):
         raise _ContractError("PRIMARY_SELECTION_POLICY_IMPLEMENTATION_MISMATCH")
-    if 1.0 - PRIMARY_CELL_RISK_FRACTION * MAX_ABS_DAILY_R <= 0.0:
+    if not _generation.independent_signal_r_enabled and 1.0 - PRIMARY_CELL_RISK_FRACTION * MAX_ABS_DAILY_R <= 0.0:
         raise _ContractError("PRIMARY_UTILITY_ACCEPTED_DOMAIN_INVALID")
 
 def _completed_trade_power_account(
@@ -4171,10 +4416,10 @@ def _completed_trade_power_account(
                 "end_event_order": close_order,
             }
             for opened, closed, open_order, close_order in zip(
-                fold["completed_trade_open_utc"],
-                fold["completed_trade_close_utc"],
-                fold["completed_trade_open_event_order"],
-                fold["completed_trade_close_event_order"],
+                fold[_generation.entry_time_field],
+                fold[_generation.exit_observed_time_field],
+                fold[_generation.entry_order_field],
+                fold[_generation.exit_order_field],
                 strict=True,
             )
         ]
@@ -4261,8 +4506,8 @@ def _completed_trade_power(
             continue
         account_generation = replace(
             _generation,
-            lane_fields=MappingProxyType({lane: "daily_net_mtm_r"}),
-            trade_lane_fields=MappingProxyType({lane: "completed_trade_net_mtm_r"}),
+            lane_fields=MappingProxyType({lane: _generation.tier_daily_field}),
+            trade_lane_fields=MappingProxyType({lane: _generation.tier_trade_field}),
             tier_lanes=MappingProxyType({tier: (lane,)}),
         )
         accounts[tier] = _completed_trade_power_account(
@@ -4323,7 +4568,7 @@ def _candidate_statistics(
             "hac_effective_days": 0.0,
             "completed_trade_hac_effective_count": 0.0,
             "completed_trade_required_effective_count": 0,
-            _PRIMARY_UTILITY_FIELD: None,
+            _generation.primary_utility_field: None,
         }
         for tier, lanes in _generation.tier_lanes.items()
     }
@@ -4350,7 +4595,7 @@ def _candidate_statistics(
     lane_log_folds = {
         lane: [
             [
-                _daily_log_growth_from_r(value, _generation=_generation)
+                _daily_primary_utility_from_r(value, _generation=_generation)
                 for value in values
             ]
             for values in folds
@@ -4377,7 +4622,7 @@ def _candidate_statistics(
         entry, attempted_trials, _generation=_generation
     )
     lane_trade_counts = {
-        lane: sum(len(fold["completed_trade_close_utc"]) for fold in _folds_for_lane(entry["folds"], lane, _generation))
+        lane: sum(len(fold[_generation.exit_observed_time_field]) for fold in _folds_for_lane(entry["folds"], lane, _generation))
         for lane in _generation.lane_fields
     }
     completed_trades = min(lane_trade_counts.values())
@@ -4395,7 +4640,7 @@ def _candidate_statistics(
             fold_lcbs.append(
                 result["mean"] - 1.6448536269514722 * result["se"]
                 if math.isfinite(result["se"])
-                else -MAX_ABS_DAILY_R
+                else -_generation.max_abs_daily_r
             )
         lcb = float(inference["lcb"])
         lane_statistics[lane] = {
@@ -4450,16 +4695,16 @@ def _candidate_statistics(
             "mean_daily_r": _mean(values),
             "worst_fold_mean_daily_r": min(fold_means),
             "newest_fold_mean_daily_r": fold_means[-1],
-            "worst_fold_mean_daily_log_growth": min(fold_log_means),
-            "newest_fold_mean_daily_log_growth": fold_log_means[-1],
+            _generation.utility_metric_name("worst_fold_mean_daily_log_growth"): min(fold_log_means),
+            _generation.utility_metric_name("newest_fold_mean_daily_log_growth"): fold_log_means[-1],
             "worst_fold_hac_lcb_daily_r": min(fold_lcbs),
             "newest_fold_hac_lcb_daily_r": fold_lcbs[-1],
             "tail_cvar_daily_r": _tail_cvar(
                 values, float(_generation.policy["tail_fraction"])
             ),
             "max_path_drawdown_r": _max_drawdown(values),
-            "mean_daily_log_growth": float(inference["mean"]),
-            "dependence_robust_lcb_daily_log_growth": (
+            _generation.utility_metric_name("mean_daily_log_growth"): float(inference["mean"]),
+            _generation.utility_metric_name("dependence_robust_lcb_daily_log_growth"): (
                 lcb if math.isfinite(lcb) else None
             ),
         }
@@ -4480,13 +4725,13 @@ def _candidate_statistics(
         required_trades = trade_power["required"] if _generation.archived else trade_power["tier_required"][tier]
         tier_trade_count = min(lane_trade_counts[lane] for lane in lanes)
         each_fold_trade_floor_met = all(
-            len(fold["completed_trade_close_utc"]) >= int(_generation.policy["min_completed_trades_per_fold"])
+            len(fold[_generation.exit_observed_time_field]) >= int(_generation.policy["min_completed_trades_per_fold"])
             for lane in lanes for fold in _folds_for_lane(entry["folds"], lane, _generation)
         )
         bootstrap_tier = bootstrap["tier_evidence"][tier]
         raw_p = max(float(stat["attempt_aware_dsr_p_value"]) for stat in lane_stats)
         conservative_lcb_values = [
-            stat["dependence_robust_lcb_daily_log_growth"] for stat in lane_stats
+            stat[_generation.utility_metric_name("dependence_robust_lcb_daily_log_growth")] for stat in lane_stats
         ]
         conservative_lcb = (
             min(float(value) for value in conservative_lcb_values)
@@ -4524,38 +4769,38 @@ def _candidate_statistics(
             "NONPOSITIVE_MEAN": bool(
                 _generation.policy["overall_mean_must_be_positive"]
             )
-            and float(base_lane["mean_daily_log_growth"]) <= 0.0,
+            and float(base_lane[_generation.utility_metric_name("mean_daily_log_growth")]) <= 0.0,
             "NONPOSITIVE_WORST_FOLD": bool(
-                _generation.policy["worst_fold_log_growth_must_be_positive"]
+                _generation.policy[_generation.utility_metric_name("worst_fold_log_growth_must_be_positive")]
             )
-            and float(base_lane["worst_fold_mean_daily_log_growth"]) <= 0.0,
+            and float(base_lane[_generation.utility_metric_name("worst_fold_mean_daily_log_growth")]) <= 0.0,
             "NONPOSITIVE_NEWEST_FOLD": bool(
-                _generation.policy["newest_fold_log_growth_must_be_positive"]
+                _generation.policy[_generation.utility_metric_name("newest_fold_log_growth_must_be_positive")]
             )
-            and float(base_lane["newest_fold_mean_daily_log_growth"]) <= 0.0,
+            and float(base_lane[_generation.utility_metric_name("newest_fold_mean_daily_log_growth")]) <= 0.0,
             "LADDER_LANE_NONPOSITIVE_MEAN": bool(
                 _generation.policy["ladder_lane_mean_must_be_positive"]
             )
             and any(
-                float(stat["mean_daily_log_growth"]) <= 0.0
+                float(stat[_generation.utility_metric_name("mean_daily_log_growth")]) <= 0.0
                 for stat in stressed_stats
             ),
             "LADDER_LANE_NONPOSITIVE_WORST_FOLD": bool(
                 _generation.policy[
-                    "ladder_lane_worst_fold_log_growth_must_be_positive"
+                    _generation.utility_metric_name("ladder_lane_worst_fold_log_growth_must_be_positive")
                 ]
             )
             and any(
-                float(stat["worst_fold_mean_daily_log_growth"]) <= 0.0
+                float(stat[_generation.utility_metric_name("worst_fold_mean_daily_log_growth")]) <= 0.0
                 for stat in stressed_stats
             ),
             "LADDER_LANE_NONPOSITIVE_NEWEST_FOLD": bool(
                 _generation.policy[
-                    "ladder_lane_newest_fold_log_growth_must_be_positive"
+                    _generation.utility_metric_name("ladder_lane_newest_fold_log_growth_must_be_positive")
                 ]
             )
             and any(
-                float(stat["newest_fold_mean_daily_log_growth"]) <= 0.0
+                float(stat[_generation.utility_metric_name("newest_fold_mean_daily_log_growth")]) <= 0.0
                 for stat in stressed_stats
             ),
             "MOVING_BLOCK_BOOTSTRAP_INSUFFICIENT_EVIDENCE": bootstrap_tier[
@@ -4590,7 +4835,7 @@ def _candidate_statistics(
                 "tier_effective_counts"
             ][tier],
             "completed_trade_required_effective_count": required_trades,
-            _PRIMARY_UTILITY_FIELD: conservative_lcb,
+            _generation.primary_utility_field: conservative_lcb,
         }
         if tier_statistics[tier]["admissible"] and (
             type(conservative_lcb) is not float or not math.isfinite(conservative_lcb)
@@ -4629,15 +4874,15 @@ def _raw_pair_inference(
     lane_statistics: dict[str, dict[str, float]] = {}
     for lane, field in _generation.lane_fields.items():
         pair_holding_days = [
-            max(_derived_holding_days(left_fold), _derived_holding_days(right_fold))
+            max(_derived_holding_days(left_fold, _generation=_generation), _derived_holding_days(right_fold, _generation=_generation))
             for left_fold, right_fold in zip(
                 _folds_for_lane(left_folds, lane, _generation),
                 _folds_for_lane(right_folds, lane, _generation), strict=True)
         ]
         differences = [
             [
-                _daily_log_growth_from_r(float(left_value), _generation=_generation)
-                - _daily_log_growth_from_r(float(right_value), _generation=_generation)
+                _daily_primary_utility_from_r(float(left_value), _generation=_generation)
+                - _daily_primary_utility_from_r(float(right_value), _generation=_generation)
                 for left_value, right_value in zip(
                     left_fold[field], right_fold[field], strict=True
                 )
@@ -4663,7 +4908,7 @@ def _raw_pair_inference(
             2.0 * min(float(left_inference["p"]), float(right_inference["p"])),
         )
         lane_statistics[lane] = {
-            "paired_mean_difference_daily_log_growth": float(
+            _generation.utility_metric_name("paired_mean_difference_daily_log_growth"): float(
                 left_inference["mean"]
             ),
             "paired_hac_effective_days": min(
@@ -4679,7 +4924,7 @@ def _raw_pair_inference(
             "raw_two_sided_difference_p": two_sided,
         }
     return {
-        "primary_cell_risk_fraction": PRIMARY_CELL_RISK_FRACTION,
+        **({} if _generation.independent_signal_r_enabled else {"primary_cell_risk_fraction": PRIMARY_CELL_RISK_FRACTION}),
         "lane_statistics": lane_statistics,
     }
 
@@ -4695,10 +4940,10 @@ def _tier_primary_utility_better(
     _generation: _ContractGeneration = ARCHIVED_GENERATION,
 ) -> bool:
     declared_fields = tuple(_generation.policy["selection_dominance_fields"])
-    if declared_fields != (_PRIMARY_UTILITY_FIELD,):
+    if declared_fields != (_generation.primary_utility_field,):
         raise _ContractError("PRIMARY_SELECTION_DIMENSION_POLICY_MISMATCH")
-    left_value = left["tier_statistics"][tier].get(_PRIMARY_UTILITY_FIELD)
-    right_value = right["tier_statistics"][tier].get(_PRIMARY_UTILITY_FIELD)
+    left_value = left["tier_statistics"][tier].get(_generation.primary_utility_field)
+    right_value = right["tier_statistics"][tier].get(_generation.primary_utility_field)
     if (
         type(left_value) is not float
         or type(right_value) is not float
@@ -4890,7 +5135,7 @@ def _pair_operation_diagnostic(
         per_direction = max(
             _dependence_operation_count(
                 [len(fold[field]) for fold in entries[candidate["ordinal"]]["folds"]],
-                [_derived_holding_days(fold) for fold in _folds_for_lane(entries[candidate["ordinal"]]["folds"], lane, _generation)],
+                [_derived_holding_days(fold, _generation=_generation) for fold in _folds_for_lane(entries[candidate["ordinal"]]["folds"], lane, _generation)],
             )
             for candidate in (candidates[:1] if _generation.archived else candidates)
             for lane, field in _generation.lane_fields.items()
@@ -5465,7 +5710,7 @@ def _evaluate_body(
     marginal = {
         "contract_version": _generation.marginal_version,
         "cell_id": cell[0],
-        "p_value_contract_sha256": PINNED_BOOK_P_VALUE_CONTRACT_SHA256 if _generation.archived else CURRENT_BOOK_P_VALUE_CONTRACT_SHA256,
+        "p_value_contract_sha256": _generation.book_p_value_contract_sha256,
         "process_sha256": reporting["process_sha256"],
         "evidence_candidate_id": reporting["process_candidate_id"],
         "source_evidence_sha256": evidence_sha,
@@ -5660,6 +5905,11 @@ def pinned_policy_snapshot() -> dict[str, Any]:
 
 
 __all__ = [
+    "V19_GENERATION", "V19_SELECTION_POLICY", "V19_SELECTION_POLICY_SHA256",
+    "V19_BOOK_P_VALUE_CONTRACT_SHA256", "V19_SELECTION_ADDENDUM_CONTRACT",
+    "V19_SELECTION_ADDENDUM_CONTRACT_SHA256", "INDEPENDENT_SIGNAL_RISK_UNIT_CONTRACT_SHA256",
+    "build_independent_signal_risk_unit_contract", "winner_generation_for_selection_version",
+    "create_winner_selection_request_v19",
     "V16_GENERATION", "V16_TRANSPORT_ENVELOPE", "WinnerTransportEnvelope",
     "MAX_SUPPORTED_WINNER_REQUEST_BYTES", "winner_generation_for_precommitment", "winner_request_byte_limit",
     "check_completed_trade_transport_count", "create_winner_selection_request_v16",

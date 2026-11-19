@@ -2326,6 +2326,8 @@ def _declared_observed_cell_executor(context, *, process, transport_edition):
             historical.DECLARED_WINNER_TRANSPORT_V16}:
         _fail("DECLARED_SLOT_TRANSPORT_EDITION_INVALID")
     search_planner.frozen_search_execution_edition(context, process)
+    if search_planner.source_edition_info(process).independent_signal_r_enabled:
+        return search_execution.execute_independent_r_historical_observed_cell
     if search_planner.is_route_a_full_panel_process(process):
         return search_execution.execute_route_a_full_panel_historical_observed_cell
     return (search_execution.execute_transport_historical_observed_cell
@@ -2337,6 +2339,7 @@ class _UnitNumericPreparation:
     """Detached calculations for one symbol/timeframe worker, never a source grant."""
     def __init__(self):
         self._frames = {}
+        self._strategy_surfaces = {}
         self._closed = False
 
     def __enter__(self):
@@ -2347,6 +2350,7 @@ class _UnitNumericPreparation:
 
     def close(self):
         self._frames.clear()
+        self._strategy_surfaces.clear()
         self._closed = True
 
     def prepare(self, key, frame, compute, *, source_columns=()):
@@ -2369,6 +2373,31 @@ class _UnitNumericPreparation:
             result[name] = values[name].copy(deep=True)
         if tags is not None:
             result.attrs[pm_core.FeatureComputer._PRECOMPUTED_ATTR] = copy.deepcopy(tags)
+        return result
+
+    def prepare_strategy_surface(self, key, strategy, before, frame, compute):
+        if key is None or before is None or self._closed:
+            return compute()
+        cached = self._strategy_surfaces.get(key)
+        if cached is not None and cached[0] == before:
+            strategy.__dict__.clear()
+            strategy.__dict__.update(copy.deepcopy(cached[1]))
+            features = frame.copy(deep=True)
+            for name in cached[2].columns:
+                features[name] = cached[2][name].copy(deep=True)
+            features = features.loc[:, cached[5]]
+            features.attrs = copy.deepcopy(cached[4])
+            return search_execution._FullPrefixStrategySurface(features,
+                cached[3].copy(deep=True), cached[6])
+        result = compute()
+        after = search_execution._route_a_plain_strategy_state(strategy)
+        if after is not None:
+            columns = [name for name in result.features if name not in frame.columns]
+            generated = result.features.loc[:, columns].copy(deep=True)
+            generated.attrs = {}
+            self._strategy_surfaces[key] = (copy.deepcopy(before), after, generated,
+                result.raw_signals.copy(deep=True), copy.deepcopy(result.features.attrs),
+                list(result.features.columns), result._content_sha256)
         return result
 
 

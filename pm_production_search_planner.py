@@ -68,6 +68,10 @@ PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v2"
 ROUTE_A_FULL_PANEL_PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v3"
 ROUTE_A_FULL_PANEL_EXECUTION_EDITION: Final = "fxpm.route-a-full-planned-owner-execution.v1"
 PROCESS_SEMANTICS_SCHEMA: Final = "fxpm.production-search-process-semantics.v2"
+INDEPENDENT_R_SOURCE_EDITION: Final = "fxpm.independent-signal-modeled-r-source.v1"
+INDEPENDENT_R_PROCESS_SCHEMA: Final = "fxpm.production-search-process-precommit.v5"
+INDEPENDENT_R_EXECUTION_EDITION: Final = "fxpm.independent-signal-modeled-r-execution.v1"
+INDEPENDENT_R_PROCESS_SEMANTICS_SCHEMA: Final = "fxpm.production-search-process-semantics.v4"
 DOMAIN_SCHEMA: Final = "fxpm.production-strategy-domain.v3"
 ATTEMPT_POLICY_SCHEMA: Final = "fxpm.production-attempt-design-policy.v2"
 PROCESS_SPOOL_SYMBOL: Final = "__PRODUCTION_SEARCH_PROCESS__"
@@ -655,6 +659,8 @@ def _process_source_generation():
         _canonical_bytes(causal.pinned_process_policy()),
         PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA,
         ROUTE_A_FULL_PANEL_EXECUTION_EDITION, PROCESS_SEMANTICS_SCHEMA,
+        INDEPENDENT_R_PROCESS_SCHEMA, INDEPENDENT_R_EXECUTION_EDITION,
+        INDEPENDENT_R_PROCESS_SEMANTICS_SCHEMA, selection.V19_GENERATION.policy_sha256,
         ATTEMPT_POLICY_SCHEMA, book.CURRENT_PINNED_WINNER_SELECTION_CONTRACT_VERSION,
         search_execution.MAX_ATTEMPTS, ATTEMPT_COUNT, BASELINE_ATTEMPTS,
         VARIANT_ATTEMPTS, GROUPED_PARAMETER_DESIGN_SEED,
@@ -672,7 +678,7 @@ def _expected_process_body(
     schema_version: str = PROCESS_SCHEMA,
 ) -> dict[str, Any]:
     run_id = _identity(run_id, "RUN_ID_INVALID")
-    if schema_version not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA):
+    if schema_version not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA, INDEPENDENT_R_PROCESS_SCHEMA):
         _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
     state = _PROCESS_VERIFICATION_STATE.get()
     if state is None:
@@ -700,7 +706,7 @@ def _derive_expected_process_body(
     )
     if observed.context_sha256 != context.context_sha256:
         _fail("GENERATION_CONTEXT_CHANGED")
-    if schema_version not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA}:
+    if schema_version not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA, INDEPENDENT_R_PROCESS_SCHEMA}:
         _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
     noise_metadata = noise101_process_metadata() if schema_version == NOISE101_PROCESS_SCHEMA else None
     domains = _strategy_domains() if noise_metadata is None else None
@@ -708,6 +714,18 @@ def _derive_expected_process_body(
     if schema_version == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA:
         import pm_winner_selection as selection
         semantics["attempt_policy"]["winner_contract_version"] = selection.V17_GENERATION.selection_version
+    if schema_version == INDEPENDENT_R_PROCESS_SCHEMA:
+        import pm_winner_selection as selection
+        semantics["schema_version"] = INDEPENDENT_R_PROCESS_SEMANTICS_SCHEMA
+        semantics["attempt_policy"]["winner_contract_version"] = selection.V19_GENERATION.selection_version
+        semantics["trade_method"] = {
+            "method_edition": "fxpm.independent-signal-modeled-r.v1",
+            "entry_regime": "CONFIRMED_PREVIOUS_BAR_AT_ENTRY_OPEN",
+            "daily_attribution": "RECORDED_EXIT_BAR_OPEN_UTC_DAY",
+            "open_at_window_end": "EXCLUDED",
+            "unresolved_at_window_end": "RIGHT_CENSORED_NO_MARK_TO_MARKET",
+            "account_replay": "SEPARATE_EXISTING_PORTFOLIO_AND_MARK_OPEN",
+            "cost_model": "SPREAD_PLUS_SWAP", "commission": "NOT_MODELED"}
     body = {
         "schema_version": schema_version,
         "authority_scope": "FROZEN_SEARCH_PROCESS_ONLY",
@@ -737,15 +755,19 @@ def _derive_expected_process_body(
         body.update(noise_metadata)
         body["process_semantics_sha256"] = _sha(semantics)
         body["authority_scope"] = "SOFTWARE_SEARCH_DESCRIPTION_ONLY_UNQUALIFIED"
-    if schema_version in (ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA):
-        body["execution_edition"] = (NOISE101_EXECUTION_EDITION if noise_metadata is not None else ROUTE_A_FULL_PANEL_EXECUTION_EDITION)
+    if schema_version in (ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA, INDEPENDENT_R_PROCESS_SCHEMA):
+        body["execution_edition"] = {ROUTE_A_FULL_PANEL_PROCESS_SCHEMA: ROUTE_A_FULL_PANEL_EXECUTION_EDITION,
+            NOISE101_PROCESS_SCHEMA: NOISE101_EXECUTION_EDITION,
+            INDEPENDENT_R_PROCESS_SCHEMA: INDEPENDENT_R_EXECUTION_EDITION}[schema_version]
         import pm_winner_selection as selection
-        generation = selection.V18_GENERATION if noise_metadata is not None else selection.V17_GENERATION
+        generation = {ROUTE_A_FULL_PANEL_PROCESS_SCHEMA: selection.V17_GENERATION,
+            NOISE101_PROCESS_SCHEMA: selection.V18_GENERATION,
+            INDEPENDENT_R_PROCESS_SCHEMA: selection.V19_GENERATION}[schema_version]
         body["winner_selection_binding"] = {
             "selection_version": generation.selection_version,
             "request_version": generation.request_version,
             "selection_policy_sha256": generation.policy_sha256,
-            "selection_addendum_contract_sha256": selection.V17_SELECTION_ADDENDUM_CONTRACT_SHA256,
+            "selection_addendum_contract_sha256": _sha(generation.selection_addendum_contract),
         }
     return body
 
@@ -884,6 +906,12 @@ def freeze_route_a_full_panel_production_search_process(context: authority_spool
     """Freeze the explicit full-panel edition before creating declared requests."""
     return _freeze_production_search_process(context, run_id=run_id,
         schema_version=ROUTE_A_FULL_PANEL_PROCESS_SCHEMA)
+
+
+def freeze_independent_signal_r_production_search_process(context: authority_spool.GenerationSpoolContext, *, run_id: str) -> FrozenProductionSearchProcess:
+    """Freeze the explicit ordinary 100/300 independent-trade edition."""
+    return _freeze_production_search_process(context, run_id=run_id,
+        schema_version=INDEPENDENT_R_PROCESS_SCHEMA)
 
 
 def frozen_search_execution_edition(context: authority_spool.GenerationSpoolContext,
@@ -2466,7 +2494,7 @@ def _state_authority_for_candidate(candidate_domain_sha256: str):
 def _require_current_process(process: FrozenProductionSearchProcess) -> None:
     if type(process) is not FrozenProductionSearchProcess or process._seal is not _PROCESS_SEAL:
         _fail("PROCESS_OBJECT_INVALID")
-    if process.to_dict().get("schema_version") not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA}:
+    if process.to_dict().get("schema_version") not in {PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, NOISE101_PROCESS_SCHEMA, INDEPENDENT_R_PROCESS_SCHEMA}:
         _fail("RETAINED_PROCESS_IS_READ_ONLY")
     body = process.to_dict()
     if (body["schema_version"] == NOISE101_PROCESS_SCHEMA
@@ -5975,6 +6003,14 @@ class SourceEditionDescriptor:
     state_registry_sha256: str
     source_release_sha256: str
 
+    @property
+    def independent_signal_r_enabled(self) -> bool:
+        return self.edition_id == INDEPENDENT_R_SOURCE_EDITION
+
+    @property
+    def winner_generation(self):
+        return search_execution.winner.winner_generation_for_selection_version(self.winner_generation_id)
+
     def to_dict(self) -> dict[str, Any]:
         return {"edition_id": self.edition_id, "process_schema": self.process_schema,
             "execution_edition": self.execution_edition, "catalogue_schema": self.catalogue_schema,
@@ -6004,15 +6040,18 @@ def is_route_a_full_panel_process(process_or_body) -> bool:
     return ((body.get("schema_version") == ROUTE_A_FULL_PANEL_PROCESS_SCHEMA
              and body.get("execution_edition") == ROUTE_A_FULL_PANEL_EXECUTION_EDITION)
         or (body.get("schema_version") == NOISE101_PROCESS_SCHEMA
-             and body.get("execution_edition") == NOISE101_EXECUTION_EDITION))
+             and body.get("execution_edition") == NOISE101_EXECUTION_EDITION)
+        or (body.get("schema_version") == INDEPENDENT_R_PROCESS_SCHEMA
+             and body.get("execution_edition") == INDEPENDENT_R_EXECUTION_EDITION))
 
 
 def full_panel_generation(process_or_body):
     body = _edition_process_body(process_or_body)
     if not is_route_a_full_panel_process(body):
         return None
-    return (search_execution.winner.V18_GENERATION if body["schema_version"] == NOISE101_PROCESS_SCHEMA
-        else search_execution.winner.V17_GENERATION)
+    return {ROUTE_A_FULL_PANEL_PROCESS_SCHEMA: search_execution.winner.V17_GENERATION,
+        NOISE101_PROCESS_SCHEMA: search_execution.winner.V18_GENERATION,
+        INDEPENDENT_R_PROCESS_SCHEMA: search_execution.winner.V19_GENERATION}[body["schema_version"]]
 
 
 def source_edition_info(process_or_body) -> SourceEditionDescriptor:
@@ -6051,15 +6090,18 @@ def source_edition_info(process_or_body) -> SourceEditionDescriptor:
             "ordered_strategy_ids": tuple(value["ordered_strategy_ids"]),
             "ordered_timeframes": tuple(value["ordered_timeframes"]),
             "domain_roster_sha256_by_timeframe": MappingProxyType({tf: rosters[tf] for tf in TIMEFRAMES})})
-    if schema not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA):
+    if schema not in (PROCESS_SCHEMA, ROUTE_A_FULL_PANEL_PROCESS_SCHEMA, INDEPENDENT_R_PROCESS_SCHEMA):
         _fail("PROCESS_SOURCE_EDITION_UNKNOWN")
     sem = body.get("semantics", {})
     names = tuple(sem.get("registry_order", state_contract.ACTUAL_STRATEGY_NAMES))
     if names != state_contract.ACTUAL_STRATEGY_NAMES:
         _fail("PROCESS_DOMAIN_ROSTER_INVALID")
-    generation = full_panel_generation(body) or search_execution.winner.CURRENT_GENERATION
+    generation = {PROCESS_SCHEMA: search_execution.winner.CURRENT_GENERATION,
+        ROUTE_A_FULL_PANEL_PROCESS_SCHEMA: search_execution.winner.V17_GENERATION,
+        INDEPENDENT_R_PROCESS_SCHEMA: search_execution.winner.V19_GENERATION}[schema]
     roster = sem.get("strategy_domain_roster_sha256", body.get("candidate_domain_sha256", ""))
-    return SourceEditionDescriptor(schema, schema, body.get("execution_edition"), None,
+    return SourceEditionDescriptor(INDEPENDENT_R_SOURCE_EDITION if schema == INDEPENDENT_R_PROCESS_SCHEMA else schema,
+        schema, body.get("execution_edition"), None,
         generation.selection_version, names, TIMEFRAMES, BASELINE_ATTEMPTS,
         VARIANTS_PER_STRATEGY, ATTEMPT_COUNT, body.get("candidate_domain_sha256", ""),
         MappingProxyType({tf: roster for tf in TIMEFRAMES}), body.get("state_contract_registry_sha256", ""),
@@ -6084,7 +6126,8 @@ def _noise101_source_release_roster() -> dict[str, Any]:
         "pm_historical_anchor_orchestration.py", "pm_historical_search_producer.py",
         "pm_strategies.py", "pm_current_refit_parameters.py", "pm_current_refit_artifacts.py",
         "pm_current_refit_execution.py", "pm_current_refit_production.py", "pm_optuna.py",
-        "pm_main.py", "pm_authority_spool.py", "pm_authority_spool_quota.py"})
+        "pm_main.py", "pm_authority_spool.py", "pm_authority_spool_quota.py",
+        "pm_signal_opportunities.py", "pm_trade_power.py", "pm_current_refit_search_producer.py"})
     base = Path(__file__).resolve().parent
     return {"schema_version": NOISE101_SOURCE_RELEASE_SCHEMA,
         "modules": {Path(name).stem: hashlib.sha256((base / name).read_bytes()).hexdigest()
@@ -6426,3 +6469,7 @@ __all__.extend(["SourceEditionDescriptor", "NOISE101_SOURCE_EDITION_ID", "NOISE1
     "freeze_noise101_software_search_description", "freeze_noise101_full_panel_production_search_process",
     "source_edition_context_for_cell", "verify_source_edition_context",
     "noise101_structural_disposition", "resume_noise101_recorded_session_signals"])
+
+__all__.extend(["INDEPENDENT_R_SOURCE_EDITION", "INDEPENDENT_R_PROCESS_SCHEMA",
+    "INDEPENDENT_R_EXECUTION_EDITION", "INDEPENDENT_R_PROCESS_SEMANTICS_SCHEMA",
+    "freeze_independent_signal_r_production_search_process"])

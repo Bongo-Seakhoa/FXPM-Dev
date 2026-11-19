@@ -3309,7 +3309,7 @@ class HistoricalSymbolSearchCapture:
         state_factory = (book.create_matched_floor_historical_process_state_decision
                          if self._winner_generation.matched_floor_enabled
                          else book.create_transport_historical_process_state_decision
-                         if getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
+                         if self._winner_generation.explicit_transport_enabled
                          else book.create_historical_process_state_decision)
         state = state_factory(
             symbol=self.symbol,
@@ -3710,7 +3710,7 @@ class HistoricalSymbolSearchCapture:
         precommitted_evidence_roles = _precommitted_evidence_roles(
             self._horizon_plan_bodies[key], len(normalized_attempts)
         )
-        transport = getattr(self, "_winner_generation", None) is winner_selection.V16_GENERATION
+        transport = self._winner_generation.explicit_transport_enabled
         matched = self._winner_generation.matched_floor_enabled
         freeze = raw_winner.freeze_winner_search_plan_v5 if transport else raw_winner.freeze_winner_search_plan_v4
         if type(self) is DeclaredSlotSearchCapture and (
@@ -3836,6 +3836,7 @@ class HistoricalSymbolSearchCapture:
         attempt_evidence: Iterable[Mapping[str, Any]],
         evidence_access_started_at_utc: str,
         evidence_access_completed_at_utc: str,
+        _independent_array_entries=None,
     ) -> _RawWinnerCellCompletion:
         """Shared production/canary raw completion before any Book projection."""
 
@@ -3911,7 +3912,7 @@ class HistoricalSymbolSearchCapture:
             _fail("RAW_WINNER_NAMESPACE_UNAVAILABLE")
         progress = getattr(self, '_progress_observer', None)
         progress_args = ({'progress': progress}
-            if progress is not None and handle.frozen.selection_generation is winner_selection.V17_GENERATION else {})
+            if progress is not None and "progress" in inspect.signature(produce).parameters else {})
         try:
             production = produce(
                 self.sink,
@@ -3922,6 +3923,8 @@ class HistoricalSymbolSearchCapture:
                 provenance_cross_binding_bytes=handle._cross_binding_bytes,
                 artifact_namespace=self.raw_artifact_namespace,
                 **progress_args,
+                **({"_independent_array_entries": _independent_array_entries}
+                    if handle.frozen.selection_generation.independent_signal_r_enabled else {}),
             )
         except TypeError as exc:
             raise HistoricalProductionAdapterError(
@@ -6791,11 +6794,14 @@ class DeclaredSlotSearchCapture(HistoricalSymbolSearchCapture):
         return body
 
     def complete_observed_cell(self, handle, *, attempt_evidence,
-                               evidence_access_started_at_utc, evidence_access_completed_at_utc):
+                               evidence_access_started_at_utc, evidence_access_completed_at_utc,
+                               _independent_array_entries=None):
         _verify_declared_slot_capture(self)
         completed = self._complete_raw_winner_cell(handle, attempt_evidence=attempt_evidence,
             evidence_access_started_at_utc=evidence_access_started_at_utc,
-            evidence_access_completed_at_utc=evidence_access_completed_at_utc)
+            evidence_access_completed_at_utc=evidence_access_completed_at_utc,
+            **({"_independent_array_entries": _independent_array_entries}
+                if _independent_array_entries is not None else {}))
         status = "OWNER" if completed.production.decision.to_dict().get("winner") is not None else "NO_TRADE"
         self._complete_slot(status=status, reason_code=(completed.production.decision.status if status == "NO_TRADE" else None), handle=handle, completed=completed)
         return completed.production
@@ -6929,7 +6935,7 @@ def _make_declared_slot_capture_authority():
             _fail("WINNER_CAPTURE_GENERATION_INVALID")
         if _winner_generation.matched_floor_enabled:
             if (not planner.is_route_a_full_panel_process(process)
-                    or _winner_generation is not planner.full_panel_generation(process)):
+                    or _winner_generation.selection_version != planner.source_edition_info(process).winner_generation_id):
                 _fail("MATCHED_FLOOR_FROZEN_EXECUTION_EDITION_REQUIRED")
         value = object.__new__(DeclaredSlotSearchCapture)
         value._winner_generation = _winner_generation
@@ -8362,7 +8368,7 @@ def _declared_frozen_selection_complexity(capture, normalized_attempts):
     import pm_production_search_planner as planner
     _verify_declared_slot_capture(capture)
     if (not capture._winner_generation.matched_floor_enabled
-            or capture._winner_generation is not planner.full_panel_generation(capture.process)):
+            or capture._winner_generation.selection_version != planner.source_edition_info(capture.process).winner_generation_id):
         _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
     planner.verify_frozen_production_search_process(capture.context, capture.process)
     return _frozen_selection_complexity_from_process(capture.process.to_dict(), normalized_attempts,
@@ -8398,7 +8404,7 @@ def _verify_declared_matched_floor_chain(context, *, process, producer_request, 
     import pm_production_search_planner as planner
     import pm_authoritative_search_execution as execution
     planner.verify_frozen_production_search_process(context, process)
-    if frozen.selection_generation is not planner.full_panel_generation(process):
+    if frozen.selection_generation.selection_version != planner.source_edition_info(process).winner_generation_id:
         _fail("MATCHED_FLOOR_GENERATION_REQUIRED")
     if frozen_pipeline_config is None:
         _fail("MATCHED_FLOOR_FROZEN_CONFIG_REQUIRED")
@@ -8408,9 +8414,12 @@ def _verify_declared_matched_floor_chain(context, *, process, producer_request, 
     if (expected != frozen.precommitment["selection_complexity_roster"]
             or winner_request.precommitment.to_dict() != frozen.precommitment):
         _fail("MATCHED_FLOOR_PRE_EVIDENCE_COMPLEXITY_SPLICE")
+    bound_fit_metadata = {} if frozen.selection_generation.independent_signal_r_enabled else None
     material = execution._reopen_route_a_matched_source_material(context,
         request=producer_request, process=process, frozen=frozen,
-        frozen_pipeline_config=frozen_pipeline_config, m5_fitted=m5_fitted)
+        frozen_pipeline_config=frozen_pipeline_config, m5_fitted=m5_fitted,
+        **({"_bound_fit_metadata_out": bound_fit_metadata} if bound_fit_metadata is not None else {}))
     raw_winner.verify_matched_floor_publication_chain(context, frozen=frozen,
         request=winner_request, producer_request=producer_request, manifest_entries=tuple(entries.values()),
-        cross_binding=cross, source_material=material)
+        cross_binding=cross, source_material=material,
+        **({"bound_fit_metadata": bound_fit_metadata} if bound_fit_metadata is not None else {}))

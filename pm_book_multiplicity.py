@@ -510,7 +510,15 @@ class _BookGeneration:
 
     @property
     def p_value_contract_sha256(self) -> str:
-        return winner.PINNED_BOOK_P_VALUE_CONTRACT_SHA256 if self.winner_generation.archived else winner.CURRENT_BOOK_P_VALUE_CONTRACT_SHA256
+        return self.winner_generation.book_p_value_contract_sha256
+
+    @property
+    def independent_signal_r_enabled(self) -> bool:
+        return self.winner_generation.independent_signal_r_enabled
+
+    @property
+    def cell_entry_version(self) -> str:
+        return "fxpm.book-multiplicity-cell.v10" if self.independent_signal_r_enabled else "fxpm.book-multiplicity-cell.v9"
 
     @property
     def selection_rule(self) -> str:
@@ -549,8 +557,13 @@ V18_GENERATION: Final = _BookGeneration(
     "fxpm.winner-raw-evidence-production.v8", "fxpm.historical-horizon-winner-cross-binding.v6",
     "fxpm.historical-insufficient-evidence-binding.v6", released=True,
 )
+V19_GENERATION: Final = _BookGeneration(
+    "fxpm.book-multiplicity.v19", winner.V19_GENERATION,
+    "fxpm.winner-raw-evidence-production.v9", "fxpm.historical-horizon-winner-cross-binding.v7",
+    "fxpm.historical-insufficient-evidence-binding.v7", released=True,
+)
 _BOOK_GENERATIONS: Final = (
-    ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION,
+    ARCHIVED_GENERATION, CURRENT_GENERATION, V16_GENERATION, V17_GENERATION, V18_GENERATION, V19_GENERATION,
 )
 CURRENT_PINNED_WINNER_SELECTION_CONTRACT_VERSION: Final = CURRENT_GENERATION.winner_generation.selection_version
 CURRENT_PINNED_WINNER_SELECTION_REQUEST_VERSION: Final = CURRENT_GENERATION.winner_generation.request_version
@@ -573,8 +586,11 @@ def book_generation_for_version(version: Any) -> _BookGeneration:
 
 
 def book_generation_for_winner(winner_generation: Any) -> _BookGeneration:
+    version = getattr(winner_generation, "selection_version", None)
+    if type(version) is not str:
+        raise _BookError("WINNER_GENERATION_INVALID")
     for generation in _BOOK_GENERATIONS:
-        if winner_generation is generation.winner_generation:
+        if version == generation.winner_generation.selection_version:
             return generation
     raise _BookError("WINNER_GENERATION_INVALID")
 
@@ -4277,6 +4293,6 @@ def matched_floor_policy_snapshot(*, winner_generation=None):
     return _policy_snapshot(_generation=_matched_floor_book_generation(winner_generation))
 
 
-__all__.extend(["V17_GENERATION", "V18_GENERATION", "book_generation_for_version", "book_generation_for_winner",
+__all__.extend(["V17_GENERATION", "V18_GENERATION", "V19_GENERATION", "book_generation_for_version", "book_generation_for_winner",
     "book_generation_for_insufficient_schema", "create_matched_floor_historical_process_state_decision",
     "evaluate_matched_floor_historical_book_multiplicity", "matched_floor_policy_snapshot"])

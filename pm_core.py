@@ -9479,6 +9479,7 @@ class Backtester:
         timeframe: str = "",
         spread_tier: Optional[FrozenSpreadTier] = None,
         entry_spread_observations: Optional[pd.Series] = None,
+        _prepared_inputs_out: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build a non-trading, partition-local source/cost provenance probe.
 
@@ -9544,6 +9545,11 @@ class Backtester:
                 "input_provenance_authenticated": False,
                 "qualification_authority": False,
             }
+        if _prepared_inputs_out is not None:
+            _prepared_inputs_out.update(entry_half_spread=entry_half_spread,
+                intrabar_half_spread=intrabar_half_spread,
+                admission_states=_states if spread_tier is not None else None,
+                source_probe=result)
         return result
 
     @staticmethod

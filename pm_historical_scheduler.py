@@ -271,6 +271,11 @@ def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dic
     if type(contract) is not dict:
         _fail("DECLARED_SCHEDULER_CONTRACT_INVALID")
     owned = _declared_json_copy(contract)
+    import pm_production_search_planner as planner
+    edition = owned.get("execution_edition")
+    if edition is not None and edition not in {planner.ROUTE_A_FULL_PANEL_EXECUTION_EDITION,
+            planner.INDEPENDENT_R_EXECUTION_EDITION}:
+        _fail("DECLARED_SCHEDULER_EXECUTION_EDITION_INVALID")
     if (owned.get("schema_version") != DECLARED_SCHEDULER_SCHEMA
             or not all(_declared_digest(owned.get(k)) for k in ("native_universe_sha256", "config_sha256", "profile_sha256"))
             or type(owned.get("active_config_path")) is not str
@@ -282,6 +287,10 @@ def _declared_contract(contract: Mapping[str, Any]) -> tuple[dict[str, Any], dic
     native_outputs = []
     runs: set[str] = set()
     for index, row in enumerate(owned["cells"]):
+        if edition is not None and type(row) is dict:
+            if row.get("execution_edition", edition) != edition:
+                _fail("DECLARED_SCHEDULER_EXECUTION_EDITION_CHANGED", index)
+            row["execution_edition"] = edition
         if (type(row) is not dict or type(row.get("root")) is not str or not row["root"]
                 or type(row.get("run_id")) is not str or not row["run_id"]
                 or type(row.get("cell")) is not dict
@@ -371,7 +380,8 @@ def _declared_verified_one_period(process, parent):
     import pm_production_search_planner as planner
     import pm_historical_anchor_orchestration as orchestration
     return (type(process) is planner.FrozenProductionSearchProcess
-        and process.to_dict().get('schema_version') == planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA
+        and process.to_dict().get('schema_version') in {planner.ROUTE_A_FULL_PANEL_PROCESS_SCHEMA,
+            planner.INDEPENDENT_R_PROCESS_SCHEMA}
         and parent.get('schema_version') in {orchestration.DECLARED_SLOT_PRECOMMIT_SCHEMA_V2,
             orchestration.DECLARED_M5_SLOT_PRECOMMIT_SCHEMA}
         and parent.get('period_selection', {}).get('mode') == 'one_period'
@@ -658,7 +668,12 @@ def _declared_initial_process(context, row, *, development):
             expected_receipt_sha256=entries[0]["descriptor"]["sha256"])
         if process.to_dict().get("run_id") != row["run_id"]:
             _fail("DECLARED_SCHEDULER_PROCESS_RECORD_INVALID")
+        if (row.get("execution_edition") is not None
+                and planner.source_edition_info(process).execution_edition != row["execution_edition"]):
+            _fail("DECLARED_SCHEDULER_EXECUTION_EDITION_CHANGED")
         return process
+    if row.get("execution_edition") == planner.INDEPENDENT_R_EXECUTION_EDITION:
+        return planner.freeze_independent_signal_r_production_search_process(context, run_id=row["run_id"])
     route_a = development or _declared_ordinary_row_selection(row) is not None
     return (planner.freeze_route_a_full_panel_production_search_process if route_a
         else planner.freeze_production_search_process)(context, run_id=row["run_id"])

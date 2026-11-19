@@ -33,6 +33,8 @@ NUMERICAL_EXECUTION_COST_ATTESTATION_VERSION = "fxpm-numerical-execution-cost-v3
 REQUIRED_SWAP_ACCRUAL_CONTRACT = "causal_swap_accrual_v1"
 REQUIRED_SWAP_PROJECTION_CONTRACT = "fxpm-swap-preopen-close-projection-v1"
 REQUIRED_TRADE_RECORD_SCHEMA = "2026-07-14-position-events-v2"
+INDEPENDENT_TRADE_RECORD_SCHEMA = "fxpm.independent-signal-power-event.v1"
+INDEPENDENT_TRADE_SOURCE_SCHEMA = "fxpm.independent-signal-power-source.v1"
 _NORMAL = NormalDist()
 _PRODUCTION_PARTITIONS = {
     "optimizer_train",
@@ -694,6 +696,28 @@ def _validate_trade_evidence_source_contract(
             "trade evidence source contract is not a mapping",
             ("SOURCE_CONTRACT_INVALID",),
         )
+    if value.get("schema_version") == INDEPENDENT_TRADE_SOURCE_SCHEMA:
+        keys = {"schema_version", "selection_generation", "method_edition", "cost_model", "commission",
+            "account_compounding", "source_contract"}
+        if (set(value) != keys or value["selection_generation"] != "fxpm.winner-selection.v19"
+                or value["method_edition"] != "fxpm.independent-signal-modeled-r.v1"
+                or value["cost_model"] != "SPREAD_PLUS_SWAP" or value["commission"] != "NOT_MODELED"
+                or value["account_compounding"] is not False
+                or not isinstance(value["source_contract"], Mapping)
+                or value["source_contract"].get("schema_version") != TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION):
+            return None, "independent trade source contract is invalid", ("SOURCE_CONTRACT_SCHEMA_INVALID",)
+        base, reason, codes = _validate_trade_evidence_source_contract(value["source_contract"])
+        if base is None:
+            return None, reason, codes
+        stable = {key: value[key] for key in keys - {"source_contract"}}
+        stable["source_contract_sha256"] = base.source_contract_sha256
+        stable_sha = _sha256_json(stable)
+        partition_sha = _sha256_json({"schema_version": INDEPENDENT_TRADE_SOURCE_SCHEMA,
+            "source_contract_sha256": stable_sha,
+            "partition_source_contract_sha256": base.partition_source_contract_sha256})
+        return replace(base, source_contract_sha256=stable_sha,
+            partition_source_contract_sha256=partition_sha, trade_record_schema_version=INDEPENDENT_TRADE_RECORD_SCHEMA,
+            execution_state_compounding=False, schema_version=INDEPENDENT_TRADE_SOURCE_SCHEMA), "", ()
     if str(value.get("schema_version") or "") != (
         TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
     ):
@@ -988,7 +1012,7 @@ def _unavailable_trade_sample(
         "source_contract": (
             source_contract.to_dict() if source_contract is not None else None
         ),
-        "net_r_contract": "strict_post_cost_pnl_dollars_divided_by_entry_risk_v1",
+        "net_r_contract": _net_r_contract_for_source(source_contract),
         "dependence_evidence": dependence_payload,
     }
     return TradeSampleEvidence(
@@ -1013,6 +1037,7 @@ def _unavailable_trade_sample(
         sample_sha256=trade_sample_identity_sha256(identity_payload),
         source_contract=source_contract,
         dependence_evidence=dependence_payload,
+        net_r_contract=_net_r_contract_for_source(source_contract),
     )
 
 
@@ -1282,6 +1307,7 @@ def build_trade_sample_evidence(
             source_contract=source,
         )
     raw_count = len(rows)
+    independent = source.schema_version == INDEPENDENT_TRADE_SOURCE_SCHEMA
     if raw_count == 0:
         return _unavailable_trade_sample(
             outcome_kind=SearchOutcomeKind.EXPECTED_INELIGIBLE,
@@ -1307,9 +1333,7 @@ def build_trade_sample_evidence(
                 minimum_observations_required=minimum,
                 source_contract=source,
             )
-        if str(trade.get("trade_record_schema_version") or "") != (
-            REQUIRED_TRADE_RECORD_SCHEMA
-        ):
+        if str(trade.get("trade_record_schema_version") or "") != source.trade_record_schema_version:
             return _unavailable_trade_sample(
                 outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
                 reason=f"trade record {index} has a stale or missing schema",
@@ -1320,10 +1344,11 @@ def build_trade_sample_evidence(
             )
         try:
             pnl = _finite_trade_number(
-                trade.get("pnl_dollars"), field_name="pnl_dollars"
+                trade.get("modeled_net_r" if independent else "pnl_dollars"),
+                field_name="modeled_net_r" if independent else "pnl_dollars"
             )
             risk = _finite_trade_number(
-                trade.get("risk_amount"), field_name="risk_amount"
+                1.0 if independent else trade.get("risk_amount"), field_name="risk_amount"
             )
             if risk <= 0.0:
                 raise ValueError("risk_amount must be positive")
@@ -1331,12 +1356,14 @@ def build_trade_sample_evidence(
             if not math.isfinite(net_r):
                 raise ValueError("derived net R is not finite")
             entry = _utc_interval_timestamp(
-                trade.get("entry_time"), field_name="entry_time"
+                trade.get("entry_open_utc" if independent else "entry_time"), field_name="entry_time"
             )
             exit_ = _utc_interval_timestamp(
-                trade.get("exit_time"), field_name="exit_time"
+                trade.get("exit_observed_at_utc" if independent else "exit_time"), field_name="exit_time"
             )
-            position_id = str(trade.get("position_id") or "").strip()
+            position_id = str(trade.get("opportunity_id" if independent else "position_id") or "").strip()
+            if independent and (not position_id.startswith("iso:") or not _is_sha256(position_id[4:])):
+                raise ValueError("opportunity_id is invalid")
             entry_order = trade.get("entry_event_order")
             exit_order = trade.get("exit_event_order")
             if not position_id or len(position_id) > 256:
@@ -1349,13 +1376,8 @@ def build_trade_sample_evidence(
             exit_key = (pd.Timestamp(exit_), exit_order)
             if exit_key <= entry_key:
                 raise ValueError("exit event does not follow entry event")
-            order_key = (
-                exit_key[0],
-                exit_key[1],
-                entry_key[0],
-                entry_key[1],
-                position_id,
-            )
+            order_key = ((entry_key[0], entry_key[1], exit_key[0], exit_key[1], position_id)
+                if independent else (exit_key[0], exit_key[1], entry_key[0], entry_key[1], position_id))
             if prior_order_key is not None and order_key <= prior_order_key:
                 raise ValueError("trade records are not in canonical event order")
             prior_order_key = order_key
@@ -1477,7 +1499,7 @@ def build_trade_sample_evidence(
         "event_start_utc": event_start,
         "event_end_utc": event_end,
         "source_contract": source.to_dict(),
-        "net_r_contract": "strict_post_cost_pnl_dollars_divided_by_entry_risk_v1",
+        "net_r_contract": _net_r_contract_for_source(source),
         "dependence_evidence": dependence_payload,
     }
     return TradeSampleEvidence(
@@ -1502,6 +1524,7 @@ def build_trade_sample_evidence(
         sample_sha256=trade_sample_identity_sha256(identity_payload),
         source_contract=source,
         dependence_evidence=dependence_payload,
+        net_r_contract=_net_r_contract_for_source(source),
     )
 
 
@@ -1616,9 +1639,7 @@ def calibrate_train_trade_power(
         )
     if pd.Timestamp(sample.event_start_utc) < pd.Timestamp(
         partition_receipt["start_utc"]
-    ) or pd.Timestamp(sample.event_end_utc) >= pd.Timestamp(
-        partition_receipt["end_utc"]
-    ):
+    ) or _sample_ends_outside_partition(sample, partition_receipt["end_utc"]):
         return TradePowerDecision(
             status="INFRA_FAILURE",
             outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
@@ -1833,8 +1854,10 @@ def evaluate_trade_power_partition(
         or not _is_sha256(
             frozen_requirement.calibration_partition_source_contract_sha256
         )
-        or frozen_requirement.source_contract_schema_version
-        != TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION
+        or (frozen_requirement.source_contract_schema_version,
+            frozen_requirement.trade_record_schema_version) not in {
+                (TRADE_EVIDENCE_SOURCE_CONTRACT_VERSION, REQUIRED_TRADE_RECORD_SCHEMA),
+                (INDEPENDENT_TRADE_SOURCE_SCHEMA, INDEPENDENT_TRADE_RECORD_SCHEMA)}
         or not _is_sha256(frozen_requirement.target_bars_sha256)
         or not _is_sha256(frozen_requirement.target_sidecar_sha256)
         or not _is_sha256(frozen_requirement.financing_schedule_sha256)
@@ -1846,8 +1869,6 @@ def evaluate_trade_power_partition(
         )
         or frozen_requirement.swap_accrual_contract_version
         != REQUIRED_SWAP_ACCRUAL_CONTRACT
-        or frozen_requirement.trade_record_schema_version
-        != REQUIRED_TRADE_RECORD_SCHEMA
         or frozen_requirement.policy_schema_version != TRADE_POWER_SCHEMA_VERSION
         or frozen_requirement.pilot_dispersion_method != "max_mad_sample_std_r"
         or not _is_sha256(frozen_requirement.attempt_ledger_payload_sha256)
@@ -2002,7 +2023,7 @@ def evaluate_trade_power_partition(
         )
     if pd.Timestamp(sample.event_start_utc) < pd.Timestamp(
         current_receipt["start_utc"]
-    ) or pd.Timestamp(sample.event_end_utc) >= pd.Timestamp(current_receipt["end_utc"]):
+    ) or _sample_ends_outside_partition(sample, current_receipt["end_utc"]):
         return TradePowerDecision(
             status="INFRA_FAILURE",
             outcome_kind=SearchOutcomeKind.INFRA_FAILURE,
@@ -2097,3 +2118,30 @@ __all__ = [
     "trade_power_decision_sha256",
     "trade_power_requirement_sha256",
 ]
+
+
+
+def build_independent_trade_power_source_contract(source_contract):
+    """Bind independent-R semantics to the unchanged authenticated pricing inputs."""
+    return {"schema_version": INDEPENDENT_TRADE_SOURCE_SCHEMA,
+        "selection_generation": "fxpm.winner-selection.v19", "method_edition": "fxpm.independent-signal-modeled-r.v1",
+        "cost_model": "SPREAD_PLUS_SWAP", "commission": "NOT_MODELED", "account_compounding": False,
+        "source_contract": json.loads(json.dumps(source_contract, allow_nan=False))}
+
+
+def _sample_ends_outside_partition(sample, end):
+    observed, boundary = pd.Timestamp(sample.event_end_utc), pd.Timestamp(end)
+    if sample.source_contract is not None and sample.source_contract.schema_version == INDEPENDENT_TRADE_SOURCE_SCHEMA:
+        return observed > boundary
+    return observed >= boundary
+
+
+__all__.extend(["INDEPENDENT_TRADE_RECORD_SCHEMA", "INDEPENDENT_TRADE_SOURCE_SCHEMA",
+    "build_independent_trade_power_source_contract"])
+
+
+
+def _net_r_contract_for_source(source):
+    if source is not None and source.schema_version == INDEPENDENT_TRADE_SOURCE_SCHEMA:
+        return "independent_modeled_net_r_per_initial_stop_risk_v1"
+    return "strict_post_cost_pnl_dollars_divided_by_entry_risk_v1"

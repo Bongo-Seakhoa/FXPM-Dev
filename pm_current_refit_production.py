@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -527,6 +527,7 @@ def _build_physical_current_refit_ledger_payload(
             _fail("PHYSICAL_LEDGER_ARTIFACT_DESCRIPTOR_INVALID")
         descriptors[artifact_id] = dict(raw)
 
+    book_generation = book.book_generation_for_version(book_body.get("contract_version"))
     selected = _selected_book_cells(book_body)
     refit_slots = [
         "|".join(
@@ -605,7 +606,7 @@ def _build_physical_current_refit_ledger_payload(
         entry = _manifest_artifact_json(
             artifact_root,
             entry_descriptor,
-            expected_format_version=_RAW_FORMATS[ART_BOOK_ENTRY],
+            expected_format_version=book_generation.cell_entry_version,
         )
         if (
             trial_descriptor.get("semantic_sha256")
@@ -819,7 +820,8 @@ def _assert_pipeline_format_contract() -> None:
         ART_RECIPE: pipeline.CURRENT_REFIT_RECIPE_VERSION,
         ART_BOOK_ENTRY: pipeline.CURRENT_REFIT_BOOK_ENTRY_VERSION,
     }
-    if observed != _RAW_FORMATS:
+    if (observed != _RAW_FORMATS
+            or pipeline.INDEPENDENT_SIGNAL_REFIT_BOOK_ENTRY_VERSION != book.V19_GENERATION.cell_entry_version):
         _fail("CURRENT_REFIT_RAW_FORMAT_CONTRACT_DRIFT")
 
 
@@ -859,7 +861,7 @@ def _semantic_and_version(
         _fail("CAPTURE_ARTIFACT_SEMANTIC_SHA_INVALID", artifact_type)
     version = _RAW_FORMATS.get(artifact_type)
     if version is None:
-        version = str(body.get("schema_version") or "")
+        version = str(body.get("schema_version") or body.get("contract_version") or "")
     if not version:
         _fail("CAPTURE_ARTIFACT_SCHEMA_MISSING", artifact_type)
     return semantic, version
@@ -920,7 +922,16 @@ def _verified_artifacts(
     )
     if missing:
         _fail("CAPTURE_ARTIFACT_TYPES_MISSING", *missing)
-    return tuple(captured[key] for key in sorted(captured))
+    # The captured Book already carries its version; bind every cell descriptor once.
+    current_books = [item for item in captured.values() if item.artifact_type == ART_CURRENT_BOOK]
+    if len(current_books) != 1:
+        _fail("CAPTURE_CURRENT_BOOK_CARDINALITY_INVALID")
+    try:
+        book_generation = book.book_generation_for_version(current_books[0].format_version)
+    except ValueError as exc:
+        raise CurrentRefitProductionCaptureError("CAPTURE_CURRENT_BOOK_VERSION_INVALID") from exc
+    return tuple(replace(captured[key], format_version=book_generation.cell_entry_version)
+        if captured[key].artifact_type == ART_BOOK_ENTRY else captured[key] for key in sorted(captured))
 
 
 def _one_type(
