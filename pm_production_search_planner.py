@@ -720,7 +720,7 @@ def _derive_expected_process_body(
         semantics["attempt_policy"]["winner_contract_version"] = selection.V19_GENERATION.selection_version
         semantics["trade_method"] = {
             "method_edition": "fxpm.independent-signal-modeled-r.v1",
-            "entry_regime": "CONFIRMED_PREVIOUS_BAR_AT_ENTRY_OPEN",
+            "entry_regime": "REGIME_LIVE_AT_CLOSED_SIGNAL_BAR",
             "daily_attribution": "RECORDED_EXIT_BAR_OPEN_UTC_DAY",
             "open_at_window_end": "EXCLUDED",
             "unresolved_at_window_end": "RIGHT_CENSORED_NO_MARK_TO_MARKET",

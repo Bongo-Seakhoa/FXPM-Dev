@@ -83,6 +83,8 @@ def test_fresh_process_binds_canonical_winner_addendum(tmp_path, freezer, schema
 
     body = process.to_dict()
     assert body["schema_version"] == schema
+    if freezer is None:
+        assert body["semantics"]["trade_method"]["entry_regime"] == "REGIME_LIVE_AT_CLOSED_SIGNAL_BAR"
     assert planner.source_edition_info(process).winner_generation_id == generation.selection_version
     assert body["winner_selection_binding"]["selection_addendum_contract_sha256"] == addendum_sha256
     assert winner._sha256_json(dict(generation.selection_addendum_contract)) == addendum_sha256

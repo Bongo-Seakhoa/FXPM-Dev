@@ -246,14 +246,18 @@ def test_production_and_cold_replay_apply_entry_live_cell_regime_after_shared_su
     case, capture = _producer_case(monkeypatch, mixed=True)
     body = capture({})
     fold = body["folds"][0]
-    episodes = opportunities.independent_entry_episodes(case["frame"], symbol=case["spec"].symbol,
-        timeframe="H1", cutoff_utc=case["frame"]["_BAR_CLOSE_TS"].iloc[-1])
+    frame = case["frame"]
+    expected_clock = [(1, 2), (3, 4)]
     for lane in fold["lanes"].values():
         records = lane["batch"]["records"]
-        assert [row["signal_bar"] for row in records] == [0, 2, 4]
-        assert all(row["entry_regime"] == "TREND" for row in records)
-        assert all(case["frame"]["REGIME_LIVE"].iloc[row["entry_bar"]] == "TREND" for row in records)
-        assert all(row["episode_id"] == episodes.iloc[row["entry_bar"]] for row in records)
+        assert [(row["signal_bar"], row["entry_bar"]) for row in records] == expected_clock
+        for row, (signal, entry) in zip(records, expected_clock, strict=True):
+            assert frame["REGIME_LIVE"].iat[signal] == "TREND"
+            assert frame["REGIME"].iat[signal] == "RANGE"
+            assert row["signal_regime"] == row["entry_regime"] == "TREND"
+            entry_open = frame.index[entry].isoformat().replace("+00:00", "Z")
+            assert row["entry_open_utc"] == entry_open
+            assert row["episode_id"] == f"{case['spec'].symbol}/H1/TREND/{entry_open}"
     facts = {"index":fold["independent_signal_r_indexes"]["final_lockbox"],
         "batches":{tier:fold["lanes"]["final_lockbox_"+tier.lower()]["batch"] for tier in ("P75","P95")}}
     geometry = facts["index"]["partition_geometry"]

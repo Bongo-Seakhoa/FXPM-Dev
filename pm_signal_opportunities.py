@@ -220,9 +220,10 @@ def _stops(strategy: Any, features: pd.DataFrame, bar: int, direction: int,
 
 
 def independent_entry_episodes(features, *, symbol, timeframe, cutoff_utc):
-    """Name known live-label runs on the full causal prefix before partition slicing."""
-    if "REGIME" not in features:
-        raise OpportunityLabelError("CONFIRMED_REGIME_REQUIRED")
+    """Name full-prefix episodes by the live label on the signal that precedes each entry."""
+    if "REGIME_LIVE" not in features:
+        raise OpportunityLabelError("REGIME_LIVE_REQUIRED")
+    labels = features["REGIME_LIVE"]
     opens = _axis(features.index, "OPEN_AXIS_INVALID")
     closes = _axis(features["_BAR_CLOSE_TS"], "CLOSE_AXIS_INVALID")
     cap = _utc(cutoff_utc, "CUTOFF_UTC_INVALID")
@@ -231,7 +232,7 @@ def independent_entry_episodes(features, *, symbol, timeframe, cutoff_utc):
     values = [None] * len(features)
     previous, identifier = None, None
     for entry in range(1, min(observed, visible + 1)):
-        label = features["REGIME"].iat[entry - 1]
+        label = labels.iat[entry - 1]
         label = label if isinstance(label, str) and label in _REGIMES else None
         if label is None:
             previous, identifier = None, None
@@ -245,8 +246,6 @@ def independent_entry_episodes(features, *, symbol, timeframe, cutoff_utc):
 def _independent_inputs(features, *, strategy, spec, symbol, timeframe, opens, closes,
         visible, observed, selected, signals, open_values, entry_spreads, admission,
         cutoff, pricing, episode_ids):
-    if "REGIME" not in features:
-        raise OpportunityLabelError("CONFIRMED_REGIME_REQUIRED")
     if episode_ids is None:
         episode_ids = independent_entry_episodes(features, symbol=symbol,
             timeframe=timeframe, cutoff_utc=cutoff)
@@ -452,8 +451,7 @@ def label_signal_opportunities(
     for bar in selected:
         direction = int(signals[bar])
         entry = bar + 1
-        signal_regime = features["REGIME_LIVE"].iat[bar]
-        raw_regime = signal_regime if independent is None else features["REGIME"].iat[bar]
+        raw_regime = features["REGIME_LIVE"].iat[bar]
         raw_regime = raw_regime if isinstance(raw_regime, str) else None
         regime = raw_regime if raw_regime in _REGIMES else None
         unknown_regimes += int(regime is None)
@@ -474,7 +472,7 @@ def label_signal_opportunities(
             entry_regime=regime, regime_status="AVAILABLE" if regime else "UNAVAILABLE",
             raw_regime=raw_regime, stop_loss_pips=stop_pips, take_profit_pips=target_pips)
         if independent is not None:
-            common.update(eligible=bool(eligible), signal_regime=signal_regime if isinstance(signal_regime, str) else None,
+            common.update(eligible=bool(eligible), signal_regime=raw_regime,
                 episode_id=independent["episodes"].iat[entry] if eligible else None,
                 eligibility_reason=None if eligible else ("NO_NEXT_OBSERVATION" if entry >= observed_opens
                     else "ENTRY_ADMISSION_" + state if state != "ADMIT" else "STRATEGY_SESSION_REFUSED"))

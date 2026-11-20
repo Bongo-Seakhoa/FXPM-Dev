@@ -3170,9 +3170,9 @@ def _independent_r_surface_sha(surface):
 
 
 def _independent_r_cell_signals(features, raw_signals, regime):
-    if regime not in book.REGIME_ORDER or "REGIME" not in features:
+    if regime not in book.REGIME_ORDER or "REGIME_LIVE" not in features:
         _fail("INDEPENDENT_R_CELL_REGIME_INVALID")
-    return raw_signals.where(features["REGIME"].eq(regime), 0).astype(np.int32)
+    return raw_signals.where(features["REGIME_LIVE"].eq(regime), 0).astype(np.int32)
 
 
 def _independent_r_geometry_inputs(prepared, features, *, timeframe, warmup_bars):

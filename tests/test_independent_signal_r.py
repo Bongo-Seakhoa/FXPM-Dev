@@ -1,5 +1,6 @@
 """Invented independent-R economic oracles; no market programme or qualification."""
 from dataclasses import replace
+from types import SimpleNamespace
 import json
 from types import SimpleNamespace
 
@@ -22,9 +23,6 @@ def _evaluate(frame, values, *, strategy=None, spec=None, pricing=None, **kwargs
     strategy = strategy or FixedStops()
     spec = spec or _spec()
     pricing = pricing or Backtester(_config())
-    if "REGIME" not in frame:
-        frame = frame.copy(deep=True)
-        frame["REGIME"] = "TREND"
     arguments = dict(strategy=strategy, spec=spec, symbol=spec.symbol, timeframe="H1",
         cutoff_utc=frame["_BAR_CLOSE_TS"].iloc[-1], pricing=pricing,
         entry_half_spreads=np.full(len(frame), spec.get_half_spread_price()),
@@ -86,22 +84,32 @@ def test_independent_r_has_no_balance_or_lot_sizing_dependency():
     assert first.initial_risk_per_unit == second.initial_risk_per_unit
 
 
-def test_independent_r_uses_entry_live_label_and_censors_unfinished_bar():
+def test_independent_r_uses_closed_signal_live_label_and_censors_unfinished_bar():
     frame = _frame()
     frame["REGIME"] = ["RANGE", "TREND", "BREAKOUT", "CHOP", "CHOP", "CHOP"]
     frame["REGIME_LIVE"] = ["CHOP", "RANGE", "TREND", "BREAKOUT", "CHOP", "CHOP"]
     frame.loc[frame.index[1:], ["High", "Low", "Close"]] = np.nan
-    batch = _evaluate(frame, [1, 1, 1, 1, 1, 1], cutoff_utc=frame.index[1] + pd.Timedelta(minutes=30))
+    stop_inputs = []
+    strategy = FixedStops()
+
+    def build_trade_intent(_features, *, regime, bar_index, **_):
+        stop_inputs.append((regime, bar_index))
+        return SimpleNamespace(stop_loss_pips=4., take_profit_pips=6.)
+
+    strategy.build_trade_intent = build_trade_intent
+    batch = _evaluate(frame, [1, 1, 1, 1, 1, 1], strategy=strategy,
+        cutoff_utc=frame.index[1] + pd.Timedelta(minutes=30))
     record = batch.records[0]
-    assert record.entry_regime == "RANGE" and record.signal_regime == "CHOP"
+    assert record.entry_regime == record.signal_regime == "CHOP"
+    assert stop_inputs == [("CHOP", 0)]
     assert record.status == "RIGHT_CENSORED" and record.entry_bar == 1
     assert record.exit_price is None and record.modeled_net_r is None
-    assert batch.episode_diagnostics["RANGE"]["resolved_episode_count"] == 0
+    assert batch.episode_diagnostics["CHOP"]["resolved_episode_count"] == 0
 
 
 def test_independent_r_episodes_precede_slicing_and_unresolved_share_is_explicit():
     frame = _frame(count=8)
-    frame["REGIME"] = ["TREND", "TREND", "TREND", "RANGE", "RANGE", "TREND", "TREND", "TREND"]
+    frame["REGIME_LIVE"] = ["TREND", "TREND", "TREND", "RANGE", "RANGE", "TREND", "TREND", "TREND"]
     frame.loc[frame.index[2], "High"] = 1.001
     episodes = opportunities.independent_entry_episodes(frame, symbol="SYNTHETIC", timeframe="H1",
         cutoff_utc=frame["_BAR_CLOSE_TS"].iloc[-1])
