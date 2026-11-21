@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import errno
 import hashlib
 import itertools
@@ -16,7 +16,7 @@ import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, Iterator, Mapping, Optional
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional
 
 import pm_authority_spool_quota as spool_quota
 
@@ -38,6 +38,27 @@ RETIREMENT_RELATIVE_PATH = spool_quota.GENERATION_TERMINAL_NAME
 RETIREMENT_INTENT_RELATIVE_PATH = "generation-retirement.intent.json"
 RETIREMENT_COMPLETE_RELATIVE_PATH = "generation-archived.json"
 WORKSPACE_OWNER_SCHEMA = "fxpm.owned-generation-workspace.v1"
+UNIT_WORKSPACE_OWNER_SCHEMA = "fxpm.owned-symbol-timeframe-generation-workspace.v1"
+UNIT_WRITER_WORKSPACE_OWNER_SCHEMA = "fxpm.owned-symbol-timeframe-writer-workspace.v1"
+_UNIT_WORKSPACE_OWNER_SCHEMAS = (UNIT_WORKSPACE_OWNER_SCHEMA, UNIT_WRITER_WORKSPACE_OWNER_SCHEMA)
+UNIT_WRITER_PRECOMMIT_PATH = "unit-writer-precommit.json"
+UNIT_WRITER_PRECOMMIT_SCHEMA = "fxpm.invented-historical-unit-writer-precommit.v1"
+_UNIT_WRITER_DISPATCH_LOCK = "declared-scheduler.lock"
+UNIT_COMPLETION_FENCE_SCHEMA = "fxpm.historical-unit-ledger-terminal-fence.v1"
+UNIT_RETIREMENT_SCHEMA = "fxpm.completed-symbol-timeframe-generation-retirement.v1"
+UNIT_LEDGER_RECEIPT_PATH = "ledger-receipt.json"
+UNIT_LEDGER_PENDING_PATH = "ledger-pending.json"
+UNIT_LEDGER_PUBLICATION_INTENT_PATH = "ledger-publication-intent.json"
+_UNIT_LEDGER_PUBLICATION_INTENT_SCHEMA = "fxpm.historical-exec-cohort-publication-intent.v1"
+UNIT_PROJECTION_PIN_SCHEMA = "fxpm.historical-exec-cohort-projection-pin.v1"
+_UNIT_LEDGER_RECEIPT_V1 = "fxpm.historical-unit-ledger-receipt.v1"
+_UNIT_LEDGER_RECEIPT_V2 = "fxpm.historical-unit-ledger-receipt.v2"
+_UNIT_COHORT_RECEIPT_V2 = "fxpm.historical-exec-cohort-receipt.v2"
+_UNIT_LEDGER_FORMAT_BY_RECEIPT = {
+    _UNIT_LEDGER_RECEIPT_V1: "fxpm-historical-unit-ledger-jsonl-v1",
+    _UNIT_LEDGER_RECEIPT_V2: "fxpm-historical-unit-ledger-jsonl-v2",
+    _UNIT_COHORT_RECEIPT_V2: "fxpm-historical-exec-cohort-jsonl-v2",
+}
 RETIREMENT_SCHEMA = "fxpm.completed-generation-retirement.v1"
 RETIREMENT_SCHEMA_V2 = "fxpm.completed-generation-retirement.v2"
 RETIREMENT_SEGMENT_SCHEMA = "fxpm.completed-generation-retirement-segment.v1"
@@ -809,12 +830,13 @@ def _write_streamed_object(
     *,
     format_name: str,
     admitted_descriptors: Optional[set[tuple[str, str, int, str]]] = None,
+    _before_link: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     _validate_format(format_name)
     _assert_context_current(context)
     if context.writable is not True:
         _fail("GENERATION_CONTEXT_READ_ONLY")
-    if _PUBLICATION_BATCHES:
+    if _before_link is None and _PUBLICATION_BATCHES:
         scope = _PUBLICATION_BATCHES.get(_publication_batch_key(context))
         if scope is not None:
             payload, chunks = _buffer_small_payload(
@@ -923,6 +945,15 @@ def _write_streamed_object(
                 relative_path = _content_relative_path(
                     content_hash, format_name
                 )
+                artifact = {
+                    "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
+                    "relative_path": relative_path,
+                    "sha256": content_hash,
+                    "size_bytes": total,
+                    "format": format_name,
+                }
+                if _before_link is not None:
+                    _before_link(dict(artifact))
                 target = _local_path(context.root, relative_path)
                 new_unique_bytes = 0
                 if admitted_descriptors is not None and (
@@ -961,13 +992,7 @@ def _write_streamed_object(
                         "TEMPORARY_FILE_CLEANUP_FAILED"
                     ) from exc
                 lease.commit(new_unique_bytes)
-                return {
-                    "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
-                    "relative_path": relative_path,
-                    "sha256": content_hash,
-                    "size_bytes": total,
-                    "format": format_name,
-                }
+                return artifact
             except BaseException:
                 _cancel_clean_reservation(
                     lease,
@@ -1233,6 +1258,28 @@ def _rollback_owned_bootstrap(root: Path, root_identity: list[int], created: lis
     return True
 
 
+def _unit_cell_roots(root: Path, cell_roots: Mapping[str, Path | str]) -> dict[str, str]:
+    if not isinstance(cell_roots, Mapping) or not cell_roots or not root.is_absolute():
+        _fail("UNIT_WORKSPACE_CONSUMER_ROSTER_INVALID")
+    _reject_reparse_chain(root)
+    unit_root = root.resolve()
+    roots = {}
+    for cell_id, value in cell_roots.items():
+        if not _is_sha256(cell_id) or not isinstance(value, (str, Path)):
+            _fail("UNIT_WORKSPACE_CONSUMER_ROSTER_INVALID")
+        cell_root = Path(value)
+        if not cell_root.is_absolute():
+            _fail("UNIT_WORKSPACE_CONSUMER_ROSTER_INVALID")
+        _reject_reparse_chain(cell_root)
+        cell_root = cell_root.resolve()
+        if cell_root.is_relative_to(unit_root) or unit_root.is_relative_to(cell_root):
+            _fail("UNIT_WORKSPACE_CELL_ROOT_OVERLAP")
+        roots[cell_id] = str(cell_root)
+    if len(set(map(Path, roots.values()))) != len(roots):
+        _fail("UNIT_WORKSPACE_CONSUMER_ROSTER_INVALID")
+    return roots
+
+
 def freeze_generation_context(
     root: Path,
     *,
@@ -1241,15 +1288,36 @@ def freeze_generation_context(
     config_sha256: str,
     limits: Optional[SpoolLimits] = None,
     owned_workspace: Optional[Mapping[str, Any]] = None,
+    unit_consumer_roots: Optional[Mapping[str, Path | str]] = None,
+    unit_retained_projection_refs: tuple[str, ...] = (),
+    unit_writer_binding_sha256: Optional[str] = None,
 ) -> GenerationSpoolContext:
     """Create or byte-identically reopen a generation context before workers."""
 
+    unit_owner = (type(owned_workspace) is dict
+        and set(owned_workspace) == {"unit_id", "unit_contract_sha256"})
+    unit_writer = unit_writer_binding_sha256 is not None
+    if unit_writer and (not unit_owner or not _is_sha256(unit_writer_binding_sha256)):
+        _fail("UNIT_WRITER_WORKSPACE_BINDING_INVALID")
+    unit_roots = None
+    if unit_owner:
+        unit_roots = _unit_cell_roots(Path(root), unit_consumer_roots)
+        if unit_writer:
+            unit_parent = Path(root).resolve().parent
+            if any(Path(value).parent != unit_parent for value in unit_roots.values()):
+                _fail("UNIT_WRITER_WORKSPACE_SIBLINGS_REQUIRED")
+        if (type(unit_retained_projection_refs) is not tuple
+                or any(not _is_sha256(value) for value in unit_retained_projection_refs)
+                or len(set(unit_retained_projection_refs)) != len(unit_retained_projection_refs)):
+            _fail("UNIT_WORKSPACE_RETAINED_REFERENCE_INVALID")
+    elif unit_consumer_roots is not None or unit_retained_projection_refs:
+        _fail("WORKSPACE_OWNER_DECLARATION_INVALID")
     safe_root = _validate_root(Path(root), create=True)
     workspace = None
     workspace_root_identity = None
     if owned_workspace is not None:
         if (type(owned_workspace) is not dict
-                or set(owned_workspace) != {"cell_id", "cell_contract_sha256"}
+                or (not unit_owner and set(owned_workspace) != {"cell_id", "cell_contract_sha256"})
                 or not all(_is_sha256(value) for value in owned_workspace.values())):
             _fail("WORKSPACE_OWNER_DECLARATION_INVALID")
         workspace = dict(owned_workspace)
@@ -1284,11 +1352,18 @@ def freeze_generation_context(
             if any(safe_root.iterdir()):
                 _fail("WORKSPACE_ROOT_NOT_EMPTY")
             owner_payload = {
-                "schema_version": WORKSPACE_OWNER_SCHEMA, "generation_id": generation,
+                "schema_version": UNIT_WORKSPACE_OWNER_SCHEMA if unit_owner else WORKSPACE_OWNER_SCHEMA,
+                "generation_id": generation,
                 "generation_context_sha256": bootstrap.context_sha256,
                 "creation_provenance": "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION", **workspace,
                 "root": str(safe_root), "root_identity": workspace_root_identity,
             }
+            if unit_owner:
+                owner_payload.update(consumer_cell_roots=unit_roots,
+                    retained_projection_refs=list(unit_retained_projection_refs))
+            if unit_writer:
+                owner_payload.update(schema_version=UNIT_WRITER_WORKSPACE_OWNER_SCHEMA,
+                    unit_writer_binding_sha256=unit_writer_binding_sha256)
             created, temporary_identity = [], None
             root_owner = {"root": str(safe_root), "root_identity": workspace_root_identity}
             try:
@@ -1418,13 +1493,16 @@ def write_opaque_artifact(
     chunks: Iterable[bytes],
     *,
     format: str,
+    _before_link: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Persist every byte from an opaque stream without sampling or truncation."""
 
     format_name = _validate_format(format)
     if format_name == CANONICAL_JSON_FORMAT:
         _fail("OPAQUE_FORMAT_COLLIDES_WITH_CANONICAL_JSON")
-    return _write_streamed_object(context, chunks, format_name=format_name)
+    if _before_link is None:
+        return _write_streamed_object(context, chunks, format_name=format_name)
+    return _write_streamed_object(context, chunks, format_name=format_name, _before_link=_before_link)
 
 
 @contextmanager
@@ -2003,9 +2081,36 @@ def _retirement_publish(root: Path, relative: str, body: dict, maximum: int,
             temporary.unlink()
 
 
+def _validate_unit_workspace_owner(root: Path, body: dict, *, context_sha256: str, generation_id: str) -> None:
+    fields = {"schema_version", "generation_id", "generation_context_sha256", "creation_provenance",
+        "unit_id", "unit_contract_sha256", "root", "root_identity", "consumer_cell_roots",
+        "retained_projection_refs"}
+    typed_writer = body.get("schema_version") == UNIT_WRITER_WORKSPACE_OWNER_SCHEMA
+    if typed_writer:
+        fields.add("unit_writer_binding_sha256")
+    if (set(body) != fields or body["schema_version"] not in _UNIT_WORKSPACE_OWNER_SCHEMAS
+            or body["generation_id"] != generation_id or body["generation_context_sha256"] != context_sha256
+            or body["creation_provenance"] != "ABSENT_OR_EMPTY_BEFORE_CONTEXT_CREATION"
+            or not _is_sha256(body["unit_id"]) or not _is_sha256(body["unit_contract_sha256"])):
+        _fail("UNIT_WORKSPACE_OWNER_RECORD_INVALID")
+    refs = body["retained_projection_refs"]
+    if (type(refs) is not list or any(not _is_sha256(value) for value in refs)
+            or len(set(refs)) != len(refs)
+            or _unit_cell_roots(root, body["consumer_cell_roots"]) != body["consumer_cell_roots"]):
+        _fail("UNIT_WORKSPACE_OWNER_RECORD_INVALID")
+    if typed_writer and (not _is_sha256(body["unit_writer_binding_sha256"])
+            or any(Path(value).parent != root.parent for value in body["consumer_cell_roots"].values())):
+        _fail("UNIT_WRITER_WORKSPACE_BINDING_INVALID")
+    _assert_retirement_root(root, body["root_identity"], declared_root=body["root"])
+
+
 def read_owned_generation_workspace(context: GenerationSpoolContext) -> tuple[dict, str]:
     _assert_context_current(context)
     body, digest = _retirement_control(context.root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+    if body.get("schema_version") in _UNIT_WORKSPACE_OWNER_SCHEMAS:
+        _validate_unit_workspace_owner(context.root, body, context_sha256=context.context_sha256,
+            generation_id=context.generation_id)
+        return body, digest
     if (set(body) != {"schema_version", "generation_id", "generation_context_sha256", "creation_provenance",
             "cell_id", "cell_contract_sha256", "root", "root_identity"} or body["schema_version"] != WORKSPACE_OWNER_SCHEMA
             or body["generation_id"] != context.generation_id
@@ -2017,10 +2122,256 @@ def read_owned_generation_workspace(context: GenerationSpoolContext) -> tuple[di
     return body, digest
 
 
+def require_unit_owner(context: GenerationSpoolContext, *, unit_id: str, unit_contract_sha256: str,
+        cell_roots: Mapping[str, Path | str], _generic_write: bool = False) -> tuple[dict, str]:
+    """Bind a unit writer to its exact declared consumer roots."""
+    owner, owner_sha256 = read_owned_generation_workspace(context)
+    if (owner["schema_version"] not in _UNIT_WORKSPACE_OWNER_SCHEMAS
+            or owner["unit_id"] != unit_id or owner["unit_contract_sha256"] != unit_contract_sha256
+            or owner["consumer_cell_roots"] != _unit_cell_roots(context.root, cell_roots)):
+        _fail("UNIT_WORKSPACE_OWNER_BINDING_INVALID")
+    if _generic_write and owner["schema_version"] == UNIT_WRITER_WORKSPACE_OWNER_SCHEMA:
+        _fail("UNIT_TYPED_WRITER_REQUIRED")
+    return owner, owner_sha256
+
+
 def _retirement_external(path: Path, maximum: int) -> tuple[dict, str]:
     if not path.is_absolute():
         _fail("RETIREMENT_EXTERNAL_PATH_INVALID")
     return _retirement_control(_validate_root(path.parent, create=False), path.name, maximum)
+
+
+def _unit_terminal_path(path: Path, root: Path, owner: dict) -> Path:
+    path = Path(path)
+    if not path.is_absolute():
+        _fail("RETIREMENT_EXTERNAL_PATH_INVALID")
+    _reject_reparse_chain(path)
+    path = path.resolve()
+    for working_root in (root, *map(Path, owner["consumer_cell_roots"].values())):
+        if path.is_relative_to(working_root) or working_root.is_relative_to(path):
+            _fail("RETIREMENT_RETAINED_PATH_OVERLAP")
+    return path
+
+
+def _unit_ledger_record(root: Path, owner: dict, owner_sha256: str, maximum: int) -> dict:
+    receipt, receipt_sha256 = _retirement_control(root, UNIT_LEDGER_RECEIPT_PATH, maximum)
+    receipt_schema = receipt.get("schema_version")
+    cohort = receipt_schema == _UNIT_COHORT_RECEIPT_V2
+    identity = receipt.get("identity") if cohort else receipt
+    expected = {"unit_id": owner["unit_id"], "unit_contract_sha256": owner["unit_contract_sha256"],
+        "workspace_owner_sha256": owner_sha256, "generation_context_sha256": owner["generation_context_sha256"]}
+    if (type(receipt_schema) is not str or receipt_schema not in _UNIT_LEDGER_FORMAT_BY_RECEIPT
+            or type(identity) is not dict or any(identity.get(key) != value for key, value in expected.items())
+            or not _is_sha256(identity.get("ledger_sha256"))):
+        _fail("UNIT_LEDGER_RECEIPT_BINDING_INVALID")
+    descriptor = _validate_descriptor(receipt.get("descriptor"), content_addressed=True)
+    if descriptor["format"] != _UNIT_LEDGER_FORMAT_BY_RECEIPT[receipt_schema]:
+        _fail("UNIT_LEDGER_RECEIPT_BINDING_INVALID")
+    if _safe_regular_file(root, descriptor["relative_path"]).stat().st_size != descriptor["size_bytes"]:
+        _fail("UNIT_LEDGER_DESCRIPTOR_CHANGED")
+    record = {"descriptor": descriptor, "ledger_sha256": identity["ledger_sha256"], "receipt_sha256": receipt_sha256}
+    if receipt_schema != _UNIT_LEDGER_RECEIPT_V1:
+        record["receipt_schema"] = receipt_schema
+    if cohort:
+        if (set(identity) != {*expected, "ledger_sha256", "authority_scope", "max_rows",
+                "max_bytes", "expected_roster_sha256"}
+                or identity["authority_scope"] != "INVENTED_SOFTWARE_ONLY"
+                or not _is_sha256(identity["expected_roster_sha256"])
+                or type(identity["max_rows"]) is not int or identity["max_rows"] <= 0
+                or type(identity["max_bytes"]) is not int or identity["max_bytes"] < descriptor["size_bytes"]):
+            _fail("UNIT_LEDGER_RECEIPT_BINDING_INVALID")
+        pending, pending_sha256 = _retirement_control(root, UNIT_LEDGER_PENDING_PATH, maximum)
+        intent, intent_sha256 = _retirement_control(root, UNIT_LEDGER_PUBLICATION_INTENT_PATH, maximum)
+        if pending != receipt or pending_sha256 != receipt_sha256 or intent != {
+                "schema_version": _UNIT_LEDGER_PUBLICATION_INTENT_SCHEMA, "identity": identity}:
+            _fail("UNIT_LEDGER_PUBLICATION_CONTROLS_CHANGED")
+        record.update(pending_receipt_sha256=pending_sha256, publication_intent_sha256=intent_sha256)
+    return record
+
+
+def _unit_projection_pin_path(cell_id: str) -> str:
+    return f"ledger-projection-{cell_id}.json"
+
+
+def publish_unit_projection_pin(context: GenerationSpoolContext, *, cell_id: str,
+        projection_sha256: str, ledger_sha256: str, receipt_sha256: str) -> dict:
+    """Persist an additive retained dependency for one actual projected cell."""
+    owner, owner_sha = read_owned_generation_workspace(context)
+    if (owner["schema_version"] not in _UNIT_WORKSPACE_OWNER_SCHEMAS or not _is_sha256(cell_id)
+            or cell_id not in owner["consumer_cell_roots"] or not _is_sha256(projection_sha256)):
+        _fail("UNIT_PROJECTION_PIN_BINDING_INVALID")
+    ledger = _unit_ledger_record(context.root, owner, owner_sha, context.limits.max_json_bytes)
+    if (ledger.get("receipt_schema") != _UNIT_COHORT_RECEIPT_V2
+            or ledger_sha256 != ledger["ledger_sha256"] or receipt_sha256 != ledger["receipt_sha256"]):
+        _fail("UNIT_PROJECTION_PIN_BINDING_INVALID")
+    body = {"schema_version": UNIT_PROJECTION_PIN_SCHEMA, "workspace_owner_sha256": owner_sha,
+        "generation_context_sha256": context.context_sha256,
+        "unit_id": owner["unit_id"], "unit_contract_sha256": owner["unit_contract_sha256"],
+        "cell_id": cell_id, "projection_sha256": projection_sha256,
+        "ledger_sha256": ledger_sha256, "receipt_sha256": receipt_sha256}
+    return _publish_exact_json(context, _unit_projection_pin_path(cell_id), body, MAX_CONTEXT_BYTES)
+
+
+def _refuse_unit_projection_pins(root: Path, owner: dict) -> None:
+    for cell_id in owner["consumer_cell_roots"]:
+        path = _local_path(root, _unit_projection_pin_path(cell_id))
+        if path.exists() or path.is_symlink():
+            _fail("UNIT_RETIREMENT_RETAINED_REFERENCE_UNRESOLVED")
+
+
+def _unit_ledger_control_paths(ledger: dict) -> set[str]:
+    if ledger.get("receipt_schema") == _UNIT_COHORT_RECEIPT_V2:
+        return {UNIT_LEDGER_RECEIPT_PATH, UNIT_LEDGER_PENDING_PATH, UNIT_LEDGER_PUBLICATION_INTENT_PATH}
+    return {UNIT_LEDGER_RECEIPT_PATH}
+
+
+def _verify_unit_terminal_consumers(root: Path, owner: dict, references: Mapping[str, Any]) -> None:
+    if not isinstance(references, Mapping) or set(references) != set(owner["consumer_cell_roots"]):
+        _fail("UNIT_RETIREMENT_CONSUMER_FENCE_REQUIRED")
+    for cell_id, relative_root in owner["consumer_cell_roots"].items():
+        reference = references[cell_id]
+        if (type(reference) is not dict or set(reference) != {"path", "sha256"}
+                or type(reference["path"]) is not str or not _is_sha256(reference["sha256"])):
+            _fail("UNIT_RETIREMENT_CONSUMER_FENCE_INVALID")
+        cell_root = _validate_root(Path(relative_root), create=False)
+        cell_owner, cell_owner_sha256 = _retirement_control(cell_root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+        cell_context, cell_context_sha256 = _retirement_control(cell_root, CONTEXT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
+        if (cell_owner.get("schema_version") != WORKSPACE_OWNER_SCHEMA or cell_owner.get("cell_id") != cell_id
+                or cell_owner.get("generation_context_sha256") != cell_context_sha256
+                or cell_owner.get("generation_id") != cell_context.get("generation_id")):
+            _fail("UNIT_RETIREMENT_CONSUMER_OWNER_INVALID")
+        _assert_retirement_root(cell_root, cell_owner["root_identity"], declared_root=cell_owner["root"])
+        fence_path = _unit_terminal_path(Path(reference["path"]), root, owner)
+        if not fence_path.is_file():
+            _fail("UNIT_RETIREMENT_CONSUMER_FENCE_REQUIRED")
+        _retirement_fence(fence_path, reference["sha256"], context_sha256=cell_context_sha256,
+            generation_id=cell_owner["generation_id"], cell_id=cell_id, workspace_sha256=cell_owner_sha256,
+            working_root=cell_root, owner=cell_owner)
+
+
+def _require_unit_writer_precommit(root: Path, owner: dict, owner_sha256: str,
+        expected_sha256: Optional[str], maximum: int) -> None:
+    from datetime import datetime
+    from pm_end_grid import canonical_bytes
+
+    if not _is_sha256(expected_sha256):
+        _fail("UNIT_WRITER_PRECOMMIT_REQUIRED")
+    try:
+        path = _safe_regular_file(root, UNIT_WRITER_PRECOMMIT_PATH)
+        body, digest = _retirement_control(root, UNIT_WRITER_PRECOMMIT_PATH, maximum)
+        if path.lstat().st_nlink != 1:
+            _fail("UNIT_WRITER_PRECOMMIT_CHANGED")
+    except (OSError, AuthoritySpoolError) as exc:
+        raise AuthoritySpoolError("UNIT_WRITER_PRECOMMIT_CHANGED") from exc
+    identity = {"schema_version": UNIT_WRITER_PRECOMMIT_SCHEMA, "authority_scope": "INVENTED_SOFTWARE_ONLY",
+        "workspace_owner_sha256": owner_sha256,
+        "unit_generation_context_sha256": owner["generation_context_sha256"],
+        **{key: owner[key] for key in ("unit_id", "unit_contract_sha256", "unit_writer_binding_sha256")}}
+    if (digest != expected_sha256 or set(body) != {*identity, "binding", "source_access_window_utc", "precommitted_at_utc"}
+            or any(body[key] != value for key, value in identity.items())):
+        _fail("UNIT_WRITER_PRECOMMIT_CHANGED")
+    binding, window = body["binding"], body["source_access_window_utc"]
+    if (type(binding) is not dict or type(window) is not dict or set(window) != {"start_utc", "end_exclusive_utc"}
+            or binding.get("source_access_window_utc") != window
+            or hashlib.sha256(canonical_bytes(binding)).hexdigest() != owner["unit_writer_binding_sha256"]):
+        _fail("UNIT_WRITER_PRECOMMIT_CHANGED")
+    try:
+        start, issued, end = (datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ") for value in (
+            window["start_utc"], body["precommitted_at_utc"], window["end_exclusive_utc"]))
+    except (TypeError, ValueError) as exc:
+        raise AuthoritySpoolError("UNIT_WRITER_PRECOMMIT_CHANGED") from exc
+    if not start <= issued < end:
+        _fail("UNIT_WRITER_PRECOMMIT_CHANGED")
+
+
+def _require_unit_writer_dispatch_file(root: Path) -> None:
+    try:
+        info = _safe_regular_file(root, _UNIT_WRITER_DISPATCH_LOCK).lstat()
+    except (OSError, AuthoritySpoolError) as exc:
+        raise AuthoritySpoolError("RETIREMENT_UNIT_LOCK_UNVERIFIED") from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_size != 1 or info.st_nlink != 1:
+        _fail("RETIREMENT_UNIT_LOCK_UNVERIFIED")
+
+
+def publish_unit_terminal_fence(context: GenerationSpoolContext, *, fence_path: Path,
+        cell_terminal_fences: Mapping[str, Any], retained_projection_refs: tuple[str, ...] = (),
+        unit_writer_precommit_sha256: Optional[str] = None) -> str:
+    """Publish a terminal unit fence after its frozen cell roster completes."""
+    owner, owner_sha256 = read_owned_generation_workspace(context)
+    if owner["schema_version"] not in _UNIT_WORKSPACE_OWNER_SCHEMAS:
+        _fail("UNIT_WORKSPACE_OWNER_BINDING_INVALID")
+    typed_writer = owner["schema_version"] == UNIT_WRITER_WORKSPACE_OWNER_SCHEMA
+    if typed_writer:
+        _require_unit_writer_dispatch_file(context.root)
+        _require_unit_writer_precommit(context.root, owner, owner_sha256,
+            unit_writer_precommit_sha256, context.limits.max_json_bytes)
+    elif unit_writer_precommit_sha256 is not None:
+        _fail("UNIT_WORKSPACE_OWNER_BINDING_INVALID")
+    if type(retained_projection_refs) is not tuple or retained_projection_refs or owner["retained_projection_refs"]:
+        _fail("UNIT_RETIREMENT_RETAINED_REFERENCE_UNRESOLVED")
+    path = _unit_terminal_path(fence_path, context.root, owner)
+    _verify_unit_terminal_consumers(context.root, owner, cell_terminal_fences)
+    ledger = _unit_ledger_record(context.root, owner, owner_sha256, context.limits.max_json_bytes)
+    if ledger.get("receipt_schema") == _UNIT_COHORT_RECEIPT_V2:
+        _refuse_unit_projection_pins(context.root, owner)
+    elif typed_writer:
+        _fail("UNIT_RETIREMENT_INVENTORY_INVALID")
+    fence = {"schema_version": UNIT_COMPLETION_FENCE_SCHEMA, "workspace_owner_sha256": owner_sha256,
+        "generation_context_sha256": context.context_sha256, "generation_id": context.generation_id,
+        "unit_id": owner["unit_id"], "unit_contract_sha256": owner["unit_contract_sha256"],
+        "cell_terminal_fences": dict(cell_terminal_fences), "ledger": ledger}
+    if typed_writer:
+        fence["unit_writer_precommit_sha256"] = unit_writer_precommit_sha256
+    return _retirement_publish_v2(_validate_root(path.parent, create=False), path.name, fence, MAX_CONTEXT_BYTES)
+
+
+def _retirement_unit_fence(path: Path, expected: str, *, root: Path, owner: dict, owner_sha256: str,
+        ledger_maximum: Optional[int] = None, precommit_maximum: int = MAX_CONTEXT_BYTES) -> dict:
+    if owner["retained_projection_refs"]:
+        _fail("UNIT_RETIREMENT_RETAINED_REFERENCE_UNRESOLVED")
+    path = _unit_terminal_path(path, root, owner)
+    if not path.is_file():
+        _fail("UNIT_RETIREMENT_FENCE_REQUIRED")
+    body, digest = _retirement_external(path, MAX_CONTEXT_BYTES)
+    identity = {"schema_version": UNIT_COMPLETION_FENCE_SCHEMA, "workspace_owner_sha256": owner_sha256,
+        **{key: owner[key] for key in ("generation_context_sha256", "generation_id", "unit_id", "unit_contract_sha256")}}
+    typed_writer = owner["schema_version"] == UNIT_WRITER_WORKSPACE_OWNER_SCHEMA
+    fields = {*identity, "cell_terminal_fences", "ledger"}
+    if typed_writer:
+        fields.add("unit_writer_precommit_sha256")
+    if (digest != expected or set(body) != fields
+            or any(body[key] != value for key, value in identity.items())):
+        _fail("UNIT_RETIREMENT_FENCE_INVALID")
+    if typed_writer:
+        _require_unit_writer_dispatch_file(root)
+        _require_unit_writer_precommit(root, owner, owner_sha256, body["unit_writer_precommit_sha256"], precommit_maximum)
+    ledger = body["ledger"]
+    if type(ledger) is not dict:
+        _fail("UNIT_RETIREMENT_FENCE_INVALID")
+    receipt_schema = ledger.get("receipt_schema", _UNIT_LEDGER_RECEIPT_V1)
+    if typed_writer and receipt_schema != _UNIT_COHORT_RECEIPT_V2:
+        _fail("UNIT_RETIREMENT_INVENTORY_INVALID")
+    ledger_fields = {"descriptor", "ledger_sha256", "receipt_sha256"}
+    if receipt_schema in (_UNIT_LEDGER_RECEIPT_V2, _UNIT_COHORT_RECEIPT_V2):
+        ledger_fields.add("receipt_schema")
+    if receipt_schema == _UNIT_COHORT_RECEIPT_V2:
+        ledger_fields.update(("pending_receipt_sha256", "publication_intent_sha256"))
+    if (type(receipt_schema) is not str or receipt_schema not in _UNIT_LEDGER_FORMAT_BY_RECEIPT
+            or set(ledger) != ledger_fields
+            or not _is_sha256(ledger["ledger_sha256"]) or not _is_sha256(ledger["receipt_sha256"])):
+        _fail("UNIT_RETIREMENT_FENCE_INVALID")
+    descriptor = _validate_descriptor(ledger["descriptor"], content_addressed=True)
+    if descriptor["format"] != _UNIT_LEDGER_FORMAT_BY_RECEIPT[receipt_schema]:
+        _fail("UNIT_RETIREMENT_FENCE_INVALID")
+    if receipt_schema == _UNIT_COHORT_RECEIPT_V2:
+        if (ledger["pending_receipt_sha256"] != ledger["receipt_sha256"]
+                or not _is_sha256(ledger["publication_intent_sha256"])):
+            _fail("UNIT_RETIREMENT_FENCE_INVALID")
+        _refuse_unit_projection_pins(root, owner)
+    if ledger_maximum is not None and ledger != _unit_ledger_record(root, owner, owner_sha256, ledger_maximum):
+        _fail("UNIT_LEDGER_DESCRIPTOR_CHANGED")
+    _verify_unit_terminal_consumers(root, owner, body["cell_terminal_fences"])
+    return body
 
 
 def _retirement_terminal_refusal_fence(body: dict, *, context_sha256: str, generation_id: str,
@@ -2731,13 +3082,16 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
     except FileNotFoundError:
         return None
     marker, _ = _retirement_control(root, RETIREMENT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
-    marker_fields = {"schema_version", "status", "generation_context_sha256", "generation_id", "cell_id",
+    unit_scope = marker.get("schema_version") == UNIT_RETIREMENT_SCHEMA
+    identity_key = "unit_id" if unit_scope else "cell_id"
+    marker_fields = {"schema_version", "status", "generation_context_sha256", "generation_id", identity_key,
         "intent_sha256", "source_fence_path", "source_fence_sha256", "retirement_receipt_path", "workspace_owner_sha256"}
-    if (set(marker) != marker_fields or marker.get("schema_version") not in {RETIREMENT_SCHEMA, RETIREMENT_SCHEMA_V2}
+    if (set(marker) != marker_fields or marker.get("schema_version") not in {
+            RETIREMENT_SCHEMA, RETIREMENT_SCHEMA_V2, UNIT_RETIREMENT_SCHEMA}
             or marker.get("status") != "RETIRING"
             or not _is_sha256(marker.get("generation_context_sha256"))
             or any(not _is_sha256(marker.get(key)) for key in
-                ("cell_id", "intent_sha256", "source_fence_sha256", "workspace_owner_sha256"))
+                (identity_key, "intent_sha256", "source_fence_sha256", "workspace_owner_sha256"))
             or any(type(marker.get(key)) is not str or not Path(marker[key]).is_absolute()
                 for key in ("source_fence_path", "retirement_receipt_path"))
             or (expected_context_sha256 is not None and marker["generation_context_sha256"] != expected_context_sha256)):
@@ -2747,6 +3101,12 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
     if (context_sha != marker["generation_context_sha256"] or context_body.get("generation_id") != marker["generation_id"]
             or owner_sha != marker["workspace_owner_sha256"]):
         _fail("RETIREMENT_CONTEXT_CHANGED")
+    if unit_scope:
+        _validate_unit_workspace_owner(root, owner, context_sha256=context_sha, generation_id=marker["generation_id"])
+        if owner["unit_id"] != marker["unit_id"]:
+            _fail("RETIREMENT_MARKER_INVALID")
+    elif owner.get("schema_version") in _UNIT_WORKSPACE_OWNER_SCHEMAS:
+        _fail("RETIREMENT_MARKER_INVALID")
     try:
         (root / RETIREMENT_COMPLETE_RELATIVE_PATH).lstat()
     except FileNotFoundError:
@@ -2765,6 +3125,31 @@ def read_generation_retirement(root: Path, *, expected_context_sha256: Optional[
     if (marker["schema_version"] == RETIREMENT_SCHEMA_V2
             and (type(receipt.get("intent_segment_count")) is not int or receipt["intent_segment_count"] < 0)):
         _fail("RETIREMENT_COMPLETION_INVALID")
+    if unit_scope:
+        typed_writer = owner["schema_version"] == UNIT_WRITER_WORKSPACE_OWNER_SCHEMA
+        fence = _retirement_unit_fence(Path(marker["source_fence_path"]), marker["source_fence_sha256"],
+            root=root, owner=owner, owner_sha256=owner_sha,
+            **({"precommit_maximum": _limits_from_payload(context_body["limits"], legacy=False).max_json_bytes}
+               if typed_writer else {}))
+        if expected_completed_fence_schema is not None and expected_completed_fence_schema != fence["schema_version"]:
+            _fail("RETIREMENT_COMPLETED_FENCE_SCHEMA_MISMATCH")
+        expected_receipt = {"generation_id": marker["generation_id"], "unit_id": marker["unit_id"],
+            "unit_contract_sha256": owner["unit_contract_sha256"], "ledger": fence["ledger"],
+            "workspace_owner_sha256": owner_sha, "intent_sha256": marker["intent_sha256"],
+            "source_fence": {"path": marker["source_fence_path"], "sha256": marker["source_fence_sha256"]},
+            "retired_payload_files": 1 + len(_unit_ledger_control_paths(fence["ledger"])), "retained_unit_locks": [],
+            "descriptor_assurance": "IDENTITY_ONLY_AFTER_WORKSPACE_RELEASE"}
+        if typed_writer:
+            expected_receipt["unit_writer_precommit_sha256"] = fence["unit_writer_precommit_sha256"]
+        fields = {*expected_receipt, "schema_version", "status", "generation_context_sha256", "retired_logical_bytes",
+            "payloads_retained", "genuine_cold_reopen_available", "qualification_authority",
+            "capital_authority", "live_authority", "order_authority"}
+        if (set(receipt) != fields or any(receipt.get(key) != value for key, value in expected_receipt.items())
+                or type(receipt["retired_logical_bytes"]) is not int
+                or receipt["retired_logical_bytes"] <= fence["ledger"]["descriptor"]["size_bytes"]):
+            _fail("RETIREMENT_COMPLETION_INVALID")
+        return {**receipt, "retirement_receipt_sha256": digest,
+            "retirement_receipt_path": marker["retirement_receipt_path"]}
     retained_reference = {}
     fence = _retirement_fence(Path(marker["source_fence_path"]), marker["source_fence_sha256"],
         context_sha256=marker["generation_context_sha256"], generation_id=marker["generation_id"],
@@ -3193,7 +3578,7 @@ def _retirement_inventory(root: Path, direct: frozenset[str], *, max_paths: int,
         retained_controls: tuple[str, ...] = ()) -> tuple[list[dict], list[dict], int, int]:
     keep = {CONTEXT_RELATIVE_PATH, WORKSPACE_OWNER_RELATIVE_PATH, RETIREMENT_RELATIVE_PATH,
         RETIREMENT_INTENT_RELATIVE_PATH, RETIREMENT_COMPLETE_RELATIVE_PATH,
-        spool_quota.QUOTA_STATE_NAME, spool_quota.QUOTA_LOCK_NAME, "declared-scheduler.lock"}
+        spool_quota.QUOTA_STATE_NAME, spool_quota.QUOTA_LOCK_NAME, _UNIT_WRITER_DISPATCH_LOCK}
     keep.update(retained_unit_locks)
     keep.update(retained_controls)
     records, directories, stack = [], [], [root]
@@ -3236,7 +3621,7 @@ def _retirement_inventory(root: Path, direct: frozenset[str], *, max_paths: int,
 
 
 @contextmanager
-def _retirement_unit_locks(root: Path, paths: tuple[str, ...], owner: dict) -> Iterator[None]:
+def _retirement_unit_locks(root: Path, paths: tuple[str, ...], owner: dict, *, marker_byte: bytes = b"0") -> Iterator[None]:
     from contextlib import ExitStack
     import pm_native_storage as storage
     with ExitStack() as handles:
@@ -3258,7 +3643,7 @@ def _retirement_unit_locks(root: Path, paths: tuple[str, ...], owner: dict) -> I
                 _reject_reparse_chain(path)
                 current = path.stat(follow_symlinks=False)
                 handle.seek(0)
-                if _file_identity(current) != _file_identity(opened) or handle.read(1) != b"0":
+                if _file_identity(current) != _file_identity(opened) or handle.read(1) != marker_byte:
                     _fail("RETIREMENT_UNIT_LOCK_UNVERIFIED")
             except OSError as exc:
                 raise AuthoritySpoolError("RETIREMENT_UNIT_LOCK_UNVERIFIED") from exc
@@ -3286,6 +3671,12 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
     _assert_retirement_root(root, owner_before_lock.get("root_identity"), declared_root=owner_before_lock.get("root"))
     if owner_before_sha != workspace_owner_sha256 or owner_before_lock.get("generation_context_sha256") != expected_context_sha256:
         _fail("RETIREMENT_OWNER_REQUIRED")
+    unit_scope = owner_before_lock.get("schema_version") in _UNIT_WORKSPACE_OWNER_SCHEMAS
+    typed_writer = owner_before_lock.get("schema_version") == UNIT_WRITER_WORKSPACE_OWNER_SCHEMA
+    if unit_scope:
+        if segment_max_records is not None:
+            _fail("UNIT_RETIREMENT_SINGLE_INTENT_REQUIRED")
+        retirement_schema = UNIT_RETIREMENT_SCHEMA
     for value in (expected_context_sha256, workspace_owner_sha256, source_fence_sha256):
         _sha256(value, "RETIREMENT_BINDING_INVALID")
     if (type(protected_paths) is not tuple or not protected_paths
@@ -3298,6 +3689,10 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
     direct = frozenset(owned_direct_files)
     if len(direct) != len(owned_direct_files) or len(direct) > max_paths:
         _fail("RETIREMENT_DIRECT_PATH_INVALID")
+    if unit_scope and (unit_lock_paths or direct not in (
+            {UNIT_LEDGER_RECEIPT_PATH},
+            {UNIT_LEDGER_RECEIPT_PATH, UNIT_LEDGER_PENDING_PATH, UNIT_LEDGER_PUBLICATION_INTENT_PATH})):
+        _fail("UNIT_RETIREMENT_INVENTORY_INVALID")
     for relative in direct:
         if type(relative) is not str or len(relative.encode("utf-8")) > 4096:
             _fail("RETIREMENT_DIRECT_PATH_INVALID")
@@ -3310,6 +3705,9 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                 or PurePosixPath(relative).name.casefold() != "units.lock" for relative in unit_lock_paths)):
         _fail("RETIREMENT_UNIT_LOCK_PATHS_INVALID")
     source_fence_path, retirement_receipt_path = Path(source_fence_path), Path(retirement_receipt_path)
+    if unit_scope:
+        source_fence_path = _unit_terminal_path(source_fence_path, root, owner_before_lock)
+        retirement_receipt_path = _unit_terminal_path(retirement_receipt_path, root, owner_before_lock)
     if source_fence_path.resolve() == retirement_receipt_path.resolve():
         _fail("RETIREMENT_RECEIPT_PATH_CONFLICT")
     _validate_root(retirement_receipt_path.parent, create=False)
@@ -3327,7 +3725,10 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
         "owned_direct_files": sorted(direct), "unit_lock_paths": list(unit_lock_paths),
         "max_paths": max_paths, "max_nodes": max_nodes, "max_bytes": max_bytes,
         "segment_max_records": segment_max_records}
-    with spool_quota.generation_retirement_lock(root, max_root_entries=max_nodes), _retirement_unit_locks(root, unit_lock_paths, owner_before_lock):
+    writer_lease = (_retirement_unit_locks(root, (_UNIT_WRITER_DISPATCH_LOCK,), owner_before_lock,
+        marker_byte=b"\0") if typed_writer else nullcontext())
+    with (writer_lease, spool_quota.generation_retirement_lock(root, max_root_entries=max_nodes),
+            _retirement_unit_locks(root, unit_lock_paths, owner_before_lock)):
         existing = read_generation_retirement(root, expected_context_sha256=expected_context_sha256)
         if existing is not None:
             marker, _ = _retirement_control(root, RETIREMENT_RELATIVE_PATH, MAX_CONTEXT_BYTES)
@@ -3368,7 +3769,12 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
         if not (root / WORKSPACE_OWNER_RELATIVE_PATH).exists():
             _fail("RETIREMENT_OWNER_REQUIRED")
         owner, owner_sha = _retirement_control(root, WORKSPACE_OWNER_RELATIVE_PATH, MAX_CONTEXT_BYTES)
-        if (set(owner) != {"schema_version", "generation_id", "generation_context_sha256", "creation_provenance",
+        if unit_scope:
+            if owner_sha != workspace_owner_sha256:
+                _fail("RETIREMENT_OWNER_REQUIRED")
+            _validate_unit_workspace_owner(root, owner, context_sha256=context_sha,
+                generation_id=context_body["generation_id"])
+        elif (set(owner) != {"schema_version", "generation_id", "generation_context_sha256", "creation_provenance",
                     "cell_id", "cell_contract_sha256", "root", "root_identity"}
                 or owner_sha != workspace_owner_sha256 or owner.get("schema_version") != WORKSPACE_OWNER_SCHEMA
                 or owner.get("generation_context_sha256") != context_sha
@@ -3413,11 +3819,23 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             _fail("RETIREMENT_INTENT_CHANGED")
         # A verified saved intent continues its original release contract.
         retained_reference = {}
-        fence = _retirement_fence(source_fence_path, source_fence_sha256, context_sha256=context_sha,
-            generation_id=owner["generation_id"], cell_id=owner["cell_id"], workspace_sha256=owner_sha,
-            working_root=root, owner=owner,
-            require_retained_account=saved_intent is None or "retained_account_result" in arguments,
-            retained_account_result_out=retained_reference)
+        unit_payload_paths = None
+        if unit_scope:
+            fence = _retirement_unit_fence(source_fence_path, source_fence_sha256, root=root, owner=owner,
+                owner_sha256=owner_sha, ledger_maximum=context_body["limits"]["max_json_bytes"]
+                if existing is None else None, precommit_maximum=context_body["limits"]["max_json_bytes"])
+            if typed_writer:
+                arguments["unit_writer_precommit_sha256"] = fence["unit_writer_precommit_sha256"]
+            unit_controls = _unit_ledger_control_paths(fence["ledger"])
+            if direct != unit_controls:
+                _fail("UNIT_RETIREMENT_INVENTORY_INVALID")
+            unit_payload_paths = {*unit_controls, fence["ledger"]["descriptor"]["relative_path"]}
+        else:
+            fence = _retirement_fence(source_fence_path, source_fence_sha256, context_sha256=context_sha,
+                generation_id=owner["generation_id"], cell_id=owner["cell_id"], workspace_sha256=owner_sha,
+                working_root=root, owner=owner,
+                require_retained_account=saved_intent is None or "retained_account_result" in arguments,
+                retained_account_result_out=retained_reference)
         if ("retained_account_result" in arguments
                 and arguments["retained_account_result"] != retained_reference):
             _fail("RETIREMENT_RESUME_BINDING_CHANGED")
@@ -3433,6 +3851,7 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                 f"declared-slots/{fence['binding']['precommit_sha256']}/precommit.json"})):
             _fail("RETIREMENT_ABORT_SOURCE_STATE_INVALID")
         controls = ()
+        retained_controls = (UNIT_WRITER_PRECOMMIT_PATH,) if typed_writer else ()
         if segment_max_records is not None:
             arguments = v2_arguments
             intent, intent_sha, controls = _retirement_v2_prepare(root, existing=existing,
@@ -3441,7 +3860,9 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
         elif existing is None:
             import shutil
             records, _, root_bytes, nodes = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
-                max_bytes=max_bytes, retained_unit_locks=unit_lock_paths)
+                max_bytes=max_bytes, retained_unit_locks=unit_lock_paths, retained_controls=retained_controls)
+            if unit_scope and {record["relative_path"] for record in records} != unit_payload_paths:
+                _fail("UNIT_RETIREMENT_INVENTORY_INVALID")
             intent = {"schema_version": RETIREMENT_SCHEMA, "generation_context_sha256": context_sha,
                 "arguments": arguments, "files": records}
             intent_bytes = len(_canonical_json_bytes(intent, maximum))
@@ -3449,8 +3870,9 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             if (nodes + 3 > max_nodes or root_bytes + control_bytes > max_bytes):
                 _fail("RETIREMENT_CONTROL_CAPACITY")
             intent_sha = _retirement_publish(root, RETIREMENT_INTENT_RELATIVE_PATH, intent, maximum, root_owner=owner)
-            marker = {"schema_version": RETIREMENT_SCHEMA, "status": "RETIRING", "generation_context_sha256": context_sha,
-                "generation_id": owner["generation_id"], "cell_id": owner["cell_id"], "intent_sha256": intent_sha,
+            identity_key = "unit_id" if unit_scope else "cell_id"
+            marker = {"schema_version": retirement_schema, "status": "RETIRING", "generation_context_sha256": context_sha,
+                "generation_id": owner["generation_id"], identity_key: owner[identity_key], "intent_sha256": intent_sha,
                 **{key: arguments[key] for key in ("source_fence_path", "source_fence_sha256", "retirement_receipt_path", "workspace_owner_sha256")}}
             _retirement_publish(root, RETIREMENT_RELATIVE_PATH, marker, MAX_CONTEXT_BYTES, root_owner=owner)
         else:
@@ -3459,7 +3881,9 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
                     or intent.get("generation_context_sha256") != context_sha):
                 _fail("RETIREMENT_RESUME_BINDING_CHANGED")
             records = intent["files"]
-        inventory_options = {"retained_controls": controls} if segment_max_records is not None else {}
+            if unit_scope and {record["relative_path"] for record in records} != unit_payload_paths:
+                _fail("UNIT_RETIREMENT_INVENTORY_INVALID")
+        inventory_options = {"retained_controls": controls if segment_max_records is not None else retained_controls}
         current, _, _, _ = _retirement_inventory(root, direct, max_paths=max_paths, max_nodes=max_nodes,
             max_bytes=max_bytes, retained_unit_locks=unit_lock_paths, **inventory_options)
         if segment_max_records is not None:
@@ -3490,14 +3914,21 @@ def retire_completed_generation(root: Path, *, expected_context_sha256: str, wor
             if [current_directory.st_dev, current_directory.st_ino] != directory["identity"]:
                 _fail("RETIREMENT_DIRECTORY_CHANGED")
             path.rmdir()
+        if unit_scope:
+            payload_identity = {"unit_id": owner["unit_id"], "unit_contract_sha256": owner["unit_contract_sha256"],
+                "ledger": fence["ledger"]}
+            if typed_writer:
+                payload_identity["unit_writer_precommit_sha256"] = fence["unit_writer_precommit_sha256"]
+        else:
+            payload_identity = {"cell_id": owner["cell_id"], "cell_contract_sha256": owner["cell_contract_sha256"],
+                "precommit_sha256": (fence["binding"] if terminal_refusal or post_source_abort or native_completion
+                    else fence["source_summary"]["binding"]).get("precommit_sha256"),
+                "end_grid_rows": fence["end_grid_rows"]}
         receipt = {"schema_version": retirement_schema, "status": "ARCHIVED_RECORD_ONLY",
             "generation_context_sha256": context_sha, "generation_id": owner["generation_id"],
-            "cell_id": owner["cell_id"], "cell_contract_sha256": owner["cell_contract_sha256"],
+            **payload_identity,
             "workspace_owner_sha256": owner_sha, "intent_sha256": intent_sha,
             "source_fence": {"path": str(source_fence_path), "sha256": source_fence_sha256},
-            "precommit_sha256": (fence["binding"] if terminal_refusal or post_source_abort or native_completion
-                else fence["source_summary"]["binding"]).get("precommit_sha256"),
-            "end_grid_rows": fence["end_grid_rows"],
             "retired_payload_files": intent["retired_payload_files"] if segment_max_records is not None else len(records),
             "retired_logical_bytes": intent["retired_logical_bytes"] if segment_max_records is not None else sum(record["bytes"] for record in records),
             "payloads_retained": False, "genuine_cold_reopen_available": False,
@@ -3558,6 +3989,7 @@ __all__ = [
     "SYMBOL_MANIFEST_SCHEMA",
     "SpoolLimits",
     "SymbolAuthoritySink",
+    "UNIT_WRITER_PRECOMMIT_PATH", "UNIT_WRITER_PRECOMMIT_SCHEMA", "UNIT_WRITER_WORKSPACE_OWNER_SCHEMA",
     "freeze_generation_context",
     "resource_capacity_reason",
     "is_resource_capacity_error",

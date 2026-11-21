@@ -3054,6 +3054,7 @@ def _build_planned_attempt_evidence(
     _generation: Any = None,
     _independent_inputs: dict | None = None,
     _source_sink=None, _frozen=None, _independent_array_entries=None,
+    _partition_batch_projection=None,
 ) -> dict[str, Any]:
     if _generation is not None and _generation.independent_signal_r_enabled:
         return _build_independent_r_attempt_evidence(attempt=attempt, raw_attempt_id=raw_attempt_id,
@@ -3061,7 +3062,8 @@ def _build_planned_attempt_evidence(
             config=config, partition_cost_precommitments=partition_cost_precommitments,
             source_observation_references=source_observation_references,
             prepared_inputs=_independent_inputs, source_sink=_source_sink,
-            frozen=_frozen, array_entries=_independent_array_entries)
+            frozen=_frozen, array_entries=_independent_array_entries,
+            partition_batch_projection=_partition_batch_projection)
     if (_full_panel_lane_capture is not None
             and type(_full_panel_lane_capture) is not _FullPanelLaneCapture):
         _fail("ROUTE_A_FULL_PANEL_CAPTURE_INVALID")
@@ -3221,7 +3223,8 @@ def _independent_r_strategy_surface(*, attempt, parameters, strategy, fitted,
 
 def _build_independent_r_attempt_evidence(*, attempt, raw_attempt_id, plan_body,
         plan_receipt_sha256, fitted, config, partition_cost_precommitments,
-        source_observation_references, prepared_inputs, source_sink=None, frozen=None, array_entries=None):
+        source_observation_references, prepared_inputs, source_sink=None, frozen=None, array_entries=None,
+        partition_batch_projection=None):
     """Capture real independent outcomes; account replay remains a separate consumer."""
     import pm_production_config_binding as config_binding
     prepared_inputs = {} if prepared_inputs is None else prepared_inputs
@@ -3244,9 +3247,9 @@ def _build_independent_r_attempt_evidence(*, attempt, raw_attempt_id, plan_body,
             dependency_warmup_bars=plan_body["derived_dependency_geometry"]["warmup_bars"])
         lanes, partition_signals, indexes = {}, {}, {}
         for partition in partitions:
-            features, signals = _slice_full_prefix_strategy_surface(
+            features, raw_signals = _slice_full_prefix_strategy_surface(
                 partition=partition, full_prefix_surface=surface)
-            signals = _independent_r_cell_signals(features, signals, regime)
+            signals = _independent_r_cell_signals(features, raw_signals, regime)
             partition_signals[partition.role] = signals
             geometry_sha = partition.geometry_receipt["receipt_sha256"]
             prepared = prepared_inputs.get(geometry_sha)
@@ -3275,13 +3278,23 @@ def _build_independent_r_attempt_evidence(*, attempt, raw_attempt_id, plan_body,
                 provenance = signal_opportunities.OpportunityProvenance(strategy.name, config_sha,
                     surface_sha, tier, _sha256(probe["numerical_execution_cost_attestation"]),
                     _sha256(probe["spread_admission"]))
-                batch = signal_opportunities.evaluate_independent_signal_r(features, signals,
+                evaluate = signal_opportunities.evaluate_independent_signal_r
+                evaluation_kwargs = dict(
                     pricing=pricing, episode_ids=episodes.loc[features.index], strategy=strategy,
                     spec=fitted.instrument_spec, symbol=symbol, timeframe=timeframe,
                     cutoff_utc=partition.end_exclusive_utc, signal_start_utc=start,
                     entry_half_spreads=values["entry_half_spread"],
                     exit_half_spreads=values["intrabar_half_spread"],
                     entry_admission=values["admission_states"], provenance=provenance)
+                batch = None
+                if partition_batch_projection is not None:
+                    batch = partition_batch_projection(evaluate=evaluate, features=features,
+                        raw_signals=raw_signals, masked_signals=signals, regime=regime,
+                        partition=partition, tier=tier, parameters=parameters,
+                        view_slot=(attempt.ordinal, ordinal, partition.role, tier),
+                        source_reference=reference, cost_probe=probe, evaluation_kwargs=evaluation_kwargs)
+                if batch is None:
+                    batch = evaluate(features, signals, **evaluation_kwargs)
                 lane = {"schema_version": "fxpm.independent-signal-partition.v1",
                     "partition_axis": dict(axis), "trade_power_partition_axis": dict(axis),
                     "source_reference": dict(reference), "batch": asdict(batch),
@@ -4211,6 +4224,7 @@ def _is_reparse(info: os.stat_result) -> bool:
 # This is neither a search outcome nor a grant to qualify, publish or trade.
 _DECLARED_UNIT_HEADER_SCHEMA = "fxpm.declared-attempt-unit-header.v2"
 _DECLARED_UNIT_SCHEMA = "fxpm.declared-attempt-unit-complete.v1"
+_DECLARED_COHORT_IDENTITY = "cohort_consumer_identity"
 
 
 def _declared_unit_relative(body: Mapping[str, Any], name: str) -> str:
@@ -4270,7 +4284,46 @@ def _read_declared_unit_header(context: Any, body: Mapping[str, Any]) -> dict[st
             or type(header.get("plan_transport")) is not dict
             or type(header.get("horizon_plan")) is not dict):
         _fail("DECLARED_UNIT_HEADER_BINDING_MISMATCH")
+    _declared_unit_cohort_identity(binding, body)
     return header
+
+
+def _declared_unit_cohort_identity(binding, body):
+    if _DECLARED_COHORT_IDENTITY not in binding:
+        return None
+    identity = binding[_DECLARED_COHORT_IDENTITY]
+    fields = {"unit_id", "unit_contract_sha256", "cell_id", "ledger_sha256",
+              "receipt_sha256", "expected_roster_sha256"}
+    if (type(identity) is not dict or set(identity) != fields
+            or identity["cell_id"] != body["cell_id"]
+            or any(type(value) is not str or len(value) != 64
+                   or any(char not in _SHA for char in value) for value in identity.values())):
+        _fail("DECLARED_UNIT_COHORT_IDENTITY_INVALID")
+    return identity
+
+
+def _bind_declared_cohort_consumer(*, context, body, binding, header, consumer):
+    recorded = None if header is None else _declared_unit_cohort_identity(header["binding"], body)
+    if header is not None and recorded is None:
+        return None, None
+    if consumer is None:
+        if recorded is not None:
+            _fail("DECLARED_UNIT_COHORT_RESUME_IDENTITY_MISMATCH")
+        return None, None
+    from pm_historical_cohort_consumer import DeclaredCohortConsumer
+    if type(consumer) is not DeclaredCohortConsumer:
+        _fail("DECLARED_UNIT_COHORT_CONSUMER_INVALID")
+    _require_declared_unit_open_window(body)
+    identity = consumer.identity()
+    if recorded is not None and identity != recorded:
+        _fail("DECLARED_UNIT_COHORT_RESUME_IDENTITY_MISMATCH")
+    bound = consumer.bind(cell_context=context, request_body=body, execution_binding=binding,
+        recorded_identity=recorded if recorded is not None else identity)
+    if bound is None:
+        if recorded is not None:
+            _fail("DECLARED_UNIT_COHORT_RESUME_IDENTITY_MISMATCH")
+        return None, None
+    return _declared_unit_cohort_identity({_DECLARED_COHORT_IDENTITY: identity}, body), bound
 
 
 def _declared_unit_identity(attempt: Any, raw_id: str) -> dict[str, Any]:
@@ -4322,14 +4375,17 @@ def _declared_completed_prefix(context: Any, body: Mapping[str, Any],
 
 
 def _publish_declared_completed_unit(context: Any, body: Mapping[str, Any],
-        binding_sha256: str, unit: Mapping[str, Any], value: Mapping[str, Any]) -> dict[str, Any]:
+        binding_sha256: str, unit: Mapping[str, Any], value: Mapping[str, Any], *,
+        _before_payload=None) -> dict[str, Any]:
     if _read_declared_completed_unit(context, body, binding_sha256, unit) is not None:
         _fail("DECLARED_UNIT_ALREADY_COMPLETE", unit["ordinal"])
-    _, size = _canonical_digest_and_size(value)
+    digest, size = _canonical_digest_and_size(value)
     if size > MAX_ATTEMPT_EVIDENCE_BYTES:
         _fail("ATTEMPT_EVIDENCE_BYTE_BOUND_EXCEEDED", unit["ordinal"])
     if value.get("attempt_id") != unit["raw_attempt_id"]:
         _fail("DECLARED_UNIT_PAYLOAD_INVALID", unit["ordinal"])
+    if _before_payload is not None:
+        _before_payload(unit, digest)
     encoder = json.JSONEncoder(allow_nan=False, ensure_ascii=True,
         separators=(",", ":"), sort_keys=True)
     descriptor = authority_spool.write_opaque_artifact(context,
@@ -4367,7 +4423,7 @@ def _declared_unit_binding(capture: Any, fitted: Any, cell_plan: Any,
 
 def _make_declared_unit_header(capture: Any, fitted: Any, cell_plan: Any,
         attempts: Sequence[Any], fold_plan: Any, handle: Any, references: Any,
-        evidence_started: str) -> dict[str, Any]:
+        evidence_started: str, *, binding=None) -> dict[str, Any]:
     _require_executable_bound_fit(fitted)
     reference = handle.frozen.bound_fitted_state_entry
     if type(reference) is not dict or not reference:
@@ -4384,7 +4440,8 @@ def _make_declared_unit_header(capture: Any, fitted: Any, cell_plan: Any,
         "plan_transport": {"cell_receipt": cell_plan.cell_receipt, "spool_entry": cell_plan.spool_entry,
             "attempt_artifacts": list(cell_plan.attempt_artifacts()),
             "state_requirements": list(cell_plan.state_requirements())},
-        "binding": _declared_unit_binding(capture, fitted, cell_plan, attempts, fold_plan, handle),
+        "binding": (_declared_unit_binding(capture, fitted, cell_plan, attempts, fold_plan, handle)
+                    if binding is None else dict(binding)),
         "request_body": capture.request.to_dict(),
         "source_session_entry": dict(capture.source_session._entry),
         "native_activation_manifest_sha256": fitted.product.index["activation"]["manifest_sha256"],
@@ -4399,8 +4456,15 @@ def _make_declared_unit_header(capture: Any, fitted: Any, cell_plan: Any,
 
 
 
+def _require_declared_unit_open_window(body):
+    window = body["source_access_window_utc"]
+    if not window["start_utc"] <= _now_utc_seconds() < window["end_exclusive_utc"]:
+        _fail("DECLARED_UNIT_ORIGINAL_WINDOW_CLOSED")
+
+
 def _continue_declared_attempt_units(context: Any, body: Mapping[str, Any],
-        binding_sha256: str, units: Sequence[Mapping[str, Any]], produce: Any, *, progress=None) -> tuple[list[dict[str, Any]], str]:
+        binding_sha256: str, units: Sequence[Mapping[str, Any]], produce: Any, *, progress=None,
+        _prepare_missing=None, _before_payload=None) -> tuple[list[dict[str, Any]], str]:
     """Resume whole attempts; no partially executed fold or ledger is inferred."""
     records = _declared_completed_prefix(context, body, binding_sha256, units)
     from pm_historical_scheduler import _declared_observe_progress
@@ -4409,14 +4473,15 @@ def _continue_declared_attempt_units(context: Any, body: Mapping[str, Any],
     end = _read_declared_unit_json(context, end_path)
     if end is not None and len(records) != len(units):
         _fail("DECLARED_UNIT_COMPLETION_ROSTER_INCOMPLETE")
-    if len(records) < len(units):
-        window = body["source_access_window_utc"]
-        now = _now_utc_seconds()
-        if not window["start_utc"] <= now < window["end_exclusive_utc"]:
-            _fail("DECLARED_UNIT_ORIGINAL_WINDOW_CLOSED")
-    for unit in units[len(records):]:
+    missing_units = units[len(records):]
+    if missing_units:
+        _require_declared_unit_open_window(body)
+        if _prepare_missing is not None and any(unit.get("status") == "PLANNED" for unit in missing_units):
+            _prepare_missing(missing_units)
+    for unit in missing_units:
         value = produce(unit)
-        row = _publish_declared_completed_unit(context, body, binding_sha256, unit, value)
+        row = _publish_declared_completed_unit(context, body, binding_sha256, unit, value,
+            _before_payload=_before_payload if unit.get("status") == "PLANNED" else None)
         records.append(row)
         _declared_observe_progress(progress, 'search_attempts', len(records), len(units))
         del value
@@ -6130,6 +6195,7 @@ def execute_historical_observed_cell(
     cell_plan: Any,
     config: PipelineConfig,
     _execution_edition: str | None = None,
+    _declared_cohort_consumer=None,
 ) -> HistoricalObservedCellExecution:
     """Run one observed historical cell through genuine raw Winner evidence.
 
@@ -6187,6 +6253,13 @@ def execute_historical_observed_cell(
     edition = planner.source_edition_info(search_process)
     independent_r_execution = edition.independent_signal_r_enabled
     full_panel_execution = planner.is_route_a_full_panel_process(search_process) and not independent_r_execution
+    declared_native_v19 = (independent_r_execution
+        and type(capture) is historical_adapter.DeclaredSlotSearchCapture
+        and capture._winner_generation is winner.V19_GENERATION
+        and frozen_execution_edition == planner.INDEPENDENT_R_EXECUTION_EDITION
+        and historical.declared_slot_source_kind(capture.request_body) == "broker_native")
+    if _declared_cohort_consumer is not None and not declared_native_v19:
+        _fail("DECLARED_UNIT_COHORT_NATIVE_V19_REQUIRED")
     if full_panel_execution and type(capture) is not historical_adapter.DeclaredSlotSearchCapture:
         _fail("ROUTE_A_FULL_PANEL_DECLARED_CAPTURE_REQUIRED")
     if planner.is_route_a_full_panel_process(search_process) and capture._winner_generation.selection_version != edition.winner_generation_id:
@@ -6306,13 +6379,37 @@ def execute_historical_observed_cell(
         if declared_mode:
             request_body = capture.request.to_dict()
             binding = _declared_unit_binding(capture, refreshed, cell_plan, attempts, fold_plan, handle)
-            if declared_header is None:
+            original_header = declared_header
+            cohort_identity = None
+            bound_cohort = None
+            if original_header is None:
+                if (capture._winner_generation is winner.V19_GENERATION
+                        and _declared_cohort_consumer is not None):
+                    if type(bound_fit_issue_owner) is not _FreshFitOwner:
+                        _fail("DECLARED_UNIT_COHORT_FRESH_FREEZE_REQUIRED")
+                    cohort_identity, bound_cohort = _bind_declared_cohort_consumer(
+                        context=capture.context, body=request_body, binding=binding,
+                        header=None, consumer=_declared_cohort_consumer)
+            else:
+                cohort_identity = _declared_unit_cohort_identity(original_header["binding"], request_body)
+                if cohort_identity is not None and (not declared_native_v19
+                        or type(bound_fit_issue_owner) is not _BoundFitOwner
+                        or bound_fit_issue_owner.header_bytes != _canonical_bytes(original_header)):
+                    _fail("DECLARED_UNIT_COHORT_ORIGINAL_REOPEN_REQUIRED")
+            if cohort_identity is not None:
+                historical_adapter._verify_declared_slot_capture_current(capture)
+                if (capture._active is not handle or capture.process is not search_process
+                        or capture.cell_plan is not cell_plan):
+                    _fail("DECLARED_UNIT_COHORT_CAPTURE_CHANGED")
+                binding[_DECLARED_COHORT_IDENTITY] = cohort_identity
+            if original_header is None:
                 declared_header = _make_declared_unit_header(capture, refreshed, cell_plan,
-                    attempts, fold_plan, handle, source_observation_references, evidence_started)
+                    attempts, fold_plan, handle, source_observation_references, evidence_started,
+                    binding=binding)
                 authority_spool._publish_exact_json(capture.context,
                     _declared_unit_relative(request_body, "header.json"),
                     declared_header, capture.context.limits.max_json_bytes)
-            elif declared_header["binding"] != binding:
+            elif original_header["binding"] != binding:
                 _fail("DECLARED_UNIT_HEADER_BINDING_MISMATCH")
             declared_binding_sha256 = _sha256(binding)
             declared_units = [_declared_unit_identity(attempt, raw_id)
@@ -6343,7 +6440,28 @@ def execute_historical_observed_cell(
                     plan_body=plan_body, timeframe=timeframe, fold_plan=fold_plan, symbol=symbol,
                     stage_custody=stage_custody, reservation=stage_reservation, staged_rows=staged,
                     source_observation_references=source_observation_references)
+            projection_used = False
+
+            def prepare_missing(_missing_units):
+                nonlocal bound_cohort
+                _, bound_cohort = _bind_declared_cohort_consumer(
+                    context=capture.context, body=request_body, binding=binding,
+                    header=original_header, consumer=_declared_cohort_consumer)
+
+            def project_partition(**view):
+                nonlocal projection_used
+                result = bound_cohort.project(**view,
+                    _before_read=lambda: _require_declared_unit_open_window(request_body))
+                projection_used |= result is not None
+                return result
+
+            def pin_projection(_unit, digest):
+                if projection_used:
+                    bound_cohort.pin(digest)
+
             def produce_unit(unit):
+                nonlocal projection_used
+                projection_used = False
                 if prepared_full_panel is not None:
                     return prepared_full_panel.unit_body(unit)
                 attempt = attempts[unit["ordinal"]]
@@ -6358,6 +6476,7 @@ def execute_historical_observed_cell(
                     source_observation_references=source_observation_references,
                     _entry_admission_preparation=entry_admission_preparation,
                     _generation=capture._winner_generation, _independent_inputs=independent_inputs,
+                    _partition_batch_projection=project_partition if bound_cohort is not None else None,
                     **({"_source_sink": capture.sink, "_frozen": handle.frozen,
                         "_independent_array_entries": independent_array_entries} if independent_r_execution else {}))
             if prepared_full_panel is not None:
@@ -6369,7 +6488,10 @@ def execute_historical_observed_cell(
                         refreshed._entry_spread_observations) as entry_admission_preparation:
                     declared_records, evidence_completed = _continue_declared_attempt_units(
                         capture.context, request_body, declared_binding_sha256, declared_units, produce_unit,
-                    progress=getattr(capture, '_progress_observer', None))
+                        progress=getattr(capture, '_progress_observer', None),
+                        _prepare_missing=(prepare_missing if cohort_identity is not None
+                                          and original_header is not None else None),
+                        _before_payload=pin_projection if cohort_identity is not None else None)
         else:
             reservation_scope = authority_spool.reserve_transient_publication(
                 capture.context

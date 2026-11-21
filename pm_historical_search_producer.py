@@ -2655,7 +2655,7 @@ def _make_declared_slot_source_authority():
     @search_planner._owned_process_verification_call
     def execute(context, *, request, process, frozen_pipeline_config,
                 m5_owner=None, m5_request_view_id=None, m5_calibration_view_id=None,
-                m5_cost_edition=None, _numeric_preparation=None):
+                m5_cost_edition=None, _numeric_preparation=None, _declared_cohort_consumer=None):
         search_planner._require_current_process(process)
         body = historical.verify_declared_slot_producer_request(context, request, process=process)
         _declared_completion_schema(body)
@@ -2763,8 +2763,12 @@ def _make_declared_slot_source_authority():
             capture = open_capture(context, request=request, process=process, plan=plan, source_session=session)
             capture._progress_observer = progress_observer
             _declared_observe_progress(progress_observer, 'search')
+            execution_options = {}
+            if (_declared_cohort_consumer is not None
+                    and execute_cell is search_execution.execute_independent_r_historical_observed_cell):
+                execution_options["_declared_cohort_consumer"] = _declared_cohort_consumer
             execute_cell(capture=capture, fitted=fitted, regime=body["regime"],
-                search_process=process, cell_plan=plan, config=config)
+                search_process=process, cell_plan=plan, config=config, **execution_options)
             return finish(capture.completion)
 
         pending_header = _declared_partial_unit_header(context, body)
