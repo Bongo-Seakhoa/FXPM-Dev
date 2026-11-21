@@ -20,7 +20,8 @@ from typing import Any, Literal, Sequence
 import numpy as np
 import pandas as pd
 
-from pm_core import _protective_session_exit, _prepare_session_execution, EXIT_NONE, EXIT_SL, EXIT_TP, EXIT_SESSION
+from pm_core import InstrumentSpec, _protective_session_exit, _prepare_session_execution, EXIT_NONE, EXIT_SL, EXIT_TP, EXIT_SESSION
+from pm_strategies import BaseStrategy
 
 
 SCHEMA_VERSION = "fxpm.signal-opportunity-labels.v1"
@@ -219,6 +220,41 @@ def _stops(strategy: Any, features: pd.DataFrame, bar: int, direction: int,
     return stop, target
 
 
+def _prepare_base_atr_stop_pairs(strategy, features, spec, pip_size, eligible_bars):
+    """Prepare base stops in signal order, leaving exceptional rows to the scalar caller."""
+    if not eligible_bars or type(spec) is not InstrumentSpec or "ATR_14" not in features:
+        return None
+    strategy_type = type(strategy)
+    if (not isinstance(strategy, BaseStrategy)
+            or strategy_type.__getattribute__ is not object.__getattribute__
+            or strategy_type.calculate_stops is not BaseStrategy.calculate_stops
+            or strategy_type.build_trade_intent is not BaseStrategy.build_trade_intent
+            or "calculate_stops" in vars(strategy) or "build_trade_intent" in vars(strategy)
+            or getattr(spec.price_to_pips, "__func__", None) is not InstrumentSpec.price_to_pips
+            or type(spec.pip_size) is not float):
+        return None
+    atr = features["ATR_14"]
+    params = strategy.params
+    if (atr.dtype != np.dtype("float64") or type(params) is not dict
+            or params.get("use_structural_sl", False) is not False):
+        return None
+    stop_mult = params.get("sl_atr_mult", 2.0)
+    target_mult = params.get("tp_atr_mult", 2.0)
+    if type(stop_mult) not in (int, float) or type(target_mult) not in (int, float):
+        return None
+    try:
+        stop_mult, target_mult = float(stop_mult), float(target_mult)
+    except OverflowError:
+        return None
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        atr_pips = atr.to_numpy(copy=False)[eligible_bars] / pip_size
+        # fmax preserves the scalar max(5.0, NaN) floor.
+        stops = np.fmax(5.0, atr_pips * stop_mult)
+        targets = np.fmax(5.0, atr_pips * target_mult)
+    return ((float(stop), float(target)) if math.isfinite(stop) and math.isfinite(target) else None
+            for stop, target in zip(stops, targets, strict=True))
+
+
 def independent_entry_episodes(features, *, symbol, timeframe, cutoff_utc):
     """Name full-prefix episodes by the live label on the signal that precedes each entry."""
     if "REGIME_LIVE" not in features:
@@ -264,12 +300,15 @@ def _independent_inputs(features, *, strategy, spec, symbol, timeframe, opens, c
                     following = bar + 1
                 session_exit[bar] = following if following < observed else -1
     entry_prices = np.full(observed, np.nan, dtype=np.float64)
+    eligible_bars = [] if session is None else None
     for bar in selected:
         entry = bar + 1
         state = admission.iloc[entry] if isinstance(admission, pd.Series) and entry < observed else (
             admission[entry] if entry < observed else None)
         if entry < observed and state == "ADMIT" and allowed[entry]:
             entry_prices[entry] = open_values[entry] + int(signals[bar]) * entry_spreads[entry]
+            if eligible_bars is not None:
+                eligible_bars.append(bar)
     # Carry preparation uses recorded time axes, not unfinished OHLC observations.
     carry_frame = features.iloc[:observed].loc[:, ["_BAR_CLOSE_TS"]].copy(deep=False)
     carry_frame.attrs = copy.deepcopy(features.attrs)
@@ -282,6 +321,7 @@ def _independent_inputs(features, *, strategy, spec, symbol, timeframe, opens, c
         enabled, contract = False, {"status": "NOT_REQUIRED_NO_ELIGIBLE_ENTRY"}
     modeled = bool(enabled) or contract.get("status") == "DISABLED"
     return {"allowed": allowed, "session_exit": session_exit, "episodes": episode_ids,
+        "base_atr_bars": eligible_bars,
         "pre": np.concatenate(([0], np.cumsum(pre, dtype=np.int64))),
         "close": np.concatenate(([0], np.cumsum(close, dtype=np.int64))),
         "long": long_rate, "short": short_rate, "swap_modeled": modeled,
@@ -445,6 +485,8 @@ def label_signal_opportunities(
     # share the same view for all indices without copying a frame per label.
     prepared.attrs = {} if independent is None else {key: copy.deepcopy(value)
         for key, value in features.attrs.items() if key != "_fxpm_structural_sl_cache"}
+    prepared_stops = (None if independent is None else _prepare_base_atr_stop_pairs(
+        strategy, prepared, spec, pip_size, independent["base_atr_bars"]))
     indexes: dict[int, _FirstTouchIndex] = {}
     rows = []
     unknown_regimes = 0
@@ -457,8 +499,11 @@ def label_signal_opportunities(
         unknown_regimes += int(regime is None)
         state = (admission.iloc[entry] if isinstance(admission, pd.Series) else admission[entry]) if entry < observed_opens else None
         eligible = entry < observed_opens and state == "ADMIT" and (independent is None or independent["allowed"][entry])
-        stop_pips, target_pips = (_stops(strategy, prepared, bar, direction, symbol, timeframe, regime, spec)
-            if independent is None or eligible else (None, None))
+        stop_pair = next(prepared_stops) if eligible and prepared_stops is not None else None
+        if stop_pair is None:
+            stop_pair = (_stops(strategy, prepared, bar, direction, symbol, timeframe, regime, spec)
+                if independent is None or eligible else (None, None))
+        stop_pips, target_pips = stop_pair
         identity = (SCHEMA_VERSION if independent is None else INDEPENDENT_R_SCHEMA,
                     provenance.strategy_id, provenance.configuration_sha256,
                     provenance.source_surface_sha256, provenance.spread_tier,

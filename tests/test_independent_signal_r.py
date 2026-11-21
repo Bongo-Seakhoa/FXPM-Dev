@@ -1,8 +1,7 @@
 """Invented independent-R economic oracles; no market programme or qualification."""
-from dataclasses import replace
+from dataclasses import asdict, replace
 from types import SimpleNamespace
 import json
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -11,7 +10,7 @@ import pytest
 import pm_core
 import pm_signal_opportunities as opportunities
 from pm_core import Backtester, PipelineConfig
-from test_signal_opportunities import FixedStops, _frame, _spec, _provenance
+from test_signal_opportunities import FixedStops, PublicStructuralStops, _frame, _spec, _provenance
 
 
 def _config(**changes):
@@ -178,3 +177,123 @@ def test_independent_r_skips_unused_financing_preparation(monkeypatch, has_signa
         entry_admission=["REFUSE"] * 6)
     assert batch.window_nonzero_count == int(has_signal)
     assert batch.cost_model["swap_contract"]["status"] == "NOT_REQUIRED_NO_ELIGIBLE_ENTRY"
+
+
+def _trace_base_atr_scalar_stops(monkeypatch):
+    calls = []
+    scalar = opportunities._stops
+
+    def trace(strategy, features, bar, *args, **kwargs):
+        calls.append(bar)
+        return scalar(strategy, features, bar, *args, **kwargs)
+
+    monkeypatch.setattr(opportunities, "_stops", trace)
+    return calls
+
+
+def test_base_atr_batch_matches_complete_scalar_v19(monkeypatch):
+    class ScalarStops(PublicStructuralStops):
+        def calculate_stops(self, *args, **kwargs):
+            return super().calculate_stops(*args, **kwargs)
+
+    frame = _frame()
+    frame.loc[frame.index[2], "High"] = 1.001
+    frame["ATR_14"] = [0.0006, 0.0005, np.nan, np.inf, np.inf, 0.0005]
+    frame["REGIME_LIVE"] = ["TREND", "TREND", "RANGE", "CHOP", "BREAKOUT", "TREND"]
+    signals = [1, 0, -1, 1, 1, 0]
+    params = dict(use_structural_sl=False, sl_atr_mult=0.0, tp_atr_mult=1.25)
+    bounds = dict(cutoff_utc=frame.index[-1],
+        entry_admission=["ADMIT", "ADMIT", "ADMIT", "ADMIT", "REFUSE", "ADMIT"],
+        exit_half_spreads=[0.00002, 0.00002, 0.00003, 0.00002, 0.00002, 0.00002])
+
+    scalar_calls = _trace_base_atr_scalar_stops(monkeypatch)
+    batch = _evaluate(frame, signals, strategy=PublicStructuralStops(**params), **bounds)
+    assert scalar_calls == []
+    scalar = _evaluate(frame, signals, strategy=ScalarStops(**params), **bounds)
+    assert scalar_calls == [0, 2]
+    assert asdict(batch) == asdict(scalar)
+    assert [record.status for record in batch.records] == [
+        "CLOSED", "RIGHT_CENSORED", "NOT_ELIGIBLE", "NO_NEXT_OBSERVATION",
+    ]
+    first, second = batch.records[:2]
+    assert first.stop_loss_pips == 5.0 and first.take_profit_pips == pytest.approx(7.5)
+    assert first.spread_r < 0.0 and first.swap_r == 0.0
+    assert second.stop_loss_pips == second.take_profit_pips == 5.0
+
+
+@pytest.mark.parametrize("fallback", (
+    "stop_override", "intent_override", "price_to_pips_override", "structural",
+    "session", "missing_atr", "nonexact_spec", "atr_float32", "bool_multiplier",
+))
+def test_base_atr_fallback_keeps_scalar_behavior(monkeypatch, fallback):
+    class SessionStops(PublicStructuralStops):
+        def session_spec(self, symbol):
+            return (0, 120)
+
+    class AlternateSpec(pm_core.InstrumentSpec):
+        pass
+
+    frame = _frame()
+    frame.loc[frame.index[2], "High"] = 1.001
+    strategy_type = SessionStops if fallback == "session" else PublicStructuralStops
+    strategy = strategy_type(use_structural_sl=fallback == "structural")
+    spec = _spec()
+    expected_stops = None
+    if fallback == "stop_override":
+        monkeypatch.setattr(strategy, "calculate_stops", lambda *args, **kwargs: (7.0, 8.0))
+        expected_stops = (7.0, 8.0)
+    elif fallback == "intent_override":
+        monkeypatch.setattr(strategy, "build_trade_intent", lambda *args, **kwargs:
+            SimpleNamespace(stop_loss_pips=7.0, take_profit_pips=8.0))
+        expected_stops = (7.0, 8.0)
+    elif fallback == "price_to_pips_override":
+        monkeypatch.setattr(spec, "price_to_pips", lambda price: 9.0)
+        expected_stops = (9.0, 9.0)
+    elif fallback == "missing_atr":
+        frame = frame.drop(columns="ATR_14")
+        expected_stops = (5.0, 5.0)
+    elif fallback == "nonexact_spec":
+        spec = AlternateSpec(**asdict(spec))
+    elif fallback == "atr_float32":
+        frame["ATR_14"] = frame["ATR_14"].astype(np.float32)
+    elif fallback == "bool_multiplier":
+        strategy.params["sl_atr_mult"] = True
+
+    scalar_calls = _trace_base_atr_scalar_stops(monkeypatch)
+    record = _evaluate(frame, [1, 0, 0, 0, 0, 0], strategy=strategy, spec=spec).records[0]
+    assert scalar_calls == [0]
+    assert record.status == "CLOSED"
+    if expected_stops is not None:
+        assert (record.stop_loss_pips, record.take_profit_pips) == expected_stops
+    if fallback == "session":
+        assert record.exit_fill == "SESSION_OPEN"
+        assert record.exit_observed_at_utc == frame.index[2].isoformat().replace("+00:00", "Z")
+
+
+def test_base_atr_refuses_invalid_pip_geometry_before_stop_work(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("Invalid pip geometry must be refused before stop preparation")
+
+    monkeypatch.setattr(opportunities, "_prepare_base_atr_stop_pairs", unexpected)
+    monkeypatch.setattr(opportunities, "_stops", unexpected)
+    spec = _spec()
+    spec.pip_position = 400  # Exact InstrumentSpec, with pip_size underflow to zero.
+    strategy = PublicStructuralStops(use_structural_sl=False)
+    with pytest.raises(opportunities.OpportunityLabelError, match="^INSTRUMENT_PIP_GEOMETRY_INVALID$"):
+        _evaluate(_frame(), [1, 0, 0, 0, 0, 0], strategy=strategy, spec=spec)
+
+
+@pytest.mark.parametrize("fail_earlier_risk", (False, True), ids=("middle-inf", "earlier-risk"))
+def test_base_atr_preserves_scalar_first_error_order(monkeypatch, fail_earlier_risk):
+    frame = _frame()
+    frame.loc[frame.index[2], "ATR_14"] = np.inf
+    spec = _spec()
+    if fail_earlier_risk:
+        # The first eligible trade must reach its initial-risk check before bar 2's stop failure.
+        monkeypatch.setattr(spec, "calculate_tick_profit", lambda *args, **kwargs: 0.0)
+    strategy = PublicStructuralStops(use_structural_sl=False)
+    scalar_calls = _trace_base_atr_scalar_stops(monkeypatch)
+    error = "INITIAL_RISK_INVALID" if fail_earlier_risk else "STOPS_INVALID"
+    with pytest.raises(opportunities.OpportunityLabelError, match=f"^{error}$"):
+        _evaluate(frame, [1, 0, -1, 0, 1, 0], strategy=strategy, spec=spec)
+    assert scalar_calls == ([] if fail_earlier_risk else [2])
