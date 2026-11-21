@@ -5267,7 +5267,8 @@ def _build_evaluated_fold(
     if _owned_generation(frozen, partition_cost_index).independent_signal_r_enabled:
         return _build_independent_r_fold(sink, frozen=frozen, attempt=attempt, planned_fold=planned_fold,
             lanes=lanes, entries=entries, hashes=hashes, shared_partition=shared_partition,
-            start=start, end=end, partition_cost_index=partition_cost_index, records_by_lane=records_by_lane)
+            start=start, end=end, partition_cost_index=partition_cost_index, records_by_lane=records_by_lane,
+            replay_receipt=provenance["attempt_replay_receipt"])
     tier_evidence = {}
     dates = None
     pending = {}
@@ -6632,16 +6633,21 @@ def verify_matched_floor_publication_chain(context, *, frozen, request, producer
             _fail("MATCHED_FLOOR_ORIGINAL_STAGE_CHAIN_CHANGED")
         folds = []
         source_indexes = []
+        evidence = ledger["entries"][attempt["ordinal"]] if independent else None
         for ordinal, planned in enumerate(precommitment["causal_fold_plan"]):
             prefix = f"{root}/attempt-{attempt['ordinal']:04d}/fold-{ordinal:03d}"
             lanes = {}
+            final_records = {}
             for lane in _LANE_KEYS:
                 published = read(prefix + "/raw/" + lane)
-                if frozen.selection_generation.independent_signal_r_enabled:
+                if independent:
                     if published.get("schema_version") != INDEPENDENT_R_PARTITION_SCHEMA or published.get("lane") != lane:
                         _fail("INDEPENDENT_R_PUBLISHED_LANE_INVALID")
                     lanes[lane] = {key: value for key, value in published.items() if key != "lane"}
-                    _independent_r_records(lanes[lane])
+                    records = _independent_r_records(lanes[lane])
+                    if lane.startswith("final_lockbox_"):
+                        final_records[lane.removeprefix("final_lockbox_").upper()] = [
+                            record for record in records if record.get("entry_regime") == frozen.regime]
                     continue
                 if (published.get("schema_version") != CURRENT_RAW_LANE_SCHEMA or published.get("lane") != lane
                         or set(published) != {*execution._RAW_LANE_KEYS, "schema_version", "lane"}):
@@ -6649,7 +6655,11 @@ def verify_matched_floor_publication_chain(context, *, frozen, request, producer
                 lanes[lane] = {key: published[key] for key in execution._RAW_LANE_KEYS}
             restored_fold = {"fold_ordinal": ordinal, "lanes": lanes,
                 "provenance": {role: read(prefix + "/provenance/" + role) for role in _PROVENANCE_KEYS}}
-            if frozen.selection_generation.independent_signal_r_enabled:
+            if independent:
+                _verify_independent_resolved_witness_fold(
+                    prefix=prefix, attempt_ordinal=attempt["ordinal"], ledger_fold=evidence["folds"][ordinal],
+                    entries=entries, read=read, final_lanes={tier: lanes["final_lockbox_" + tier.lower()] for tier in _TIERS},
+                    final_records=final_records, replay_receipt=restored_fold["provenance"]["attempt_replay_receipt"])
                 packed_indexes = read(prefix + "/independent-indexes")
                 restored_fold["independent_signal_r_indexes"] = packed_indexes
                 source_indexes.append(_expand_independent_index_arrays(packed_indexes, read=read,
@@ -7061,13 +7071,142 @@ def _independent_tier_trade_vector_body(row, *, axis_sha256, risk_sha256, genera
         "risk_unit_contract_sha256": risk_sha256, "trade_power_binding": row["trade_power_binding"]}
 
 
+_INDEPENDENT_RESOLVED_WITNESS_V1 = "fxpm.independent-signal-resolved-witness.v1"
+_INDEPENDENT_RESOLVED_WITNESS_V2 = "fxpm.independent-signal-resolved-witness.v2"
+
+
+def _independent_resolved_witness(final, records, *, attempt_replay_receipt_sha256, spread_tier,
+        batch_sha256=None):
+    return {"schema_version": _INDEPENDENT_RESOLVED_WITNESS_V2,
+        "source_reference": final["source_reference"], "partition_axis": final["trade_power_partition_axis"],
+        "method_edition": final["batch"]["method_edition"], "records": records,
+        "batch_sha256": _sha_json(final["batch"]) if batch_sha256 is None else batch_sha256,
+        "owner": {"attempt_replay_receipt_sha256": attempt_replay_receipt_sha256, "spread_tier": spread_tier}}
+
+
+def _verify_independent_resolved_witness(witness, final, records, *, attempt_replay_receipt_sha256,
+        spread_tier, allow_retained_v1=False, verified_witness_sha256=None):
+    code = "INDEPENDENT_R_RESOLVED_WITNESS_BINDING_CHANGED"
+    if type(witness) is not dict:
+        _fail(code)
+    expected = _independent_resolved_witness(final, records,
+        attempt_replay_receipt_sha256=attempt_replay_receipt_sha256, spread_tier=spread_tier)
+    if allow_retained_v1 is True and witness.get("schema_version") == _INDEPENDENT_RESOLVED_WITNESS_V1:
+        expected["schema_version"] = _INDEPENDENT_RESOLVED_WITNESS_V1
+        del expected["owner"]
+    if verified_witness_sha256 is None:
+        matches = _canonical_bytes(witness) == _canonical_bytes(expected)
+    else:
+        matches = verified_witness_sha256 == _sha_json(expected)
+    if not matches:
+        _fail(code)
+
+
+def _verify_independent_resolved_witness_fold(*, prefix, attempt_ordinal, ledger_fold, entries, read,
+        final_lanes, final_records, replay_receipt, allow_retained_v1=False):
+    code = "INDEPENDENT_R_RESOLVED_WITNESS_BINDING_CHANGED"
+    replay_entry = entries.get(prefix + "/provenance/attempt_replay_receipt", {})
+    replay_sha = ledger_fold.get("attempt_replay_receipt_sha256")
+    if (replay_entry.get("artifact_type") != "winner_attempt_replay_receipt"
+            or replay_entry.get("descriptor", {}).get("sha256") != replay_sha
+            or replay_receipt.get("schema_version") != INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+            or replay_receipt.get("receipt_role") != "attempt_replay_receipt"
+            or type(replay_receipt.get("attempt_ordinal")) is not int
+            or replay_receipt.get("attempt_ordinal") != attempt_ordinal
+            or type(replay_receipt.get("fold_ordinal")) is not int
+            or replay_receipt.get("fold_ordinal") != ledger_fold.get("fold_ordinal")):
+        _fail(code)
+    _hex(replay_sha, 64, code)
+    for tier in _TIERS:
+        artifact_id = prefix + "/resolved-" + tier.lower()
+        entry = entries.get(artifact_id, {})
+        tier_evidence = ledger_fold["tier_evidence"][tier]
+        witness_sha = tier_evidence.get("independent_signal_r_witness_sha256")
+        if (entry.get("artifact_type") != "winner_independent_signal_r_witness"
+                or tier_evidence.get("spread_tier") != tier
+                or entry.get("descriptor", {}).get("sha256") != witness_sha):
+            _fail(code)
+        _hex(witness_sha, 64, code)
+        _verify_independent_resolved_witness(read(artifact_id), final_lanes[tier], final_records[tier],
+            attempt_replay_receipt_sha256=replay_sha, spread_tier=tier, allow_retained_v1=allow_retained_v1,
+            verified_witness_sha256=witness_sha)
+
+
+def verify_independent_resolved_witness_publication(context, *, frozen, request, manifest_entries,
+        allow_retained_v1=False):
+    """Verify resolved witnesses against a sealed publication and its actual Winner request."""
+    code = "INDEPENDENT_R_RESOLVED_WITNESS_BINDING_CHANGED"
+    root = _source_observation_identity(context, frozen)
+    authority_spool._assert_context_current(context)
+    if type(request) is not winner.WinnerSelectionRequest or frozen.selection_generation is not winner.V19_GENERATION:
+        _fail(code)
+    precommitment = request.precommitment.to_dict()
+    attempt_ledger = request.attempt_ledger.to_dict()
+    ledger = request.evidence_ledger.to_dict()
+    if (precommitment != frozen.precommitment or attempt_ledger != frozen.attempt_ledger
+            or ledger.get("contract_version") != winner.V19_GENERATION.evidence_version
+            or ledger.get("precommitment_payload_sha256") != request.precommitment.payload_sha256
+            or ledger.get("attempt_ledger_payload_sha256") != request.attempt_ledger.payload_sha256
+            or len(ledger["entries"]) != len(attempt_ledger["attempts"])):
+        _fail(code)
+    entries = {}
+    for entry in manifest_entries:
+        artifact_id = entry["artifact_id"]
+        if artifact_id.startswith(root + "/"):
+            if artifact_id in entries:
+                _fail(code)
+            entries[artifact_id] = entry
+
+    def read(artifact_id):
+        entry = entries.get(artifact_id)
+        if entry is None:
+            _fail(code)
+        return _source_observation_closure_body(context, entry)
+
+    for attempt, evidence in zip(attempt_ledger["attempts"], ledger["entries"], strict=True):
+        ordinal = attempt["ordinal"]
+        if evidence["ordinal"] != ordinal or evidence["attempt_id"] != attempt["attempt_id"]:
+            _fail(code)
+        folds = evidence["folds"]
+        if attempt["precommitted_evidence_role"] == "PRESEARCH_PROCESS_REJECTED":
+            if folds:
+                _fail(code)
+            continue
+        if len(folds) != len(precommitment["causal_fold_plan"]):
+            _fail(code)
+        for fold, planned in zip(folds, precommitment["causal_fold_plan"], strict=True):
+            fold_ordinal = planned["fold_ordinal"]
+            if fold["fold_ordinal"] != fold_ordinal:
+                _fail(code)
+            prefix = f"{root}/attempt-{ordinal:04d}/fold-{fold_ordinal:03d}"
+            final_lanes, final_records = {}, {}
+            for tier in _TIERS:
+                lane = "final_lockbox_" + tier.lower()
+                lane_id = prefix + "/raw/" + lane
+                if entries.get(lane_id, {}).get("artifact_type") != "winner_raw_backtester_lane":
+                    _fail(code)
+                published = read(lane_id)
+                if published.pop("lane", None) != lane:
+                    _fail(code)
+                final_lanes[tier] = published
+                final_records[tier] = _independent_r_records(published, regime=frozen.regime)
+            replay_receipt = read(prefix + "/provenance/attempt_replay_receipt")
+            _verify_independent_resolved_witness_fold(prefix=prefix, attempt_ordinal=ordinal, ledger_fold=fold,
+                entries=entries, read=read, final_lanes=final_lanes, final_records=final_records,
+                replay_receipt=replay_receipt, allow_retained_v1=allow_retained_v1)
+
+
+__all__.append("verify_independent_resolved_witness_publication")
+
+
 def _build_independent_r_fold(sink, *, frozen, attempt, planned_fold, lanes, entries,
-        hashes, shared_partition, start, end, partition_cost_index, records_by_lane):
+        hashes, shared_partition, start, end, partition_cost_index, records_by_lane, replay_receipt):
     generation = _owned_generation(frozen, partition_cost_index)
     prefix = f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}/attempt-{attempt['ordinal']:04d}/fold-{planned_fold['fold_ordinal']:03d}"
     pending, dates = {}, None
     for tier in _TIERS:
-        final = lanes["final_lockbox_" + tier.lower()]
+        lane = "final_lockbox_" + tier.lower()
+        final = lanes[lane]
         records, days, daily, values, opened, exited, observed, ids, open_orders, close_orders = _independent_trade_vectors(
             final, regime=frozen.regime, start=start, end=end, _records=records_by_lane[id(final)])
         if dates is not None and days != dates:
@@ -7083,10 +7222,9 @@ def _build_independent_r_fold(sink, *, frozen, attempt, planned_fold, lanes, ent
         entries["power-" + tier.lower()] = power_entry
         binding = _fold_power_binding(attempt_ledger=_owned_attempt_ledger(frozen, partition_cost_index), train=decisions[0],
             final=decisions[2]) if all(decision is not None and decision.passed for decision in decisions) else None
-        witness = {"schema_version": "fxpm.independent-signal-resolved-witness.v1",
-            "source_reference": final["source_reference"], "partition_axis": final["trade_power_partition_axis"],
-            "method_edition": final["batch"]["method_edition"], "records": records,
-            "batch_sha256": _sha_json(final["batch"])}
+        witness = _independent_resolved_witness(final, records,
+            attempt_replay_receipt_sha256=hashes["attempt_replay_receipt"], spread_tier=tier,
+            batch_sha256=replay_receipt["independent_tier_execution_receipt"]["lanes"][lane]["independent_batch_sha256"])
         witness_entry = _put_ascii_json(sink, prefix + "/resolved-" + tier.lower(), "winner_independent_signal_r_witness", witness)
         entries["resolved-" + tier.lower()] = witness_entry
         order_anchor, open_offsets, close_offsets = winner._encode_event_order_offsets(open_orders, close_orders, "INDEPENDENT_R_EVENT_ORDER_INVALID")

@@ -1,7 +1,9 @@
 """INVENTED SOFTWARE FIXTURES ONLY: no market, source, or profitability evidence."""
+from copy import deepcopy
 from datetime import date, datetime, timedelta
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -74,7 +76,7 @@ def _validate(fold, axis, policy):
         _generation=winner.V19_GENERATION)
 
 
-def _v19_witness_ledger(*, repeated_witness):
+def _v19_witness_ledger_inputs(*, repeated_witness):
     from pm_authority_spool import ARTIFACT_DESCRIPTOR_SCHEMA
     from pm_winner_raw_evidence import _evidence_entry
 
@@ -179,12 +181,16 @@ def _v19_witness_ledger(*, repeated_witness):
             "selection_complexity_roster_sha256": policy["selection_complexity_roster_sha256"],
             "entries": addendum_rows, "entries_sha256": _sha(addendum_rows)},
     }
-    # Exercise the real ledger boundary with one invented fold. The fixture
-    # does not represent a declared V19 process or a production request.
-    return winner._validate_evidence_ledger(payload, policy, policy_sha, attempt_sha,
-        datetime.fromisoformat("2023-12-31T00:00:00+00:00"), (policy["cell_id"], *cell),
-        [attempt], [planned], datetime.fromisoformat(boundary), datetime.fromisoformat(completed),
-        _sha("INVENTED_REQUEST"), _generation=generation)
+    return dict(payload=payload, policy=policy, policy_sha=policy_sha, attempt_payload_sha=attempt_sha,
+        frozen_at=datetime.fromisoformat("2023-12-31T00:00:00+00:00"), cell=(policy["cell_id"], *cell),
+        attempts=[attempt], fold_plan=[planned], latest_evidence_boundary=datetime.fromisoformat(boundary),
+        verification_time=datetime.fromisoformat(completed), request_sha=_sha("INVENTED_REQUEST"),
+        _generation=generation)
+
+
+def _v19_witness_ledger(*, repeated_witness):
+    # Exercise the real ledger boundary with one invented fold.
+    return winner._validate_evidence_ledger(**_v19_witness_ledger_inputs(repeated_witness=repeated_witness))
 
 
 def test_v19_evidence_ledger_accepts_distinct_tier_witnesses():
@@ -199,6 +205,209 @@ def test_v19_evidence_ledger_refuses_cross_tier_witness_replay():
     with pytest.raises(winner._ContractError) as caught:
         _v19_witness_ledger(repeated_witness=True)
     assert str(caught.value) == "EVIDENCE_0000_POSITION_ACTIVITY_LEDGER_SHA256_REPLAYED_ACROSS_EVIDENCE_DOMAINS"
+
+
+_RETAINED_P75_COLLISION = "79e35071604dadccfd66b861134faf5a17ab4d8afe051ff5b64396cb619baa06"
+_RETAINED_FOLD_OWNERS = {
+    80: ("ad1e099dd2565c135c13494d68590b353df0da492688eb948ffa6f3e63cfa33c",
+         "88988eb83df5f1adef616ba7251419651d7a944a2c945c5bb40d0d66e0cea7f5"),
+    114: ("d09b12d972da7cad27d27b14be28a2e910a111abcfd8d63efc85138a4d2a1a08",
+          "3810319f6172fafb333401c6a8abcaa2adea8c12a74c04307a28f8db241e1f8e"),
+}
+_WITNESS_BINDING_REFUSAL = "INDEPENDENT_R_RESOLVED_WITNESS_BINDING_CHANGED"
+
+
+@pytest.fixture(scope="module")
+def retained_v19_witness_owners(tmp_path_factory):
+    """Two read-only sealed Source356 folds and their witness publications in isolated scratch."""
+    import pm_authority_spool as spool
+    import pm_winner_raw_evidence as raw
+
+    checkout = Path(__file__).resolve().parents[4]
+    summary_path = checkout / ".tmp/fxpm_default_v19_terminal_356/q/terminal_summary.json"
+    summary = json.loads(summary_path.read_bytes())
+    retained_root = Path(summary["issue"]["spool_root"])
+    unit_root = Path(summary["absolute_units_root"])
+    assert retained_root.is_relative_to(summary_path.parents[1])
+    assert unit_root.is_relative_to(retained_root)
+
+    cached = {}
+
+    def retained_object(digest):
+        if digest not in cached:
+            path = retained_root / "objects" / "sha256" / digest[:2] / (digest + ".fxpm-ascii-json-v1")
+            body = path.read_bytes()
+            assert hashlib.sha256(body).hexdigest() == digest
+            value = json.loads(body)
+            assert raw._canonical_bytes(value) == body
+            cached[digest] = value
+        return cached[digest]
+
+    root = tmp_path_factory.mktemp("owner") / "s"
+    context = spool.freeze_generation_context(root, generation_id="invented-source356-witness-owners",
+        native_universe_sha256=_sha("INVENTED_SOFTWARE_ONLY"), config_sha256=_sha("INVENTED_METADATA_ONLY"))
+    sink = spool.open_symbol_sink(context, "EURUSD")
+    owners = {}
+    entries = {}
+    for attempt_ordinal, (fold_sha, replay_sha) in _RETAINED_FOLD_OWNERS.items():
+        original_fold = retained_object(fold_sha)
+        replay = retained_object(replay_sha)
+        unit_receipt = json.loads((unit_root / f"{attempt_ordinal:06d}.json").read_bytes())
+        unit = retained_object(unit_receipt["payload"]["sha256"])
+        fold = unit["folds"][0]
+        assert replay == fold["provenance"]["attempt_replay_receipt"]
+        assert replay["schema_version"] == raw.INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+        assert replay["attempt_ordinal"] == attempt_ordinal
+        assert replay["fold_ordinal"] == original_fold["fold_ordinal"] == fold["fold_ordinal"] == 0
+        assert replay["receipt_sha256"] == _sha({key: value for key, value in replay.items()
+                                                if key != "receipt_sha256"})
+        assert replay_sha == original_fold["attempt_replay_receipt_sha256"] != replay["receipt_sha256"]
+        assert original_fold["tier_evidence"]["P75"]["independent_signal_r_witness_sha256"] == _RETAINED_P75_COLLISION
+        prefix = f"invented-source356/attempt-{attempt_ordinal:04d}/fold-000"
+        replay_id = prefix + "/provenance/attempt_replay_receipt"
+        entries[replay_id] = raw._put_ascii_json(sink, replay_id, "winner_attempt_replay_receipt", replay)
+        assert entries[replay_id]["descriptor"]["sha256"] == replay_sha
+        ledger_fold = deepcopy(original_fold)
+        lanes = {tier: fold["lanes"]["final_lockbox_" + tier.lower()] for tier in ("P75", "P95")}
+        records = {tier: raw._independent_r_records(lane, regime=replay["regime"])
+                   for tier, lane in lanes.items()}
+        old_entries, witnesses = {}, {}
+        for tier, lane in lanes.items():
+            field = winner.V19_GENERATION.witness_field
+            old_sha = original_fold["tier_evidence"][tier][field]
+            old_witness = retained_object(old_sha)
+            assert old_witness["schema_version"] == "fxpm.independent-signal-resolved-witness.v1"
+            witness = raw._independent_resolved_witness(lane, records[tier],
+                attempt_replay_receipt_sha256=replay_sha, spread_tier=tier)
+            assert witness["schema_version"] == "fxpm.independent-signal-resolved-witness.v2"
+            assert {key: value for key, value in witness.items() if key not in ("owner", "schema_version")} == {
+                key: value for key, value in old_witness.items() if key != "schema_version"}
+            art_id = prefix + "/resolved-" + tier.lower()
+            art_type = "winner_independent_signal_r_witness"
+            old_entries[art_id] = raw._put_ascii_json(sink, art_id + "-retained-v1", art_type, old_witness)
+            assert old_entries[art_id]["descriptor"]["sha256"] == old_sha
+            entries[art_id] = raw._put_ascii_json(sink, art_id, art_type, witness)
+            ledger_fold["tier_evidence"][tier][field] = entries[art_id]["descriptor"]["sha256"]
+            witnesses[tier] = witness
+        owners[attempt_ordinal] = dict(prefix=prefix, attempt_ordinal=attempt_ordinal,
+            ledger_fold=ledger_fold, final_lanes=lanes, final_records=records, replay_receipt=replay,
+            original_fold=original_fold, old_entries=old_entries, witnesses=witnesses)
+
+    first = owners[80]
+    wrong_tier = raw._independent_resolved_witness(first["final_lanes"]["P75"], first["final_records"]["P75"],
+        attempt_replay_receipt_sha256=first["ledger_fold"]["attempt_replay_receipt_sha256"], spread_tier="P95")
+    wrong_tier_entry = raw._put_ascii_json(sink, first["prefix"] + "/swapped-tier-control",
+        "winner_independent_signal_r_witness", wrong_tier)
+    sink.seal()
+    return context, owners, entries, wrong_tier_entry
+
+
+def _verify_witness_owner(raw, context, owner, entries, *, retained=False, allow_retained_v1=False):
+    def read(artifact_id):
+        return raw._source_observation_closure_body(context, entries[artifact_id])
+
+    raw._verify_independent_resolved_witness_fold(prefix=owner["prefix"], attempt_ordinal=owner["attempt_ordinal"],
+        ledger_fold=owner["original_fold"] if retained else owner["ledger_fold"],
+        entries=entries, read=read, final_lanes=owner["final_lanes"], final_records=owner["final_records"],
+        replay_receipt=owner["replay_receipt"], allow_retained_v1=allow_retained_v1)
+
+
+def _two_owner_ledger(owners, *, repeat_witness=False):
+    from pm_winner_raw_evidence import _evidence_entry
+
+    # Actual retained fold owner and newly published witness references are
+    # inserted into the existing invented one-fold ledger validator fixture.
+    inputs = _v19_witness_ledger_inputs(repeated_witness=False)
+    payload, policy = inputs["payload"], inputs["policy"]
+    template_fold = payload["entries"][0]["folds"][0]
+    addendum = payload["selection_addendum"]
+    template_addendum = addendum["entries"][0]
+    template_attempt = inputs["attempts"][0]
+    template_complexity = policy["selection_complexity_roster"][0]
+    axis = payload["shared_fold_axis"][0]
+    attempts, evidence, addenda, complexities = [], [], [], []
+    field = winner.V19_GENERATION.witness_field
+    for ordinal, owner in enumerate(owners.values()):
+        actual_fold = owner["ledger_fold"]
+        attempt = {**template_attempt, "ordinal": ordinal,
+            "attempt_id": _sha(["INVENTED_TWO_OWNER_ATTEMPT", ordinal])[:40],
+            "process_candidate_id": _sha(["INVENTED_TWO_OWNER_CANDIDATE", ordinal])[:40]}
+        attempts.append(attempt)
+        complexities.append({**template_complexity, **{key: attempt[key]
+            for key in ("ordinal", "process_candidate_id")}})
+        fold = deepcopy(template_fold)
+        fold.update({key: actual_fold[key] for key in actual_fold if key != "tier_evidence"})
+        for tier, row in fold["tier_evidence"].items():
+            row[field] = actual_fold["tier_evidence"][tier][field]
+        if repeat_witness and ordinal == 1:
+            fold["tier_evidence"]["P75"][field] = owners[80]["ledger_fold"]["tier_evidence"]["P75"][field]
+        _rehash(fold, axis, policy)
+        evidence.append(_evidence_entry(attempt, status="PROCESS_REJECTED", folds=[fold]))
+        row = deepcopy(template_addendum)
+        row.update({key: attempt[key] for key in ("ordinal", "attempt_id", "process_candidate_id")})
+        row["stage_origin_binding"].update(attempt_ordinal=ordinal, attempt_id=attempt["attempt_id"])
+        addenda.append(row)
+    policy.update(selection_complexity_roster=complexities, selection_complexity_roster_sha256=_sha(complexities))
+    policy_sha, attempt_sha = _sha(policy), _sha({"attempts": attempts})
+    for row in addenda:
+        row["stage_origin_binding"]["precommitment_sha256"] = policy_sha
+    addendum.update(precommitment_payload_sha256=policy_sha, attempt_ledger_payload_sha256=attempt_sha,
+        selection_complexity_roster_sha256=policy["selection_complexity_roster_sha256"],
+        entries=addenda, entries_sha256=_sha(addenda))
+    payload.update(precommitment_payload_sha256=policy_sha, attempt_ledger_payload_sha256=attempt_sha,
+        attempt_count=len(attempts), entries=evidence, entries_sha256=_sha(evidence))
+    inputs.update(policy_sha=policy_sha, attempt_payload_sha=attempt_sha, attempts=attempts)
+    return winner._validate_evidence_ledger(**inputs)
+
+
+def test_source356_v19_distinct_resolved_witness_owners_pass_raw_and_winner(retained_v19_witness_owners):
+    import pm_winner_raw_evidence as raw
+
+    context, owners, entries, _ = retained_v19_witness_owners
+    first, second = (owners[ordinal]["witnesses"]["P75"] for ordinal in (80, 114))
+    assert {key: value for key, value in first.items() if key != "owner"} == {
+        key: value for key, value in second.items() if key != "owner"}
+    assert first["owner"] != second["owner"]
+    for owner in owners.values():
+        _verify_witness_owner(raw, context, owner, entries)
+    _, verified, _ = _two_owner_ledger(owners)
+    field = winner.V19_GENERATION.witness_field
+    assert [row["folds"][0]["tier_evidence"]["P75"][field] for row in verified] == [_sha(first), _sha(second)]
+    assert _sha(first) != _sha(second)
+
+
+def test_source356_v19_winner_refuses_same_resolved_witness_owner_replay(retained_v19_witness_owners):
+    _, owners, _, _ = retained_v19_witness_owners
+    with pytest.raises(winner._ContractError) as caught:
+        _two_owner_ledger(owners, repeat_witness=True)
+    assert str(caught.value) == "EVIDENCE_0001_POSITION_ACTIVITY_LEDGER_SHA256_REPLAYED_ACROSS_EVIDENCE_DOMAINS"
+
+
+@pytest.mark.parametrize("splice", ["owner", "tier"])
+def test_source356_v19_raw_refuses_swapped_resolved_witness(splice, retained_v19_witness_owners):
+    import pm_winner_raw_evidence as raw
+
+    context, owners, entries, wrong_tier = retained_v19_witness_owners
+    owner = deepcopy(owners[80])
+    art_id = owner["prefix"] + "/resolved-p75"
+    source = entries[owners[114]["prefix"] + "/resolved-p75"] if splice == "owner" else wrong_tier
+    # Move both references to the exact swapped body so identity comparison
+    # reaches the owner field rather than stopping at a digest mismatch.
+    read_view = {**entries, art_id: {**entries[art_id], "descriptor": source["descriptor"]}}
+    owner["ledger_fold"]["tier_evidence"]["P75"][winner.V19_GENERATION.witness_field] = source["descriptor"]["sha256"]
+    with pytest.raises(raw.WinnerRawEvidenceError, match="^" + _WITNESS_BINDING_REFUSAL + "$"):
+        _verify_witness_owner(raw, context, owner, read_view)
+
+
+def test_source356_v19_raw_reads_exact_v1_only_as_retained_evidence(retained_v19_witness_owners):
+    import pm_winner_raw_evidence as raw
+
+    context, owners, entries, _ = retained_v19_witness_owners
+    for owner in owners.values():
+        retained_entries = {**entries, **owner["old_entries"]}
+        _verify_witness_owner(raw, context, owner, retained_entries, retained=True, allow_retained_v1=True)
+        with pytest.raises(raw.WinnerRawEvidenceError, match="^" + _WITNESS_BINDING_REFUSAL + "$"):
+            _verify_witness_owner(raw, context, owner, retained_entries, retained=True)
 
 
 def test_additive_utility_has_no_wealth_domain_and_legacy_contract_is_retained():
