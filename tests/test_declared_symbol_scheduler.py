@@ -232,8 +232,17 @@ def _synthetic_declared_worker(contract,symbol):
         body=json.loads(path.read_text()) if path.exists() else None
         return SimpleNamespace(run_receipt=body,terminal_stop=bool(body and body["terminal_stop"]),
             first_uncommitted_slot=None if body else {"ordinal":1})
-    def execute(*,context,precommit,process,frozen_pipeline_config,cell_id,_verified_progress_out=None):
+    unpassed_numeric_preparation = object()
+
+    def execute(*,context,precommit,process,frozen_pipeline_config,cell_id,_verified_progress_out=None,
+            _numeric_preparation=unpassed_numeric_preparation):
         assert contexts[precommit.receipt_sha256] is context
+        if contract.get("_one_period_unit") is True:
+            assert type(_numeric_preparation) is producer._UnitNumericPreparation
+            numeric_preparation = "unit"
+        else:
+            assert _numeric_preparation is unpassed_numeric_preparation
+            numeric_preparation = "absent"
         note("search")
         if contract.get("synthetic_capacity_stage")=="execute":
             capacity_failure()
@@ -247,6 +256,7 @@ def _synthetic_declared_worker(contract,symbol):
             (board/f"{precommit.to_dict()['run_id']}.started").write_bytes(_encoded(
                 {"pid": os.getpid(), "symbol": symbol, "timeframe": cell["timeframe"],
                     "regime": cell["regime"], "root": str(context.root),
+                    "numeric_preparation": numeric_preparation,
                     "classification": "SYNTHETIC_METADATA_ONLY"}))
             if contract.get("synthetic_unit_barrier"):
                 (board/f"unit-{symbol}-{cell['timeframe']}.arrived").write_text(str(os.getpid()))
@@ -566,7 +576,8 @@ def test_malformed_completed_domain_row_closes_admission_before_refill(tmp_path,
 
 @pytest.mark.parametrize("reason",["WINDOW_EXPIRED","NATIVE_DRIFT"])
 def test_finalized_slots_without_account_precheck_lapse_before_new_native_production(tmp_path,reason):
-    contract=_contract(tmp_path,("AUDUSD",));contract["synthetic_account_unavailable"]=True
+    contract = _ordinary_contract(tmp_path, [("AUDUSD", "H1", "TREND")], mode="final_study_13")
+    contract["synthetic_account_unavailable"] = True
     with pytest.raises(scheduler.DeclaredSymbolSchedulerError) as caught:
         scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker,contract=contract,
             requested_workers=1,telemetry_path=tmp_path/"incomplete-account.jsonl")
@@ -903,6 +914,14 @@ def test_unresolved_or_invalid_parallel_reason_never_admits_capacity(tmp_path, r
     assert row["run_receipt"] is None and row["account_descriptor"] is None
 
 
+def _assert_unit_numeric_preparation(contract, *, attempted=None):
+    board = Path(contract["synthetic_board"])
+    started = {path.stem: path.read_bytes() for path in board.glob("*.started")}
+    expected = {cell["run_id"]: "unit" for cell in contract["cells"][:attempted]}
+    assert {run_id: json.loads(body)["numeric_preparation"] for run_id, body in started.items()} == expected
+    return started
+
+
 def test_ordinary_one_period_same_symbol_timeframes_overlap_with_disjoint_namespaces(tmp_path, capfd):
     import pm_authority_spool as spool
     import pm_end_grid as grid
@@ -919,6 +938,7 @@ def test_ordinary_one_period_same_symbol_timeframes_overlap_with_disjoint_namesp
     assert [row["cell_id"] for row in report["cells"]] == [row["cell"]["cell_id"] for row in contract["cells"]]
     assert all(row["status"] == "COMPLETED" and row["independent_one_period"] is True
         and row["run_receipt_confirmed"] for row in report["cells"])
+    _assert_unit_numeric_preparation(contract)
     pids = {timeframe: {result["worker_pid"] for source, result in zip(contract["cells"], report["cells"], strict=True)
         if source["cell"]["timeframe"] == timeframe}
         for timeframe in ("H1", "H4")}
@@ -982,6 +1002,7 @@ def test_ordinary_one_period_failure_continues_sibling_cells_and_refills_queue(t
     assert all(row["independent_one_period"] is True for row in report["cells"])
     assert all(Path(row["root"]).exists() for row in contract["cells"])
     assert all(row["run_receipt_confirmed"] for row in report["cells"][1:])
+    _assert_unit_numeric_preparation(contract)
 
 
 @pytest.mark.parametrize("action,reason", [("permission", "PermissionError"),
@@ -1002,6 +1023,7 @@ def test_ordinary_one_period_fatal_failure_stops_refill_and_labels_unstarted_cel
     assert report["cells"][0]["closes_admission"] is True
     assert all(row["reason_code"] for row in report["cells"][1:])
     assert all(not Path(row["root"]).exists() for row in contract["cells"][1:])
+    _assert_unit_numeric_preparation(contract, attempted=1)
 
 
 @pytest.mark.parametrize("mode", ["handover", "final_study_13"])
@@ -1020,12 +1042,14 @@ def test_ordinary_saved_contexts_keep_symbol_grouping_without_new_search_or_proc
     first = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
         requested_workers=2, telemetry_path=tmp_path / "fresh-contexts.jsonl")
     assert first["status"] == "COMPLETED" and first["worker_limit"] == 2
+    started = _assert_unit_numeric_preparation(contract)
     contract.update(synthetic_forbid_replay=True, synthetic_forbid_process_freeze=True)
     second = scheduler.run_declared_symbol_scheduler(_synthetic_declared_worker, contract=contract,
         requested_workers=2, telemetry_path=tmp_path / "saved-contexts.jsonl")
     assert second["status"] == "COMPLETED" and second["worker_limit"] == 1
     assert [row["status"] for row in second["cells"]] == ["REOPENED", "REOPENED"]
     assert len({row["worker_pid"] for row in second["cells"]}) == 1
+    assert _assert_unit_numeric_preparation(contract) == started
 
 
 def test_ordinary_child_progress_sink_failure_is_observational(tmp_path):
@@ -1036,3 +1060,4 @@ def test_ordinary_child_progress_sink_failure_is_observational(tmp_path):
     assert report["status"] == "COMPLETED"
     assert [row["status"] for row in report["cells"]] == ["COMPLETED", "COMPLETED"]
     assert all(row["independent_one_period"] is True and row["run_receipt_confirmed"] for row in report["cells"])
+    _assert_unit_numeric_preparation(contract)
