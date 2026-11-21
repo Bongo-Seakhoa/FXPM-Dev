@@ -6715,7 +6715,7 @@ def verify_matched_floor_publication_chain(context, *, frozen, request, producer
             fold = folds[witness["fold_ordinal"]]
             geometry = next(row for row in fold["provenance"]["anchor_horizon_decision"]["partition_geometry"]
                 if row["role"] == witness["partition_role"])
-            if frozen.selection_generation.independent_signal_r_enabled:
+            if independent:
                 role = witness["partition_role"]
                 facts = {**witness["facts"], "index": source_indexes[witness["fold_ordinal"]][role],
                     "batches": {tier: fold["lanes"][role + "_" + tier.lower()]["batch"] for tier in _TIERS}}
