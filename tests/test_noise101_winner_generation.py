@@ -6,11 +6,8 @@ exercise transport and generation contracts; they are not the actual 101 roster.
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
-from importlib.util import module_from_spec, spec_from_file_location
 import json
-import os
 from pathlib import Path
-import sys
 from types import MappingProxyType
 
 import pytest
@@ -74,18 +71,9 @@ def _v18_request(attempt_count=2):
 
 
 def _old_v13_policy():
-    checkout = Path(os.environ.get("FXPM_QA_AUTHORITATIVE_CHECKOUT", Path.cwd()))
-    path = checkout / ".tmp/fxpm_noise101_software_image_003/pm_winner_selection.py"
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == "91caf76e6232edc46110b52f0753521c00fc6897adc41b25edc201bc043058ca"
-    name = "fxpm_invented_source303_v13_policy_baseline"
-    spec = spec_from_file_location(name, path)
-    module = module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-        return dict(module.V17_SELECTION_POLICY), module.V17_GENERATION.policy_sha256
-    finally:
-        sys.modules.pop(name, None)
+    # Frozen policy from bc5c023e994470ee5e8ba34e381349212c4ab3c1, before Noise101.
+    path = Path(__file__).with_name("fixtures") / "winner_v13_policy.json"
+    return json.loads(path.read_bytes()), "84f4f22073d4b331ca671636138b9761445181e0e904fc626cf734dfb8761922"
 
 
 def test_v18_policy_changes_exactly_two_keys_and_preserves_actual_v13_bytes():
@@ -95,7 +83,8 @@ def test_v18_policy_changes_exactly_two_keys_and_preserves_actual_v13_bytes():
     assert hashlib.sha256(canonical(old)).hexdigest() == old_sha == winner.V17_GENERATION.policy_sha256
     new = dict(winner.V18_SELECTION_POLICY)
     assert new.keys() == old.keys()
-    assert {key for key in new if new[key] != old[key]} == {"policy_version", "moving_block_bootstrap_operation_limit"}
+    changed = {key for key in new if canonical(new[key]) != canonical(old[key])}
+    assert changed == {"policy_version", "moving_block_bootstrap_operation_limit"}
     assert new["policy_version"] == "fxpm.winner-statistical-policy.v14"
     assert new["moving_block_bootstrap_operation_limit"] == 141484032
     assert winner.V18_GENERATION.statistical_policy_version == new["policy_version"]

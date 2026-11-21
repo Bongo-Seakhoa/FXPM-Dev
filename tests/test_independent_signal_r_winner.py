@@ -522,7 +522,8 @@ def test_legacy_v17_v18_policy_bytes_and_keys_remain_the_accepted_contract():
     assert json.dumps(old, sort_keys=True) == json.dumps(dict(winner.V17_SELECTION_POLICY), sort_keys=True)
     newer = dict(winner.V18_SELECTION_POLICY)
     assert newer.keys() == old.keys()
-    assert {key for key in old if old[key] != newer[key]} == {"policy_version", "moving_block_bootstrap_operation_limit"}
+    changed = {key for key in old if json.dumps(old[key], sort_keys=True) != json.dumps(newer[key], sort_keys=True)}
+    assert changed == {"policy_version", "moving_block_bootstrap_operation_limit"}
 
 
 def test_matched_floor_equality_and_aliases_remain_stable():
