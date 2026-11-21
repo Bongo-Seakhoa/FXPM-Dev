@@ -148,14 +148,14 @@ def test_merge_authenticates_all_segments_before_accepting_survivor_subsets():
 
 
 @pytest.fixture
-def owned_tree():
-    root = Path(os.environ["FXPM_DERIVED_QA_ROOT"])
-    assert root.is_absolute() and root.is_dir()
-    spool._reject_reparse_chain(root)
+def owned_tree(tmp_path, monkeypatch):
     helper = importlib.import_module("tests.test_completed_generation_retirement")
     fixture = helper.CompletedGenerationRetirementTests(
         "test_native_completion_archives_owned_payload_and_retains_exact_full_grid")
-    fixture.setUp()
+    with monkeypatch.context() as fixture_env:
+        if not os.environ.get("FXPM_DERIVED_QA_ROOT"):
+            fixture_env.setenv("FXPM_DERIVED_QA_ROOT", str(tmp_path))
+        fixture.setUp()
     context, entries, arguments = fixture.fixture()
     return context, entries, {**arguments, "segment_max_records": 2}
 
@@ -526,7 +526,7 @@ def test_explicit_cold_process_resumes_the_same_v2_marker(owned_tree, monkeypatc
     request = args["source_fence_path"].parent / "invented-cold-resume.json"
     request.write_bytes(_encode({"root": str(context.root), "arguments": payload}))
     candidate = Path(spool.__file__).resolve().parent
-    canonical = Path(__file__).resolve().parents[3]
+    canonical = Path(storage.__file__).resolve().parent
     script = """import json,sys
 from pathlib import Path
 sys.path.insert(0,sys.argv[1]); sys.path.insert(1,sys.argv[2])
