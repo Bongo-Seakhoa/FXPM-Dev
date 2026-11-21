@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import UserDict
 import copy
 import hashlib
 from dataclasses import replace
@@ -1517,11 +1518,13 @@ def test_historical_executor_replays_before_attempt_verification(
         lambda *_args, **_kwargs: None,
     )
 
+    process = UserDict(schema_version=search_planner.PROCESS_SCHEMA)
+    process.to_dict = process.data.copy
     result = execution.execute_historical_observed_cell(
         capture=capture,
         fitted=fitted,
         regime="TREND",
-        search_process=object(),
+        search_process=process,
         cell_plan=object(),
         config=config,
     )
@@ -1811,11 +1814,13 @@ def test_historical_executor_replays_envelope_before_attempt_roster(
         lambda **_kwargs: None,
     )
 
+    process = UserDict(schema_version=search_planner.PROCESS_SCHEMA)
+    process.to_dict = process.data.copy
     result = execution.execute_historical_observed_cell(
         capture=capture,
         fitted=fitted,
         regime="TREND",
-        search_process=SimpleNamespace(),
+        search_process=process,
         cell_plan=SimpleNamespace(),
         config=_config(),
     )
@@ -2594,7 +2599,9 @@ def test_historical_native_entry_executes_real_tiers_under_unissued_control(tmp_
     case, request, capture, _handle, _evidence = fixture._current_capture_from_case(
         current_native_case, tmp_path, freeze=False)
     regime = case["plan"].to_dict()["cell"]["regime"]
-    process = SimpleNamespace(receipt_sha256=request.to_dict()["search_process_receipt_sha256"])
+    process = UserDict(schema_version=search_planner.PROCESS_SCHEMA)
+    process.to_dict = process.data.copy
+    process.receipt_sha256 = request.to_dict()["search_process_receipt_sha256"]
     plan = SimpleNamespace(mode="HISTORICAL_ANCHOR", symbol=capture.symbol, timeframe="D1", regime=regime,
         search_process_receipt_sha256=process.receipt_sha256, horizon_plan=case["plan"],
         attempt_artifacts=lambda: case["attempt_artifacts"],
@@ -2649,7 +2656,10 @@ def _current_unissued_control_plan(case, *, artifact_namespace="current-refit/un
 def test_current_native_entry_executes_real_tiers_under_unissued_control(tmp_path, monkeypatch, current_native_case):
     from tests import test_winner_raw_evidence as raw_fixture
     case = raw_fixture.clone_current_native_case(current_native_case, tmp_path)
-    plan, process = _current_unissued_control_plan(case)
+    plan, original_process = _current_unissued_control_plan(case)
+    process = UserDict(schema_version=search_planner.PROCESS_SCHEMA)
+    process.to_dict = process.data.copy
+    process.receipt_sha256 = original_process.receipt_sha256
     _unissued_outer_control(monkeypatch, case, case["sink"], plan, process)
     publications = raw_fixture._record_real_source_observation_publication(monkeypatch)
     result = execution.execute_current_observed_cell(process=process, sink=case["sink"], cell_plan=plan,
@@ -2756,15 +2766,19 @@ def test_current_executor_persists_binding_before_strategy_evaluation(
         "schema_version": "fxpm.winner-partition-cost-precommitments.v1", "rows": [],
     }
     order = []
+    cache_branches = []
 
     def precommit_costs(**kwargs):
         assert kwargs["attempts"] == (verified_attempt,)
         assert kwargs["fitted"] is fitted
         assert kwargs["plan_body"] is plan_body
+        cache = kwargs["source_observation_cache"]
+        assert cache == {}
         if not empty_reference_cache:
             receipt = transport["receipt"]
-            kwargs["source_observation_cache"][execution._sha256(["SYNTHETIC_ORDERING_GEOMETRY"])] = (
+            cache[execution._sha256(["SYNTHETIC_ORDERING_GEOMETRY"])] = (
                 receipt["receipt_sha256"], execution._canonical_bytes(receipt))
+        cache_branches.append("complete" if cache else "empty")
         order.append("costs")
         return partition_costs
 
@@ -2837,12 +2851,17 @@ def test_current_executor_persists_binding_before_strategy_evaluation(
         order.append("produce")
         return produced
 
-    monkeypatch.setattr(execution.raw_winner, "produce_winner_v15_raw_evidence", produce)
+    def producer_for_generation(generation):
+        assert generation is winner.CURRENT_GENERATION
+        return produce
+
+    monkeypatch.setattr(execution.raw_winner, "raw_evidence_producer_for_generation", producer_for_generation)
     if empty_reference_cache:
         with pytest.raises(execution.AuthoritativeSearchExecutionError) as error:
             execution.execute_current_observed_cell(process=process, sink=sink,
                 cell_plan=cell_plan, fitted=fitted, config=_config())
         assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_SET_REQUIRED"
+        assert cache_branches == ["empty"]
         assert persisted["value"] is True
         assert order == ["costs", "freeze", "persist"]
         assert not stage.exists()
@@ -2852,6 +2871,7 @@ def test_current_executor_persists_binding_before_strategy_evaluation(
         process=process, sink=sink, cell_plan=cell_plan, fitted=fitted, config=_config(),
     )
     assert result.status == "WINNER_RAW_EVIDENCE_COMPLETE"
+    assert cache_branches == ["complete"]
     assert result.production is produced
     assert result.cross_binding_bytes == binding_bytes
     descriptor = result.cross_binding_entry["descriptor"]
@@ -3635,7 +3655,8 @@ def test_entry_admission_shared_pool_across_planned_attempts_keeps_real_checks(m
     case = _invented_admission_executor_case()
     backtesters, strategies = [], []
 
-    def runtime_strategy(_attempt):
+    def runtime_strategy(_attempt, *, timeframe):
+        assert timeframe == "H1"
         strategy = case.Strategy()
         strategies.append(strategy)
         return strategy, {}
