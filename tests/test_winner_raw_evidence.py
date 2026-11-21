@@ -389,12 +389,25 @@ def test_source_observation_reference_provenance_rejects_version_or_schema_mix(t
 
 
 def _source_observation_closure_case(tmp_path, *, referenced=True, replay_mutation=None,
-        provenance_mutation=None):
+        provenance_mutation=None, generation=winner.CURRENT_GENERATION,
+        independent_provenance=False, splice_source=False):
     from tests.test_authoritative_search_execution import _fold_provenance_transport_fixture
     case = _source_observation_transport_case(tmp_path)
     reference = _publish_observation_transport(case) if referenced else None
-    provenance, _, _ = _fold_provenance_transport_fixture(source_observation_references=(
-        {partition: reference for partition in raw._PARTITIONS} if referenced else None))
+    references = {partition: reference for partition in raw._PARTITIONS} if referenced else None
+    published_references = [reference] if referenced else []
+    if splice_source:
+        alternate = copy.deepcopy(case["receipt"])
+        alternate["observations"][0]["points"] = 8.0
+        replacement = _publish_observation_transport(case, _reseal(alternate))
+        references["optimizer_train"] = replacement
+        published_references.append(replacement)
+    provenance, _, _ = _fold_provenance_transport_fixture(source_observation_references=references)
+    if independent_provenance:
+        replay = provenance["attempt_replay_receipt"]
+        replay["genuine_independent_signal_r_capture"] = replay.pop("position_events_are_genuine_backtester_v2")
+        provenance = {role: _reseal({**receipt, "schema_version": raw.INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA})
+            for role, receipt in provenance.items()}
     replay = provenance["attempt_replay_receipt"]
     if replay_mutation is not None:
         replay_mutation(replay)
@@ -405,7 +418,8 @@ def _source_observation_closure_case(tmp_path, *, referenced=True, replay_mutati
     frozen = replace(case["frozen"],
         attempt_ledger_bytes=_canonical({"attempts": [
             {"ordinal": 0, "precommitted_evidence_role": "EVALUATION_REQUIRED"}]}),
-        precommitment_bytes=_canonical({"causal_fold_plan": [{"fold_ordinal": 0}]}),
+        precommitment_bytes=_canonical({"contract_version": generation.precommitment_version,
+            "causal_fold_plan": [{"fold_ordinal": 0}]}),
         partition_cost_precommitments_bytes=_canonical({"rows": [
             {"attempt_ordinal": 0, "fold_ordinal": 0, "partition": partition,
                 "source_observation_receipt_sha256": case["receipt"]["receipt_sha256"]}
@@ -416,8 +430,8 @@ def _source_observation_closure_case(tmp_path, *, referenced=True, replay_mutati
         entry = raw._put_ascii_json(case["sink"],
             prefix + "/attempt-0000/fold-000/provenance/" + role, "winner_" + role, body)
         roster["attempt-0000-fold-000-provenance-" + role] = entry["descriptor"]
-    if referenced:
-        descriptor = reference["artifact_entry"]["descriptor"]
+    for published in published_references:
+        descriptor = published["artifact_entry"]["descriptor"]
         roster["source-observation-" + descriptor["sha256"]] = descriptor
     return {**case, "frozen": frozen, "reference": reference, "replay": replay,
         "production_receipt": {"artifact_roster": roster}, "entries": case["sink"].artifact_roster()}
@@ -428,8 +442,7 @@ def _verify_observation_transport_closure(case, *, context=None):
         frozen=case["frozen"], manifest_entries=case["entries"], production_receipt=case["production_receipt"])
 
 
-def test_source_observation_reference_symbol_seal_and_cold_closure(tmp_path):
-    case = _source_observation_closure_case(tmp_path)
+def _assert_cold_observation_transport_closure(case):
     receipt = case["sink"].seal()
     manifest = spool.verify_symbol_receipt(case["context"].root, receipt,
         expected_generation_id=case["context"].generation_id, expected_symbol="EURUSD",
@@ -448,8 +461,11 @@ def test_source_observation_reference_symbol_seal_and_cold_closure(tmp_path):
         reference=case["reference"], expected_receipt_sha256=case["receipt"]["receipt_sha256"])) == _canonical(case["receipt"])
 
 
-def test_source_observation_reference_closure_expands_actual_compact_cost_precommitments(tmp_path):
-    case = _source_observation_closure_case(tmp_path)
+def test_source_observation_reference_symbol_seal_and_cold_closure(tmp_path):
+    _assert_cold_observation_transport_closure(_source_observation_closure_case(tmp_path))
+
+
+def _bind_compact_observation_costs(case):
     costs = _partition_transport_case(attempt_count=1, fold_count=1)
     for row in costs["rows"]:
         row["source_observation_receipt_sha256"] = case["receipt"]["receipt_sha256"]
@@ -458,7 +474,56 @@ def test_source_observation_reference_closure_expands_actual_compact_cost_precom
     assert all("source_observation_receipt_sha256" not in row for row in compact["rows"])
     case["frozen"] = replace(case["frozen"], frozen_tier_pair_contract_bytes=_canonical(costs["pair"]),
         partition_cost_precommitments_bytes=_canonical(compact))
+
+
+def test_source_observation_reference_closure_expands_actual_compact_cost_precommitments(tmp_path):
+    case = _source_observation_closure_case(tmp_path)
+    _bind_compact_observation_costs(case)
     assert _verify_observation_transport_closure(case) is None
+
+
+def test_independent_source_observation_reference_cold_closure(tmp_path):
+    case = _source_observation_closure_case(tmp_path, generation=winner.V19_GENERATION,
+        independent_provenance=True)
+    assert case["frozen"].selection_generation is winner.V19_GENERATION
+    assert case["replay"]["schema_version"] == raw.INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+    assert case["replay"]["genuine_independent_signal_r_capture"] is True
+    _bind_compact_observation_costs(case)
+    _assert_cold_observation_transport_closure(case)
+
+
+@pytest.mark.parametrize("generation,independent_provenance,mixed", [
+    pytest.param(winner.V17_GENERATION, True, False, id="v6-on-v17"),
+    pytest.param(winner.V19_GENERATION, False, False, id="v5-on-v19"),
+    pytest.param(winner.V19_GENERATION, True, True, id="mixed-v5-v6"),
+])
+def test_independent_source_observation_reference_cold_closure_refuses_wrong_provenance(
+        tmp_path, generation, independent_provenance, mixed):
+    def mix_provenance(provenance):
+        receipt = provenance["anchor_refit_receipt"]
+        provenance["anchor_refit_receipt"] = _reseal({**receipt,
+            "schema_version": raw.REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA})
+
+    case = _source_observation_closure_case(tmp_path, generation=generation,
+        independent_provenance=independent_provenance, provenance_mutation=mix_provenance if mixed else None)
+    assert case["frozen"].selection_generation is generation
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _verify_observation_transport_closure(case)
+    assert error.value.code == "SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID"
+
+
+def test_independent_source_observation_reference_cold_closure_refuses_spliced_source(tmp_path):
+    case = _source_observation_closure_case(tmp_path, generation=winner.V19_GENERATION,
+        independent_provenance=True, splice_source=True)
+    source = case["replay"]["source_observation_references"]["optimizer_train"]
+    assert source["source_observation_receipt_sha256"] != case["receipt"]["receipt_sha256"]
+    assert raw.resolve_source_observation_reference(case["sink"], frozen=case["frozen"], reference=source,
+        expected_receipt_sha256=source["source_observation_receipt_sha256"])["observations"][0]["points"] == 8.0
+    descriptor = source["artifact_entry"]["descriptor"]
+    assert case["production_receipt"]["artifact_roster"]["source-observation-" + descriptor["sha256"]] == descriptor
+    with pytest.raises(raw.WinnerRawEvidenceError) as error:
+        _verify_observation_transport_closure(case)
+    assert error.value.code == "SOURCE_OBSERVATION_RECEIPT_BINDING_INVALID"
 
 
 @pytest.mark.parametrize("mutation", ["orphan", "omitted_manifest_source", "omitted_production_source",

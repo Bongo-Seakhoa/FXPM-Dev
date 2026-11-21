@@ -3221,6 +3221,19 @@ def _independent_r_strategy_surface(*, attempt, parameters, strategy, fitted,
         owner.prepare_strategy_surface(key, strategy, before, fitted._frame, compute))
 
 
+def _independent_r_spread_admission(seed_admission, *, entry_bars, admission_states, records):
+    states = admission_states[entry_bars]
+    return {
+        **seed_admission,
+        "signal_opportunities": len(entry_bars),
+        "known_cap_pass_opportunities": int(np.count_nonzero(states == "ADMIT")),
+        "known_cap_refused_opportunities": int(np.count_nonzero(states == "REFUSE")),
+        "missing_refused_opportunities": int(np.count_nonzero(states == "MISSING")),
+        "missing_executed_legs": sum(record.entry_admission == "MISSING" and record.entry_price is not None
+            for record in records),
+    }
+
+
 def _build_independent_r_attempt_evidence(*, attempt, raw_attempt_id, plan_body,
         plan_receipt_sha256, fitted, config, partition_cost_precommitments,
         source_observation_references, prepared_inputs, source_sink=None, frozen=None, array_entries=None,
@@ -3270,7 +3283,9 @@ def _build_independent_r_attempt_evidence(*, attempt, raw_attempt_id, plan_body,
                     fold_ordinal=ordinal, partition=partition))
             axis, half_spread_arrays = _independent_r_geometry_inputs(prepared, features,
                 timeframe=timeframe, warmup_bars=partition.warmup_bars)
-            start = pd.Timestamp(features["_BAR_CLOSE_TS"].iloc[max(1, partition.warmup_bars) - 1])
+            entry_start = max(1, partition.warmup_bars)
+            start = pd.Timestamp(features["_BAR_CLOSE_TS"].iloc[entry_start - 1])
+            entry_bars = np.flatnonzero(signals.to_numpy()[entry_start - 1:-1]) + entry_start
             for tier in ("P75", "P95"):
                 values = prepared[tier]
                 probe = values["source_probe"]
@@ -3299,8 +3314,10 @@ def _build_independent_r_attempt_evidence(*, attempt, raw_attempt_id, plan_body,
                     "partition_axis": dict(axis), "trade_power_partition_axis": dict(axis),
                     "source_reference": dict(reference), "batch": asdict(batch),
                     "source_contract": source_contract,
+                    "spread_admission": _independent_r_spread_admission(probe["spread_admission"],
+                        entry_bars=entry_bars, admission_states=values["admission_states"], records=batch.records),
                     **{key: copy.deepcopy(probe[key]) for key in (
-                        "numerical_execution_cost_attestation", "spread_model", "spread_admission",
+                        "numerical_execution_cost_attestation", "spread_model",
                         "swap_accrual_contract")}}
                 _verify_partition_precommitment(precommitments=partition_cost_precommitments,
                     attempt=attempt, fold_ordinal=ordinal, partition=partition, tier=tier,

@@ -4332,16 +4332,23 @@ def verify_source_observation_reference_closure(context: Any, *, frozen: FrozenW
     versions: set[str] = set()
     pair_common: dict[tuple[int, int], dict[str, Any]] = {}
     replay_entries: dict[tuple[int, int], Mapping[str, Any]] = {}
+    referenced_schemas = {REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA, INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA}
     specifics = {schema: _provenance_specific_keys(current=True,
-        referenced=schema == REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA)
-        for schema in (CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA, REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA)}
+        referenced=schema in referenced_schemas,
+        independent=schema == INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA)
+        for schema in (CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA, REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA,
+            INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA)}
+    try:
+        independent = bool(provenance_entries) and frozen.selection_generation.independent_signal_r_enabled
+    except ValueError as exc:
+        raise WinnerRawEvidenceError("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID") from exc
     for artifact_id, entry in provenance_entries.items():
         receipt = _source_observation_closure_body(context, entry)
         schema = receipt.get("schema_version")
-        if type(schema) is not str or schema not in {CURRENT_AUTHORITATIVE_PROVENANCE_SCHEMA, REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA}:
+        if type(schema) is not str or schema not in specifics:
             _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
         versions.add(schema)
-        if len(versions) > 1:
+        if len(versions) > 1 or (schema == INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA) != independent:
             _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
         specific = specifics[schema]
         role = receipt.get("receipt_role")
@@ -4378,7 +4385,7 @@ def verify_source_observation_reference_closure(context: Any, *, frozen: FrozenW
         for ordinal, fold_ordinal in expected_pairs for role in _PROVENANCE_KEYS}
     if set(provenance_entries) != expected_provenance_ids or set(replay_entries) != expected_pairs:
         _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
-    if REFERENCED_AUTHORITATIVE_PROVENANCE_SCHEMA not in versions:
+    if versions.isdisjoint(referenced_schemas):
         if source_entries or observed_keys:
             _fail("SOURCE_OBSERVATION_REFERENCE_CLOSURE_INVALID")
         return

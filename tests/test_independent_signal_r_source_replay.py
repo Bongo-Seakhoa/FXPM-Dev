@@ -287,3 +287,78 @@ def test_production_reuses_episode_axis_and_array_encodings_at_their_existing_ow
         for tier in ("P75", "P95"):
             for side in ("entry_half_spread", "intrabar_half_spread"):
                 assert left[tier][side] is right[tier][side]
+
+
+def test_v19_session_admission_counters_pass_strict_raw_reconstruction(monkeypatch):
+    import pm_winner_raw_evidence as raw
+    from pm_spread_profile import spread_admission
+
+    class SessionStops(FixedStops):
+        def session_spec(self, symbol):
+            return (0, 120)
+
+    case = _source_case(monkeypatch)
+    frame, spec = case["frame"], case["spec"]
+    strategy = SessionStops()
+    signals = case["signals"]
+    observations = pd.Series([1., 1., 3., 5., np.nan, 1.], index=frame.index)
+    observations_sha = hashlib.sha256(pd.util.hash_pandas_object(
+        observations, index=True).values.tobytes()).hexdigest()
+    axis = pm_core.build_backtest_partition_axis(frame, timeframe="H1", warmup_bars=1)
+    cutoff = pd.Timestamp(axis["end_utc"])
+    episodes = opportunities.independent_entry_episodes(
+        frame, symbol=spec.symbol, timeframe="H1", cutoff_utc=cutoff)
+    entry_bars = np.flatnonzero(signals.to_numpy()[:-1]) + 1
+    expected = {"P75": (5, 2, 2, 1, 0), "P95": (5, 3, 1, 1, 0)}
+    counter_keys = ("signal_opportunities", "known_cap_pass_opportunities",
+        "known_cap_refused_opportunities", "missing_refused_opportunities", "missing_executed_legs")
+    reconstructed, lanes = [], {}
+    for tier, contract in case["tiers"].items():
+        pricing, prepared = pm_core.Backtester(case["config"]), {}
+        probe = pricing.build_evidence_source_seed_result(frame, spec.symbol, spec=spec, timeframe="H1",
+            spread_tier=contract, entry_spread_observations=observations, _prepared_inputs_out=prepared)
+        seed = probe["spread_admission"]
+        before = dict(seed)
+        provenance = opportunities.OpportunityProvenance(strategy.name, execution._sha256("INVENTED_CONFIG"),
+            execution._sha256("INVENTED_SURFACE"), tier, execution._sha256(probe["numerical_execution_cost_attestation"]),
+            execution._sha256(seed))
+        batch = opportunities.evaluate_independent_signal_r(
+            frame, signals, pricing=pricing, episode_ids=episodes, strategy=strategy, spec=spec,
+            symbol=spec.symbol, timeframe="H1", cutoff_utc=cutoff, signal_start_utc=frame["_BAR_CLOSE_TS"].iloc[0],
+            entry_half_spreads=prepared["entry_half_spread"], exit_half_spreads=prepared["intrabar_half_spread"],
+            entry_admission=prepared["admission_states"], provenance=provenance)
+        admission = execution._independent_r_spread_admission(seed, entry_bars=entry_bars,
+            admission_states=prepared["admission_states"], records=batch.records)
+        assert seed == before and all(key not in seed for key in counter_keys)
+        assert tuple(admission[key] for key in counter_keys) == expected[tier]
+        assert any(row.exit_reason == "SESSION" for row in batch.records)
+        assert any(row.eligibility_reason == "STRATEGY_SESSION_REFUSED" for row in batch.records)
+        states = np.array([spread_admission(contract, point) for point in observations])
+        mask = states == "ADMIT"
+        mask_sha = hashlib.sha256(mask.astype(np.uint8).tobytes()).hexdigest()
+        reconstructed.append((tier, states, mask, mask_sha))
+        lanes["optimizer_train_" + tier.lower()] = {
+            "schema_version": raw.INDEPENDENT_R_PARTITION_SCHEMA,
+            "trade_power_partition_axis": axis, "batch": asdict(batch),
+            "spread_model": probe["spread_model"], "spread_admission": admission,
+        }
+
+    transport = {"schema_version": raw.SOURCE_OBSERVATIONS_SCHEMA, "symbol": spec.symbol,
+        "timeframe": "H1", "source_timeframe": "M1", "observations": [], "entry_observations_sha256": observations_sha,
+        "source_product": {"data_dir": "INVENTED_UNIT_TRANSPORT", "index_descriptor": {},
+            "index_sha256": "0" * 64, "symbol": spec.symbol, "timeframe": "M1",
+            "cutoff_utc": cutoff.isoformat(), "activation_manifest_sha256": "1" * 64,
+            "production_contract_required": False}}
+    transport["receipt_sha256"] = raw._sha_json(transport)
+
+    # The source state is independently reconstructed above. Exercise the strict
+    # partition/receipt checks with the real session evaluator output.
+    monkeypatch.setattr(raw, "_prepare_source_observation_receipt",
+        lambda *_args, **_kwargs: (frame.index, observations_sha, tuple(reconstructed)))
+    inputs = {"sink": None, "frozen": SimpleNamespace(symbol=spec.symbol, timeframe="H1"),
+        "expected_sha256": transport["receipt_sha256"], "partition": "optimizer_train",
+        "signals": {"values": signals.tolist()}, "lanes": lanes}
+    assert raw._validated_source_observation_receipt(transport, **inputs) == transport
+    lanes["optimizer_train_p75"]["spread_admission"]["known_cap_pass_opportunities"] += 1
+    with pytest.raises(raw.WinnerRawEvidenceError, match="TIER_ADMISSION_RECONSTRUCTION_FAILED"):
+        raw._validated_source_observation_receipt(transport, **inputs)
