@@ -1,4 +1,5 @@
 """INVENTED SOFTWARE FIXTURES ONLY: no market, source, or profitability evidence."""
+from datetime import date, datetime, timedelta
 import hashlib
 import json
 
@@ -71,6 +72,133 @@ def _validate(fold, axis, policy):
     return winner._validate_current_fold(fold, ordinal=0, shared_axis=axis, policy=policy,
         attempt_payload_sha=_sha("INVENTED"), attempted_trials=1, authenticated=False,
         _generation=winner.V19_GENERATION)
+
+
+def _v19_witness_ledger(*, repeated_witness):
+    from pm_authority_spool import ARTIFACT_DESCRIPTOR_SCHEMA
+    from pm_winner_raw_evidence import _evidence_entry
+
+    generation = winner.V19_GENERATION
+    fold, axis, policy = _fold_fixture()
+    cell = ("EURUSD", "D1", "TREND")
+    policy.update(contract_version=generation.precommitment_version,
+        run_id="INVENTED_V19_WITNESS_REPLAY", cell_id=winner.compute_cell_id(*cell),
+        symbol=cell[0], timeframe=cell[1], regime=cell[2],
+        frozen_tier_pair_contract_sha256=_sha(policy["frozen_tier_pair_contract"]))
+    policy.update({name: _sha(["INVENTED", name]) for name in (
+        "partition_cost_precommitments_sha256", "process_registry_sha256",
+        "horizon_registry_sha256", "trial_registry_sha256")})
+    attempt = {
+        "ordinal": 0, "attempt_id": _sha("INVENTED_ATTEMPT")[:40],
+        "process_candidate_id": _sha("INVENTED_CANDIDATE")[:40],
+        "strategy_id": "INVENTED_STRATEGY", "precommitted_evidence_role": "EVALUATION_REQUIRED",
+        **{name: _sha(["INVENTED", name]) for name in (
+            "process_sha256", "horizon_process_sha256", "trial_definition_sha256", "refit_recipe_sha256")},
+        **{name: policy[name] for name in ("source_contract_sha256", "cost_contract_sha256",
+            generation.pair_field, "risk_unit_contract_sha256")},
+    }
+    complexity = {key: attempt[key] for key in ("ordinal", "process_candidate_id",
+        "strategy_id", "trial_definition_sha256", "refit_recipe_sha256")}
+    complexity.update(dict.fromkeys(("source_strategy_domain_sha256", "parameter_domain",
+        "parameter_domain_sha256", "finite_domain_cardinality", "active_free_parameter_count")))
+    policy["selection_complexity_roster"] = [complexity]
+    policy["selection_complexity_roster_sha256"] = _sha([complexity])
+    policy_sha, attempt_sha = _sha(policy), _sha({"attempts": [attempt]})
+
+    start = date.fromisoformat(axis["oos_start_date_utc"])
+    days = generation.policy["min_days_per_fold"]
+    dates = [(start + timedelta(days=offset)).isoformat() for offset in range(days)]
+    planned = {"fold_ordinal": 0, "fold_id": "INVENTED_FOLD",
+        "anchor_as_of_utc": "2023-12-31T00:00:00Z", "oos_start_date_utc": dates[0],
+        "oos_end_date_utc": dates[-1]}
+    partition = {
+        "schema_version": generation.shared_partition_version, "causal_fold_plan_row_sha256": _sha(planned),
+        **{name: policy[name] for name in ("cell_id", "symbol", "timeframe", "regime",
+            "source_contract_sha256", "cost_contract_sha256", generation.pair_field, "risk_unit_contract_sha256")},
+        **{name: _sha(["INVENTED", name]) for name in (
+            "native_prefix_index_sha256", "native_prefix_content_sha256", "native_source_sha256",
+            "activation_manifest_sha256", "source_group_decision_sha256", "regime_fit_decision_sha256",
+            "execution_spec_receipt_sha256")},
+    }
+    axis = {**planned, "daily_dates_utc": dates,
+        "shared_oos_partition": {**partition, "receipt_sha256": _sha(partition)}}
+    for row in fold["tier_evidence"].values():
+        row["daily_resolved_trade_r_e12_i64be_base64"] = winner._encode_r_e12_i64be_base64(
+            [60 * 10**12, 0, 250000000000] + [0] * (days - 3),
+            maximum_abs_r=generation.max_abs_daily_r, code="INVENTED_DAILY")
+    if repeated_witness:
+        p75, p95 = (fold["tier_evidence"][tier] for tier in ("P75", "P95"))
+        p95[generation.witness_field] = p75[generation.witness_field]
+    _rehash(fold, axis, policy)
+    entries = [_evidence_entry(attempt, status="PROCESS_REJECTED", folds=[fold])]
+
+    account = _validate(fold, axis, policy)["tier_evidence"]["P75"]
+    identity = {key: account[key] for key in generation.trade_identity_fields}
+    floor = {"floor_status": "UNAVAILABLE_BASE_FILL_OR_POSITION_PARITY_MISMATCH",
+        "floor_reason_codes": ["INVENTED_TIER_PARITY_MISMATCH"]}
+    partition_statuses = [
+        {"fold_ordinal": 0, "partition_role": role, "witness_sha256": _sha(["INVENTED_WITNESS", role]), **floor}
+        for role in ("optimizer_train", "tuning_validation", "final_lockbox")
+    ]
+    origin = {**_origin_fixture(generation), "precommitment_sha256": policy_sha,
+        "attempt_id": attempt["attempt_id"]}
+    witness_digest = _sha("INVENTED_MATCHED_BASE_WITNESSES_DESCRIPTOR")
+    addendum_rows = [{
+        **{key: attempt[key] for key in ("ordinal", "attempt_id", "process_candidate_id")},
+        "stage_origin_binding": origin,
+        "partition_witnesses_descriptor": {
+            "artifact_id": "invented/attempt-0000/matched-base-witnesses",
+            "artifact_type": "winner_matched_base_witnesses",
+            "descriptor": {"schema_version": ARTIFACT_DESCRIPTOR_SCHEMA, "sha256": witness_digest,
+                "relative_path": f"objects/sha256/{witness_digest[:2]}/{witness_digest}.fxpm-ascii-json-v1",
+                "size_bytes": 64, "format": "fxpm-ascii-json-v1"},
+        },
+        "full_witnesses_sha256": origin["matched_base_facts_sha256"],
+        "partition_statuses": partition_statuses,
+        "final_folds": [{"fold_ordinal": 0, "shared_fold_axis_row_sha256": _sha(axis),
+            "raw_shared_oos_partition_sha256": _sha(axis["shared_oos_partition"]),
+            "base_opportunity_identity": identity, "base_opportunity_identity_sha256": _sha(identity),
+            "base_actual_initial_risk_net_r": None, "matched_p95_spread_cost_r": None, **floor}],
+    }]
+    boundary = "2024-04-01T00:00:00Z"
+    completed = "2024-04-01T00:00:01Z"
+    payload = {
+        **{name: policy[name] for name in ("run_id", "cell_id", "symbol", "timeframe", "regime",
+            "partition_cost_precommitments_sha256", "source_contract_sha256", "cost_contract_sha256",
+            generation.pair_field, "risk_unit_contract_sha256", "process_registry_sha256",
+            "horizon_registry_sha256", "trial_registry_sha256")},
+        "contract_version": generation.evidence_version,
+        "generated_at_utc": completed, "evidence_access_started_at_utc": boundary,
+        "evidence_access_completed_at_utc": completed, "latest_evidence_boundary_utc": boundary,
+        "precommitment_payload_sha256": policy_sha, "attempt_ledger_payload_sha256": attempt_sha,
+        "shared_fold_axis_count": 1, "shared_fold_axis_sha256": _sha([axis]), "shared_fold_axis": [axis],
+        "attempt_count": 1, "entries_sha256": _sha(entries), "entries": entries,
+        "evidence_scope": "PROCESS_LEVEL_ONLY", "parameter_evidence_inherited": False,
+        "selection_addendum": {"contract_version": generation.selection_addendum_evidence_version,
+            "precommitment_payload_sha256": policy_sha, "attempt_ledger_payload_sha256": attempt_sha,
+            "selection_complexity_roster_sha256": policy["selection_complexity_roster_sha256"],
+            "entries": addendum_rows, "entries_sha256": _sha(addendum_rows)},
+    }
+    # Exercise the real ledger boundary with one invented fold. The fixture
+    # does not represent a declared V19 process or a production request.
+    return winner._validate_evidence_ledger(payload, policy, policy_sha, attempt_sha,
+        datetime.fromisoformat("2023-12-31T00:00:00+00:00"), (policy["cell_id"], *cell),
+        [attempt], [planned], datetime.fromisoformat(boundary), datetime.fromisoformat(completed),
+        _sha("INVENTED_REQUEST"), _generation=generation)
+
+
+def test_v19_evidence_ledger_accepts_distinct_tier_witnesses():
+    _, entries, axes = _v19_witness_ledger(repeated_witness=False)
+    assert len(entries) == len(axes) == 1
+    tiers = entries[0]["folds"][0]["tier_evidence"]
+    field = winner.V19_GENERATION.witness_field
+    assert tiers["P75"][field] != tiers["P95"][field]
+
+
+def test_v19_evidence_ledger_refuses_cross_tier_witness_replay():
+    with pytest.raises(winner._ContractError) as caught:
+        _v19_witness_ledger(repeated_witness=True)
+    assert str(caught.value) == "EVIDENCE_0000_POSITION_ACTIVITY_LEDGER_SHA256_REPLAYED_ACROSS_EVIDENCE_DOMAINS"
 
 
 def test_additive_utility_has_no_wealth_domain_and_legacy_contract_is_retained():

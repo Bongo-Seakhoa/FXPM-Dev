@@ -3148,7 +3148,7 @@ def _validate_evidence_ledger(
                 )
             accounts = {"ARCHIVED": fold} if _generation.archived else fold["tier_evidence"]
             for tier, account in accounts.items():
-                activity = account["position_activity_ledger_sha256"]
+                activity = account[_generation.witness_field]
                 if activity in evidence_identity_domains:
                     raise _ContractError(prefix + "POSITION_ACTIVITY_LEDGER_SHA256_REPLAYED_ACROSS_EVIDENCE_DOMAINS")
                 evidence_identity_domains[activity] = f"CANDIDATE_{ordinal:04d}_FOLD_{fold_ordinal:03d}_{tier}_ACTIVITY"
