@@ -28,6 +28,7 @@ from pm_strategies import StrategyRegistry
 def _process_body() -> dict:
     domains = planner._strategy_domains()
     return {
+        "schema_version": planner.PROCESS_SCHEMA,
         "candidate_domain_sha256": (
             planner.state_contract.STRATEGY_CANDIDATE_DOMAIN_SHA256
         ),
@@ -348,12 +349,16 @@ def test_attempt_roster_tunes_every_strategy_with_real_grid_variants() -> None:
 
     defaults = attempts[: planner.BASELINE_ATTEMPTS]
     variants = attempts[planner.BASELINE_ATTEMPTS :]
-    assert [item["strategy_id"] for item in defaults] == StrategyRegistry.list_all()
+    expected_ids = planner.source_edition_info(process).ordered_strategy_ids
+    assert expected_ids == tuple(planner.state_contract.ACTUAL_STRATEGY_NAMES)
+    assert set(expected_ids) <= set(StrategyRegistry.list_all())
+    assert planner.NOISE101_STRATEGY_ID not in expected_ids
+    assert [item["strategy_id"] for item in defaults] == list(expected_ids)
     assert len(variants) == planner.VARIANT_ATTEMPTS
 
     # Every registered strategy is tuned, exactly VARIANTS_PER_STRATEGY times.
     tuned = Counter(item["strategy_id"] for item in variants)
-    assert set(tuned) == set(StrategyRegistry.list_all())
+    assert set(tuned) == set(expected_ids)
     assert set(tuned.values()) == {planner.VARIANTS_PER_STRATEGY}
 
     # No strategy may contribute the same parameter point twice.
@@ -2302,7 +2307,7 @@ def test_cell_plan_reopen_replays_carried_rosters_and_rejects_splice(
         config_sha256="b" * 64,
     )
     process = planner.FrozenProductionSearchProcess(
-        planner._canonical_bytes({"run_id": "cell-plan-run"}),
+        planner._canonical_bytes({"run_id": "cell-plan-run", "schema_version": planner.PROCESS_SCHEMA}),
         planner._canonical_bytes({"unused": True}),
         planner._PROCESS_SEAL,
     )
