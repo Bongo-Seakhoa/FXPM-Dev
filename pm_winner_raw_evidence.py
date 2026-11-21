@@ -5908,6 +5908,21 @@ def _evaluate_produced_winner_decision(request, generation):
     return decision, marginal
 
 
+def _merge_fold_production_entries(roster, entries, *, fold_prefix, shared_array_prefix=None):
+    for name, entry in entries.items():
+        shared = shared_array_prefix is not None and (
+            name.startswith("matched-array-") or entry["artifact_type"] == "winner_matched_spread_array"
+        )
+        if not shared:
+            roster[f"{fold_prefix}-{name}"] = entry
+            continue
+        digest = entry["descriptor"]["sha256"]
+        if (name != f"matched-array-{digest}" or entry["artifact_type"] != "winner_matched_spread_array"
+                or entry["artifact_id"] != shared_array_prefix + digest
+                or roster.setdefault(name, entry) != entry):
+            _fail("INDEPENDENT_R_SHARED_ARRAY_PROOF_CONFLICT")
+
+
 def _produce_winner_raw_evidence(
     sink: SymbolAuthoritySink,
     *,
@@ -6006,6 +6021,8 @@ def _produce_winner_raw_evidence(
     provenance_schemas: set[str] = set()
     shared_fold_axis: Optional[list[dict[str, Any]]] = None
     total_completed_trades = 0
+    source_prefix = _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
+    shared_array_prefix = source_prefix + "/matched-floor-arrays/" if _generation.independent_signal_r_enabled else None
     from pm_historical_scheduler import _declared_observe_progress
     _declared_observe_progress(progress, 'result_attempts', 0, len(attempt_ledger['attempts']))
     for attempt, attempt_artifacts, cross_binding_attempt in zip(
@@ -6025,10 +6042,7 @@ def _produce_winner_raw_evidence(
                 or raw.get("attempt_id") != attempt["attempt_id"]
             ):
                 _fail(f"ATTEMPT_{ordinal:04d}_EVIDENCE_IDENTITY_MISMATCH")
-            prefix = (
-                f"{_artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)}/"
-                f"attempt-{ordinal:04d}"
-            )
+            prefix = f"{source_prefix}/attempt-{ordinal:04d}"
             if set(raw) == {"attempt_id", "outcome"}:
                 outcome = raw.get("outcome")
                 status = _outcome_status(outcome, frozen=frozen, attempt=attempt)
@@ -6106,11 +6120,9 @@ def _produce_winner_raw_evidence(
                     raise WinnerRawEvidenceIncomplete(
                         "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE", exc.code
                     ) from exc
-                for name, entry in fold_entries.items():
-                    spool_entries[
-                        f"attempt-{ordinal:04d}-fold-"
-                        f"{planned_fold['fold_ordinal']:03d}-{name}"
-                    ] = entry
+                _merge_fold_production_entries(spool_entries, fold_entries,
+                    fold_prefix=f"attempt-{ordinal:04d}-fold-{planned_fold['fold_ordinal']:03d}",
+                    shared_array_prefix=shared_array_prefix)
                 if outcome.status == "TECHNICAL_FAILURE":
                     raise WinnerRawEvidenceIncomplete(
                         "ATTEMPT_TECHNICAL_EVIDENCE_FAILURE", outcome.reason_code
@@ -6178,7 +6190,6 @@ def _produce_winner_raw_evidence(
         precommitment["causal_fold_plan"]
     ):
         _fail("SHARED_FOLD_AXIS_UNAVAILABLE")
-    source_prefix = _artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
     registered_sources = {entry["artifact_id"]: entry for entry in sink.artifact_roster()
         if entry["artifact_id"].startswith(source_prefix + "/")
         and (entry["artifact_id"].startswith(source_prefix + "/source-observations/")

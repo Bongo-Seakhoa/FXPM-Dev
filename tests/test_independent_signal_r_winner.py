@@ -3,7 +3,6 @@ from copy import deepcopy
 from datetime import date, datetime, timedelta
 import hashlib
 import json
-from pathlib import Path
 
 import pytest
 
@@ -207,76 +206,107 @@ def test_v19_evidence_ledger_refuses_cross_tier_witness_replay():
     assert str(caught.value) == "EVIDENCE_0000_POSITION_ACTIVITY_LEDGER_SHA256_REPLAYED_ACROSS_EVIDENCE_DOMAINS"
 
 
-_RETAINED_P75_COLLISION = "79e35071604dadccfd66b861134faf5a17ab4d8afe051ff5b64396cb619baa06"
-_RETAINED_FOLD_OWNERS = {
-    80: ("ad1e099dd2565c135c13494d68590b353df0da492688eb948ffa6f3e63cfa33c",
-         "88988eb83df5f1adef616ba7251419651d7a944a2c945c5bb40d0d66e0cea7f5"),
-    114: ("d09b12d972da7cad27d27b14be28a2e910a111abcfd8d63efc85138a4d2a1a08",
-          "3810319f6172fafb333401c6a8abcaa2adea8c12a74c04307a28f8db241e1f8e"),
-}
 _WITNESS_BINDING_REFUSAL = "INDEPENDENT_R_RESOLVED_WITNESS_BINDING_CHANGED"
 
 
+def _invented_owner_provenance(capture, lanes, reference):
+    from test_authoritative_search_execution import _fold_provenance_transport_fixture
+    import pm_authoritative_search_execution as execution
+    import pm_winner_raw_evidence as raw
+
+    references = dict.fromkeys(raw._PARTITIONS, reference)
+    template, _, _ = _fold_provenance_transport_fixture(source_observation_references=references)
+    lane_hashes = {name: _sha(lane) for name, lane in lanes.items()}
+    execution_receipt = raw.build_independent_tier_execution_receipt(lanes, _sha("INVENTED_TIER_PAIR"))
+    signals = capture["signals"]
+    signal_digest = hashlib.sha256(signals.to_numpy(dtype="<i4").tobytes()).hexdigest()
+    signal_vector = execution._receipt(execution.SIGNAL_VECTOR_VERSION, {
+        "encoding": "little-endian-signed-int32", "observation_count": len(signals),
+        "values": signals.tolist(), "signal_vector_sha256": signal_digest,
+    })
+    schema = raw.INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+    specific = raw._provenance_specific_keys(current=True, referenced=True, independent=True)
+    replay = template["attempt_replay_receipt"]
+    del replay["position_events_are_genuine_backtester_v2"]
+    replay.update(lane_sha256=lane_hashes, independent_tier_execution_receipt=execution_receipt,
+        independent_tier_execution_receipt_sha256=execution_receipt["receipt_sha256"],
+        signal_vector_receipts=dict.fromkeys(raw._PARTITIONS, signal_vector),
+        genuine_independent_signal_r_capture=True)
+    template["anchor_trial_ledger"]["attempted_trials_exact"] = 2
+    for ordinal in range(2):
+        provenance = {}
+        for role, receipt in template.items():
+            body = {key: value for key, value in receipt.items() if key not in {"receipt_sha256", "schema_version"}}
+            body.update(attempt_ordinal=ordinal, horizon_attempt_id=f"invented-owner-{ordinal}",
+                timeframe="D1", fold_id="INVENTED_FOLD")
+            sealed = execution._receipt(schema, body)
+            provenance[role] = raw._validated_self_hashed_receipt(sealed, role=role,
+                expected_keys=raw._PROVENANCE_COMMON_KEYS | specific[role], schema_version=schema)
+        yield provenance
+
+
 @pytest.fixture(scope="module")
-def retained_v19_witness_owners(tmp_path_factory):
-    """Two read-only sealed Source356 folds and their witness publications in isolated scratch."""
+def invented_v19_witness_owners(tmp_path_factory):
+    """Two invented receipt owners share a genuine independent-R batch."""
+    from dataclasses import asdict, replace
+    from test_independent_signal_r import _evaluate
+    from test_independent_signal_r_production_raw import _capture_case
+    from test_signal_opportunities import _provenance
+    from test_winner_raw_evidence import _source_observation_transport_case
     import pm_authority_spool as spool
     import pm_winner_raw_evidence as raw
 
-    checkout = Path(__file__).resolve().parents[4]
-    summary_path = checkout / ".tmp/fxpm_default_v19_terminal_356/q/terminal_summary.json"
-    summary = json.loads(summary_path.read_bytes())
-    retained_root = Path(summary["issue"]["spool_root"])
-    unit_root = Path(summary["absolute_units_root"])
-    assert retained_root.is_relative_to(summary_path.parents[1])
-    assert unit_root.is_relative_to(retained_root)
-
-    cached = {}
-
-    def retained_object(digest):
-        if digest not in cached:
-            path = retained_root / "objects" / "sha256" / digest[:2] / (digest + ".fxpm-ascii-json-v1")
-            body = path.read_bytes()
-            assert hashlib.sha256(body).hexdigest() == digest
-            value = json.loads(body)
-            assert raw._canonical_bytes(value) == body
-            cached[digest] = value
-        return cached[digest]
-
-    root = tmp_path_factory.mktemp("owner") / "s"
-    context = spool.freeze_generation_context(root, generation_id="invented-source356-witness-owners",
-        native_universe_sha256=_sha("INVENTED_SOFTWARE_ONLY"), config_sha256=_sha("INVENTED_METADATA_ONLY"))
-    sink = spool.open_symbol_sink(context, "EURUSD")
+    case = _source_observation_transport_case(tmp_path_factory.mktemp("witness-owners"),
+        generation_id="invented-v19-witness-owners")
+    context, sink = case["context"], case["sink"]
+    frozen = replace(case["frozen"], timeframe="D1", artifact_namespace="invented-v19-witness-owners")
+    capture = _capture_case(daily=True)
+    base = capture["lane"]
+    axes = [bar.isoformat().replace("+00:00", "Z") for bar in capture["frame"].index]
+    observations = [{"target_open_utc": timestamp, "expected_prior_fine_close_utc": timestamp,
+        "prior_fine_close_utc": timestamp, "points": 9.0} for timestamp in axes]
+    receipt_body = {key: value for key, value in case["receipt"].items() if key != "receipt_sha256"}
+    receipt_body.update(timeframe="D1", observations=observations, entry_observations_sha256=_sha(observations),
+        source_product={**receipt_body["source_product"], "cutoff_utc": base["batch"]["cutoff_utc"]})
+    reference = raw.publish_source_observation_receipt(sink, frozen=frozen,
+        receipt={**receipt_body, "receipt_sha256": _sha(receipt_body)})
+    p95_batch = asdict(_evaluate(capture["frame"], capture["signals"].tolist(),
+        strategy=capture["strategy"], spec=capture["spec"], pricing=capture["pricing"], timeframe="D1",
+        provenance=_provenance(capture["strategy"], tier="P95")))
+    p95_batch["records"] = list(p95_batch["records"])
+    final_lanes = {
+        "P75": {**base, "source_reference": reference},
+        "P95": {**base, "source_reference": reference, "batch": p95_batch,
+            "swap_accrual_contract": p95_batch["cost_model"]["swap_contract"]},
+    }
+    records = {tier: raw._independent_r_records(lane, regime="TREND") for tier, lane in final_lanes.items()}
+    assert records["P75"] and records["P95"]
+    lanes = {role + "_" + tier.lower(): lane
+        for role in raw._PARTITIONS for tier, lane in final_lanes.items()}
+    retained_sink = spool.open_symbol_sink(context, "EURUSD", manifest_domain=spool.HISTORICAL_ANCHOR_MANIFEST_DOMAIN)
+    root = raw._artifact_prefix(frozen.artifact_namespace, frozen.timeframe, frozen.regime)
     owners = {}
-    entries = {}
-    for attempt_ordinal, (fold_sha, replay_sha) in _RETAINED_FOLD_OWNERS.items():
-        original_fold = retained_object(fold_sha)
-        replay = retained_object(replay_sha)
-        unit_receipt = json.loads((unit_root / f"{attempt_ordinal:06d}.json").read_bytes())
-        unit = retained_object(unit_receipt["payload"]["sha256"])
-        fold = unit["folds"][0]
-        assert replay == fold["provenance"]["attempt_replay_receipt"]
-        assert replay["schema_version"] == raw.INDEPENDENT_AUTHORITATIVE_PROVENANCE_SCHEMA
+    for attempt_ordinal, provenance in enumerate(_invented_owner_provenance(capture, lanes, reference)):
+        prefix = f"{root}/attempt-{attempt_ordinal:04d}/fold-000"
+        receipts = {role: raw._put_ascii_json(sink, prefix + "/provenance/" + role, "winner_" + role, receipt)
+            for role, receipt in provenance.items()}
+        replay = provenance["attempt_replay_receipt"]
+        replay_sha = receipts["attempt_replay_receipt"]["descriptor"]["sha256"]
         assert replay["attempt_ordinal"] == attempt_ordinal
-        assert replay["fold_ordinal"] == original_fold["fold_ordinal"] == fold["fold_ordinal"] == 0
-        assert replay["receipt_sha256"] == _sha({key: value for key, value in replay.items()
-                                                if key != "receipt_sha256"})
-        assert replay_sha == original_fold["attempt_replay_receipt_sha256"] != replay["receipt_sha256"]
-        assert original_fold["tier_evidence"]["P75"]["independent_signal_r_witness_sha256"] == _RETAINED_P75_COLLISION
-        prefix = f"invented-source356/attempt-{attempt_ordinal:04d}/fold-000"
-        replay_id = prefix + "/provenance/attempt_replay_receipt"
-        entries[replay_id] = raw._put_ascii_json(sink, replay_id, "winner_attempt_replay_receipt", replay)
-        assert entries[replay_id]["descriptor"]["sha256"] == replay_sha
-        ledger_fold = deepcopy(original_fold)
-        lanes = {tier: fold["lanes"]["final_lockbox_" + tier.lower()] for tier in ("P75", "P95")}
-        records = {tier: raw._independent_r_records(lane, regime=replay["regime"])
-                   for tier, lane in lanes.items()}
+        assert replay["fold_ordinal"] == 0
+        assert replay_sha == _sha(replay) != replay["receipt_sha256"]
+        ledger_fold = {"fold_ordinal": 0,
+            "tier_evidence": {tier: {"spread_tier": tier} for tier in final_lanes},
+            **{("attempt_oos_source_receipt" if role == "oos_source_receipt" else role) + "_sha256":
+                entry["descriptor"]["sha256"] for role, entry in receipts.items()}}
+        original_fold = deepcopy(ledger_fold)
         old_entries, witnesses = {}, {}
-        for tier, lane in lanes.items():
+        for tier, lane in final_lanes.items():
             field = winner.V19_GENERATION.witness_field
-            old_sha = original_fold["tier_evidence"][tier][field]
-            old_witness = retained_object(old_sha)
-            assert old_witness["schema_version"] == "fxpm.independent-signal-resolved-witness.v1"
+            old_witness = {"schema_version": "fxpm.independent-signal-resolved-witness.v1",
+                "source_reference": reference, "partition_axis": lane["trade_power_partition_axis"],
+                "method_edition": lane["batch"]["method_edition"], "records": records[tier],
+                "batch_sha256": _sha(lane["batch"])}
             witness = raw._independent_resolved_witness(lane, records[tier],
                 attempt_replay_receipt_sha256=replay_sha, spread_tier=tier)
             assert witness["schema_version"] == "fxpm.independent-signal-resolved-witness.v2"
@@ -284,21 +314,34 @@ def retained_v19_witness_owners(tmp_path_factory):
                 key: value for key, value in old_witness.items() if key != "schema_version"}
             art_id = prefix + "/resolved-" + tier.lower()
             art_type = "winner_independent_signal_r_witness"
-            old_entries[art_id] = raw._put_ascii_json(sink, art_id + "-retained-v1", art_type, old_witness)
-            assert old_entries[art_id]["descriptor"]["sha256"] == old_sha
-            entries[art_id] = raw._put_ascii_json(sink, art_id, art_type, witness)
-            ledger_fold["tier_evidence"][tier][field] = entries[art_id]["descriptor"]["sha256"]
+            old_entries[art_id] = raw._put_ascii_json(retained_sink, art_id, art_type, old_witness)
+            original_fold["tier_evidence"][tier][field] = old_entries[art_id]["descriptor"]["sha256"]
+            entry = raw._put_ascii_json(sink, art_id, art_type, witness)
+            ledger_fold["tier_evidence"][tier][field] = entry["descriptor"]["sha256"]
             witnesses[tier] = witness
         owners[attempt_ordinal] = dict(prefix=prefix, attempt_ordinal=attempt_ordinal,
-            ledger_fold=ledger_fold, final_lanes=lanes, final_records=records, replay_receipt=replay,
+            ledger_fold=ledger_fold, final_lanes=final_lanes, final_records=records,
             original_fold=original_fold, old_entries=old_entries, witnesses=witnesses)
 
-    first = owners[80]
+    field = winner.V19_GENERATION.witness_field
+    assert owners[0]["original_fold"]["tier_evidence"]["P75"][field] == owners[1]["original_fold"]["tier_evidence"]["P75"][field]
+    first = owners[0]
     wrong_tier = raw._independent_resolved_witness(first["final_lanes"]["P75"], first["final_records"]["P75"],
         attempt_replay_receipt_sha256=first["ledger_fold"]["attempt_replay_receipt_sha256"], spread_tier="P95")
     wrong_tier_entry = raw._put_ascii_json(sink, first["prefix"] + "/swapped-tier-control",
         "winner_independent_signal_r_witness", wrong_tier)
-    sink.seal()
+    def sealed_entries(owner_sink):
+        manifest = spool.verify_symbol_receipt(context.root, owner_sink.seal(),
+            expected_generation_id=context.generation_id, expected_symbol="EURUSD",
+            expected_native_universe_sha256=context.native_universe_sha256, expected_config_sha256=context.config_sha256,
+            expected_manifest_domain=owner_sink.manifest_domain)
+        return {entry["artifact_id"]: entry for entry in manifest["artifacts"]}
+
+    entries = sealed_entries(sink)
+    retained_entries = sealed_entries(retained_sink)
+    for owner in owners.values():
+        assert all(retained_entries[key] == entry for key, entry in owner["old_entries"].items())
+        owner["old_entries"] = {key: retained_entries[key] for key in owner["old_entries"]}
     return context, owners, entries, wrong_tier_entry
 
 
@@ -309,14 +352,13 @@ def _verify_witness_owner(raw, context, owner, entries, *, retained=False, allow
     raw._verify_independent_resolved_witness_fold(prefix=owner["prefix"], attempt_ordinal=owner["attempt_ordinal"],
         ledger_fold=owner["original_fold"] if retained else owner["ledger_fold"],
         entries=entries, read=read, final_lanes=owner["final_lanes"], final_records=owner["final_records"],
-        replay_receipt=owner["replay_receipt"], allow_retained_v1=allow_retained_v1)
+        replay_receipt=read(owner["prefix"] + "/provenance/attempt_replay_receipt"), allow_retained_v1=allow_retained_v1)
 
 
 def _two_owner_ledger(owners, *, repeat_witness=False):
     from pm_winner_raw_evidence import _evidence_entry
 
-    # Actual retained fold owner and newly published witness references are
-    # inserted into the existing invented one-fold ledger validator fixture.
+    # Use the scratch publications as the provenance of the invented ledger.
     inputs = _v19_witness_ledger_inputs(repeated_witness=False)
     payload, policy = inputs["payload"], inputs["policy"]
     template_fold = payload["entries"][0]["folds"][0]
@@ -340,7 +382,7 @@ def _two_owner_ledger(owners, *, repeat_witness=False):
         for tier, row in fold["tier_evidence"].items():
             row[field] = actual_fold["tier_evidence"][tier][field]
         if repeat_witness and ordinal == 1:
-            fold["tier_evidence"]["P75"][field] = owners[80]["ledger_fold"]["tier_evidence"]["P75"][field]
+            fold["tier_evidence"]["P75"][field] = owners[0]["ledger_fold"]["tier_evidence"]["P75"][field]
         _rehash(fold, axis, policy)
         evidence.append(_evidence_entry(attempt, status="PROCESS_REJECTED", folds=[fold]))
         row = deepcopy(template_addendum)
@@ -360,11 +402,11 @@ def _two_owner_ledger(owners, *, repeat_witness=False):
     return winner._validate_evidence_ledger(**inputs)
 
 
-def test_source356_v19_distinct_resolved_witness_owners_pass_raw_and_winner(retained_v19_witness_owners):
+def test_v19_distinct_resolved_witness_owners_pass_raw_and_winner(invented_v19_witness_owners):
     import pm_winner_raw_evidence as raw
 
-    context, owners, entries, _ = retained_v19_witness_owners
-    first, second = (owners[ordinal]["witnesses"]["P75"] for ordinal in (80, 114))
+    context, owners, entries, _ = invented_v19_witness_owners
+    first, second = (owners[ordinal]["witnesses"]["P75"] for ordinal in (0, 1))
     assert {key: value for key, value in first.items() if key != "owner"} == {
         key: value for key, value in second.items() if key != "owner"}
     assert first["owner"] != second["owner"]
@@ -376,21 +418,21 @@ def test_source356_v19_distinct_resolved_witness_owners_pass_raw_and_winner(reta
     assert _sha(first) != _sha(second)
 
 
-def test_source356_v19_winner_refuses_same_resolved_witness_owner_replay(retained_v19_witness_owners):
-    _, owners, _, _ = retained_v19_witness_owners
+def test_v19_winner_refuses_same_resolved_witness_owner_replay(invented_v19_witness_owners):
+    _, owners, _, _ = invented_v19_witness_owners
     with pytest.raises(winner._ContractError) as caught:
         _two_owner_ledger(owners, repeat_witness=True)
     assert str(caught.value) == "EVIDENCE_0001_POSITION_ACTIVITY_LEDGER_SHA256_REPLAYED_ACROSS_EVIDENCE_DOMAINS"
 
 
 @pytest.mark.parametrize("splice", ["owner", "tier"])
-def test_source356_v19_raw_refuses_swapped_resolved_witness(splice, retained_v19_witness_owners):
+def test_v19_raw_refuses_swapped_resolved_witness(splice, invented_v19_witness_owners):
     import pm_winner_raw_evidence as raw
 
-    context, owners, entries, wrong_tier = retained_v19_witness_owners
-    owner = deepcopy(owners[80])
+    context, owners, entries, wrong_tier = invented_v19_witness_owners
+    owner = deepcopy(owners[0])
     art_id = owner["prefix"] + "/resolved-p75"
-    source = entries[owners[114]["prefix"] + "/resolved-p75"] if splice == "owner" else wrong_tier
+    source = entries[owners[1]["prefix"] + "/resolved-p75"] if splice == "owner" else wrong_tier
     # Move both references to the exact swapped body so identity comparison
     # reaches the owner field rather than stopping at a digest mismatch.
     read_view = {**entries, art_id: {**entries[art_id], "descriptor": source["descriptor"]}}
@@ -399,10 +441,10 @@ def test_source356_v19_raw_refuses_swapped_resolved_witness(splice, retained_v19
         _verify_witness_owner(raw, context, owner, read_view)
 
 
-def test_source356_v19_raw_reads_exact_v1_only_as_retained_evidence(retained_v19_witness_owners):
+def test_v19_raw_reads_exact_v1_only_as_retained_evidence(invented_v19_witness_owners):
     import pm_winner_raw_evidence as raw
 
-    context, owners, entries, _ = retained_v19_witness_owners
+    context, owners, entries, _ = invented_v19_witness_owners
     for owner in owners.values():
         retained_entries = {**entries, **owner["old_entries"]}
         _verify_witness_owner(raw, context, owner, retained_entries, retained=True, allow_retained_v1=True)

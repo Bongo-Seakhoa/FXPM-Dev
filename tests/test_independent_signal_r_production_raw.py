@@ -13,10 +13,112 @@ import pm_core
 import pm_trade_power as power
 import pm_winner_raw_evidence as raw
 import pm_winner_selection as winner
+from pm_authority_spool import ARTIFACT_DESCRIPTOR_SCHEMA
 from pm_search_outcomes import SearchOutcomeKind
 from test_independent_signal_r import _config, _evaluate
 from test_signal_opportunities import FixedStops, _frame, _spec
 from test_trade_power import _ar1, _lineage, _policy, _source_contract, _trade_records
+
+
+_SHARED_ARRAY_CONFLICT = "INDEPENDENT_R_SHARED_ARRAY_PROOF_CONFLICT"
+
+
+def _invented_fold_descriptor(payload):
+    encoded = raw._canonical_bytes({"fixture_provenance": "INVENTED_FOLD_GRAPH_SOFTWARE_ONLY", **payload})
+    digest = hashlib.sha256(encoded).hexdigest()
+    return {
+        "schema_version": ARTIFACT_DESCRIPTOR_SCHEMA,
+        "sha256": digest,
+        "size_bytes": len(encoded),
+        "format": raw.ASCII_JSON_FORMAT,
+        "relative_path": f"objects/sha256/{digest[:2]}/{digest}.{raw.ASCII_JSON_FORMAT}",
+    }
+
+
+@pytest.fixture
+def invented_fold_entries():
+    """Software-only entries in the shape Raw receives from fold publication."""
+    root = "invented-fold-graph/winner-search/D1/TREND/"
+    shared_prefix = root + "matched-floor-arrays/"
+    descriptor = _invented_fold_descriptor({"array": [1, 2, 3]})
+    digest = descriptor["sha256"]
+    proof = "matched-array-" + digest
+    array = {"artifact_id": shared_prefix + digest, "artifact_type": "winner_matched_spread_array",
+             "descriptor": descriptor}
+    local_types = {
+        "independent-indexes": "winner_independent_signal_r_indexes",
+        "winner-fold": "winner_evaluated_fold",
+        "shared-oos-partition": "winner_shared_oos_partition",
+    }
+    folds = []
+    for ordinal in (0, 1):
+        fold_id = f"attempt-0000/fold-{ordinal:03d}"
+        local = {
+            name: {"artifact_id": f"{root}{fold_id}/{name}", "artifact_type": artifact_type,
+                "descriptor": _invented_fold_descriptor({"fold_ordinal": ordinal, "role": name})}
+            for name, artifact_type in local_types.items()
+        }
+        folds.append((fold_id.replace("/", "-"), {**local, proof: deepcopy(array)}))
+    return shared_prefix, proof, folds
+
+
+def test_v19_fold_merge_keeps_one_shared_array_and_all_local_roles(invented_fold_entries):
+    shared_prefix, proof, folds = invented_fold_entries
+    roster, expected = {}, {}
+    for fold_prefix, entries in folds:
+        raw._merge_fold_production_entries(roster, entries,
+            fold_prefix=fold_prefix, shared_array_prefix=shared_prefix)
+        expected.update({f"{fold_prefix}-{name}": entry for name, entry in entries.items() if name != proof})
+    assert roster == {**expected, proof: folds[0][1][proof]}
+    assert len({entry["artifact_id"] for entry in roster.values()}) == len(roster)
+
+
+@pytest.mark.parametrize("changed", ("descriptor", "type"))
+def test_v19_fold_merge_refuses_conflicting_shared_proof(changed, invented_fold_entries):
+    shared_prefix, proof, folds = invented_fold_entries
+    (first_prefix, first), (second_prefix, second) = folds
+    roster = {}
+    raw._merge_fold_production_entries(roster, first, fold_prefix=first_prefix,
+        shared_array_prefix=shared_prefix)
+    conflict = deepcopy(second[proof])
+    if changed == "descriptor":
+        conflict["descriptor"]["size_bytes"] += 1
+    else:
+        conflict["artifact_type"] = "winner_independent_signal_r_indexes"
+    original_array = roster[proof]
+    with pytest.raises(raw.WinnerRawEvidenceError) as caught:
+        raw._merge_fold_production_entries(roster, {proof: conflict}, fold_prefix=second_prefix,
+            shared_array_prefix=shared_prefix)
+    assert caught.value.code == _SHARED_ARRAY_CONFLICT
+    assert roster[proof] is original_array
+
+
+def test_v19_fold_merge_keeps_equal_content_nonshared_leaves_fold_local(invented_fold_entries):
+    shared_prefix, _, folds = invented_fold_entries
+    (first_prefix, first), (second_prefix, second) = folds
+    first_leaf, second_leaf = first["winner-fold"], second["winner-fold"]
+    # A software-only variant reuses bytes under different fold-local IDs.
+    second_with_equal_content = {**second_leaf, "descriptor": first_leaf["descriptor"]}
+    roster = {}
+    raw._merge_fold_production_entries(roster, {"winner-fold": first_leaf}, fold_prefix=first_prefix,
+        shared_array_prefix=shared_prefix)
+    raw._merge_fold_production_entries(roster, {"winner-fold": second_with_equal_content}, fold_prefix=second_prefix,
+        shared_array_prefix=shared_prefix)
+    assert first_leaf["artifact_id"] != second_leaf["artifact_id"]
+    assert roster == {f"{first_prefix}-winner-fold": first_leaf,
+                      f"{second_prefix}-winner-fold": second_with_equal_content}
+
+
+def test_v17_fold_merge_keeps_production_roster_bytes_exact(invented_fold_entries):
+    _, _, folds = invented_fold_entries
+    baseline, candidate = {}, {}
+    for fold_prefix, entries in folds:
+        raw._merge_fold_production_entries(candidate, entries, fold_prefix=fold_prefix)
+        for name, entry in entries.items():
+            baseline[f"{fold_prefix}-{name}"] = entry["descriptor"]
+    assert raw._canonical_bytes({name: entry["descriptor"] for name, entry in candidate.items()}) == (
+        raw._canonical_bytes(baseline)
+    )
 
 
 def _capture_case(*, daily=False, hour=0):
