@@ -1448,8 +1448,9 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
         "_state_domain_ceiling_records",
         lambda *_args, **_kwargs: (domain_records, 4),
     )
+    process_body = {"schema_version": planner.PROCESS_SCHEMA}
     planner._verify_state_context_plan_binding(
-        process_body={},
+        process_body=process_body,
         receipt=receipt,
         attempts=[artifact],
         states=[state],
@@ -1480,7 +1481,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
         match="STATE_DOMAIN_CEILING_REPLAY_INVALID",
     ):
         planner._verify_state_context_plan_binding(
-            process_body={},
+            process_body=process_body,
             receipt=spliced_receipt,
             attempts=[artifact],
             states=[state],
@@ -1503,7 +1504,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
         match="STATE_REQUIREMENT_REPLAY_INVALID",
     ):
         planner._verify_state_context_plan_binding(
-            process_body={},
+            process_body=process_body,
             receipt=changed_envelope,
             attempts=[artifact],
             states=[state],
@@ -1521,7 +1522,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
         match="STATE_CONTEXT_GEOMETRY_BINDING_INVALID",
     ):
         planner._verify_state_context_plan_binding(
-            process_body={},
+            process_body=process_body,
             receipt=changed_geometry,
             attempts=[artifact],
             states=[state],
@@ -1537,7 +1538,7 @@ def test_state_context_verifier_rehashes_and_cross_binds_every_requirement(
         match="STATE_REQUIREMENT_REPLAY_INVALID",
     ):
         planner._verify_state_context_plan_binding(
-            process_body={},
+            process_body=process_body,
             receipt=receipt,
             attempts=[artifact],
             states=[tampered],
