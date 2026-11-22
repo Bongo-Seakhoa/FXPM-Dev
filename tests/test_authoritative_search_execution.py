@@ -966,6 +966,7 @@ def test_release_contract_binds_all_execution_dependencies() -> None:
         "pm_current_refit_artifacts",
         "pm_historical_production_adapter",
         "pm_native_prefix_production",
+        "pm_production_search_planner",
         "pm_trade_power",
         "pm_winner_raw_evidence",
         "pm_winner_selection",
