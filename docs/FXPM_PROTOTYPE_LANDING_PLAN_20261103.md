@@ -40,7 +40,7 @@ No FxPM run is active.
 5. **Complete the full Book and V19 native-account fence** (W9). Keep historical evidence and account state independently verifiable.
 6. **Build live admission and mode selection** (W10). Connect the adopted Winner contract to promotion, prove handling parity and separate per-account budgets. The operator chooses paper, demo or funded before use.
 7. **Review research proposals as later editions** (W11). Keep daily history windows plan-bound. Scope the scoring rule, order handling, hourly costs and early stopping independently where they change policy or execution.
-8. **The 13-period study, once,** after landing.
+8. **Run the final 13-period study once after landing.** Classify its acquired-history results as exposed and reserve independent evaluation for the fresh data in section 8.
 
 The measurement, research design and architecture scopes can proceed independently of native execution. Schedule substantial laptop workloads against the four-worker default.
 
@@ -89,3 +89,14 @@ Attach the finding to the existing readiness report as evidence. Keep its admiss
 - Scope selected-handling parity after the selection boundary is verified. Bind the adopted handling in the historical evidence, then prove the same entry and management semantics in the existing order path. Preserve the adopted risk settings and current fail-closed controls. The operator chooses the execution mode when an admitted release is ready.
 
 Source366 supplies the actual invented no-winner reference on its original release. The current release needs its own bound input for a fresh cold read. An actual positive V19 selection and live handling parity remain open. Review this contract with Original Claude before opening the product implementation scope.
+
+## 8. Acquired history and fresh evaluation
+
+E7442 relays the operator's decision to allow acquired data for fitting, training and the final walk-forward study. The report from that history is exposed. The proposed untouched evaluation starts after the actual retained files end. The relay calls for four complete 28-day periods of newly acquired data. Exact dates and coverage still need to be established from the actual files and the authorized acquisition route.
+
+- **Preserve the S4 exposure record.** The initial S4 build used bars through 22 June 2024 and computed forward outputs. Third reports that the later forward figures remained unread and undisclosed. Keep the E7440 inventory, timings and compact result evidence when retiring any confirmed disposable units. The revised E7443 research scope is separate from engine execution. [Historical period geometry](../pm_production_anchor_plan.py#L1197)
+- **Version the engine's data scope.** The current product and its sealed receipts bind the original source cutoff and final-study roster. Build a separately scoped successor using the actual authorized coverage and purpose. Existing receipts remain readable with their own dates and source identities. The one native engineering case still needs its exact source-access window and peer scope. [Original source cutoff](../pm_historical_anchor_orchestration.py#L3072) [Final-study selection](../pm_historical_anchor_orchestration.py#L3695)
+- **Acquire fresh data into isolated custody.** Verify the existing read-only acquisition route, permitted source/account identity, complete per-symbol and timeframe coverage, and exact start and end. Use immutable custody separate from active training and fitting. Reports can check timestamps and inventory coverage before the model freeze. Keep outcomes unavailable to design and selection until the exact reviewed method, configuration, roster and evaluation contract are frozen. Report actual missing or partial periods. [Existing overlay acquisition](../tools/acquire_native_overlay.py)
+- **Design staged search as a separate edition.** Reuse the existing strategy and attempt roster, guard training-only rankings, preserve every planned candidate and distinguish policy pruning from an infrastructure stop. Use the existing custody and resume path. Quantify changed selections and actual stage and end-to-end time against the fixed engine baseline. Study block counts alone do not change product search policy. [Attempt custody](../pm_authoritative_search_execution.py#L4482) [Winner roster checks](../pm_winner_selection.py#L2078)
+
+Source acquisition and later evaluation will carry their own observed authority and evidence. Neither historical training use nor an acquired file admits broker orders or selects a live execution mode.
