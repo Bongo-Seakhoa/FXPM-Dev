@@ -2883,117 +2883,84 @@ def test_current_executor_persists_binding_before_strategy_evaluation(
     assert not stage.exists()
 
 
-def test_declared_executor_empty_reference_set_records_stop_with_frozen_pointers(tmp_path, monkeypatch):
-    """Actual emitter/guard/lifecycle on labelled metadata stubs, not native or full300 proof."""
-    from tests import test_declared_slot_owner_surface as declared
+def test_declared_executor_empty_reference_set_records_stop_with_frozen_pointers(
+        tmp_path, monkeypatch, _route_a_owned_invented_native_source):
+    """Exercise the legacy source owner and STOP emitter with locally invented data."""
+    import pm_authority_spool as spool
+    import pm_historical_anchor_orchestration as orchestration
+    import pm_historical_search_producer as producer
+
     adapter = execution.historical_adapter
-    monkeypatch.setattr(declared._TrackedStructuralFitted, "_read_source",
-        lambda self: {"symbol": "AUDUSD", "timeframe": "H1"})
-    env = declared._declared_environment(tmp_path, monkeypatch)
-    capture, fitted, config, plan = declared._structural_live_capture(env, monkeypatch)
-    fitted.product = SimpleNamespace()
-    fitted.source_contract_seeds = {tier: {"fixture_provenance": "SYNTHETIC_REFERENCE_GUARD_ONLY"}
-        for tier in ("P75", "P95")}
-    fitted.frozen_tier_pair_contract = {"fixture_provenance": "SYNTHETIC_REFERENCE_GUARD_ONLY"}
-    attempt_artifacts = ({"fixture_provenance": "SYNTHETIC_REFERENCE_GUARD_ONLY"},)
-    verified = execution._VerifiedAttempt(ordinal=0, plan_attempt={"status": "PLANNED"},
-        candidate={}, trial={}, artifacts=SimpleNamespace())
-    plan_body = {"cell": {"symbol": "AUDUSD", "timeframe": "H1", "regime": "TREND"}}
-    folds = tuple({"fold_ordinal": ordinal} for ordinal in range(4))
-    monkeypatch.setattr(execution, "_verified_historical_cell_plan_inputs",
-        lambda *args, **kwargs: (plan.horizon_plan, attempt_artifacts))
-    monkeypatch.setattr(execution, "_verify_capture_horizon_plan_identity", lambda *args, **kwargs: None)
-    monkeypatch.setattr(execution, "_reverify_fitted_timeframe", lambda actual, supplied: actual)
-    monkeypatch.setattr(execution, "_reverify_cell_state_error_envelope", lambda **kwargs: None)
-    monkeypatch.setattr(execution, "_verify_attempt_roster", lambda **kwargs: (plan_body, (verified,)))
-    monkeypatch.setattr(execution, "_winner_fold_plan", lambda attempts: folds)
-    snapshot_calls = []
-    snapshot_marker = {"classification": "SYNTHETIC_SNAPSHOT_PHASE_MARKER_NOT_A_BOUND_REFERENCE"}
-    def structural_snapshot(actual, actual_fitted, actual_folds, issue_owner):
-        # This negative guard test never consumes a fitted reference as authority.
-        assert actual is capture and actual_fitted is fitted and actual_folds is folds
-        assert type(issue_owner) is execution._FreshFitOwner
-        assert issue_owner.fitted is fitted and issue_owner.original_fitted is fitted
-        assert issue_owner.context_id == id(capture.context)
-        assert issue_owner.request_sha256 == capture.request.receipt_sha256
-        assert issue_owner.config is config
-        snapshot_calls.append(issue_owner)
-        return snapshot_marker
-    monkeypatch.setattr(execution, "_publish_declared_bound_fit", structural_snapshot)
-    def forbidden_unit_work(*args, **kwargs):
-        pytest.fail("Empty reference guard reached F header or unit publication")
-    monkeypatch.setattr(execution, "_make_declared_unit_header", forbidden_unit_work)
-    monkeypatch.setattr(execution, "_continue_declared_attempt_units", forbidden_unit_work)
-    costs = {"schema_version": "SYNTHETIC_REFERENCE_GUARD_COST_STUB", "rows": []}
-    order = []
-    def empty_cost_precommit(**kwargs):
-        assert kwargs["source_observation_cache"] == {}
-        assert kwargs["fitted"] is fitted and kwargs["attempts"] == (verified,)
-        order.append("costs")
-        return costs
-    monkeypatch.setattr(execution, "_partition_cost_precommitments", empty_cost_precommit)
-    pointers = {role: capture.sink.put_json(capture.raw_artifact_namespace + "/synthetic-reference-guard-" + role,
-        "synthetic_reference_guard_marker", {"classification": "SYNTHETIC_GUARD_POINTER_NOT_RAW_AUTHORITY", "role": role})["descriptor"]
-        for role in ("frozen", "graph", "cross")}
-    handle = adapter.FrozenHistoricalCell(symbol=capture.symbol, timeframe="H1", regime="TREND",
-        frozen=SimpleNamespace(attempt_ledger={"attempt_count": 1},
-            precommitment={"latest_evidence_boundary_utc": "2020-01-01T00:00:00Z"},
-            partition_cost_precommitments=costs),
-        frozen_receipt_descriptor=pointers["frozen"], frozen_descriptor_graph=pointers["graph"],
-        cross_binding_descriptor=pointers["cross"], artifact_namespace=capture.raw_artifact_namespace,
-        _attempt_artifacts=attempt_artifacts, _horizon_execution_contracts=(), _source_count_receipts=(),
-        _native_prefix_product=None, _cross_binding_bytes=b"", _capture_nonce="synthetic-reference-guard-only")
-    def freeze(actual, timeframe, regime, **kwargs):
-        assert actual is capture and (timeframe, regime) == ("H1", "TREND")
-        assert kwargs["partition_cost_precommitments"] is costs
-        assert kwargs["bound_fitted_state_entry"] is snapshot_marker
-        capture._active = handle
-        order.append("freeze")
-        return handle
-    monkeypatch.setattr(adapter.DeclaredSlotSearchCapture, "freeze_observed_cell", freeze)
-    monkeypatch.setattr(execution, "_raw_attempt_ids", lambda frozen, attempts: ("synthetic-raw-0",))
-    original_guard = execution._require_source_observation_references
-    guard_inputs = []
-    def observe_guard(value):
-        guard_inputs.append(value)
-        return original_guard(value)
-    monkeypatch.setattr(execution, "_require_source_observation_references", observe_guard)
-    def forbidden_evaluation(**kwargs):
-        pytest.fail("Empty official reference set reached strategy evaluation")
-    monkeypatch.setattr(execution, "_build_planned_attempt_evidence", forbidden_evaluation)
-    def completion_body(actual, *, status, reason_code, handle, completed):
-        assert actual is capture and completed is None
-        assert handle is not None and handle is capture._active
-        return {"classification": "SYNTHETIC_REFERENCE_GUARD_LIFECYCLE_NOT_FULL300_PRODUCTION",
-            "status": status, "reason_code": reason_code, "owner": None,
-            "frozen_plan_receipt": handle.frozen_receipt_descriptor,
-            "frozen_descriptor_graph": handle.frozen_descriptor_graph,
-            "horizon_winner_cross_binding": handle.cross_binding_descriptor,
-            "winner_request_entry": None, "winner_decision_entry": None,
-            "raw_production_receipt": None, "production_descriptor_graph": None,
-            "qualification_authority": False, "capital_authority": False, "live_authority": False, "order_authority": False}
-    monkeypatch.setattr(adapter, "_declared_capture_completion_body", completion_body)
-    result = execution.execute_historical_observed_cell(capture=capture, fitted=fitted,
-        regime="TREND", search_process=env.process, cell_plan=plan, config=config)
-    assert guard_inputs == [{}] and order == ["costs", "freeze"]
-    assert len(snapshot_calls) == 1
-    assert (result.status, result.failure_code) == ("TECHNICAL_FAILURE", "SOURCE_OBSERVATION_REFERENCE_SET_REQUIRED")
-    assert result.production is None and result.attempted_trials_exact == 1
-    observed = capture.completion
-    assert (observed["status"], observed["reason_code"]) == ("STOP", "SOURCE_OBSERVATION_REFERENCE_SET_REQUIRED")
-    assert capture._finished is True and capture._active is None
-    assert observed["frozen_plan_receipt"] == pointers["frozen"]
-    assert observed["frozen_descriptor_graph"] == pointers["graph"]
-    assert observed["horizon_winner_cross_binding"] == pointers["cross"]
-    failure = adapter._reopen_ascii_json_entry(capture.context, observed["technical_failure_entry"],
-        expected_type="declared_slot_technical_failure", code="TEST_REFERENCE_GUARD_FAILURE_INVALID")
-    assert failure["failure_code"] == "SOURCE_OBSERVATION_REFERENCE_SET_REQUIRED"
-    assert failure["frozen_receipt_sha256"] == pointers["frozen"]["sha256"]
-    assert failure["attempted_trials_exact"] == 1
-    assert all(observed[name] is None for name in ("owner", "winner_request_entry", "winner_decision_entry",
-        "raw_production_receipt", "production_descriptor_graph"))
-    assert all(observed[name] is False for name in (
-        "qualification_authority", "capital_authority", "live_authority", "order_authority"))
+    execute = execution.execute_historical_observed_cell
+    publish_references = execution._publish_source_observation_references
+    observed_stops = []
+
+    def forbidden_attempt_work(*args, **kwargs):
+        pytest.fail("Empty reference set reached header, unit or strategy execution")
+
+    def observe_execution(**kwargs):
+        capture = kwargs["capture"]
+        assert capture._winner_generation is winner.CURRENT_GENERATION
+        seen_frozen = []
+
+        def publish_empty_references(sink, *, frozen, source_observation_cache):
+            assert sink is capture.sink
+            handle = capture._active
+            assert type(handle) is adapter.FrozenHistoricalCell and handle.frozen is frozen
+            assert frozen.bound_fitted_state_entry and source_observation_cache
+            seen_frozen.append(handle)
+            source_observation_cache.clear()
+            return publish_references(sink, frozen=frozen, source_observation_cache=source_observation_cache)
+
+        with monkeypatch.context() as fault:
+            fault.setattr(execution, "_publish_source_observation_references", publish_empty_references)
+            fault.setattr(execution, "_make_declared_unit_header", forbidden_attempt_work)
+            fault.setattr(execution, "_continue_declared_attempt_units", forbidden_attempt_work)
+            fault.setattr(execution, "_build_planned_attempt_evidence", forbidden_attempt_work)
+            result = execute(**kwargs)
+
+        assert len(seen_frozen) == 1
+        handle = seen_frozen[0]
+        failure_code = "SOURCE_OBSERVATION_REFERENCE_SET_REQUIRED"
+        attempted_count = handle.frozen.attempt_ledger["attempt_count"]
+        assert attempted_count > 0
+        assert (result.status, result.failure_code) == ("TECHNICAL_FAILURE", failure_code)
+        assert result.production is None and result.attempted_trials_exact == attempted_count
+
+        stop = capture.completion
+        assert (stop["status"], stop["reason_code"]) == ("STOP", failure_code)
+        assert capture._finished is True and capture._active is None
+        assert stop["frozen_plan_receipt"] == handle.frozen_receipt_descriptor
+        assert stop["frozen_descriptor_graph"] == handle.frozen_descriptor_graph
+        assert stop["horizon_winner_cross_binding"] == handle.cross_binding_descriptor
+        failure = adapter._reopen_ascii_json_entry(capture.context, stop["technical_failure_entry"],
+            expected_type="declared_slot_technical_failure", code="TEST_REFERENCE_GUARD_FAILURE_INVALID")
+        assert failure["failure_code"] == failure_code
+        assert failure["frozen_receipt_sha256"] == handle.frozen_receipt_descriptor["sha256"]
+        assert failure["attempted_trials_exact"] == attempted_count
+        assert all(stop[name] is None for name in ("owner", "winner_request_entry", "winner_decision_entry",
+            "raw_production_receipt", "production_descriptor_graph"))
+        assert all(stop[name] is False for name in (
+            "qualification_authority", "capital_authority", "live_authority", "order_authority"))
+        observed_stops.append(stop)
+        return result
+
+    with _invented_fixture_external_io_guard(monkeypatch):
+        env = _build_owned_invented_declared_inputs(tmp_path,
+            source_access_window_utc=_route_a_owned_utc_window(),
+            native_fixture=_route_a_owned_invented_native_source)
+        body = env.precommit.to_dict()
+        symbol = body["cells"][0]["symbol"]
+        request = orchestration.declared_slot_producer_request(env.context, precommit=env.precommit,
+            process=env.process, cell_id=env.cell_id, slot_id=env.slot_id,
+            attempt_id="invented-empty-reference-guard", sink=spool.open_symbol_sink(env.context, symbol))
+        try:
+            monkeypatch.setattr(execution, "execute_historical_observed_cell", observe_execution)
+            completion = producer.execute_declared_slot_owner_search(env.context, request=request,
+                process=env.process, frozen_pipeline_config=env.frozen_pipeline_config)
+            assert observed_stops == [completion], completion
+        finally:
+            orchestration._release_declared_slot_producer_request(request, env.context)
 
 
 # Labelled synthetic store tests. These do not claim native/300-trial/Raw authority.
